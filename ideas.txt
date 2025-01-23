@@ -1,0 +1,116 @@
+reverberator is a python script that will:
+Recoverable Easy VERsioning Backup - erator
+
+Job Name (Unique Key)
+Path Monitoring
+Minium snapshot time
+Vault Path
+Keep 1 Compelete Backup
+Only Sync Attributes (permissions)
+Keep N versions
+Vault Size Limit
+
+
+monitor a list of path for changes using {inotifywait -m -r -e modify,create,delete,attrib}
+When script starts, if a new path that was not previously tracked was found, 
+and <Keep 1 Compelete Backup> is true, script will make a copy of the entire path to 
+<vault_dir>/{sanitized_backup_dir_name}/V{version_number}-{ISO-8601_sanitized_time}/
+
+
+I am writing a data backup tool in linux, it will have a vault that is just a path, 
+it will have subfolders for each backup jobs, and in each job folder, 
+it will have subfolders for historic versions. 
+it will mainly use inotifywait to monitor folders, use cp to copy the changed files, 
+and use symlinks to link the old version files in the old version folder to the new version folder 
+if they are not changed to reduce disk space usages. 
+it will be designed to be easy to use, easy to configure, simple to manage, 
+and as it is just use a path as a backup target, 
+fully compatible with varies other linux features and will be easy to browse the version histories 
+unlike other archiving / backup software that leaves custom archive files or archive folder structures with objects 
+that only works with itself. ( in the vault of this tool, 
+it will be simple to copy out the files just with cp --derefenence to dereference the symlinks ).
+
+folder deduplication done just using sym links
+ln -srL 
+no deduplication for files, but will use
+cp --reflink=auto --sparse=always -af
+to save space ( enable underlying fs CoW support )
+
+
+folder structure will be
+source_path -> <vault_dir>/{sanitized_backup_job_name}/V{version_number}-{ISO-8601_sanitized_time}/
+
+detect changes using
+inotifywait -m -r [-e modify,create,delete,attrib]
+
+start a thread to monitor and append output to a list <to_process>
+it will also log to TSV file <vault_dir>/{sanitized_backup_job_name}/journal.tsv - open in append only mode
+
+prev_to_process_len = 0
+
+while True:
+	wait(min_snapshot_time)
+	if not to_process:
+		continue
+	# if changes detected, continue waiting
+	if len(to_process) > prev_to_process_len:
+		prev_to_process_len = len(to_process)
+		continue
+	# If changes detected and after min_snapshot_time, no further changes detected,
+	# we will do a snapshot
+	process_list = to_process.copy()
+	to_process.clear()
+
+	file_to_backup = set()
+	path_to_delete = set()
+	file_change_attr = set()
+	folder_changed = set()
+	for item in process_list:
+		if item.event = 'delete':
+			path_to_delete.add(item.path)
+		elif item.type = 'dir':
+			folder_changed.add(item.path)
+		elif item.event in ['modify','create']:
+			file_to_backup.add(item.path)
+		elif item.event = 'attrib':
+			file_change_attr.add(item.path)
+		elif item.event = 'move':
+			path_to_delete.add(item.path)
+			file_to_backup.add(item.new_path)
+	# delete take precedence over backup
+	file_change_attr = file_change_attr - path_to_delete
+	file_to_backup = file_to_backup - path_to_delete
+	folder_changed = folder_changed - path_to_delete
+	# if we are already backing up a file, we don't need to backup attr only again
+	file_change_attr = file_change_attr - file_to_backup
+
+	# backup
+	do_incremental_backup(monitor_path,vault_path,file_to_backup,file_to_delete,file_change_attr,folder_changed)
+	
+def do_incremental_backup(monitor_path,vault_path,file_to_backup,file_to_delete,file_change_attr,folder_changed):
+	# if there is no current, do a full backup
+	#do_full_backup(monitor_path,vault_path)
+	last_version, last_timestamp = get_vault_info(vault_path,last=True)
+	this_version = last_version + 1
+	this_timestamp = time.time()
+	this_version_path = os.path.join(vault_path,f'V{this_version}-{this_timestamp}')
+	# walk over {vault_path}/current/ and create a new version
+	files, links , folders = get_file_list(os.path.join(vault_path,'current'))
+	# sync the folders to this version to create dir structure
+	sync_folders(folders,this_version_path)
+	# update the folder metadata to this version
+	sync_folders(folder_changed,this_version_path)
+	for file in files + links - file_to_backup - file_to_delete - file_change_attr:
+		# ln -srL files to this version path
+	for file in file_to_backup:
+		# cp --reflink=auto --sparse=always -af monitor path files to this version path
+	for file in file_change_attr:
+		# cp --reflink=auto --sparse=always -af vault path files to this version path
+		# copy the attr only from monitor path to this version path
+		# this is so on fs with CoW support, we can save space by only storing the attr
+	
+
+
+	
+		
+		

@@ -1,0 +1,3 @@
+TSVZ>=2.70
+multiCMD>=1.13
+xxhash
