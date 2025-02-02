@@ -1,3 +1,4 @@
-TSVZ>=2.70
-multiCMD>=1.13
+TSVZ>=3.10
+multiCMD>=1.17
 xxhash
+inotify-simple

@@ -11,7 +11,16 @@ Keep N versions
 Vault Size Limit
 
 
-monitor a list of path for changes using {inotifywait -m -r -e modify,create,delete,attrib}
+monitor a list of path for changes using 
+{inotifywait --monitor --recursive --event attrib,close_write,move,create,delete,unmount}
+
+if umount detected, stop inotifywait as it will stop monitoring any more,
+use findmnt --output-all --target <path> to get the FS UUID
+if FS UUID is not available / not match, try part uuid, then fs label, then part label, then dev path
+if none match, we will halt operation and wait for a mount / umount / remount / move event
+use findmnt --poll --first-only --target <path> to do event based wait
+if any operation detected, we will recheck the FS UUID and continue monitoring
+
 When script starts, if a new path that was not previously tracked was found, 
 and <Keep 1 Compelete Backup> is true, script will make a copy of the entire path to 
 <vault_dir>/{sanitized_backup_dir_name}/V{version_number}-{ISO-8601_sanitized_time}/
@@ -40,8 +49,6 @@ to save space ( enable underlying fs CoW support )
 folder structure will be
 source_path -> <vault_dir>/{sanitized_backup_job_name}/V{version_number}-{ISO-8601_sanitized_time}/
 
-detect changes using
-inotifywait -m -r [-e modify,create,delete,attrib]
 
 start a thread to monitor and append output to a list <to_process>
 it will also log to TSV file <vault_dir>/{sanitized_backup_job_name}/journal.tsv - open in append only mode

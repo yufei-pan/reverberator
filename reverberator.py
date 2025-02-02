@@ -5,7 +5,25 @@ from collections import deque
 import time
 from dataclasses import dataclass
 import xxhash
+import os
+import inotify_simple
 
+# for the lib wrapping aroung inotify, I tried
+# wtr-wather, watchdog, watchfiles
+# None of them seem to work well with the most basic tests
+# I need it to work with:
+# 1. able to notice changes recursively
+# 2. able to notice changes in the folders
+# 3. do not incorrectly group move events
+# 4. recognize mkdir -p properly
+# 5. notice umount events and notify properly
+# 6. notice mount events and notify properly
+# 7. compatible with symlink events 
+
+
+__version__ = 0.01
+
+## WIP
 
 @dataclass
 class ChangeEvent:
@@ -21,6 +39,13 @@ class ChangeEvent:
 	event:str
 	path:str
 	moved_from:str = None
+
+def path_daemon(monitor_path:str,to_process:deque,vault_path:str):
+	journalPath = os.path.join(vault_path,'journal.nsv')
+	#inotifywaitObj = multiCMD.run_command(['inotifywait','-m','-r','-e','create,delete,move,attrib','-o',journalPath,monitor_path])
+	inotify_obj = inotify_simple.INotify()
+	
+
 
 def backuper(to_process:deque,min_snapshot_delay_seconds:int = 60):
 	prev_to_process_len = 0
