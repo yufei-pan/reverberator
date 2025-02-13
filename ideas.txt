@@ -10,6 +10,16 @@ Only Sync Attributes (permissions)
 Keep N versions
 Vault Size Limit
 
+each backup property (size, backup date, etc. ) was cached in the vault's own index.tsv,
+if vault size limit was hit for the first time, be extra cautious and recheck the entire vault size again to see if any changes
+we update the file sizes accordingly and mark not repeat vault size check again then proceed to normal reverb retire process
+normal reverb retire process:
+process recursive dependency:
+	move files that is not a link to the next version if the next version have a link pointing to this file
+check for this reverb size again, maybe small or even zero
+remove this version, recalculate the size of the vault from the removed size
+if vault size limit was hit again, repeat the process until the vault size is below the limit
+
 
 monitor a list of path for changes using 
 {inotifywait --monitor --recursive --event attrib,close_write,move,create,delete,unmount}
@@ -20,6 +30,7 @@ if FS UUID is not available / not match, try part uuid, then fs label, then part
 if none match, we will halt operation and wait for a mount / umount / remount / move event
 use findmnt --poll --first-only --target <path> to do event based wait
 if any operation detected, we will recheck the FS UUID and continue monitoring
+the monitoring log will be stored in the vault's own journal.tsv
 
 When script starts, if a new path that was not previously tracked was found, 
 and <Keep 1 Compelete Backup> is true, script will make a copy of the entire path to 
