@@ -46,6 +46,7 @@ class ChangeEvent:
 	path:str
 	moved_from:str = None
 
+JOURNAL_HEADER = ['monotonic_time','event','type','path','moved_from']
 # by defualt, set the max backup threads to 2* the number of cores
 BACKUP_SEMAPHORE = threading.Semaphore(2*os.cpu_count())
 
@@ -103,12 +104,13 @@ def main():
 		backup_size_limit = rule[9]
 		vault_path_signiture = rule[10]
 		to_process = deque()
-		reverberatorThread = threading.Thread(target=reverberator,args=(job_name,monitor_path,monitor_path_signiture,to_process,vault_path,vault_path_signiture),daemon=True)
-		tl.info(f'Starting reverb monitor for {job_name} with monitor path {monitor_path} and vault path {vault_path}')
+		reverberatorThread = threading.Thread(target=reverberator,args=(job_name,monitor_path,monitor_path_signiture,to_process),daemon=True)
+		tl.teeprint(f'Starting reverb monitor for {job_name} with monitor path {monitor_path}:{monitor_path_signiture}')
 		reverberatorThread.start()
 		main_threads.append(reverberatorThread)
-		backup_thread = threading.Thread(target=backuper,args=(to_process,min_snapshot_delay_seconds,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit),daemon=True)
-		tl.info(f'Starting backup thread for {job_name} with min_snapshot_delay_seconds {min_snapshot_delay_seconds}, keep_one_complete_backup {keep_one_complete_backup}, only_sync_attributes {only_sync_attributes}, keep_n_versions {keep_n_versions}, backup_size_limit {backup_size_limit}')
+		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,vault_path,vault_path_signiture,min_snapshot_delay_seconds,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit),daemon=True)
+		tl.teeprint(f'Starting backup thread for {job_name} with vault path {vault_path}:{vault_path_signiture}')
+		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
 		backup_thread.start()
 		main_threads.append(backup_thread)
 	for thread in main_threads:
@@ -173,7 +175,6 @@ def get_args(args = None):
 		startArgs.append(f'\'{values}\'')
 	return args, ' '.join(startArgs)
 
-
 def parse_rules(rule_file:str):
 	# will read and parse the rule file using tsvz.
 	# this will also responsible for filling in the defaults and auto fields and generating actual rules
@@ -182,23 +183,20 @@ def parse_rules(rule_file:str):
 	# will also exit if the rule file is not valid ( broken beyond repair ) / does not exit
 	pass
 
-def reverberator(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:deque,vault_path:str,vault_path_signiture:str):
+def reverberator(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:deque):
 	# main monitoring function to deal with one reverb.
-	journalPath = os.path.join(vault_path,'journal.nsv')
-	inotify_obj = inotify_simple.INotify()
-	vault_fs_flag = threading.Event()
 	monitor_fs_flag = threading.Event()
-	vault_fs_thread = threading.Thread(target=setup_fs_flag,args=(vault_path,vault_path_signiture,vault_fs_flag),daemon=True)
-	monitor_fs_thread = threading.Thread(target=setup_fs_flag,args=(monitor_path,monitor_path_signiture,monitor_fs_flag),daemon=True)
-	vault_fs_thread.start()
+	monitor_fs_thread = threading.Thread(target=fs_flag_daemon,args=(monitor_path,monitor_path_signiture,monitor_fs_flag),daemon=True)
 	monitor_fs_thread.start()
-	vault_fs_flag.wait()
 	monitor_fs_flag.wait()
+	
+	inotify_obj = inotify_simple.INotify()
 	pass
 
-def setup_fs_flag(path:str,signiture:str,fsEvent:threading.Event):
+def fs_flag_daemon(path:str,signiture:str,fsEvent:threading.Event):
 	while GREEN_LIGHT.is_set():
 		if check_fs_signiture(path,signiture):
+			tl.teeprint(f'FS signiture for {path} verified.')
 			fsEvent.set()
 		else:
 			fsEvent.clear()
@@ -220,13 +218,18 @@ def wait_fs_event(path:str,timeout = 0):
 	# use findmnt --poll --first-only --target <path> to do event based wait
 	pass
 
-def backuper(to_process:deque,min_snapshot_delay_seconds:int = DEFAULT_SNAPSHOT_DELAY, keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT):
+def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault_path_signiture:str,min_snapshot_delay_seconds:int = DEFAULT_SNAPSHOT_DELAY, keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False):
 	# main function for handling the backup for one reverb
+	vault_fs_flag = threading.Event()
+	vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signiture,vault_fs_flag),daemon=True)
+	vault_fs_thread.start()
+	vault_fs_flag.wait()
 	prev_to_process_len = 0
 	time_to_sleep = 0
 	# to_process: deque([ChangedEvent:{'monotonic_time':'231241','event':'create','type':'file','path':'/path/to/file'},...])
 	while GREEN_LIGHT.is_set():
 		time.sleep(time_to_sleep)
+		vault_fs_flag.wait()
 		if not to_process:
 			time_to_sleep = min_snapshot_delay_seconds
 			continue
@@ -241,13 +244,27 @@ def backuper(to_process:deque,min_snapshot_delay_seconds:int = DEFAULT_SNAPSHOT_
 		# we will do a snapshot
 		process_list = to_process.copy()
 		to_process.clear()
+		if log_journal:
+			journalPath = os.path.join(vault_path,job_name,'journal.nsv')
+			log_events_to_journal(process_list,journalPath)
 		prev_to_process_len = 0
 		time_to_sleep = 0
 		if GREEN_LIGHT.is_set():
-			do_incremental_backup(process_list)
-		
+			# appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ...)
+			if log_journal:
+				TSVZ.appendTabularFile(journalPath,[time.monotonic_ns(),'start','reverb',monitor_path,os.path.join(vault_path,job_name)],teeLogger=tl,header=JOURNAL_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
+			do_incremental_backup(process_list,vault_fs_flag)
+			if log_journal:
+				TSVZ.appendTabularFile(journalPath,[time.monotonic_ns(),'end','reverb',monitor_path,os.path.join(vault_path,job_name)],teeLogger=tl,header=JOURNAL_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
 
-def do_incremental_backup(change_events:deque):
+def log_events_to_journal(change_events:deque,journal_path:str):
+	# this function will log the journal of the changes
+	# the journal will be a nsv file with the following fields:
+	# monotonic_time, event, type, path
+	# this will be used to recover the changes in the case of a crash
+	pass
+
+def do_incremental_backup(change_events:deque,vault_fs_flag:threading.Event):
 	# # if there is no current, do a full backup
 	# #do_first_backup(monitor_path,vault_path)
 	# # calculate this backup size
