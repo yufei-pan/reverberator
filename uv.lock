@@ -18,14 +18,14 @@ sdist = { url = "https://files.pythonhosted.org/packages/51/41/59ca6011f5463d5e5
 
 [[package]]
 name = "multicmd"
-version = "1.20"
+version = "1.22"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argparse" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/79/95/021c3912690e20280d64820dc708d93ec82a4fbdf0f3f22ece47b2498c86/multicmd-1.20.tar.gz", hash = "sha256:db05c9607452b4dd9c21036a7716994067f74c3c29dca004c318331f04879d93", size = 7692 }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/3a/06fe4c8eacbf1524951a86a6a94dd3376c14c35943141f9c86dfbd31d5cc/multicmd-1.22.tar.gz", hash = "sha256:7586679555e17205bad4d235275dbe7b1c1061e33222d13b8f240f0c860fc185", size = 7807 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/e4/3d4bef0f184511745beaa07a570ad008accad32985c05c2bc224d68531b8/multiCMD-1.20-py3-none-any.whl", hash = "sha256:9e2eae270b9b9e9921340e202f74bd2506a5877ad7e3923cbd54d5dc5b9dc72f", size = 8417 },
+    { url = "https://files.pythonhosted.org/packages/5f/4b/4204b25bee6c8fb3b9d1bafb4ca2e0930cdbd2c6d335523a3451378f0212/multiCMD-1.22-py3-none-any.whl", hash = "sha256:c57867a035e486e1589755e241035bb78440b0943761caa210cc91fdb17f2fa2", size = 8564 },
 ]
 
 [[package]]
@@ -86,11 +86,11 @@ wheels = [
 
 [[package]]
 name = "tsvz"
-version = "3.13"
+version = "3.15"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/89/d8/f8d8538505baaeab584cd6bcfb1332bd9b57c8599d9d23b0020a26448455/tsvz-3.13.tar.gz", hash = "sha256:6a8c5e7ce86a1f6d98f7b754f1aeb83493b68556e0e3cd59253ee0a7fd149406", size = 14761 }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/17/058bf69c942fa6e0d5f232e548105fd6cbc2858849c3bb3b1034de6e31fa/tsvz-3.15.tar.gz", hash = "sha256:860158b7733a120fc38360b3589d8ed280503dad366435d62e471cd323ea131b", size = 14770 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/29/6a/de6e2100f22a8ae6f33e5d6c0568cda3a45fb1c1ea3d20ca8c5e363f7592/TSVZ-3.13-py3-none-any.whl", hash = "sha256:eaafee4efaef827c2db167e5d101949862616c8d94189b0e18be5cbffdea5709", size = 14682 },
+    { url = "https://files.pythonhosted.org/packages/9c/c3/e370309a61c8eaf2fc94ba2de5e3519f012be1e7953b921635886ee0749d/TSVZ-3.15-py3-none-any.whl", hash = "sha256:c73e8ce146249a108f2870fd40ad0cf12f8dfe91de1fd2f49a93ea56ba6d9892", size = 14705 },
 ]
 
 [[package]]
