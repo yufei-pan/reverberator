@@ -8,11 +8,13 @@ import xxhash
 
 from collections import deque
 import time
-from dataclasses import dataclass
+from collections import namedtuple
+from collections import OrderedDict
 import os
 import threading
 import sys
 import signal
+import resource
 
 # for the lib wrapping aroung inotify, I tried
 # wtr-wather, watchdog, watchfiles
@@ -31,20 +33,30 @@ __version__ = 0.01
 
 ## WIP
 
-@dataclass
-class ChangeEvent:
-	monotonic_time:int
-	# type can be file or dir.
-	type:str
-	# if type is dir, event can be create 
-	#  ( need to recursively copy everything as inotifywait does not caputre mkdir -p properly for all sub folders),
-	#  ,delete, attrib, move
-	# if type is file, event can be delete, change, attrib, move
-	# move detection will be handled by monitor if moved_from moved_to events were captured. 
-	# it will use an tsv storing all the path inode number and hash to detect move.
-	event:str
-	path:str
-	moved_from:str = None
+# @dataclass
+# class ChangeEvent:
+# 	monotonic_time:int
+# 	# type can be file or dir.
+# 	type:str
+# 	# if type is dir, event can be create 
+# 	#  ( need to recursively copy everything as inotifywait does not caputre mkdir -p properly for all sub folders),
+# 	#  ,delete, attrib, move
+# 	# if type is file, event can be delete, change, attrib, move
+# 	# move detection will be handled by monitor if moved_from moved_to events were captured. 
+# 	# it will use an tsv storing all the path inode number and hash to detect move.
+# 	event:str
+# 	path:str
+# 	moved_from:str = None
+
+
+# if type is dir, event can be create 
+#  ( need to recursively copy everything as inotifywait does not caputre mkdir -p properly for all sub folders),
+#  ,delete, attrib, move
+# if type is file, event can be delete, change, attrib, move
+# move detection will be handled by monitor if moved_from moved_to events were captured. 
+# it will use an tsv storing all the path inode number and hash to detect move.
+
+ChangeEvent = namedtuple('ChangeEvent', ['monotonic_time', 'is_dir', 'event', 'path','moved_from'])
 
 JOURNAL_HEADER = ['monotonic_time','event','type','path','moved_from']
 # by defualt, set the max backup threads to 2* the number of cores
@@ -55,6 +67,8 @@ DEFAULT_KEEP_ONE_COMPLETE_BACKUP = False
 DEFAULT_ONLY_SYNC_ATTRIBUTES = False
 DEFAULT_KEEP_N_VERSIONS = 30
 DEFAULT_BACKUP_SIZE_LIMIT = '5%'
+
+COOKIE_DICT_MAX_SIZE = 16384
 
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
@@ -79,6 +93,10 @@ def main():
 	tl.teeprint('> ' + argString)
 	if args.verbose:
 		DEBUG = True
+	# warn the user if reverberator is not run as root
+	if os.geteuid() != 0:
+		tl.teeerror('Warning: reverberator is not run as root, dynamic nofile tuning will not work. And file permissions can cause errors.')
+	irm = inotify_resource_manager()
 	if args.threads == 0:
 		# set the max backup threads to 200k, which is usually about the max for a user set in ulimit. pratically unlimited.
 		BACKUP_SEMAPHORE = threading.Semaphore(200000)
@@ -124,10 +142,10 @@ def main():
 		vault_path_signiture = rule[10]
 		to_process = deque()
 		to_process_flag = threading.Event()
-		reverberatorThread = threading.Thread(target=reverberator,args=(job_name,monitor_path,monitor_path_signiture,to_process,to_process_flag),daemon=True)
+		watcherThread = threading.Thread(target=watcher,args=(job_name,monitor_path,monitor_path_signiture,to_process,to_process_flag,irm),daemon=True)
 		tl.teeprint(f'Starting reverb monitor for {job_name} with monitor path {monitor_path}:{monitor_path_signiture}')
-		reverberatorThread.start()
-		main_threads.append(reverberatorThread)
+		watcherThread.start()
+		main_threads.append(watcherThread)
 		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,vault_path,vault_path_signiture,to_process_flag,min_snapshot_delay_seconds,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit),daemon=True)
 		tl.teeprint(f'Starting backup thread for {job_name} with vault path {vault_path}:{vault_path_signiture}')
 		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
@@ -213,6 +231,166 @@ def get_args(args = None):
 				startArgs.append(f'--{argumentName}=\'{value}\'')
 	startArgs.append(f'\'{args.rule_path}\'')
 	return args, ' '.join(startArgs)
+
+class inotify_resource_manager:
+	def __init__(self):
+		global DEBUG
+		self.current_user_instances = 0
+		self.current_user_watches = 0
+		self.can_set_max_queued_events = True
+		self.can_set_max_user_instances = True
+		self.can_set_max_user_watches = True
+		self.can_set_max_no_files = True
+		self.can_set_max_no_files_user = True
+		self.debug = DEBUG
+		self.max_queued_events = self.getSysctlValues('fs.inotify.max_queued_events')
+		self.max_user_instances = self.getSysctlValues('fs.inotify.max_user_instances')
+		self.max_user_watches = self.getSysctlValues('fs.inotify.max_user_watches')
+		self.max_no_files = self.getSysctlValues('fs.file-max')
+		try:
+			soft , hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+			if soft < hard:
+				resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+			self.max_no_files_user = hard
+		except:
+			self.max_no_files_user = 0
+
+	def __iter__(self):
+		for key in self.__dict__.keys():
+			yield key, getattr(self,key)
+
+	def __str__(self):
+		# do not include the can_set in the string representation
+		return str(dict((k, v) for k, v in self.__dict__.items() if not k.startswith('can_set_')))
+	
+	def __repr__(self):
+		return str(dict(self))
+
+	def getSysctlValues(self,field):
+		global tl
+		try:
+			rtn = multiCMD.run_command(['sysctl',field],timeout=1,quiet=not self.debug)
+			if rtn and rtn[0]:
+				return int(rtn[0].split('=')[-1].strip())
+		except:
+			import traceback
+			tl.error(traceback.format_exc())
+			tl.error(f'Failed to get {field} value')
+		return 0
+	
+	def setSysctlValues(self,field,value,value_name):
+		global tl
+		try:
+			if not getattr(self,f'can_set_{value_name}'):
+				return False
+			if value is ...:
+				value = getattr(self,value_name)
+			# check if the current value is less
+			rtn = self.getSysctlValues(field)
+			if rtn and rtn > value:
+				tl.info(f'Current {field} is already higher than {value}')
+				setattr(self,value_name,rtn)
+				return False
+			rc = multiCMD.run_command(['sudo','sysctl',f'{field}={value}'],timeout=1,quiet=not self.debug,return_code_only=True)
+			if self.debug:
+				tl.teeprint(f'sudo sysctl {field}={value} return code = {rc}')
+			if rc:
+				if self.debug:
+					tl.teeprint(f'Failed to set {field} to {value}')
+				else:
+					tl.info(f'Failed to set {field} to {value}')
+				setattr(self,f'can_set_{value_name}',False)
+				if rtn:
+					setattr(self,value_name,rtn)
+				return False
+			else:
+				tl.teeok(f'Increased inotify {field} to {value}')
+				setattr(self,value_name,value)
+				return True
+		except:
+			try:
+				import traceback
+				tl.error(traceback.format_exc())
+				tl.teeerror(f'Failed to set {field} = {value} for {value_name}')
+				setattr(self,f'can_set_{value_name}',False)
+				rtn = self.getSysctlValues(field)
+				if rtn:
+					setattr(self,value_name,rtn)
+				else:
+					setattr(self,value_name,-1)
+			except:
+				tl.teeerror(f'Failed to set {field} value')
+		return False
+
+	def increaseInotifyMaxQueueEvents(self,max_events:int = ...):
+		if not self.can_set_max_queued_events:
+			return False
+		return self.setSysctlValues('fs.inotify.max_queued_events',max_events,'max_queued_events')
+
+	def increaseInotifyMaxUserInstances(self,max_instances:int = ...):
+		if not self.can_set_max_user_instances:
+			return False
+		return self.setSysctlValues('fs.inotify.max_user_instances',max_instances,'max_user_instances')
+
+	def increaseInotifyMaxUserWatches(self,max_watches:int = ...):
+		if not self.can_set_max_user_watches:
+			return False
+		rtn = self.setSysctlValues('fs.inotify.max_user_watches',max_watches,'max_user_watches')
+		rtn2 = self.increaseNoFiles(max_watches)
+		return rtn and rtn2
+
+	def increaseNoFiles(self,nofile:int = ...):
+		global tl
+		if not self.can_set_max_no_files_user:
+			return False
+		if nofile is ...:
+			nofile = self.max_no_files
+		# attempt to increase the open file limit
+		try:
+			# check if the current value is less
+			if resource.getrlimit(resource.RLIMIT_NOFILE)[0] > nofile:
+				if self.debug:
+					tl.teeprint(f'Current open file limit is already higher than {nofile}')
+				else:
+					tl.info(f'Current open file limit is already higher than {nofile}')
+				self.max_no_files = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+				return False
+			rtn = self.__increaseSystemNoFiles(nofile)
+			resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
+			tl.teeok(f'Increased open file limit to {nofile}')
+			self.max_no_files = nofile
+			return rtn
+		except:
+			import traceback
+			tl.error(traceback.format_exc())
+			tl.teeerror(f'Failed to increase open file limit to {nofile}')
+			self.can_set_max_no_files_user = False
+			return False
+
+	def __increaseSystemNoFiles(self,nofile:int):
+		if not self.can_set_max_no_files:
+			return False
+		return self.setSysctlValues('fs.file-max',nofile,'max_no_files')
+
+	def increaseUserInstances(self,count:int = 1):
+		self.current_user_instances += count
+		if self.max_user_instances <= self.current_user_instances:
+			self.increaseInotifyMaxUserInstances(self.max_user_instances * 2)
+		return self.current_user_instances
+	
+	def decreaseUserInstances(self,count:int = 1):
+		self.current_user_instances -= count
+		return self.current_user_instances
+	
+	def increaseUserWatches(self,count:int = 1):
+		self.current_user_watches += count
+		if self.max_user_watches <= self.current_user_watches:
+			self.increaseInotifyMaxUserWatches(self.max_user_watches * 2)
+		return self.current_user_watches
+	
+	def decreaseUserWatches(self,count:int = 1):
+		self.current_user_watches -= count
+		return self.current_user_watches
 
 def parse_rules(rule_file:str):
 	'''
@@ -322,16 +500,128 @@ def parse_rules(rule_file:str):
 		tl.teeprint(f'Removed invalid rule: {ruleName}')
 	return rules
 
-def reverberator(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:deque,to_process_flag:threading.Event):
+def watcher(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager):
+	global GREEN_LIGHT
 	# main monitoring function to deal with one reverb.
 	monitor_fs_flag = threading.Event()
 	monitor_fs_thread = threading.Thread(target=fs_flag_daemon,args=(monitor_path,monitor_path_signiture,monitor_fs_flag),daemon=True)
+	tl.teeprint(f'Starting path watcher {job_name} for {monitor_path}')
 	monitor_fs_thread.start()
-	monitor_fs_flag.wait()
-	inotify_obj = inotify_simple.INotify()
-	...
+	while GREEN_LIGHT.is_set():
+		monitor_fs_flag.wait()
+		watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_flag=to_process_flag,irm=irm)
+
+def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager):
+	global COOKIE_DICT_MAX_SIZE
+	global tl
+	global GREEN_LIGHT
+	flags = inotify_simple.flags
+	watch_flags = flags.MODIFY | flags.ATTRIB | flags.MOVED_FROM | flags.MOVED_TO | flags.CREATE | flags.DELETE | flags.DELETE_SELF | flags.MOVE_SELF | flags.UNMOUNT | flags.Q_OVERFLOW
+	selfDestructMask = flags.UNMOUNT | flags.DELETE_SELF | flags.MOVE_SELF
+	cookieDic = OrderedDict()
+	wdDic = {}
+	irm.increaseUserInstances()
+	with inotify_simple.INotify() as inotify_obj:
+		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags)
+		while GREEN_LIGHT.is_set():
+			events =  inotify_obj.read(read_delay=1)
+			monTime = time.monotonic_ns()
+			for event in events:
+				if event.mask & flags.Q_OVERFLOW:
+					tl.teeerror('Queue overflow, event maybe lost')
+					tl.teeprint('Attempting to increase inotify max_queued_events')
+					irm.increaseInotifyMaxQueueEvents(irm.max_queued_events * 2)
+					continue
+				if event.mask & selfDestructMask:
+					if event.wd == mainWatchDescriptor:
+						# if UNMOUNT or IGNORED or DELETE_SELF, MOVE_SELF, return false
+						irm.decreaseUserWatches(len(wdDic))
+						irm.decreaseUserInstances()
+						return False
+					elif event.mask & flags.DELETE_SELF:
+						wdDic.pop(event.wd)
+						irm.decreaseUserWatches()
+						continue
+					elif event.mask & flags.UNMOUNT:
+						wdDic.pop(event.wd)
+						wdDic[inotify_obj.add_watch(wdDic[event.wd], watch_flags)] = wdDic[event.wd]
+						continue
+				if not event.wd in wdDic:
+					tl.teeerror('Watch descriptor not found in wdDic, ignoring event')
+					continue
+				if not event.name:
+					continue
+				eventPath = os.path.join(wdDic[event.wd],event.name)
+				isDir = True if event.mask & flags.ISDIR else False
+				if event.mask & flags.CREATE:
+					if isDir:
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags)
+					to_process.append(ChangeEvent(monTime,isDir,'create',eventPath,None))
+				elif event.mask & flags.DELETE:
+					if isDir:
+						inotify_obj.rm_watch(event.wd)
+						del wdDic[event.wd]
+						irm.decreaseUserWatches()
+					to_process.append(ChangeEvent(monTime,isDir,'delete',eventPath,None))
+				elif event.mask & flags.ATTRIB:
+					to_process.append(ChangeEvent(monTime,isDir,'attrib',eventPath,None))
+				elif event.mask & flags.MOVED_FROM:
+					cookieDic[event.cookie] = (event.wd,eventPath,isDir)
+					while len(cookieDic) > COOKIE_DICT_MAX_SIZE:
+						cookie,value = cookieDic.popitem(last=False)
+						# treat the move as a delete
+						if value[2]:
+							inotify_obj.rm_watch(value[0])
+							del wdDic[value[0]]
+							irm.decreaseUserWatches()
+						to_process.append(ChangeEvent(monTime,isDir,'delete',value[1],None))
+					to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,None))
+				elif event.mask & flags.MOVED_TO:
+					if event.cookie in cookieDic:
+						to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,cookieDic[event.cookie][1]))
+						cookieDic.pop(event.cookie)
+					else:
+						if isDir:
+							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags)
+						to_process.append(ChangeEvent(monTime,isDir,'create',eventPath,None))
+				elif event.mask & flags.MODIFY:
+					to_process.append(ChangeEvent(monTime,isDir,'modify',eventPath,None))
+				# else:
+				# 	tl.info(f'Unprocessed event {event}')
+			to_process_flag.set()
+
+def testWatchFolderOperation(testCMD:list,to_process:deque,to_process_flag:threading.Event):
+	multiCMD.run_command(testCMD)
+	to_process_flag.wait(1)
+	print(to_process)
+	to_process.clear()
+	to_process_flag.clear()
+
+def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int):
+	irm.increaseUserWatches()
+	parentWatchDescriptor = inotify_obj.add_watch(monitor_path, watch_flags)
+	wdDic[parentWatchDescriptor] = monitor_path
+	allFolders = get_all_folders(monitor_path)
+	irm.increaseUserWatches(len(allFolders))
+	for folder in allFolders:
+		wdDic[inotify_obj.add_watch(folder, watch_flags)] = folder
+	return parentWatchDescriptor
+
+def get_all_folders(path):
+    folders = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    folders.append(entry.path)
+                    folders.extend(get_all_folders(entry.path))  # Recursive call
+    except PermissionError:
+        pass  # Skip folders without permission
+    return folders
 
 def fs_flag_daemon(path:str,signiture:str,fsEvent:threading.Event):
+	global GREEN_LIGHT
+	global tl
 	while GREEN_LIGHT.is_set():
 		if check_fs_signiture(path,signiture):
 			tl.teeprint(f'FS signiture for {path} verified.')
@@ -369,7 +659,6 @@ def get_fs_signitures(path:str) -> str:
 	fields = [bytes(f, 'utf-8').decode('unicode_escape') for f in fields if f]
 	return fields
 
-
 def wait_fs_event(path:str,timeout = 0):
 	global DEBUG
 	global GREEN_LIGHT
@@ -392,8 +681,6 @@ def wait_fs_event(path:str,timeout = 0):
 		return True
 	return False
 
-	
-
 def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault_path_signiture:str,to_process_flag:threading.Event,
 			 min_snapshot_delay_seconds:int = DEFAULT_SNAPSHOT_DELAY, keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
@@ -413,7 +700,7 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 		if time_to_sleep > 0:
 			time.sleep(time_to_sleep)
 		vault_fs_flag.wait()
-		if not to_process:
+		while not to_process:
 			to_process_flag.wait()
 		# if changes detected, continue waiting
 		if len(to_process) > prev_to_process_len:
@@ -439,6 +726,9 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 			do_incremental_backup(process_list,vault_fs_flag)
 			if log_journal:
 				TSVZ.appendTabularFile(journalPath,[time.monotonic_ns(),'end','reverb',monitor_path,os.path.join(vault_path,job_name)],teeLogger=tl,header=JOURNAL_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
+
+def format_change_events(change_events:deque):
+	...
 
 def log_events_to_journal(change_events:deque,journal_path:str):
 	# this function will log the journal of the changes
