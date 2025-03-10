@@ -1,5 +1,6 @@
 reverberator is a python script that will:
-Recoverable Easy VERsioning Backup - erator
+Recoverable Easy VERsioning Backup - generator
+REcursive VERsioning Backup genERATOR
 
 Job Name (Unique Key)
 Path Monitoring
