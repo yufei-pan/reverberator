@@ -18,14 +18,14 @@ sdist = { url = "https://files.pythonhosted.org/packages/51/41/59ca6011f5463d5e5
 
 [[package]]
 name = "multicmd"
-version = "1.22"
+version = "1.23"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argparse" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7a/3a/06fe4c8eacbf1524951a86a6a94dd3376c14c35943141f9c86dfbd31d5cc/multicmd-1.22.tar.gz", hash = "sha256:7586679555e17205bad4d235275dbe7b1c1061e33222d13b8f240f0c860fc185", size = 7807 }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/fd/1f73c46a0c3a66d2d674d449abe1096affb7c9a0c316f36b4f6a86b37cb2/multicmd-1.23.tar.gz", hash = "sha256:c88d4a3a9d826cb5b5f0c002958136b38f9c7a838f37c6292c3fb97f988591f3", size = 7873 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5f/4b/4204b25bee6c8fb3b9d1bafb4ca2e0930cdbd2c6d335523a3451378f0212/multiCMD-1.22-py3-none-any.whl", hash = "sha256:c57867a035e486e1589755e241035bb78440b0943761caa210cc91fdb17f2fa2", size = 8564 },
+    { url = "https://files.pythonhosted.org/packages/a8/ff/5d7703bc388311abb10e3b583154109da7b76f086ef0a7099c726a308be6/multiCMD-1.23-py3-none-any.whl", hash = "sha256:f7256b83ab80466692a9ff85a9263396d7fc20cc5d7f80c4bbf8d70410b19d22", size = 8612 },
 ]
 
 [[package]]
@@ -74,23 +74,23 @@ wheels = [
 
 [[package]]
 name = "tee-logger"
-version = "6.26"
+version = "6.30"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "python-dateutil" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ea/0a/a270ffd2e50c445a8ee30df96148fd45e91094c6b5e81356eae519054b6f/tee_logger-6.26.tar.gz", hash = "sha256:bf709dc2f50e1539bb49ebd175e90e17db472798221af8b9e11d1e3a808be28a", size = 10023 }
+sdist = { url = "https://files.pythonhosted.org/packages/59/6e/c150a588dfe304a01c9889378a22c7f2d477e7bc283f7c66c6c7e3b532ff/tee_logger-6.30.tar.gz", hash = "sha256:92fb7e1ee5ae17d920ff5bd24f66cf56977c1c29e609cc3063498ae8fd8e747a", size = 10360 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/17/51/6edec7b5ec0c7a59a474437efaf642cd391e3ccc46953145ea3ec2c87857/tee_logger-6.26-py3-none-any.whl", hash = "sha256:a105f53277de287b1fbabbf359075b04aaeab42c9aeaf1299c0cc8a3f088de2d", size = 8208 },
+    { url = "https://files.pythonhosted.org/packages/db/43/2488e30c99c44397d47006fdf86a96aea893b5af128fe43f1deb589cf848/tee_logger-6.30-py3-none-any.whl", hash = "sha256:d9245fbf53120802abc56519a498674a08aa3bc4286d4f6cf8805fe0b2825a5d", size = 8454 },
 ]
 
 [[package]]
 name = "tsvz"
-version = "3.15"
+version = "3.18"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/2c/17/058bf69c942fa6e0d5f232e548105fd6cbc2858849c3bb3b1034de6e31fa/tsvz-3.15.tar.gz", hash = "sha256:860158b7733a120fc38360b3589d8ed280503dad366435d62e471cd323ea131b", size = 14770 }
+sdist = { url = "https://files.pythonhosted.org/packages/e1/15/d132896eaf6c3ffbc82421d705103a53d6c9732d1dee83ec84d449454dc9/tsvz-3.18.tar.gz", hash = "sha256:ad5c8b675478139323f3be0369c0bbecf5278a9b43a80398291748c655c6c874", size = 14926 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9c/c3/e370309a61c8eaf2fc94ba2de5e3519f012be1e7953b921635886ee0749d/TSVZ-3.15-py3-none-any.whl", hash = "sha256:c73e8ce146249a108f2870fd40ad0cf12f8dfe91de1fd2f49a93ea56ba6d9892", size = 14705 },
+    { url = "https://files.pythonhosted.org/packages/47/7e/015b5a8e63cec68b6a24e75e7cf60f7d1719a7682c4c170cecc5975127c6/tsvz-3.18-py3-none-any.whl", hash = "sha256:669fe0fd3c29924586ffbb6bda58f2ee2db2d6678bebbc00aa46848e71abef86", size = 14846 },
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ import threading
 import sys
 import signal
 import resource
+import datetime
 
 # for the lib wrapping aroung inotify, I tried
 # wtr-wather, watchdog, watchfiles
@@ -35,7 +36,7 @@ __version__ = 0.01
 
 # @dataclass
 # class ChangeEvent:
-# 	monotonic_time:int
+# 	monotonic_time:float
 # 	# type can be file or dir.
 # 	type:str
 # 	# if type is dir, event can be create 
@@ -55,10 +56,13 @@ __version__ = 0.01
 # if type is file, event can be delete, change, attrib, move
 # move detection will be handled by monitor if moved_from moved_to events were captured. 
 # it will use an tsv storing all the path inode number and hash to detect move.
+CHANGED_EVENT_HEADER = ['monotonic_time', 'is_dir', 'event', 'path','moved_from']
+BACKUP_ENTRY_VALUES_HEADER = ['iso_time','event','source_path']
 
-ChangeEvent = namedtuple('ChangeEvent', ['monotonic_time', 'is_dir', 'event', 'path','moved_from'])
+ChangeEvent = namedtuple('ChangeEvent', CHANGED_EVENT_HEADER)
+BackupEntryValues = namedtuple('BackupEntryValues', BACKUP_ENTRY_VALUES_HEADER)
 
-JOURNAL_HEADER = ['monotonic_time','event','type','path','moved_from']
+
 # by defualt, set the max backup threads to 2* the number of cores
 BACKUP_SEMAPHORE = threading.Semaphore(2*os.cpu_count())
 
@@ -69,6 +73,7 @@ DEFAULT_KEEP_N_VERSIONS = 30
 DEFAULT_BACKUP_SIZE_LIMIT = '5%'
 
 COOKIE_DICT_MAX_SIZE = 16384
+COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir'])
 
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
@@ -514,29 +519,30 @@ def watcher(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:
 def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager):
 	global COOKIE_DICT_MAX_SIZE
 	global tl
-	global GREEN_LIGHT
 	flags = inotify_simple.flags
 	watch_flags = flags.MODIFY | flags.ATTRIB | flags.MOVED_FROM | flags.MOVED_TO | flags.CREATE | flags.DELETE | flags.DELETE_SELF | flags.MOVE_SELF | flags.UNMOUNT | flags.Q_OVERFLOW
 	selfDestructMask = flags.UNMOUNT | flags.DELETE_SELF | flags.MOVE_SELF
 	cookieDic = OrderedDict()
-	wdDic = {}
+	wdDic = bidict()
 	irm.increaseUserInstances()
 	with inotify_simple.INotify() as inotify_obj:
 		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags)
 		while GREEN_LIGHT.is_set():
 			events =  inotify_obj.read(read_delay=1)
-			monTime = time.monotonic_ns()
+			monTime = time.monotonic()
 			for event in events:
 				if event.mask & flags.Q_OVERFLOW:
 					tl.teeerror('Queue overflow, event maybe lost')
 					tl.teeprint('Attempting to increase inotify max_queued_events')
 					irm.increaseInotifyMaxQueueEvents(irm.max_queued_events * 2)
 					continue
+				isDir = True if event.mask & flags.ISDIR else False
 				if event.mask & selfDestructMask:
 					if event.wd == mainWatchDescriptor:
 						# if UNMOUNT or IGNORED or DELETE_SELF, MOVE_SELF, return false
 						irm.decreaseUserWatches(len(wdDic))
 						irm.decreaseUserInstances()
+						to_process.append(ChangeEvent(monTime,isDir,'self_destruct',monitor_path,None))
 						return False
 					elif event.mask & flags.DELETE_SELF:
 						wdDic.pop(event.wd)
@@ -546,13 +552,14 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 						wdDic.pop(event.wd)
 						wdDic[inotify_obj.add_watch(wdDic[event.wd], watch_flags)] = wdDic[event.wd]
 						continue
+					elif event.mask & flags.MOVE_SELF:
+						pass
 				if not event.wd in wdDic:
 					tl.teeerror('Watch descriptor not found in wdDic, ignoring event')
 					continue
 				if not event.name:
 					continue
 				eventPath = os.path.join(wdDic[event.wd],event.name)
-				isDir = True if event.mask & flags.ISDIR else False
 				if event.mask & flags.CREATE:
 					if isDir:
 						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags)
@@ -578,8 +585,13 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 					to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,None))
 				elif event.mask & flags.MOVED_TO:
 					if event.cookie in cookieDic:
-						to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,cookieDic[event.cookie][1]))
-						cookieDic.pop(event.cookie)
+						value = cookieDic.pop(event.cookie)
+						to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,value[1]))
+						if isDir:
+							# we need to update wdDic to reflect the new path
+							wds = wdDic.inverse[value[1]]
+							for wd in wds:
+								wdDic[wd] = eventPath
 					else:
 						if isDir:
 							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags)
@@ -589,6 +601,27 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 				# else:
 				# 	tl.info(f'Unprocessed event {event}')
 			to_process_flag.set()
+
+class bidict(dict):
+	# Credit: https://stackoverflow.com/users/1422096/basj
+	# https://stackoverflow.com/questions/3318625/how-to-implement-an-efficient-bidirectional-hash-table
+	def __init__(self, *args, **kwargs):
+		super(bidict, self).__init__(*args, **kwargs)
+		self.inverse = {}
+		for key, value in self.items():
+			self.inverse.setdefault(value, []).append(key) 
+
+	def __setitem__(self, key, value):
+		if key in self:
+			self.inverse[self[key]].remove(key) 
+		super(bidict, self).__setitem__(key, value)
+		self.inverse.setdefault(value, []).append(key)        
+
+	def __delitem__(self, key):
+		self.inverse.setdefault(self[key], []).remove(key)
+		if self[key] in self.inverse and not self.inverse[self[key]]: 
+			del self.inverse[self[key]]
+		super(bidict, self).__delitem__(key)
 
 def testWatchFolderOperation(testCMD:list,to_process:deque,to_process_flag:threading.Event):
 	multiCMD.run_command(testCMD)
@@ -608,16 +641,16 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	return parentWatchDescriptor
 
 def get_all_folders(path):
-    folders = []
-    try:
-        with os.scandir(path) as entries:
-            for entry in entries:
-                if entry.is_dir(follow_symlinks=False):
-                    folders.append(entry.path)
-                    folders.extend(get_all_folders(entry.path))  # Recursive call
-    except PermissionError:
-        pass  # Skip folders without permission
-    return folders
+	folders = []
+	try:
+		with os.scandir(path) as entries:
+			for entry in entries:
+				if entry.is_dir(follow_symlinks=False):
+					folders.append(entry.path)
+					folders.extend(get_all_folders(entry.path))  # Recursive call
+	except PermissionError:
+		pass  # Skip folders without permission
+	return folders
 
 def fs_flag_daemon(path:str,signiture:str,fsEvent:threading.Event):
 	global GREEN_LIGHT
@@ -686,8 +719,9 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
 			 backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False):
 	global BACKUP_SEMAPHORE
-	global JOURNAL_HEADER
+	global BACKUP_ENTRY_VALUES_HEADER
 	global tl
+	global DEBUG
 	# main function for handling the backup for one reverb
 	vault_fs_flag = threading.Event()
 	vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signiture,vault_fs_flag),daemon=True)
@@ -711,33 +745,38 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 			continue
 		# If changes detected and after min_snapshot_time, no further changes detected,
 		# we will do a snapshot
-		process_list = to_process.copy()
+		to_process_temp = to_process.copy()
 		to_process.clear()
 		to_process_flag.clear()
+		backupEntries = change_events_to_backup_entries(to_process_temp)
 		if log_journal:
 			journalPath = os.path.join(vault_path,job_name,'journal.nsv')
-			log_events_to_journal(process_list,journalPath)
+			log_events_to_journal(backupEntries,journalPath)
 		prev_to_process_len = 0
 		time_to_sleep = 0
 		if GREEN_LIGHT.is_set():
 			# appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ...)
 			if log_journal:
-				TSVZ.appendTabularFile(journalPath,[time.monotonic_ns(),'start','reverb',monitor_path,os.path.join(vault_path,job_name)],teeLogger=tl,header=JOURNAL_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
-			do_incremental_backup(process_list,vault_fs_flag)
+				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'start_reverb_backup',os.path.join(vault_path,job_name)],teeLogger=tl,header=BACKUP_ENTRY_VALUES_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
+			do_incremental_backup(backupEntries,vault_fs_flag)
 			if log_journal:
-				TSVZ.appendTabularFile(journalPath,[time.monotonic_ns(),'end','reverb',monitor_path,os.path.join(vault_path,job_name)],teeLogger=tl,header=JOURNAL_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
+				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'end_reverb_backup',os.path.join(vault_path,job_name)],teeLogger=tl,header=BACKUP_ENTRY_VALUES_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
 
-def format_change_events(change_events:deque):
+def change_events_to_backup_entries(change_events:deque) -> dict:
+	global DEBUG
+	if DEBUG:
+
 	...
+	
 
-def log_events_to_journal(change_events:deque,journal_path:str):
+def log_events_to_journal(backup_entries:dict,journal_path:str):
 	# this function will log the journal of the changes
 	# the journal will be a nsv file with the following fields:
 	# monotonic_time, event, type, path
 	# this will be used to recover the changes in the case of a crash
 	...
 
-def do_incremental_backup(change_events:deque,vault_fs_flag:threading.Event):
+def do_incremental_backup(backup_entries:dict,vault_fs_flag:threading.Event):
 	# # if there is no current, do a full backup
 	# #do_first_backup(monitor_path,vault_path)
 	# # calculate this backup size
@@ -764,6 +803,7 @@ def do_incremental_backup(change_events:deque,vault_fs_flag:threading.Event):
 	# 	# cp --reflink=auto --sparse=always -af vault path files to this version path
 	# 	# copy the attr only from monitor path to this version path
 	# 	# this is so on fs with CoW support, we can save space by only storing the attr
+	# remember to also sync attr from source for move events
 	with BACKUP_SEMAPHORE:
 		# do the actual backup
 		...
