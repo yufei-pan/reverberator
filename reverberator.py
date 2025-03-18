@@ -239,7 +239,6 @@ def get_args(args = None):
 
 class inotify_resource_manager:
 	def __init__(self):
-		global DEBUG
 		self.current_user_instances = 0
 		self.current_user_watches = 0
 		self.can_set_max_queued_events = True
@@ -247,7 +246,7 @@ class inotify_resource_manager:
 		self.can_set_max_user_watches = True
 		self.can_set_max_no_files = True
 		self.can_set_max_no_files_user = True
-		self.debug = DEBUG
+		self.debug = False
 		self.max_queued_events = self.getSysctlValues('fs.inotify.max_queued_events')
 		self.max_user_instances = self.getSysctlValues('fs.inotify.max_user_instances')
 		self.max_user_watches = self.getSysctlValues('fs.inotify.max_user_watches')
@@ -272,7 +271,6 @@ class inotify_resource_manager:
 		return str(dict(self))
 
 	def getSysctlValues(self,field):
-		global tl
 		try:
 			rtn = multiCMD.run_command(['sysctl',field],timeout=1,quiet=not self.debug)
 			if rtn and rtn[0]:
@@ -284,7 +282,6 @@ class inotify_resource_manager:
 		return 0
 	
 	def setSysctlValues(self,field,value,value_name):
-		global tl
 		try:
 			if not getattr(self,f'can_set_{value_name}'):
 				return False
@@ -345,7 +342,6 @@ class inotify_resource_manager:
 		return rtn and rtn2
 
 	def increaseNoFiles(self,nofile:int = ...):
-		global tl
 		if not self.can_set_max_no_files_user:
 			return False
 		if nofile is ...:
@@ -516,19 +512,32 @@ def watcher(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:
 		monitor_fs_flag.wait()
 		watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_flag=to_process_flag,irm=irm)
 
-def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager):
+def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True):
 	global COOKIE_DICT_MAX_SIZE
 	global tl
+	global DEBUG
 	flags = inotify_simple.flags
 	watch_flags = flags.MODIFY | flags.ATTRIB | flags.MOVED_FROM | flags.MOVED_TO | flags.CREATE | flags.DELETE | flags.DELETE_SELF | flags.MOVE_SELF | flags.UNMOUNT | flags.Q_OVERFLOW
 	selfDestructMask = flags.UNMOUNT | flags.DELETE_SELF | flags.MOVE_SELF
 	cookieDic = OrderedDict()
 	wdDic = bidict()
+	pendingMoveFromEvents = OrderedDict()
+	newDirWDs = set()
 	irm.increaseUserInstances()
 	with inotify_simple.INotify() as inotify_obj:
 		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags)
+		if mainWatchDescriptor == -1:
+			tl.teeerror(f'Failed to initialize folder watchers for {monitor_path}')
+			return False
 		while GREEN_LIGHT.is_set():
-			events =  inotify_obj.read(read_delay=1)
+			events =  inotify_obj.read()
+			if not to_process_flag.is_set():
+				# this means the to_process was just processed
+				newDirWDs.clear()
+			if DEBUG:
+				tl.teeok(f'Events detected: {len(events)}')
+				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
+				print(TSVZ.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
 			monTime = time.monotonic()
 			for event in events:
 				if event.mask & flags.Q_OVERFLOW:
@@ -540,67 +549,131 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 				if event.mask & selfDestructMask:
 					if event.wd == mainWatchDescriptor:
 						# if UNMOUNT or IGNORED or DELETE_SELF, MOVE_SELF, return false
+						if DEBUG:
+							tl.teeprint('Main dir self destruct event detected, terminating')
 						irm.decreaseUserWatches(len(wdDic))
 						irm.decreaseUserInstances()
 						to_process.append(ChangeEvent(monTime,isDir,'self_destruct',monitor_path,None))
 						return False
 					elif event.mask & flags.DELETE_SELF:
-						wdDic.pop(event.wd)
+						if DEBUG:
+							tl.teeprint(f'Sub dir delete self event detected, removing watch for {wdDic.get(event.wd,None)}')
+						wdDic.pop(event.wd, None)
 						irm.decreaseUserWatches()
 						continue
 					elif event.mask & flags.UNMOUNT:
-						wdDic.pop(event.wd)
-						wdDic[inotify_obj.add_watch(wdDic[event.wd], watch_flags)] = wdDic[event.wd]
+						if event.wd in wdDic:
+							if DEBUG:
+								tl.teeprint(f'Sub dir unmount event detected, resetting watch for {wdDic.get(event.wd,None)}')
+							wdDic.pop(event.wd, None)
+							wdDic[inotify_obj.add_watch(wdDic[event.wd], watch_flags)] = wdDic[event.wd]
+						else:
+							if DEBUG:
+								tl.teeerror(f'Sub dir unmount event detected, but watch not in wdDic found for {event.wd}')
 						continue
 					elif event.mask & flags.MOVE_SELF:
-						pass
-				if not event.wd in wdDic:
-					tl.teeerror('Watch descriptor not found in wdDic, ignoring event')
-					continue
+						if DEBUG:
+							tl.teeprint('Sub dir move self event detected, skipping')
+						continue
 				if not event.name:
+					if DEBUG:
+						tl.teeprint('Event name not found, ignoring event')
+					continue
+				if event.wd not in wdDic:
+					if DEBUG:
+						tl.teeerror(f'Watch descriptor {event.wd} not found in wdDic {wdDic}, ignoring event')
+					continue
+				if discard_new_recursive_folder_events_until_read and event.wd in newDirWDs:
+					if DEBUG:
+						tl.teeprint(f'Discarding event for new recursive folder {wdDic[event.wd]}')
 					continue
 				eventPath = os.path.join(wdDic[event.wd],event.name)
 				if event.mask & flags.CREATE:
+					if DEBUG:
+						tl.teeprint(f'Create event detected for {eventPath}')
 					if isDir:
-						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags)
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs)
 					to_process.append(ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.DELETE:
-					if isDir:
-						inotify_obj.rm_watch(event.wd)
-						del wdDic[event.wd]
-						irm.decreaseUserWatches()
+					if DEBUG:
+						tl.teeprint(f'Delete event detected for {eventPath}')
+					# if isDir:
+					# 	if DEBUG:
+					# 		tl.teeprint(f'Deleting wd {event.wd} for {eventPath}')
+					# 	wdDic.pop(event.wd, None)
+					# 	try:
+					# 		inotify_obj.rm_watch(event.wd)
+					# 	except:
+					# 		if DEBUG:
+					# 			tl.teeerror(f'Failed to remove watch for {event.wd} (already removed?)')
+					# 	irm.decreaseUserWatches()
 					to_process.append(ChangeEvent(monTime,isDir,'delete',eventPath,None))
 				elif event.mask & flags.ATTRIB:
+					if DEBUG:
+						tl.teeprint(f'Attrib event detected for {eventPath}')
 					to_process.append(ChangeEvent(monTime,isDir,'attrib',eventPath,None))
 				elif event.mask & flags.MOVED_FROM:
-					cookieDic[event.cookie] = (event.wd,eventPath,isDir)
+					if DEBUG:
+						tl.teeprint(f'Move from event detected for {eventPath}')
+					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir)
 					while len(cookieDic) > COOKIE_DICT_MAX_SIZE:
-						cookie,value = cookieDic.popitem(last=False)
+						if DEBUG:
+							tl.teeprint('Cookie dictionary is full, popping oldest item')
+						_,cookie_value = cookieDic.popitem(last=False)
 						# treat the move as a delete
-						if value[2]:
-							inotify_obj.rm_watch(value[0])
-							del wdDic[value[0]]
-							irm.decreaseUserWatches()
-						to_process.append(ChangeEvent(monTime,isDir,'delete',value[1],None))
-					to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,None))
+						# if cookie_value.isDir:
+						# 	if DEBUG:
+						# 		tl.teeprint(f'Deleting wd {cookie_value.wd} for {cookie_value.path}')
+						# 	wdDic.pop(cookie_value.wd, None)
+						# 	try:
+						# 		inotify_obj.rm_watch(cookie_value.wd)
+						# 	except:
+						# 		if DEBUG:
+						# 			tl.teeerror(f'Failed to remove watch for {cookie_value.wd} (already removed?)')
+						# 	irm.decreaseUserWatches()
+						if DEBUG:
+							tl.teeprint(f'Adding delete event for {cookie_value.path}')
+						to_process.append(ChangeEvent(monTime,isDir,'delete',cookie_value.path,None))
+					#to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,None))
+					pendingMoveFromEvents[event.cookie] = ChangeEvent(monTime,isDir,'delete',eventPath,None)
 				elif event.mask & flags.MOVED_TO:
+					if DEBUG:
+						tl.teeprint(f'Move to event detected for {eventPath}')
 					if event.cookie in cookieDic:
-						value = cookieDic.pop(event.cookie)
-						to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,value[1]))
+						if DEBUG:
+							tl.teeprint(f'Cookie found for {event.cookie}')
+							tl.teeprint(f'Adding move event for {cookieDic[event.cookie].path} to {eventPath}')
+						cookie_value = cookieDic.pop(event.cookie)
+						pendingMoveFromEvents.pop(event.cookie,None)
+						to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,cookie_value.path))
 						if isDir:
 							# we need to update wdDic to reflect the new path
-							wds = wdDic.inverse[value[1]]
-							for wd in wds:
-								wdDic[wd] = eventPath
+							if cookie_value.path in wdDic.inverse:
+								if DEBUG:
+									tl.teeprint(f'Updating all values of wdDic {wdDic.inverse[cookie_value.path]} for {cookie_value.path} to {eventPath}')
+								wds = wdDic.inverse[cookie_value.path]
+								for wd in wds:
+									wdDic[wd] = eventPath
 					else:
+						if DEBUG:
+							tl.teeprint(f'Cookie not found for {event.cookie}')
+							tl.teeprint(f'Treating move as create event for {eventPath}')
 						if isDir:
-							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags)
+							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs)
 						to_process.append(ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.MODIFY:
+					if DEBUG:
+						tl.teeprint(f'Modify event detected for {eventPath}')
 					to_process.append(ChangeEvent(monTime,isDir,'modify',eventPath,None))
-				# else:
-				# 	tl.info(f'Unprocessed event {event}')
+				elif DEBUG:
+					tl.info(f'Unprocessed event {event}')
+			if pendingMoveFromEvents:
+				if DEBUG:
+					tl.teeprint(f'Adding unmatched pending move_from events as deletes {pendingMoveFromEvents.keys()}')
+				to_process.extend(pendingMoveFromEvents.values())
+				pendingMoveFromEvents.clear()
 			to_process_flag.set()
+	return True
 
 class bidict(dict):
 	# Credit: https://stackoverflow.com/users/1422096/basj
@@ -630,14 +703,25 @@ def testWatchFolderOperation(testCMD:list,to_process:deque,to_process_flag:threa
 	to_process.clear()
 	to_process_flag.clear()
 
-def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int):
+def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None):
+	if not os.path.exists(monitor_path):
+		return -1
 	irm.increaseUserWatches()
+	if DEBUG:
+		print(f'Adding watch for {monitor_path}')
 	parentWatchDescriptor = inotify_obj.add_watch(monitor_path, watch_flags)
+	if newDirWds is not None:
+		newDirWds.add(parentWatchDescriptor)
 	wdDic[parentWatchDescriptor] = monitor_path
 	allFolders = get_all_folders(monitor_path)
+	if DEBUG:
+		print(f'Adding watch for {len(allFolders)} sub folders')
 	irm.increaseUserWatches(len(allFolders))
 	for folder in allFolders:
-		wdDic[inotify_obj.add_watch(folder, watch_flags)] = folder
+		childWd = inotify_obj.add_watch(folder, watch_flags)
+		if newDirWds is not None:
+			newDirWds.add(childWd)
+		wdDic[childWd] = folder
 	return parentWatchDescriptor
 
 def get_all_folders(path):
@@ -676,17 +760,17 @@ def check_fs_signiture(path:str,signiture:str):
 		return False
 	return signiture in pathSignitures
 
-def get_fs_signitures(path:str) -> str:
+def get_fs_signitures(path:str) -> list:
 	global DEBUG
 	# df --no-sync --output=source,ipcent,pcent,target for use percentage
 	# lsblk --raw --paths --output=kname,label,model,name,partlabel,partuuid,uuid,serial,fstype,wwn <dev> for infos
 	rtnHost = multiCMD.run_command(['df','--no-sync','--output=source',path],timeout=60,quiet=DEBUG,return_object=True)
-	if rtnHost.returncode != 0 or not rtnHost.stdout or not len(rtnHost.stdout) > 1:
-		return None
+	if rtnHost.returncode != 0 or not rtnHost.stdout or len(rtnHost.stdout) <= 1:
+		return []
 	deviceName = rtnHost.stdout[1].split()[0]
 	rtnHost = multiCMD.run_command(['lsblk','--raw','--output=uuid,label,partuuid,partlabel,wwn,serial,model,name,kname,pkname',deviceName],timeout=60,quiet=DEBUG,return_object=True)
-	if rtnHost.returncode != 0 or not rtnHost.stdout or not len(rtnHost.stdout) > 1:
-		return None
+	if rtnHost.returncode != 0 or not rtnHost.stdout or len(rtnHost.stdout) <= 1:
+		return []
 	fields = rtnHost.stdout[1].split()
 	# lsblk do \x escape for some characters, we need to unescape them
 	fields = [bytes(f, 'utf-8').decode('unicode_escape') for f in fields if f]
@@ -762,9 +846,186 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 			if log_journal:
 				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'end_reverb_backup',os.path.join(vault_path,job_name)],teeLogger=tl,header=BACKUP_ENTRY_VALUES_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
 
-def change_events_to_backup_entries(change_events:deque) -> dict:
+def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
+	# possibile events are create, delete, attrib, move, modify
+	# CHANGED_EVENT_HEADER = ['monotonic_time', 'is_dir', 'event', 'path','moved_from']
+	# BACKUP_ENTRY_VALUES_HEADER = ['iso_time','event','source_path']
+	# collapse the change events
+	# for a single file, only these events will be kept:
+	# 	modify, attrib, move, delete ( create will be treated as modify as we will be copying the entire file )
+	# 	modify will be exclusive to file
+	# for a single directory, only the following kinds of events will be kept:
+	# 	create, delete, attrib, move ( modify should not be possible but just in case, it will be treated as create )
+	# 	folder create will recursively copy all its contents 
+	# 	create should be exclusive to folder
+	# New: we will now combine create and monify events and name it as taint
+	# Only move what with a moved_from will be kept, all moves without moved_from will be treated as delete
+	# will get the iso_time using (datetime.datetime.now() - datetime.timedelta(seconds=time.monotonic() - monTime)).isoformat())
+	# will indicate if a path is a dir by making sure it ends with /
+	# if it is a self_destruct event, we still keep it in 
 	global DEBUG
-	...
+	global tl
+	if DEBUG:
+		tl.teeprint('Converting the following change events to backup entries')
+		tl.printTable(change_events,header = CHANGED_EVENT_HEADER)
+	backup_entries = OrderedDict()
+	newDirectories = set()
+	pendingMoveSourceParents = set()
+	moveSourceToDestDict = {}
+	iso_time = ''
+	for changeEvent in reversed(change_events):
+		# get the absolute path
+		to_add = True
+		abs_path = os.path.abspath(changeEvent.path)
+		if changeEvent.moved_from:
+			abs_moved_from = os.path.abspath(changeEvent.moved_from)
+			if changeEvent.is_dir:
+				abs_moved_from += '/'
+		else:
+			abs_moved_from = None
+		event = changeEvent.event
+		if changeEvent.is_dir:
+			abs_path += '/'
+		if DEBUG:
+			tl.teeprint('-'*80)
+			tl.teeprint(f'Processing {event} on {abs_path} with source {abs_moved_from}')
+		# pre handle move events
+		if event == 'move':
+			if abs_moved_from:
+				pendingMoveSourceParents.add(abs_moved_from)
+				if abs_path in moveSourceToDestDict:
+					# chain move, we will modify the chronologically later move event's source to this event's source
+					finialTarget = moveSourceToDestDict[abs_path]
+					moveSourceToDestDict[abs_moved_from] = finialTarget
+					del moveSourceToDestDict[abs_path]
+					if finialTarget in backup_entries:
+						backup_entries[finialTarget] = BackupEntryValues(backup_entries[finialTarget].iso_time,backup_entries[finialTarget].event,abs_moved_from)
+						if DEBUG:
+							if backup_entries[finialTarget].event != 'move':
+								tl.teeprint(f'  Chain move (now {backup_entries[finialTarget].event}) from {abs_moved_from} through {abs_path} to {finialTarget}')
+							else:
+								tl.teeprint(f'  Chain move from {abs_moved_from} through {abs_path} to {finialTarget}')
+					else:
+						# this means the later move event was deleted, no need to update it
+						if DEBUG:
+							tl.teeprint(f'  Already removed chain move event from {abs_moved_from} through {abs_path} to {finialTarget}')
+						if abs_path in backup_entries:
+							if DEBUG:
+								tl.teeprint(f'    Removing {backup_entries[abs_path].event} event on {abs_path}')
+							del backup_entries[abs_path]
+					to_add = False
+				else:
+					moveSourceToDestDict[abs_moved_from] = abs_path
+			else:
+				if abs_path in pendingMoveSourceParents:
+					# we have handled this event's children, so we can ignore this event
+					pendingMoveSourceParents.remove(abs_path)
+					if DEBUG:
+						tl.teeprint(f'Skipping child move event {abs_path}')
+					to_add = False
+				else:
+					# virgin move, treat as create
+					if DEBUG:
+						tl.teeprint(f'Virgin move event {abs_path}')
+					event = 'create'
+		elif abs_path in moveSourceToDestDict:
+			# This means the path was chronologically later moved.
+			# the event can be 'create', 'modify', 'attrib', 'delete' at this point
+			# in all cases, as we cannot simply perform a recursive link as a move in the backup, ( need to backup source data )
+			# we will break the move event into a delete of source and a {event} of dest
+			# here, escalate the current event to the chronologically later move
+			if event == 'delete':
+				# if the path was chronologically later moved from, then it must exist, thus this delete is likely invalid
+				if DEBUG:
+					tl.teeprint(f'Delete event detected immediately before a move with {abs_path} as source. Ignoring delete')
+				to_add = False
+			elif event == 'attrib':
+				# escalate to check file content also as it is not possible to sync attrib only to a symlink 
+				event = 'modify'
+			moveDest = moveSourceToDestDict[abs_path]
+			if DEBUG:
+				tl.teeprint(f'  Seperating move event from {abs_path} to {moveDest}')
+			if moveDest in backup_entries:
+				if event == 'create':
+					to_add = False
+					escalated_event = 'taint'
+				else:
+					if event == 'modify':
+						escalated_event = 'taint'
+					else:
+						escalated_event = event
+					event = 'delete'
+				if DEBUG:
+					tl.teeprint(f'    Escalating {backup_entries[moveDest].event} to {escalated_event} at {backup_entries[moveDest].iso_time} on {moveDest}')
+				backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,escalated_event,abs_path)
+			else:
+				if DEBUG:
+					tl.teeprint(f'    Already removed event on {moveDest}, skipping escalating')
+				if abs_path in backup_entries:
+					if DEBUG:
+						tl.teeprint(f'    Removing {backup_entries[abs_path].event} event on {abs_path}')
+					del backup_entries[abs_path]
+				continue
+			
+		# handle repeated events on the same path
+		if abs_path in backup_entries:
+			if DEBUG:
+				tl.teeprint(f'  {abs_path} already exists in backup entries')
+			# handle repeated events on the same path
+			later_event_on_path = backup_entries[abs_path].event
+			if event == 'create' and later_event_on_path == 'delete':
+				# if the path was new and then chronologically later deleted, then we ignore both events
+				if DEBUG:
+					tl.teeprint(f'Skipping event as Creating {abs_path} that is later deleted.')
+					tl.teeprint(f'  Removing delete event {abs_path}:{backup_entries[abs_path]} as it was created in this iteration')
+				del backup_entries[abs_path]
+				to_add = False
+			elif later_event_on_path in ('delete','taint','move'):
+				# if the path is chronologically later deleted, then we simply do not need to perform backups
+				# if the path is chronologically later modified, because the current event can be modify / attrib / move / delete , in all cases we will ignore this event
+				# if the path is chronologically later moved to, meaning it was later overwriiten moved to. We do not care what it had been done to before then.
+				# in this version of reverberator, create is a complete file tree copy, so if it is chronologically later "created", all previoud events no longer matter.
+				# in the case of move, because we are skipping this event without adding it to the move sources,
+				# the next chronological move event of the source will be treated as a delete
+				if event == 'move':
+					# we also need to add a event to remove the source 
+					if DEBUG:
+						tl.teeprint(f'Moving to {abs_path} that is later {later_event_on_path}d.')
+					if later_event_on_path == 'delete':
+						if DEBUG:
+							tl.teeprint(f'  Removing delete event {abs_path}:{backup_entries[abs_path]} as it was created by move in this iteration')
+						del backup_entries[abs_path]
+					abs_path = abs_moved_from
+					abs_moved_from = None
+					event = 'delete'
+				else:
+					if DEBUG:
+						tl.teeprint(f'Skipping {event} on {abs_path}')
+					to_add = False
+			elif later_event_on_path == 'attrib':
+				if event in ('attrib','delete'):
+					# delete: the path was chronologically later attributed, so it must exist later, thus we ignore the delete
+					if DEBUG:
+						tl.teeprint(f'Skipping dup {event} on {abs_path}')
+					to_add = False
+				if event in ('modify', 'create', 'move','taint'):
+					# we need to escalate the chronologically later event to modify / create / move as attrib only copies the metadata
+					if DEBUG:
+						tl.teeprint(f'Escalating attrib event to {event} on {abs_path}')
+					del backup_entries[abs_path]
+		if to_add:
+			if event == 'create' or event == 'modify':
+				event = 'taint'
+			if not iso_time:
+				iso_time = (datetime.datetime.now() - datetime.timedelta(seconds=time.monotonic() - changeEvent.monotonic_time)).isoformat()
+			if DEBUG:
+				tl.teeprint(f'Adding {event} on {abs_path} at {iso_time} with source {abs_moved_from}')
+			backup_entries[abs_path] = BackupEntryValues(iso_time,event,abs_moved_from)
+			backup_entries.move_to_end(abs_path,last=False)
+	if DEBUG:
+		tl.teeprint('Converted backup entries')
+		tl.printTable(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER)
+	return backup_entries
 	
 
 def log_events_to_journal(backup_entries:dict,journal_path:str):
