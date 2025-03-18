@@ -58,10 +58,18 @@ __version__ = 0.01
 # it will use an tsv storing all the path inode number and hash to detect move.
 CHANGED_EVENT_HEADER = ['monotonic_time', 'is_dir', 'event', 'path','moved_from']
 BACKUP_ENTRY_VALUES_HEADER = ['iso_time','event','source_path']
+REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Monitoring File System Signiture', 
+		'Minium snapshot time', 'Vault Path', 'Keep 1 Compelete Backup', 
+		'Only Sync Attributes (permissions)', 'Keep N versions', 'Backup Size Limit', 
+		'Vault File System Signiture']
+REVERB_RULE_HEADER = ['job_name', 'mon_path', 'mon_fs_signiture', 
+		'min_shapshot_time', 'vault_path', 'keep_one_complete_backup', 
+		'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
+		'vault_fs_signiture']
 
 ChangeEvent = namedtuple('ChangeEvent', CHANGED_EVENT_HEADER)
 BackupEntryValues = namedtuple('BackupEntryValues', BACKUP_ENTRY_VALUES_HEADER)
-
+ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 
 # by defualt, set the max backup threads to 2* the number of cores
 BACKUP_SEMAPHORE = threading.Semaphore(2*os.cpu_count())
@@ -82,6 +90,7 @@ DEBUG = True
 
 tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=False,noLog=True)
 
+#%% ---- Main CLI Functions ----
 def main():
 	global BACKUP_SEMAPHORE
 	global tl
@@ -117,41 +126,40 @@ def main():
 		sys.exit(1)
 	# start the main loop
 	main_threads = []
-	for rule in rules:
-		job_name = rule[0]
-		monitor_path = rule[1]
-		monitor_path_signiture = rule[2]
+	for reverb_rule in rules:
+		job_name = reverb_rule.job_name
+		monitor_path = reverb_rule.mon_path
+		monitor_path_signiture = reverb_rule.mon_fs_signiture
 		min_snapshot_delay_seconds = DEFAULT_SNAPSHOT_DELAY
 		try:
-			min_snapshot_delay_seconds = int(rule[3])
+			min_snapshot_delay_seconds = int(reverb_rule.min_shapshot_time)
 		except:
-			tl.teeerror(f'Error: Rule {job_name} has invalid min_snapshot_delay_seconds value: {rule[3]}')
+			tl.teeerror(f'Error: Rule {job_name} has invalid min_snapshot_delay_seconds value: {reverb_rule.min_shapshot_time}')
 			tl.teeprint(f"Reverting to default value: {DEFAULT_SNAPSHOT_DELAY}")
-		vault_path = rule[4]
-		vault_path_signiture = rule[5]
-		if rule[6].lower() == 'none':
+		vault_path = reverb_rule.vault_path
+		if reverb_rule.keep_one_complete_backup.lower() == 'none':
 			keep_one_complete_backup = DEFAULT_KEEP_ONE_COMPLETE_BACKUP
 		else:
-			keep_one_complete_backup = rule[6].lower() in ['true','yes','1','t','y','on','enable','enabled','en','e']
-		if rule[7].lower() == 'none':
+			keep_one_complete_backup = reverb_rule.keep_one_complete_backup.lower() in ['true','yes','1','t','y','on','enable','enabled','en','e']
+		if reverb_rule.only_sync_attributes.lower() == 'none':
 			only_sync_attributes = DEFAULT_ONLY_SYNC_ATTRIBUTES
 		else:
-			only_sync_attributes = rule[7].lower() in ['true','yes','1','t','y','on','enable','enabled','en','e']
+			only_sync_attributes = reverb_rule.only_sync_attributes.lower() in ['true','yes','1','t','y','on','enable','enabled','en','e']
 		keep_n_versions = DEFAULT_KEEP_N_VERSIONS
 		try:
-			keep_n_versions = int(rule[8])
+			keep_n_versions = int(reverb_rule.keep_n_versions)
 		except:
-			tl.teeerror(f'Error: Rule {job_name} has invalid keep_n_versions value: {rule[8]}')
+			tl.teeerror(f'Error: Rule {job_name} has invalid keep_n_versions value: {reverb_rule.keep_n_versions}')
 			tl.teeprint(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}")
-		backup_size_limit = rule[9]
-		vault_path_signiture = rule[10]
+		backup_size_limit = reverb_rule.backup_size_limit
+		vault_path_signiture = reverb_rule.vault_fs_signiture
 		to_process = deque()
 		to_process_flag = threading.Event()
 		watcherThread = threading.Thread(target=watcher,args=(job_name,monitor_path,monitor_path_signiture,to_process,to_process_flag,irm),daemon=True)
 		tl.teeprint(f'Starting reverb monitor for {job_name} with monitor path {monitor_path}:{monitor_path_signiture}')
 		watcherThread.start()
 		main_threads.append(watcherThread)
-		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,vault_path,vault_path_signiture,to_process_flag,min_snapshot_delay_seconds,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit),daemon=True)
+		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,vault_path,vault_path_signiture,to_process_flag,min_snapshot_delay_seconds,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,log_journal),daemon=True)
 		tl.teeprint(f'Starting backup thread for {job_name} with vault path {vault_path}:{vault_path_signiture}')
 		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
 		backup_thread.start()
@@ -237,8 +245,112 @@ def get_args(args = None):
 	startArgs.append(f'\'{args.rule_path}\'')
 	return args, ' '.join(startArgs)
 
+def parse_rules(rule_file:str):
+	'''
+	Parse the rule file using TSVZ and fill in the defaults and auto fields
+
+	Args:
+		rule_file (str): The rule file
+
+	Returns:
+		rules (list): The rules
+	'''
+	# will read and parse the rule file using tsvz.
+	# this will also responsible for filling in the defaults and auto fields and generating actual rules
+	# and append to the end if the rule is not "explicit"
+	# explicit: no fields empty / auto
+	# will also exit if the rule file is not valid ( broken beyond repair ) / does not exit
+	global DEBUG
+	global DEFAULT_SNAPSHOT_DELAY
+	global DEFAULT_KEEP_ONE_COMPLETE_BACKUP
+	global DEFAULT_ONLY_SYNC_ATTRIBUTES
+	global DEFAULT_KEEP_N_VERSIONS
+	global DEFAULT_BACKUP_SIZE_LIMIT
+	global tl
+	global REVERB_RULE_TSV_HEADER
+	if not os.path.exists(rule_file):
+		tl.teeerror(f'Error: Rule file {rule_file} does not exist.')
+		sys.exit(1)
+
+	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=DEBUG)
+	if not rules:
+		tl.teeerror(f'Error: Rule file {rule_file} appears empty after parsing.')
+		sys.exit(1)
+	# fill in empty / auto and append:
+	rulesToUpdate = []
+	returnReverbRules = []
+	for ruleName in rules:
+		ruleList = rules[ruleName]
+		if DEBUG:
+			tl.teeprint(f'Checking rule: {ruleList}')
+		ruleUpdated = False
+		if not ruleList[0]:
+			tl.teelog(f'Warning: Rule {ruleName} has empty Job Name. Ignoring rule...',level='warning')
+			continue
+		if not ruleList[1]:
+			tl.teelog(f'Warning: Rule {ruleName} has empty Path Monitoring. Ignoring rule...',level='warning')
+			continue
+		if not ruleList[2] or ruleList[2].lower() == 'auto':
+			signitures = get_fs_signitures(ruleList[1])
+			if signitures and signitures[0]:
+				ruleList[2] = signitures[0]
+				tl.teelog(f'Auto filled Monitoring File System Signiture for {ruleName}: {ruleList[2]}',level='info')
+				ruleUpdated = True
+			else:
+				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signiture, disabling fs monitoring for this run...',level='warning')
+				ruleList[2] = 'auto'
+		if not ruleList[3] or ruleList[3].lower() == 'none':
+			ruleList[3] = '0'
+			tl.info(f'Zeroed Minium snapshot time for {ruleName}: {ruleList[3]}')
+			ruleUpdated = True
+		elif ruleList[3].lower() == 'auto':
+			ruleList[3] = DEFAULT_SNAPSHOT_DELAY
+			tl.info(f'Auto filled Minium snapshot time for {ruleName}: {ruleList[3]}')
+			ruleUpdated = True
+		if not ruleList[4]:
+			tl.teelog(f'Warning: Rule {ruleName} has empty Vault Path. Ignoring rule...',level='warning')
+			continue
+		if not ruleList[5] or ruleList[5].lower() == 'auto' or ruleList[5].lower() == 'none':
+			ruleList[5] = str(DEFAULT_KEEP_ONE_COMPLETE_BACKUP)
+			tl.info(f'Auto filled Keep 1 Compelete Backup for {ruleName}: {ruleList[5]}')
+			ruleUpdated = True
+		if not ruleList[6] or ruleList[6].lower() == 'auto' or ruleList[6].lower() == 'none':
+			ruleList[6] = str(DEFAULT_ONLY_SYNC_ATTRIBUTES)
+			tl.info(f'Auto filled Only Sync Attributes for {ruleName}: {ruleList[6]}')
+			ruleUpdated = True
+		if not ruleList[7] or ruleList[7].lower() == 'none':
+			ruleList[7] = '0'
+			tl.info(f'Zeroed Keep N versions for {ruleName}: {ruleList[7]}')
+			ruleUpdated = True
+		elif ruleList[7].lower() == 'auto':
+			ruleList[7] = DEFAULT_KEEP_N_VERSIONS
+			tl.info(f'Auto filled Keep N versions for {ruleName}: {ruleList[7]}')
+			ruleUpdated = True
+		if not ruleList[8] or ruleList[8].lower() == 'auto' or ruleList[8].lower() == 'none':
+			ruleList[8] = DEFAULT_BACKUP_SIZE_LIMIT
+			tl.info(f'Auto filled Backup Size Limit for {ruleName}: {ruleList[8]}')
+			ruleUpdated = True
+		if not ruleList[9] or ruleList[9].lower() == 'auto':
+			signitures = get_fs_signitures(ruleList[4])
+			if signitures and signitures[0]:
+				ruleList[9] = signitures[0]
+				tl.teelog(f'Auto filled Vault File System Signiture for {ruleName}: {ruleList[9]}',level='info')
+				ruleUpdated = True
+			else:
+				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signiture, disabling fs monitoring for this run...',level='warning')
+				ruleList[9] = 'auto'
+		if ruleUpdated:
+			tl.info(f'Updating rule {ruleName}: {ruleList}')
+			rulesToUpdate.append(ruleList)
+		returnReverbRules.append(ReverbRule(*ruleList))
+		# append to tsv as well
+		TSVZ.appendLinesTabularFile(rule_file,rulesToUpdate,header=REVERB_RULE_TSV_HEADER,createIfNotExist=False,verifyHeader=True,verbose=DEBUG,strict=False)
+	return returnReverbRules
+
+#%% ---- IRM ----
 class inotify_resource_manager:
 	def __init__(self):
+		global DEBUG
 		self.current_user_instances = 0
 		self.current_user_watches = 0
 		self.can_set_max_queued_events = True
@@ -246,7 +358,7 @@ class inotify_resource_manager:
 		self.can_set_max_user_watches = True
 		self.can_set_max_no_files = True
 		self.can_set_max_no_files_user = True
-		self.debug = False
+		self.debug = DEBUG
 		self.max_queued_events = self.getSysctlValues('fs.inotify.max_queued_events')
 		self.max_user_instances = self.getSysctlValues('fs.inotify.max_user_instances')
 		self.max_user_watches = self.getSysctlValues('fs.inotify.max_user_watches')
@@ -271,6 +383,7 @@ class inotify_resource_manager:
 		return str(dict(self))
 
 	def getSysctlValues(self,field):
+		global tl
 		try:
 			rtn = multiCMD.run_command(['sysctl',field],timeout=1,quiet=not self.debug)
 			if rtn and rtn[0]:
@@ -282,6 +395,7 @@ class inotify_resource_manager:
 		return 0
 	
 	def setSysctlValues(self,field,value,value_name):
+		global tl
 		try:
 			if not getattr(self,f'can_set_{value_name}'):
 				return False
@@ -342,6 +456,7 @@ class inotify_resource_manager:
 		return rtn and rtn2
 
 	def increaseNoFiles(self,nofile:int = ...):
+		global tl
 		if not self.can_set_max_no_files_user:
 			return False
 		if nofile is ...:
@@ -393,114 +508,7 @@ class inotify_resource_manager:
 		self.current_user_watches -= count
 		return self.current_user_watches
 
-def parse_rules(rule_file:str):
-	'''
-	Parse the rule file using TSVZ and fill in the defaults and auto fields
-
-	Args:
-		rule_file (str): The rule file
-
-	Returns:
-		rules (list): The rules
-	'''
-	# will read and parse the rule file using tsvz.
-	# this will also responsible for filling in the defaults and auto fields and generating actual rules
-	# and append to the end if the rule is not "explicit"
-	# explicit: no fields empty / auto
-	# will also exit if the rule file is not valid ( broken beyond repair ) / does not exit
-	global DEBUG
-	global DEFAULT_SNAPSHOT_DELAY
-	global DEFAULT_KEEP_ONE_COMPLETE_BACKUP
-	global DEFAULT_ONLY_SYNC_ATTRIBUTES
-	global DEFAULT_KEEP_N_VERSIONS
-	global DEFAULT_BACKUP_SIZE_LIMIT
-	global tl
-	if not os.path.exists(rule_file):
-		tl.teeerror(f'Error: Rule file {rule_file} does not exist.')
-		sys.exit(1)
-	header = ['Job Name (Unique Key)', 'Path Monitoring', 'Monitoring File System Signiture', 
-		   'Minium snapshot time', 'Vault Path', 'Keep 1 Compelete Backup', 
-		   'Only Sync Attributes (permissions)', 'Keep N versions', 'Backup Size Limit', 
-		   'Vault File System Signiture']
-	rules = TSVZ.readTabularFile(rule_file,header=header,verifyHeader=True,strict=False,verbose=DEBUG)
-	if not rules:
-		tl.teeerror(f'Error: Rule file {rule_file} appears empty after parsing.')
-		sys.exit(1)
-	# fill in empty / auto and append:
-	rulesToRemove = []
-	for ruleName in rules:
-		ruleList = rules[ruleName]
-		if DEBUG:
-			tl.teeprint(f'Checking rule: {ruleList}')
-		ruleUpdated = False
-		if not ruleList[0]:
-			tl.teelog(f'Warning: Rule {ruleName} has empty Job Name. Ignoring rule...',level='warning')
-			rulesToRemove.append(ruleName)
-			continue
-		if not ruleList[1]:
-			tl.teelog(f'Warning: Rule {ruleName} has empty Path Monitoring. Ignoring rule...',level='warning')
-			rulesToRemove.append(ruleName)
-			continue
-		if not ruleList[2] or ruleList[2].lower() == 'auto':
-			signitures = get_fs_signitures(ruleList[1])
-			if signitures and signitures[0]:
-				ruleList[2] = signitures[0]
-				tl.teelog(f'Auto filled Monitoring File System Signiture for {ruleName}: {ruleList[2]}',level='info')
-				ruleUpdated = True
-			else:
-				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signiture, disabling fs monitoring for this run...',level='warning')
-				ruleList[2] = 'auto'
-		if not ruleList[3] or ruleList[3].lower() == 'none':
-			ruleList[3] = '0'
-			tl.info(f'Zeroed Minium snapshot time for {ruleName}: {ruleList[3]}')
-			ruleUpdated = True
-		elif ruleList[3].lower() == 'auto':
-			ruleList[3] = DEFAULT_SNAPSHOT_DELAY
-			tl.info(f'Auto filled Minium snapshot time for {ruleName}: {ruleList[3]}')
-			ruleUpdated = True
-		if not ruleList[4]:
-			tl.teelog(f'Warning: Rule {ruleName} has empty Vault Path. Ignoring rule...',level='warning')
-			rulesToRemove.append(ruleName)
-			continue
-		if not ruleList[5] or ruleList[5].lower() == 'auto' or ruleList[5].lower() == 'none':
-			ruleList[5] = str(DEFAULT_KEEP_ONE_COMPLETE_BACKUP)
-			tl.info(f'Auto filled Keep 1 Compelete Backup for {ruleName}: {ruleList[5]}')
-			ruleUpdated = True
-		if not ruleList[6] or ruleList[6].lower() == 'auto' or ruleList[6].lower() == 'none':
-			ruleList[6] = str(DEFAULT_ONLY_SYNC_ATTRIBUTES)
-			tl.info(f'Auto filled Only Sync Attributes for {ruleName}: {ruleList[6]}')
-			ruleUpdated = True
-		if not ruleList[7] or ruleList[7].lower() == 'none':
-			ruleList[7] = '0'
-			tl.info(f'Zeroed Keep N versions for {ruleName}: {ruleList[7]}')
-			ruleUpdated = True
-		elif ruleList[7].lower() == 'auto':
-			ruleList[7] = DEFAULT_KEEP_N_VERSIONS
-			tl.info(f'Auto filled Keep N versions for {ruleName}: {ruleList[7]}')
-			ruleUpdated = True
-		if not ruleList[8] or ruleList[8].lower() == 'auto' or ruleList[8].lower() == 'none':
-			ruleList[8] = DEFAULT_BACKUP_SIZE_LIMIT
-			tl.info(f'Auto filled Backup Size Limit for {ruleName}: {ruleList[8]}')
-			ruleUpdated = True
-		if not ruleList[9] or ruleList[9].lower() == 'auto':
-			signitures = get_fs_signitures(ruleList[4])
-			if signitures and signitures[0]:
-				ruleList[9] = signitures[0]
-				tl.teelog(f'Auto filled Vault File System Signiture for {ruleName}: {ruleList[9]}',level='info')
-				ruleUpdated = True
-			else:
-				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signiture, disabling fs monitoring for this run...',level='warning')
-				ruleList[9] = 'auto'
-		if ruleUpdated:
-			tl.info(f'Updated rule {ruleName}: {ruleList}')
-			# append to tsv as well
-			TSVZ.appendTabularFile(rule_file,ruleList,header=header,createIfNotExist=False,verifyHeader=True,verbose=DEBUG,strict=False)
-	# remove the rules that are invalid
-	for ruleName in rulesToRemove:
-		rules.remove(ruleName)
-		tl.teeprint(f'Removed invalid rule: {ruleName}')
-	return rules
-
+#%% ---- Watcher ----
 def watcher(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager):
 	global GREEN_LIGHT
 	# main monitoring function to deal with one reverb.
@@ -798,6 +806,7 @@ def wait_fs_event(path:str,timeout = 0):
 		return True
 	return False
 
+#%% ---- Backup ----
 def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault_path_signiture:str,to_process_flag:threading.Event,
 			 min_snapshot_delay_seconds:int = DEFAULT_SNAPSHOT_DELAY, keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
