@@ -764,8 +764,6 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 
 def change_events_to_backup_entries(change_events:deque) -> dict:
 	global DEBUG
-	if DEBUG:
-
 	...
 	
 

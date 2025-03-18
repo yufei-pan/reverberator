@@ -18,14 +18,14 @@ sdist = { url = "https://files.pythonhosted.org/packages/51/41/59ca6011f5463d5e5
 
 [[package]]
 name = "multicmd"
-version = "1.23"
+version = "1.26"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "argparse" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6f/fd/1f73c46a0c3a66d2d674d449abe1096affb7c9a0c316f36b4f6a86b37cb2/multicmd-1.23.tar.gz", hash = "sha256:c88d4a3a9d826cb5b5f0c002958136b38f9c7a838f37c6292c3fb97f988591f3", size = 7873 }
+sdist = { url = "https://files.pythonhosted.org/packages/0c/9e/3e71d8dc619d0971dfa47028a5f391a91e43c842f1c099ab51bfbe697147/multicmd-1.26.tar.gz", hash = "sha256:fbf35007a9758e496d6910bebcbd665698c198e1429c1746be855ee23322bee1", size = 8050 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/ff/5d7703bc388311abb10e3b583154109da7b76f086ef0a7099c726a308be6/multiCMD-1.23-py3-none-any.whl", hash = "sha256:f7256b83ab80466692a9ff85a9263396d7fc20cc5d7f80c4bbf8d70410b19d22", size = 8612 },
+    { url = "https://files.pythonhosted.org/packages/9f/0b/8c8a63abd9e58a0abdea1a5dcc2dd402223aa3cba0ac0496ebc96de3eb62/multicmd-1.26-py3-none-any.whl", hash = "sha256:5cba313d4b02e761b6d7966d8279afeecb6f4ac302b650da3e832242f87adb8e", size = 8813 },
 ]
 
 [[package]]
