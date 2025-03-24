@@ -16,6 +16,9 @@ import sys
 import signal
 import resource
 import datetime
+import unicodedata
+import re
+from shutil import copystat
 
 # for the lib wrapping aroung inotify, I tried
 # wtr-wather, watchdog, watchfiles
@@ -58,6 +61,7 @@ __version__ = 0.01
 # it will use an tsv storing all the path inode number and hash to detect move.
 CHANGED_EVENT_HEADER = ['monotonic_time', 'is_dir', 'event', 'path','moved_from']
 BACKUP_ENTRY_VALUES_HEADER = ['iso_time','event','source_path']
+BACKUP_JOURNAL_HEADER = ['at_path','iso_time','event','source_path']
 REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Monitoring File System Signiture', 
 		'Minium snapshot time', 'Vault Path', 'Keep 1 Compelete Backup', 
 		'Only Sync Attributes (permissions)', 'Keep N versions', 'Backup Size Limit', 
@@ -103,7 +107,7 @@ def main():
 	global DEBUG
 	signal.signal(signal.SIGINT, signal_handler)
 	args, argString = get_args()
-	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=args.log_compress_months, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet)
+	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=args.log_compress_months, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log)
 	tl.teeprint('> ' + argString)
 	if args.verbose:
 		DEBUG = True
@@ -155,11 +159,11 @@ def main():
 		vault_path_signiture = reverb_rule.vault_fs_signiture
 		to_process = deque()
 		to_process_flag = threading.Event()
-		watcherThread = threading.Thread(target=watcher,args=(job_name,monitor_path,monitor_path_signiture,to_process,to_process_flag,irm),daemon=True)
+		watcherThread = threading.Thread(target=watcher,args=(job_name,monitor_path,monitor_path_signiture,to_process,to_process_flag,irm,min_snapshot_delay_seconds),daemon=True)
 		tl.teeprint(f'Starting reverb monitor for {job_name} with monitor path {monitor_path}:{monitor_path_signiture}')
 		watcherThread.start()
 		main_threads.append(watcherThread)
-		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,vault_path,vault_path_signiture,to_process_flag,min_snapshot_delay_seconds,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,log_journal),daemon=True)
+		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,vault_path,vault_path_signiture,to_process_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal),daemon=True)
 		tl.teeprint(f'Starting backup thread for {job_name} with vault path {vault_path}:{vault_path_signiture}')
 		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
 		backup_thread.start()
@@ -215,9 +219,11 @@ def get_args(args = None):
 	parser.add_argument("-lcm","--log_compress_months", type=int, help="Compress verbose log files after months (default:2)", default=2)
 	parser.add_argument("-ldy","--log_delete_years", type=int, help="Delete log files after years (default:2)", default=2)
 	parser.add_argument('-q', '--quiet', action='store_true', help='Suppress all output to stdout.')
+	parser.add_argument('-nl','--no_log', action='store_true', help='Do not log to file.')
 	parser.add_argument('-v','--verbose','--debug', action='store_true', help='Print debug logs.')
 	parser.add_argument('-V', '--version', action='version', version=f"%(prog)s {__version__} with {lib_vers}; reverb (REcursive VERsioning Backup) generator by pan@zopyr.us")
 	parser.add_argument('-t','--threads', type=int, help='Number of threads to use for backup. Use negative number for how many times of CPU count you want. Use 0 for 200k. (default: -2)', default=-2)
+	parser.add_argument('-j','--journal', action='store_true', help='Log backup actions to a journal file in the vault path.')
 	parser.add_argument('rule_path', metavar='RULE_PATH', type=str, nargs='?', default='reverb_rule.tsv', help='Path to the rule definition tabular file')
 	try:
 		args = parser.parse_intermixed_args(args)
@@ -287,6 +293,11 @@ def parse_rules(rule_file:str):
 		if not ruleList[0]:
 			tl.teelog(f'Warning: Rule {ruleName} has empty Job Name. Ignoring rule...',level='warning')
 			continue
+		cleanedJobName = slugify(ruleList[0])
+		if cleanedJobName != ruleList[0]:
+			tl.teelog(f'Warning: Rule {ruleName} has dirty Job Name. Changing to {cleanedJobName}',level='warning')
+			ruleList[0] = cleanedJobName
+			ruleUpdated = True
 		if not ruleList[1]:
 			tl.teelog(f'Warning: Rule {ruleName} has empty Path Monitoring. Ignoring rule...',level='warning')
 			continue
@@ -346,6 +357,22 @@ def parse_rules(rule_file:str):
 		# append to tsv as well
 		TSVZ.appendLinesTabularFile(rule_file,rulesToUpdate,header=REVERB_RULE_TSV_HEADER,createIfNotExist=False,verifyHeader=True,verbose=DEBUG,strict=False)
 	return returnReverbRules
+
+def slugify(value, allow_unicode=False):
+	"""
+	Taken from https://github.com/django/django/blob/master/django/utils/text.py
+	Convert to ASCII if 'allow_unicode' is False. Convert spaces or repeated
+	dashes to single dashes. Remove characters that aren't alphanumerics,
+	underscores, or hyphens. Convert to lowercase. Also strip leading and
+	trailing whitespace, dashes, and underscores.
+	"""
+	value = str(value)
+	if allow_unicode:
+		value = unicodedata.normalize('NFKC', value)
+	else:
+		value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+	value = re.sub(r'[^\w\s-]', '', value.lower())
+	return re.sub(r'[-\s]+', '-', value).strip('-_')
 
 #%% ---- IRM ----
 class inotify_resource_manager:
@@ -509,7 +536,7 @@ class inotify_resource_manager:
 		return self.current_user_watches
 
 #%% ---- Watcher ----
-def watcher(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager):
+def watcher(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY):
 	global GREEN_LIGHT
 	# main monitoring function to deal with one reverb.
 	monitor_fs_flag = threading.Event()
@@ -518,9 +545,9 @@ def watcher(job_name:str,monitor_path:str,monitor_path_signiture:str,to_process:
 	monitor_fs_thread.start()
 	while GREEN_LIGHT.is_set():
 		monitor_fs_flag.wait()
-		watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_flag=to_process_flag,irm=irm)
+		watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds)
 
-def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True):
+def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY):
 	global COOKIE_DICT_MAX_SIZE
 	global tl
 	global DEBUG
@@ -531,6 +558,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 	wdDic = bidict()
 	pendingMoveFromEvents = OrderedDict()
 	newDirWDs = set()
+	processPending = False
 	irm.increaseUserInstances()
 	with inotify_simple.INotify() as inotify_obj:
 		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags)
@@ -538,10 +566,19 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 			tl.teeerror(f'Failed to initialize folder watchers for {monitor_path}')
 			return False
 		while GREEN_LIGHT.is_set():
-			events =  inotify_obj.read()
-			if not to_process_flag.is_set():
+			events =  inotify_obj.read(timeout=min_snapshot_delay_seconds)
+			if not events:
+				# this means timeout have elapsed, we can signal the backuper to process
+				if to_process:
+					if DEBUG:
+						tl.teeprint('Timeout elapsed, signaling backuper to process')
+					to_process_flag.set()
+					processPending = True
+				continue
+			if processPending and not to_process_flag.is_set():
 				# this means the to_process was just processed
 				newDirWDs.clear()
+				processPending = False
 			if DEBUG:
 				tl.teeok(f'Events detected: {len(events)}')
 				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
@@ -680,7 +717,6 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 					tl.teeprint(f'Adding unmatched pending move_from events as deletes {pendingMoveFromEvents.keys()}')
 				to_process.extend(pendingMoveFromEvents.values())
 				pendingMoveFromEvents.clear()
-			to_process_flag.set()
 	return True
 
 class bidict(dict):
@@ -712,6 +748,7 @@ def testWatchFolderOperation(testCMD:list,to_process:deque,to_process_flag:threa
 	to_process_flag.clear()
 
 def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None):
+	global DEBUG
 	if not os.path.exists(monitor_path):
 		return -1
 	irm.increaseUserWatches()
@@ -733,16 +770,29 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	return parentWatchDescriptor
 
 def get_all_folders(path):
+	_, folders = get_all_files_and_folders(path)
+	return folders
+
+def get_all_files(path):
+	files, _ = get_all_files_and_folders(path)
+	return files
+
+def get_all_files_and_folders(path):
+	files = []
 	folders = []
 	try:
 		with os.scandir(path) as entries:
 			for entry in entries:
 				if entry.is_dir(follow_symlinks=False):
 					folders.append(entry.path)
-					folders.extend(get_all_folders(entry.path))  # Recursive call
+					child_files, child_folders = get_all_files_and_folders(entry.path)
+					files.extend(child_files)
+					folders.extend(child_folders)
+				else:
+					files.append(entry.path)
 	except PermissionError:
-		pass  # Skip folders without permission
-	return folders
+		pass
+	return files, folders
 
 def fs_flag_daemon(path:str,signiture:str,fsEvent:threading.Event):
 	global GREEN_LIGHT
@@ -808,7 +858,7 @@ def wait_fs_event(path:str,timeout = 0):
 
 #%% ---- Backup ----
 def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault_path_signiture:str,to_process_flag:threading.Event,
-			 min_snapshot_delay_seconds:int = DEFAULT_SNAPSHOT_DELAY, keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
+			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
 			 backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False):
 	global BACKUP_SEMAPHORE
@@ -820,40 +870,25 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 	vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signiture,vault_fs_flag),daemon=True)
 	vault_fs_thread.start()
 	vault_fs_flag.wait()
-	prev_to_process_len = 0
-	time_to_sleep = 0
+	backupEntries = OrderedDict()
 	# to_process: deque([ChangedEvent:{'monotonic_time':'231241','event':'create','type':'file','path':'/path/to/file'},...])
 	while GREEN_LIGHT.is_set():
-		if time_to_sleep > 0:
-			time.sleep(time_to_sleep)
 		vault_fs_flag.wait()
-		while not to_process:
+		do_backup(backupEntries,vault_fs_flag,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,vault_path_signiture=vault_path_signiture,
+			  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, backup_size_limit=backup_size_limit, log_journal=log_journal)
+		while not backupEntries:
 			to_process_flag.wait()
-		# if changes detected, continue waiting
-		if len(to_process) > prev_to_process_len:
-			# check the last change time, sleep for min_snapshot_delay_seconds - (now - last change time)
-			last_change_time = to_process[-1]['monotonic_time']
-			time_to_sleep = min_snapshot_delay_seconds - (time.monotonic() - last_change_time)
-			prev_to_process_len = len(to_process)
-			continue
-		# If changes detected and after min_snapshot_time, no further changes detected,
-		# we will do a snapshot
-		to_process_temp = to_process.copy()
-		to_process.clear()
-		to_process_flag.clear()
-		backupEntries = change_events_to_backup_entries(to_process_temp)
+			if DEBUG:
+				tl.teeprint(f'Signaling backuper to process, {len(to_process)} events to process')
+			to_process_temp = to_process.copy()
+			to_process.clear()
+			to_process_flag.clear()
+			backupEntries = change_events_to_backup_entries(to_process_temp)
+			if DEBUG:
+				tl.teeprint(f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries')
 		if log_journal:
 			journalPath = os.path.join(vault_path,job_name,'journal.nsv')
 			log_events_to_journal(backupEntries,journalPath)
-		prev_to_process_len = 0
-		time_to_sleep = 0
-		if GREEN_LIGHT.is_set():
-			# appendTabularFile(fileName,lineToAppend,teeLogger = None,header = '',createIfNotExist = False,verifyHeader = True,verbose = False,encoding = 'utf8', strict = True, delimiter = ...)
-			if log_journal:
-				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'start_reverb_backup',os.path.join(vault_path,job_name)],teeLogger=tl,header=BACKUP_ENTRY_VALUES_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
-			do_incremental_backup(backupEntries,vault_fs_flag)
-			if log_journal:
-				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'end_reverb_backup',os.path.join(vault_path,job_name)],teeLogger=tl,header=BACKUP_ENTRY_VALUES_HEADER,createIfNotExist=True,verifyHeader=False,strict=False)
 
 def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 	# possibile events are create, delete, attrib, move, modify
@@ -1036,45 +1071,298 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 		tl.printTable(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER)
 	return backup_entries
 	
-
 def log_events_to_journal(backup_entries:dict,journal_path:str):
 	# this function will log the journal of the changes
 	# the journal will be a nsv file with the following fields:
 	# monotonic_time, event, type, path
 	# this will be used to recover the changes in the case of a crash
-	...
+	global tl
+	lines = [[path,entry.iso_time,entry.event,entry.source_path] for path,entry in backup_entries.items()]
+	TSVZ.appendLinesTabularFile(journal_path,lines,header = BACKUP_JOURNAL_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl)
 
-def do_incremental_backup(backup_entries:dict,vault_fs_flag:threading.Event):
-	# # if there is no current, do a full backup
-	# #do_first_backup(monitor_path,vault_path)
-	# # calculate this backup size
-	# # calculate vault size
-	# # if this backup size + vault size > backup_size_limit
-	# # invoke the stepper
-	# last_version, last_timestamp = get_vault_info(vault_path,last=True)
-	# this_version = last_version + 1
-	# this_timestamp = time.time()
-	# this_version_path = os.path.join(vault_path,f'V{this_version}-{this_timestamp}')
-	# # walk over {vault_path}/current/ and create a new version
-	# files, links , folders = get_file_list(os.path.join(vault_path,'current'))
-	# # sync the folders to this version to create dir structure
-	# sync_folders(folders,this_version_path)
-	# # update the folder metadata to this version
-	# sync_folders(folder_changed,this_version_path)
-	# for file in files + links - file_to_backup - file_to_delete - file_change_attr:
-	# 	# ln -srL files to this version path
-	# 	...
-	# for file in file_to_backup:
-	# 	# cp --reflink=auto --sparse=always -af monitor path files to this version path
-	# 	...
-	# for file in file_change_attr:
-	# 	# cp --reflink=auto --sparse=always -af vault path files to this version path
-	# 	# copy the attr only from monitor path to this version path
-	# 	# this is so on fs with CoW support, we can save space by only storing the attr
+def do_backup(backup_entries:dict,
+			 job_name:str,monitor_path:str,vault_path:str,vault_path_signiture:str,
+			 keep_one_complete_backup:bool , 
+			 only_sync_attributes:bool, keep_n_versions:int , 
+			 backup_size_limit:str,log_journal:bool = False):
 	# remember to also sync attr from source for move events
+	global DEBUG
+	global tl
+	job_vault = os.path.join(vault_path,job_name)
+	if log_journal:
+		journalPath = os.path.join(job_vault,'journal.nsv')
+		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'start_reverb_backup',os.path.join(vault_path,job_name)],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 	with BACKUP_SEMAPHORE:
 		# do the actual backup
-		...
+		# get the latest current version path
+		current_version_path, vault_size , vault_inodes= get_vault_info(job_vault_path=job_vault)
+		if not current_version_path:
+			if DEBUG:
+				tl.teeerror(f'Failed to get current version path for {job_vault}, treating the vault as new.')
+			backup_folder = os.path.join(job_vault,f'V0--{datetime.datetime.now().astimezone().strftime('%Y-%m-%dT%H-%M-%SZ%z')}')
+			if keep_one_complete_backup:
+				do_complete_backup(monitor_path,backup_folder)
+			else:
+				do_referenced_copy(monitor_path,backup_folder)
+		else:
+			# get the size of the current backup
+			estimated_backup_size, estimated_backup_inode = get_backup_size_inode(backup_entries)
+			backup_limit_size, backup_limit_inode = get_backup_limits_from_str(backup_size_limit)
+			if backup_limit_size:
+				while vault_size + estimated_backup_size > backup_limit_size:
+					if DEBUG:
+						tl.teeprint(f'Vault size {vault_size} + estimated backup size {estimated_backup_size} exceeds backup size limit {backup_limit_size}')
+					# we need to remove the oldest version
+					removed_size, removed_inodes = stepper()
+					vault_size -= removed_size
+					vault_inodes -= removed_inodes
+					if not removed_size and not removed_inodes:
+						break
+			if backup_limit_inode:
+				while vault_inodes + estimated_backup_inode > backup_limit_inode:
+					if DEBUG:
+						tl.teeprint(f'Vault inodes {vault_inodes} + estimated backup inodes {estimated_backup_inode} exceeds backup inode limit {backup_limit_inode}')
+					# we need to remove the oldest version
+					removed_size, removed_inodes = stepper()
+					vault_size -= removed_size
+					vault_inodes -= removed_inodes
+					if not removed_size and not removed_inodes:
+						break
+			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
+			
+			
+		# check the size of the backup
+		backup_size_str = format_bytes(get_path_size(backup_folder),use_1024_bytes=True,to_str=True).replace(' ','_')
+		backup_inode_str = format_bytes(get_path_inodes(backup_folder),use_1024_bytes=False,to_str=True).replace(' ','')
+		backup_folder_with_size = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino'
+		os.rename(backup_folder,backup_folder_with_size)
+		if DEBUG:
+			tl.teeok(f'Created new backup at {backup_folder_with_size}')
+		# create the current version symlink
+		if os.path.exists(os.path.join(job_vault,'current_version')):
+			os.remove(os.path.join(job_vault,'current_version'))
+		os.symlink(backup_folder_with_size,os.path.join(job_vault,'current_version'),target_is_directory=True)
+	if log_journal:
+		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'end_reverb_backup',os.path.join(vault_path,job_name)],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+
+def get_vault_info(job_vault_path:str) -> tuple:
+	# this function gets the latest version path
+	# it will return the target of the link of current_version in the job vault.
+	# if the link does not exist or broken, it will try to use rule to find the latest version folder
+	# if it cannot find anything, it will return an empty string
+	# job vault subfolder should follow: V{version}--{ISO8601ish time}--{size of this backup}-{inodes of this backup}
+	# ex. V0--2021-01-01_00-00-00_-0800--1.3_GiB-4.2K_ino
+	global DEBUG
+	global tl
+	if not os.path.exists(job_vault_path):
+		tl.teeerror(f'Job vault path {job_vault_path} does not exist')
+		return '', 0, 0
+	current_version_symlink_path = os.path.join(job_vault_path,'current_version')
+	if os.path.islink(current_version_symlink_path):
+		link_target = os.readlink(current_version_symlink_path)
+		if os.path.isdir(link_target) and is_subpath(link_target,job_vault_path):
+			if DEBUG:
+				tl.teeok(f'Current version symlink to {link_target}')
+			return link_target
+		else:
+			tl.teeerror(f'Broken symlink {current_version_symlink_path} to {link_target}')
+	# if the symlink is broken, we will try to find the latest version folder
+	most_recent_version = 0
+	most_recent_version_path = ''
+	vault_size = 0
+	vault_inodes = 0
+	try:
+		for entry in os.scandir(job_vault_path):
+			if entry.is_dir() and entry.name.startswith('V') and '--' in entry.name:
+				version_number_str = entry.name.lstrip('V').partition('--')[0]
+				if version_number_str.isdigit():
+					version_number = int(version_number_str)
+					if version_number > most_recent_version:
+						most_recent_version = version_number
+						most_recent_version_path = entry.path
+				try:
+					entry_size_inode_str = entry.name.rpartition('--')[2]
+					entry_size_str = entry_size_inode_str.partition('-')[0].replace('_',' ')
+					entry_size = format_bytes(entry_size_str,to_int=True)
+					entry_inode_str = entry_size_inode_str.rpartition('-')[2].replace('_',' ')
+					entry_inode = format_bytes(entry_inode_str,to_int=True)
+					vault_size += entry_size
+					vault_inodes += entry_inode
+				except:
+					pass
+	except PermissionError:
+		tl.teeerror(f'Permission error while scanning {job_vault_path}')
+	return most_recent_version_path, vault_size, vault_inodes
+
+def is_subpath(child, parent):
+    child = os.path.realpath(child)
+    parent = os.path.realpath(parent)
+    common = os.path.commonpath([child, parent])
+    return common == parent
+
+def do_complete_backup(source_path:str,backup_folder:str):
+	global DEBUG
+	multiCMD.run_command(['cp','-a','--reflink=auto','--sparse=always',source_path,backup_folder],quiet=DEBUG,return_code_only=True)
+
+def do_referenced_copy(source_path:str,backup_folder:str):
+	global DEBUG
+	global tl
+	global BACKUP_SEMAPHORE
+	files, folders = get_all_files_and_folders(source_path)
+	for folder in folders:
+		try:
+			rel_folder = os.path.relpath(folder,source_path)
+			backup_folder_path = os.path.join(backup_folder,rel_folder)
+			os.makedirs(backup_folder_path,exist_ok=True)
+			# copy the folder metadata
+			copystat(folder,backup_folder_path)
+			st = os.stat(folder)
+			if os.name == 'posix':
+				os.chown(backup_folder_path, st.st_uid, st.st_gid)
+			os.utime(backup_folder_path, (st.st_atime, st.st_mtime))
+		except:
+			tl.teeerror(f'Failed to copy folder {folder}')
+	commands = []
+	for file in files:
+		# use ln -fsrLT to do a relative symlink
+		# ln --symbolic --relative --logical --force --no-target-directory
+		rel_file = os.path.relpath(file,source_path)
+		backup_file_path = os.path.join(backup_folder,rel_file)
+		commands.append(['ln','-fsrLT',file,backup_file_path])
+	if commands:
+		run_commands_with_semaphore(commands)
+
+def run_commands_with_semaphore(commands:list):
+	global BACKUP_SEMAPHORE
+	global DEBUG
+	# check if there is any free semaphores available
+	# Use as much semaphore as possible
+	remaining_semaphores = BACKUP_SEMAPHORE._value
+	if remaining_semaphores < len(commands) // 2:
+		threads_to_use = remaining_semaphores // 2
+	else:
+		threads_to_use = len(commands) // 2
+	if threads_to_use > 1:
+		[BACKUP_SEMAPHORE.acquire() for _ in range(threads_to_use)]
+		multiCMD.run_commands(commands,quiet=DEBUG,return_code_only=True,max_threads=threads_to_use)
+		BACKUP_SEMAPHORE.release(threads_to_use)
+	else:
+		multiCMD.run_commands(commands,quiet=DEBUG,return_code_only=True)
+
+def get_path_size(path:str):
+	# this function gets the actual size of a path
+	# du --bytes -s <path>
+	rtn = multiCMD.run_command(['du','--bytes','-s',path],quiet=True)
+	if rtn and rtn[0] and rtn[0].partition('\t')[0].isdigit():
+		return int(rtn[0].partition('\t')[0])
+	else:
+		return 0
+
+def get_path_inodes(path:str):
+	# this function gets the number of inodes in a path
+	# df --inodes -s <path>
+	rtn = multiCMD.run_command(['du','--inodes','-s',path],quiet=True)
+	if rtn and rtn[0] and rtn[0].partition('\t')[0].isdigit():
+		return int(rtn[0].partition('\t')[0])
+	else:
+		return 0
+
+def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_format='.2f'):
+	"""
+	Format the size in bytes to a human-readable format or vice versa.
+	From hpcp: https://github.com/yufei-pan/hpcp
+
+	Args:
+		size (int or str): The size in bytes or a string representation of the size.
+		use_1024_bytes (bool, optional): Whether to use 1024 bytes as the base for conversion. If None, it will be determined automatically. Default is None.
+		to_int (bool, optional): Whether to convert the size to an integer. Default is False.
+		to_str (bool, optional): Whether to convert the size to a string representation. Default is False.
+		str_format (str, optional): The format string to use when converting the size to a string. Default is '.2f'.
+
+	Returns:
+		int or str: The formatted size based on the provided arguments.
+
+	Examples:
+		>>> format_bytes(1500)
+		'1.50 KB'
+		>>> format_bytes('1.5 GiB', to_int=True)
+		1610612736
+	"""
+	if to_int or isinstance(size, str):
+		if isinstance(size, int):
+			return size
+		elif isinstance(size, str):
+			# Use regular expression to split the numeric part from the unit, handling optional whitespace
+			match = re.match(r"(\d+(\.\d+)?)\s*([a-zA-Z]*)", size)
+			if not match:
+				print("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'")
+				print(f"Got: {size}")
+				return 0
+			number, _, unit = match.groups()
+			number = float(number)
+			unit  = unit.strip().lower().rstrip('b')
+			# Define the unit conversion dictionary
+			if unit.endswith('i'):
+				# this means we treat the unit as 1024 bytes if it ends with 'i'
+				use_1024_bytes = True
+			elif use_1024_bytes is None:
+				use_1024_bytes = False
+			unit  = unit.rstrip('i')
+			if use_1024_bytes:
+				power = 2**10
+			else:
+				power = 10**3
+			unit_labels = {'': 0, 'k': 1, 'm': 2, 'g': 3, 't': 4, 'p': 5}
+			if unit not in unit_labels:
+				print(f"Invalid unit '{unit}'. Expected one of {list(unit_labels.keys())}")
+				return 0
+			# Calculate the bytes
+			return int(number * (power ** unit_labels[unit]))
+		else:
+			try:
+				return int(size)
+			except Exception as e:
+				return 0
+	elif to_str or isinstance(size, int) or isinstance(size, float):
+		if isinstance(size, str):
+			try:
+				size = size.lower().strip().rstrip('b')
+				size = float(size)
+			except Exception as e:
+				return size
+		# size is in bytes
+		if use_1024_bytes or use_1024_bytes is None:
+			power = 2**10
+			n = 0
+			power_labels = {0 : '', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti', 5: 'Pi'}
+			while size > power:
+				size /= power
+				n += 1
+			return f"{size:{str_format}}{' '}{power_labels[n]}"
+		else:
+			power = 10**3
+			n = 0
+			power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T', 5: 'P'}
+			while size > power:
+				size /= power
+				n += 1
+			return f"{size:{str_format}}{' '}{power_labels[n]}"
+	else:
+		try:
+			return format_bytes(float(size), use_1024_bytes)
+		except Exception as e:
+			import traceback
+			print(f"Error: {e}")
+			print(traceback.format_exc())
+			print(f"Invalid size: {size}")
+		return 0
+
+def get_backup_size_inode(backup_entries:dict):
+	# this function gets the size of the backup entries
+	...
+
+def get_backup_limits_from_str(backup_size_limit):
+	...
 
 def stepper():
 	# this function remove the oldest reverb from path
@@ -1084,6 +1372,5 @@ def stepper():
 	#   if the vault size is much smaller than the estimated and smaller than the vault size limit, return
 	...
 
-def get_path_size():
-	# this function gets the actual size of a path
-	...
+def get_path_fs
+
