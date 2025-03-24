@@ -86,11 +86,11 @@ wheels = [
 
 [[package]]
 name = "tsvz"
-version = "3.18"
+version = "3.23"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e1/15/d132896eaf6c3ffbc82421d705103a53d6c9732d1dee83ec84d449454dc9/tsvz-3.18.tar.gz", hash = "sha256:ad5c8b675478139323f3be0369c0bbecf5278a9b43a80398291748c655c6c874", size = 14926 }
+sdist = { url = "https://files.pythonhosted.org/packages/ed/90/9236338905521df0fdc3310b6a45ae8ad5d176b4498b239ca1d206c2a2b6/tsvz-3.23.tar.gz", hash = "sha256:44fa89fe77bb37cf9d2bbfe0cbc6cde7f58eb66655399e3e1c9b441e757d5701", size = 14978 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/47/7e/015b5a8e63cec68b6a24e75e7cf60f7d1719a7682c4c170cecc5975127c6/tsvz-3.18-py3-none-any.whl", hash = "sha256:669fe0fd3c29924586ffbb6bda58f2ee2db2d6678bebbc00aa46848e71abef86", size = 14846 },
+    { url = "https://files.pythonhosted.org/packages/79/14/d36e1a912b2399b8403699bd4f5d8d4a54d843396b23f4a1110f8399567c/tsvz-3.23-py3-none-any.whl", hash = "sha256:f3fca670dc1f639568247f70a83ac19a2979159371469de505d46bdde3ca0258", size = 14964 },
 ]
 
 [[package]]
