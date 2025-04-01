@@ -33,7 +33,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.01
+__version__ = 0.02
 
 ## WIP
 
@@ -71,12 +71,16 @@ REVERB_RULE_HEADER = ['job_name', 'mon_path', 'mon_fs_signiture',
 		'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
 		'vault_fs_signiture']
 VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
+VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes']
 VAULT_TIMESTAMP_FORMAT = '%Y-%m-%d_%H-%M-%S_%z'
+TRACKING_FILES_FOLDERS_HEADER = ['files','folders']
 
 ChangeEvent = namedtuple('ChangeEvent', CHANGED_EVENT_HEADER)
 BackupEntryValues = namedtuple('BackupEntryValues', BACKUP_ENTRY_VALUES_HEADER)
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
+VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER)
+TrackingFilesFolders = namedtuple('TrackingFilesFolders', TRACKING_FILES_FOLDERS_HEADER)
 
 # by defualt, set the max backup threads to 2* the number of cores
 BACKUP_SEMAPHORE = threading.Semaphore(2*os.cpu_count())
@@ -881,11 +885,14 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 	vault_fs_flag.wait()
 	monitor_fs_flag.wait()
 	backupEntries = OrderedDict()
+	vaultInfo = None
+	trackingFilesFolders = None
 	# to_process: deque([ChangedEvent:{'monotonic_time':'231241','event':'create','type':'file','path':'/path/to/file'},...])
 	while GREEN_LIGHT.is_set():
 		vault_fs_flag.wait()
-		do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
-			  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, backup_size_limit=backup_size_limit, log_journal=log_journal)
+		vaultInfo,trackingFilesFolders = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
+			  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
+			  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,trackingFilesFolders=trackingFilesFolders)
 		while not backupEntries:
 			to_process_flag.wait()
 			if DEBUG:
@@ -1099,7 +1106,8 @@ def do_backup(backup_entries:dict,
 			 job_name:str,monitor_path:str,vault_path:str,
 			 keep_one_complete_backup:bool, 
 			 only_sync_attributes:bool, keep_n_versions:int , 
-			 backup_size_limit:str,log_journal:bool = False):
+			 backup_size_limit:str,log_journal:bool = False,
+			 vaultInfo:VaultInfo = None,trackingFilesFolders:TrackingFilesFolders = None):
 	# remember to also sync attr from source for move events
 	global DEBUG
 	global tl
@@ -1114,20 +1122,26 @@ def do_backup(backup_entries:dict,
 	with BACKUP_SEMAPHORE:
 		# do the actual backup
 		# get the latest current version path
-		vault_info_dict, vault_size , vault_inodes= get_vault_info(job_vault_path=job_vault)
+		if not vaultInfo or not vaultInfo.vault_info_dict:
+			vaultInfo = get_vault_info(job_vault_path=job_vault)
+		vault_info_dict = vaultInfo.vault_info_dict
+		vault_size = vaultInfo.vault_size
+		vault_inodes = vaultInfo.vault_inodes
 		if not vault_info_dict:
 			if DEBUG:
 				tl.teeerror(f'Failed to get any version for {job_vault}, treating the vault as new.')
-			backup_folder = os.path.join(job_vault,f'V0--{datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)}')
+			this_version_number = 0
+			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
+			backup_folder = os.path.join(job_vault,f'V0--{this_timestamp}')
 			if keep_one_complete_backup:
-				do_complete_backup(monitor_path,backup_folder)
+				cp_af_copy_path(monitor_path,backup_folder)
 			else:
-				do_referenced_copy(monitor_path,backup_folder)
+				trackingFilesFolders = do_referenced_copy(monitor_path,backup_folder)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
 			if not backup_entries:
-				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path)
+				trackingFilesFolders = delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path)
 			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes)
 			estimated_backup_inode = latest_version_info.inode + estimated_backup_inode_change
 			vault_fs_size, vault_fs_inode = get_path_fs_info(vault_path)
@@ -1161,11 +1175,17 @@ def do_backup(backup_entries:dict,
 				vault_inodes -= removed_inodes
 				if not removed_size and not removed_inodes:
 					break
-			backup_folder = os.path.join(job_vault,f'V{latest_version_info.version_number}--{datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)}')
-			do_reverb_backup(latest_version_info,only_sync_attributes)
+			this_version_number = latest_version_info.version_number + 1
+			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
+			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
+			trackingFilesFolders = do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,trackingFilesFolders,monitor_path)
 		# check the size of the backup
-		backup_size_str = format_bytes(get_path_size(backup_folder),use_1024_bytes=True,to_str=True).replace(' ','_')
-		backup_inode_str = format_bytes(get_path_inodes(backup_folder),use_1024_bytes=False,to_str=True).replace(' ','')
+		this_size = get_path_size(backup_folder)
+		this_inodes = get_path_inodes(backup_folder)
+		vault_size += this_size
+		vault_inodes += this_inodes
+		backup_size_str = format_bytes(this_size,use_1024_bytes=True,to_str=True).replace(' ','_')
+		backup_inode_str = format_bytes(this_inodes,use_1024_bytes=False,to_str=True).replace(' ','')
 		backup_folder_with_size = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino'
 		os.rename(backup_folder,backup_folder_with_size)
 		if DEBUG:
@@ -1173,11 +1193,13 @@ def do_backup(backup_entries:dict,
 		# create the current version symlink
 		if os.path.exists(os.path.join(job_vault,'current_version')):
 			os.remove(os.path.join(job_vault,'current_version'))
+		vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder_with_size,this_timestamp,this_size,this_inodes)
 		os.symlink(backup_folder_with_size,os.path.join(job_vault,'current_version'),target_is_directory=True)
 	if log_journal:
 		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'end_reverb_backup',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+	return VaultInfo(vault_info_dict,vault_size,vault_inodes), trackingFilesFolders
 
-def get_vault_info(job_vault_path:str,recalculate:bool=False) -> tuple:
+def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	# job vault subfolder should follow: V{version}--{ISO8601ish time}--{size of this backup}-{inodes of this backup}
 	# ex. V0--2021-01-01_00-00-00_-0800--1.3_GiB-4.2K_ino
 	global DEBUG
@@ -1185,7 +1207,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> tuple:
 	global VAULT_TIMESTAMP_FORMAT
 	if not os.path.exists(job_vault_path):
 		tl.teeerror(f'Job vault path {job_vault_path} does not exist')
-		return {}, 0, 0
+		return VaultInfo({},0,0)
 	# if the symlink is broken, we will try to find the latest version folder
 	vault_info_dict = {}
 	vault_size = 0
@@ -1235,7 +1257,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> tuple:
 							tl.teeerror(f'Error processing {entry.name}: {traceback.format_exc()}')
 	except PermissionError:
 		tl.teeerror(f'Permission error while scanning {job_vault_path}')
-	return OrderedDict(sorted(vault_info_dict.items())), vault_size, vault_inodes
+	return VaultInfo(OrderedDict(sorted(vault_info_dict.items())), vault_size, vault_inodes)
 
 def is_subpath(child, parent):
 	'''
@@ -1263,38 +1285,56 @@ def is_subpath(child, parent):
 	common = os.path.commonpath([child, parent])
 	return common == parent
 
-def do_complete_backup(source_path:str,backup_folder:str):
+def cp_af_copy_path(source_path:str,dest_path:str,wait_for_return:bool = True,sem:threading.Semaphore = None):
 	global DEBUG
-	multiCMD.run_command(['cp','-a','--reflink=auto','--sparse=always',source_path,backup_folder],quiet=not DEBUG,return_code_only=True)
+	return multiCMD.run_command(['cp','-af','--reflink=auto','--sparse=always',source_path,dest_path],quiet=not DEBUG,return_code_only=True,wait_for_return=wait_for_return,sem=sem)
 
-def do_referenced_copy(source_path:str,backup_folder:str):
+def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:TrackingFilesFolders=None,relative = False):
 	global DEBUG
 	global tl
 	global BACKUP_SEMAPHORE
-	files, folders = get_all_files_and_folders(source_path)
+	if not trackingFilesFolders:
+		files, folders = get_all_files_and_folders(source_path)
+		files = [os.path.relpath(file,source_path) for file in files]
+		folders = [os.path.relpath(folder,source_path) + '/' for folder in folders]
+	else:
+		files, folders = trackingFilesFolders.files, trackingFilesFolders.folders
 	for folder in folders:
-		try:
-			rel_folder = os.path.relpath(folder,source_path)
-			backup_folder_path = os.path.join(backup_folder,rel_folder)
-			os.makedirs(backup_folder_path,exist_ok=True)
-			# copy the folder metadata
-			copystat(folder,backup_folder_path)
-			st = os.stat(folder)
-			if os.name == 'posix':
-				os.chown(backup_folder_path, st.st_uid, st.st_gid)
-			os.utime(backup_folder_path, (st.st_atime, st.st_mtime))
-		except:
-			tl.teeerror(f'Failed to copy folder {folder}')
+		source_folder = os.path.join(source_path,folder)
+		backup_folder_path = os.path.join(backup_folder,folder)
+		os.makedirs(backup_folder_path,exist_ok=True)
+		copy_file_meta(source_folder,backup_folder_path)
 	commands = []
 	for file in files:
 		# use ln -fsrLT to do a relative symlink
 		# ln --symbolic --logical --force --no-target-directory
-		rel_file = os.path.relpath(file,source_path)
-		backup_file_path = os.path.join(backup_folder,rel_file)
-		file = os.path.abspath(file)
-		commands.append(['ln','-fsLT',file,backup_file_path])
+		source_file = os.path.join(source_path,file)
+		backup_file_path = os.path.join(backup_folder,file)
+		source_file = os.path.abspath(source_file)
+		if relative:
+			commands.append(['ln','-rfsLT',source_file,backup_file_path])
+		else:
+			commands.append(['ln','-fsLT',source_file,backup_file_path])
 	if commands:
 		run_commands_with_semaphore(commands)
+	return TrackingFilesFolders(files, folders)
+
+def copy_file_meta(source_file:str,backup_file_path:str):
+	global tl
+	global DEBUG
+	try:
+		# copy the file metadata
+		copystat(source_file,backup_file_path)
+		st = os.stat(source_file)
+		if os.name == 'posix':
+			os.chown(backup_file_path, st.st_uid, st.st_gid)
+		os.utime(backup_file_path, (st.st_atime, st.st_mtime))
+		if DEBUG:
+			tl.teeprint(f'Copied metadata of {source_file} to {backup_file_path}')
+		return True
+	except:
+		tl.teeerror(f'Failed to copy metadata of {source_file}')
+		return False
 
 def run_commands_with_semaphore(commands:list):
 	global BACKUP_SEMAPHORE
@@ -1458,11 +1498,13 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	# When restarting reverberator, will do one backup that will only handle create, modify, delete, attrib.
 	monitor_files, monitor_folders = get_all_files_and_folders(monitor_path)
 	latest_version_files, latest_version_folders = get_all_files_and_folders(latest_version_info.path)
-	latest_version_files_folders = set()
-	for latest_version_entry in latest_version_files:
-		latest_version_files_folders.add(os.path.relpath(latest_version_entry,latest_version_info.path))
-	for latest_version_entry in latest_version_folders:
-		latest_version_files_folders.add(os.path.relpath(latest_version_entry,latest_version_info.path)+'/')
+	latest_version_files = [os.path.relpath(latest_version_entry,latest_version_info.path) for latest_version_entry in latest_version_files]
+	latest_version_folders = [os.path.relpath(latest_version_entry,latest_version_info.path) + '/' for latest_version_entry in latest_version_folders]
+	latest_version_files_folders = set(latest_version_files + latest_version_folders)
+	# for latest_version_entry in latest_version_files:
+	# 	latest_version_files_folders.add(os.path.relpath(latest_version_entry,latest_version_info.path))
+	# for latest_version_entry in latest_version_folders:
+	# 	latest_version_files_folders.add(os.path.relpath(latest_version_entry,latest_version_info.path)+'/')
 	for monitor_entry in monitor_files:
 		rel_entry = os.path.relpath(monitor_entry,monitor_path)
 		isDir = False
@@ -1476,7 +1518,8 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 		if DEBUG:
 			tl.teeprint(f'Deleted file/folder {deleted_entry}')
 		backupEntries[os.path.join(monitor_path,deleted_entry)] = BackupEntryValues(datetime.datetime.now().isoformat(),'delete',None)
-	
+	return TrackingFilesFolders(latest_version_files,latest_version_folders)
+
 def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_files_folders:set,rel_entry:str,monitor_entry:str,isDir:bool):
 	global DEBUG
 	global tl
@@ -1748,7 +1791,87 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	multiCMD.run_command(['rm','-rf',referenceVaultPath],quiet=True,return_code_only=True)
 	return removingSize, removingInodes
 
-def do_reverb_backup():
+def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
+					 only_sync_attributes:bool,trackingFilesFolders:TrackingFilesFolders,monitor_path:str):
+	global DEBUG
+	global tl
 	# this function does the actual backup using a referenced version and a change list to copy the source from
-	...
+	# reverb backup flow:
+	#   do referenced copy of the last version to the current backup folder 
+	#   replay the changes chronologically ( to respect moves )
+	vaultFiles, vaultFolders  = do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,trackingFilesFolders=trackingFilesFolders,relative=True)
+	vaultFiles = set(vaultFiles)
+	vaultFolders = set(vaultFolders)
+	for path, values in backup_entries.items():
+		relative_path = os.path.relpath(path=path,start=monitor_path)
+		vault_path = os.path.join(backup_folder,relative_path)
+		isDir = path.endswith('/')
+		# create, modify, attrib, move, delete
+		if values.event in {'create','modify'}:
+			# we just over write the vault file with the source file
+			if isDir:
+				vaultFolders.add(relative_path)
+				newFiles, newFolders = get_all_files_and_folders(path)
+				for file in newFiles:
+					vaultFiles.add(os.path.relpath(file,monitor_path))
+				for folder in newFolders:
+					vaultFolders.add(os.path.relpath(folder,monitor_path)+'/')
+			else:
+				vaultFiles.add(relative_path)
+			# we just copy the entire folder / file ( for recursive create purposes )
+			cp_af_copy_path(source_path=path,dest_path=vault_path,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+		elif values.event == 'attrib':
+			if isDir:
+				# we just copy the folder metadata
+				os.makedirs(vault_path,exist_ok=True)
+				copy_file_meta(path,vault_path)
+				vaultFolders.add(relative_path)
+			else:
+				if only_sync_attributes:
+					# we just copy the file metadata
+					copy_file_meta(path,vault_path)
+				else:
+					# we copy the file
+					cp_af_copy_path(source_path=path,dest_path=vault_path,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+				vaultFiles.add(relative_path)
+		elif values.event == 'delete':
+			if isDir:
+				# we just remove the folder
+				if os.path.abspath(vault_path) == '/':
+					# we cannot remove root
+					tl.teeerror(f'Attempting to remove root, skipping')
+				else:
+					multiCMD.run_command(['rm','-rf',vault_path],quiet=True,return_code_only=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+				vaultFolders.discard(relative_path)
+				# also need to remove all the files in the folder
+				vaultFiles = {file for file in vaultFiles if not file.startswith(vault_path)}
+			else:
+				# we just remove the file
+				multiCMD.run_command(['rm','-f',vault_path],quiet=True,return_code_only=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+				vaultFiles.discard(relative_path)
+		elif values.event == 'move':
+			target_relative_path = os.path.relpath(values.target_path,monitor_path)
+			if isDir:
+				vaultFolders.discard(relative_path)
+				vaultFolders.add(target_relative_path)
+				# also need to move all the files in the folder
+				oldFiles = set()
+				newFiles = set()
+				for file in vaultFiles:
+					if file.startswith(relative_path):
+						oldFiles.add(file)
+						newFiles.add(os.path.relpath(file,monitor_path))
+				vaultFiles.difference_update(oldFiles)
+				vaultFiles.update(newFiles)
+			else:
+				vaultFiles.discard(relative_path)
+				vaultFiles.add(target_relative_path)
+			# we need to wait for cp threads to finish to allow rename
+			multiCMD.join_threads()
+			target_path = os.path.join(backup_folder,target_relative_path)
+			os.rename(vault_path,target_path)
+			if DEBUG:
+				tl.teeprint(f'Moved {vault_path} to {target_path}')
+	multiCMD.join_threads()
+	return TrackingFilesFolders(vaultFiles,vaultFolders)
 
