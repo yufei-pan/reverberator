@@ -295,6 +295,8 @@ def parse_rules(rule_file:str):
 		sys.exit(1)
 
 	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=DEBUG)
+	if DEBUG:
+		tl.teeprint(f'Parsed rules: \n{rules}')
 	if not rules:
 		tl.teeerror(f'Error: Rule file {rule_file} appears empty after parsing.')
 		sys.exit(1)
@@ -594,7 +596,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 			if DEBUG:
 				tl.teeok(f'Events detected: {len(events)}')
 				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
-				print(TSVZ.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
+				tl.teeprint(TSVZ.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
 			monTime = time.monotonic()
 			for event in events:
 				if event.mask & flags.Q_OVERFLOW:
@@ -752,27 +754,21 @@ class bidict(dict):
 			del self.inverse[self[key]]
 		super(bidict, self).__delitem__(key)
 
-def testWatchFolderOperation(testCMD:list,to_process:deque,to_process_flag:threading.Event):
-	multiCMD.run_command(testCMD)
-	to_process_flag.wait(1)
-	print(to_process)
-	to_process.clear()
-	to_process_flag.clear()
-
 def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None):
 	global DEBUG
+	global tl
 	if not os.path.exists(monitor_path):
 		return -1
 	irm.increaseUserWatches()
 	if DEBUG:
-		print(f'Adding watch for {monitor_path}')
+		tl.teeprint(f'Adding watch for {monitor_path}')
 	parentWatchDescriptor = inotify_obj.add_watch(monitor_path, watch_flags)
 	if newDirWds is not None:
 		newDirWds.add(parentWatchDescriptor)
 	wdDic[parentWatchDescriptor] = monitor_path
 	allFolders = get_all_folders(monitor_path)
 	if DEBUG:
-		print(f'Adding watch for {len(allFolders)} sub folders')
+		tl.teeprint(f'Adding watch for {len(allFolders)} sub folders')
 	irm.increaseUserWatches(len(allFolders))
 	for folder in allFolders:
 		childWd = inotify_obj.add_watch(folder, watch_flags)
@@ -790,6 +786,8 @@ def get_all_files(path):
 	return files
 
 def get_all_files_and_folders(path):
+	global DEBUG
+	global tl
 	files = []
 	folders = []
 	try:
@@ -802,8 +800,10 @@ def get_all_files_and_folders(path):
 					folders.extend(child_folders)
 				else:
 					files.append(entry.path)
-	except PermissionError:
-		pass
+	except Exception as e:
+		if DEBUG:
+			tl.teeerror(f'Error scanning {path}: {e}')
+		return [], []
 	return files, folders
 
 def fs_flag_daemon(path:str,signiture:str,fsEvent:threading.Event):
@@ -1285,9 +1285,12 @@ def is_subpath(child, parent):
 	common = os.path.commonpath([child, parent])
 	return common == parent
 
-def cp_af_copy_path(source_path:str,dest_path:str,wait_for_return:bool = True,sem:threading.Semaphore = None):
+def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...):
 	global DEBUG
-	return multiCMD.run_command(['cp','-af','--reflink=auto','--sparse=always',source_path,dest_path],quiet=not DEBUG,return_code_only=True,wait_for_return=wait_for_return,sem=sem)
+	if mcae is ...:
+		return multiCMD.run_command(['cp','-af','--reflink=auto','--sparse=always',source_path,dest_path],quiet=not DEBUG,return_code_only=True,wait_for_return=True)
+	else:
+		return mcae.run_command(['cp','-af','--reflink=auto','--sparse=always',source_path,dest_path])
 
 def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:TrackingFilesFolders=None,relative = False):
 	global DEBUG
@@ -1304,7 +1307,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:Tr
 		backup_folder_path = os.path.join(backup_folder,folder)
 		os.makedirs(backup_folder_path,exist_ok=True)
 		copy_file_meta(source_folder,backup_folder_path)
-	commands = []
+	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE)
 	for file in files:
 		# use ln -fsrLT to do a relative symlink
 		# ln --symbolic --logical --force --no-target-directory
@@ -1312,11 +1315,12 @@ def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:Tr
 		backup_file_path = os.path.join(backup_folder,file)
 		source_file = os.path.abspath(source_file)
 		if relative:
-			commands.append(['ln','-rfsLT',source_file,backup_file_path])
+			# taskObj = multiCMD.run_command(['ln','-rfsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+			mcae.run_command(['ln','-rfsLT',source_file,backup_file_path])
 		else:
-			commands.append(['ln','-fsLT',source_file,backup_file_path])
-	if commands:
-		run_commands_with_semaphore(commands)
+			#taskObj = multiCMD.run_command(['ln','-fsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+			mcae.run_command(['ln','-fsLT',source_file,backup_file_path])
+	mcae.join()
 	return TrackingFilesFolders(files, folders)
 
 def copy_file_meta(source_file:str,backup_file_path:str):
@@ -1336,39 +1340,40 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 		tl.teeerror(f'Failed to copy metadata of {source_file}')
 		return False
 
-def run_commands_with_semaphore(commands:list):
-	global BACKUP_SEMAPHORE
-	global DEBUG
-	global tl
-	# check if there is any free semaphores available
-	# Use as much semaphore as possible
-	remaining_semaphores = BACKUP_SEMAPHORE._value
-	if remaining_semaphores < len(commands) // 2:
-		threads_to_use = remaining_semaphores // 2
-	else:
-		threads_to_use = len(commands) // 2
-	if DEBUG:
-		tl.teeprint(f'Using {threads_to_use} threads for backup')
-	if threads_to_use > 1:
-		[BACKUP_SEMAPHORE.acquire() for _ in range(threads_to_use)]
-		if DEBUG:
-			tl.teeprint(f'Running backup commands with {threads_to_use} threads, reduced sem from {remaining_semaphores} to {BACKUP_SEMAPHORE._value}')
-		multiCMD.run_commands(commands,quiet=True,return_code_only=True,max_threads=threads_to_use)
-		BACKUP_SEMAPHORE.release(threads_to_use)
-		if DEBUG:
-			tl.teeprint(f'Released {threads_to_use} semaphores, sem count: {BACKUP_SEMAPHORE._value}')
-	else:
-		multiCMD.run_commands(commands,quiet=True,return_code_only=True)
+# def run_commands_with_semaphore(commands:list):
+# 	global BACKUP_SEMAPHORE
+# 	global DEBUG
+# 	global tl
+# 	# check if there is any free semaphores available
+# 	# Use as much semaphore as possible
+# 	remaining_semaphores = BACKUP_SEMAPHORE._value
+# 	if remaining_semaphores < len(commands) // 2:
+# 		threads_to_use = remaining_semaphores // 2
+# 	else:
+# 		threads_to_use = len(commands) // 2
+# 	if DEBUG:
+# 		tl.teeprint(f'Using {threads_to_use} threads for backup')
+# 	if threads_to_use > 1:
+# 		[BACKUP_SEMAPHORE.acquire() for _ in range(threads_to_use)]
+# 		if DEBUG:
+# 			tl.teeprint(f'Running backup commands with {threads_to_use} threads, reduced sem from {remaining_semaphores} to {BACKUP_SEMAPHORE._value}')
+# 		multiCMD.run_commands(commands,quiet=True,return_code_only=True,max_threads=threads_to_use)
+# 		BACKUP_SEMAPHORE.release(threads_to_use)
+# 		if DEBUG:
+# 			tl.teeprint(f'Released {threads_to_use} semaphores, sem count: {BACKUP_SEMAPHORE._value}')
+# 	else:
+# 		multiCMD.run_commands(commands,quiet=True,return_code_only=True)
 
 def get_path_size(*path:str):
 	global DEBUG
+	global tl
 	# this function gets the actual size of a path
 	# du --bytes -s <path>
 	if DEBUG:
 		startTime = time.perf_counter()
 	rtn = multiCMD.run_command(['du','--block-size=1','-csP',*path],quiet=True)
 	if DEBUG:
-		print(f'get_path_size took {time.perf_counter()-startTime} seconds')
+		tl.teeprint(f'get_path_size took {time.perf_counter()-startTime} seconds')
 	if rtn and rtn[-1] and rtn[-1].partition('\t')[0].isdigit():
 		return int(rtn[-1].partition('\t')[0])
 	else:
@@ -1376,19 +1381,21 @@ def get_path_size(*path:str):
 
 def get_path_inodes(*path:str):
 	global DEBUG
+	global tl
 	# this function gets the number of inodes in a path
 	# df --inodes -s <path>
 	if DEBUG:
 		startTime = time.perf_counter()
 	rtn = multiCMD.run_command(['du','--inodes','-csP',*path],quiet=True)
 	if DEBUG:
-		print(f'get_path_inodes took {time.perf_counter()-startTime} seconds')
+		tl.teeprint(f'get_path_inodes took {time.perf_counter()-startTime} seconds')
 	if rtn and rtn[-1] and rtn[-1].partition('\t')[0].isdigit():
 		return int(rtn[-1].partition('\t')[0])
 	else:
 		return 0
 
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_format='.2f'):
+	global tl
 	"""
 	Format the size in bytes to a human-readable format or vice versa.
 	From hpcp: https://github.com/yufei-pan/hpcp
@@ -1424,8 +1431,8 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 			if not match:
 				if to_str:
 					return size
-				print("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'")
-				print(f"Got: {size}")
+				tl.teeerror("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'")
+				tl.teeprint(f"Got: {size}")
 				return 0
 			number, _, unit = match.groups()
 			number = float(number)
@@ -1445,7 +1452,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 			if unit not in unit_labels:
 				if to_str:
 					return size
-				print(f"Invalid unit '{unit}'. Expected one of {list(unit_labels.keys())}")
+				tl.teeerror(f"Invalid unit '{unit}'. Expected one of {list(unit_labels.keys())}")
 				return 0
 			if to_str:
 				return format_bytes(size=int(number * (power ** unit_labels[unit])), use_1024_bytes=use_1024_bytes, to_str=True, str_format=str_format)
@@ -1485,9 +1492,9 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 			return format_bytes(float(size), use_1024_bytes)
 		except Exception as e:
 			import traceback
-			print(f"Error: {e}")
-			print(traceback.format_exc())
-			print(f"Invalid size: {size}")
+			tl.teeerror(f"Error: {e}")
+			tl.teeprint(traceback.format_exc())
+			tl.teeerror("Invalid size: {size}")
 		return 0
 
 def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str):
@@ -1722,6 +1729,8 @@ def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_
 	return rtn_size_limit, rtn_inode_limit
 
 def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
+	global tl
+	global DEBUG
 	# this function remove the oldest reverb from path
 	if len(vault_info_dict) < 2:
 		# we cannot step as there is less than 2 availble reverbs
@@ -1729,8 +1738,8 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	referenceVersionNumber, referenceVaultEntry = vault_info_dict.popitem(last=False)
 	referenceVaultPath = os.path.abspath(referenceVaultEntry.path)
 	if referenceVaultPath == '/':
-		print('Attempting to remove root, skipping')
-		print(referenceVaultEntry)
+		tl.teeerror('Attempting to remove root, skipping')
+		tl.teeprint(referenceVaultEntry)
 		return 0 , 0
 	if DEBUG:
 		tl.teeprint(f'Removing {referenceVersionNumber}: {referenceVaultPath}')
@@ -1755,16 +1764,23 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 					new_target = os.path.relpath(movedPath[target],applyingVaultEntry.path)
 					if DEBUG:
 						tl.teeprint(f'Applying new target {new_target} to {file}')
-					os.remove(file)
-					os.symlink(new_target,file)
+					try:
+						os.remove(file)
+						os.symlink(new_target,file)
+					except Exception as e:
+						tl.teeerror(f'Error applying new target {new_target} to {file}: {e}')
 					continue
 				if target.startswith(referenceVaultPath):
 					# this means we need to move the file to the new location
 					# get the relative path of the target
 					if DEBUG:
 						tl.teeprint(f'Moving {target} to {file}')
-					os.remove(file)
-					os.rename(target,file)
+					try:
+						os.remove(file)
+						os.rename(target,file)
+					except Exception as e:
+						tl.teeerror(f'Error moving {target} to {file}: {e}')
+						continue
 					new_size += os.path.getsize(file)
 					pendingMovedPath[target] = os.path.relpath(file,applyingVaultEntry.path)
 				elif DEBUG:
@@ -1777,7 +1793,11 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 			if newVaultPath != applyingVaultEntry.path:
 				if DEBUG:
 					tl.teeprint(f'Renaming {applyingVaultEntry.path} to {newVaultPath}')
-				os.rename(applyingVaultEntry.path,newVaultPath)
+				try:
+					os.rename(applyingVaultEntry.path,newVaultPath)
+				except Exception as e:
+					tl.teeerror(f'Error renaming {applyingVaultEntry.path} to {newVaultPath}: {e}')
+					continue
 				vault_info_dict[applyingVersionNumber] = applyingVaultEntry._replace(path=newVaultPath)
 		else:
 			newVaultPath = applyingVaultEntry.path
@@ -1795,6 +1815,34 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					 only_sync_attributes:bool,trackingFilesFolders:TrackingFilesFolders,monitor_path:str):
 	global DEBUG
 	global tl
+	global BACKUP_SEMAPHORE
+	def copy_path(isDir,path,relative_path,vaultFolders,vaultFiles,vault_path,mcae):
+		if isDir:
+			vaultFolders.add(relative_path)
+			newFiles, newFolders = get_all_files_and_folders(path)
+			for file in newFiles:
+				vaultFiles.add(os.path.relpath(file,monitor_path))
+			for folder in newFolders:
+				vaultFolders.add(os.path.relpath(folder,monitor_path)+'/')
+		else:
+			vaultFiles.add(relative_path)
+		# we just copy the entire folder / file ( for recursive create purposes )
+		cp_af_copy_path(source_path=path,dest_path=vault_path,mcae=mcae)
+	def delete_path(isDir,vault_path,relative_path,mcae,vaultFolders,vaultFiles):
+		if isDir:
+			# we just remove the folder
+			if os.path.abspath(vault_path) == '/':
+				# we cannot remove root
+				tl.teeerror(f'Attempting to remove root, skipping')
+			else:
+				mcae.run_command(['rm','-rf',vault_path])
+			vaultFolders.discard(relative_path)
+			# also need to remove all the files in the folder
+			vaultFiles = {file for file in vaultFiles if not file.startswith(vault_path)}
+		else:
+			# we just remove the file
+			mcae.run_command(['rm','-f',vault_path])
+			vaultFiles.discard(relative_path)
 	# this function does the actual backup using a referenced version and a change list to copy the source from
 	# reverb backup flow:
 	#   do referenced copy of the last version to the current backup folder 
@@ -1802,24 +1850,17 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	vaultFiles, vaultFolders  = do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,trackingFilesFolders=trackingFilesFolders,relative=True)
 	vaultFiles = set(vaultFiles)
 	vaultFolders = set(vaultFolders)
+	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE)
 	for path, values in backup_entries.items():
+		if DEBUG:
+			tl.teeprint(f'Processing {path} {values}')
 		relative_path = os.path.relpath(path=path,start=monitor_path)
 		vault_path = os.path.join(backup_folder,relative_path)
 		isDir = path.endswith('/')
 		# create, modify, attrib, move, delete
 		if values.event in {'create','modify'}:
 			# we just over write the vault file with the source file
-			if isDir:
-				vaultFolders.add(relative_path)
-				newFiles, newFolders = get_all_files_and_folders(path)
-				for file in newFiles:
-					vaultFiles.add(os.path.relpath(file,monitor_path))
-				for folder in newFolders:
-					vaultFolders.add(os.path.relpath(folder,monitor_path)+'/')
-			else:
-				vaultFiles.add(relative_path)
-			# we just copy the entire folder / file ( for recursive create purposes )
-			cp_af_copy_path(source_path=path,dest_path=vault_path,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+			copy_path(isDir,path,relative_path,vaultFolders,vaultFiles,vault_path,mcae)
 		elif values.event == 'attrib':
 			if isDir:
 				# we just copy the folder metadata
@@ -1832,46 +1873,47 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					copy_file_meta(path,vault_path)
 				else:
 					# we copy the file
-					cp_af_copy_path(source_path=path,dest_path=vault_path,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+					cp_af_copy_path(source_path=path,dest_path=vault_path,mcae=mcae)
 				vaultFiles.add(relative_path)
 		elif values.event == 'delete':
+			delete_path(isDir,vault_path,relative_path,mcae,vaultFolders,vaultFiles)
+		elif values.event == 'move':
+			source_relative_path = os.path.relpath(values.source_path,monitor_path)
+			target_relative_path = relative_path
 			if isDir:
-				# we just remove the folder
 				if os.path.abspath(vault_path) == '/':
 					# we cannot remove root
-					tl.teeerror(f'Attempting to remove root, skipping')
-				else:
-					multiCMD.run_command(['rm','-rf',vault_path],quiet=True,return_code_only=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
-				vaultFolders.discard(relative_path)
-				# also need to remove all the files in the folder
-				vaultFiles = {file for file in vaultFiles if not file.startswith(vault_path)}
-			else:
-				# we just remove the file
-				multiCMD.run_command(['rm','-f',vault_path],quiet=True,return_code_only=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
-				vaultFiles.discard(relative_path)
-		elif values.event == 'move':
-			target_relative_path = os.path.relpath(values.target_path,monitor_path)
-			if isDir:
-				vaultFolders.discard(relative_path)
-				vaultFolders.add(target_relative_path)
+					tl.teeerror(f'Attempting to move root, skipping')
+					continue
+				vaultFolders.discard(source_relative_path)
+				vaultFolders.add(relative_path)
 				# also need to move all the files in the folder
 				oldFiles = set()
 				newFiles = set()
 				for file in vaultFiles:
-					if file.startswith(relative_path):
+					if file.startswith(source_relative_path):
 						oldFiles.add(file)
 						newFiles.add(os.path.relpath(file,monitor_path))
 				vaultFiles.difference_update(oldFiles)
 				vaultFiles.update(newFiles)
 			else:
-				vaultFiles.discard(relative_path)
+				vaultFiles.discard(source_relative_path)
 				vaultFiles.add(target_relative_path)
 			# we need to wait for cp threads to finish to allow rename
-			multiCMD.join_threads()
+			mcae.wait()
+			source_path = os.path.join(backup_folder,source_relative_path)
 			target_path = os.path.join(backup_folder,target_relative_path)
-			os.rename(vault_path,target_path)
-			if DEBUG:
-				tl.teeprint(f'Moved {vault_path} to {target_path}')
-	multiCMD.join_threads()
+			try:
+				os.rename(source_path,target_path)
+				if DEBUG:
+					tl.teeprint(f'Moved {source_path} to {target_path}')
+			except:
+				tl.teeerror(f'Failed to move {source_path} to {target_path}')
+				if DEBUG:
+					import traceback
+					tl.teeerror(traceback.format_exc())
+				# if we fail to move, we just copy the file
+				copy_path(isDir,source_path,target_relative_path,vaultFolders,vaultFiles,target_path,mcae)
+				delete_path(isDir,source_path,source_relative_path,mcae,vaultFolders,vaultFiles)
+	mcae.join()
 	return TrackingFilesFolders(vaultFiles,vaultFolders)
-
