@@ -62,12 +62,12 @@ __version__ = 0.10
 CHANGED_EVENT_HEADER = ['monotonic_time', 'is_dir', 'event', 'path','moved_from']
 BACKUP_ENTRY_VALUES_HEADER = ['iso_time','event','source_path']
 BACKUP_JOURNAL_HEADER = ['at_path','iso_time','event','source_path']
-REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Monitoring File System Signiture', 
-		'Minium snapshot time', 'Vault Path', 'Keep 1 Compelete Backup', 
+REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Vault Path','Monitoring File System Signiture', 
+		'Minium snapshot interval', 'Maximum snapshot interval','Keep 1 Compelete Backup', 
 		'Only Sync Attributes (permissions)', 'Keep N versions', 'Backup Size Limit', 
 		'Vault File System Signiture']
-REVERB_RULE_HEADER = ['job_name', 'mon_path', 'mon_fs_signiture', 
-		'min_shapshot_time', 'vault_path', 'keep_one_complete_backup', 
+REVERB_RULE_HEADER = ['job_name', 'mon_path','vault_path', 'mon_fs_signiture', 
+		'min_shapshot_time','max_shapshot_time' , 'keep_one_complete_backup', 
 		'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
 		'vault_fs_signiture']
 VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
@@ -308,25 +308,41 @@ def parse_rules(rule_file:str):
 		if DEBUG:
 			tl.teeprint(f'Checking rule: {ruleList}')
 		ruleUpdated = False
-		if not ruleList[0]:
+		#['job_name', 'mon_path','vault_path', 'mon_fs_signiture', 
+		#'min_shapshot_time','max_shapshot_time' , 'keep_one_complete_backup', 
+		#'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
+		#'vault_fs_signiture']
+		# outRule is a dict
+		inRule = { field: value for field, value in zip(REVERB_RULE_HEADER, ruleList)}
+		# job_name
+		if not inRule['job_name']:
 			tl.teelog(f'Warning: Rule {ruleName} has empty Job Name. Ignoring rule...',level='warning')
 			continue
-		cleanedJobName = slugify(ruleList[0])
-		if cleanedJobName != ruleList[0]:
+		cleanedJobName = slugify(inRule['job_name'])
+		if cleanedJobName != inRule['job_name']:
 			tl.teelog(f'Warning: Rule {ruleName} has dirty Job Name. Changing to {cleanedJobName}',level='warning')
-			ruleList[0] = cleanedJobName
+			inRule['job_name'] = cleanedJobName
 			ruleUpdated = True
-		if not ruleList[1]:
+		# mon_path
+		if not inRule['mon_path']:
 			tl.teelog(f'Warning: Rule {ruleName} has empty Path Monitoring. Ignoring rule...',level='warning')
 			continue
-		if not os.path.exists(ruleList[1]):
-			tl.teeerror(f'Error: Rule {ruleName} has Path Monitoring: {ruleList[1]} which does not exist. Ignoring rule...')
+		if not os.path.exists(inRule['mon_path']):
+			tl.teeerror(f'Error: Rule {ruleName} has Path Monitoring: {inRule["mon_path"]} which does not exist. Ignoring rule...')
 			continue
-		newSourcePath = os.path.realpath(ruleList[1])
-		if newSourcePath != ruleList[1]:
+		newSourcePath = os.path.realpath(inRule['mon_path'])
+		if newSourcePath != inRule['mon_path']:
 			tl.teelog(f'Warning: Rule {ruleName} has dirty Path Monitoring. Changing to {newSourcePath}',level='warning')
-			ruleList[1] = newSourcePath
+			inRule['mon_path'] = newSourcePath
 			ruleUpdated = True
+		# vault_path
+		if not inRule['vault_path']:
+			tl.teelog(f'Warning: Rule {ruleName} has empty Vault Path. Ignoring rule...',level='warning')
+			continue
+		if is_subpath(inRule['vault_path'],inRule['mon_path']):
+			tl.teelog(f'Warning: Rule {ruleName} has Vault Path: {inRule["vault_path"]} which is a subpath of the source path. Ignoring rule...',level='warning')
+			continue
+		# mon_fs_signature
 		if not ruleList[2] or ruleList[2].lower() == 'auto':
 			signitures = get_fs_signitures(ruleList[1])
 			if signitures and signitures[0]:
@@ -336,6 +352,7 @@ def parse_rules(rule_file:str):
 			else:
 				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signiture, disabling fs monitoring for this run...',level='warning')
 				ruleList[2] = 'auto'
+		# min_shapshot_time
 		if not ruleList[3] or ruleList[3].lower() == 'none':
 			ruleList[3] = '0'
 			tl.info(f'Zeroed Minium snapshot time for {ruleName}: {ruleList[3]}')
@@ -344,21 +361,18 @@ def parse_rules(rule_file:str):
 			ruleList[3] = DEFAULT_SNAPSHOT_DELAY
 			tl.info(f'Auto filled Minium snapshot time for {ruleName}: {ruleList[3]}')
 			ruleUpdated = True
-		if not ruleList[4]:
-			tl.teelog(f'Warning: Rule {ruleName} has empty Vault Path. Ignoring rule...',level='warning')
-			continue
-		# vault path cannot be contained under the source path
-		if is_subpath(ruleList[4],ruleList[1]):
-			tl.teelog(f'Warning: Rule {ruleName} has Vault Path: {ruleList[4]} which is a subpath of the source path. Ignoring rule...',level='warning')
-			continue
+		# max_shapshot_time
+		# keep_one_complete_backup
 		if not ruleList[5] or ruleList[5].lower() == 'auto' or ruleList[5].lower() == 'none':
 			ruleList[5] = str(DEFAULT_KEEP_ONE_COMPLETE_BACKUP)
 			tl.info(f'Auto filled Keep 1 Compelete Backup for {ruleName}: {ruleList[5]}')
 			ruleUpdated = True
+		# only_sync_attributes
 		if not ruleList[6] or ruleList[6].lower() == 'auto' or ruleList[6].lower() == 'none':
 			ruleList[6] = str(DEFAULT_ONLY_SYNC_ATTRIBUTES)
 			tl.info(f'Auto filled Only Sync Attributes for {ruleName}: {ruleList[6]}')
 			ruleUpdated = True
+		# keep_n_versions
 		if not ruleList[7] or ruleList[7].lower() == 'none':
 			ruleList[7] = '0'
 			tl.info(f'Zeroed Keep N versions for {ruleName}: {ruleList[7]}')
@@ -367,10 +381,12 @@ def parse_rules(rule_file:str):
 			ruleList[7] = DEFAULT_KEEP_N_VERSIONS
 			tl.info(f'Auto filled Keep N versions for {ruleName}: {ruleList[7]}')
 			ruleUpdated = True
+		# backup_size_limit
 		if not ruleList[8] or ruleList[8].lower() == 'auto' or ruleList[8].lower() == 'none':
 			ruleList[8] = DEFAULT_BACKUP_SIZE_LIMIT
 			tl.info(f'Auto filled Backup Size Limit for {ruleName}: {ruleList[8]}')
 			ruleUpdated = True
+		# vault_fs_signiture
 		if not ruleList[9] or ruleList[9].lower() == 'auto':
 			if not os.path.exists(ruleList[4]):
 				# try create it 
@@ -387,10 +403,11 @@ def parse_rules(rule_file:str):
 			else:
 				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signiture, disabling fs monitoring for this run...',level='warning')
 				ruleList[9] = 'auto'
+		# check if the rule is explicit
 		if ruleUpdated:
 			tl.info(f'Updating rule {ruleName}: {ruleList}')
 			rulesToUpdate.append(ruleList)
-		returnReverbRules.append(ReverbRule(*ruleList))
+		returnReverbRules.append()
 		# append to tsv as well
 		TSVZ.appendLinesTabularFile(rule_file,rulesToUpdate,header=REVERB_RULE_TSV_HEADER,createIfNotExist=False,verifyHeader=True,verbose=DEBUG,strict=False)
 	return returnReverbRules
