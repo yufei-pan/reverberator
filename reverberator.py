@@ -62,14 +62,14 @@ __version__ = 0.10
 CHANGED_EVENT_HEADER = ['monotonic_time', 'is_dir', 'event', 'path','moved_from']
 BACKUP_ENTRY_VALUES_HEADER = ['iso_time','event','source_path']
 BACKUP_JOURNAL_HEADER = ['at_path','iso_time','event','source_path']
-REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Vault Path','Monitoring File System Signiture', 
+REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Vault Path','Monitoring File System Signature', 
 		'Minium snapshot interval', 'Maximum snapshot interval','Keep 1 Compelete Backup', 
 		'Only Sync Attributes (permissions)', 'Keep N versions', 'Backup Size Limit', 
-		'Vault File System Signiture']
-REVERB_RULE_HEADER = ['job_name', 'mon_path','vault_path', 'mon_fs_signiture', 
+		'Vault File System Signature']
+REVERB_RULE_HEADER = ['job_name', 'mon_path','vault_path', 'mon_fs_signature', 
 		'min_shapshot_time','max_shapshot_time' , 'keep_one_complete_backup', 
 		'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
-		'vault_fs_signiture']
+		'vault_fs_signature']
 VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
 VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes']
 VAULT_TIMESTAMP_FORMAT = '%Y-%m-%d_%H-%M-%S_%z'
@@ -86,9 +86,10 @@ TrackingFilesFolders = namedtuple('TrackingFilesFolders', TRACKING_FILES_FOLDERS
 BACKUP_SEMAPHORE = threading.Semaphore(2*os.cpu_count())
 
 DEFAULT_SNAPSHOT_DELAY = 60
-DEFAULT_KEEP_ONE_COMPLETE_BACKUP = False
-DEFAULT_ONLY_SYNC_ATTRIBUTES = False
-DEFAULT_KEEP_N_VERSIONS = 30
+DEFAULT_MAX_DELAY = 86400
+DEFAULT_KEEP_ONE_COMPLETE_BACKUP = True
+DEFAULT_ONLY_SYNC_ATTRIBUTES = True
+DEFAULT_KEEP_N_VERSIONS = 0
 DEFAULT_BACKUP_SIZE_LIMIT = '5%'
 
 ARG_MAX = os.sysconf('SC_ARG_MAX')
@@ -102,7 +103,7 @@ GREEN_LIGHT.set()
 
 HASH_SIZE = 1<<16
 
-DEBUG = True
+DEBUG = False
 
 tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=False,noLog=True)
 
@@ -112,6 +113,7 @@ def main():
 	global tl
 	global GREEN_LIGHT
 	global DEFAULT_SNAPSHOT_DELAY
+	global DEFAULT_MAX_DELAY
 	global DEFAULT_KEEP_ONE_COMPLETE_BACKUP
 	global DEFAULT_ONLY_SYNC_ATTRIBUTES
 	global DEFAULT_KEEP_N_VERSIONS
@@ -145,13 +147,18 @@ def main():
 	for reverb_rule in rules:
 		job_name = reverb_rule.job_name
 		monitor_path = reverb_rule.mon_path
-		monitor_path_signiture = reverb_rule.mon_fs_signiture
+		monitor_path_signature = reverb_rule.mon_fs_signature
 		min_snapshot_delay_seconds = DEFAULT_SNAPSHOT_DELAY
 		try:
 			min_snapshot_delay_seconds = int(reverb_rule.min_shapshot_time)
 		except:
 			tl.teeerror(f'Error: Rule {job_name} has invalid min_snapshot_delay_seconds value: {reverb_rule.min_shapshot_time}')
 			tl.teeprint(f"Reverting to default value: {DEFAULT_SNAPSHOT_DELAY}")
+		try:
+			max_shapshot_delay_seconds = int(reverb_rule.max_shapshot_time)
+		except:
+			tl.teeerror(f'Error: Rule {job_name} has invalid min_snapshot_delay_seconds value: {reverb_rule.max_shapshot_time}')
+			tl.teeprint(f"Reverting to default value: {DEFAULT_MAX_DELAY}")
 		vault_path = reverb_rule.vault_path
 		if reverb_rule.keep_one_complete_backup.lower() == 'none':
 			keep_one_complete_backup = DEFAULT_KEEP_ONE_COMPLETE_BACKUP
@@ -168,22 +175,22 @@ def main():
 			tl.teeerror(f'Error: Rule {job_name} has invalid keep_n_versions value: {reverb_rule.keep_n_versions}')
 			tl.teeprint(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}")
 		backup_size_limit = reverb_rule.backup_size_limit
-		vault_path_signiture = reverb_rule.vault_fs_signiture
+		vault_path_signature = reverb_rule.vault_fs_signature
 		to_process = deque()
 		to_process_flag = threading.Event()
 		monitor_fs_flag = threading.Event()
-		monitor_fs_thread = threading.Thread(target=fs_flag_daemon,args=(monitor_path,monitor_path_signiture,monitor_fs_flag),daemon=True)
+		monitor_fs_thread = threading.Thread(target=fs_flag_daemon,args=(monitor_path,monitor_path_signature,monitor_fs_flag),daemon=True)
 		tl.teeprint(f'Starting path watcher {job_name} for {monitor_path}')
 		monitor_fs_thread.start()
-		watcherThread = threading.Thread(target=watcher,args=(monitor_fs_flag,monitor_path,to_process,to_process_flag,irm,min_snapshot_delay_seconds),daemon=True)
+		watcherThread = threading.Thread(target=watcher,args=(monitor_fs_flag,monitor_path,to_process,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds),daemon=True)
 		watcherThread.start()
 		main_threads.append(watcherThread)
-		tl.teeok(f'Started reverb monitor for {job_name} with monitor path {monitor_path}:{monitor_path_signiture}')
-		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,monitor_path,vault_path,vault_path_signiture,to_process_flag,monitor_fs_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal),daemon=True)
+		tl.teeok(f'Started reverb monitor for {job_name} with monitor path {monitor_path}:{monitor_path_signature}')
+		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal),daemon=True)
 		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
 		backup_thread.start()
 		main_threads.append(backup_thread)
-		tl.teeok(f'Started backup thread for {job_name} with vault path {vault_path}:{vault_path_signiture}')
+		tl.teeok(f'Started backup thread for {job_name} with vault path {vault_path}:{vault_path_signature}')
 	for thread in main_threads:
 		thread.join()
 	tl.teeok('All threads have exited. Exiting main thread.')
@@ -202,7 +209,7 @@ def signal_handler(sig, frame):
 		None
 	'''
 	if GREEN_LIGHT.is_set():
-		tl.teeerror('Ctrl C caught, cleanning up and exiting... ( can take up to 3 seconds )')
+		tl.teeerror('Ctrl C caught, cleanning up and exiting... ( can take up to 5 seconds )')
 		GREEN_LIGHT.clear()
 	else:
 		tl.teeerror('Ctrl C caught again, exiting immediately!')
@@ -308,12 +315,7 @@ def parse_rules(rule_file:str):
 		if DEBUG:
 			tl.teeprint(f'Checking rule: {ruleList}')
 		ruleUpdated = False
-		#['job_name', 'mon_path','vault_path', 'mon_fs_signiture', 
-		#'min_shapshot_time','max_shapshot_time' , 'keep_one_complete_backup', 
-		#'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
-		#'vault_fs_signiture']
-		# outRule is a dict
-		inRule = { field: value for field, value in zip(REVERB_RULE_HEADER, ruleList)}
+		inRule = OrderedDict(zip(REVERB_RULE_HEADER, ruleList))
 		# job_name
 		if not inRule['job_name']:
 			tl.teelog(f'Warning: Rule {ruleName} has empty Job Name. Ignoring rule...',level='warning')
@@ -343,71 +345,71 @@ def parse_rules(rule_file:str):
 			tl.teelog(f'Warning: Rule {ruleName} has Vault Path: {inRule["vault_path"]} which is a subpath of the source path. Ignoring rule...',level='warning')
 			continue
 		# mon_fs_signature
-		if not ruleList[2] or ruleList[2].lower() == 'auto':
-			signitures = get_fs_signitures(ruleList[1])
-			if signitures and signitures[0]:
-				ruleList[2] = signitures[0]
-				tl.teelog(f'Auto filled Monitoring File System Signiture for {ruleName}: {ruleList[2]}',level='info')
+		if not inRule["mon_fs_signature"] or inRule["mon_fs_signature"].lower() == 'auto':
+			signatures = get_fs_signatures(inRule["mon_path"])
+			if signatures and signatures[0]:
+				inRule["mon_fs_signature"] = signatures[0]
+				tl.teelog(f'Auto filled Monitoring File System Signature for {ruleName}: {inRule["mon_fs_signature"]}',level='info')
 				ruleUpdated = True
 			else:
-				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signiture, disabling fs monitoring for this run...',level='warning')
-				ruleList[2] = 'auto'
+				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...',level='warning')
+				inRule["mon_fs_signature"] = 'auto'
 		# min_shapshot_time
-		if not ruleList[3] or ruleList[3].lower() == 'none':
-			ruleList[3] = '0'
-			tl.info(f'Zeroed Minium snapshot time for {ruleName}: {ruleList[3]}')
+		if not inRule["min_shapshot_time"] or inRule["min_shapshot_time"].lower() == 'none':
+			inRule["min_shapshot_time"] = '0'
+			tl.info(f'Zeroed Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}')
 			ruleUpdated = True
-		elif ruleList[3].lower() == 'auto':
-			ruleList[3] = DEFAULT_SNAPSHOT_DELAY
-			tl.info(f'Auto filled Minium snapshot time for {ruleName}: {ruleList[3]}')
+		elif inRule["min_shapshot_time"].lower() == 'auto':
+			inRule["min_shapshot_time"] = DEFAULT_SNAPSHOT_DELAY
+			tl.info(f'Auto filled Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}')
 			ruleUpdated = True
 		# max_shapshot_time
 		# keep_one_complete_backup
-		if not ruleList[5] or ruleList[5].lower() == 'auto' or ruleList[5].lower() == 'none':
-			ruleList[5] = str(DEFAULT_KEEP_ONE_COMPLETE_BACKUP)
-			tl.info(f'Auto filled Keep 1 Compelete Backup for {ruleName}: {ruleList[5]}')
+		if not inRule["keep_one_complete_backup"] or inRule["keep_one_complete_backup"].lower() == 'auto' or inRule["keep_one_complete_backup"].lower() == 'none':
+			inRule["keep_one_complete_backup"] = str(DEFAULT_KEEP_ONE_COMPLETE_BACKUP)
+			tl.info(f'Auto filled Keep 1 Compelete Backup for {ruleName}: {inRule["keep_one_complete_backup"]}')
 			ruleUpdated = True
 		# only_sync_attributes
-		if not ruleList[6] or ruleList[6].lower() == 'auto' or ruleList[6].lower() == 'none':
-			ruleList[6] = str(DEFAULT_ONLY_SYNC_ATTRIBUTES)
-			tl.info(f'Auto filled Only Sync Attributes for {ruleName}: {ruleList[6]}')
+		if not inRule["only_sync_attributes"] or inRule["only_sync_attributes"].lower() == 'auto' or inRule["only_sync_attributes"].lower() == 'none':
+			inRule["only_sync_attributes"] = str(DEFAULT_ONLY_SYNC_ATTRIBUTES)
+			tl.info(f'Auto filled Only Sync Attributes for {ruleName}: {inRule["only_sync_attributes"]}')
 			ruleUpdated = True
 		# keep_n_versions
-		if not ruleList[7] or ruleList[7].lower() == 'none':
-			ruleList[7] = '0'
-			tl.info(f'Zeroed Keep N versions for {ruleName}: {ruleList[7]}')
+		if not inRule["keep_n_versions"] or inRule["keep_n_versions"].lower() == 'none':
+			inRule["keep_n_versions"] = '0'
+			tl.info(f'Zeroed Keep N versions for {ruleName}: {inRule["keep_n_versions"]}')
 			ruleUpdated = True
-		elif ruleList[7].lower() == 'auto':
-			ruleList[7] = DEFAULT_KEEP_N_VERSIONS
-			tl.info(f'Auto filled Keep N versions for {ruleName}: {ruleList[7]}')
+		elif inRule["keep_n_versions"].lower() == 'auto':
+			inRule["keep_n_versions"] = DEFAULT_KEEP_N_VERSIONS
+			tl.info(f'Auto filled Keep N versions for {ruleName}: {inRule["keep_n_versions"]}')
 			ruleUpdated = True
 		# backup_size_limit
-		if not ruleList[8] or ruleList[8].lower() == 'auto' or ruleList[8].lower() == 'none':
-			ruleList[8] = DEFAULT_BACKUP_SIZE_LIMIT
-			tl.info(f'Auto filled Backup Size Limit for {ruleName}: {ruleList[8]}')
+		if not inRule["backup_size_limit"] or inRule["backup_size_limit"].lower() == 'auto' or inRule["backup_size_limit"].lower() == 'none':
+			inRule["backup_size_limit"] = DEFAULT_BACKUP_SIZE_LIMIT
+			tl.info(f'Auto filled Backup Size Limit for {ruleName}: {inRule["backup_size_limit"]}')
 			ruleUpdated = True
-		# vault_fs_signiture
-		if not ruleList[9] or ruleList[9].lower() == 'auto':
-			if not os.path.exists(ruleList[4]):
+		# vault_fs_signature
+		if not inRule["vault_fs_signature"] or inRule["vault_fs_signature"].lower() == 'auto':
+			if not os.path.exists(inRule["vault_path"]):
 				# try create it 
 				try:
-					os.makedirs(ruleList[4],exist_ok=True)
+					os.makedirs(inRule["vault_path"],exist_ok=True)
 				except:
-					tl.teelog(f'Warning: Rule {ruleName} with {ruleList[4]} does not exist and failed to create it. Ignoring rule...',level='warning')
+					tl.teelog(f'Warning: Rule {ruleName} with {inRule["vault_path"]} does not exist and failed to create it. Ignoring rule...',level='warning')
 					continue
-			signitures = get_fs_signitures(ruleList[4])
-			if signitures and signitures[0]:
-				ruleList[9] = signitures[0]
-				tl.teelog(f'Auto filled Vault File System Signiture for {ruleName}: {ruleList[9]}',level='info')
+			signatures = get_fs_signatures(inRule["vault_path"])
+			if signatures and signatures[0]:
+				inRule["vault_fs_signature"] = signatures[0]
+				tl.teelog(f'Auto filled Vault File System Signature for {ruleName}: {inRule["vault_fs_signature"]}',level='info')
 				ruleUpdated = True
 			else:
-				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signiture, disabling fs monitoring for this run...',level='warning')
-				ruleList[9] = 'auto'
+				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...',level='warning')
+				inRule["vault_fs_signature"] = 'auto'
 		# check if the rule is explicit
 		if ruleUpdated:
-			tl.info(f'Updating rule {ruleName}: {ruleList}')
-			rulesToUpdate.append(ruleList)
-		returnReverbRules.append()
+			tl.info(f'Updating rule {ruleName}: {inRule}')
+			rulesToUpdate.append(list(inRule.values()))
+		returnReverbRules.append(ReverbRule(**inRule))
 		# append to tsv as well
 		TSVZ.appendLinesTabularFile(rule_file,rulesToUpdate,header=REVERB_RULE_TSV_HEADER,createIfNotExist=False,verifyHeader=True,verbose=DEBUG,strict=False)
 	return returnReverbRules
@@ -590,7 +592,7 @@ class inotify_resource_manager:
 		return self.current_user_watches
 
 #%% ---- Watcher ----
-def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY):
+def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
 	global GREEN_LIGHT
 	# main monitoring function to deal with one reverb.
 	while GREEN_LIGHT.is_set():
@@ -599,9 +601,9 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to
 		if not GREEN_LIGHT.is_set():
 			tl.teeprint(f'Exiting watcher thread for {monitor_path}')
 			return False
-		watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds)
+		watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds)
 
-def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY):
+def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
 	global COOKIE_DICT_MAX_SIZE
 	global tl
 	global DEBUG
@@ -620,6 +622,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 			tl.teeerror(f'Failed to initialize folder watchers for {monitor_path}')
 			return False
 		lastReadTime = time.monotonic()
+		lastProcessTime = time.monotonic()
 		while GREEN_LIGHT.is_set():
 			read_delay = max(min(3,min_snapshot_delay_seconds),0.00001)
 			events =  inotify_obj.read(timeout=read_delay * 1000)
@@ -630,11 +633,17 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 					to_process_flag.set()
 					processPending = True
 				continue
+			if to_process and not to_process_flag.is_set() and time.monotonic() - lastProcessTime > max_shapshot_delay_seconds:
+				if DEBUG:
+					tl.teeprint('Max Delay timeout elapsed, signaling backuper to process')
+				to_process_flag.set()
+				processPending = True
 			lastReadTime = time.monotonic()
 			if processPending and not to_process_flag.is_set():
 				# this means the to_process was just processed
 				newDirWDs.clear()
 				processPending = False
+				lastProcessTime = time.monotonic()
 			if DEBUG:
 				tl.teeok(f'Events detected: {len(events)}')
 				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
@@ -804,7 +813,12 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	irm.increaseUserWatches()
 	if DEBUG:
 		tl.teeprint(f'Adding watch for {monitor_path}')
-	parentWatchDescriptor = inotify_obj.add_watch(monitor_path, watch_flags)
+	try:
+		parentWatchDescriptor = inotify_obj.add_watch(monitor_path, watch_flags)
+	except Exception as e:
+		if DEBUG:
+			tl.teeerror(f'Failed to add watch for {monitor_path}: {e}')
+		return -1
 	if newDirWds is not None:
 		newDirWds.add(parentWatchDescriptor)
 	wdDic[parentWatchDescriptor] = monitor_path
@@ -813,10 +827,16 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 		tl.teeprint(f'Adding watch for {len(allFolders)} sub folders')
 	irm.increaseUserWatches(len(allFolders))
 	for folder in allFolders:
-		childWd = inotify_obj.add_watch(folder, watch_flags)
-		if newDirWds is not None:
-			newDirWds.add(childWd)
-		wdDic[childWd] = folder
+		try:
+			childWd = inotify_obj.add_watch(folder, watch_flags)
+			if newDirWds is not None:
+				newDirWds.add(childWd)
+			wdDic[childWd] = folder
+		except Exception as e:
+			if DEBUG:
+				tl.teeerror(f'Failed to add watch for {folder}: {e}')
+			irm.decreaseUserWatches()
+			continue
 	return parentWatchDescriptor
 
 def get_all_folders(path):
@@ -848,31 +868,31 @@ def get_all_files_and_folders(path):
 		return [], []
 	return files, folders
 
-def fs_flag_daemon(path:str,signiture:str,fsEvent:threading.Event):
+def fs_flag_daemon(path:str,signature:str,fsEvent:threading.Event):
 	global GREEN_LIGHT
 	global tl
 	while GREEN_LIGHT.is_set():
-		if check_fs_signiture(path,signiture):
-			tl.teeprint(f'FS signiture for {path} verified.')
+		if check_fs_signature(path,signature):
+			tl.teeprint(f'FS signature for {path} verified.')
 			fsEvent.set()
 		else:
 			fsEvent.clear()
 		wait_fs_event(path,timeout = 0)
 
-def check_fs_signiture(path:str,signiture:str):
+def check_fs_signature(path:str,signature:str):
 	# not: as findmnt not garenteed to have inode number, and lsblk have more fileds anyway.
 		# use findmnt --json --output SOURCE,TARGET,FSTYPE,LABEL,UUID,PARTLABEL,PARTUUID,SIZE,USE%,FSROOT --target 
 		# if FS UUID is not available / not match, try part uuid, then fs label, then part label, then dev path
 	# df --no-sync --output=source,ipcent,pcent,target for use percentage
 	# lsblk --raw --paths --output=kname,label,model,name,partlabel,partuuid,uuid,serial,fstype,wwn <dev> for infos
-	if not signiture or signiture == 'N/A' or signiture == 'auto':
+	if not signature or signature == 'N/A' or signature == 'auto':
 		return True
-	pathSignitures = get_fs_signitures(path)
-	if not pathSignitures:
+	pathSignatures = get_fs_signatures(path)
+	if not pathSignatures:
 		return False
-	return signiture in pathSignitures
+	return signature in pathSignatures
 
-def get_fs_signitures(path:str) -> list:
+def get_fs_signatures(path:str) -> list:
 	global DEBUG
 	# df --no-sync --output=source,ipcent,pcent,target for use percentage
 	# lsblk --raw --paths --output=kname,label,model,name,partlabel,partuuid,uuid,serial,fstype,wwn <dev> for infos
@@ -909,7 +929,7 @@ def wait_fs_event(path:str,timeout = 0):
 	return False
 
 #%% ---- Backup ----
-def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault_path_signiture:str,
+def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault_path_signature:str,
 			 to_process_flag:threading.Event,monitor_fs_flag=threading.Event(),
 			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
@@ -927,7 +947,7 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 			tl.teelog(f'Warning: Vault path {vault_path} does not exist and failed to create it. Backuper Stopped!',level='error')
 			return
 	vault_fs_flag = threading.Event()
-	vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signiture,vault_fs_flag),daemon=True)
+	vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signature,vault_fs_flag),daemon=True)
 	vault_fs_thread.start()
 	while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
 		vault_fs_flag.wait(3)
@@ -1199,8 +1219,7 @@ def do_backup(backup_entries:dict,
 			os.makedirs(backup_folder,exist_ok=True)
 			if keep_one_complete_backup:
 				monitorFiles,monitorFolders  = get_all_files_and_folders(monitor_path)
-				if DEBUG:
-					tl.teeprint(f'Creating a complete backup of {monitor_path} to {backup_folder}')
+				tl.teeok(f'Creating a complete backup of {monitor_path} to {backup_folder}')
 				if log_journal:
 					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_complete_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 				relativeFilePaths = []
@@ -1222,8 +1241,7 @@ def do_backup(backup_entries:dict,
 					mcae.wait(timeout=3)
 				mcae.cleanup(timeout=3)
 			else:
-				if DEBUG:
-					tl.teeprint(f'Creating a referenced backup of {monitor_path} to {backup_folder}')
+				tl.teeok(f'Creating a referenced backup of {monitor_path} to {backup_folder}')
 				if log_journal:
 					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_referenced_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 				trackingFilesFolders = do_referenced_copy(monitor_path,backup_folder)
@@ -1283,6 +1301,7 @@ def do_backup(backup_entries:dict,
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
 			os.makedirs(backup_folder,exist_ok=True)
+			tl.teeok(f'Creating a reverb backup of {monitor_path} to {backup_folder}')
 			trackingFilesFolders = do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,trackingFilesFolders,monitor_path)
 		# check the size of the backup
 		this_size = get_path_size(backup_folder)
@@ -1293,13 +1312,7 @@ def do_backup(backup_entries:dict,
 		backup_inode_str = format_bytes(this_inodes,use_1024_bytes=False,to_str=True).replace(' ','')
 		backup_folder_with_size = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino'
 		os.rename(backup_folder,backup_folder_with_size)
-		if DEBUG:
-			tl.teeok(f'Created new backup at {backup_folder_with_size}')
-			# tl.teeprint("trackingFilesFolders:")
-			# tl.teeprint(trackingFilesFolders.files)
-			# tl.teeprint(trackingFilesFolders.folders)
-			# tl.teeprint(f'Changed Entries:')
-			# tl.printTable(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER)
+		tl.teeok(f'Created new backup at {backup_folder_with_size}')
 		# create the current version symlink
 		if os.path.exists(os.path.join(job_vault,'current_version')):
 			os.remove(os.path.join(job_vault,'current_version'))
@@ -1418,12 +1431,13 @@ def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = 
 	else:
 		return mcae.run_command(['cp','-af','--reflink=auto','--sparse=always',source_path,dest_path])
 
-def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:TrackingFilesFolders=None,relative = False):
+def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:TrackingFilesFolders=None,relative=False):
 	global DEBUG
 	global tl
 	global BACKUP_SEMAPHORE
+	global GREEN_LIGHT
 	if DEBUG:
-		tl.teeok(f'Creating a referenced copy of {source_path} to {backup_folder}')
+		tl.teeprint(f'Creating a referenced copy of {source_path} to {backup_folder}')
 	if not trackingFilesFolders:
 		files, folders = get_all_files_and_folders(source_path)
 		files = [os.path.relpath(file,source_path) for file in files]
@@ -1435,21 +1449,27 @@ def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:Tr
 		backup_folder_path = os.path.join(backup_folder,folder)
 		os.makedirs(backup_folder_path,exist_ok=True)
 		copy_file_meta(source_folder,backup_folder_path)
-	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
+		if not GREEN_LIGHT.is_set():
+			tl.teeerror('Backup process interrupted, stopping')
+			return TrackingFilesFolders([], [])
 	for file in files:
 		# use ln -fsrLT to do a relative symlink
 		# ln --symbolic --logical --force --no-target-directory
 		source_file = os.path.join(source_path,file)
 		backup_file_path = os.path.join(backup_folder,file)
-		source_file = os.path.abspath(source_file)
 		if relative:
-			# taskObj = multiCMD.run_command(['ln','-rfsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
-			mcae.run_command(['ln','-rfsLT',source_file,backup_file_path])
+			source_file = os.path.relpath(source_file,os.path.dirname(backup_file_path))
 		else:
-			#taskObj = multiCMD.run_command(['ln','-fsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
-			mcae.run_command(['ln','-fsLT',source_file,backup_file_path])
-	while GREEN_LIGHT.is_set() and mcae.runningThreads:
-		mcae.join(3)
+			source_file = os.path.abspath(source_file)
+		# note: no longer using --logical as we are moving to use chained symlinks to reduce run time disk IO
+		#taskObj = multiCMD.run_command(['ln','-fsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
+		#mcae.run_command(['ln','-fsT',source_file,backup_file_path])
+		if os.path.exists(backup_file_path):
+			os.remove(backup_file_path)
+		os.symlink(source_file, backup_file_path)
+		if not GREEN_LIGHT.is_set():
+			tl.teeerror('Backup process interrupted, stopping')
+			return TrackingFilesFolders([], [])
 	return TrackingFilesFolders(files, folders)
 
 def copy_file_meta(source_file:str,backup_file_path:str):
@@ -1647,27 +1667,17 @@ def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_fi
 		latest_version_files_folders.remove(rel_entry)
 		# check if the file is the same
 		latest_version_entry = os.path.join(latest_version_path,rel_entry)
-		if DEBUG:
-			tl.teeprint(f'Checking {monitor_entry} against {latest_version_entry}')
 		try:
-			monitor_entry_stat = os.stat(monitor_entry)
-			latest_version_entry_stat = os.stat(latest_version_entry)
+			monitor_entry_stat = os.lstat(monitor_entry)
+			latest_version_entry_stat = os.lstat(latest_version_entry)
 		except:
 			if DEBUG:
 				import traceback
-				tl.teeerror(f'Error getting stat for {monitor_entry} or {latest_version_entry}')
+				tl.teeerror(f'Error getting lstat for {monitor_entry} or {latest_version_entry}')
 				tl.teeerror(traceback.format_exc())
-			try:
-				monitor_entry_stat = os.lstat(monitor_entry)
-				latest_version_entry_stat = os.lstat(latest_version_entry)
-			except:
-				if DEBUG:
-					import traceback
-					tl.teeerror(f'Error getting lstat for {monitor_entry} or {latest_version_entry}')
-					tl.teeerror(traceback.format_exc())
-				tl.teeerror(f'Error getting stat for {monitor_entry} or {latest_version_entry}, treating as create')
-				backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'create',None)
-				return
+			tl.teeerror(f'Error getting stat for {monitor_entry} or {latest_version_entry}, treating as create')
+			backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'create',None)
+			return
 		# do dev and inode based skip first
 		try:
 			if monitor_entry_stat.st_dev == latest_version_entry_stat.st_dev and monitor_entry_stat.st_ino == latest_version_entry_stat.st_ino:
@@ -1690,6 +1700,17 @@ def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_fi
 					backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'attrib',None)
 				elif DEBUG:
 					tl.teeprint(f'Dir attrib same {monitor_entry}')
+				return
+			# if is link, only check target
+			if os.path.islink(monitor_entry):
+				# check if the target is the same
+				if os.path.realpath(monitor_entry) == os.path.realpath(latest_version_entry):
+					if DEBUG:
+						tl.teeprint(f'Same link {monitor_entry}')
+				else:
+					if DEBUG:
+						tl.teeprint(f'Link target different {monitor_entry}')
+					backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'modify',None)
 				return
 			if monitor_entry_stat.st_size != latest_version_entry_stat.st_size:
 				# file size is different
@@ -1730,7 +1751,11 @@ def hash_file(path,size = ...,full_hash=False):
 		# Do not hash
 		return ''
 	if size == ...:
-		size = os.path.getsize(path)
+		try:
+			size = os.path.getsize(path)
+		except:
+			# if the file does not exist / cannot be accessed, return empty hash
+			return ''
 	hasher = xxhash.xxh64()
 	with open(path, 'rb') as f:
 		if not full_hash:
@@ -1880,68 +1905,79 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 		tl.teeerror('Attempting to remove root, skipping')
 		tl.teeprint(referenceVaultEntry)
 		return 0 , 0
+	tl.teeprint(f'Recursively removing V{referenceVersionNumber}: {referenceVaultPath}')
+	vaultInfoIter = iter(vault_info_dict)
+	applyingVersionNumber = next(vaultInfoIter)
+	applyingVaultEntry = vault_info_dict[applyingVersionNumber]
+	# now we need to go through all files in the applying vault entry
+	# find all symlinks that is referencing an files in the reference vault entry
+	# if it is in movedPath, we apply the new path to the symlink
+	# if it is not in movedPath, this means it is first reference, thus
+	#   we remove the symlink in the appying vault, move the file to the new location, and add the pair to movedPath
+	path_files = get_all_files(applyingVaultEntry.path)
 	if DEBUG:
-		tl.teeprint(f'Removing {referenceVersionNumber}: {referenceVaultPath}')
-	movedPath = {}
-	for applyingVersionNumber in vault_info_dict:
-		applyingVaultEntry = vault_info_dict[applyingVersionNumber]
-		# now we need to go through all files in the applying vault entry
-		# find all symlinks that is referencing an files in the reference vault entry
-		# if it is in movedPath, we apply the new path to the symlink
-		# if it is not in movedPath, this means it is first reference, thus
-		#   we remove the symlink in the appying vault, move the file to the new location, and add the pair to movedPath
-		path_files = get_all_files(applyingVaultEntry.path)
-		if DEBUG:
-			tl.teeprint(f"Dealing with {applyingVersionNumber}: {applyingVaultEntry.path} ({len(path_files)} files)")
-		new_size = applyingVaultEntry.size
-		pendingMovedPath = {}
-		for file in path_files:
-			if os.path.islink(file):
-				target = os.path.realpath(file)
-				if target in movedPath:
-					# we just apply the new dest to the link
-					new_target = os.path.relpath(movedPath[target],applyingVaultEntry.path)
-					if DEBUG:
-						tl.teeprint(f'Applying new target {new_target} to {file}')
-					try:
-						os.remove(file)
-						os.symlink(new_target,file)
-					except Exception as e:
-						tl.teeerror(f'Error applying new target {new_target} to {file}: {e}')
-					continue
-				if target.startswith(referenceVaultPath):
-					# this means we need to move the file to the new location
-					# get the relative path of the target
-					if DEBUG:
-						tl.teeprint(f'Moving {target} to {file}')
-					try:
-						os.remove(file)
-						os.rename(target,file)
-					except Exception as e:
-						tl.teeerror(f'Error moving {target} to {file}: {e}')
-						continue
-					new_size += os.path.getsize(file)
-					pendingMovedPath[target] = os.path.relpath(file,applyingVaultEntry.path)
-				elif DEBUG:
-					tl.teeprint(f'Not moving {target} to {file}')
-					tl.teeprint(f'{os.path.abspath(target)} not in {referenceVaultPath}')
-		#V0--2021-01-01_00-00-00_-0800--1.3_GiB-4.2K_ino
-		if new_size != applyingVaultEntry.size:
-			backup_size_str = format_bytes(new_size,use_1024_bytes=True,to_str=True).replace(' ','_')
-			newVaultPath = applyingVaultEntry.path.rpartition('--')[0] + f'--{backup_size_str}B-' + applyingVaultEntry.path.rpartition('-')[2]
-			if newVaultPath != applyingVaultEntry.path:
+		tl.teeprint(f"Dealing with {applyingVersionNumber}: {applyingVaultEntry.path} ({len(path_files)} files)")
+	new_size = applyingVaultEntry.size
+	for file in path_files:
+		if os.path.islink(file):
+			linkTarget = os.path.abspath(os.path.join(os.path.dirname(file), os.readlink(file)))
+			if linkTarget.startswith(referenceVaultPath):
+				# this means we need to move the file to the new location
+				# get the relative path of the target
 				if DEBUG:
-					tl.teeprint(f'Renaming {applyingVaultEntry.path} to {newVaultPath}')
+					tl.teeprint(f'Moving {linkTarget} to {file}')
 				try:
-					os.rename(applyingVaultEntry.path,newVaultPath)
+					os.remove(file)
+					os.rename(linkTarget,file)
 				except Exception as e:
-					tl.teeerror(f'Error renaming {applyingVaultEntry.path} to {newVaultPath}: {e}')
+					tl.teeerror(f'Error moving {linkTarget} to {file}: {e}')
 					continue
-				vault_info_dict[applyingVersionNumber] = applyingVaultEntry._replace(path=newVaultPath)
-		else:
-			newVaultPath = applyingVaultEntry.path
-		for target in pendingMovedPath:
-			movedPath[target] = os.path.join(newVaultPath,pendingMovedPath[target])
+				try:
+					new_size += os.path.getsize(file)
+				except Exception as e:
+					if DEBUG:
+						tl.teeerror(f'Error getting size of {file}: {e}')
+			elif DEBUG:
+				tl.teeprint(f'Not moving {linkTarget} to {file}')
+				tl.teeprint(f'{os.path.abspath(linkTarget)} not in {referenceVaultPath}')
+	#V0--2021-01-01_00-00-00_-0800--1.3_GiB-4.2K_ino
+	if new_size != applyingVaultEntry.size:
+		backup_size_str = format_bytes(new_size,use_1024_bytes=True,to_str=True).replace(' ','_')
+		newVaultPath = applyingVaultEntry.path.rpartition('--')[0] + f'--{backup_size_str}B-' + applyingVaultEntry.path.rpartition('-')[2]
+		oldVaultPath = applyingVaultEntry.path
+		if newVaultPath != oldVaultPath:
+			if DEBUG:
+				tl.teeprint(f'Renaming {oldVaultPath} to {newVaultPath}')
+			try:
+				os.rename(oldVaultPath,newVaultPath)
+			except Exception as e:
+				tl.teeerror(f'Error renaming {oldVaultPath} to {newVaultPath}: {e}')
+				#continue
+			vault_info_dict[applyingVersionNumber] = applyingVaultEntry._replace(path=newVaultPath)
+		# because we have renamed the next vault, thus we need to modify the links of the next next vault
+		oldAbsolutePath = os.path.abspath(oldVaultPath)
+		newAbsolutePath = os.path.abspath(newVaultPath)
+		if len(vault_info_dict) > 1:
+			renamingVersionNumber = next(vaultInfoIter)
+			renamingVaultEntry = vault_info_dict[renamingVersionNumber]
+			for file in get_all_files(renamingVaultEntry.path):
+				if os.path.islink(file):
+					linkTarget = os.path.abspath(os.path.join(os.path.dirname(file), os.readlink(file)))
+					if linkTarget.startswith(oldAbsolutePath):
+						newLinkTarget = os.path.relpath(linkTarget.replace(oldAbsolutePath,newAbsolutePath),start=os.path.dirname(file))
+						# this means we need to relink
+						if DEBUG:
+							tl.teeprint(f'Relinking {file} to {newLinkTarget}')
+						try:
+							os.remove(file)
+							os.symlink(newLinkTarget,file)
+						except Exception as e:
+							tl.teeerror(f'Error relinking {file} to {newLinkTarget}: {e}')
+							continue
+
+	# if DEBUG:
+	# 	tl.teeprint(f'As we are now using chained links, we are only removing the next entry. we are not looping though the whole vault.')
+	# break
 	# remove the reference vault entry
 	if DEBUG:
 		tl.teeprint(f'Removing {referenceVaultPath}')
@@ -2070,3 +2106,4 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 
 if __name__ == "__main__":
 	main()
+# %%
