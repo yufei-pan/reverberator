@@ -3,3 +3,4 @@ Job Name (Unique Key)	Path Monitoring	Monitoring File System Signiture	Minium sn
 # need to be unique for path distinction	Please use absolute path 	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Please use absolute path	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %	Will auto record if not set, use string literal N/A if does not care about FS
 #_defaults_#		auto		/var/reverbs/	True	True	0	5%,i5%,1G,i1K	auto
 test	/tmp/test		5	test_vault
+test	/tmp/test	auto	5	test_vault	True	False	0	5%,i5%,1G,i100	51b24057-fdb5-4a79-853c-40c88adad8a5
