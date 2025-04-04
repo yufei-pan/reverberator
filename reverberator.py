@@ -18,6 +18,7 @@ import resource
 import datetime
 import unicodedata
 import re
+import glob
 from shutil import copystat
 
 # for the lib wrapping aroung inotify, I tried
@@ -75,6 +76,8 @@ VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes']
 VAULT_TIMESTAMP_FORMAT = '%Y-%m-%d_%H-%M-%S_%z'
 TRACKING_FILES_FOLDERS_HEADER = ['files','folders']
 
+CONTENT_FILE_EXTENSION_NAME = '.modified_contents.nsv'
+
 ChangeEvent = namedtuple('ChangeEvent', CHANGED_EVENT_HEADER)
 BackupEntryValues = namedtuple('BackupEntryValues', BACKUP_ENTRY_VALUES_HEADER)
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
@@ -121,7 +124,7 @@ def main():
 	global DEBUG
 	signal.signal(signal.SIGINT, signal_handler)
 	args, argString = get_args()
-	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=args.log_compress_months, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log)
+	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=args.log_compress_months, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log,callerStackDepth=4)
 	tl.teeprint(argString)
 	if args.verbose:
 		DEBUG = True
@@ -607,6 +610,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 	global COOKIE_DICT_MAX_SIZE
 	global tl
 	global DEBUG
+	global GREEN_LIGHT
 	flags = inotify_simple.flags
 	watch_flags = flags.MODIFY | flags.ATTRIB | flags.MOVED_FROM | flags.MOVED_TO | flags.CREATE | flags.DELETE | flags.DELETE_SELF | flags.MOVE_SELF | flags.UNMOUNT | flags.Q_OVERFLOW
 	selfDestructMask = flags.UNMOUNT | flags.DELETE_SELF | flags.MOVE_SELF
@@ -938,9 +942,10 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 	global BACKUP_ENTRY_VALUES_HEADER
 	global tl
 	global DEBUG
+	global GREEN_LIGHT
 	# main function for handling the backup for one reverb
 	# if the vault path does not exist, create it
-	if not os.path.exists(vault_path):
+	if not os.path.lexists(vault_path):
 		try:
 			os.makedirs(vault_path,exist_ok=True)
 		except:
@@ -1188,9 +1193,12 @@ def do_backup(backup_entries:dict,
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
 	global VAULT_TIMESTAMP_FORMAT
+	global CONTENT_FILE_EXTENSION_NAME
+	global GREEN_LIGHT
+	global BACKUP_ENTRY_VALUES_HEADER
 	# this function will do the actual backup
 	job_vault = os.path.join(vault_path,job_name)
-	if not os.path.exists(job_vault):
+	if not os.path.lexists(job_vault):
 		try:
 			os.makedirs(job_vault,exist_ok=True)
 		except:
@@ -1310,24 +1318,26 @@ def do_backup(backup_entries:dict,
 		vault_inodes += this_inodes
 		backup_size_str = format_bytes(this_size,use_1024_bytes=True,to_str=True).replace(' ','_')
 		backup_inode_str = format_bytes(this_inodes,use_1024_bytes=False,to_str=True).replace(' ','')
-		backup_folder_with_size = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino'
-		os.rename(backup_folder,backup_folder_with_size)
-		tl.teeok(f'Created new backup at {backup_folder_with_size}')
+		content_file_name = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+		content_file_content = [[path] + list(values) for path,values in backup_entries.items()]
+		TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
+		tl.teeok(f'Created new backup at {backup_folder} with {content_file_name}')
 		# create the current version symlink
-		if os.path.exists(os.path.join(job_vault,'current_version')):
+		if os.path.lexists(os.path.join(job_vault,'current_version')):
 			os.remove(os.path.join(job_vault,'current_version'))
-		vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder_with_size,this_timestamp,this_size,this_inodes)
-		os.symlink(os.path.basename(backup_folder_with_size),os.path.join(job_vault,'current_version'),target_is_directory=True)
+		vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder,this_timestamp,this_size,this_inodes)
+		os.symlink(os.path.basename(backup_folder),os.path.join(job_vault,'current_version'),target_is_directory=True)
 	if log_journal:
 		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'end_reverb_backup_{len(trackingFilesFolders.files)}files_{len(trackingFilesFolders.folders)}folders_tracked',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 	return VaultInfo(vault_info_dict,vault_size,vault_inodes), trackingFilesFolders
 
 def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
-	# job vault subfolder should follow: V{version}--{ISO8601ish time}--{size of this backup}-{inodes of this backup}
-	# ex. V0--2021-01-01_00-00-00_-0800--1.3_GiB-4.2K_ino
+	# job vault subfolder should follow: V{version}--{ISO8601ish time}
+	# ex. V0--2021-01-01_00-00-00_-0800
 	global DEBUG
 	global tl
 	global VAULT_TIMESTAMP_FORMAT
+	global CONTENT_FILE_EXTENSION_NAME
 	if not os.path.exists(job_vault_path):
 		tl.teeerror(f'Job vault path {job_vault_path} does not exist')
 		return VaultInfo({},0,0)
@@ -1335,49 +1345,85 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	vault_info_dict = {}
 	vault_size = 0
 	vault_inodes = 0
+	orphan_entries = set()
+	content_file_to_delete = set()
 	try:
 		for entry in os.scandir(job_vault_path):
-			if entry.is_dir() and entry.name.startswith('V') and '--' in entry.name:
+			if entry.name.startswith('V') and '--' in entry.name:
 				version_number_str = entry.name.lstrip('V').partition('--')[0]
 				if version_number_str.isdigit():
 					version_number = int(version_number_str)
-					try:
-						if not recalculate:
-							entry_size_inode_str = entry.name.rpartition('--')[2]
-							entry_size_str = entry_size_inode_str.partition('-')[0].replace('_','')
-							entry_size = format_bytes(entry_size_str,to_int=True)
-							entry_inode_str = entry_size_inode_str.rpartition('-')[2].replace('_ino','')
-							entry_inode = format_bytes(entry_inode_str,to_int=True)
-							vault_size += entry_size
-							vault_inodes += entry_inode
-							entry_timestamp = datetime.datetime.strptime(entry.name.partition('--')[2].rpartition('--')[0],VAULT_TIMESTAMP_FORMAT).timestamp()
-							#VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
-							vault_info_dict[version_number] = VaultEntry(version_number,entry.path,entry_timestamp,entry_size,entry_inode)
-						else:
-							# we will recalculate the size and inodes for the folders and rename the folders accordingly
-							entry_size = get_path_size(entry.path)
-							entry_inode = get_path_inodes(entry.path)
-							vault_size += entry_size
-							vault_inodes += entry_inode
-							backup_size_str = format_bytes(entry_size,use_1024_bytes=True,to_str=True).replace(' ','_')
-							backup_inode_str = format_bytes(entry_inode,use_1024_bytes=False,to_str=True).replace(' ','')
-							entry_timestamp = datetime.datetime.strptime(entry.name.partition('--')[2].rpartition('--')[0],VAULT_TIMESTAMP_FORMAT).timestamp()
-							new_entry_name = f'V{version_number}--{datetime.datetime.fromtimestamp(entry_timestamp).astimezone().strftime(VAULT_TIMESTAMP_FORMAT)}--{backup_size_str}B-{backup_inode_str}_ino'
-							if entry.name != new_entry_name:
-								tl.teeprint(f'Renaming {entry.name} to {new_entry_name}')
-								try:
-									new_entry_path = os.path.join(job_vault_path,new_entry_name)
-									os.rename(entry.path,new_entry_path)
-									vault_info_dict[version_number] = VaultEntry(version_number,new_entry_path,entry_timestamp,entry_size,entry_inode)
-								except Exception as e:
-									tl.teeerror(f'Error renaming {entry.name} to {new_entry_name}: {e}')
-									continue
+					if CONTENT_FILE_EXTENSION_NAME not in entry.name:
+						if entry.is_dir():
+							orphan_entries.add(entry.path)
+					elif entry.is_file():
+						try:
+							vault_path = entry.path.rpartition('--')[0]
+							if not os.path.exists(vault_path):
+								tl.teeerror(f'Vault path {vault_path} for content {entry.name} does not exist, deleting content file...')
+								content_file_to_delete.add(entry.path)
+								continue
+							orphan_entries.discard(vault_path)
+							if not recalculate:
+								entry_name = entry.name.rstrip(CONTENT_FILE_EXTENSION_NAME)
+								entry_size_inode_str = entry_name.rpartition('--')[2]
+								entry_size_str = entry_size_inode_str.partition('-')[0].replace('_','')
+								entry_size = format_bytes(entry_size_str,to_int=True)
+								entry_inode_str = entry_size_inode_str.rpartition('-')[2].replace('_ino','')
+								entry_inode = format_bytes(entry_inode_str,to_int=True)
+								vault_size += entry_size
+								vault_inodes += entry_inode
+								entry_timestamp = datetime.datetime.strptime(entry.name.partition('--')[2].rpartition('--')[0],VAULT_TIMESTAMP_FORMAT).timestamp()
+								#VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
 							else:
-								vault_info_dict[version_number] = VaultEntry(version_number,entry.path,entry_timestamp,entry_size,entry_inode)
-					except:
-						if DEBUG:
-							import traceback
-							tl.teeerror(f'Error processing {entry.name}: {traceback.format_exc()}')
+								# we will recalculate the size and inodes for the folders and rename the folders accordingly
+								entry_size = get_path_size(vault_path)
+								entry_inode = get_path_inodes(vault_path)
+								vault_size += entry_size
+								vault_inodes += entry_inode
+								backup_size_str = format_bytes(entry_size,use_1024_bytes=True,to_str=True).replace(' ','_')
+								backup_inode_str = format_bytes(entry_inode,use_1024_bytes=False,to_str=True).replace(' ','')
+								entry_timestamp = datetime.datetime.strptime(entry.name.partition('--')[2].rpartition('--')[0],VAULT_TIMESTAMP_FORMAT).timestamp()
+								new_entry_name = f'V{version_number}--{datetime.datetime.fromtimestamp(entry_timestamp).astimezone().strftime(VAULT_TIMESTAMP_FORMAT)}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+								if entry.name != new_entry_name:
+									tl.teeprint(f'Renaming {entry.name} to {new_entry_name}')
+									try:
+										new_entry_path = os.path.join(job_vault_path,new_entry_name)
+										os.rename(entry.path,new_entry_path)
+									except Exception as e:
+										tl.teeerror(f'Error renaming {entry.name} to {new_entry_name}: {e}')
+							vault_info_dict[version_number] = VaultEntry(version_number,vault_path,entry_timestamp,entry_size,entry_inode)
+						except:
+							if DEBUG:
+								import traceback
+								tl.teeerror(f'Error processing {entry.name}: {traceback.format_exc()}')
+		for entry in content_file_to_delete:
+			try:
+				os.remove(entry)
+			except Exception as e:
+				tl.teeerror(f'Error deleting {entry}: {e}')
+		for entry in orphan_entries:
+			# generate appropriate content file name ( leave it empty )
+			try:
+				version_number = int(os.path.basename(entry).lstrip('V').partition('--')[0])
+			except:
+				tl.teeerror(f'Error getting version number from orphan {entry}')
+				continue
+			entry_size = get_path_size(entry)
+			entry_inode = get_path_inodes(entry)
+			vault_size += entry_size
+			vault_inodes += entry_inode
+			backup_size_str = format_bytes(entry_size,use_1024_bytes=True,to_str=True).replace(' ','_')
+			backup_inode_str = format_bytes(entry_inode,use_1024_bytes=False,to_str=True).replace(' ','')
+			content_file_name = f'{entry}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+			entry_timestamp = datetime.datetime.strptime(entry.partition('--')[2],VAULT_TIMESTAMP_FORMAT).timestamp()
+			if DEBUG:
+				tl.teeprint(f'Creating content file {content_file_name} for orphan entry {entry}')
+			try:
+				TSVZ.appendTabularFile(content_file_name,[],header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
+				vault_info_dict[version_number] = VaultEntry(version_number,entry,entry_timestamp,entry_size,entry_inode)
+			except Exception as e:
+				tl.teeerror(f'Error creating content file {content_file_name} for orphan entry {entry}: {e}')
 	except PermissionError:
 		tl.teeerror(f'Permission error while scanning {job_vault_path}')
 	return VaultInfo(OrderedDict(sorted(vault_info_dict.items())), vault_size, vault_inodes)
@@ -1411,7 +1457,7 @@ def is_subpath(child, parent):
 def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...):
 	global DEBUG
 	global tl
-	if os.path.exists(dest_path):
+	if os.path.lexists(dest_path):
 		if dest_path == '/':
 			tl.teeerror('Cannot copy as root directory')
 			return False
@@ -1444,6 +1490,10 @@ def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:Tr
 		folders = [os.path.relpath(folder,source_path) + '/' for folder in folders]
 	else:
 		files, folders = trackingFilesFolders.files, trackingFilesFolders.folders
+		if DEBUG:
+			tl.teeprint(f'Using cached tracked files and folders {len(files)} {len(folders)}')
+			tl.info('\n"'+'"\n"'.join(files) + '"')
+			tl.info('\n"'+'"\n"'.join(folders) + '"')
 	for folder in folders:
 		source_folder = os.path.join(source_path,folder)
 		backup_folder_path = os.path.join(backup_folder,folder)
@@ -1464,7 +1514,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:Tr
 		# note: no longer using --logical as we are moving to use chained symlinks to reduce run time disk IO
 		#taskObj = multiCMD.run_command(['ln','-fsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
 		#mcae.run_command(['ln','-fsT',source_file,backup_file_path])
-		if os.path.exists(backup_file_path):
+		if os.path.lexists(backup_file_path):
 			os.remove(backup_file_path)
 		os.symlink(source_file, backup_file_path)
 		if not GREEN_LIGHT.is_set():
@@ -1484,7 +1534,7 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 		os.utime(backup_file_path, (st.st_atime, st.st_mtime))
 		return True
 	except:
-		tl.teeerror(f'Failed to copy metadata of {source_file}')
+		tl.teeerror(f'Failed to copy metadata {source_file} -> {backup_file_path}')
 		if DEBUG:
 			import traceback
 			tl.teeerror(traceback.format_exc())
@@ -1747,14 +1797,18 @@ def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_fi
 def hash_file(path,size = ...,full_hash=False):
 	#From hpcp: https://github.com/yufei-pan/hpcp
 	global HASH_SIZE
+	global DEBUG
+	global tl
 	if HASH_SIZE <= 0:
 		# Do not hash
 		return ''
 	if size == ...:
 		try:
-			size = os.path.getsize(path)
+			size = max(os.lstat(path).st_size,4096)
 		except:
 			# if the file does not exist / cannot be accessed, return empty hash
+			if DEBUG:
+				tl.teeerror(f'Error getting size for {path}')
 			return ''
 	hasher = xxhash.xxh64()
 	with open(path, 'rb') as f:
@@ -1827,13 +1881,23 @@ def get_path_fs_info(path:str):
 	# this function gets the filesystem usage information of a path
 	# df --no-sync --output=size,itotal <path>
 	global DEBUG
-	rtn = multiCMD.run_command(['df','--no-sync','--output=size,itotal',path],quiet=not DEBUG)
-	if rtn and rtn[-1]:
-		try:
-			size, inodes = rtn[-1].split(maxsplit=1)
-			return int(size), int(inodes)
-		except:
-			pass
+	global tl
+	# rtn = multiCMD.run_command(['df','--no-sync','--output=size,itotal',path],quiet=not DEBUG)
+	# if rtn and rtn[-1]:
+	# 	try:
+	# 		size, inodes = rtn[-1].split(maxsplit=1)
+	# 		return int(size), int(inodes)
+	# 	except:
+	# 		pass
+	# use os.statvfs instead
+	try:
+		result = os.statvfs(path)
+		size = result.f_frsize * result.f_blocks
+		inodes = result.f_files
+		return size, inodes
+	except Exception as e:
+		if DEBUG:
+			tl.teeerror(f'Error getting filesystem info for {path}: {e}')
 	return 0,0
 
 def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_inode:int) -> tuple:
@@ -1876,23 +1940,28 @@ def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_
 					pass
 		elif limit.startswith('i'):
 			try:
-				inode_limit = int(limit.lstrip('i'))
+				inode_limit = int(format_bytes(limit.lstrip('i'),to_int=True))
 			except:
 				pass
 		else:
 			try:
-				size_limit = int(limit)
+				size_limit = int(format_bytes(limit,to_int=True))
 			except:
 				pass
-		if size_limit > rtn_size_limit:
-			rtn_size_limit = size_limit
-		if inode_limit > rtn_inode_limit:
+		if rtn_inode_limit < 0:
 			rtn_inode_limit = inode_limit
+		elif inode_limit > 0 and inode_limit < rtn_inode_limit:
+			rtn_inode_limit = inode_limit
+		if rtn_size_limit < 0:
+			rtn_size_limit = size_limit
+		elif size_limit > 0 and size_limit < rtn_size_limit:
+			rtn_size_limit = size_limit
 	return rtn_size_limit, rtn_inode_limit
 
 def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	global tl
 	global DEBUG
+	global CONTENT_FILE_EXTENSION_NAME
 	if DEBUG:
 		tl.teeok('Running stepper to remove oldest reverb')
 	# this function remove the oldest reverb from path
@@ -1905,10 +1974,17 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 		tl.teeerror('Attempting to remove root, skipping')
 		tl.teeprint(referenceVaultEntry)
 		return 0 , 0
+	#reference_content_file_path = f'{referenceVaultPath}--{format_bytes(referenceVaultEntry.size,use_1024_bytes=True,to_str=True).replace(" ","_")}B-{format_bytes(referenceVaultEntry.inode,use_1024_bytes=False,to_str=True).replace(" ","")}_ino{CONTENT_FILE_EXTENSION_NAME}'
 	tl.teeprint(f'Recursively removing V{referenceVersionNumber}: {referenceVaultPath}')
 	vaultInfoIter = iter(vault_info_dict)
 	applyingVersionNumber = next(vaultInfoIter)
 	applyingVaultEntry = vault_info_dict[applyingVersionNumber]
+	backup_size_str = format_bytes(applyingVaultEntry.size,use_1024_bytes=True,to_str=True).replace(' ','_')
+	backup_inode_str = format_bytes(applyingVaultEntry.inode,use_1024_bytes=False,to_str=True).replace(' ','')
+	content_file_path = f'{applyingVaultEntry.path}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+	if not os.path.lexists(content_file_path):
+		tl.teeerror(f'Content file {content_file_path} does not exist, creating a new one...')
+		content_file_path = ''
 	# now we need to go through all files in the applying vault entry
 	# find all symlinks that is referencing an files in the reference vault entry
 	# if it is in movedPath, we apply the new path to the symlink
@@ -1918,6 +1994,7 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	if DEBUG:
 		tl.teeprint(f"Dealing with {applyingVersionNumber}: {applyingVaultEntry.path} ({len(path_files)} files)")
 	new_size = applyingVaultEntry.size
+	block_size = os.statvfs(referenceVaultPath).f_frsize
 	for file in path_files:
 		if os.path.islink(file):
 			linkTarget = os.path.abspath(os.path.join(os.path.dirname(file), os.readlink(file)))
@@ -1927,54 +2004,40 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 				if DEBUG:
 					tl.teeprint(f'Moving {linkTarget} to {file}')
 				try:
+					new_size += max(os.lstat(linkTarget).st_size,block_size)
+					new_size -= max(os.lstat(file).st_size,block_size)
+				except Exception as e:
+					if DEBUG:
+						tl.teeerror(f'Error getting size of {file}: {e}')
+				try:
 					os.remove(file)
 					os.rename(linkTarget,file)
 				except Exception as e:
 					tl.teeerror(f'Error moving {linkTarget} to {file}: {e}')
 					continue
-				try:
-					new_size += os.path.getsize(file)
-				except Exception as e:
-					if DEBUG:
-						tl.teeerror(f'Error getting size of {file}: {e}')
 			elif DEBUG:
 				tl.teeprint(f'Not moving {linkTarget} to {file}')
 				tl.teeprint(f'{os.path.abspath(linkTarget)} not in {referenceVaultPath}')
-	#V0--2021-01-01_00-00-00_-0800--1.3_GiB-4.2K_ino
+	#V0--2021-01-01_00-00-00_-0800
 	if new_size != applyingVaultEntry.size:
 		backup_size_str = format_bytes(new_size,use_1024_bytes=True,to_str=True).replace(' ','_')
-		newVaultPath = applyingVaultEntry.path.rpartition('--')[0] + f'--{backup_size_str}B-' + applyingVaultEntry.path.rpartition('-')[2]
-		oldVaultPath = applyingVaultEntry.path
-		if newVaultPath != oldVaultPath:
+		new_content_file_path = f'{applyingVaultEntry.path}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+		if content_file_path:
 			if DEBUG:
-				tl.teeprint(f'Renaming {oldVaultPath} to {newVaultPath}')
+				tl.teeprint(f'Renaming {content_file_path} to {new_content_file_path}')
 			try:
-				os.rename(oldVaultPath,newVaultPath)
+				os.rename(content_file_path,new_content_file_path)
 			except Exception as e:
-				tl.teeerror(f'Error renaming {oldVaultPath} to {newVaultPath}: {e}')
+				tl.teeerror(f'Error renaming {content_file_path} to {new_content_file_path}: {e}')
 				#continue
-			vault_info_dict[applyingVersionNumber] = applyingVaultEntry._replace(path=newVaultPath)
-		# because we have renamed the next vault, thus we need to modify the links of the next next vault
-		oldAbsolutePath = os.path.abspath(oldVaultPath)
-		newAbsolutePath = os.path.abspath(newVaultPath)
-		if len(vault_info_dict) > 1:
-			renamingVersionNumber = next(vaultInfoIter)
-			renamingVaultEntry = vault_info_dict[renamingVersionNumber]
-			for file in get_all_files(renamingVaultEntry.path):
-				if os.path.islink(file):
-					linkTarget = os.path.abspath(os.path.join(os.path.dirname(file), os.readlink(file)))
-					if linkTarget.startswith(oldAbsolutePath):
-						newLinkTarget = os.path.relpath(linkTarget.replace(oldAbsolutePath,newAbsolutePath),start=os.path.dirname(file))
-						# this means we need to relink
-						if DEBUG:
-							tl.teeprint(f'Relinking {file} to {newLinkTarget}')
-						try:
-							os.remove(file)
-							os.symlink(newLinkTarget,file)
-						except Exception as e:
-							tl.teeerror(f'Error relinking {file} to {newLinkTarget}: {e}')
-							continue
-
+		else:
+			if DEBUG:
+				tl.teeprint(f'Creating content file {new_content_file_path}')
+			try:
+				TSVZ.appendTabularFile(new_content_file_path,[],header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
+			except Exception as e:
+				tl.teeerror(f'Error creating content file {new_content_file_path}: {e}')
+				#continue
 	# if DEBUG:
 	# 	tl.teeprint(f'As we are now using chained links, we are only removing the next entry. we are not looping though the whole vault.')
 	# break
@@ -1983,7 +2046,9 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 		tl.teeprint(f'Removing {referenceVaultPath}')
 	removingSize = get_path_size(referenceVaultPath)
 	removingInodes = get_path_inodes(referenceVaultPath)
-	multiCMD.run_command(['rm','-rf',referenceVaultPath],quiet=not DEBUG,return_code_only=True)
+	#os.remove(path=reference_content_file_path)
+	paths_to_remove = glob.glob(referenceVaultPath+'*',recursive=False)
+	multiCMD.run_command(['rm','-rf',*paths_to_remove],quiet=not DEBUG,return_code_only=True)
 	return removingSize, removingInodes
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
@@ -1991,41 +2056,45 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	global DEBUG
 	global tl
 	global BACKUP_SEMAPHORE
+	global GREEN_LIGHT
 	if DEBUG:
 		tl.teeok(f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}')
-	def copy_path(isDir,sourcePath,relative_path,vaultFolders,vaultFiles,file_vault_path,mcae):
+	def copy_path(isDir,monitor_path,source_real_path,source_relative_path,vaultFolders,vaultFiles,
+			   file_vault_real_path,backup_folder,mcae):
 		if isDir:
-			vaultFolders.add(relative_path)
-			newFiles, newFolders = get_all_files_and_folders(sourcePath)
-			for subFolder in newFolders:
-				subFolderRelativePath = os.path.relpath(subFolder,sourcePath)+'/'
-				subFoldeerVaultPath = os.path.join(file_vault_path,subFolderRelativePath)
+			vaultFolders.add(source_relative_path)
+			os.makedirs(file_vault_real_path,exist_ok=True)
+			copy_file_meta(source_file=source_real_path,backup_file_path=file_vault_real_path)
+			newFiles, newFolders = get_all_files_and_folders(source_real_path)
+			for subFolderRealPath in newFolders:
+				subFolderRelativePath = os.path.relpath(subFolderRealPath,monitor_path)
+				subFolderVaultPath = os.path.join(backup_folder,subFolderRelativePath)
 				vaultFolders.add(subFolderRelativePath)
-				os.makedirs(subFoldeerVaultPath,exist_ok=True)
-				copy_file_meta(subFolder,subFoldeerVaultPath)
-			for subFile in newFiles:
-				subFileRelativePath = os.path.relpath(subFile,sourcePath)
-				subFileVaultPath = os.path.join(file_vault_path,subFileRelativePath)
+				os.makedirs(subFolderVaultPath,exist_ok=True)
+				copy_file_meta(source_file=subFolderRealPath,backup_file_path=subFolderVaultPath)
+			for subFileRealPath in newFiles:
+				subFileRelativePath = os.path.relpath(subFileRealPath,monitor_path)
+				subFileVaultPath = os.path.join(backup_folder,subFileRelativePath)
 				vaultFiles.add(subFileRelativePath)
-				cp_af_copy_path(source_path=subFile,dest_path=subFileVaultPath,mcae=mcae)
+				cp_af_copy_path(source_path=subFileRealPath,dest_path=subFileVaultPath,mcae=mcae)
 		else:
-			vaultFiles.add(relative_path)
+			vaultFiles.add(source_relative_path)
 		# we just copy the entire folder / file ( for recursive create purposes )
-			cp_af_copy_path(source_path=sourcePath,dest_path=file_vault_path,mcae=mcae)
-	def delete_path(isDir,vault_path,relative_path,mcae,vaultFolders,vaultFiles):
+			cp_af_copy_path(source_path=source_real_path,dest_path=file_vault_real_path,mcae=mcae)
+	def delete_path(isDir,vault_real_path,relative_path,mcae,vaultFolders,vaultFiles):
 		if isDir:
 			# we just remove the folder
-			if os.path.abspath(vault_path) == '/':
+			if os.path.abspath(vault_real_path) == '/':
 				# we cannot remove root
 				tl.teeerror(f'Attempting to remove root, skipping')
 			else:
-				mcae.run_command(['rm','-rf',vault_path])
+				mcae.run_command(['rm','-rf',vault_real_path])
 			vaultFolders.discard(relative_path)
 			# also need to remove all the files in the folder
-			vaultFiles = {file for file in vaultFiles if not file.startswith(vault_path)}
+			vaultFiles = {file for file in vaultFiles if not file.startswith(vault_real_path)}
 		else:
 			# we just remove the file
-			mcae.run_command(['rm','-f',vault_path])
+			mcae.run_command(['rm','-f',vault_real_path])
 			vaultFiles.discard(relative_path)
 	# this function does the actual backup using a referenced version and a change list to copy the source from
 	# reverb backup flow:
@@ -2034,72 +2103,86 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	vaultFiles, vaultFolders  = do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,trackingFilesFolders=trackingFilesFolders,relative=True)
 	vaultFiles = set(vaultFiles)
 	vaultFolders = set(vaultFolders)
+	if DEBUG:
+		tl.teeprint(f'Using cached tracked files and folders {len(vaultFiles)} {len(vaultFolders)}')
+		tl.info('\n"'+'"\n"'.join(vaultFiles) + '"')
+		tl.info('\n"'+'"\n"'.join(vaultFolders) + '"')
 	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
-	for path, values in backup_entries.items():
+	for event_source_real_path, event_values in backup_entries.items():
 		if DEBUG:
-			tl.teeprint(f'Processing {path} {values}')
-		relative_path = os.path.relpath(path=path,start=monitor_path)
-		file_vault_path = os.path.join(backup_folder,relative_path)
-		isDir = path.endswith('/')
+			tl.teeprint(f'Processing {event_source_real_path} {event_values}')
+		event_relative_path = os.path.relpath(path=event_source_real_path,start=monitor_path)
+		file_vault_target_path = os.path.join(backup_folder,event_relative_path)
+		isDir = event_source_real_path.endswith('/')
 		# create, modify, attrib, move, delete
-		if values.event in {'create','modify'}:
+		if event_values.event in {'create','modify'}:
 			# we just over write the vault file with the source file
-			copy_path(isDir,path,relative_path,vaultFolders,vaultFiles,file_vault_path,mcae)
-		elif values.event == 'attrib':
+			copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=event_source_real_path,
+			 source_relative_path=event_relative_path,vaultFolders=vaultFolders,vaultFiles=vaultFiles,
+			 file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
+		elif event_values.event == 'attrib':
 			if isDir:
 				# we just copy the folder metadata
-				os.makedirs(file_vault_path,exist_ok=True)
-				copy_file_meta(path,file_vault_path)
-				vaultFolders.add(relative_path)
+				os.makedirs(file_vault_target_path,exist_ok=True)
+				copy_file_meta(event_source_real_path,file_vault_target_path)
+				vaultFolders.add(event_relative_path)
 			else:
 				if only_sync_attributes:
 					# we just copy the file metadata
-					copy_file_meta(path,file_vault_path)
+					copy_file_meta(event_source_real_path,file_vault_target_path)
 				else:
 					# we copy the file
-					cp_af_copy_path(source_path=path,dest_path=file_vault_path,mcae=mcae)
-				vaultFiles.add(relative_path)
-		elif values.event == 'delete':
-			delete_path(isDir,file_vault_path,relative_path,mcae,vaultFolders,vaultFiles)
-		elif values.event == 'move':
-			source_relative_path = os.path.relpath(values.source_path,monitor_path)
-			target_relative_path = relative_path
+					cp_af_copy_path(source_path=event_source_real_path,dest_path=file_vault_target_path,mcae=mcae)
+				vaultFiles.add(event_relative_path)
+		elif event_values.event == 'delete':
+			delete_path(isDir=isDir,vault_real_path=file_vault_target_path,relative_path=event_relative_path,
+			   mcae=mcae,vaultFolders=vaultFolders,vaultFiles=vaultFiles)
+		elif event_values.event == 'move':
+			link_source_relative_path = os.path.relpath(event_values.source_path,monitor_path)
+			link_target_relative_path = event_relative_path
 			if isDir:
-				if os.path.abspath(file_vault_path) == '/':
+				if os.path.abspath(file_vault_target_path) == '/':
 					# we cannot remove root
 					tl.teeerror(f'Attempting to move root, skipping')
 					continue
-				vaultFolders.discard(source_relative_path)
-				vaultFolders.add(relative_path)
+				vaultFolders.discard(link_source_relative_path)
+				vaultFolders.add(link_target_relative_path)
 				# also need to move all the files in the folder
 				oldFiles = set()
 				newFiles = set()
 				for file in vaultFiles:
-					if file.startswith(source_relative_path):
+					if file.startswith(link_source_relative_path):
 						oldFiles.add(file)
 						newFiles.add(os.path.relpath(file,monitor_path))
 				vaultFiles.difference_update(oldFiles)
 				vaultFiles.update(newFiles)
 			else:
-				vaultFiles.discard(source_relative_path)
-				vaultFiles.add(target_relative_path)
+				vaultFiles.discard(link_source_relative_path)
+				vaultFiles.add(link_target_relative_path)
 			# we need to wait for copy threads to finish to allow rename
 			while GREEN_LIGHT.is_set() and mcae.runningThreads:
 				mcae.wait(timeout=3)
-			source_path = os.path.join(backup_folder,source_relative_path)
-			target_path = os.path.join(backup_folder,target_relative_path)
+			link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
+			link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
 			try:
-				os.rename(source_path,target_path)
+				if os.path.lexists(link_target_backup_real_path):
+					os.remove(link_target_backup_real_path)
+				os.rename(link_source_backup_real_path,link_target_backup_real_path)
 				if DEBUG:
-					tl.teeprint(f'Moved {source_path} to {target_path}')
+					tl.teeprint(f'Moved {link_source_backup_real_path} to {link_target_backup_real_path}')
 			except:
-				tl.teeerror(f'Failed to move {source_path} to {target_path}')
+				tl.teeerror(f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
 				if DEBUG:
 					import traceback
 					tl.teeerror(traceback.format_exc())
 				# if we fail to move, we just copy the file
-				copy_path(isDir,source_path,target_relative_path,vaultFolders,vaultFiles,target_path,mcae)
-				delete_path(isDir,source_path,source_relative_path,mcae,vaultFolders,vaultFiles)
+				copy_path(isDir=isDir,monitor_path=monitor_path,
+				  source_real_path=event_source_real_path,
+				  source_relative_path=event_relative_path,
+				  vaultFolders=vaultFolders,vaultFiles=vaultFiles,
+				  file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
+				delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
+				  relative_path=link_source_relative_path,mcae=mcae,vaultFolders=vaultFolders,vaultFiles=vaultFiles)
 	while GREEN_LIGHT.is_set() and mcae.runningThreads:
 		mcae.join(timeout=3)
 	return TrackingFilesFolders(vaultFiles,vaultFolders)
