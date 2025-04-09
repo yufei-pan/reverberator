@@ -104,6 +104,9 @@ COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir'])
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
 
+WATCHER_LOG_PREFIX = '👀'
+BACKUPER_LOG_PREFIX = '📥'
+
 HASH_SIZE = 1<<16
 
 DEBUG = False
@@ -124,7 +127,7 @@ def main():
 	global DEBUG
 	signal.signal(signal.SIGINT, signal_handler)
 	args, argString = get_args()
-	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=args.log_compress_months, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log,callerStackDepth=4)
+	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=0, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log,callerStackDepth=4,in_place_compression='xz')
 	tl.teeprint(argString)
 	if args.verbose:
 		DEBUG = True
@@ -242,7 +245,6 @@ def get_args(args = None):
 	parser = argparse.ArgumentParser(description='Copy files from source to destination')
 	parser.add_argument("-ld","--log_dir", type=str, help="Log directory. (default:/var/log)", default='/var/log')
 	parser.add_argument("-pn","--program_name", type=str, help="Program name for log dir (default:reverberator)", default='reverberator')
-	parser.add_argument("-lcm","--log_compress_months", type=int, help="Compress verbose log files after months (default:2)", default=2)
 	parser.add_argument("-ldy","--log_delete_years", type=int, help="Delete log files after years (default:2)", default=2)
 	parser.add_argument('-q', '--quiet', action='store_true', help='Suppress all output to stdout.')
 	parser.add_argument('-nl','--no_log', action='store_true', help='Do not log to file.')
@@ -307,6 +309,8 @@ def parse_rules(rule_file:str):
 	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=DEBUG)
 	if DEBUG:
 		tl.teeprint(f'Parsed rules: \n{rules}')
+	else:
+		tl.info(f'Parsed rules: \n{rules}')
 	if not rules:
 		tl.teeerror(f'Error: Rule file {rule_file} appears empty after parsing.')
 		sys.exit(1)
@@ -496,6 +500,8 @@ class inotify_resource_manager:
 			rc = multiCMD.run_command(['sudo','sysctl',f'{field}={value}'],timeout=1,quiet=not self.debug,return_code_only=True)
 			if self.debug:
 				tl.teeprint(f'sudo sysctl {field}={value} return code = {rc}')
+			else:
+				tl.info(f'sudo sysctl {field}={value} return code = {rc}')
 			if rc:
 				if self.debug:
 					tl.teeprint(f'Failed to set {field} to {value}')
@@ -623,7 +629,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 	with inotify_simple.INotify() as inotify_obj:
 		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags)
 		if mainWatchDescriptor == -1:
-			tl.teeerror(f'Failed to initialize folder watchers for {monitor_path}')
+			tl.teeerror(f'{WATCHER_LOG_PREFIX}|Failed to initialize folder watchers for {monitor_path}')
 			return False
 		lastReadTime = time.monotonic()
 		lastProcessTime = time.monotonic()
@@ -632,14 +638,12 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 			events =  inotify_obj.read(timeout=read_delay * 1000)
 			if not events:
 				if to_process and not to_process_flag.is_set() and time.monotonic() - lastReadTime > min_snapshot_delay_seconds:
-					if DEBUG:
-						tl.teeprint('Timeout elapsed, signaling backuper to process')
+					watcherTeeLogToTl(monitor_path,'Timeout elapsed, signaling backuper to process')
 					to_process_flag.set()
 					processPending = True
 				continue
 			if to_process and not to_process_flag.is_set() and time.monotonic() - lastProcessTime > max_shapshot_delay_seconds:
-				if DEBUG:
-					tl.teeprint('Max Delay timeout elapsed, signaling backuper to process')
+				watcherTeeLogToTl(monitor_path,'Max Delay timeout elapsed, signaling backuper to process')
 				to_process_flag.set()
 				processPending = True
 			lastReadTime = time.monotonic()
@@ -648,58 +652,48 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 				newDirWDs.clear()
 				processPending = False
 				lastProcessTime = time.monotonic()
-			if DEBUG:
-				tl.teeok(f'Events detected: {len(events)}')
-				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
-				tl.teeprint(TSVZ.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
+			decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
+			watcherTeeLogToTl(monitor_path,TSVZ.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
 			monTime = time.monotonic()
 			for event in events:
 				if event.mask & flags.Q_OVERFLOW:
-					tl.teeerror('Queue overflow, event maybe lost')
-					tl.teeprint('Attempting to increase inotify max_queued_events')
+					watcherTeeLogToTl(monitor_path,'Queue overflow, event maybe lost',error=True)
+					watcherTeeLogToTl(monitor_path,'Attempting to increase inotify max_queued_events')
 					irm.increaseInotifyMaxQueueEvents(irm.max_queued_events * 2)
 					continue
 				isDir = True if event.mask & flags.ISDIR else False
 				if event.mask & selfDestructMask:
 					if event.wd == mainWatchDescriptor:
 						# if UNMOUNT or IGNORED or DELETE_SELF, MOVE_SELF, return false
-						if DEBUG:
-							tl.teeprint('Main dir self destruct event detected, terminating')
+						watcherTeeLogToTl(monitor_path,'Main dir self destruct event detected, terminating')
 						irm.decreaseUserWatches(len(wdDic))
 						irm.decreaseUserInstances()
 						to_process.append(ChangeEvent(monTime,isDir,'self_destruct',monitor_path,None))
 						return False
 					elif event.mask & flags.DELETE_SELF:
-						if DEBUG:
-							tl.teeprint(f'Sub dir delete self event detected, removing watch for {wdDic.get(event.wd,None)}')
+						watcherTeeLogToTl(monitor_path,f'Sub dir delete self event detected, removing watch for {wdDic.get(event.wd,None)}')
 						wdDic.pop(event.wd, None)
 						irm.decreaseUserWatches()
 						continue
 					elif event.mask & flags.UNMOUNT:
 						if event.wd in wdDic:
-							if DEBUG:
-								tl.teeprint(f'Sub dir unmount event detected, resetting watch for {wdDic.get(event.wd,None)}')
+							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, resetting watch for {wdDic.get(event.wd,None)}')
 							wdDic.pop(event.wd, None)
 							wdDic[inotify_obj.add_watch(wdDic[event.wd], watch_flags)] = wdDic[event.wd]
 						else:
-							if DEBUG:
-								tl.teeerror(f'Sub dir unmount event detected, but watch not in wdDic found for {event.wd}')
+							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, but watch not in wdDic found for {event.wd}')
 						continue
 					elif event.mask & flags.MOVE_SELF:
-						if DEBUG:
-							tl.teeprint('Sub dir move self event detected, skipping')
+						watcherTeeLogToTl(monitor_path,'Sub dir move self event detected, skipping')
 						continue
 				if not event.name:
-					if DEBUG:
-						tl.teeprint('Event name not found, ignoring event')
+					watcherTeeLogToTl(monitor_path,'Event name not found, ignoring event')
 					continue
 				if event.wd not in wdDic:
-					if DEBUG:
-						tl.teeerror(f'Watch descriptor {event.wd} not found in wdDic {wdDic}, ignoring event')
+					watcherTeeLogToTl(monitor_path,f'Watch descriptor {event.wd} not found in wdDic {wdDic}, ignoring event')
 					continue
 				if discard_new_recursive_folder_events_until_read and event.wd in newDirWDs:
-					if DEBUG:
-						tl.teeprint(f'Discarding event for new recursive folder {wdDic[event.wd]}')
+					watcherTeeLogToTl(monitor_path,f'Discarding event for new recursive folder {wdDic[event.wd]}')
 					continue
 				eventPath = os.path.join(wdDic[event.wd],event.name)
 				if event.mask & flags.CREATE:
@@ -731,8 +725,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 						tl.teeprint(f'Move from event detected for {eventPath}')
 					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir)
 					while len(cookieDic) > COOKIE_DICT_MAX_SIZE:
-						if DEBUG:
-							tl.teeprint('Cookie dictionary is full, popping oldest item')
+						watcherTeeLogToTl(monitor_path,'Cookie dictionary is full, popping oldest item')
 						_,cookie_value = cookieDic.popitem(last=False)
 						# treat the move as a delete
 						# if cookie_value.isDir:
@@ -779,14 +772,36 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 					if DEBUG:
 						tl.teeprint(f'Modify event detected for {eventPath}')
 					to_process.append(ChangeEvent(monTime,isDir,'modify',eventPath,None))
-				elif DEBUG:
-					tl.info(f'Unprocessed event {event}')
+				else:
+					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
 			if pendingMoveFromEvents:
 				if DEBUG:
 					tl.teeprint(f'Adding unmatched pending move_from events as deletes {pendingMoveFromEvents.keys()}')
 				to_process.extend(pendingMoveFromEvents.values())
 				pendingMoveFromEvents.clear()
 	return True
+
+def watcherTeeLogToTl(monitor_path:str,message:str,error=False):
+	global tl
+	global DEBUG
+	message = f'{WATCHER_LOG_PREFIX}| {monitor_path} | ' + message
+	if error:
+		tl.teeerror(message,callerStackDepth=4)
+	if DEBUG:
+		tl.teeprint(message,callerStackDepth=4)
+	else:
+		tl.info(message,callerStackDepth=4)
+
+def backuperTeeLogToTl(path:str,message:str,error=False):
+	global tl
+	global DEBUG
+	message = f'{BACKUPER_LOG_PREFIX}| {path} | ' + message
+	if error:
+		tl.teeerror(message,callerStackDepth=4)
+	if DEBUG:
+		tl.teeprint(message,callerStackDepth=4)
+	else:
+		tl.info(message,callerStackDepth=4)
 
 class bidict(dict):
 	# Credit: https://stackoverflow.com/users/1422096/basj
@@ -815,20 +830,17 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	if not os.path.exists(monitor_path):
 		return -1
 	irm.increaseUserWatches()
-	if DEBUG:
-		tl.teeprint(f'Adding watch for {monitor_path}')
+	watcherTeeLogToTl(monitor_path,f'Adding watch for {monitor_path}')
 	try:
 		parentWatchDescriptor = inotify_obj.add_watch(monitor_path, watch_flags)
 	except Exception as e:
-		if DEBUG:
-			tl.teeerror(f'Failed to add watch for {monitor_path}: {e}')
+		watcherTeeLogToTl(monitor_path,f'Failed to add watch for {monitor_path}: {e}',error=True)
 		return -1
 	if newDirWds is not None:
 		newDirWds.add(parentWatchDescriptor)
 	wdDic[parentWatchDescriptor] = monitor_path
 	allFolders = get_all_folders(monitor_path)
-	if DEBUG:
-		tl.teeprint(f'Adding watch for {len(allFolders)} sub folders')
+	watcherTeeLogToTl(monitor_path,f'Adding watch for {len(allFolders)} sub folders')
 	irm.increaseUserWatches(len(allFolders))
 	for folder in allFolders:
 		try:
@@ -837,8 +849,7 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 				newDirWds.add(childWd)
 			wdDic[childWd] = folder
 		except Exception as e:
-			if DEBUG:
-				tl.teeerror(f'Failed to add watch for {folder}: {e}')
+			watcherTeeLogToTl(monitor_path,f'Failed to add watch for {folder}: {e}',error=True)
 			irm.decreaseUserWatches()
 			continue
 	return parentWatchDescriptor
@@ -867,8 +878,7 @@ def get_all_files_and_folders(path):
 				else:
 					files.append(entry.path)
 	except Exception as e:
-		if DEBUG:
-			tl.teeerror(f'Error scanning {path}: {e}')
+		watcherTeeLogToTl(path,f'Error scanning {path}: {e}',error=True)
 		return [], []
 	return files, folders
 
@@ -877,7 +887,7 @@ def fs_flag_daemon(path:str,signature:str,fsEvent:threading.Event):
 	global tl
 	while GREEN_LIGHT.is_set():
 		if check_fs_signature(path,signature):
-			tl.teeprint(f'FS signature for {path} verified.')
+			watcherTeeLogToTl(path,f'FS signature for {path} verified.')
 			fsEvent.set()
 		else:
 			fsEvent.clear()
@@ -974,14 +984,12 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 				to_process_flag.wait(3)
 			if not GREEN_LIGHT.is_set():
 				return
-			if DEBUG:
-				tl.teeprint(f'Backuper processing, {len(to_process)} events to process')
+			backuperTeeLogToTl(job_name,f'Backuper processing, {len(to_process)} events to process')
 			to_process_temp = to_process.copy()
 			to_process.clear()
 			to_process_flag.clear()
 			backupEntries = change_events_to_backup_entries(to_process_temp)
-			if DEBUG:
-				tl.teeprint(f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries')
+			backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries')
 		if log_journal:
 			journalPath = os.path.join(vault_path,job_name,'journal.tsv')
 			log_events_to_journal(backupEntries,journalPath)
@@ -1004,9 +1012,8 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 	# if it is a self_destruct event, we still keep it in 
 	global DEBUG
 	global tl
-	if DEBUG:
-		tl.teeprint('Converting the following change events to backup entries')
-		tl.printTable(change_events,header = CHANGED_EVENT_HEADER)
+	backuperTeeLogToTl('convertor','Converting the following change events to backup entries')
+	backuperTeeLogToTl('convertor',Tee_Logger.pretty_format_table(change_events,header = CHANGED_EVENT_HEADER))
 	backup_entries = OrderedDict()
 	newDirectories = set()
 	pendingMoveSourceParents = set()
