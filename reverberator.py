@@ -652,7 +652,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 				processPending = False
 				lastProcessTime = time.monotonic()
 			decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
-			watcherTeeLogToTl(monitor_path,TSVZ.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
+			watcherTeeLogToTl(monitor_path,'\n'+TSVZ.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
 			monTime = time.monotonic()
 			for event in events:
 				if event.mask & flags.Q_OVERFLOW:
@@ -986,7 +986,7 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 	# if it is a self_destruct event, we still keep it in 
 	global DEBUG
 	backuperTeeLogToTl('convertor','Converting the following change events to backup entries')
-	backuperTeeLogToTl('convertor',Tee_Logger.pretty_format_table(change_events,header = CHANGED_EVENT_HEADER))
+	backuperTeeLogToTl('convertor','\n'+Tee_Logger.pretty_format_table(change_events,header = CHANGED_EVENT_HEADER))
 	backup_entries = OrderedDict()
 	pendingMoveSourceParents = set()
 	moveSourceToDestDict = {}
@@ -1146,7 +1146,7 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 			backup_entries[abs_path] = BackupEntryValues(iso_time,event,abs_moved_from)
 			backup_entries.move_to_end(abs_path,last=False)
 	backuperTeeLogToTl(abs_path,'Converted backup entries')
-	backuperTeeLogToTl(abs_path,Tee_Logger.pretty_format_table(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER))
+	backuperTeeLogToTl(abs_path,'\n'+Tee_Logger.pretty_format_table(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER))
 	return backup_entries
 
 def log_events_to_journal(backup_entries:dict,journal_path:str):
