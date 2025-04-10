@@ -5,3 +5,4 @@ __pycache__
 test*/
 uv.lock
 my*.tsv
+*log/
