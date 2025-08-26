@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+reverberator.py
+reverberator.egg-info/PKG-INFO
+reverberator.egg-info/SOURCES.txt
+reverberator.egg-info/dependency_links.txt
+reverberator.egg-info/entry_points.txt
+reverberator.egg-info/requires.txt
+reverberator.egg-info/top_level.txt

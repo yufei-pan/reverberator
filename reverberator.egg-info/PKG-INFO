@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: reverberator
+Version: 0.16
+Summary: A inotify based tool to create REVERBs (REcursive VERsioning Backup) using symlinks
+Author-email: Yufei Pan <pan@zopyr.us>
+License-Expression: GPL-3.0-or-later
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: POSIX :: Linux
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+Requires-Dist: argparse>=1.4.0
+Requires-Dist: inotify-simple>=1.3.5
+Requires-Dist: multicmd>=1.29
+Requires-Dist: tee-logger>=6.34
+Requires-Dist: tsvz>=3.25
+Requires-Dist: xxhash>=3.5.0
+
+Design decision:
+	When reverberator is in cold start, will not calculate hash to do space efficient move operations to vault.
+	When restarting reverberator, will do one backup that will only handle create, modify, delete, attrib.

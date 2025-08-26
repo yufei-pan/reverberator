@@ -1,17 +1,15 @@
 [project]
 name = "reverberator"
-version = "0.1"
+version = "0.16"
 description = "A inotify based tool to create REVERBs (REcursive VERsioning Backup) using symlinks"
 readme = "README.md"
 requires-python = ">=3.7"
-license = {text = "GPL-3.0-or-later"}
+license = "GPL-3.0-or-later"
 authors = [
     { name = "Yufei Pan", email = "pan@zopyr.us" },
 ]
-homepage = "https://github.com/yufei-pan/reverberator"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
