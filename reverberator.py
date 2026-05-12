@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.16
+__version__ = 0.18
 
 ## WIP
 
@@ -111,6 +111,13 @@ HASH_SIZE = 1<<16
 
 DEBUG = False
 
+SAMPLE_REVERB_RULE_FILE = '''
+Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signature	Minium snapshot interval	Maximum snapshot interval	Keep 1 Compelete Backup	Only Sync Attributes (permissions) 	Keep N versions	Backup Size Limit	Vault File System Signature
+# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	When vault is empty, copy entire monitorig path to vault instead of using links	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Bigger ones take precedence	The UUID > Label > path for the vault file system
+# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS
+#_defaults_#		/var/reverbs/	auto	60	86400	True	True	0	5%,i5%	auto
+'''
+
 tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=False,noLog=True)
 
 #%% ---- Main CLI Functions ----
@@ -131,6 +138,12 @@ def main():
 	tl.teeprint(argString)
 	if args.verbose:
 		DEBUG = True
+	if args.drop_sample_reverb_rule_file:
+		rule_path = os.path.abspath(args.rule_path)
+		with open(rule_path, 'w', encoding='utf-8') as f:
+			f.write(SAMPLE_REVERB_RULE_FILE.strip() + '\n')
+		tl.teeok(f'Dropped sample rule file at {rule_path}')
+		return
 	# warn the user if reverberator is not run as root
 	if os.geteuid() != 0:
 		tl.teeerror('Warning: reverberator is not run as root, dynamic nofile tuning will not work. And file permissions can cause errors.')
@@ -242,17 +255,39 @@ def get_args(args = None):
 	'''
 	global __version__
 	lib_vers = f'inotify_simple {inotify_simple.__version__}; xxhash {xxhash.VERSION}; Tee_Logger {Tee_Logger.__version__}; multiCMD {multiCMD.__version__}; TSVZ {TSVZ.__version__}'
-	parser = argparse.ArgumentParser(description='Copy files from source to destination')
-	parser.add_argument("-ld","--log_dir", type=str, help="Log directory. (default:/var/log)", default='/var/log')
-	parser.add_argument("-pn","--program_name", type=str, help="Program name for log dir (default:reverberator)", default='reverberator')
-	parser.add_argument("-ldy","--log_delete_years", type=int, help="Delete log files after years (default:2)", default=2)
-	parser.add_argument('-q', '--quiet', action='store_true', help='Suppress all output to stdout.')
-	parser.add_argument('-nl','--no_log', action='store_true', help='Do not log to file.')
-	parser.add_argument('-v','--verbose','--debug', action='store_true', help='Print debug logs.')
+	class MixedHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawTextHelpFormatter):
+		pass
+	parser = argparse.ArgumentParser(
+		description=(
+			"reverberator watches source paths from a TSV rule file and creates recursive, "
+			"versioned backups in configured vault locations."
+		),
+		epilog=(
+			"Examples:\n"
+			"  reverberator reverb_rule.tsv\n"
+			"  reverberator --verbose --threads 4 /etc/reverb/custom_rules.tsv\n\n"
+			"Thread mode:\n"
+			"  --threads < 0 : multiplier of CPU count (e.g. -2 => 2x CPU count)\n"
+			"  --threads = 0 : use a very large worker pool (200000)\n"
+			"  --threads > 0 : exact worker thread count"
+		),
+		formatter_class=lambda prog: MixedHelpFormatter(
+			prog,
+			max_help_position=32,
+			width=100
+		)
+	)
+	parser.add_argument("-ld","--log_dir", type=str, help="Directory where log files are written.", default='/var/log')
+	parser.add_argument("-pn","--program_name", type=str, help="Program name used as the log subdirectory.", default='reverberator')
+	parser.add_argument("-ldy","--log_delete_years", type=int, help="Delete log files older than this many years.", default=2)
+	parser.add_argument('-q', '--quiet', action='store_true', help='Suppress stdout output (errors may still be emitted).')
+	parser.add_argument('-nl','--no_log', action='store_true', help='Disable writing log files to disk.')
+	parser.add_argument('-v','--verbose','--debug', action='store_true', help='Enable verbose debug logging.')
 	parser.add_argument('-V', '--version', action='version', version=f"%(prog)s {__version__} with {lib_vers}; reverb (REcursive VERsioning Backup) generator by pan@zopyr.us")
-	parser.add_argument('-t','--threads', type=int, help='Number of threads to use for backup. Use negative number for how many times of CPU count you want. Use 0 for 200k. (default: -2)', default=-2)
-	parser.add_argument('-j','--journal', action='store_true', help='Log backup actions to a journal file in the vault path.')
-	parser.add_argument('rule_path', metavar='RULE_PATH', type=str, nargs='?', default='reverb_rule.tsv', help='Path to the rule definition tabular file')
+	parser.add_argument('-t','--threads', type=int, help='Worker thread count policy for backup processing (see thread mode details below).', default=-2)
+	parser.add_argument('-j','--journal', action='store_true', help='Write backup actions to a journal file in the vault path.')
+	parser.add_argument('--drop_sample_reverb_rule_file', '--drop-sample-rule', action='store_true', help='Write SAMPLE_REVERB_RULE_FILE to RULE_PATH and exit.')
+	parser.add_argument('rule_path', metavar='RULE_PATH', type=str, nargs='?', default='reverb_rule.tsv', help='Path to the TSV rule-definition file.')
 	try:
 		args = parser.parse_intermixed_args(args)
 	except Exception as e:
@@ -417,7 +452,8 @@ def parse_rules(rule_file:str):
 			tl.info(f'Updating rule {ruleName}: {inRule}')
 			rulesToUpdate.append(list(inRule.values()))
 		returnReverbRules.append(ReverbRule(**inRule))
-		# append to tsv as well
+	# append all updated rows to tsv once (avoid cumulative duplicate appends)
+	if rulesToUpdate:
 		TSVZ.appendLinesTabularFile(rule_file,rulesToUpdate,header=REVERB_RULE_TSV_HEADER,createIfNotExist=False,verifyHeader=True,verbose=DEBUG,strict=False)
 	return returnReverbRules
 
@@ -879,7 +915,7 @@ def get_fs_signatures(path:str) -> list:
 	deviceName = rtnHost.stdout[1].split()[0]
 	rtnHost = multiCMD.run_command(['lsblk','--raw','--output=uuid,label,partuuid,partlabel,wwn,serial,model,name,kname,pkname',deviceName],timeout=60,quiet=not DEBUG,return_object=True)
 	if rtnHost.returncode != 0 or not rtnHost.stdout or len(rtnHost.stdout) <= 1:
-		return []
+		return [deviceName]
 	fields = rtnHost.stdout[1].split()
 	# lsblk do \x escape for some characters, we need to unescape them
 	fields = [bytes(f, 'utf-8').decode('unicode_escape') for f in fields if f]

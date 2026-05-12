@@ -1,0 +1,25 @@
+[Unit]
+Description=Reverberator recursive versioning backup daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Reverberator warns when not run as root because some tuning/permissions may fail.
+User=root
+Group=root
+
+# Update these paths for your installation.
+WorkingDirectory=/opt/reverberator
+ExecStart=/usr/bin/env python3 /opt/reverberator/reverberator.py /etc/reverberator/reverb_rule.tsv
+
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+
+# Optional hardening/tuning.
+NoNewPrivileges=true
+LimitNOFILE=524288
+
+[Install]
+WantedBy=multi-user.target
