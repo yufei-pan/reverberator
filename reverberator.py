@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.18
+__version__ = 0.20
 
 ## WIP
 
@@ -94,6 +94,8 @@ DEFAULT_KEEP_ONE_COMPLETE_BACKUP = True
 DEFAULT_ONLY_SYNC_ATTRIBUTES = True
 DEFAULT_KEEP_N_VERSIONS = 0
 DEFAULT_BACKUP_SIZE_LIMIT = '5%'
+
+MOVE_PAIR_TIMEOUT_SECONDS = 30
 
 ARG_MAX = os.sysconf('SC_ARG_MAX')
 ARGUMENT_LIMIT = (ARG_MAX - 4096) // 2048
@@ -170,14 +172,16 @@ def main():
 		min_snapshot_delay_seconds = DEFAULT_SNAPSHOT_DELAY
 		try:
 			min_snapshot_delay_seconds = int(reverb_rule.min_shapshot_time)
-		except:
+		except Exception as _:
 			tl.teeerror(f'Error: Rule {job_name} has invalid min_snapshot_delay_seconds value: {reverb_rule.min_shapshot_time}')
 			tl.teeprint(f"Reverting to default value: {DEFAULT_SNAPSHOT_DELAY}")
+		max_shapshot_delay_seconds = DEFAULT_MAX_DELAY
 		try:
 			max_shapshot_delay_seconds = int(reverb_rule.max_shapshot_time)
-		except:
-			tl.teeerror(f'Error: Rule {job_name} has invalid min_snapshot_delay_seconds value: {reverb_rule.max_shapshot_time}')
+		except Exception as _:
+			tl.teeerror(f'Error: Rule {job_name} has invalid max_snapshot_delay_seconds value: {reverb_rule.max_shapshot_time}')
 			tl.teeprint(f"Reverting to default value: {DEFAULT_MAX_DELAY}")
+			max_shapshot_delay_seconds = DEFAULT_MAX_DELAY
 		vault_path = reverb_rule.vault_path
 		if reverb_rule.keep_one_complete_backup.lower() == 'none':
 			keep_one_complete_backup = DEFAULT_KEEP_ONE_COMPLETE_BACKUP
@@ -190,7 +194,7 @@ def main():
 		keep_n_versions = DEFAULT_KEEP_N_VERSIONS
 		try:
 			keep_n_versions = int(reverb_rule.keep_n_versions)
-		except:
+		except Exception as _:
 			tl.teeerror(f'Error: Rule {job_name} has invalid keep_n_versions value: {reverb_rule.keep_n_versions}')
 			tl.teeprint(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}")
 		backup_size_limit = reverb_rule.backup_size_limit
@@ -290,7 +294,7 @@ def get_args(args = None):
 	parser.add_argument('rule_path', metavar='RULE_PATH', type=str, nargs='?', default='reverb_rule.tsv', help='Path to the TSV rule-definition file.')
 	try:
 		args = parser.parse_intermixed_args(args)
-	except Exception as e:
+	except Exception as _:
 		#eprint(f"Error while parsing arguments: {e!r}")
 		# try to parse the arguments using parse_known_args
 		args, unknown = parser.parse_known_args()
@@ -406,6 +410,14 @@ def parse_rules(rule_file:str):
 			tl.info(f'Auto filled Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}')
 			ruleUpdated = True
 		# max_shapshot_time
+		if not inRule["max_shapshot_time"] or inRule["max_shapshot_time"].lower() == 'none':
+			inRule["max_shapshot_time"] = str(DEFAULT_MAX_DELAY)
+			tl.info(f'Auto filled Maximum snapshot time for {ruleName}: {inRule["max_shapshot_time"]}')
+			ruleUpdated = True
+		elif inRule["max_shapshot_time"].lower() == 'auto':
+			inRule["max_shapshot_time"] = DEFAULT_MAX_DELAY
+			tl.info(f'Auto filled Maximum snapshot time for {ruleName}: {inRule["max_shapshot_time"]}')
+			ruleUpdated = True
 		# keep_one_complete_backup
 		if not inRule["keep_one_complete_backup"] or inRule["keep_one_complete_backup"].lower() == 'auto' or inRule["keep_one_complete_backup"].lower() == 'none':
 			inRule["keep_one_complete_backup"] = str(DEFAULT_KEEP_ONE_COMPLETE_BACKUP)
@@ -436,7 +448,7 @@ def parse_rules(rule_file:str):
 				# try create it 
 				try:
 					os.makedirs(inRule["vault_path"],exist_ok=True)
-				except:
+				except Exception as _:
 					tl.teelog(f'Warning: Rule {ruleName} with {inRule["vault_path"]} does not exist and failed to create it. Ignoring rule...',level='warning')
 					continue
 			signatures = get_fs_signatures(inRule["vault_path"])
@@ -494,7 +506,7 @@ class inotify_resource_manager:
 			if soft < hard:
 				resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 			self.max_no_files_user = hard
-		except:
+		except Exception as _:
 			self.max_no_files_user = 0
 
 	def __iter__(self):
@@ -514,7 +526,7 @@ class inotify_resource_manager:
 			rtn = multiCMD.run_command(['sysctl',field],timeout=1,quiet=not self.debug)
 			if rtn and rtn[0]:
 				return int(rtn[0].split('=')[-1].strip())
-		except:
+		except Exception as _:
 			import traceback
 			tl.error(traceback.format_exc())
 			tl.error(f'Failed to get {field} value')
@@ -551,7 +563,7 @@ class inotify_resource_manager:
 				tl.teeok(f'Increased inotify {field} to {value}')
 				setattr(self,value_name,value)
 				return True
-		except:
+		except Exception as _:
 			try:
 				import traceback
 				tl.error(traceback.format_exc())
@@ -562,7 +574,7 @@ class inotify_resource_manager:
 					setattr(self,value_name,rtn)
 				else:
 					setattr(self,value_name,-1)
-			except:
+			except Exception as _:
 				tl.teeerror(f'Failed to set {field} value')
 		return False
 
@@ -604,7 +616,7 @@ class inotify_resource_manager:
 			tl.teeok(f'Increased open file limit to {nofile}')
 			self.max_no_files = nofile
 			return rtn
-		except:
+		except Exception as _:
 			import traceback
 			tl.error(traceback.format_exc())
 			tl.teeerror(f'Failed to increase open file limit to {nofile}')
@@ -660,6 +672,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 	pendingMoveFromEvents = OrderedDict()
 	newDirWDs = set()
 	processPending = False
+	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
 	irm.increaseUserInstances()
 	with inotify_simple.INotify() as inotify_obj:
 		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags)
@@ -671,6 +684,12 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 		while GREEN_LIGHT.is_set():
 			read_delay = max(min(3,min_snapshot_delay_seconds),0.00001)
 			events =  inotify_obj.read(timeout=read_delay * 1000)
+			now = time.monotonic()
+			expired_move_cookies = [cookie for cookie, change_event in pendingMoveFromEvents.items() if now - change_event.monotonic_time > move_pair_timeout]
+			for cookie in expired_move_cookies:
+				if DEBUG:
+					watcherTeeLogToTl(monitor_path,f'Adding expired unmatched move_from as delete for cookie {cookie}')
+				to_process.append(pendingMoveFromEvents.pop(cookie))
 			if not events:
 				if to_process and not to_process_flag.is_set() and time.monotonic() - lastReadTime > min_snapshot_delay_seconds:
 					watcherTeeLogToTl(monitor_path,'Timeout elapsed, signaling backuper to process')
@@ -712,9 +731,10 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 						continue
 					elif event.mask & flags.UNMOUNT:
 						if event.wd in wdDic:
-							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, resetting watch for {wdDic.get(event.wd,None)}')
+							unmount_path = wdDic[event.wd]
+							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, resetting watch for {unmount_path}')
 							wdDic.pop(event.wd, None)
-							wdDic[inotify_obj.add_watch(wdDic[event.wd], watch_flags)] = wdDic[event.wd]
+							wdDic[inotify_obj.add_watch(unmount_path, watch_flags)] = unmount_path
 						else:
 							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, but watch not in wdDic found for {event.wd}')
 						continue
@@ -788,11 +808,6 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 					to_process.append(ChangeEvent(monTime,isDir,'modify',eventPath,None))
 				else:
 					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
-			if pendingMoveFromEvents:
-				if DEBUG:
-					watcherTeeLogToTl(monitor_path,f'Adding unmatched pending move_from events as deletes {pendingMoveFromEvents.keys()}')
-				to_process.extend(pendingMoveFromEvents.values())
-				pendingMoveFromEvents.clear()
 	return True
 
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
@@ -955,7 +970,7 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 	if not os.path.lexists(vault_path):
 		try:
 			os.makedirs(vault_path,exist_ok=True)
-		except:
+		except Exception as _:
 			watcherTeeLogToTl(monitor_path,f'Warning: Vault path {vault_path} does not exist and failed to create it. Backuper Stopped!',error=True)
 			return
 	vault_fs_flag = threading.Event()
@@ -1213,9 +1228,13 @@ def do_backup(backup_entries:dict,
 	if not os.path.lexists(job_vault):
 		try:
 			os.makedirs(job_vault,exist_ok=True)
-		except:
+		except Exception as _:
 			backuperTeeLogToTl(job_name,f'Warning: Vault path {job_vault} does not exist and failed to create it. Backuper Stopped!',error=True)
-			return
+			if vaultInfo is None:
+				vaultInfo = VaultInfo({}, 0, 0)
+			if trackingFilesFolders is None:
+				trackingFilesFolders = TrackingFilesFolders([], [])
+			return vaultInfo, trackingFilesFolders
 	if log_journal:
 		journalPath = os.path.join(job_vault,'journal.tsv')
 		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'start_reverb_backup_{len(backup_entries)}_enties',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
@@ -1394,7 +1413,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 									except Exception as e:
 										backuperTeeLogToTl(job_vault_path,f'Error renaming {entry.name} to {new_entry_name}: {e}',error=True)
 							vault_info_dict[version_number] = VaultEntry(version_number,vault_path,entry_timestamp,entry_size,entry_inode)
-						except:
+						except Exception as _:
 							import traceback
 							backuperTeeLogToTl(job_vault_path,f'Error processing {entry.name}: {traceback.format_exc()}',error=True)
 		for entry in content_file_to_delete:
@@ -1406,7 +1425,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 			# generate appropriate content file name ( leave it empty )
 			try:
 				version_number = int(os.path.basename(entry).lstrip('V').partition('--')[0])
-			except:
+			except Exception as _:
 				backuperTeeLogToTl(job_vault_path,f'Error getting version number from orphan {entry}',error=True)
 				continue
 			entry_size = get_path_size(entry)
@@ -1525,7 +1544,7 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 			os.chown(backup_file_path, st.st_uid, st.st_gid)
 		os.utime(backup_file_path, (st.st_atime, st.st_mtime))
 		return True
-	except:
+	except Exception as _:
 		backuperTeeLogToTl(path=source_file,error=True,message=f'Failed to copy metadata {source_file} -> {backup_file_path}')
 		import traceback
 		backuperTeeLogToTl(path=source_file,error=True,message=traceback.format_exc())
@@ -1625,21 +1644,21 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 		else:
 			try:
 				return int(size)
-			except Exception as e:
+			except Exception as _:
 				return 0
 	elif to_str or isinstance(size, int) or isinstance(size, float):
 		if isinstance(size, str):
 			try:
 				size = size.rstrip('B').rstrip('b')
 				size = float(size.lower().strip())
-			except Exception as e:
+			except Exception as _:
 				return size
 		# size is in bytes
 		if use_1024_bytes or use_1024_bytes is None:
 			power = 2**10
 			n = 0
 			power_labels = {0 : '', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti', 5: 'Pi'}
-			while size > power:
+			while size >= power:
 				size /= power
 				n += 1
 			return f"{size:{str_format}}{' '}{power_labels[n]}"
@@ -1647,7 +1666,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 			power = 10**3
 			n = 0
 			power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T', 5: 'P'}
-			while size > power:
+			while size >= power:
 				size /= power
 				n += 1
 			return f"{size:{str_format}}{' '}{power_labels[n]}"
@@ -1701,7 +1720,7 @@ def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_fi
 		try:
 			monitor_entry_stat = os.lstat(monitor_entry)
 			latest_version_entry_stat = os.lstat(latest_version_entry)
-		except:
+		except Exception as _:
 			if DEBUG:
 				import traceback
 				backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error getting lstat for {monitor_entry} or {latest_version_entry}')
@@ -1714,12 +1733,12 @@ def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_fi
 			if monitor_entry_stat.st_dev == latest_version_entry_stat.st_dev and monitor_entry_stat.st_ino == latest_version_entry_stat.st_ino:
 				# same file
 				if DEBUG:
-					backuperTeeLogToTl(path=monitor_entry,message=f'Same file according to dev and ino number')
+					backuperTeeLogToTl(path=monitor_entry,message='Same file according to dev and ino number')
 				return
-		except:
+		except Exception as _:
 			if DEBUG:
 				import traceback
-				backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error comparing dev and ino')
+				backuperTeeLogToTl(path=monitor_entry,error=True,message='Error comparing dev and ino')
 				backuperTeeLogToTl(path=monitor_entry,error=True,message=traceback.format_exc())
 		try:
 			if isDir:
@@ -1727,26 +1746,26 @@ def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_fi
 				if monitor_entry_stat.st_mode != latest_version_entry_stat.st_mode or monitor_entry_stat.st_uid != latest_version_entry_stat.st_uid or monitor_entry_stat.st_gid != latest_version_entry_stat.st_gid:
 					# attrib changed
 					if DEBUG:
-						backuperTeeLogToTl(path=monitor_entry,message=f'Dir attrib changed')
+						backuperTeeLogToTl(path=monitor_entry,message='Dir attrib changed')
 					backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'attrib',None)
 				elif DEBUG:
-					backuperTeeLogToTl(path=monitor_entry,message=f'Dir attrib same')
+					backuperTeeLogToTl(path=monitor_entry,message='Dir attrib same')
 				return
 			# if is link, only check target
 			if os.path.islink(monitor_entry):
 				# check if the target is the same
 				if os.path.realpath(monitor_entry) == os.path.realpath(latest_version_entry):
 					if DEBUG:
-						backuperTeeLogToTl(path=monitor_entry,message=f'Same link')
+						backuperTeeLogToTl(path=monitor_entry,message='Same link')
 				else:
 					if DEBUG:
-						backuperTeeLogToTl(path=monitor_entry,message=f'Link target different')
+						backuperTeeLogToTl(path=monitor_entry,message='Link target different')
 					backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'modify',None)
 				return
 			if monitor_entry_stat.st_size != latest_version_entry_stat.st_size:
 				# file size is different
 				if DEBUG:
-					backuperTeeLogToTl(path=monitor_entry,message=f'Size different')
+					backuperTeeLogToTl(path=monitor_entry,message='Size different')
 				backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'modify',None)
 			elif monitor_entry_stat.st_mtime_ns != latest_version_entry_stat.st_mtime_ns:
 				if DEBUG:
@@ -1754,25 +1773,25 @@ def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_fi
 				backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'modify',None)
 			elif hash_file(monitor_entry,monitor_entry_stat.st_size) != hash_file(latest_version_entry,latest_version_entry_stat.st_size):
 				if DEBUG:
-					backuperTeeLogToTl(path=monitor_entry,message=f'Size Same, mtime same, hash different')
+					backuperTeeLogToTl(path=monitor_entry,message='Size Same, mtime same, hash different')
 				backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'modify',None)
 			elif monitor_entry_stat.st_mode != latest_version_entry_stat.st_mode or monitor_entry_stat.st_uid != latest_version_entry_stat.st_uid or monitor_entry_stat.st_gid != latest_version_entry_stat.st_gid:
 				if DEBUG:
-					backuperTeeLogToTl(path=monitor_entry,message=f'Size Same, mtime same, hash same, attr different')
+					backuperTeeLogToTl(path=monitor_entry,message='Size Same, mtime same, hash same, attr different')
 				backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'attrib',None)
 			elif DEBUG:
-				backuperTeeLogToTl(path=monitor_entry,message=f'Size Same, mtime same, hash same, attr same')
-		except:
+				backuperTeeLogToTl(path=monitor_entry,message='Size Same, mtime same, hash same, attr same')
+		except Exception as _:
 			if DEBUG:
 				import traceback
-				backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error comparing size, mtime, hash')
+				backuperTeeLogToTl(path=monitor_entry,error=True,message='Error comparing size, mtime, hash')
 				backuperTeeLogToTl(path=monitor_entry,error=True,message=traceback.format_exc())
-				backuperTeeLogToTl(path=monitor_entry,message=f'Adding as modify')
+				backuperTeeLogToTl(path=monitor_entry,message='Adding as modify')
 			backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'modify',None)
 	else:
 		# this is a new file/folder
 		if DEBUG:
-			backuperTeeLogToTl(path=monitor_entry,message=f'New file/folder')
+			backuperTeeLogToTl(path=monitor_entry,message='New file/folder')
 		backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),'create',None)
 
 def hash_file(path,size = ...,full_hash=False):
@@ -1784,7 +1803,7 @@ def hash_file(path,size = ...,full_hash=False):
 	if size == ...:
 		try:
 			size = max(os.lstat(path).st_size,4096)
-		except:
+		except Exception as _:
 			# if the file does not exist / cannot be accessed, return empty hash
 			backuperTeeLogToTl(path='hash_file',error=True,message=f'Error getting size for {path}')
 			return ''
@@ -1891,8 +1910,8 @@ def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_
 	if not backup_size_limit or backup_size_limit == '0':
 		return 0, 0
 	backup_size_limits = backup_size_limit.split(',')
-	rtn_size_limit = -1
-	rtn_inode_limit = -1
+	rtn_size_limit = 0
+	rtn_inode_limit = 0
 	for limit in backup_size_limits:
 		size_limit = -1
 		inode_limit = -1
@@ -1904,33 +1923,31 @@ def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_
 					if vault_fs_inode and inode_limit == 0:
 						# if vault has inodes but we cannot use any, set inode limit to 1
 						inode_limit = 1
-				except:
+				except Exception as _:
 					pass
 			else:
 				try:
 					size_limit = int(float(limit) * vault_fs_size // 100)
 					if vault_fs_size and size_limit == 0:
 						size_limit = 1
-				except:
+				except Exception as _:
 					pass
 		elif limit.startswith('i'):
 			try:
 				inode_limit = int(format_bytes(limit.lstrip('i'),to_int=True))
-			except:
+			except Exception as _:
 				pass
 		else:
 			try:
 				size_limit = int(format_bytes(limit,to_int=True))
-			except:
+			except Exception as _:
 				pass
-		if rtn_inode_limit < 0:
-			rtn_inode_limit = inode_limit
-		elif inode_limit > 0 and inode_limit < rtn_inode_limit:
-			rtn_inode_limit = inode_limit
-		if rtn_size_limit < 0:
-			rtn_size_limit = size_limit
-		elif size_limit > 0 and size_limit < rtn_size_limit:
-			rtn_size_limit = size_limit
+		if inode_limit > 0:
+			if rtn_inode_limit == 0 or inode_limit < rtn_inode_limit:
+				rtn_inode_limit = inode_limit
+		if size_limit > 0:
+			if rtn_size_limit == 0 or size_limit < rtn_size_limit:
+				rtn_size_limit = size_limit
 	return rtn_size_limit, rtn_inode_limit
 
 def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
@@ -2052,12 +2069,14 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# we just remove the folder
 			if os.path.abspath(vault_real_path) == '/':
 				# we cannot remove root
-				backuperTeeLogToTl(path=vault_real_path,error=True,message=f'Attempting to remove root, skipping')
+				backuperTeeLogToTl(path=vault_real_path,error=True,message='Attempting to remove root, skipping')
 			else:
 				mcae.run_command(['rm','-rf',vault_real_path])
 			vaultFolders.discard(relative_path)
-			# also need to remove all the files in the folder
-			vaultFiles = {file for file in vaultFiles if not file.startswith(vault_real_path)}
+			# also need to remove all the files and subfolders in the folder
+			relative_prefix = relative_path if relative_path.endswith('/') else relative_path + '/'
+			vaultFiles.difference_update(file for file in vaultFiles if file.startswith(relative_prefix))
+			vaultFolders.difference_update(folder for folder in vaultFolders if folder.startswith(relative_prefix))
 		else:
 			# we just remove the file
 			mcae.run_command(['rm','-f',vault_real_path])
@@ -2105,19 +2124,29 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			if isDir:
 				if os.path.abspath(file_vault_target_path) == '/':
 					# we cannot remove root
-					backuperTeeLogToTl(path=file_vault_target_path,error=True,message=f'Attempting to move root, skipping')
+					backuperTeeLogToTl(path=file_vault_target_path,error=True,message='Attempting to move root, skipping')
 					continue
 				vaultFolders.discard(link_source_relative_path)
 				vaultFolders.add(link_target_relative_path)
 				# also need to move all the files in the folder
+				source_prefix = link_source_relative_path if link_source_relative_path.endswith('/') else link_source_relative_path + '/'
+				target_prefix = link_target_relative_path if link_target_relative_path.endswith('/') else link_target_relative_path + '/'
 				oldFiles = set()
 				newFiles = set()
 				for file in vaultFiles:
-					if file.startswith(link_source_relative_path):
+					if file.startswith(source_prefix):
 						oldFiles.add(file)
-						newFiles.add(os.path.relpath(file,monitor_path))
+						newFiles.add(target_prefix + file[len(source_prefix):])
 				vaultFiles.difference_update(oldFiles)
 				vaultFiles.update(newFiles)
+				oldFolders = set()
+				newFolders = set()
+				for folder in vaultFolders:
+					if folder.startswith(source_prefix):
+						oldFolders.add(folder)
+						newFolders.add(target_prefix + folder[len(source_prefix):])
+				vaultFolders.difference_update(oldFolders)
+				vaultFolders.update(newFolders)
 			else:
 				vaultFiles.discard(link_source_relative_path)
 				vaultFiles.add(link_target_relative_path)
@@ -2131,11 +2160,11 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					os.remove(link_target_backup_real_path)
 				os.rename(link_source_backup_real_path,link_target_backup_real_path)
 				backuperTeeLogToTl(path=monitor_path,message=f'Moved {link_source_backup_real_path} to {link_target_backup_real_path}')
-			except:
+			except Exception as _:
 				backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
 				import traceback
 				backuperTeeLogToTl(path=monitor_path,error=True,message=traceback.format_exc())
-				backuperTeeLogToTl(path=monitor_path,message=f'Doing delete & copy instead')
+				backuperTeeLogToTl(path=monitor_path,message='Doing delete & copy instead')
 				# if we fail to move, we just copy the file
 				copy_path(isDir=isDir,monitor_path=monitor_path,
 				  source_real_path=event_source_real_path,
