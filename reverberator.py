@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.20
+__version__ = 0.21
 
 ## WIP
 
@@ -81,6 +81,12 @@ PENDING_TRANSACTIONS_FILE_NAME = '.reverberator_pending_transactions.nsv'
 
 ChangeEvent = namedtuple('ChangeEvent', CHANGED_EVENT_HEADER)
 BackupEntryValues = namedtuple('BackupEntryValues', BACKUP_ENTRY_VALUES_HEADER)
+
+def strip_suffix(s, suffix):
+	return s[:-len(suffix)] if suffix and s.endswith(suffix) else s
+
+def strip_prefix(s, prefix):
+	return s[len(prefix):] if prefix and s.startswith(prefix) else s
 
 def append_change_event(to_process:deque, to_process_lock:threading.Lock, event:ChangeEvent):
 	with to_process_lock:
@@ -261,9 +267,9 @@ def get_args(args = None):
 
 	Example:
 		>>> get_args(['-ld','/tmp','--verbose','--threads=4','rule.tsv'])[0]
-		Namespace(log_dir='/tmp', program_name='reverberator', log_compress_months=2, log_delete_years=2, quiet=False, no_log=False, verbose=True, threads=4, journal=False, rule_path='rule.tsv')
-		>>> get_args(['-ld','/tmp','-pn','reverb','--log_compress_months=3','--log_delete_years=3','--quiet','--verbose','--threads=4','rule.tsv'])[1].partition('--')[2]
-		"log_dir=\'/tmp\' --program_name=\'reverb\' --log_compress_months=\'3\' --log_delete_years=\'3\' --quiet=\'True\' --verbose=\'True\' --threads=\'4\' \'rule.tsv\'"
+		Namespace(log_dir='/tmp', program_name='reverberator', log_delete_years=2, quiet=False, no_log=False, verbose=True, threads=4, journal=False, drop_sample_reverb_rule_file=False, rule_path='rule.tsv')
+		>>> get_args(['-ld','/tmp','-pn','reverb','--log_delete_years=3','--quiet','--verbose','--threads=4','rule.tsv'])[1].partition('--')[2]
+		"log_dir=\'/tmp\' --program_name=\'reverb\' --log_delete_years=\'3\' --quiet=\'True\' --verbose=\'True\' --threads=\'4\' \'rule.tsv\'"
 	'''
 	global __version__
 	lib_vers = f'inotify_simple {inotify_simple.__version__}; xxhash {xxhash.VERSION}; Tee_Logger {Tee_Logger.__version__}; multiCMD {multiCMD.__version__}; TSVZ {TSVZ.__version__}'
@@ -308,8 +314,8 @@ def get_args(args = None):
 		args, unknown = parser.parse_known_args()
 		# if there are unknown arguments, we will try to parse them again using parse_args
 		if unknown:
-			print(f"Warning: Unknown arguments, treating all as Source Path: {unknown!r}")
-			args.rule_path = args.rule_path + unknown
+			print(f"Error: Unrecognized arguments: {unknown!r}", file=sys.stderr)
+			sys.exit(2)
 	#print(f'Arguments: {vars(args)}')
 	default_args_dict = vars(parser.parse_args([]))
 	# format a long format argument of what the user supplied and echo it back
@@ -414,7 +420,7 @@ def parse_rules(rule_file:str):
 			tl.info(f'Zeroed Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}')
 			ruleUpdated = True
 		elif inRule["min_shapshot_time"].lower() == 'auto':
-			inRule["min_shapshot_time"] = DEFAULT_SNAPSHOT_DELAY
+			inRule["min_shapshot_time"] = str(DEFAULT_SNAPSHOT_DELAY)
 			tl.info(f'Auto filled Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}')
 			ruleUpdated = True
 		# max_shapshot_time
@@ -423,7 +429,7 @@ def parse_rules(rule_file:str):
 			tl.info(f'Auto filled Maximum snapshot time for {ruleName}: {inRule["max_shapshot_time"]}')
 			ruleUpdated = True
 		elif inRule["max_shapshot_time"].lower() == 'auto':
-			inRule["max_shapshot_time"] = DEFAULT_MAX_DELAY
+			inRule["max_shapshot_time"] = str(DEFAULT_MAX_DELAY)
 			tl.info(f'Auto filled Maximum snapshot time for {ruleName}: {inRule["max_shapshot_time"]}')
 			ruleUpdated = True
 		# keep_one_complete_backup
@@ -442,7 +448,7 @@ def parse_rules(rule_file:str):
 			tl.info(f'Zeroed Keep N versions for {ruleName}: {inRule["keep_n_versions"]}')
 			ruleUpdated = True
 		elif inRule["keep_n_versions"].lower() == 'auto':
-			inRule["keep_n_versions"] = DEFAULT_KEEP_N_VERSIONS
+			inRule["keep_n_versions"] = str(DEFAULT_KEEP_N_VERSIONS)
 			tl.info(f'Auto filled Keep N versions for {ruleName}: {inRule["keep_n_versions"]}')
 			ruleUpdated = True
 		# backup_size_limit
@@ -666,9 +672,9 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to
 		if not GREEN_LIGHT.is_set():
 			watcherTeeLogToTl(monitor_path,f'Exiting watcher thread for {monitor_path}',ok=True)
 			return False
-		watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds)
+		watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_lock=to_process_lock,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds)
 
-def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
+def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
 	global COOKIE_DICT_MAX_SIZE
 	global DEBUG
 	global GREEN_LIGHT
@@ -782,7 +788,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 						_,cookie_value = cookieDic.popitem(last=False)
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Adding delete event for {cookie_value.path}')
-						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'delete',cookie_value.path,None))
+						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,cookie_value.isDir,'delete',cookie_value.path,None))
 					#append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,None))
 					pendingMoveFromEvents[event.cookie] = ChangeEvent(monTime,isDir,'delete',eventPath,None)
 				elif event.mask & flags.MOVED_TO:
@@ -985,6 +991,7 @@ def get_monitor_path_most_recent_change_time(monitor_path:str) -> float:
 	return latest_mtime
 
 def fs_flag_daemon(path:str,signature:str,fsEvent:threading.Event):
+	global GREEN_LIGHT
 	while GREEN_LIGHT.is_set():
 		if check_fs_signature(path,signature):
 			watcherTeeLogToTl(path,f'FS signature for {path} verified.')
@@ -1296,8 +1303,8 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 			backuperTeeLogToTl(abs_path,f'Adding {event} on {abs_path} at {iso_time} with source {abs_moved_from}')
 			backup_entries[abs_path] = BackupEntryValues(iso_time,event,abs_moved_from)
 			backup_entries.move_to_end(abs_path,last=False)
-	backuperTeeLogToTl(abs_path,'Converted backup entries')
-	backuperTeeLogToTl(abs_path,'\n'+TSVZ.pretty_format_table(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER))
+	backuperTeeLogToTl('convertor','Converted backup entries')
+	backuperTeeLogToTl('convertor','\n'+TSVZ.pretty_format_table(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER))
 	return backup_entries
 
 def log_events_to_journal(backup_entries:dict,journal_path:str):
@@ -1504,7 +1511,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	try:
 		for entry in os.scandir(job_vault_path):
 			if entry.name.startswith('V') and '--' in entry.name:
-				version_number_str = entry.name.lstrip('V').partition('--')[0]
+				version_number_str = strip_prefix(entry.name, 'V').partition('--')[0]
 				if version_number_str.isdigit():
 					version_number = int(version_number_str)
 					if CONTENT_FILE_EXTENSION_NAME not in entry.name:
@@ -1519,7 +1526,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 								continue
 							orphan_entries.discard(vault_path)
 							if not recalculate:
-								entry_name = entry.name.rstrip(CONTENT_FILE_EXTENSION_NAME)
+								entry_name = strip_suffix(entry.name, CONTENT_FILE_EXTENSION_NAME)
 								entry_size_inode_str = entry_name.rpartition('--')[2]
 								entry_size_str = entry_size_inode_str.partition('-')[0].replace('_','')
 								entry_size = format_bytes(entry_size_str,to_int=True)
@@ -1558,7 +1565,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 		for entry in orphan_entries:
 			# generate appropriate content file name ( leave it empty )
 			try:
-				version_number = int(os.path.basename(entry).lstrip('V').partition('--')[0])
+				version_number = int(strip_prefix(os.path.basename(entry), 'V').partition('--')[0])
 			except Exception as _:
 				backuperTeeLogToTl(job_vault_path,f'Error getting version number from orphan {entry}',error=True)
 				continue
@@ -1753,14 +1760,15 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 				return 0
 			number, _, unit = match.groups()
 			number = float(number)
-			unit  = unit.strip().lower().rstrip('b')
+			unit = unit.strip().lower()
+			unit = strip_suffix(unit, 'b')
 			# Define the unit conversion dictionary
 			if unit.endswith('i'):
 				# this means we treat the unit as 1024 bytes if it ends with 'i'
 				use_1024_bytes = True
 			elif use_1024_bytes is None:
 				use_1024_bytes = False
-			unit  = unit.rstrip('i')
+			unit = strip_suffix(unit, 'i')
 			if use_1024_bytes:
 				power = 2**10
 			else:
@@ -1783,8 +1791,8 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 	elif to_str or isinstance(size, int) or isinstance(size, float):
 		if isinstance(size, str):
 			try:
-				size = size.rstrip('B').rstrip('b')
-				size = float(size.lower().strip())
+				size = strip_suffix(strip_suffix(size.lower().strip(), 'b'), 'B')
+				size = float(size)
 			except Exception as _:
 				return size
 		# size is in bytes
@@ -2050,10 +2058,10 @@ def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_
 		size_limit = -1
 		inode_limit = -1
 		if limit.endswith('%'):
-			limit = limit.rstrip('%')
+			limit = strip_suffix(limit, '%')
 			if limit.startswith('i'):
 				try:
-					inode_limit = int(float(limit.lstrip('i')) * vault_fs_inode // 100)
+					inode_limit = int(float(strip_prefix(limit, 'i')) * vault_fs_inode // 100)
 					if vault_fs_inode and inode_limit == 0:
 						# if vault has inodes but we cannot use any, set inode limit to 1
 						inode_limit = 1
@@ -2068,7 +2076,7 @@ def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_
 					pass
 		elif limit.startswith('i'):
 			try:
-				inode_limit = int(format_bytes(limit.lstrip('i'),to_int=True))
+				inode_limit = int(format_bytes(strip_prefix(limit, 'i'),to_int=True))
 			except Exception as _:
 				pass
 		else:
