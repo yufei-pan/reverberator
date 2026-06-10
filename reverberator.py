@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.18
+__version__ = 0.19
 
 ## WIP
 
@@ -77,9 +77,14 @@ VAULT_TIMESTAMP_FORMAT = '%Y-%m-%d_%H-%M-%S_%z'
 TRACKING_FILES_FOLDERS_HEADER = ['files','folders']
 
 CONTENT_FILE_EXTENSION_NAME = '.modified_contents.nsv'
+PENDING_TRANSACTIONS_FILE_NAME = '.reverberator_pending_transactions.nsv'
 
 ChangeEvent = namedtuple('ChangeEvent', CHANGED_EVENT_HEADER)
 BackupEntryValues = namedtuple('BackupEntryValues', BACKUP_ENTRY_VALUES_HEADER)
+
+def append_change_event(to_process:deque, to_process_lock:threading.Lock, event:ChangeEvent):
+	with to_process_lock:
+		to_process.append(event)
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
 VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER)
@@ -133,6 +138,7 @@ def main():
 	global DEFAULT_BACKUP_SIZE_LIMIT
 	global DEBUG
 	signal.signal(signal.SIGINT, signal_handler)
+	signal.signal(signal.SIGTERM, signal_handler)
 	args, argString = get_args()
 	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=0, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log,callerStackDepth=4,in_place_compression='xz')
 	tl.teeprint(argString)
@@ -196,16 +202,18 @@ def main():
 		backup_size_limit = reverb_rule.backup_size_limit
 		vault_path_signature = reverb_rule.vault_fs_signature
 		to_process = deque()
+		to_process_lock = threading.Lock()
+		load_pending_transactions_for_resume(job_name=job_name, monitor_path=monitor_path, vault_path=vault_path, to_process=to_process)
 		to_process_flag = threading.Event()
 		monitor_fs_flag = threading.Event()
 		monitor_fs_thread = threading.Thread(target=fs_flag_daemon,args=(monitor_path,monitor_path_signature,monitor_fs_flag),daemon=True)
 		tl.teeprint(f'Starting path watcher {job_name} for {monitor_path}')
 		monitor_fs_thread.start()
-		watcherThread = threading.Thread(target=watcher,args=(monitor_fs_flag,monitor_path,to_process,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds),daemon=True)
+		watcherThread = threading.Thread(target=watcher,args=(monitor_fs_flag,monitor_path,to_process,to_process_lock,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds),daemon=True)
 		watcherThread.start()
 		main_threads.append(watcherThread)
 		tl.teeok(f'Started reverb monitor for {job_name} with monitor path {monitor_path}:{monitor_path_signature}')
-		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal),daemon=True)
+		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,to_process_lock,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal),daemon=True)
 		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
 		backup_thread.start()
 		main_threads.append(backup_thread)
@@ -637,7 +645,7 @@ class inotify_resource_manager:
 		return self.current_user_watches
 
 #%% ---- Watcher ----
-def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
+def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
 	global GREEN_LIGHT
 	# main monitoring function to deal with one reverb.
 	while GREEN_LIGHT.is_set():
@@ -703,7 +711,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 						watcherTeeLogToTl(monitor_path,'Main dir self destruct event detected, terminating')
 						irm.decreaseUserWatches(len(wdDic))
 						irm.decreaseUserInstances()
-						to_process.append(ChangeEvent(monTime,isDir,'self_destruct',monitor_path,None))
+						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'self_destruct',monitor_path,None))
 						return False
 					elif event.mask & flags.DELETE_SELF:
 						watcherTeeLogToTl(monitor_path,f'Sub dir delete self event detected, removing watch for {wdDic.get(event.wd,None)}')
@@ -712,9 +720,10 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 						continue
 					elif event.mask & flags.UNMOUNT:
 						if event.wd in wdDic:
-							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, resetting watch for {wdDic.get(event.wd,None)}')
+							unmount_path = wdDic[event.wd]
+							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, resetting watch for {unmount_path}')
 							wdDic.pop(event.wd, None)
-							wdDic[inotify_obj.add_watch(wdDic[event.wd], watch_flags)] = wdDic[event.wd]
+							wdDic[inotify_obj.add_watch(unmount_path, watch_flags)] = unmount_path
 						else:
 							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, but watch not in wdDic found for {event.wd}')
 						continue
@@ -736,15 +745,15 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 						watcherTeeLogToTl(monitor_path,f'Create event detected for {eventPath}')
 					if isDir:
 						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs)
-					to_process.append(ChangeEvent(monTime,isDir,'create',eventPath,None))
+					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.DELETE:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Delete event detected for {eventPath}')
-					to_process.append(ChangeEvent(monTime,isDir,'delete',eventPath,None))
+					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'delete',eventPath,None))
 				elif event.mask & flags.ATTRIB:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Attrib event detected for {eventPath}')
-					to_process.append(ChangeEvent(monTime,isDir,'attrib',eventPath,None))
+					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'attrib',eventPath,None))
 				elif event.mask & flags.MOVED_FROM:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move from event detected for {eventPath}')
@@ -754,8 +763,8 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 						_,cookie_value = cookieDic.popitem(last=False)
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Adding delete event for {cookie_value.path}')
-						to_process.append(ChangeEvent(monTime,isDir,'delete',cookie_value.path,None))
-					#to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,None))
+						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'delete',cookie_value.path,None))
+					#append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,None))
 					pendingMoveFromEvents[event.cookie] = ChangeEvent(monTime,isDir,'delete',eventPath,None)
 				elif event.mask & flags.MOVED_TO:
 					if DEBUG:
@@ -766,7 +775,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 							watcherTeeLogToTl(monitor_path,f'Adding move event for {cookieDic[event.cookie].path} to {eventPath}')
 						cookie_value = cookieDic.pop(event.cookie)
 						pendingMoveFromEvents.pop(event.cookie,None)
-						to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,cookie_value.path))
+						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,cookie_value.path))
 						if isDir:
 							# we need to update wdDic to reflect the new path
 							if cookie_value.path in wdDic.inverse:
@@ -781,17 +790,18 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_flag:threading.Even
 							watcherTeeLogToTl(monitor_path,f'Treating move as create event for {eventPath}')
 						if isDir:
 							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs)
-						to_process.append(ChangeEvent(monTime,isDir,'create',eventPath,None))
+						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.MODIFY:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Modify event detected for {eventPath}')
-					to_process.append(ChangeEvent(monTime,isDir,'modify',eventPath,None))
+					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'modify',eventPath,None))
 				else:
 					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
 			if pendingMoveFromEvents:
 				if DEBUG:
 					watcherTeeLogToTl(monitor_path,f'Adding unmatched pending move_from events as deletes {pendingMoveFromEvents.keys()}')
-				to_process.extend(pendingMoveFromEvents.values())
+				with to_process_lock:
+					to_process.extend(pendingMoveFromEvents.values())
 				pendingMoveFromEvents.clear()
 	return True
 
@@ -883,6 +893,84 @@ def get_all_files_and_folders(path):
 		return [], []
 	return files, folders
 
+def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:deque) -> bool:
+	pending_transactions_path = os.path.join(vault_path, PENDING_TRANSACTIONS_FILE_NAME)
+	if not os.path.exists(pending_transactions_path):
+		return False
+	try:
+		pending_mtime = os.path.getmtime(pending_transactions_path)
+	except Exception as e:
+		backuperTeeLogToTl(job_name, f'Failed to read pending transactions timestamp for {pending_transactions_path}: {e}', error=True)
+		return False
+	latest_monitor_change = get_monitor_path_most_recent_change_time(monitor_path)
+	# Resume only when the latest monitor-path mtime is at least 1 second older
+	# than the pending file (no filesystem changes after the pending snapshot).
+	should_resume = latest_monitor_change <= pending_mtime - 1.0
+	if not should_resume:
+		backuperTeeLogToTl(job_name, 'Pending transactions file exists but did not pass resume timestamp check. Falling back to delta generation.')
+		try:
+			os.remove(pending_transactions_path)
+		except Exception as e:
+			backuperTeeLogToTl(job_name, f'Failed to remove skipped pending transactions file {pending_transactions_path}: {e}', error=True)
+		return False
+	loaded_count = 0
+	try:
+		pending_rows_raw = TSVZ.readTabularFile(
+			pending_transactions_path,
+			header=CHANGED_EVENT_HEADER,
+			verifyHeader=True,
+			strict=False,
+			verbose=DEBUG,
+			defaults=[],
+			correctColumnNum=len(CHANGED_EVENT_HEADER)
+		)
+		for row in pending_rows_raw.values():
+			moved_from = row[4]
+			if moved_from == '':
+				moved_from = None
+			to_process.append(ChangeEvent(
+				float(row[0]),
+				row[1] in (True, 'True', 'true', '1', 1),
+				row[2],
+				row[3],
+				moved_from
+			))
+			loaded_count += 1
+		try:
+			os.remove(pending_transactions_path)
+		except Exception as e:
+			backuperTeeLogToTl(job_name, f'Failed to remove pending transactions file {pending_transactions_path}: {e}', error=True)
+		backuperTeeLogToTl(job_name, f'Loaded {loaded_count} pending transactions from {pending_transactions_path}')
+	except Exception as e:
+		backuperTeeLogToTl(job_name, f'Failed to load pending transactions from {pending_transactions_path}: {e}', error=True)
+		to_process.clear()
+		try:
+			os.remove(pending_transactions_path)
+		except Exception as e:
+			backuperTeeLogToTl(job_name, f'Failed to remove pending transactions file {pending_transactions_path}: {e}', error=True)
+		loaded_count = 0
+	return loaded_count > 0
+
+def get_monitor_path_most_recent_change_time(monitor_path:str) -> float:
+	latest_mtime = 0.0
+	paths_to_scan = [monitor_path]
+	while paths_to_scan:
+		current_path = paths_to_scan.pop()
+		try:
+			current_stat = os.stat(current_path, follow_symlinks=False)
+			latest_mtime = max(latest_mtime, current_stat.st_mtime)
+		except Exception as e:
+			watcherTeeLogToTl(monitor_path, f'Error reading stat for {current_path}: {e}', error=True)
+			continue
+		if os.path.isdir(current_path) and not os.path.islink(current_path):
+			try:
+				with os.scandir(current_path) as entries:
+					for entry in entries:
+						paths_to_scan.append(entry.path)
+			except Exception as e:
+				watcherTeeLogToTl(monitor_path, f'Error scanning {current_path}: {e}', error=True)
+	return latest_mtime
+
 def fs_flag_daemon(path:str,signature:str,fsEvent:threading.Event):
 	while GREEN_LIGHT.is_set():
 		if check_fs_signature(path,signature):
@@ -942,7 +1030,7 @@ def wait_fs_event(path:str,timeout = 0):
 	return False
 
 #%% ---- Backup ----
-def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault_path_signature:str,
+def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monitor_path:str,vault_path:str,vault_path_signature:str,
 			 to_process_flag:threading.Event,monitor_fs_flag=threading.Event(),
 			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
@@ -951,45 +1039,59 @@ def backuper(job_name:str,to_process:deque,monitor_path:str,vault_path:str,vault
 	global BACKUP_ENTRY_VALUES_HEADER
 	global GREEN_LIGHT
 	# main function for handling the backup for one reverb
-	# if the vault path does not exist, create it
-	if not os.path.lexists(vault_path):
-		try:
-			os.makedirs(vault_path,exist_ok=True)
-		except:
-			watcherTeeLogToTl(monitor_path,f'Warning: Vault path {vault_path} does not exist and failed to create it. Backuper Stopped!',error=True)
-			return
-	vault_fs_flag = threading.Event()
-	vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signature,vault_fs_flag),daemon=True)
-	vault_fs_thread.start()
-	while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
-		vault_fs_flag.wait(3)
-	while GREEN_LIGHT.is_set() and not monitor_fs_flag.is_set():
-		monitor_fs_flag.wait(3)
-	backupEntries = OrderedDict()
-	vaultInfo = None
-	trackingFilesFolders = None
-	# to_process: deque([ChangedEvent:{'monotonic_time':'231241','event':'create','type':'file','path':'/path/to/file'},...])
-	while GREEN_LIGHT.is_set():
+	try:
+		# if the vault path does not exist, create it
+		if not os.path.lexists(vault_path):
+			try:
+				os.makedirs(vault_path,exist_ok=True)
+			except:
+				watcherTeeLogToTl(monitor_path,f'Warning: Vault path {vault_path} does not exist and failed to create it. Backuper Stopped!',error=True)
+				return
+		vault_fs_flag = threading.Event()
+		vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signature,vault_fs_flag),daemon=True)
+		vault_fs_thread.start()
 		while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
 			vault_fs_flag.wait(3)
-		vaultInfo,trackingFilesFolders = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
-			  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
-			  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,trackingFilesFolders=trackingFilesFolders)
-		backupEntries.clear()
-		while not backupEntries and GREEN_LIGHT.is_set():
-			while GREEN_LIGHT.is_set() and not to_process_flag.is_set():
-				to_process_flag.wait(3)
-			if not GREEN_LIGHT.is_set():
-				return
-			backuperTeeLogToTl(job_name,f'Backuper processing, {len(to_process)} events to process')
-			to_process_temp = to_process.copy()
-			to_process.clear()
-			to_process_flag.clear()
+		while GREEN_LIGHT.is_set() and not monitor_fs_flag.is_set():
+			monitor_fs_flag.wait(3)
+		backupEntries = OrderedDict()
+		with to_process_lock:
+			if to_process:
+				backuperTeeLogToTl(job_name, f'Found {len(to_process)} restored pending transactions at startup')
+				to_process_temp = to_process.copy()
+				to_process.clear()
+			else:
+				to_process_temp = deque()
+		if to_process_temp:
 			backupEntries = change_events_to_backup_entries(to_process_temp)
-			backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries')
-		if log_journal:
-			journalPath = os.path.join(vault_path,job_name,'journal.tsv')
-			log_events_to_journal(backupEntries,journalPath)
+			backuperTeeLogToTl(job_name, f'Converted restored pending transactions into {len(backupEntries)} backup entries')
+		vaultInfo = None
+		trackingFilesFolders = None
+		# to_process: deque([ChangedEvent:{'monotonic_time':'231241','event':'create','type':'file','path':'/path/to/file'},...])
+		while GREEN_LIGHT.is_set():
+			while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
+				vault_fs_flag.wait(3)
+			vaultInfo,trackingFilesFolders = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
+				  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
+				  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,trackingFilesFolders=trackingFilesFolders)
+			backupEntries.clear()
+			while not backupEntries and GREEN_LIGHT.is_set():
+				while GREEN_LIGHT.is_set() and not to_process_flag.is_set():
+					to_process_flag.wait(3)
+				if not GREEN_LIGHT.is_set():
+					break
+				with to_process_lock:
+					backuperTeeLogToTl(job_name,f'Backuper processing, {len(to_process)} events to process')
+					to_process_temp = to_process.copy()
+					to_process.clear()
+				to_process_flag.clear()
+				backupEntries = change_events_to_backup_entries(to_process_temp)
+				backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries')
+			if log_journal:
+				journalPath = os.path.join(vault_path,job_name,'journal.tsv')
+				log_events_to_journal(backupEntries,journalPath)
+	finally:
+		persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
 
 def backuperTeeLogToTl(path:str,message:str,error=False,ok=False):
 	global tl
@@ -1332,6 +1434,40 @@ def do_backup(backup_entries:dict,
 	if log_journal:
 		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'end_reverb_backup_{len(trackingFilesFolders.files)}files_{len(trackingFilesFolders.folders)}folders_tracked',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 	return VaultInfo(vault_info_dict,vault_size,vault_inodes), trackingFilesFolders
+
+def persist_pending_transactions(job_name:str, vault_path:str, to_process:deque, to_process_lock:threading.Lock=None):
+	if to_process_lock is not None:
+		with to_process_lock:
+			pending_events = list(to_process)
+	else:
+		pending_events = list(to_process)
+	if not pending_events:
+		return
+	pending_transactions_path = os.path.join(vault_path, PENDING_TRANSACTIONS_FILE_NAME)
+	try:
+		os.makedirs(vault_path, exist_ok=True)
+		if os.path.exists(pending_transactions_path):
+			os.remove(pending_transactions_path)
+		pending_rows = [[
+			event.monotonic_time,
+			event.is_dir,
+			event.event,
+			event.path,
+			event.moved_from if event.moved_from is not None else ''
+		] for event in pending_events]
+		TSVZ.appendLinesTabularFile(
+			pending_transactions_path,
+			pending_rows,
+			header=CHANGED_EVENT_HEADER,
+			createIfNotExist=True,
+			verifyHeader=True,
+			strict=False,
+			teeLogger=tl,
+			verbose=DEBUG
+		)
+		backuperTeeLogToTl(job_name, f'Saved {len(pending_rows)} pending transactions to {pending_transactions_path}')
+	except Exception as e:
+		backuperTeeLogToTl(job_name, f'Failed to save pending transactions to {pending_transactions_path}: {e}', error=True)
 
 def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	# job vault subfolder should follow: V{version}--{ISO8601ish time}
