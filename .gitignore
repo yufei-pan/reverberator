@@ -6,3 +6,5 @@ test*/
 uv.lock
 my*.tsv
 *log/
+*.egg-info/
+dist/
