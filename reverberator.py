@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.23
+__version__ = 0.24
 
 ## WIP
 
@@ -1884,12 +1884,15 @@ def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = 
 		if dest_path == '/':
 			backuperTeeLogToTl(path=source_path,error=True,message='Cannot copy as root directory')
 			return False
-		if is_subpath(dest_path,source_path):
+		# Clear symlinks before is_subpath(). realpath follows the link (e.g.
+		# .venv/bin/python3.13 -> python3 -> /usr/bin/python3), so dest and source
+		# can resolve to the same path and falsely trip the subpath guard.
+		# Removing a symlink never destroys source-tree contents.
+		if os.path.islink(dest_path):
+			os.remove(dest_path)
+		elif is_subpath(dest_path,source_path):
 			backuperTeeLogToTl(path=source_path,error=True,message=f'Cannot copy {source_path} to {dest_path} as it is a subpath of the source')
 			return False
-		if os.path.islink(dest_path):
-			# remove the symlink
-			os.remove(dest_path)
 		elif os.path.isfile(dest_path):
 			os.remove(dest_path)
 		elif os.path.isdir(dest_path):
@@ -2552,9 +2555,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				mcae.run_command(['rm','-rf',vault_real_path])
 			vaultFolders.discard(as_folder_entry(relative_path))
 			# also need to remove all the files and subfolders in the folder
+			# collect matches first: difference_update must not iterate the set it mutates
 			relative_prefix = as_folder_entry(relative_path)
-			vaultFiles.difference_update(file for file in vaultFiles if file.startswith(relative_prefix))
-			vaultFolders.difference_update(folder for folder in vaultFolders if folder.startswith(relative_prefix))
+			vaultFiles.difference_update({file for file in vaultFiles if file.startswith(relative_prefix)})
+			vaultFolders.difference_update({folder for folder in vaultFolders if folder.startswith(relative_prefix)})
 		else:
 			# we just remove the file
 			mcae.run_command(['rm','-f',vault_real_path])

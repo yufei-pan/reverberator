@@ -233,7 +233,74 @@ class TestEmptyBackupSkip(unittest.TestCase):
 				rv.delta_generate_backup_entries = original
 
 
+class TestCpAfCopyPathSymlinkDest(unittest.TestCase):
+	def test_symlink_dest_resolving_like_source_is_replaced(self):
+		'''Dest symlink that realpaths to the same target as source must not trip is_subpath.'''
+		with tempfile.TemporaryDirectory() as root:
+			src_dir = os.path.join(root, 'src')
+			dst_dir = os.path.join(root, 'dst')
+			os.makedirs(src_dir)
+			os.makedirs(dst_dir)
+			real_target = os.path.join(root, 'real_python')
+			with open(real_target, 'w') as f:
+				f.write('bin')
+			# Source chain: python3.13 -> python3 -> real_target (like a venv)
+			os.symlink(real_target, os.path.join(src_dir, 'python3'))
+			src = os.path.join(src_dir, 'python3.13')
+			os.symlink('python3', src)
+			# Prior vault entry left the same relative symlink chain
+			os.symlink(real_target, os.path.join(dst_dir, 'python3'))
+			dst = os.path.join(dst_dir, 'python3.13')
+			os.symlink('python3', dst)
+			self.assertEqual(os.path.realpath(src), os.path.realpath(dst))
+			self.assertTrue(rv.is_subpath(dst, src))  # documents the false-positive
+			ok = rv.cp_af_copy_path(src, dst)
+			self.assertEqual(ok, 0)  # return_code_only: 0 means success
+			self.assertTrue(os.path.islink(dst))
+			self.assertEqual(os.readlink(dst), 'python3')
+
+
+class TestDeletePathSetUpdate(unittest.TestCase):
+	def test_dir_delete_updates_tracking_sets_without_runtime_error(self):
+		with tempfile.TemporaryDirectory() as root:
+			monitor = os.path.join(root, 'mon')
+			vault = os.path.join(root, 'vault')
+			job = 'job'
+			job_vault = os.path.join(vault, job)
+			v0 = os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800')
+			os.makedirs(os.path.join(monitor, 'sub'))
+			os.makedirs(v0)
+			with open(os.path.join(monitor, 'sub', 'a.txt'), 'w') as f:
+				f.write('a')
+			with open(os.path.join(monitor, 'keep.txt'), 'w') as f:
+				f.write('k')
+			# Prior version referenced-copy inputs
+			os.makedirs(os.path.join(v0, 'sub'))
+			with open(os.path.join(v0, 'sub', 'a.txt'), 'w') as f:
+				f.write('a')
+			with open(os.path.join(v0, 'keep.txt'), 'w') as f:
+				f.write('k')
+			tracking = rv.TrackingFilesFolders(['sub/a.txt', 'keep.txt'], ['sub/'])
+			entries = OrderedDict([
+				(os.path.join(monitor, 'sub') + '/', rv.BackupEntryValues('t', 'delete', None)),
+			])
+			rv.GREEN_LIGHT.set()
+			latest = rv.VaultEntry(0, v0, 0, 1, 1)
+			result = rv.do_reverb_backup(
+				entries,
+				os.path.join(job_vault, 'V1--2021-01-02_00-00-00_-0800'),
+				latest,
+				True,
+				tracking,
+				monitor,
+			)
+			self.assertNotIn('sub/a.txt', result.files)
+			self.assertNotIn('sub/', result.folders)
+			self.assertIn('keep.txt', result.files)
+
+
 class TestDecrementStepperAbort(unittest.TestCase):
+
 	def _make_pair(self, root):
 		# V0 real file, V1 symlink to V0 file
 		v0 = os.path.join(root, 'V0--2021-01-01_00-00-00_-0800')
