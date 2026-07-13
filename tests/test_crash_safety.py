@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+from collections import OrderedDict
+
 import reverberator as rv
 
 
@@ -89,6 +91,49 @@ class TestDoBackupCommitGate(unittest.TestCase):
 				name.endswith(rv.CONTENT_FILE_EXTENSION_NAME)
 				for name in os.listdir(job_vault)
 			))
+
+
+class TestEmptyBackupSkip(unittest.TestCase):
+	def test_no_new_version_when_delta_empty(self):
+		with tempfile.TemporaryDirectory() as root:
+			monitor = os.path.join(root, 'mon')
+			vault = os.path.join(root, 'vault')
+			job = 'job'
+			os.makedirs(monitor)
+			open(os.path.join(monitor, 'a.txt'), 'w').write('hi')
+			job_vault = os.path.join(vault, job)
+			v0 = os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800')
+			os.makedirs(v0)
+			open(os.path.join(v0, 'a.txt'), 'w').write('hi')
+			original = rv.delta_generate_backup_entries
+			try:
+				rv.delta_generate_backup_entries = lambda backupEntries, latest_version_info, monitor_path: rv.TrackingFilesFolders([], [])
+				vault_info = rv.VaultInfo(
+					OrderedDict([
+						(0, rv.VaultEntry(0, v0, 0, 1, 1))
+					]),
+					1,
+					1,
+				)
+				rv.GREEN_LIGHT.set()
+				info, tracking, committed = rv.do_backup(
+					{},
+					job_name=job,
+					monitor_path=monitor,
+					vault_path=vault,
+					keep_one_complete_backup=True,
+					only_sync_attributes=True,
+					keep_n_versions=0,
+					backup_size_limit='0',
+					log_journal=False,
+					vaultInfo=vault_info,
+					trackingFilesFolders=rv.TrackingFilesFolders(['a.txt'], []),
+				)
+				self.assertTrue(committed)
+				versions = [p for p in os.listdir(job_vault) if p.startswith('V') and os.path.isdir(os.path.join(job_vault, p))]
+				self.assertEqual(versions, ['V0--2021-01-01_00-00-00_-0800'])
+			finally:
+				rv.delta_generate_backup_entries = original
 
 
 if __name__ == '__main__':
