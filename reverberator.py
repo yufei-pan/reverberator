@@ -1658,6 +1658,54 @@ def persist_pending_transactions(job_name:str, vault_path:str, to_process:deque,
 	except Exception as e:
 		backuperTeeLogToTl(job_name, f'Failed to save pending transactions to {pending_transactions_path}: {e}', error=True)
 
+def remove_incomplete_vault_versions(job_vault_path: str) -> list:
+	'''
+	Delete V* version directories that have no matching content file.
+
+	A version is committed only when its content file exists. Incomplete
+	directories left after a crash/stop are removed on startup.
+
+	Returns:
+		list: Absolute paths of deleted version directories.
+	'''
+	deleted = []
+	if not os.path.isdir(job_vault_path):
+		return deleted
+	# Map version dir path -> whether a content file was seen
+	version_dirs = {}
+	content_for = set()
+	try:
+		for entry in os.scandir(job_vault_path):
+			name = entry.name
+			if not (name.startswith('V') and '--' in name):
+				continue
+			version_number_str = strip_prefix(name, 'V').partition('--')[0]
+			if not version_number_str.isdigit():
+				continue
+			if CONTENT_FILE_EXTENSION_NAME in name:
+				if entry.is_file():
+					vault_path = entry.path.rpartition('--')[0]
+					content_for.add(vault_path)
+			elif entry.is_dir():
+				version_dirs[entry.path] = True
+	except Exception as e:
+		backuperTeeLogToTl(job_vault_path, f'Error scanning for incomplete versions: {e}', error=True)
+		return deleted
+	for vault_dir in list(version_dirs):
+		if vault_dir in content_for:
+			continue
+		backuperTeeLogToTl(
+			job_vault_path,
+			f'Removing incomplete version (no content file): {vault_dir}',
+			error=True,
+		)
+		try:
+			multiCMD.run_command(['rm', '-rf', vault_dir], quiet=not DEBUG, return_code_only=True)
+			deleted.append(vault_dir)
+		except Exception as e:
+			backuperTeeLogToTl(job_vault_path, f'Failed to remove incomplete version {vault_dir}: {e}', error=True)
+	return deleted
+
 def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	# job vault subfolder should follow: V{version}--{ISO8601ish time}
 	# ex. V0--2021-01-01_00-00-00_-0800
