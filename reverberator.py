@@ -154,6 +154,10 @@ COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir'])
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
 
+WATCH_RESULT_OK = 'ok'
+WATCH_RESULT_INIT_FAILED = 'init_failed'
+WATCH_RESULT_SELF_DESTRUCT = 'self_destruct'
+
 WATCHER_LOG_PREFIX = '👀'
 BACKUPER_LOG_PREFIX = '📥'
 
@@ -729,11 +733,14 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to
 		if not GREEN_LIGHT.is_set():
 			watcherTeeLogToTl(monitor_path,f'Exiting watcher thread for {monitor_path}',ok=True)
 			return False
-		ok = watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_lock=to_process_lock,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds)
-		if not ok:
+		result = watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_lock=to_process_lock,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds)
+		if result == WATCH_RESULT_INIT_FAILED or result is False:
 			watcherTeeLogToTl(monitor_path,f'Watch init/loop failed for {monitor_path}; requesting shutdown',error=True)
 			GREEN_LIGHT.clear()
 			return False
+		if result == WATCH_RESULT_SELF_DESTRUCT:
+			watcherTeeLogToTl(monitor_path,f'Watch root disappeared for {monitor_path}; waiting for filesystem recovery',error=True)
+			monitor_fs_flag.clear()
 
 def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
 	global COOKIE_DICT_MAX_SIZE
@@ -753,7 +760,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags)
 		if mainWatchDescriptor == -1:
 			watcherTeeLogToTl(monitor_path,f'Failed to initialize folder watchers for {monitor_path}',error=True)
-			return False
+			return WATCH_RESULT_INIT_FAILED
 		lastReadTime = time.monotonic()
 		lastProcessTime = time.monotonic()
 		while GREEN_LIGHT.is_set():
@@ -803,7 +810,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 						irm.decreaseUserWatches(len(wdDic))
 						irm.decreaseUserInstances()
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'self_destruct',monitor_path,None))
-						return False
+						return WATCH_RESULT_SELF_DESTRUCT
 					elif event.mask & flags.DELETE_SELF:
 						watcherTeeLogToTl(monitor_path,f'Sub dir delete self event detected, removing watch for {wdDic.get(event.wd,None)}')
 						wdDic.pop(event.wd, None)
@@ -902,7 +909,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'modify',eventPath,None))
 				else:
 					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
-	return True
+	return WATCH_RESULT_OK
 
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
 	global tl
@@ -1216,6 +1223,9 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 					for event in reversed(backup_entries_to_change_events(backupEntries)):
 						to_process.appendleft(event)
 				backupEntries.clear()
+				if GREEN_LIGHT.is_set():
+					backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running; requesting shutdown',error=True)
+					GREEN_LIGHT.clear()
 				break
 			backupEntries.clear()
 			force_full_scan = False
