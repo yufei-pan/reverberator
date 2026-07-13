@@ -2373,6 +2373,25 @@ def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_
 				rtn_size_limit = size_limit
 	return rtn_size_limit, rtn_inode_limit
 
+def refresh_vault_entry_size_metadata(entry:VaultEntry) -> VaultEntry:
+	'''Recalculate size/inode from disk and rename content file to match.'''
+	new_size = get_path_size(entry.path)
+	new_inode = get_path_inodes(entry.path)
+	old_size_str = format_bytes(entry.size,use_1024_bytes=True,to_str=True).replace(' ','_')
+	old_inode_str = format_bytes(entry.inode,use_1024_bytes=False,to_str=True).replace(' ','')
+	old_content = f'{entry.path}--{old_size_str}B-{old_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+	new_size_str = format_bytes(new_size,use_1024_bytes=True,to_str=True).replace(' ','_')
+	new_inode_str = format_bytes(new_inode,use_1024_bytes=False,to_str=True).replace(' ','')
+	new_content = f'{entry.path}--{new_size_str}B-{new_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+	if os.path.lexists(old_content) and old_content != new_content:
+		try:
+			os.rename(old_content,new_content)
+		except Exception as e:
+			backuperTeeLogToTl(path=entry.path,error=True,message=f'Error renaming content file {old_content} -> {new_content}: {e}')
+	elif not os.path.lexists(new_content) and not os.path.lexists(old_content):
+		pass
+	return VaultEntry(entry.version_number,entry.path,entry.timestamp,new_size,new_inode)
+
 def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	'''
 	Remove the oldest vault version and materialize the next version's symlinks.
@@ -2416,6 +2435,7 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	backuperTeeLogToTl(path=referenceVaultPath,message=f"Dealing with {applyingVersionNumber}: {applyingVaultEntry.path} ({len(path_files)} files)")
 	new_size = applyingVaultEntry.size
 	block_size = os.statvfs(referenceVaultPath).f_frsize
+	materialize_failed = False
 	for file in path_files:
 		if os.path.islink(file):
 			linkTarget = os.path.abspath(os.path.join(os.path.dirname(file), os.readlink(file)))
@@ -2431,14 +2451,24 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 					if DEBUG:
 						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error getting size of {file}: {e}')
 				try:
-					os.remove(file)
 					os.rename(linkTarget,file)
 				except Exception as e:
+					materialize_failed = True
 					backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error moving {linkTarget} to {file}: {e}')
 					continue
 			elif DEBUG:
 				backuperTeeLogToTl(path=referenceVaultPath,message=f'Not moving {linkTarget} to {file}')
 				backuperTeeLogToTl(path=referenceVaultPath,message=f'{os.path.abspath(linkTarget)} not in {referenceVaultPath}')
+	if materialize_failed:
+		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Aborting removal of {referenceVaultPath} because materializing linked files failed')
+		new_dict = OrderedDict()
+		new_dict[referenceVersionNumber] = referenceVaultEntry
+		new_dict.update(vault_info_dict)
+		vault_info_dict.clear()
+		vault_info_dict.update(new_dict)
+		vault_info_dict[referenceVersionNumber] = refresh_vault_entry_size_metadata(vault_info_dict[referenceVersionNumber])
+		vault_info_dict[applyingVersionNumber] = refresh_vault_entry_size_metadata(vault_info_dict[applyingVersionNumber])
+		return 0, 0
 	#V0--2021-01-01_00-00-00_-0800
 	if new_size != applyingVaultEntry.size:
 		backup_size_str = format_bytes(new_size,use_1024_bytes=True,to_str=True).replace(' ','_')

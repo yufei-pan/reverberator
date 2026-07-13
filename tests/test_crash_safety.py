@@ -100,11 +100,13 @@ class TestEmptyBackupSkip(unittest.TestCase):
 			vault = os.path.join(root, 'vault')
 			job = 'job'
 			os.makedirs(monitor)
-			open(os.path.join(monitor, 'a.txt'), 'w').write('hi')
+			with open(os.path.join(monitor, 'a.txt'), 'w') as f:
+				f.write('hi')
 			job_vault = os.path.join(vault, job)
 			v0 = os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800')
 			os.makedirs(v0)
-			open(os.path.join(v0, 'a.txt'), 'w').write('hi')
+			with open(os.path.join(v0, 'a.txt'), 'w') as f:
+				f.write('hi')
 			original = rv.delta_generate_backup_entries
 			try:
 				rv.delta_generate_backup_entries = lambda backupEntries, latest_version_info, monitor_path: rv.TrackingFilesFolders([], [])
@@ -134,6 +136,61 @@ class TestEmptyBackupSkip(unittest.TestCase):
 				self.assertEqual(versions, ['V0--2021-01-01_00-00-00_-0800'])
 			finally:
 				rv.delta_generate_backup_entries = original
+
+
+class TestDecrementStepperAbort(unittest.TestCase):
+	def _make_pair(self, root):
+		# V0 real file, V1 symlink to V0 file
+		v0 = os.path.join(root, 'V0--2021-01-01_00-00-00_-0800')
+		v1 = os.path.join(root, 'V1--2021-01-02_00-00-00_-0800')
+		os.makedirs(v0)
+		os.makedirs(v1)
+		with open(os.path.join(v0, 'a.txt'), 'w') as f:
+			f.write('data')
+		os.symlink(os.path.join(v0, 'a.txt'), os.path.join(v1, 'a.txt'))
+		# content files with parseable names (use get_path_size after)
+		for path, ver in ((v0, 0), (v1, 1)):
+			sz = rv.get_path_size(path)
+			ino = rv.get_path_inodes(path)
+			sz_s = rv.format_bytes(sz, use_1024_bytes=True, to_str=True).replace(' ', '_')
+			ino_s = rv.format_bytes(ino, use_1024_bytes=False, to_str=True).replace(' ', '')
+			with open(f'{path}--{sz_s}B-{ino_s}_ino{rv.CONTENT_FILE_EXTENSION_NAME}', 'w') as f:
+				f.write('path\tiso_time\tevent\tsource_path\n')
+		d = OrderedDict([
+			(0, rv.VaultEntry(0, v0, 0, rv.get_path_size(v0), rv.get_path_inodes(v0))),
+			(1, rv.VaultEntry(1, v1, 1, rv.get_path_size(v1), rv.get_path_inodes(v1))),
+		])
+		return d, v0, v1
+
+	def test_successful_step_removes_oldest(self):
+		with tempfile.TemporaryDirectory() as root:
+			d, v0, v1 = self._make_pair(root)
+			removed_size, removed_inodes = rv.decrement_stepper(d)
+			self.assertFalse(os.path.isdir(v0))
+			self.assertTrue(os.path.isfile(os.path.join(v1, 'a.txt')))
+			self.assertFalse(os.path.islink(os.path.join(v1, 'a.txt')))
+			self.assertNotIn(0, d)
+			self.assertGreater(removed_size + removed_inodes, 0)
+
+	def test_materialize_failure_keeps_oldest_and_restores_dict(self):
+		with tempfile.TemporaryDirectory() as root:
+			d, v0, v1 = self._make_pair(root)
+			real_rename = os.rename
+
+			def boom(src, dst):
+				if os.path.basename(src) == 'a.txt' or os.path.basename(dst) == 'a.txt':
+					raise OSError('simulated')
+				return real_rename(src, dst)
+
+			os.rename = boom
+			try:
+				removed_size, removed_inodes = rv.decrement_stepper(d)
+			finally:
+				os.rename = real_rename
+			self.assertEqual((removed_size, removed_inodes), (0, 0))
+			self.assertTrue(os.path.isdir(v0))
+			self.assertIn(0, d)
+			self.assertTrue(os.path.islink(os.path.join(v1, 'a.txt')))
 
 
 if __name__ == '__main__':
