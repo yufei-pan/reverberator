@@ -248,6 +248,8 @@ def main():
 			tl.teeprint(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}")
 		backup_size_limit = reverb_rule.backup_size_limit
 		vault_path_signature = reverb_rule.vault_fs_signature
+		job_vault = os.path.join(vault_path, job_name)
+		remove_incomplete_vault_versions(job_vault)
 		to_process = deque()
 		to_process_lock = threading.Lock()
 		load_pending_transactions_for_resume(job_name=job_name, monitor_path=monitor_path, vault_path=vault_path, to_process=to_process)
@@ -1776,27 +1778,15 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 			except Exception as e:
 				backuperTeeLogToTl(job_vault_path,f'Error deleting {entry}: {e}',error=True)
 		for entry in orphan_entries:
-			# generate appropriate content file name ( leave it empty )
+			backuperTeeLogToTl(
+				job_vault_path,
+				f'Removing incomplete orphan version (no content file): {entry}',
+				error=True,
+			)
 			try:
-				version_number = int(strip_prefix(os.path.basename(entry), 'V').partition('--')[0])
-				# parse the timestamp from the basename: the full path may itself contain '--'
-				entry_timestamp = datetime.datetime.strptime(os.path.basename(entry).partition('--')[2],VAULT_TIMESTAMP_FORMAT).timestamp()
-			except Exception as _:
-				backuperTeeLogToTl(job_vault_path,f'Error parsing version number / timestamp from orphan {entry}, skipping it',error=True)
-				continue
-			try:
-				entry_size = get_path_size(entry)
-				entry_inode = get_path_inodes(entry)
-				vault_size += entry_size
-				vault_inodes += entry_inode
-				backup_size_str = format_bytes(entry_size,use_1024_bytes=True,to_str=True).replace(' ','_')
-				backup_inode_str = format_bytes(entry_inode,use_1024_bytes=False,to_str=True).replace(' ','')
-				content_file_name = f'{entry}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
-				backuperTeeLogToTl(job_vault_path,f'Creating content file {content_file_name} for orphan entry {entry}')
-				TSVZ.appendTabularFile(content_file_name,[],header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
-				vault_info_dict[version_number] = VaultEntry(version_number,entry,entry_timestamp,entry_size,entry_inode)
+				multiCMD.run_command(['rm', '-rf', entry], quiet=not DEBUG, return_code_only=True)
 			except Exception as e:
-				backuperTeeLogToTl(job_vault_path,f'Error creating content file for orphan entry {entry}: {e}',error=True)
+				backuperTeeLogToTl(job_vault_path, f'Error removing orphan {entry}: {e}', error=True)
 	except PermissionError:
 		backuperTeeLogToTl(job_vault_path,f'Permission error while scanning {job_vault_path}',error=True)
 	except Exception as _:

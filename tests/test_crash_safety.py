@@ -23,5 +23,16 @@ class TestRemoveIncompleteVaultVersions(unittest.TestCase):
 			self.assertEqual(deleted, [orphan])
 
 
+class TestGetVaultInfoOrphans(unittest.TestCase):
+	def test_orphan_dir_is_removed_not_indexed(self):
+		with tempfile.TemporaryDirectory() as job_vault:
+			orphan = os.path.join(job_vault, 'V3--2021-01-03_00-00-00_-0800')
+			os.makedirs(orphan)
+			open(os.path.join(orphan, 'x'), 'w').write('y')
+			info = rv.get_vault_info(job_vault)
+			self.assertFalse(os.path.isdir(orphan))
+			self.assertNotIn(3, info.vault_info_dict)
+
+
 if __name__ == '__main__':
 	unittest.main()
