@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.24
+__version__ = 0.25
 
 ## WIP
 
@@ -1878,6 +1878,64 @@ def is_subpath(child, parent):
 	common = os.path.commonpath([child, parent])
 	return common == parent
 
+def _dir_create_prefix(dir_path:str) -> str:
+	return dir_path if dir_path.endswith('/') else dir_path + '/'
+
+def path_covered_by_dir_create(path:str, dir_path:str) -> bool:
+	'''True if path is strictly inside dir_path (dir create covers recursive copy).'''
+	prefix = _dir_create_prefix(dir_path)
+	if path == prefix or path == prefix.rstrip('/'):
+		return False
+	return path.startswith(prefix)
+
+def prune_entries_covered_by_dir_creates(backup_entries:dict) -> OrderedDict:
+	'''
+	Drop create/modify/attrib entries covered by an ancestor directory create.
+
+	Directory creates recursively copy their trees, so child create/modify/attrib
+	(and nested directory creates) are redundant and unsafe to replay first.
+	Deletes and moves are kept.
+	'''
+	dir_creates = [p for p, values in backup_entries.items()
+				   if values.event == 'create' and p.endswith('/')]
+	# Also treat paths marked as dirs via trailing slash only (backup entries use /)
+	pruned = OrderedDict()
+	for path, values in backup_entries.items():
+		if values.event in ('create', 'modify', 'attrib'):
+			if any(path_covered_by_dir_create(path, d) for d in dir_creates):
+				continue
+		pruned[path] = values
+	return pruned
+
+def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
+	'''
+	Order entries so vault replay is safe with async cp/rm:
+
+	1. deletes, deepest paths first (children before parents)
+	2. create/modify/attrib, shallowest first (parents before children)
+	3. moves last, preserving relative order
+	'''
+	deletes = []
+	moves = []
+	rest = []
+	for path, values in backup_entries.items():
+		if values.event == 'delete':
+			deletes.append((path, values))
+		elif values.event == 'move':
+			moves.append((path, values))
+		else:
+			rest.append((path, values))
+	deletes.sort(key=lambda pv: (-pv[0].rstrip('/').count(os.sep), -len(pv[0]), pv[0]))
+	rest.sort(key=lambda pv: (pv[0].rstrip('/').count(os.sep), len(pv[0]), pv[0]))
+	ordered = OrderedDict()
+	for path, values in deletes + rest + moves:
+		ordered[path] = values
+	return ordered
+
+def prepare_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
+	'''Prune redundant child ops under dir creates, then order for safe replay.'''
+	return order_backup_entries_for_replay(prune_entries_covered_by_dir_creates(backup_entries))
+
 def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...):
 	global DEBUG	
 	if os.path.lexists(dest_path):
@@ -1898,6 +1956,9 @@ def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = 
 		elif os.path.isdir(dest_path):
 			import shutil
 			shutil.rmtree(dest_path)
+	dest_parent = os.path.dirname(dest_path)
+	if dest_parent and not os.path.isdir(dest_parent):
+		os.makedirs(dest_parent, exist_ok=True)
 	if mcae is ...:
 		return multiCMD.run_command(['cp','-af','--reflink=auto','--sparse=always',source_path,dest_path],quiet=not DEBUG,return_code_only=True,wait_for_return=True)
 	else:
@@ -2105,17 +2166,15 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	latest_version_files = [os.path.relpath(latest_version_entry,latest_version_info.path) for latest_version_entry in latest_version_files]
 	latest_version_folders = [os.path.relpath(latest_version_entry,latest_version_info.path) + '/' for latest_version_entry in latest_version_folders]
 	latest_version_files_folders = set(latest_version_files + latest_version_folders)
-	# for latest_version_entry in latest_version_files:
-	# 	latest_version_files_folders.add(os.path.relpath(latest_version_entry,latest_version_info.path))
-	# for latest_version_entry in latest_version_folders:
-	# 	latest_version_files_folders.add(os.path.relpath(latest_version_entry,latest_version_info.path)+'/')
-	for monitor_entry in monitor_files:
-		rel_entry = os.path.relpath(monitor_entry,monitor_path)
-		isDir = False
-		check_duplicate(backupEntries,latest_version_info.path,latest_version_files_folders,rel_entry,monitor_entry,isDir)
+	# Folders before files so new-tree creates are parent-first in insertion order
+	# (prepare_backup_entries_for_replay also enforces this; this keeps content logs clearer).
 	for monitor_entry in monitor_folders:
 		rel_entry = os.path.relpath(monitor_entry,monitor_path) + '/'
 		isDir = True
+		check_duplicate(backupEntries,latest_version_info.path,latest_version_files_folders,rel_entry,monitor_entry,isDir)
+	for monitor_entry in monitor_files:
+		rel_entry = os.path.relpath(monitor_entry,monitor_path)
+		isDir = False
 		check_duplicate(backupEntries,latest_version_info.path,latest_version_files_folders,rel_entry,monitor_entry,isDir)
 	for deleted_entry in latest_version_files_folders:
 		# this is a deleted file/folder
@@ -2522,6 +2581,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					 only_sync_attributes:bool,trackingFilesFolders:TrackingFilesFolders,monitor_path:str):
 	global BACKUP_SEMAPHORE
 	global GREEN_LIGHT
+	backup_entries = prepare_backup_entries_for_replay(backup_entries)
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
 	def copy_path(isDir,monitor_path,source_real_path,source_relative_path,vaultFolders,vaultFiles,
 			   file_vault_real_path,backup_folder,mcae):
@@ -2563,6 +2623,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# we just remove the file
 			mcae.run_command(['rm','-f',vault_real_path])
 			vaultFiles.discard(relative_path)
+	def wait_for_async_commands(mcae):
+		while GREEN_LIGHT.is_set() and mcae.runningThreads:
+			mcae.wait(timeout=3)
 	# this function does the actual backup using a referenced version and a change list to copy the source from
 	# reverb backup flow:
 	#   do referenced copy of the last version to the current backup folder 
@@ -2572,12 +2635,22 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	vaultFolders = set(vaultFolders)
 	backuperTeeLogToTl(path=monitor_path,message=f'Using cached tracked files and folders {len(vaultFiles)} {len(vaultFolders)}')
 	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
+	need_delete_barrier = False
 	for event_source_real_path, event_values in backup_entries.items():
 		backuperTeeLogToTl(path=monitor_path,message=f'Processing {event_source_real_path} {event_values}')
 		event_relative_path = os.path.relpath(path=event_source_real_path,start=monitor_path)
 		file_vault_target_path = os.path.join(backup_folder,event_relative_path)
 		isDir = event_source_real_path.endswith('/')
 		# create, modify, attrib, move, delete
+		if event_values.event == 'delete':
+			delete_path(isDir=isDir,vault_real_path=file_vault_target_path,relative_path=event_relative_path,
+			   mcae=mcae,vaultFolders=vaultFolders,vaultFiles=vaultFiles)
+			need_delete_barrier = True
+			continue
+		if need_delete_barrier:
+			# finish async rms before creates/moves recreate overlapping paths
+			wait_for_async_commands(mcae)
+			need_delete_barrier = False
 		if event_values.event in {'create','modify'}:
 			# we just over write the vault file with the source file
 			copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=event_source_real_path,
@@ -2592,14 +2665,15 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			else:
 				if only_sync_attributes:
 					# we just copy the file metadata
+					# ensure parent exists when prior version lacked this path
+					parent_dir = os.path.dirname(file_vault_target_path)
+					if parent_dir:
+						os.makedirs(parent_dir, exist_ok=True)
 					copy_file_meta(event_source_real_path,file_vault_target_path)
 				else:
 					# we copy the file
 					cp_af_copy_path(source_path=event_source_real_path,dest_path=file_vault_target_path,mcae=mcae)
 				vaultFiles.add(event_relative_path)
-		elif event_values.event == 'delete':
-			delete_path(isDir=isDir,vault_real_path=file_vault_target_path,relative_path=event_relative_path,
-			   mcae=mcae,vaultFolders=vaultFolders,vaultFiles=vaultFiles)
 		elif event_values.event == 'move':
 			link_source_relative_path = os.path.relpath(event_values.source_path,monitor_path)
 			link_target_relative_path = event_relative_path
@@ -2633,8 +2707,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				vaultFiles.discard(link_source_relative_path)
 				vaultFiles.add(link_target_relative_path)
 			# we need to wait for copy threads to finish to allow rename
-			while GREEN_LIGHT.is_set() and mcae.runningThreads:
-				mcae.wait(timeout=3)
+			wait_for_async_commands(mcae)
 			link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
 			link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
 			try:
@@ -2659,8 +2732,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				  file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
 				delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
 				  relative_path=link_source_relative_path,mcae=mcae,vaultFolders=vaultFolders,vaultFiles=vaultFiles)
-	while GREEN_LIGHT.is_set() and mcae.runningThreads:
-		mcae.join(timeout=3)
+				wait_for_async_commands(mcae)
+	if need_delete_barrier:
+		wait_for_async_commands(mcae)
+	wait_for_async_commands(mcae)
 	if mcae.runningThreads or not GREEN_LIGHT.is_set():
 		backuperTeeLogToTl(path=monitor_path,error=True,message='Reverb backup interrupted before copy threads finished')
 	return TrackingFilesFolders(vaultFiles,vaultFolders)
