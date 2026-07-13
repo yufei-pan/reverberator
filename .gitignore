@@ -4,7 +4,7 @@ __pycache__
 *.pyc
 test*/
 !tests/
-!tests/**
+!tests/**/*.py
 uv.lock
 my*.tsv
 *log/
