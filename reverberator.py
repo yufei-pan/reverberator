@@ -1202,9 +1202,15 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 		while GREEN_LIGHT.is_set():
 			while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
 				vault_fs_flag.wait(3)
-			vaultInfo,trackingFilesFolders = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
+			vaultInfo,trackingFilesFolders,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 				  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 				  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,trackingFilesFolders=trackingFilesFolders)
+			if not committed:
+				with to_process_lock:
+					for event in reversed(backup_entries_to_change_events(backupEntries)):
+						to_process.appendleft(event)
+				backupEntries.clear()
+				break
 			backupEntries.clear()
 			force_full_scan = False
 			while not backupEntries and not force_full_scan and GREEN_LIGHT.is_set():
@@ -1228,6 +1234,10 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 			if log_journal:
 				journalPath = os.path.join(vault_path,job_name,'journal.tsv')
 				log_events_to_journal(backupEntries,journalPath)
+	except Exception:
+		import traceback
+		backuperTeeLogToTl(job_name, traceback.format_exc(), error=True)
+		GREEN_LIGHT.clear()
 	finally:
 		persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
 
@@ -1480,6 +1490,18 @@ def log_events_to_journal(backup_entries:dict,journal_path:str):
 	lines = [[path,entry.iso_time,entry.event,entry.source_path] for path,entry in backup_entries.items()]
 	TSVZ.appendLinesTabularFile(journal_path,lines,header = BACKUP_JOURNAL_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl)
 
+def backup_entries_to_change_events(backup_entries:dict) -> list:
+	'''
+	Convert in-flight backup entries back to ChangeEvents for pending persistence.
+	'''
+	events = []
+	base = time.monotonic()
+	for i, (path, values) in enumerate(backup_entries.items()):
+		is_dir = path.endswith('/')
+		moved_from = values.source_path if values.event == 'move' else None
+		events.append(ChangeEvent(base + (i * 0.001), is_dir, values.event, path, moved_from))
+	return events
+
 def do_backup(backup_entries:dict,
 			 job_name:str,monitor_path:str,vault_path:str,
 			 keep_one_complete_backup:bool, 
@@ -1505,7 +1527,7 @@ def do_backup(backup_entries:dict,
 				vaultInfo = VaultInfo({}, 0, 0)
 			if trackingFilesFolders is None:
 				trackingFilesFolders = TrackingFilesFolders([], [])
-			return vaultInfo, trackingFilesFolders
+			return vaultInfo, trackingFilesFolders, False
 	if log_journal:
 		journalPath = os.path.join(job_vault,'journal.tsv')
 		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'start_reverb_backup_{len(backup_entries)}_enties',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
@@ -1605,6 +1627,14 @@ def do_backup(backup_entries:dict,
 		os.makedirs(backup_folder,exist_ok=True)
 		backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
 		trackingFilesFolders = do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,trackingFilesFolders,monitor_path)
+	backup_finished = GREEN_LIGHT.is_set()
+	if not backup_finished:
+		backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
+		if vaultInfo is None:
+			vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
+		if trackingFilesFolders is None:
+			trackingFilesFolders = TrackingFilesFolders([], [])
+		return vaultInfo, trackingFilesFolders, False
 	# check the size of the backup
 	this_size = get_path_size(backup_folder)
 	this_inodes = get_path_inodes(backup_folder)
@@ -1623,7 +1653,7 @@ def do_backup(backup_entries:dict,
 	os.symlink(os.path.basename(backup_folder),os.path.join(job_vault,'current_version'),target_is_directory=True)
 	if log_journal:
 		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'end_reverb_backup_{len(trackingFilesFolders.files)}files_{len(trackingFilesFolders.folders)}folders_tracked',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
-	return VaultInfo(vault_info_dict,vault_size,vault_inodes), trackingFilesFolders
+	return VaultInfo(vault_info_dict,vault_size,vault_inodes), trackingFilesFolders, True
 
 def persist_pending_transactions(job_name:str, vault_path:str, to_process:deque, to_process_lock:threading.Lock=None):
 	if to_process_lock is not None:
@@ -2574,6 +2604,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				  relative_path=link_source_relative_path,mcae=mcae,vaultFolders=vaultFolders,vaultFiles=vaultFiles)
 	while GREEN_LIGHT.is_set() and mcae.runningThreads:
 		mcae.join(timeout=3)
+	if mcae.runningThreads or not GREEN_LIGHT.is_set():
+		backuperTeeLogToTl(path=monitor_path,error=True,message='Reverb backup interrupted before copy threads finished')
 	return TrackingFilesFolders(vaultFiles,vaultFolders)
 
 if __name__ == "__main__":
