@@ -3,6 +3,8 @@
 __pycache__
 *.pyc
 test*/
+!tests/
+!tests/**
 uv.lock
 my*.tsv
 *log/

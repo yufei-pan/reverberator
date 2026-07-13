@@ -1,7 +1,9 @@
 import os
 import tempfile
 import unittest
+from collections import deque
 from collections import OrderedDict
+import threading
 
 import reverberator as rv
 
@@ -52,6 +54,28 @@ class TestBackupEntriesToChangeEvents(unittest.TestCase):
 		self.assertTrue(by_path['/tmp/d/'].is_dir)
 		self.assertEqual(by_path['/tmp/b'].event, 'move')
 		self.assertEqual(by_path['/tmp/b'].moved_from, '/tmp/a')
+
+
+class TestWatcherInitFailure(unittest.TestCase):
+	def test_watcher_clears_green_light_when_watchfolder_fails(self):
+		rv.GREEN_LIGHT.set()
+		monitor_fs_flag = threading.Event()
+		monitor_fs_flag.set()
+		original = rv.watchFolder
+		try:
+			rv.watchFolder = lambda *a, **k: False
+			rv.watcher(
+				monitor_fs_flag,
+				'/nonexistent',
+				deque(),
+				threading.Lock(),
+				threading.Event(),
+				rv.inotify_resource_manager(),
+			)
+			self.assertFalse(rv.GREEN_LIGHT.is_set())
+		finally:
+			rv.watchFolder = original
+			rv.GREEN_LIGHT.set()
 
 
 class TestDoBackupCommitGate(unittest.TestCase):
