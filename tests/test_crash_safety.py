@@ -63,7 +63,7 @@ class TestWatcherInitFailure(unittest.TestCase):
 		monitor_fs_flag.set()
 		original = rv.watchFolder
 		try:
-			rv.watchFolder = lambda *a, **k: False
+			rv.watchFolder = lambda *a, **k: 'init_failed'
 			rv.watcher(
 				monitor_fs_flag,
 				'/nonexistent',
@@ -76,6 +76,77 @@ class TestWatcherInitFailure(unittest.TestCase):
 		finally:
 			rv.watchFolder = original
 			rv.GREEN_LIGHT.set()
+
+	def test_watchfolder_reports_self_destruct_without_clearing_green_light(self):
+		rv.GREEN_LIGHT.set()
+		original_inotify = rv.inotify_simple.INotify
+		original_initialize = rv.initializeFolderWatchers
+
+		class FakeEvent:
+			def __init__(self, wd, mask):
+				self.wd = wd
+				self.mask = mask
+				self.cookie = 0
+				self.name = ''
+
+		class FakeINotify:
+			def __enter__(self):
+				return self
+
+			def __exit__(self, *args):
+				return False
+
+			def read(self, timeout=None):
+				return [FakeEvent(42, rv.inotify_simple.flags.UNMOUNT)]
+
+		try:
+			rv.inotify_simple.INotify = FakeINotify
+			rv.initializeFolderWatchers = lambda *a, **k: 42
+			result = rv.watchFolder(
+				'/monitor',
+				deque(),
+				threading.Lock(),
+				threading.Event(),
+				rv.inotify_resource_manager(),
+			)
+			self.assertEqual(result, 'self_destruct')
+			self.assertTrue(rv.GREEN_LIGHT.is_set())
+		finally:
+			rv.inotify_simple.INotify = original_inotify
+			rv.initializeFolderWatchers = original_initialize
+			rv.GREEN_LIGHT.set()
+
+
+class TestBackuperCommitFailure(unittest.TestCase):
+	def test_uncommitted_backup_while_green_light_set_requeues_and_clears_green_light(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			rv.GREEN_LIGHT.set()
+			original_do_backup = rv.do_backup
+			original_fs_flag_daemon = rv.fs_flag_daemon
+			try:
+				rv.do_backup = lambda *a, **k: (None, None, False)
+				rv.fs_flag_daemon = lambda path, signature, fs_event: fs_event.set()
+				to_process = deque([
+					rv.ChangeEvent(1, False, 'modify', os.path.join(tmp, 'monitor', 'f.txt'), None)
+				])
+				monitor_fs_flag = threading.Event()
+				monitor_fs_flag.set()
+				rv.backuper(
+					'job',
+					to_process,
+					threading.Lock(),
+					os.path.join(tmp, 'monitor'),
+					os.path.join(tmp, 'vault'),
+					'N/A',
+					threading.Event(),
+					monitor_fs_flag,
+				)
+				self.assertEqual(len(to_process), 1)
+				self.assertFalse(rv.GREEN_LIGHT.is_set())
+			finally:
+				rv.do_backup = original_do_backup
+				rv.fs_flag_daemon = original_fs_flag_daemon
+				rv.GREEN_LIGHT.set()
 
 
 class TestDoBackupCommitGate(unittest.TestCase):
