@@ -1586,6 +1586,13 @@ def do_backup(backup_entries:dict,
 			if log_journal:
 				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'delta_generated_{len(backup_entries)}_differences',monitor_path],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 				log_events_to_journal(backup_entries,journalPath)
+		if not backup_entries:
+			backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
+			if vaultInfo is None:
+				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
+			if trackingFilesFolders is None:
+				trackingFilesFolders = TrackingFilesFolders([], [])
+			return vaultInfo, trackingFilesFolders, True
 		estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path)
 		backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
 		estimated_backup_inode = latest_version_info.inode + estimated_backup_inode_change
