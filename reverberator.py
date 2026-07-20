@@ -792,7 +792,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 				lastProcessTime = time.monotonic()
 			if DEBUG:
 				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
-				watcherTeeLogToTl(monitor_path,'\n'+TSVZ.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
+				watcherTeeLogToTl(monitor_path,'\n'+multiCMD.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
 			monTime = time.monotonic()
 			for event in events:
 				if event.mask & flags.Q_OVERFLOW:
@@ -1328,7 +1328,7 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 	global DEBUG
 	backuperTeeLogToTl('convertor','Converting the following change events to backup entries')
 	if DEBUG:
-		backuperTeeLogToTl('convertor','\n'+TSVZ.pretty_format_table(change_events,header = CHANGED_EVENT_HEADER))
+		backuperTeeLogToTl('convertor','\n'+multiCMD.pretty_format_table(change_events,header = CHANGED_EVENT_HEADER))
 	backup_entries = OrderedDict()
 	pendingMoveSourceParents = set()
 	moveSourceToDestDict = {}
@@ -1494,7 +1494,7 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 			backup_entries.move_to_end(abs_path,last=False)
 	backuperTeeLogToTl('convertor','Converted backup entries')
 	if DEBUG:
-		backuperTeeLogToTl('convertor','\n'+TSVZ.pretty_format_table(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER))
+		backuperTeeLogToTl('convertor','\n'+multiCMD.pretty_format_table(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER))
 	return backup_entries
 
 def log_events_to_journal(backup_entries:dict,journal_path:str):
