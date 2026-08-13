@@ -2,6 +2,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import pytest
 import reverberator as rv
 from tests.harness import create_job, reverberator_script
@@ -41,6 +42,13 @@ def run_reverberator(tmp_path, process_env):
 	log_dir = str(tmp_path / 'proc_logs')
 	os.makedirs(log_dir, exist_ok=True)
 
+	def _drain(stream, buf):
+		try:
+			for line in iter(stream.readline, ''):
+				buf.append(line)
+		except Exception:
+			pass
+
 	def _run(rule_path, extra_args=()):
 		p = subprocess.Popen(
 			[sys.executable, reverberator_script(), '--no_log', '-ld', log_dir, *list(extra_args), str(rule_path)],
@@ -49,6 +57,14 @@ def run_reverberator(tmp_path, process_env):
 			stderr=subprocess.PIPE,
 			text=True,
 		)
+		p._out_buf = []
+		p._err_buf = []
+		p._drain_threads = (
+			threading.Thread(target=_drain, args=(p.stdout, p._out_buf), daemon=True),
+			threading.Thread(target=_drain, args=(p.stderr, p._err_buf), daemon=True),
+		)
+		for t in p._drain_threads:
+			t.start()
 		procs.append(p)
 		return p
 
@@ -61,6 +77,16 @@ def run_reverberator(tmp_path, process_env):
 			except subprocess.TimeoutExpired:
 				p.kill()
 				p.wait()
+		for t in getattr(p, '_drain_threads', ()):
+			t.join(timeout=1)
+		out = ''.join(getattr(p, '_out_buf', []))
+		err = ''.join(getattr(p, '_err_buf', []))
+		if out:
+			print('--- reverberator stdout ---')
+			print(out)
+		if err:
+			print('--- reverberator stderr ---')
+			print(err)
 
 
 def pytest_collection_modifyitems(config, items):
