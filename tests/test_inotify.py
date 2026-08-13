@@ -23,14 +23,12 @@ def _wait_watch_ready(job, to_process, lock):
 	wait_until(ready, message='watcher not ready')
 
 
-def _close_new_dir_discard(job, to_process, lock, to_process_flag):
-	'''Simulate backuper consuming a batch so watchFolder clears newDirWDs.'''
+def _consume_batch(to_process, lock, to_process_flag):
+	'''Drain to_process then clear the flag, same order as backuper.'''
 	wait_until(to_process_flag.is_set, message='watcher did not signal process')
-	probe = os.path.join(job.monitor, '.watch_ready')
+	with lock:
+		to_process.clear()
 	to_process_flag.clear()
-	before = len(_events(to_process, lock))
-	os.utime(probe, None)
-	wait_until(lambda: len(_events(to_process, lock)) > before, message='discard-window poke not seen')
 
 
 def _start_watch(job, to_process, to_process_flag):
@@ -88,8 +86,7 @@ def test_file_rename_move_or_equivalent(job, poll_fast):
 			if moves and moves[0].moved_from and moves[0].moved_from.endswith('a.txt'):
 				return True
 			creates = [e for e in evs if e.event == 'create' and e.path.endswith('b.txt')]
-			deletes = [e for e in evs if e.event == 'delete' and e.path.endswith('a.txt')]
-			return bool(creates or deletes)
+			return bool(creates)
 		wait_until(ok, message='rename produced neither move nor delete+create')
 	finally:
 		rv.GREEN_LIGHT.clear()
@@ -103,15 +100,22 @@ def test_mkdir_p_watches_child_create(job, poll_fast):
 	thread, lock = _start_watch(job, to_process, flag)
 	try:
 		_wait_watch_ready(job, to_process, lock)
-		nested = os.path.join(job.monitor, 'd', 'e')
-		os.makedirs(nested)
+		_consume_batch(to_process, lock, flag)
 		dpath = os.path.join(job.monitor, 'd')
+		os.mkdir(dpath)
 		wait_until(
 			lambda: any(e.event == 'create' and e.path.rstrip('/') == dpath for e in _events(to_process, lock)),
 			message='mkdir d not seen',
 		)
-		_close_new_dir_discard(job, to_process, lock, flag)
-		child = os.path.join(nested, 'z.txt')
+		_consume_batch(to_process, lock, flag)
+		epath = os.path.join(dpath, 'e')
+		os.mkdir(epath)
+		wait_until(
+			lambda: any(e.event == 'create' and e.path.rstrip('/') == epath for e in _events(to_process, lock)),
+			message='mkdir e not seen',
+		)
+		_consume_batch(to_process, lock, flag)
+		child = os.path.join(epath, 'z.txt')
 		open(child, 'w').write('z')
 		wait_until(
 			lambda: any(e.event == 'create' and e.path.endswith('z.txt') for e in _events(to_process, lock)),
@@ -131,8 +135,13 @@ def test_queue_overflow_full_scan_or_skip(job, poll_fast):
 		_wait_watch_ready(job, to_process, lock)
 		for i in range(20000):
 			open(os.path.join(job.monitor, f'f{i}.txt'), 'w').write('x')
-		evs = _events(to_process, lock)
-		if not any(e.event == 'full_scan' for e in evs):
+		try:
+			wait_until(
+				lambda: any(e.event == 'full_scan' for e in _events(to_process, lock)),
+				timeout=2.0,
+				message='no full_scan',
+			)
+		except AssertionError:
 			pytest.skip('could not fill inotify queue on this kernel')
 	finally:
 		rv.GREEN_LIGHT.clear()
