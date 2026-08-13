@@ -65,7 +65,7 @@ def test_bidict_overwrite_and_delete():
 	d = rv.bidict({1: '/a', 2: '/b'})
 	assert d.inverse['/a'] == [1]
 	d[1] = '/c'
-	assert d.inverse['/a'] == []
+	assert '/a' not in d.inverse
 	assert d.inverse['/c'] == [1]
 	del d[2]
 	assert '/b' not in d.inverse

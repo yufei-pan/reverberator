@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.26
+__version__ = 0.27
 
 ## WIP
 
@@ -952,8 +952,8 @@ class bidict(dict):
 		>>> d.inverse['/a']
 		[1]
 		>>> d[1] = '/c'
-		>>> d.inverse['/a']
-		[]
+		>>> '/a' in d.inverse
+		False
 		>>> d.inverse['/c']
 		[1]
 		>>> del d[2]
@@ -970,9 +970,12 @@ class bidict(dict):
 
 	def __setitem__(self, key, value):
 		if key in self:
-			self.inverse[self[key]].remove(key) 
+			old = self[key]
+			self.inverse[old].remove(key)
+			if not self.inverse[old]:
+				del self.inverse[old]
 		super(bidict, self).__setitem__(key, value)
-		self.inverse.setdefault(value, []).append(key)        
+		self.inverse.setdefault(value, []).append(key) 
 
 	def __delitem__(self, key):
 		self.inverse.setdefault(self[key], []).remove(key)
@@ -1417,35 +1420,43 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 			# in all cases, as we cannot simply perform a recursive link as a move in the backup, ( need to backup source data )
 			# we will break the move event into a delete of source and a {event} of dest
 			# here, escalate the current event to the chronologically later move
+			moveDest = moveSourceToDestDict[abs_path]
 			if event == 'delete':
-				# if the path was chronologically later moved from, then it must exist, thus this delete is likely invalid
+				# Later move-from means dest should not become delete. A paired
+				# move relocates the referenced copy. Recreate-then-move already
+				# escalated dest to create, which does not remove the old source,
+				# so still record a source delete.
 				if DEBUG:
 					backuperTeeLogToTl(abs_path,f'Delete event detected immediately before a move with {abs_path} as source. Ignoring delete')
-				to_add = False
-			elif event == 'attrib':
-				# escalate to check file content also as it is not possible to sync attrib only to a symlink 
-				event = 'modify'
-			moveDest = moveSourceToDestDict[abs_path]
-			if DEBUG:
-				backuperTeeLogToTl(abs_path,f'  Seperating move event from {abs_path} to {moveDest}')
-			if moveDest in backup_entries:
-				if event == 'create':
-					to_add = False
-					escalated_event = 'create'
+				if moveDest in backup_entries and backup_entries[moveDest].event == 'create':
+					to_add = True
 				else:
-					escalated_event = event
-					event = 'delete'
-				if DEBUG:
-					backuperTeeLogToTl(abs_path,f'    Escalating {backup_entries[moveDest].event} to {escalated_event} at {backup_entries[moveDest].iso_time} on {moveDest}')
-				backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,escalated_event,abs_path)
+					to_add = False
+					continue
 			else:
+				if event == 'attrib':
+					# escalate to check file content also as it is not possible to sync attrib only to a symlink
+					event = 'modify'
 				if DEBUG:
-					backuperTeeLogToTl(abs_path,f'    Already removed event on {moveDest}, skipping escalating')
-				if abs_path in backup_entries:
+					backuperTeeLogToTl(abs_path,f'  Seperating move event from {abs_path} to {moveDest}')
+				if moveDest in backup_entries:
+					if event == 'create':
+						to_add = False
+						escalated_event = 'create'
+					else:
+						escalated_event = event
+						event = 'delete'
 					if DEBUG:
-						backuperTeeLogToTl(abs_path,f'    Removing {backup_entries[abs_path].event} event on {abs_path}')
-					del backup_entries[abs_path]
-				continue
+						backuperTeeLogToTl(abs_path,f'    Escalating {backup_entries[moveDest].event} to {escalated_event} at {backup_entries[moveDest].iso_time} on {moveDest}')
+					backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,escalated_event,abs_path)
+				else:
+					if DEBUG:
+						backuperTeeLogToTl(abs_path,f'    Already removed event on {moveDest}, skipping escalating')
+					if abs_path in backup_entries:
+						if DEBUG:
+							backuperTeeLogToTl(abs_path,f'    Removing {backup_entries[abs_path].event} event on {abs_path}')
+						del backup_entries[abs_path]
+					continue
 			
 		# handle repeated events on the same path
 		if abs_path in backup_entries:
@@ -1472,7 +1483,7 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 					if DEBUG:
 						backuperTeeLogToTl(abs_path,f'Skipping event as Creating {abs_path} that is later moved to.')
 					to_add = False
-			elif later_event_on_path in ('delete','modify','move'):
+			elif later_event_on_path in ('delete','modify','move','create'):
 				# if the path is chronologically later deleted, then we simply do not need to perform backups
 				# if the path is chronologically later modified, because the current event can be modify / attrib / move / delete , in all cases we will ignore this event
 				# if the path is chronologically later moved to, meaning it was later overwriiten moved to. We do not care what it had been done to before then.
