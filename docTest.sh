@@ -1,2 +1,2 @@
 #!/bin/bash
-uv run python -m doctest -v reverberator.py
+uv run --extra test pytest
