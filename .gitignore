@@ -1,4 +1,5 @@
 .venv
+.worktrees/
 .vscode
 __pycache__
 *.pyc
