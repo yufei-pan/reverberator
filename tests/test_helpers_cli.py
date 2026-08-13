@@ -1,4 +1,5 @@
 import os
+import sys
 import pytest
 import reverberator as rv
 
@@ -51,4 +52,59 @@ def test_harness_write_rule_explicit_columns(tmp_path):
 	assert job.monitor in text
 	assert 'N/A' in text
 	assert '\tauto\t' not in text
+
+
+def test_slugify_dirty_and_unicode():
+	assert rv.slugify('My Job Name!') == 'my-job-name'
+	assert rv.slugify('  spaces--and___underscores  ') == 'spaces-and___underscores'
+	assert rv.slugify('über') == 'uber'
+	assert rv.slugify('café', allow_unicode=True) == 'café'
+
+
+def test_bidict_overwrite_and_delete():
+	d = rv.bidict({1: '/a', 2: '/b'})
+	assert d.inverse['/a'] == [1]
+	d[1] = '/c'
+	assert d.inverse['/a'] == []
+	assert d.inverse['/c'] == [1]
+	del d[2]
+	assert '/b' not in d.inverse
+
+
+def test_get_args_defaults_and_flags():
+	args, _ = rv.get_args([])
+	assert args.rule_path == 'reverb_rule.tsv'
+	assert args.journal is False
+	assert rv.get_args(['--journal'])[0].journal is True
+	assert rv.get_args(['-t', '0'])[0].threads == 0
+	assert rv.get_args(['-t', '-2'])[0].threads == -2
+	assert rv.get_args(['-t', '4'])[0].threads == 4
+	assert rv.get_args(['--drop_sample_reverb_rule_file', 'out.tsv'])[0].drop_sample_reverb_rule_file is True
+	assert rv.get_args(['--verbose'])[0].verbose is True
+
+
+def test_hash_file_full_vs_partial(tmp_path):
+	p = tmp_path / 'blob.bin'
+	p.write_bytes(b'x' * (rv.HASH_SIZE + 100) + b'TAIL')
+	full = rv.hash_file(str(p), full_hash=True)
+	part = rv.hash_file(str(p), full_hash=False)
+	assert len(full) == 16
+	assert len(part) == 16
+	assert full != part
+
+
+def test_check_fs_signature_mismatch(tmp_path):
+	assert rv.check_fs_signature(str(tmp_path), 'N/A') is True
+	assert rv.check_fs_signature(str(tmp_path), 'this-signature-cannot-match-zzzz') is False
+
+
+def test_signal_handler_first_clears_green_light_second_exits(monkeypatch):
+	rv.GREEN_LIGHT.set()
+	exited = []
+	monkeypatch.setattr(sys, 'exit', lambda code: exited.append(code))
+	monkeypatch.setattr(rv.time, 'sleep', lambda s: None)
+	rv.signal_handler(None, None)
+	assert rv.GREEN_LIGHT.is_set() is False
+	rv.signal_handler(None, None)
+	assert exited == [1]
 
