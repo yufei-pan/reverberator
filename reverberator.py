@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.25
+__version__ = 0.26
 
 ## WIP
 
@@ -143,6 +143,24 @@ DEFAULT_ONLY_SYNC_ATTRIBUTES = True
 DEFAULT_KEEP_N_VERSIONS = 0
 DEFAULT_BACKUP_SIZE_LIMIT = '5%'
 
+DEFAULT_POLL_WAIT_SECONDS = 3.0
+POLL_WAIT_SECONDS = DEFAULT_POLL_WAIT_SECONDS
+
+def apply_poll_wait_from_env():
+	'''Set POLL_WAIT_SECONDS from REVERB_POLL_WAIT_SECONDS. Invalid/missing → 3.0.'''
+	global POLL_WAIT_SECONDS
+	raw = os.environ.get('REVERB_POLL_WAIT_SECONDS')
+	if raw is None or not str(raw).strip():
+		POLL_WAIT_SECONDS = DEFAULT_POLL_WAIT_SECONDS
+		return POLL_WAIT_SECONDS
+	try:
+		POLL_WAIT_SECONDS = float(raw)
+	except (TypeError, ValueError):
+		POLL_WAIT_SECONDS = DEFAULT_POLL_WAIT_SECONDS
+	return POLL_WAIT_SECONDS
+
+apply_poll_wait_from_env()
+
 MOVE_PAIR_TIMEOUT_SECONDS = 30
 
 ARG_MAX = os.sysconf('SC_ARG_MAX')
@@ -188,6 +206,7 @@ def main():
 	global DEFAULT_KEEP_N_VERSIONS
 	global DEFAULT_BACKUP_SIZE_LIMIT
 	global DEBUG
+	apply_poll_wait_from_env()
 	signal.signal(signal.SIGINT, signal_handler)
 	signal.signal(signal.SIGTERM, signal_handler)
 	args, argString = get_args()
@@ -729,7 +748,7 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to
 	# main monitoring function to deal with one reverb.
 	while GREEN_LIGHT.is_set():
 		while GREEN_LIGHT.is_set() and not monitor_fs_flag.is_set():
-			monitor_fs_flag.wait(3)
+			monitor_fs_flag.wait(POLL_WAIT_SECONDS)
 		if not GREEN_LIGHT.is_set():
 			watcherTeeLogToTl(monitor_path,f'Exiting watcher thread for {monitor_path}',ok=True)
 			return False
@@ -764,7 +783,7 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 		lastReadTime = time.monotonic()
 		lastProcessTime = time.monotonic()
 		while GREEN_LIGHT.is_set():
-			read_delay = max(min(3,min_snapshot_delay_seconds),0.00001)
+			read_delay = max(min(POLL_WAIT_SECONDS, min_snapshot_delay_seconds), 0.00001)
 			events =  inotify_obj.read(timeout=read_delay * 1000)
 			now = time.monotonic()
 			expired_move_cookies = [cookie for cookie, change_event in pendingMoveFromEvents.items() if now - change_event.monotonic_time > move_pair_timeout]
@@ -1192,9 +1211,9 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 		vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signature,vault_fs_flag),daemon=True)
 		vault_fs_thread.start()
 		while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
-			vault_fs_flag.wait(3)
+			vault_fs_flag.wait(POLL_WAIT_SECONDS)
 		while GREEN_LIGHT.is_set() and not monitor_fs_flag.is_set():
-			monitor_fs_flag.wait(3)
+			monitor_fs_flag.wait(POLL_WAIT_SECONDS)
 		backupEntries = OrderedDict()
 		with to_process_lock:
 			if to_process:
@@ -1214,7 +1233,7 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 		# to_process: deque([ChangedEvent:{'monotonic_time':'231241','event':'create','type':'file','path':'/path/to/file'},...])
 		while GREEN_LIGHT.is_set():
 			while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
-				vault_fs_flag.wait(3)
+				vault_fs_flag.wait(POLL_WAIT_SECONDS)
 			vaultInfo,trackingFilesFolders,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 				  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 				  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,trackingFilesFolders=trackingFilesFolders)
@@ -1231,7 +1250,7 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 			force_full_scan = False
 			while not backupEntries and not force_full_scan and GREEN_LIGHT.is_set():
 				while GREEN_LIGHT.is_set() and not to_process_flag.is_set():
-					to_process_flag.wait(3)
+					to_process_flag.wait(POLL_WAIT_SECONDS)
 				if not GREEN_LIGHT.is_set():
 					break
 				with to_process_lock:
@@ -1586,8 +1605,8 @@ def do_backup(backup_entries:dict,
 				cp_af_copy_path(monitorFile,backupFilePath,mcae)
 			trackingFilesFolders = TrackingFilesFolders(relativeFilePaths,relativeFolderPaths)
 			while GREEN_LIGHT.is_set() and mcae.runningThreads:
-				mcae.wait(timeout=3)
-			mcae.cleanup(timeout=3)
+				mcae.wait(timeout=POLL_WAIT_SECONDS)
+			mcae.cleanup(timeout=POLL_WAIT_SECONDS)
 		else:
 			backuperTeeLogToTl(job_name,f'Creating a referenced backup of {monitor_path} to {backup_folder}',ok=True)
 			if log_journal:
@@ -2625,7 +2644,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			vaultFiles.discard(relative_path)
 	def wait_for_async_commands(mcae):
 		while GREEN_LIGHT.is_set() and mcae.runningThreads:
-			mcae.wait(timeout=3)
+			mcae.wait(timeout=POLL_WAIT_SECONDS)
 	# this function does the actual backup using a referenced version and a change list to copy the source from
 	# reverb backup flow:
 	#   do referenced copy of the last version to the current backup folder 

@@ -1,6 +1,6 @@
 [project]
 name = "reverberator"
-version = "0.25"
+version = "0.26"
 description = "A inotify based tool to create REVERBs (REcursive VERsioning Backup) using symlinks"
 readme = "README.md"
 requires-python = ">=3.7"
@@ -22,3 +22,18 @@ dependencies = [
 
 [project.scripts]
 reverberator = "reverberator:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "reverberator.py"]
+addopts = ["--doctest-modules", "-ra"]
+norecursedirs = [".venv", "dist", ".git"]
+pythonpath = ["."]
+markers = [
+	"unit: fast in-process tests",
+	"inotify: live kernel inotify",
+	"process: spawn reverberator CLI",
+	"privileged: requires root or REVERB_PRIVILEGED=1",
+]
