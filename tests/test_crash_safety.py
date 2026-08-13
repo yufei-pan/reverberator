@@ -6,6 +6,9 @@ from collections import OrderedDict
 import threading
 
 import reverberator as rv
+import pytest
+
+pytestmark = pytest.mark.unit
 
 
 class TestRemoveIncompleteVaultVersions(unittest.TestCase):
