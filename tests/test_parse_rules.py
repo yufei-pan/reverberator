@@ -1,5 +1,6 @@
 import os
 import pytest
+import TSVZ
 import reverberator as rv
 from tests.harness import write_rule
 
@@ -20,18 +21,36 @@ def test_parse_rules_header_only_exits(tmp_path):
 	assert exc.value.code == 1
 
 
-def test_parse_rules_empty_job_name_ignored(job):
+def test_parse_rules_blank_only_key_exits(job):
 	write_rule(job)
 	lines = open(job.rule_path, encoding='utf-8').read().splitlines()
 	blank = '\t'.join([''] + [job.monitor, job.vault, 'N/A', '1', '86400', 'True', 'True', '0', '0', 'N/A'])
 	with open(job.rule_path, 'w', encoding='utf-8') as f:
 		f.write(lines[0] + '\n' + blank + '\n')
-	# TSVZ.readTabularFile skips rows with an empty unique key, so parse_rules
-	# sees no rules and sys.exit(1) (same as header-only). The in-loop empty
-	# job_name continue is not reachable through TSVZ for a blank first column.
+	# TSVZ skips empty unique keys, so a blank-only file is empty after parse.
 	with pytest.raises(SystemExit) as exc:
 		rv.parse_rules(job.rule_path)
 	assert exc.value.code == 1
+
+
+def test_parse_rules_empty_job_name_row_dropped_keeps_valid(job):
+	write_rule(job)
+	lines = open(job.rule_path, encoding='utf-8').read().splitlines()
+	blank = '\t'.join([''] + [job.monitor, job.vault, 'N/A', '1', '86400', 'True', 'True', '0', '0', 'N/A'])
+	with open(job.rule_path, 'w', encoding='utf-8') as f:
+		f.write(lines[0] + '\n' + blank + '\n' + lines[1] + '\n')
+	rules = rv.parse_rules(job.rule_path)
+	assert len(rules) == 1
+	assert rules[0].job_name == job.job_name
+
+
+def test_parse_rules_empty_monitor_ignored(job):
+	write_rule(job)
+	lines = open(job.rule_path, encoding='utf-8').read().splitlines()
+	cols = lines[1].split('\t')
+	cols[1] = ''
+	open(job.rule_path, 'w', encoding='utf-8').write(lines[0] + '\n' + '\t'.join(cols) + '\n')
+	assert rv.parse_rules(job.rule_path) == []
 
 
 def test_parse_rules_missing_monitor_ignored(job):
@@ -52,17 +71,37 @@ def test_parse_rules_vault_subpath_of_monitor_ignored(job):
 
 def test_parse_rules_slugifies_job_name_and_appends(job):
 	write_rule(job)
-	text = open(job.rule_path, encoding='utf-8').read().replace('\tjob\t', '\tMy Job!\t', 1)
-	# header uses "Job Name" not the value; replace the data-row job name:
 	lines = open(job.rule_path, encoding='utf-8').read().splitlines()
 	cols = lines[1].split('\t')
 	cols[0] = 'My Job!'
-	open(job.rule_path, 'w', encoding='utf-8').write(lines[0] + '\n' + '\t'.join(cols) + '\n')
+	dirty_line = '\t'.join(cols)
+	open(job.rule_path, 'w', encoding='utf-8').write(lines[0] + '\n' + dirty_line + '\n')
 	rules = rv.parse_rules(job.rule_path)
 	assert len(rules) == 1
 	assert rules[0].job_name == 'my-job'
-	updated = open(job.rule_path, encoding='utf-8').read()
-	assert 'my-job' in updated
+	data_rows = open(job.rule_path, encoding='utf-8').read().splitlines()[1:]
+	assert dirty_line in data_rows
+	assert len(data_rows) == 2
+	assert data_rows[1].split('\t')[0] == 'my-job'
+
+
+def test_parse_rules_realpath_monitor_and_appends(job):
+	write_rule(job)
+	dirty = os.path.join(job.monitor, '..', 'monitor')
+	canonical = os.path.realpath(dirty)
+	assert dirty != canonical
+	lines = open(job.rule_path, encoding='utf-8').read().splitlines()
+	cols = lines[1].split('\t')
+	cols[1] = dirty
+	dirty_line = '\t'.join(cols)
+	open(job.rule_path, 'w', encoding='utf-8').write(lines[0] + '\n' + dirty_line + '\n')
+	rules = rv.parse_rules(job.rule_path)
+	assert len(rules) == 1
+	assert rules[0].mon_path == canonical
+	data_rows = open(job.rule_path, encoding='utf-8').read().splitlines()[1:]
+	assert dirty_line in data_rows
+	assert len(data_rows) == 2
+	assert data_rows[1].split('\t')[1] == canonical
 
 
 def test_parse_rules_na_signatures_unchanged(job):
@@ -107,3 +146,32 @@ def test_parse_rules_none_and_auto_defaults(job):
 	assert rules[0].only_sync_attributes == str(rv.DEFAULT_ONLY_SYNC_ATTRIBUTES)
 	assert rules[0].keep_n_versions == '0'
 	assert rules[0].backup_size_limit == rv.DEFAULT_BACKUP_SIZE_LIMIT
+
+
+def test_parse_rules_min_and_keep_n_auto(job):
+	write_rule(job)
+	lines = open(job.rule_path, encoding='utf-8').read().splitlines()
+	cols = lines[1].split('\t')
+	cols[4] = 'auto'
+	cols[8] = 'auto'
+	open(job.rule_path, 'w', encoding='utf-8').write(lines[0] + '\n' + '\t'.join(cols) + '\n')
+	rules = rv.parse_rules(job.rule_path)
+	assert rules[0].min_shapshot_time == str(rv.DEFAULT_SNAPSHOT_DELAY)
+	assert rules[0].keep_n_versions == str(rv.DEFAULT_KEEP_N_VERSIONS)
+
+
+def test_parse_rules_tsvz_defaults_fill_blank_min(job):
+	write_rule(job)
+	lines = open(job.rule_path, encoding='utf-8').read().splitlines()
+	cols = lines[1].split('\t')
+	cols[4] = ''
+	defaults = [''] * len(cols)
+	defaults[0] = TSVZ.DEFAULTS_INDICATOR_KEY
+	defaults[4] = '60'
+	with open(job.rule_path, 'w', encoding='utf-8') as f:
+		f.write(lines[0] + '\n')
+		f.write('\t'.join(defaults) + '\n')
+		f.write('\t'.join(cols) + '\n')
+	rules = rv.parse_rules(job.rule_path)
+	assert len(rules) == 1
+	assert rules[0].min_shapshot_time == '60'
