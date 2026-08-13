@@ -4,6 +4,9 @@ import unittest
 from collections import OrderedDict, deque
 
 import reverberator as rv
+import pytest
+
+pytestmark = pytest.mark.unit
 
 
 class TestCpAfCreatesParentDirs(unittest.TestCase):
