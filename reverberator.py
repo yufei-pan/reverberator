@@ -1849,6 +1849,10 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 				os.remove(entry)
 			except Exception as e:
 				backuperTeeLogToTl(job_vault_path,f'Error deleting {entry}: {e}',error=True)
+		# scandir order is not guaranteed: a content file may be seen before its
+		# V* directory, so discard indexed paths before treating leftovers as orphans.
+		for ve in vault_info_dict.values():
+			orphan_entries.discard(ve.path)
 		for entry in orphan_entries:
 			backuperTeeLogToTl(
 				job_vault_path,
