@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.27
+__version__ = 0.28
 
 ## WIP
 
@@ -2565,8 +2565,27 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 				try:
 					os.rename(linkTarget,file)
 				except Exception as e:
-					materialize_failed = True
-					backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error moving {linkTarget} to {file}: {e}')
+					if os.path.lexists(linkTarget):
+						# the target is still there but we could not move it, so removing the
+						# reference vault would destroy the only copy. keep it and retry later.
+						materialize_failed = True
+						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error moving {linkTarget} to {file}: {e}')
+						continue
+					# the target is already gone, so this link was dangling before we touched it.
+					# removing the reference vault loses nothing that is not already lost, and
+					# keeping the link would carry the broken reference forward into every later
+					# version. drop it and keep stepping, as aborting here wedges retention forever.
+					try:
+						new_size -= max(os.lstat(file).st_size,block_size)
+					except Exception as sizeError:
+						if DEBUG:
+							backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error getting size of {file}: {sizeError}')
+					try:
+						os.remove(file)
+					except Exception as removeError:
+						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error removing dangling link {file} -> {linkTarget}: {removeError}')
+					else:
+						backuperTeeLogToTl(path=referenceVaultPath,message=f'Removed dangling link {file} -> {linkTarget} as the target is already missing')
 					continue
 			elif DEBUG:
 				backuperTeeLogToTl(path=referenceVaultPath,message=f'Not moving {linkTarget} to {file}')

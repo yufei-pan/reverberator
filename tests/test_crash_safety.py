@@ -357,6 +357,47 @@ class TestDecrementStepperAbort(unittest.TestCase):
 			self.assertIn(0, d)
 			self.assertTrue(os.path.islink(os.path.join(v1, 'a.txt')))
 
+	def test_dangling_link_into_reference_does_not_block_removal(self):
+		with tempfile.TemporaryDirectory() as root:
+			d, v0, v1 = self._make_pair(root)
+			# the real file vanished from the oldest version, so V1's link is
+			# already dangling before the stepper ever touches it
+			os.remove(os.path.join(v0, 'a.txt'))
+			self.assertTrue(os.path.islink(os.path.join(v1, 'a.txt')))
+
+			removed_size, removed_inodes = rv.decrement_stepper(d)
+
+			self.assertFalse(os.path.isdir(v0))
+			self.assertNotIn(0, d)
+			self.assertFalse(os.path.lexists(os.path.join(v1, 'a.txt')))
+			self.assertGreater(removed_size + removed_inodes, 0)
+
+	def test_chained_dangling_links_drain_across_successive_steps(self):
+		# mirrors the production shape: V2 -> V1 -> V0, where V0's real file is
+		# already gone, so every step must keep making progress
+		with tempfile.TemporaryDirectory() as root:
+			d, v0, v1 = self._make_pair(root)
+			v2 = os.path.join(root, 'V2--2021-01-03_00-00-00_-0800')
+			os.makedirs(v2)
+			os.symlink(os.path.join(v1, 'a.txt'), os.path.join(v2, 'a.txt'))
+			sz = rv.get_path_size(v2)
+			ino = rv.get_path_inodes(v2)
+			sz_s = rv.format_bytes(sz, use_1024_bytes=True, to_str=True).replace(' ', '_')
+			ino_s = rv.format_bytes(ino, use_1024_bytes=False, to_str=True).replace(' ', '')
+			with open(f'{v2}--{sz_s}B-{ino_s}_ino{rv.CONTENT_FILE_EXTENSION_NAME}', 'w') as f:
+				f.write('path\tiso_time\tevent\tsource_path\n')
+			d[2] = rv.VaultEntry(2, v2, 2, sz, ino)
+			os.remove(os.path.join(v0, 'a.txt'))
+
+			rv.decrement_stepper(d)
+			self.assertFalse(os.path.isdir(v0))
+			self.assertEqual(list(d), [1, 2])
+
+			rv.decrement_stepper(d)
+			self.assertFalse(os.path.isdir(v1))
+			self.assertEqual(list(d), [2])
+			self.assertFalse(os.path.lexists(os.path.join(v2, 'a.txt')))
+
 
 if __name__ == '__main__':
 	unittest.main()
