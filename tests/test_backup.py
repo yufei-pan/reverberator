@@ -122,3 +122,57 @@ def test_move_rename_failure_falls_back_to_copy_delete(job, monkeypatch):
 	)
 	assert os.path.isfile(os.path.join(v1, 'b.txt'))
 	assert open(os.path.join(v1, 'b.txt')).read() == 'data'
+
+
+def test_vanished_source_is_not_recorded_in_tracking(job):
+	# a short-lived file (git's index.stash.<pid>) is gone by the time the
+	# backup replays its create event; it must not enter the tracking list
+	seed_monitor(job, {'keep.txt': 'k'})
+	v0 = write_committed_version(job, 0, {'keep.txt': 'k'})
+	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
+	os.makedirs(v1)
+	gone = os.path.join(job.monitor, '.git', 'index.stash.4242')
+	entries = OrderedDict([
+		(gone, rv.BackupEntryValues('t', 'create', None)),
+		(os.path.join(job.monitor, 'keep.txt'), rv.BackupEntryValues('t', 'modify', None)),
+	])
+	latest = rv.VaultEntry(0, v0, 0, 1, 1)
+	rv.GREEN_LIGHT.set()
+	result = rv.do_reverb_backup(entries, v1, latest, True, rv.TrackingFilesFolders(['keep.txt'], []), job.monitor)
+	assert '.git/index.stash.4242' not in result.files
+	assert not os.path.lexists(os.path.join(v1, '.git', 'index.stash.4242'))
+	# the rest of the backup must still succeed
+	assert os.path.isfile(os.path.join(v1, 'keep.txt'))
+	assert 'keep.txt' in result.files
+
+
+def test_referenced_copy_drops_tracked_file_missing_from_reference(job):
+	# a tracking list that lies about the referenced version must not produce
+	# a dangling link that every later version inherits
+	v0 = write_committed_version(job, 0, {'real.txt': 'r'})
+	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
+	os.makedirs(v1)
+	rv.GREEN_LIGHT.set()
+	result = rv.do_referenced_copy(
+		source_path=v0, backup_folder=v1,
+		trackingFilesFolders=rv.TrackingFilesFolders(['real.txt', 'ghost.txt'], []),
+		relative=True,
+	)
+	assert not os.path.lexists(os.path.join(v1, 'ghost.txt'))
+	assert 'ghost.txt' not in result.files
+	assert os.path.lexists(os.path.join(v1, 'real.txt'))
+	assert 'real.txt' in result.files
+
+
+def test_copy_keeps_inherited_link_when_source_vanished(job):
+	# losing the inherited reference would drop the previous version's copy
+	v0 = write_committed_version(job, 0, {'a.txt': 'a'})
+	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
+	os.makedirs(v1)
+	dest = os.path.join(v1, 'a.txt')
+	os.symlink(os.path.join(v0, 'a.txt'), dest)
+	rv.GREEN_LIGHT.set()
+	rc = rv.cp_af_copy_path(source_path=os.path.join(job.monitor, 'a.txt'), dest_path=dest)
+	assert rc is False
+	assert os.path.islink(dest)
+	assert os.path.exists(dest)

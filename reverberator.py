@@ -34,7 +34,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.28
+__version__ = 0.29
 
 ## WIP
 
@@ -1971,7 +1971,14 @@ def prepare_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 	return order_backup_entries_for_replay(prune_entries_covered_by_dir_creates(backup_entries))
 
 def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...):
-	global DEBUG	
+	global DEBUG
+	if not os.path.lexists(source_path):
+		# the source vanished between its event and this copy, which short lived
+		# files such as git's index.stash.<pid> do routinely. return before
+		# clearing dest: an inherited link there still references the previous
+		# version's copy, and dropping it would lose that reference for nothing.
+		backuperTeeLogToTl(path=source_path,error=True,message=f'Not copying {source_path} to {dest_path}: source no longer exists')
+		return False
 	if os.path.lexists(dest_path):
 		if dest_path == '/':
 			backuperTeeLogToTl(path=source_path,error=True,message='Cannot copy as root directory')
@@ -2011,33 +2018,46 @@ def do_referenced_copy(source_path:str,backup_folder:str,trackingFilesFolders:Tr
 		backuperTeeLogToTl(path=source_path,message=f'Using cached tracked files and folders {len(files)} {len(folders)}')
 		#backuperTeeLogToTl(path=source_path,message='\n"'+'"\n"'.join(files) + '"')
 		#backuperTeeLogToTl(path=source_path,message='\n"'+'"\n"'.join(folders) + '"')
+	kept_folders = []
 	for folder in folders:
 		source_folder = os.path.join(source_path,folder)
 		backup_folder_path = os.path.join(backup_folder,folder)
+		if not os.path.lexists(source_folder):
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked folder missing from {source_path}: {folder}')
+			continue
 		os.makedirs(backup_folder_path,exist_ok=True)
 		copy_file_meta(source_folder,backup_folder_path)
+		kept_folders.append(folder)
 		if not GREEN_LIGHT.is_set():
 			backuperTeeLogToTl(path=source_path,error=True,message='Backup process interrupted, stopping')
 			return TrackingFilesFolders([], [])
+	kept_files = []
 	for file in files:
 		# use ln -fsrLT to do a relative symlink
 		# ln --symbolic --logical --force --no-target-directory
-		source_file = os.path.join(source_path,file)
+		source_file_real = os.path.join(source_path,file)
 		backup_file_path = os.path.join(backup_folder,file)
+		if not os.path.lexists(source_file_real):
+			# the tracked list claims a file this version does not have. linking it
+			# anyway produces a dangling link that every later version inherits and
+			# chains onto, so drop the entry here and let the list self heal.
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked file missing from {source_path}: {file}')
+			continue
 		if relative:
-			source_file = os.path.relpath(source_file,os.path.dirname(backup_file_path))
+			source_file = os.path.relpath(source_file_real,os.path.dirname(backup_file_path))
 		else:
-			source_file = os.path.abspath(source_file)
+			source_file = os.path.abspath(source_file_real)
 		# note: no longer using --logical as we are moving to use chained symlinks to reduce run time disk IO
 		#taskObj = multiCMD.run_command(['ln','-fsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
 		#mcae.run_command(['ln','-fsT',source_file,backup_file_path])
 		if os.path.lexists(backup_file_path):
 			os.remove(backup_file_path)
 		os.symlink(source_file, backup_file_path)
+		kept_files.append(file)
 		if not GREEN_LIGHT.is_set():
 			backuperTeeLogToTl(path=source_path,error=True,message='Backup process interrupted, stopping')
 			return TrackingFilesFolders([], [])
-	return TrackingFilesFolders(files, folders)
+	return TrackingFilesFolders(kept_files, kept_folders)
 
 def copy_file_meta(source_file:str,backup_file_path:str):
 	try:
@@ -2638,6 +2658,12 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
 	def copy_path(isDir,monitor_path,source_real_path,source_relative_path,vaultFolders,vaultFiles,
 			   file_vault_real_path,backup_folder,mcae):
+		if not os.path.lexists(source_real_path):
+			# recording a path we cannot copy makes the tracked list lie about this
+			# version, and the next referenced copy turns every such entry into a
+			# dangling link that all later versions inherit. skip it instead.
+			backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not tracking {source_relative_path}: source no longer exists')
+			return
 		if isDir:
 			vaultFolders.add(as_folder_entry(source_relative_path))
 			os.makedirs(file_vault_real_path,exist_ok=True)
@@ -2652,6 +2678,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			for subFileRealPath in newFiles:
 				subFileRelativePath = os.path.relpath(subFileRealPath,monitor_path)
 				subFileVaultPath = os.path.join(backup_folder,subFileRelativePath)
+				if not os.path.lexists(subFileRealPath):
+					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not tracking {subFileRelativePath}: source no longer exists')
+					continue
 				vaultFiles.add(subFileRelativePath)
 				cp_af_copy_path(source_path=subFileRealPath,dest_path=subFileVaultPath,mcae=mcae)
 		else:
