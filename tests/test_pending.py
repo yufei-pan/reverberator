@@ -108,3 +108,19 @@ def test_pending_file_too_large_for_the_memory_available_requests_a_full_scan(jo
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process) is True
 	assert [e.event for e in to_process] == ['full_scan']
 	assert not os.path.exists(pending_path)
+
+
+def test_queue_too_large_to_write_out_persists_a_full_scan(job, monkeypatch):
+	# writing every row holds them all as Python objects while the service stops
+	monkeypatch.setattr(rv, 'read_memory_state', lambda: (2 * rv.PENDING_ROW_BYTES, 16 << 30, 0.0))
+	seed_monitor(job, {'a.txt': 'x'})
+	queue = rv.ChangeEventQueue(job.monitor)
+	for t in range(10):
+		queue.append(rv.ChangeEvent(float(t), False, 'create', os.path.join(job.monitor, f'f{t}'), None))
+	os.makedirs(job.job_vault, exist_ok=True)
+	rv.persist_pending_transactions(job.job_name, job.vault, queue)
+	monkeypatch.setattr(rv, 'read_memory_state', lambda: (16 << 30, 16 << 30, 0.0))
+	_resumable(job, os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
+	to_process = rv.ChangeEventQueue()
+	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process) is True
+	assert [e.event for e in to_process] == ['full_scan']
