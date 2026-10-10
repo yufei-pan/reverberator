@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import pytest
 import reverberator as rv
 
@@ -91,6 +92,24 @@ def test_hash_file_full_vs_partial(tmp_path):
 	assert len(full) == 16
 	assert len(part) == 16
 	assert full != part
+
+
+def test_hash_file_refuses_fifo_without_blocking(tmp_path):
+	# a file swapped for a FIFO after its lstat would block a plain open forever, with no writer
+	fifo = str(tmp_path / 'was_a_file')
+	os.mkfifo(fifo)
+	outcome = []
+
+	def hash_it():
+		try:
+			outcome.append(rv.hash_file(fifo, 4096))
+		except OSError as e:
+			outcome.append(e)
+	worker = threading.Thread(target=hash_it, daemon=True)
+	worker.start()
+	worker.join(timeout=5)
+	assert not worker.is_alive(), 'hash_file blocked opening a FIFO'
+	assert isinstance(outcome[0], OSError)
 
 
 def test_check_fs_signature_mismatch(tmp_path):

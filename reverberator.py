@@ -22,6 +22,8 @@ import glob
 import select
 import sqlite3
 import stat
+import errno
+import fcntl
 from concurrent.futures import Future, ThreadPoolExecutor
 from shutil import copystat
 
@@ -2840,7 +2842,12 @@ def hash_file(path,size = ...,full_hash=False):
 			backuperTeeLogToTl(path='hash_file',error=True,message=f'Error getting size for {path}')
 			return ''
 	hasher = xxhash.xxh64()
-	with open(path, 'rb') as f:
+	# a file swapped for a FIFO after its lstat would block a plain open forever with no writer
+	with open(path, 'rb', opener=lambda file, flags: os.open(file, flags | os.O_NONBLOCK | os.O_NOCTTY)) as f:
+		if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+			raise OSError(errno.EINVAL, 'Not a regular file', path)
+		# regular files ignore O_NONBLOCK, but drop it in case a filesystem passes it on
+		fcntl.fcntl(f.fileno(), fcntl.F_SETFL, fcntl.fcntl(f.fileno(), fcntl.F_GETFL) & ~os.O_NONBLOCK)
 		if not full_hash:
 			# Only hash the last hash_size bytes, in one read: the disk seeks once for them either way
 			f.seek(-min(HASH_SIZE,size), os.SEEK_END)
