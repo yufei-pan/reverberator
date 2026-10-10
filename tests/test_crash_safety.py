@@ -125,10 +125,8 @@ class TestBackuperCommitFailure(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as tmp:
 			rv.GREEN_LIGHT.set()
 			original_do_backup = rv.do_backup
-			original_fs_flag_daemon = rv.fs_flag_daemon
 			try:
 				rv.do_backup = lambda *a, **k: (None, None, False)
-				rv.fs_flag_daemon = lambda path, signature, fs_event: fs_event.set()
 				to_process = deque([
 					rv.ChangeEvent(1, False, 'modify', os.path.join(tmp, 'monitor', 'f.txt'), None)
 				])
@@ -148,7 +146,6 @@ class TestBackuperCommitFailure(unittest.TestCase):
 				self.assertFalse(rv.GREEN_LIGHT.is_set())
 			finally:
 				rv.do_backup = original_do_backup
-				rv.fs_flag_daemon = original_fs_flag_daemon
 				rv.GREEN_LIGHT.set()
 
 

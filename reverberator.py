@@ -19,6 +19,7 @@ import datetime
 import unicodedata
 import re
 import glob
+import select
 from shutil import copystat
 
 # for the lib wrapping aroung inotify, I tried
@@ -34,7 +35,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.29
+__version__ = 0.30
 
 ## WIP
 
@@ -163,6 +164,8 @@ apply_poll_wait_from_env()
 
 MOVE_PAIR_TIMEOUT_SECONDS = 30
 
+MOUNTINFO_PATH = '/proc/self/mountinfo'
+
 ARG_MAX = os.sysconf('SC_ARG_MAX')
 ARGUMENT_LIMIT = (ARG_MAX - 4096) // 2048
 
@@ -279,10 +282,8 @@ def main():
 		to_process_lock = threading.Lock()
 		load_pending_transactions_for_resume(job_name=job_name, monitor_path=monitor_path, vault_path=vault_path, to_process=to_process)
 		to_process_flag = threading.Event()
-		monitor_fs_flag = threading.Event()
-		monitor_fs_thread = threading.Thread(target=fs_flag_daemon,args=(monitor_path,monitor_path_signature,monitor_fs_flag),daemon=True)
 		tl.teeprint(f'Starting path watcher {job_name} for {monitor_path}')
-		monitor_fs_thread.start()
+		monitor_fs_flag = FS_SIGNATURE_MONITOR.register(monitor_path,monitor_path_signature)
 		watcherThread = threading.Thread(target=watcher,args=(monitor_fs_flag,monitor_path,to_process,to_process_lock,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds),daemon=True)
 		watcherThread.start()
 		main_threads.append(watcherThread)
@@ -1116,16 +1117,6 @@ def get_monitor_path_most_recent_change_time(monitor_path:str) -> float:
 				watcherTeeLogToTl(monitor_path, f'Error scanning {current_path}: {e}', error=True)
 	return latest_mtime
 
-def fs_flag_daemon(path:str,signature:str,fsEvent:threading.Event):
-	global GREEN_LIGHT
-	while GREEN_LIGHT.is_set():
-		if check_fs_signature(path,signature):
-			watcherTeeLogToTl(path,f'FS signature for {path} verified.')
-			fsEvent.set()
-		else:
-			fsEvent.clear()
-		wait_fs_event(path,timeout = 0)
-
 def check_fs_signature(path:str,signature:str):
 	'''
 	Return whether path still lives on the filesystem identified by signature.
@@ -1168,25 +1159,190 @@ def get_fs_signatures(path:str) -> list:
 	fields = [bytes(f, 'utf-8').decode('unicode_escape') for f in fields if f]
 	return fields
 
-def wait_fs_event(path:str,timeout = 0):
-	global DEBUG
-	global GREEN_LIGHT
-	# this function waits for fs event
-	# use findmnt --poll --first-only --target <path> to do event based wait
-	command = ['findmnt','--poll','--first-only']
-	timeout = int(timeout * 1000)
-	if timeout > 0:
-		command.append(f'--timeout={timeout}')
-	command.append(f'--target={path}')
-	rtnHost = multiCMD.run_command(command,timeout=timeout+1 if timeout > 0  else timeout,quiet=not DEBUG,return_object=True,wait_for_return=False)
-	while GREEN_LIGHT.is_set() and rtnHost.thread.is_alive():
-		rtnHost.thread.join(1)
-	# if the thread is still alive, we need to kill it
-	rtnHost.stop = True
-	rtnHost.thread.join(1)
-	if rtnHost.returncode == 0:
-		return True
-	return False
+def parse_mount_table(mountinfo:bytes) -> list:
+	r'''
+	Parse /proc/self/mountinfo content into (mount_point, fingerprint) pairs in kernel order.
+
+	The fingerprint (mount id, device, fs root, source) changes whenever the mount is replaced,
+	and later entries stack on top of earlier ones at the same mount point.
+
+	Examples:
+		>>> table = parse_mount_table(b'22 1 8:1 / / rw shared:1 - ext4 /dev/sda1 rw\n'
+		...     b'40 22 8:17 /data /mnt/my\\040disk rw - xfs /dev/sdb1 rw\n')
+		>>> [mount_point for mount_point, _ in table]
+		['/', '/mnt/my disk']
+		>>> table[1][1]
+		(b'40', b'8:17', b'/data', b'/dev/sdb1')
+		>>> parse_mount_table(b'garbage\n')
+		[]
+	'''
+	mount_table = []
+	for line in mountinfo.splitlines():
+		fields = line.split()
+		if len(fields) < 5:
+			continue
+		# optional fields end at a lone '-', followed by fs type and source
+		try:
+			source = fields[fields.index(b'-', 6) + 2]
+		except (ValueError, IndexError):
+			source = b''
+		# mountinfo octal-escapes space, tab, newline and backslash
+		mount_point = re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8)]), fields[4])
+		mount_table.append((os.fsdecode(mount_point), (fields[0], fields[2], fields[3], source)))
+	return mount_table
+
+def mount_fingerprint(mount_table:list, path:str):
+	'''
+	Fingerprint of the mount containing path: the deepest mount point, topmost when stacked.
+
+	Examples:
+		>>> table = [('/', ('root',)), ('/mnt', ('a',)), ('/mnt', ('b',)), ('/mnt2', ('c',))]
+		>>> mount_fingerprint(table, '/mnt/x/y')
+		('b',)
+		>>> mount_fingerprint(table, '/mnt2x')
+		('root',)
+		>>> mount_fingerprint([], '/mnt') is None
+		True
+	'''
+	fingerprint = None
+	deepest = -1
+	for mount_point, mount_id in mount_table:
+		if mount_point == '/' or path == mount_point or path.startswith(mount_point + '/'):
+			if len(mount_point) >= deepest:
+				deepest = len(mount_point)
+				fingerprint = mount_id
+	return fingerprint
+
+class fs_signature_monitor:
+	'''
+	One shared daemon thread keeping a flag per (path, signature) pair set while the path lives
+	on the filesystem identified by signature.
+
+	Replaces a findmnt --poll subprocess (plus its multiCMD threads) per path: /proc/self/mountinfo
+	raises POLLPRI on every mount table change, the same signal findmnt --poll waits on. A pair is
+	only re-checked (df + lsblk) when the mount containing its path changes, like findmnt --target,
+	and rules sharing a path share that check.
+	'''
+	def __init__(self, mountinfo_path:str = MOUNTINFO_PATH):
+		self.mountinfo_path = mountinfo_path
+		self.lock = threading.Lock()
+		# (path, signature) -> [threading.Event], one per register() call
+		self.flags = {}
+		# (path, signature) -> fingerprint of the mount containing path at its last check
+		self.fingerprints = {}
+		# (path, signature) -> result of its last check
+		self.states = {}
+		self.thread = None
+		self.wake_r, self.wake_w = os.pipe()
+		os.set_blocking(self.wake_r, False)
+		os.set_blocking(self.wake_w, False)
+
+	def register(self, path:str, signature:str) -> threading.Event:
+		'''
+		Get a flag for path / signature. Every caller gets its own Event, so a caller clearing
+		it (watcher on self destruct) stays blocked until the containing mount changes.
+		'''
+		fs_event = threading.Event()
+		key = (path, signature)
+		with self.lock:
+			if self.states.get(key):
+				fs_event.set()
+			self.flags.setdefault(key, []).append(fs_event)
+		self.start()
+		return fs_event
+
+	def start(self):
+		with self.lock:
+			if self.thread is None or not self.thread.is_alive():
+				# mount changes were not observed while stopped
+				self.fingerprints.clear()
+				self.thread = threading.Thread(target=self.run, name='fs_signature_monitor', daemon=True)
+				self.thread.start()
+		self.wake()
+
+	def unregister(self, path:str, signature:str, fs_event:threading.Event):
+		key = (path, signature)
+		with self.lock:
+			fs_events = self.flags.get(key, [])
+			if fs_event in fs_events:
+				fs_events.remove(fs_event)
+			if not fs_events:
+				self.flags.pop(key, None)
+				self.fingerprints.pop(key, None)
+				self.states.pop(key, None)
+
+	def wake(self):
+		try:
+			os.write(self.wake_w, b'\0')
+		except BlockingIOError:
+			# pipe full: a wake up is already pending
+			pass
+
+	def check_changed(self):
+		'''Re-check every pair whose containing mount changed since its last check.'''
+		try:
+			with open(self.mountinfo_path, 'rb') as f:
+				mount_table = parse_mount_table(f.read())
+		except Exception:
+			mount_table = []
+		with self.lock:
+			keys = list(self.flags)
+		for key in keys:
+			path, signature = key
+			fingerprint = mount_fingerprint(mount_table, os.path.realpath(path))
+			with self.lock:
+				if self.fingerprints.get(key, ...) == fingerprint:
+					continue
+			fs_ok = check_fs_signature(path, signature)
+			with self.lock:
+				if key not in self.flags:
+					continue
+				changed = self.states.get(key) != fs_ok
+				self.fingerprints[key] = fingerprint
+				self.states[key] = fs_ok
+				for fs_event in self.flags[key]:
+					if fs_ok:
+						fs_event.set()
+					else:
+						fs_event.clear()
+			if changed:
+				watcherTeeLogToTl(path, f'FS signature {signature} for {path} ' + ('verified.' if fs_ok else 'does not match, pausing.'))
+
+	def run(self):
+		global GREEN_LIGHT
+		poller = select.poll()
+		poller.register(self.wake_r, select.POLLIN)
+		mountinfo_file = None
+		try:
+			mountinfo_file = open(self.mountinfo_path, 'rb')
+			# the mount table always polls readable, POLLPRI | POLLERR only fire on a change
+			poller.register(mountinfo_file.fileno(), select.POLLPRI)
+		except Exception as e:
+			watcherTeeLogToTl(self.mountinfo_path, f'Failed to watch mount table, fs signatures will not be re-checked on mount changes: {e}', error=True)
+		try:
+			while True:
+				with self.lock:
+					# decided under the lock so register() never hands a pair to an exiting thread
+					if not GREEN_LIGHT.is_set():
+						self.thread = None
+						return
+				try:
+					self.check_changed()
+				except Exception:
+					import traceback
+					watcherTeeLogToTl(self.mountinfo_path, traceback.format_exc(), error=True)
+				while GREEN_LIGHT.is_set() and not poller.poll(int(max(POLL_WAIT_SECONDS * 1000, 1))):
+					pass
+				try:
+					while os.read(self.wake_r, 4096):
+						pass
+				except BlockingIOError:
+					pass
+		finally:
+			if mountinfo_file is not None:
+				mountinfo_file.close()
+
+FS_SIGNATURE_MONITOR = fs_signature_monitor()
 
 #%% ---- Backup ----
 def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monitor_path:str,vault_path:str,vault_path_signature:str,
@@ -1202,6 +1358,7 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 		# no monitor fs gating requested: use an always-set event
 		monitor_fs_flag = threading.Event()
 		monitor_fs_flag.set()
+	vault_fs_flag = None
 	try:
 		# if the vault path does not exist, create it
 		if not os.path.lexists(vault_path):
@@ -1210,9 +1367,7 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 			except Exception as _:
 				watcherTeeLogToTl(monitor_path,f'Warning: Vault path {vault_path} does not exist and failed to create it. Backuper Stopped!',error=True)
 				return
-		vault_fs_flag = threading.Event()
-		vault_fs_thread = threading.Thread(target=fs_flag_daemon,args=(vault_path,vault_path_signature,vault_fs_flag),daemon=True)
-		vault_fs_thread.start()
+		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
 		while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
 			vault_fs_flag.wait(POLL_WAIT_SECONDS)
 		while GREEN_LIGHT.is_set() and not monitor_fs_flag.is_set():
@@ -1277,6 +1432,8 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 		backuperTeeLogToTl(job_name, traceback.format_exc(), error=True)
 		GREEN_LIGHT.clear()
 	finally:
+		if vault_fs_flag is not None:
+			FS_SIGNATURE_MONITOR.unregister(vault_path,vault_path_signature,vault_fs_flag)
 		persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
 
 def backuperTeeLogToTl(path:str,message:str,error=False,ok=False):
