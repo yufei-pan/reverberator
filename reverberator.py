@@ -35,7 +35,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.31
+__version__ = 0.32
 
 ## WIP
 
@@ -1017,30 +1017,47 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			continue
 	return parentWatchDescriptor
 
+def iter_tree_entries(path:str, rel_prefix:str = ''):
+	'''
+	Walk path depth first, yielding (entry_path, rel_path, is_dir) with each folder right before its contents.
+	Folder paths end with /. Symlinks to folders are not followed and come out as files.
+	Nothing is listed up front, so walking a tree of 500k entries holds only the open folders of one branch.
+
+	Examples:
+		>>> import tempfile
+		>>> root = tempfile.mkdtemp()
+		>>> os.makedirs(os.path.join(root, 'd', 'e'))
+		>>> open(os.path.join(root, 'd', 'e', 'f'), 'w').close()
+		>>> os.symlink('d', os.path.join(root, 'link'))
+		>>> sorted((rel_path, is_dir) for _, rel_path, is_dir in iter_tree_entries(root))
+		[('d/', True), ('d/e/', True), ('d/e/f', False), ('link', False)]
+		>>> [entry_path == os.path.join(root, rel_path) for entry_path, rel_path, _ in iter_tree_entries(root)]
+		[True, True, True, True]
+		>>> import shutil; shutil.rmtree(root)
+	'''
+	try:
+		with os.scandir(path) as entries:
+			for entry in entries:
+				rel_path = rel_prefix + entry.name
+				if entry.is_dir(follow_symlinks=False):
+					yield entry.path + '/', rel_path + '/', True
+					yield from iter_tree_entries(entry.path, rel_path + '/')
+				else:
+					yield entry.path, rel_path, False
+	except Exception as e:
+		watcherTeeLogToTl(path,f'Error scanning {path}: {e}',error=True)
+
 def get_all_folders(path):
-	_, folders = get_all_files_and_folders(path)
-	return folders
+	return [entry_path for entry_path, _, is_dir in iter_tree_entries(path) if is_dir]
 
 def get_all_files(path):
-	files, _ = get_all_files_and_folders(path)
-	return files
+	return [entry_path for entry_path, _, is_dir in iter_tree_entries(path) if not is_dir]
 
 def get_all_files_and_folders(path):
 	files = []
 	folders = []
-	try:
-		with os.scandir(path) as entries:
-			for entry in entries:
-				if entry.is_dir(follow_symlinks=False):
-					folders.append(entry.path+'/')
-					child_files, child_folders = get_all_files_and_folders(entry.path)
-					files.extend(child_files)
-					folders.extend(child_folders)
-				else:
-					files.append(entry.path)
-	except Exception as e:
-		watcherTeeLogToTl(path,f'Error scanning {path}: {e}',error=True)
-		return [], []
+	for entry_path, _, is_dir in iter_tree_entries(path):
+		(folders if is_dir else files).append(entry_path)
 	return files, folders
 
 def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:deque) -> bool:
@@ -2377,20 +2394,17 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	# this function will generate the backup entries by comparing size, mtime and hash between latest version and the monitoring path.
 	# When reverberator is in cold start, will not calculate hash to do space efficient move operations to vault.
 	# When restarting reverberator, will do one backup that will only handle create, modify, delete, attrib.
-	monitor_files, monitor_folders = get_all_files_and_folders(monitor_path)
-	latest_version_files, latest_version_folders = get_all_files_and_folders(latest_version_info.path)
-	latest_version_files = [os.path.relpath(latest_version_entry,latest_version_info.path) for latest_version_entry in latest_version_files]
-	latest_version_folders = [os.path.relpath(latest_version_entry,latest_version_info.path) + '/' for latest_version_entry in latest_version_folders]
-	latest_version_files_folders = set(latest_version_files + latest_version_folders)
-	# Folders before files so new-tree creates are parent-first in insertion order
+	# only the latest version's relative paths are listed: they are kept as tracking anyway.
+	# the monitor tree is compared as it is walked instead of being listed as absolute paths first
+	latest_version_files = []
+	latest_version_folders = []
+	for _, rel_entry, isDir in iter_tree_entries(latest_version_info.path):
+		(latest_version_folders if isDir else latest_version_files).append(rel_entry)
+	latest_version_files_folders = set(latest_version_files)
+	latest_version_files_folders.update(latest_version_folders)
+	# the walk yields each folder before its contents, so new-tree creates are parent-first in insertion order
 	# (prepare_backup_entries_for_replay also enforces this; this keeps content logs clearer).
-	for monitor_entry in monitor_folders:
-		rel_entry = os.path.relpath(monitor_entry,monitor_path) + '/'
-		isDir = True
-		check_duplicate(backupEntries,latest_version_info.path,latest_version_files_folders,rel_entry,monitor_entry,isDir)
-	for monitor_entry in monitor_files:
-		rel_entry = os.path.relpath(monitor_entry,monitor_path)
-		isDir = False
+	for monitor_entry, rel_entry, isDir in iter_tree_entries(monitor_path):
 		check_duplicate(backupEntries,latest_version_info.path,latest_version_files_folders,rel_entry,monitor_entry,isDir)
 	for deleted_entry in latest_version_files_folders:
 		# this is a deleted file/folder
