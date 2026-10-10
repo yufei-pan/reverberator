@@ -35,12 +35,11 @@ def test_keep_n_versions_2_steps_before_v2(job):
 		(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues('t', 'modify', None)),
 	])
 	info = rv.get_vault_info(job.job_vault)
-	tracking = rv.TrackingFilesFolders(['a.txt'], [])
 	rv.do_backup(
 		entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
 		keep_one_complete_backup=True, only_sync_attributes=True,
 		keep_n_versions=2, backup_size_limit='0',
-		vaultInfo=info, trackingFilesFolders=tracking,
+		vaultInfo=info,
 	)
 	assert not os.path.isdir(v0)
 	names = [os.path.basename(p) for p in committed_versions(job)]
@@ -60,7 +59,7 @@ def test_tiny_size_limit_still_creates_version_if_stepper_cannot_free(job, monke
 		entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
 		keep_one_complete_backup=True, only_sync_attributes=True,
 		keep_n_versions=0, backup_size_limit='1',
-		vaultInfo=info, trackingFilesFolders=rv.TrackingFilesFolders(['a.txt'], []),
+		vaultInfo=info,
 	)
 	assert len(committed_versions(job)) >= 2
 
@@ -85,6 +84,5 @@ def test_inode_limit_i1_attempts_stepper(job, monkeypatch):
 		keep_one_complete_backup=True, only_sync_attributes=True,
 		keep_n_versions=0, backup_size_limit='i1',
 		vaultInfo=rv.get_vault_info(job.job_vault),
-		trackingFilesFolders=rv.TrackingFilesFolders(['a.txt'], []),
 	)
 	assert called

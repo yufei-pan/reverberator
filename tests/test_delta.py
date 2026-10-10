@@ -1,10 +1,11 @@
 import os
 import shutil
+import sys
 import tracemalloc
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_committed_version
+from tests.harness import seed_monitor, write_committed_version, write_tree, tracked_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -48,7 +49,9 @@ def chained_versions(job, names):
 	for version in (1, 2):
 		current = os.path.join(job.job_vault, f'V{version}--2021-01-0{version + 1}_00-00-00_-0800')
 		os.makedirs(current)
-		rv.do_referenced_copy(previous, current, relative=True)
+		manifest = tracked_manifest(job.job_vault, previous, names, sorted({os.path.dirname(n) + '/' for n in names if '/' in n}))
+		rv.do_referenced_copy(previous, current, manifest, relative=True)
+		manifest.close()
 		previous = current
 	assert all(os.path.islink(os.path.join(previous, name)) for name in names)
 	return v0, rv.VaultEntry(2, previous, 0, 1, 1)
@@ -97,21 +100,35 @@ def test_delta_new_tree_lists_each_folder_before_its_contents(job):
 	assert (tracking.files, tracking.folders) == (['keep.txt'], [])
 
 
-def test_delta_holds_little_beyond_the_tracking_lists_it_returns(job):
-	# every restart compares trees of 500k+ entries: listing both of them as absolute paths
-	# on top of the relative lists kept for tracking cost ~3.7x what the comparison returns
-	tree = {f'd{d:02d}/s{s:02d}/{"a_fairly_long_file_name_" * 2}{f:03d}.txt': 'x' for d in range(10) for s in range(10) for f in range(30)}
-	seed_monitor(job, tree)
-	v0 = os.path.join(job.job_vault, 'V0--2021-01-01_00-00-00_-0800')
-	shutil.copytree(job.monitor, v0, symlinks=True)
-	entries = OrderedDict()
-	tracemalloc.start()
-	try:
-		before = tracemalloc.get_traced_memory()[0]
-		tracking = rv.delta_generate_backup_entries(entries, rv.VaultEntry(0, v0, 0, 1, 1), job.monitor)
-		kept, peak = tracemalloc.get_traced_memory()
-	finally:
-		tracemalloc.stop()
-	assert entries == OrderedDict()
-	assert len(tracking.files) == len(tree) and len(tracking.folders) == 110
-	assert peak - before < 2 * (kept - before)
+def test_delta_memory_does_not_grow_with_the_tree(job, monkeypatch):
+	# restarts compare trees of 500k+ entries: holding a Python string per entry cost hundreds of MB.
+	# small batches and pool, so a few thousand entries already show whether anything is held per entry
+	monkeypatch.setattr(rv, 'MANIFEST_BATCH_SIZE', 50)
+	monkeypatch.setattr(rv, 'COMPARE_THREADS', 2)
+
+	def peak_for(files):
+		root = os.path.join(job.root, f'tree{files}')
+		monitor = os.path.join(root, 'monitor')
+		names = [f'd{i % 10:02d}/s{i // 10 % 10:02d}/{"a_fairly_long_file_name_" * 2}{i:05d}.txt' for i in range(files)]
+		write_tree(monitor, dict.fromkeys(names, 'x'))
+		v0 = os.path.join(root, 'vault', 'job', 'V0--2021-01-01_00-00-00_-0800')
+		shutil.copytree(monitor, v0, symlinks=True)
+		latest = rv.VaultEntry(0, v0, 0, 1, 1)
+		peak = 0
+		# the first start lists the version and reads every copy, later ones read only the monitored side
+		for _ in range(2):
+			entries = OrderedDict()
+			tracemalloc.start()
+			try:
+				before = tracemalloc.get_traced_memory()[0]
+				manifest = rv.delta_generate_backup_entries(entries, latest, monitor)
+				peak = max(peak, tracemalloc.get_traced_memory()[1] - before)
+			finally:
+				tracemalloc.stop()
+			manifest.close()
+			assert entries == OrderedDict()
+		return peak, sum(sys.getsizeof(name) + 8 for name in names)
+
+	small, small_paths = peak_for(1000)
+	large, large_paths = peak_for(4000)
+	assert large - small < (large_paths - small_paths) / 4
