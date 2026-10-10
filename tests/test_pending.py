@@ -9,7 +9,7 @@ pytestmark = pytest.mark.unit
 
 def test_persist_writes_rows_empty_deque_writes_nothing(job):
 	os.makedirs(job.job_vault, exist_ok=True)
-	rv.persist_pending_transactions(job.job_name, job.vault, deque())
+	rv.persist_pending_transactions(job.job_name, job.vault, rv.ChangeEventQueue())
 	pending = os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME)
 	assert not os.path.exists(pending)
 	events = deque([rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None)])
@@ -24,11 +24,11 @@ def test_load_resume_when_pending_newer_than_monitor(job):
 	os.utime(a, (1000, 1000))
 	pending_path = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
 	os.utime(pending_path, (2000, 2000))
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	ok = rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process)
 	assert ok is True
 	assert len(to_process) == 1
-	assert to_process[0].event == 'modify'
+	assert list(to_process)[0].event == 'modify'
 	assert not os.path.exists(pending_path)
 
 
@@ -40,7 +40,7 @@ def test_load_discard_when_monitor_not_older(job):
 	os.utime(pending_path, (now, now))
 	os.utime(job.monitor, (now, now))
 	os.utime(a, (now, now))
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	ok = rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process)
 	assert ok is False
 	assert len(to_process) == 0
@@ -55,7 +55,7 @@ def test_load_corrupt_pending_clears(job):
 	os.utime(job.monitor, (1000, 1000))
 	os.utime(os.path.join(job.monitor, 'a.txt'), (1000, 1000))
 	os.utime(pending_path, (2000, 2000))
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	ok = rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process)
 	assert ok is False
 	assert len(to_process) == 0
@@ -81,7 +81,7 @@ def test_events_sharing_a_time_survive_persist_and_load(job):
 	os.makedirs(job.job_vault, exist_ok=True)
 	rv.persist_pending_transactions(job.job_name, job.vault, events)
 	_resumable(job, os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process) is True
 	assert [(e.event, e.path, e.is_dir) for e in to_process] == [(e.event, e.path, e.is_dir) for e in events]
 
@@ -94,16 +94,17 @@ def test_pending_rows_lost_on_read_request_a_full_scan(job):
 		rv.ChangeEvent(5.0, False, 'create', os.path.join(job.monitor, 'b.txt'), None),
 	])
 	_resumable(job, pending_path)
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process) is True
 	assert [(e.event, e.path) for e in to_process] == [('full_scan', job.monitor)]
 
 
-def test_more_pending_events_than_the_queue_holds_request_a_full_scan(job, monkeypatch):
-	monkeypatch.setattr(rv, 'MAX_QUEUED_EVENTS', 2)
+def test_pending_file_too_large_for_the_memory_available_requests_a_full_scan(job, monkeypatch):
+	monkeypatch.setattr(rv, 'read_memory_state', lambda: (100, 16 << 30, 0.0))
 	seed_monitor(job, {'a.txt': 'x'})
 	pending_path = write_pending(job, [rv.ChangeEvent(float(i), False, 'modify', os.path.join(job.monitor, 'a.txt'), None) for i in range(3)])
 	_resumable(job, pending_path)
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process) is True
 	assert [e.event for e in to_process] == ['full_scan']
+	assert not os.path.exists(pending_path)

@@ -1,7 +1,6 @@
 import os
 import subprocess
 import threading
-from collections import deque
 import pytest
 import reverberator as rv
 from tests.harness import write_committed_version, wait_until, committed_versions
@@ -22,7 +21,7 @@ def test_unmount_self_destruct_does_not_delete_vault(job, poll_fast, tmp_path):
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('keep')
 	try:
 		v0 = write_committed_version(job, 0, {'a.txt': 'keep'})
-		to_process = deque()
+		to_process = rv.ChangeEventQueue()
 		lock = threading.Lock()
 		flag = threading.Event()
 		irm = rv.inotify_resource_manager()

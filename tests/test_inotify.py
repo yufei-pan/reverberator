@@ -1,7 +1,6 @@
 import os
 import threading
 import time
-from collections import deque
 import pytest
 import reverberator as rv
 from tests.harness import wait_until
@@ -53,7 +52,7 @@ def _start_watch(job, to_process, to_process_flag, min_snapshot_delay_seconds=0,
 
 
 def test_file_create_modify_delete_attrib(job, poll_fast):
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag)
 	try:
@@ -75,7 +74,7 @@ def test_file_create_modify_delete_attrib(job, poll_fast):
 
 def test_file_rename_move_or_equivalent(job, poll_fast):
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('x')
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag)
 	try:
@@ -96,7 +95,7 @@ def test_file_rename_move_or_equivalent(job, poll_fast):
 
 
 def test_mkdir_p_watches_child_create(job, poll_fast):
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag)
 	try:
@@ -133,7 +132,7 @@ def _has_create(to_process, lock, path):
 
 
 def test_subdir_created_inside_new_dir_before_batch_is_watched(job, poll_fast):
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag)
 	try:
@@ -159,7 +158,7 @@ def test_subdir_created_inside_new_dir_before_batch_is_watched(job, poll_fast):
 
 def test_dir_moved_into_new_dir_before_batch_reports_new_paths(job, poll_fast):
 	os.makedirs(os.path.join(job.monitor, 'old', 'sub'))
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag)
 	try:
@@ -187,7 +186,7 @@ def test_dir_moved_into_new_dir_before_batch_reports_new_paths(job, poll_fast):
 
 def test_new_dir_events_recorded_after_batch_taken_when_max_delay_rearms(job, poll_fast):
 	# a busy tree never goes quiet for the min delay, so only the max delay signals the backuper
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=0)
 	try:
@@ -214,7 +213,7 @@ def test_new_dir_events_recorded_after_batch_taken_when_max_delay_rearms(job, po
 
 
 def test_queue_overflow_full_scan_or_skip(job, poll_fast):
-	to_process = deque()
+	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag)
 	try:
@@ -235,16 +234,22 @@ def test_queue_overflow_full_scan_or_skip(job, poll_fast):
 		rv.GREEN_LIGHT.set()
 
 
-def test_queue_past_the_cap_becomes_one_full_scan(job, poll_fast, monkeypatch):
-	# a busy job can wait a day for a quiet moment to back up: its events must not pile up meanwhile
-	monkeypatch.setattr(rv, 'MAX_QUEUED_EVENTS', 50)
-	to_process = deque()
+def test_long_queue_becomes_one_full_scan_only_when_memory_is_short(job, poll_fast, monkeypatch):
+	# on a machine with memory to spare, a busy job keeps every event however long it waits to back up
+	monkeypatch.setattr(rv, 'QUEUE_KEEP_EVENTS', 50)
+	monkeypatch.setattr(rv, 'MEMORY_CHECK_SECONDS', 0)
+	memory = {'state': (8 << 30, 16 << 30, 0.0)}
+	monkeypatch.setattr(rv, 'read_memory_state', lambda: memory['state'])
+	to_process = rv.ChangeEventQueue(job.monitor)
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=3600)
 	try:
 		_wait_watch_ready(job, to_process, lock)
 		for i in range(200):
 			open(os.path.join(job.monitor, f'f{i}.txt'), 'w').write('x')
+		wait_until(lambda: sum(e.event == 'create' for e in _events(to_process, lock)) >= 200, message='creates not queued')
+		memory['state'] = (8 << 30, 16 << 30, 40.0)
+		open(os.path.join(job.monitor, 'stalled.txt'), 'w').write('x')
 		wait_until(lambda: [e.event for e in _events(to_process, lock)] == ['full_scan'], message='no lone full_scan')
 		open(os.path.join(job.monitor, 'later.txt'), 'w').write('x')
 		# nothing to wait for when the event is dropped: give the watcher a few reads to pick it up
