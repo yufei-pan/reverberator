@@ -2406,6 +2406,10 @@ def check_duplicate(backupEntries:dict,latest_version_path:str,latest_version_fi
 		try:
 			monitor_entry_stat = os.lstat(monitor_entry)
 			latest_version_entry_stat = os.lstat(latest_version_entry)
+			# unchanged files are stored as symlinks chained back to the version holding the content:
+			# compare a regular source file against the file the chain resolves to, not the link itself
+			if not isDir and os.path.islink(latest_version_entry) and not os.path.islink(monitor_entry):
+				latest_version_entry_stat = os.stat(latest_version_entry)
 		except Exception as _:
 			if DEBUG:
 				import traceback
