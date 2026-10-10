@@ -40,7 +40,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.33
+__version__ = 0.34
 
 ## WIP
 
@@ -134,6 +134,11 @@ def as_folder_entry(rel_path:str) -> str:
 
 def append_change_event(to_process:deque, to_process_lock:threading.Lock, event:ChangeEvent):
 	with to_process_lock:
+		if to_process and to_process[0].event == 'full_scan':
+			# the backuper compares the whole tree for a batch holding a full scan, which covers this event
+			return
+		if event.event == 'full_scan':
+			to_process.clear()
 		to_process.append(event)
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
@@ -176,6 +181,9 @@ ARG_MAX = os.sysconf('SC_ARG_MAX')
 ARGUMENT_LIMIT = (ARG_MAX - 4096) // 2048
 
 COOKIE_DICT_MAX_SIZE = 16384
+# past this many queued events one full scan replaces them: a busy job can wait a day for a quiet moment to back up,
+# and comparing against the manifest takes about a minute for 500k entries
+MAX_QUEUED_EVENTS = 50000
 COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir'])
 
 GREEN_LIGHT = threading.Event()
@@ -949,6 +957,9 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'modify',eventPath,None))
 				else:
 					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
+			if len(to_process) > MAX_QUEUED_EVENTS:
+				watcherTeeLogToTl(monitor_path,f'{len(to_process)} events queued, replacing them with a full scan')
+				append_change_event(to_process, to_process_lock, ChangeEvent(monTime,False,'full_scan',monitor_path,None))
 	return WATCH_RESULT_OK
 
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
@@ -1100,6 +1111,16 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 			defaults=[],
 			correctColumnNum=len(CHANGED_EVENT_HEADER)
 		)
+		with open(pending_transactions_path, 'rb') as f:
+			# one line per row after the header
+			written_rows = sum(chunk.count(b'\n') for chunk in iter(lambda: f.read(1 << 20), b'')) - 1
+		if pending_rows_raw and (len(pending_rows_raw) != written_rows or len(pending_rows_raw) > MAX_QUEUED_EVENTS):
+			# rows are keyed by their time when read back, and files written before times were spaced apart lose
+			# every row sharing one. replaying the rest would skip those changes, so compare the whole tree instead
+			backuperTeeLogToTl(job_name, f'Read {len(pending_rows_raw)} of {written_rows} pending transactions, requesting a full scan instead')
+			pending_rows_raw = {}
+			to_process.append(ChangeEvent(time.monotonic(), False, 'full_scan', monitor_path, None))
+			loaded_count += 1
 		for row in pending_rows_raw.values():
 			moved_from = row[4]
 			if moved_from == '':
@@ -1916,13 +1937,21 @@ def persist_pending_transactions(job_name:str, vault_path:str, to_process:deque,
 		os.makedirs(job_vault, exist_ok=True)
 		if os.path.exists(pending_transactions_path):
 			os.remove(pending_transactions_path)
-		pending_rows = [[
-			event.monotonic_time,
-			event.is_dir,
-			event.event,
-			event.path,
-			event.moved_from if event.moved_from is not None else ''
-		] for event in pending_events]
+		pending_rows = []
+		last_time = None
+		for event in pending_events:
+			# rows are keyed by their time when read back, and events from one inotify read share it: space them apart
+			event_time = event.monotonic_time
+			if last_time is not None and event_time <= last_time:
+				event_time = last_time + 1e-6
+			last_time = event_time
+			pending_rows.append([
+				event_time,
+				event.is_dir,
+				event.event,
+				event.path,
+				event.moved_from if event.moved_from is not None else ''
+			])
 		TSVZ.appendLinesTabularFile(
 			pending_transactions_path,
 			pending_rows,

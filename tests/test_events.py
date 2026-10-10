@@ -1,3 +1,4 @@
+import threading
 from collections import deque, OrderedDict
 import pytest
 import reverberator as rv
@@ -131,3 +132,13 @@ def test_backup_entries_round_trip_move_and_dir():
 	assert by_path[f'{P}/d/'].event == 'create'
 	assert by_path[f'{P}/b'].event == 'move'
 	assert by_path[f'{P}/b'].moved_from == f'{P}/a'
+
+
+def test_full_scan_replaces_queued_events_and_absorbs_later_ones():
+	# the backuper compares the whole tree for a batch holding a full scan, which covers every other event in it
+	queue = deque()
+	lock = threading.Lock()
+	rv.append_change_event(queue, lock, rv.ChangeEvent(1.0, False, 'create', '/m/a', None))
+	rv.append_change_event(queue, lock, rv.ChangeEvent(2.0, False, 'full_scan', '/m', None))
+	rv.append_change_event(queue, lock, rv.ChangeEvent(3.0, False, 'modify', '/m/b', None))
+	assert list(queue) == [rv.ChangeEvent(2.0, False, 'full_scan', '/m', None)]
