@@ -1,4 +1,6 @@
 import os
+import shutil
+import tracemalloc
 from collections import OrderedDict
 import pytest
 import reverberator as rv
@@ -79,3 +81,37 @@ def test_delta_same_size_and_mtime_new_content_behind_chained_link_is_modify(job
 	entries = OrderedDict()
 	rv.delta_generate_backup_entries(entries, latest, job.monitor)
 	assert entries[source].event == 'modify'
+
+
+def test_delta_new_tree_lists_each_folder_before_its_contents(job):
+	seed_monitor(job, {'keep.txt': 'k', 'new/sub/f.txt': 'f', 'new/g.txt': 'g'})
+	v0 = write_committed_version(job, 0, {'keep.txt': 'k'})
+	os.utime(os.path.join(job.monitor, 'keep.txt'), ns=(0, os.lstat(os.path.join(v0, 'keep.txt')).st_mtime_ns))
+	entries = OrderedDict()
+	tracking = rv.delta_generate_backup_entries(entries, rv.VaultEntry(0, v0, 0, 1, 1), job.monitor)
+	paths = list(entries)
+	assert {p: v.event for p, v in entries.items()} == {os.path.join(job.monitor, p): 'create' for p in ('new/', 'new/sub/', 'new/sub/f.txt', 'new/g.txt')}
+	for path in paths:
+		parent = os.path.dirname(path.rstrip('/')) + '/'
+		assert parent not in entries or paths.index(parent) < paths.index(path)
+	assert (tracking.files, tracking.folders) == (['keep.txt'], [])
+
+
+def test_delta_holds_little_beyond_the_tracking_lists_it_returns(job):
+	# every restart compares trees of 500k+ entries: listing both of them as absolute paths
+	# on top of the relative lists kept for tracking cost ~3.7x what the comparison returns
+	tree = {f'd{d:02d}/s{s:02d}/{"a_fairly_long_file_name_" * 2}{f:03d}.txt': 'x' for d in range(10) for s in range(10) for f in range(30)}
+	seed_monitor(job, tree)
+	v0 = os.path.join(job.job_vault, 'V0--2021-01-01_00-00-00_-0800')
+	shutil.copytree(job.monitor, v0, symlinks=True)
+	entries = OrderedDict()
+	tracemalloc.start()
+	try:
+		before = tracemalloc.get_traced_memory()[0]
+		tracking = rv.delta_generate_backup_entries(entries, rv.VaultEntry(0, v0, 0, 1, 1), job.monitor)
+		kept, peak = tracemalloc.get_traced_memory()
+	finally:
+		tracemalloc.stop()
+	assert entries == OrderedDict()
+	assert len(tracking.files) == len(tree) and len(tracking.folders) == 110
+	assert peak - before < 2 * (kept - before)
