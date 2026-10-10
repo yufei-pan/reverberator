@@ -5,6 +5,7 @@ from collections import OrderedDict, deque
 
 import reverberator as rv
 import pytest
+from tests.harness import tracked_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -101,7 +102,7 @@ class TestReverbBackupNewTreeFileBeforeParent(unittest.TestCase):
 			os.makedirs(pkg)
 			with open(os.path.join(pkg, 'a.py'), 'w') as f:
 				f.write('print(1)')
-			tracking = rv.TrackingFilesFolders(['keep.txt'], [])
+			tracking = tracked_manifest(job_vault, v0, ['keep.txt'])
 			# Deliberately list file create before parent dir creates (buggy delta order)
 			entries = OrderedDict([
 				(os.path.join(pkg, 'a.py'), rv.BackupEntryValues('t1', 'create', None)),

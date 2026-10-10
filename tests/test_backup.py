@@ -2,7 +2,7 @@ import os
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_committed_version, committed_versions
+from tests.harness import seed_monitor, write_committed_version, committed_versions, tracked_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -72,7 +72,7 @@ def test_reverb_create_modify_delete_attrib_move_file_and_dir(job):
 		(os.path.join(job.monitor, 'moved') + '/', rv.BackupEntryValues('t', 'move', os.path.join(job.monitor, 'sub') + '/')),
 	])
 	latest = rv.VaultEntry(0, v0, 0, 1, 1)
-	tracking = rv.TrackingFilesFolders(['keep.txt', 'old.txt', 'sub/x.txt'], ['sub/'])
+	tracking = tracked_manifest(job.job_vault, v0, ['keep.txt', 'old.txt', 'sub/x.txt'], ['sub/'])
 	rv.GREEN_LIGHT.set()
 	result = rv.do_reverb_backup(entries, v1, latest, True, tracking, job.monitor)
 	assert os.path.isfile(os.path.join(v1, 'keep.txt'))
@@ -95,7 +95,10 @@ def test_attrib_only_sync_vs_copy(job):
 			(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues('t', 'attrib', None)),
 		])
 		latest = rv.VaultEntry(0, v0, 0, 1, 1)
-		rv.do_reverb_backup(entries, v, latest, only_sync, rv.TrackingFilesFolders(['a.txt'], []), job.monitor)
+		manifest = tracked_manifest(job.job_vault, v0, ['a.txt'])
+		rv.do_reverb_backup(entries, v, latest, only_sync, manifest, job.monitor)
+		# the backup's changes stay uncommitted until the caller commits them with the version
+		manifest.close()
 		assert os.path.lexists(os.path.join(v, 'a.txt'))
 
 
@@ -118,7 +121,7 @@ def test_move_rename_failure_falls_back_to_copy_delete(job, monkeypatch):
 	])
 	rv.do_reverb_backup(
 		entries, v1, rv.VaultEntry(0, v0, 0, 1, 1), True,
-		rv.TrackingFilesFolders(['a.txt'], []), job.monitor,
+		tracked_manifest(job.job_vault, v0, ['a.txt']), job.monitor,
 	)
 	assert os.path.isfile(os.path.join(v1, 'b.txt'))
 	assert open(os.path.join(v1, 'b.txt')).read() == 'data'
@@ -138,7 +141,7 @@ def test_vanished_source_is_not_recorded_in_tracking(job):
 	])
 	latest = rv.VaultEntry(0, v0, 0, 1, 1)
 	rv.GREEN_LIGHT.set()
-	result = rv.do_reverb_backup(entries, v1, latest, True, rv.TrackingFilesFolders(['keep.txt'], []), job.monitor)
+	result = rv.do_reverb_backup(entries, v1, latest, True, tracked_manifest(job.job_vault, v0, ['keep.txt']), job.monitor)
 	assert '.git/index.stash.4242' not in result.files
 	assert not os.path.lexists(os.path.join(v1, '.git', 'index.stash.4242'))
 	# the rest of the backup must still succeed
@@ -153,15 +156,12 @@ def test_referenced_copy_drops_tracked_file_missing_from_reference(job):
 	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
 	os.makedirs(v1)
 	rv.GREEN_LIGHT.set()
-	result = rv.do_referenced_copy(
-		source_path=v0, backup_folder=v1,
-		trackingFilesFolders=rv.TrackingFilesFolders(['real.txt', 'ghost.txt'], []),
-		relative=True,
-	)
+	manifest = tracked_manifest(job.job_vault, v0, ['real.txt', 'ghost.txt'])
+	assert rv.do_referenced_copy(source_path=v0, backup_folder=v1, manifest=manifest, relative=True)
 	assert not os.path.lexists(os.path.join(v1, 'ghost.txt'))
-	assert 'ghost.txt' not in result.files
+	assert 'ghost.txt' not in manifest.files
 	assert os.path.lexists(os.path.join(v1, 'real.txt'))
-	assert 'real.txt' in result.files
+	assert 'real.txt' in manifest.files
 
 
 def test_copy_keeps_inherited_link_when_source_vanished(job):

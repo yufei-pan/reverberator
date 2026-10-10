@@ -35,6 +35,17 @@ def seed_monitor(job: JobPaths, tree: dict) -> None:
 	write_tree(job.monitor, tree)
 
 
+def tracked_manifest(job_vault: str, version_dir: str, files=(), folders=()) -> 'rv.VaultManifest':
+	'''A committed manifest tracking files and folders as version_dir's unverified entries.'''
+	manifest = rv.VaultManifest(job_vault)
+	manifest.begin()
+	manifest.reset(version_dir)
+	for rel in [*folders, *files]:
+		manifest.add(rel)
+	manifest.commit(version_dir)
+	return manifest
+
+
 def write_rule(job: JobPaths, min_snapshot: str = '1', max_snapshot: str = '86400',
 		mon_fs_signature: str = 'N/A', vault_fs_signature: str = 'N/A',
 		keep_one_complete_backup: str = 'True', only_sync_attributes: str = 'True',

@@ -7,6 +7,7 @@ import threading
 
 import reverberator as rv
 import pytest
+from tests.harness import tracked_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -204,7 +205,7 @@ class TestEmptyBackupSkip(unittest.TestCase):
 				f.write('hi')
 			original = rv.delta_generate_backup_entries
 			try:
-				rv.delta_generate_backup_entries = lambda backupEntries, latest_version_info, monitor_path: rv.TrackingFilesFolders([], [])
+				rv.delta_generate_backup_entries = lambda backupEntries, latest_version_info, monitor_path, **_: None
 				vault_info = rv.VaultInfo(
 					OrderedDict([
 						(0, rv.VaultEntry(0, v0, 0, 1, 1))
@@ -224,7 +225,6 @@ class TestEmptyBackupSkip(unittest.TestCase):
 					backup_size_limit='0',
 					log_journal=False,
 					vaultInfo=vault_info,
-					trackingFilesFolders=rv.TrackingFilesFolders(['a.txt'], []),
 				)
 				self.assertTrue(committed)
 				versions = [p for p in os.listdir(job_vault) if p.startswith('V') and os.path.isdir(os.path.join(job_vault, p))]
@@ -280,7 +280,7 @@ class TestDeletePathSetUpdate(unittest.TestCase):
 				f.write('a')
 			with open(os.path.join(v0, 'keep.txt'), 'w') as f:
 				f.write('k')
-			tracking = rv.TrackingFilesFolders(['sub/a.txt', 'keep.txt'], ['sub/'])
+			tracking = tracked_manifest(job_vault, v0, ['sub/a.txt', 'keep.txt'], ['sub/'])
 			entries = OrderedDict([
 				(os.path.join(monitor, 'sub') + '/', rv.BackupEntryValues('t', 'delete', None)),
 			])
