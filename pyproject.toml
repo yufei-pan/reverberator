@@ -14,7 +14,7 @@ classifiers = [
 ]
 dependencies = [
     "inotify-simple>=1.3.5",
-    "multicmd>=1.29",
+    "multicmd>=1.51",
     "tee-logger>=6.34",
     "tsvz>=3.25",
     "xxhash>=3.5.0",
