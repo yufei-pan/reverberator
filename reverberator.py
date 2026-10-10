@@ -24,6 +24,8 @@ import sqlite3
 import stat
 import errno
 import fcntl
+import marshal
+import zlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from shutil import copystat
 
@@ -40,7 +42,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.34
+__version__ = 0.35
 
 ## WIP
 
@@ -132,13 +134,244 @@ def as_folder_entry(rel_path:str) -> str:
 	# tracking sets store folder entries with a trailing slash; normalize to that convention
 	return rel_path if rel_path.endswith('/') else rel_path + '/'
 
-def append_change_event(to_process:deque, to_process_lock:threading.Lock, event:ChangeEvent):
-	with to_process_lock:
-		if to_process and to_process[0].event == 'full_scan':
-			# the backuper compares the whole tree for a batch holding a full scan, which covers this event
+def read_memory_state(proc_root:str = '/proc', cgroup_root:str = '/sys/fs/cgroup') -> tuple:
+	'''
+	(available bytes, total bytes, stall percent): the tighter of the machine and the limits of this process's cgroups,
+	and the largest share of the last minute their tasks spent stalled waiting for memory. What cannot be read is None.
+
+	Examples:
+		>>> available, total, stall = read_memory_state()
+		>>> available is None or 0 <= available <= total
+		True
+	'''
+	available = total = stall = None
+	try:
+		meminfo = {}
+		with open(os.path.join(proc_root, 'meminfo')) as f:
+			for line in f:
+				name, _, value = line.partition(':')
+				if value.split():
+					meminfo[name] = int(value.split()[0]) * 1024
+		available, total = meminfo['MemAvailable'], meminfo['MemTotal']
+	except (OSError, KeyError, ValueError):
+		pass
+	pressure_files = [os.path.join(proc_root, 'pressure', 'memory')]
+	try:
+		with open(os.path.join(proc_root, 'self', 'cgroup')) as f:
+			cgroup_path = next((line[3:].strip() for line in f if line.startswith('0::')), None)
+	except OSError:
+		cgroup_path = None
+	if cgroup_path is not None:
+		# a limit on any cgroup up the tree applies to this process too
+		parts = [part for part in cgroup_path.split('/') if part]
+		for depth in range(len(parts), -1, -1):
+			cgroup = os.path.join(cgroup_root, *parts[:depth])
+			pressure_files.append(os.path.join(cgroup, 'memory.pressure'))
+			try:
+				limits = []
+				for name in ('memory.max', 'memory.high'):
+					try:
+						with open(os.path.join(cgroup, name)) as f:
+							value = f.read().strip()
+					except FileNotFoundError:
+						continue
+					if value.isdigit():
+						limits.append(int(value))
+				if limits:
+					with open(os.path.join(cgroup, 'memory.current')) as f:
+						headroom = max(min(limits) - int(f.read()), 0)
+					if available is None or headroom < available:
+						available, total = headroom, min(limits)
+			except (OSError, ValueError):
+				pass
+	for path in pressure_files:
+		try:
+			with open(path) as f:
+				for line in f:
+					if line.startswith('some '):
+						for field in line.split()[1:]:
+							name, _, value = field.partition('=')
+							if name == 'avg60':
+								stall = max(stall or 0.0, float(value))
+		except (OSError, ValueError):
+			pass
+	return available, total, stall
+
+class ChangeEventQueue:
+	'''
+	A job's change events waiting for the backuper, oldest first. Callers hold the job's to_process_lock.
+
+	Events are kept zlib compressed in blocks of QUEUE_BLOCK_EVENTS. As the queue grows, it drops the modify and attrib
+	events the backup conversion would skip anyway, and once longer than QUEUE_KEEP_EVENTS it becomes one full scan
+	when memory runs short. A queued full scan absorbs every later event, as the backuper compares the whole tree for it.
+
+	Examples:
+		>>> queue = ChangeEventQueue('/m')
+		>>> for t in range(3):
+		...     queue.append(ChangeEvent(float(t), False, 'modify', '/m/log', None))
+		>>> queue.append(ChangeEvent(3.0, False, 'create', '/m/new', None))
+		>>> queue.compact()
+		>>> [(event.monotonic_time, event.event) for event in queue]
+		[(2.0, 'modify'), (3.0, 'create')]
+		>>> taken = queue.take()
+		>>> (len(taken), len(queue))
+		(2, 0)
+		>>> queue.append(ChangeEvent(4.0, False, 'full_scan', '/m', None))
+		>>> queue.append(ChangeEvent(5.0, False, 'modify', '/m/log', None))
+		>>> [event.event for event in queue]
+		['full_scan']
+	'''
+	def __init__(self, monitor_path:str = ''):
+		self.monitor_path = monitor_path
+		self.clear()
+
+	def clear(self):
+		# (event count, zlib compressed marshal of the events' fields), oldest first
+		self._blocks = []
+		# the newest events, not packed yet
+		self._recent = []
+		self._count = 0
+		self._packed_bytes = 0
+		self._full_scan = None
+		self._compact_at = QUEUE_COMPACT_EVENTS
+		self._next_memory_check = 0.0
+
+	def __len__(self):
+		return self._count
+
+	def __bool__(self):
+		return self._count > 0
+
+	@property
+	def full_scan_requested(self) -> bool:
+		return self._full_scan is not None
+
+	def nbytes(self) -> int:
+		'''Roughly how much memory the queued events take.'''
+		return self._packed_bytes + len(self._recent) * QUEUED_EVENT_BYTES
+
+	def __iter__(self):
+		if self._full_scan is not None:
+			yield self._full_scan
+			return
+		for _, block in self._blocks:
+			for fields in marshal.loads(zlib.decompress(block)):
+				yield ChangeEvent(*fields)
+		yield from self._recent
+
+	def __reversed__(self):
+		if self._full_scan is not None:
+			yield self._full_scan
+			return
+		yield from reversed(self._recent)
+		for _, block in reversed(self._blocks):
+			for fields in reversed(marshal.loads(zlib.decompress(block))):
+				yield ChangeEvent(*fields)
+
+	@staticmethod
+	def _pack(events) -> tuple:
+		# marshal only ever reads back blocks this queue packed in memory, never data from a file or another process
+		return len(events), zlib.compress(marshal.dumps([tuple(event) for event in events]), 1)
+
+	def append(self, event:ChangeEvent):
+		if self._full_scan is not None:
+			# the backuper compares the whole tree for a full scan, which covers this event
 			return
 		if event.event == 'full_scan':
-			to_process.clear()
+			self.clear()
+			self._full_scan = event
+			self._count = 1
+			return
+		self._recent.append(event)
+		self._count += 1
+		if len(self._recent) >= QUEUE_BLOCK_EVENTS:
+			block = self._pack(self._recent)
+			self._blocks.append(block)
+			self._packed_bytes += len(block[1])
+			self._recent = []
+		if self._count >= self._compact_at:
+			self.compact()
+		if self._count > QUEUE_KEEP_EVENTS and time.monotonic() >= self._next_memory_check:
+			self._next_memory_check = time.monotonic() + MEMORY_CHECK_SECONDS
+			reason = self._memory_short()
+			if reason:
+				watcherTeeLogToTl(self.monitor_path,f'{self._count} events queued and {reason}: replacing them with a full scan',error=True)
+				self.append(ChangeEvent(time.monotonic(),False,'full_scan',self.monitor_path,None))
+
+	def prepend(self, events):
+		'''Put events back in front of the queue, as a backup that did not commit hands its batch back.'''
+		if self._full_scan is not None:
+			return
+		events = list(events)
+		for event in events:
+			if event.event == 'full_scan':
+				self.append(event)
+				return
+		blocks = [self._pack(events[i:i + QUEUE_BLOCK_EVENTS]) for i in range(0, len(events), QUEUE_BLOCK_EVENTS)]
+		self._blocks[:0] = blocks
+		self._packed_bytes += sum(len(block) for _, block in blocks)
+		self._count += len(events)
+
+	def take(self) -> 'ChangeEventQueue':
+		'''Move every queued event into a new queue and empty this one, as the backuper takes its batch.'''
+		taken = ChangeEventQueue(self.monitor_path)
+		taken._blocks, taken._recent, taken._count = self._blocks, self._recent, self._count
+		taken._packed_bytes, taken._full_scan = self._packed_bytes, self._full_scan
+		self.clear()
+		return taken
+
+	def compact(self):
+		'''
+		Drop each modify or attrib event whose path's next event is the same kind, unless a later move takes the path
+		as its source: the backup conversion keeps only the last of such a run, so the batch converts the same.
+		'''
+		drop = bytearray(self._count)
+		next_touch = {}
+		later_move_sources = set()
+		index = self._count
+		for event in reversed(self):
+			index -= 1
+			# keyed like change_events_to_backup_entries keys its entries
+			path = os.path.abspath(event.path) + ('/' if event.is_dir else '')
+			if event.event in ('modify','attrib') and next_touch.get(path) == event.event and path not in later_move_sources:
+				drop[index] = 1
+				continue
+			next_touch[path] = event.event if event.moved_from is None else 'move'
+			if event.moved_from is not None:
+				source = os.path.abspath(event.moved_from) + ('/' if event.is_dir else '')
+				next_touch[source] = 'move'
+				later_move_sources.add(source)
+		dropped = drop.count(1)
+		if dropped:
+			# packed again a block at a time, so compacting never holds every event unpacked
+			blocks = []
+			batch = []
+			for event, gone in zip(self, drop):
+				if not gone:
+					batch.append(event)
+					if len(batch) == QUEUE_BLOCK_EVENTS:
+						blocks.append(self._pack(batch))
+						batch = []
+			self._blocks, self._recent = blocks, batch
+			self._packed_bytes = sum(len(block) for _, block in blocks)
+			self._count -= dropped
+		self._compact_at = max(QUEUE_COMPACT_EVENTS, 2 * self._count)
+
+	def _memory_short(self) -> str:
+		'''Why memory is too short to keep queueing events, or '' when it is not.'''
+		available, total, stall = read_memory_state()
+		if stall is not None and stall >= MEMORY_STALL_PERCENT:
+			return f'tasks stalled on memory {stall:.0f}% of the last minute'
+		if available is not None and total:
+			if available < total * MEMORY_LOW_FRACTION:
+				return f'only {format_bytes(available,use_1024_bytes=True,to_str=True)}B of memory is available'
+			held = self.nbytes()
+			if held > (available + held) * QUEUE_MEMORY_SHARE:
+				return f'they hold {format_bytes(held,use_1024_bytes=True,to_str=True)}B of {format_bytes(available + held,use_1024_bytes=True,to_str=True)}B available'
+		return ''
+
+def append_change_event(to_process:ChangeEventQueue, to_process_lock:threading.Lock, event:ChangeEvent):
+	with to_process_lock:
 		to_process.append(event)
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
@@ -181,9 +414,19 @@ ARG_MAX = os.sysconf('SC_ARG_MAX')
 ARGUMENT_LIMIT = (ARG_MAX - 4096) // 2048
 
 COOKIE_DICT_MAX_SIZE = 16384
-# past this many queued events one full scan replaces them: a busy job can wait a day for a quiet moment to back up,
-# and comparing against the manifest takes about a minute for 500k entries
-MAX_QUEUED_EVENTS = 50000
+# queued change events are kept zlib compressed in blocks of this many, about 15 bytes an event instead of about 210
+QUEUE_BLOCK_EVENTS = 4096
+QUEUED_EVENT_BYTES = 210
+# a queue this long drops the events the backup conversion would skip, and again each time it doubles
+QUEUE_COMPACT_EVENTS = 16384
+# a queue longer than this becomes one full scan when memory runs short: tasks stall on memory for MEMORY_STALL_PERCENT
+# of the last minute, less than MEMORY_LOW_FRACTION of the memory (or of a cgroup limit) is available, or the queue
+# would hold more than QUEUE_MEMORY_SHARE of the memory available to it. it reads the memory state every MEMORY_CHECK_SECONDS
+QUEUE_KEEP_EVENTS = 65536
+MEMORY_STALL_PERCENT = 10.0
+MEMORY_LOW_FRACTION = 0.05
+QUEUE_MEMORY_SHARE = 0.25
+MEMORY_CHECK_SECONDS = 30
 COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir'])
 
 GREEN_LIGHT = threading.Event()
@@ -300,7 +543,7 @@ def main():
 		vault_path_signature = reverb_rule.vault_fs_signature
 		job_vault = os.path.join(vault_path, job_name)
 		remove_incomplete_vault_versions(job_vault)
-		to_process = deque()
+		to_process = ChangeEventQueue(monitor_path)
 		to_process_lock = threading.Lock()
 		load_pending_transactions_for_resume(job_name=job_name, monitor_path=monitor_path, vault_path=vault_path, to_process=to_process)
 		to_process_flag = threading.Event()
@@ -767,7 +1010,7 @@ class inotify_resource_manager:
 		return self.current_user_watches
 
 #%% ---- Watcher ----
-def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
+def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
 	global GREEN_LIGHT
 	# main monitoring function to deal with one reverb.
 	while GREEN_LIGHT.is_set():
@@ -785,7 +1028,7 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:deque,to
 			watcherTeeLogToTl(monitor_path,f'Watch root disappeared for {monitor_path}; waiting for filesystem recovery',error=True)
 			monitor_fs_flag.clear()
 
-def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
+def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
 	global COOKIE_DICT_MAX_SIZE
 	global DEBUG
 	global GREEN_LIGHT
@@ -957,9 +1200,6 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'modify',eventPath,None))
 				else:
 					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
-			if len(to_process) > MAX_QUEUED_EVENTS:
-				watcherTeeLogToTl(monitor_path,f'{len(to_process)} events queued, replacing them with a full scan')
-				append_change_event(to_process, to_process_lock, ChangeEvent(monTime,False,'full_scan',monitor_path,None))
 	return WATCH_RESULT_OK
 
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
@@ -1079,7 +1319,7 @@ def get_all_folders(path):
 def get_all_files(path):
 	return [entry_path for entry_path, _, is_dir in iter_tree_entries(path) if not is_dir]
 
-def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:deque) -> bool:
+def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:ChangeEventQueue) -> bool:
 	# stored inside the per-job vault folder so jobs sharing a vault path do not clobber each other
 	pending_transactions_path = os.path.join(vault_path, job_name, PENDING_TRANSACTIONS_FILE_NAME)
 	if not os.path.exists(pending_transactions_path):
@@ -1101,6 +1341,16 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 			backuperTeeLogToTl(job_name, f'Failed to remove skipped pending transactions file {pending_transactions_path}: {e}', error=True)
 		return False
 	loaded_count = 0
+	available, _, _ = read_memory_state()
+	# reading the file holds every row as Python lists, about four times the file's size
+	if available is not None and os.path.getsize(pending_transactions_path) * 4 > available * QUEUE_MEMORY_SHARE:
+		backuperTeeLogToTl(job_name, f'Pending transactions file {pending_transactions_path} is too large for the memory available, requesting a full scan instead', error=True)
+		to_process.append(ChangeEvent(time.monotonic(), False, 'full_scan', monitor_path, None))
+		try:
+			os.remove(pending_transactions_path)
+		except Exception as e:
+			backuperTeeLogToTl(job_name, f'Failed to remove pending transactions file {pending_transactions_path}: {e}', error=True)
+		return True
 	try:
 		pending_rows_raw = TSVZ.readTabularFile(
 			pending_transactions_path,
@@ -1114,7 +1364,7 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 		with open(pending_transactions_path, 'rb') as f:
 			# one line per row after the header
 			written_rows = sum(chunk.count(b'\n') for chunk in iter(lambda: f.read(1 << 20), b'')) - 1
-		if pending_rows_raw and (len(pending_rows_raw) != written_rows or len(pending_rows_raw) > MAX_QUEUED_EVENTS):
+		if pending_rows_raw and len(pending_rows_raw) != written_rows:
 			# rows are keyed by their time when read back, and files written before times were spaced apart lose
 			# every row sharing one. replaying the rest would skip those changes, so compare the whole tree instead
 			backuperTeeLogToTl(job_name, f'Read {len(pending_rows_raw)} of {written_rows} pending transactions, requesting a full scan instead')
@@ -1396,7 +1646,7 @@ class fs_signature_monitor:
 FS_SIGNATURE_MONITOR = fs_signature_monitor()
 
 #%% ---- Backup ----
-def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monitor_path:str,vault_path:str,vault_path_signature:str,
+def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,monitor_path:str,vault_path:str,vault_path_signature:str,
 			 to_process_flag:threading.Event,monitor_fs_flag:threading.Event=None,
 			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
@@ -1428,18 +1678,15 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 		with to_process_lock:
 			if to_process:
 				backuperTeeLogToTl(job_name, f'Found {len(to_process)} restored pending transactions at startup')
-				to_process_temp = to_process.copy()
-				to_process.clear()
-			else:
-				to_process_temp = deque()
+			to_process_temp = to_process.take()
 		if to_process_temp:
-			if any(event.event == 'full_scan' for event in to_process_temp):
+			if to_process_temp.full_scan_requested:
 				backuperTeeLogToTl(job_name, 'Restored pending transactions contain a full_scan request, forcing delta generation')
 			else:
 				backupEntries = change_events_to_backup_entries(to_process_temp)
 				backuperTeeLogToTl(job_name, f'Converted restored pending transactions into {len(backupEntries)} backup entries')
 		vaultInfo = None
-		# to_process: deque([ChangedEvent:{'monotonic_time':'231241','event':'create','type':'file','path':'/path/to/file'},...])
+		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while GREEN_LIGHT.is_set():
 			while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
 				vault_fs_flag.wait(POLL_WAIT_SECONDS)
@@ -1448,8 +1695,7 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 				  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest)
 			if not committed:
 				with to_process_lock:
-					for event in reversed(backup_entries_to_change_events(backupEntries)):
-						to_process.appendleft(event)
+					to_process.prepend(backup_entries_to_change_events(backupEntries))
 				backupEntries.clear()
 				if GREEN_LIGHT.is_set():
 					backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running; requesting shutdown',error=True)
@@ -1464,10 +1710,9 @@ def backuper(job_name:str,to_process:deque,to_process_lock:threading.Lock,monito
 					break
 				with to_process_lock:
 					backuperTeeLogToTl(job_name,f'Backuper processing, {len(to_process)} events to process')
-					to_process_temp = to_process.copy()
-					to_process.clear()
+					to_process_temp = to_process.take()
 				to_process_flag.clear()
-				if any(event.event == 'full_scan' for event in to_process_temp):
+				if to_process_temp.full_scan_requested:
 					# events were lost (e.g. inotify queue overflow): discard the partial batch and
 					# let do_backup delta-generate against the latest version instead
 					backuperTeeLogToTl(job_name,'Full scan requested, forcing delta generation')
@@ -1560,7 +1805,7 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 	global DEBUG
 	backuperTeeLogToTl('convertor','Converting the following change events to backup entries')
 	if DEBUG:
-		backuperTeeLogToTl('convertor','\n'+multiCMD.pretty_format_table(change_events,header = CHANGED_EVENT_HEADER))
+		backuperTeeLogToTl('convertor','\n'+multiCMD.pretty_format_table(list(change_events),header = CHANGED_EVENT_HEADER))
 	backup_entries = OrderedDict()
 	pendingMoveSourceParents = set()
 	moveSourceToDestDict = {}
@@ -1923,13 +2168,38 @@ def do_backup(backup_entries:dict,
 		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'end_reverb_backup_{tracked_files}files_{tracked_folders}folders_tracked',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 	return VaultInfo(vault_info_dict,vault_size,vault_inodes), manifest, True
 
-def persist_pending_transactions(job_name:str, vault_path:str, to_process:deque, to_process_lock:threading.Lock=None):
+def pending_transaction_rows(events) -> list:
+	'''
+	Rows to persist the queued events with.
+
+	Examples:
+		>>> [row[0] for row in pending_transaction_rows([ChangeEvent(5.0, False, 'create', '/m/a', None), ChangeEvent(5.0, False, 'create', '/m/b', None)])]
+		[5.0, 5.000001]
+	'''
+	rows = []
+	last_time = None
+	for event in events:
+		# rows are keyed by their time when read back, and events from one inotify read share it: space them apart
+		event_time = event.monotonic_time
+		if last_time is not None and event_time <= last_time:
+			event_time = last_time + 1e-6
+		last_time = event_time
+		rows.append([
+			event_time,
+			event.is_dir,
+			event.event,
+			event.path,
+			event.moved_from if event.moved_from is not None else ''
+		])
+	return rows
+
+def persist_pending_transactions(job_name:str, vault_path:str, to_process:'ChangeEventQueue', to_process_lock:threading.Lock=None):
 	if to_process_lock is not None:
 		with to_process_lock:
-			pending_events = list(to_process)
+			pending_rows = pending_transaction_rows(to_process)
 	else:
-		pending_events = list(to_process)
-	if not pending_events:
+		pending_rows = pending_transaction_rows(to_process)
+	if not pending_rows:
 		return
 	job_vault = os.path.join(vault_path, job_name)
 	pending_transactions_path = os.path.join(job_vault, PENDING_TRANSACTIONS_FILE_NAME)
@@ -1937,21 +2207,6 @@ def persist_pending_transactions(job_name:str, vault_path:str, to_process:deque,
 		os.makedirs(job_vault, exist_ok=True)
 		if os.path.exists(pending_transactions_path):
 			os.remove(pending_transactions_path)
-		pending_rows = []
-		last_time = None
-		for event in pending_events:
-			# rows are keyed by their time when read back, and events from one inotify read share it: space them apart
-			event_time = event.monotonic_time
-			if last_time is not None and event_time <= last_time:
-				event_time = last_time + 1e-6
-			last_time = event_time
-			pending_rows.append([
-				event_time,
-				event.is_dir,
-				event.event,
-				event.path,
-				event.moved_from if event.moved_from is not None else ''
-			])
 		TSVZ.appendLinesTabularFile(
 			pending_transactions_path,
 			pending_rows,
