@@ -60,3 +60,50 @@ def test_load_corrupt_pending_clears(job):
 	assert ok is False
 	assert len(to_process) == 0
 	assert not os.path.exists(pending_path)
+
+
+def _resumable(job, pending_path):
+	# the monitored tree is older than the pending file, so loading resumes from it
+	for path in (job.monitor, *(os.path.join(job.monitor, name) for name in os.listdir(job.monitor))):
+		os.utime(path, (1000, 1000))
+	os.utime(pending_path, (2000, 2000))
+
+
+def test_events_sharing_a_time_survive_persist_and_load(job):
+	# events from one inotify read share their time, and rows are keyed by it when read back
+	seed_monitor(job, {'a.txt': 'x'})
+	events = deque([
+		rv.ChangeEvent(5.0, False, 'create', os.path.join(job.monitor, 'a.txt'), None),
+		rv.ChangeEvent(5.0, False, 'create', os.path.join(job.monitor, 'b.txt'), None),
+		rv.ChangeEvent(5.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None),
+		rv.ChangeEvent(6.0, True, 'delete', os.path.join(job.monitor, 'd') + '/', None),
+	])
+	os.makedirs(job.job_vault, exist_ok=True)
+	rv.persist_pending_transactions(job.job_name, job.vault, events)
+	_resumable(job, os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
+	to_process = deque()
+	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process) is True
+	assert [(e.event, e.path, e.is_dir) for e in to_process] == [(e.event, e.path, e.is_dir) for e in events]
+
+
+def test_pending_rows_lost_on_read_request_a_full_scan(job):
+	# a pending file with rows sharing a time, as written before they were spaced apart
+	seed_monitor(job, {'a.txt': 'x'})
+	pending_path = write_pending(job, [
+		rv.ChangeEvent(5.0, False, 'create', os.path.join(job.monitor, 'a.txt'), None),
+		rv.ChangeEvent(5.0, False, 'create', os.path.join(job.monitor, 'b.txt'), None),
+	])
+	_resumable(job, pending_path)
+	to_process = deque()
+	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process) is True
+	assert [(e.event, e.path) for e in to_process] == [('full_scan', job.monitor)]
+
+
+def test_more_pending_events_than_the_queue_holds_request_a_full_scan(job, monkeypatch):
+	monkeypatch.setattr(rv, 'MAX_QUEUED_EVENTS', 2)
+	seed_monitor(job, {'a.txt': 'x'})
+	pending_path = write_pending(job, [rv.ChangeEvent(float(i), False, 'modify', os.path.join(job.monitor, 'a.txt'), None) for i in range(3)])
+	_resumable(job, pending_path)
+	to_process = deque()
+	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, to_process) is True
+	assert [e.event for e in to_process] == ['full_scan']

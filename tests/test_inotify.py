@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 from collections import deque
 import pytest
 import reverberator as rv
@@ -228,6 +229,27 @@ def test_queue_overflow_full_scan_or_skip(job, poll_fast):
 			)
 		except AssertionError:
 			pytest.skip('could not fill inotify queue on this kernel')
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=5)
+		rv.GREEN_LIGHT.set()
+
+
+def test_queue_past_the_cap_becomes_one_full_scan(job, poll_fast, monkeypatch):
+	# a busy job can wait a day for a quiet moment to back up: its events must not pile up meanwhile
+	monkeypatch.setattr(rv, 'MAX_QUEUED_EVENTS', 50)
+	to_process = deque()
+	flag = threading.Event()
+	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=3600)
+	try:
+		_wait_watch_ready(job, to_process, lock)
+		for i in range(200):
+			open(os.path.join(job.monitor, f'f{i}.txt'), 'w').write('x')
+		wait_until(lambda: [e.event for e in _events(to_process, lock)] == ['full_scan'], message='no lone full_scan')
+		open(os.path.join(job.monitor, 'later.txt'), 'w').write('x')
+		# nothing to wait for when the event is dropped: give the watcher a few reads to pick it up
+		time.sleep(0.5)
+		assert [(e.event, e.path) for e in _events(to_process, lock)] == [('full_scan', job.monitor)]
 	finally:
 		rv.GREEN_LIGHT.clear()
 		thread.join(timeout=5)
