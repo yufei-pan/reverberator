@@ -35,7 +35,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.30
+__version__ = 0.31
 
 ## WIP
 
@@ -786,6 +786,12 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 		while GREEN_LIGHT.is_set():
 			read_delay = max(min(POLL_WAIT_SECONDS, min_snapshot_delay_seconds), 0.00001)
 			events =  inotify_obj.read(timeout=read_delay * 1000)
+			if processPending and not to_process_flag.is_set():
+				# the backuper took the batch, so its recursive folder copies run from now on: record events in those folders again.
+				# check before the delays below can signal again, as a fresh signal hides that the batch was taken
+				newDirWDs.clear()
+				processPending = False
+				lastProcessTime = time.monotonic()
 			now = time.monotonic()
 			expired_move_cookies = [cookie for cookie, change_event in pendingMoveFromEvents.items() if now - change_event.monotonic_time > move_pair_timeout]
 			for cookie in expired_move_cookies:
@@ -805,11 +811,6 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 				to_process_flag.set()
 				processPending = True
 			lastReadTime = time.monotonic()
-			if processPending and not to_process_flag.is_set():
-				# this means the to_process was just processed
-				newDirWDs.clear()
-				processPending = False
-				lastProcessTime = time.monotonic()
 			if DEBUG:
 				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
 				watcherTeeLogToTl(monitor_path,'\n'+multiCMD.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
@@ -856,6 +857,10 @@ def watchFolder(monitor_path:str,to_process:deque,to_process_lock:threading.Lock
 					continue
 				if discard_new_recursive_folder_events_until_read and event.wd in newDirWDs:
 					watcherTeeLogToTl(monitor_path,f'Discarding event for new recursive folder {wdDic[event.wd]}')
+					if isDir and event.mask & (flags.CREATE | flags.MOVED_TO):
+						# the recursive copy holds this folder, but it still needs watches for later changes,
+						# and a folder moved in keeps its watches under its old path until they are added again here
+						initializeFolderWatchers(inotify_obj,os.path.join(wdDic[event.wd],event.name),wdDic,irm,watch_flags,newDirWDs)
 					continue
 				eventPath = os.path.join(wdDic[event.wd],event.name)
 				if event.mask & flags.CREATE:
