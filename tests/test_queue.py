@@ -119,3 +119,34 @@ def test_read_memory_state_takes_the_tightest_limit_and_worst_stall(tmp_path):
 	(cgroup / 'system.slice' / 'memory.current').write_text(f'{3 << 30}\n')
 	assert rv.read_memory_state(str(proc), str(cgroup)) == (1 << 30, 4 << 30, 12.0)
 	assert rv.read_memory_state(str(tmp_path / 'missing'), str(tmp_path / 'missing')) == (None, None, None)
+
+
+def test_memory_short_at_a_compaction_point_gives_up_the_queue_before_compacting(monkeypatch):
+	# compacting holds every distinct path it meets: it must not run when memory is already short
+	monkeypatch.setattr(rv, 'QUEUE_KEEP_EVENTS', 20)
+	monkeypatch.setattr(rv, 'QUEUE_COMPACT_EVENTS', 30)
+	monkeypatch.setattr(rv, 'MEMORY_CHECK_SECONDS', 10**6)
+	monkeypatch.setattr(rv.ChangeEventQueue, 'compact', lambda self: pytest.fail('compacted while memory was short'))
+	queue = rv.ChangeEventQueue('/m')
+	_memory(monkeypatch, 8 << 30, 16 << 30, 0.0)
+	queue.append(_ev(0, 'create', '/m/first'))
+	for t in range(1, 21):
+		queue.append(_ev(t, 'create', f'/m/f{t}'))
+	_memory(monkeypatch, 8 << 30, 16 << 30, 50.0)
+	for t in range(21, 30):
+		queue.append(_ev(t, 'create', f'/m/f{t}'))
+	assert queue.full_scan_requested
+
+
+def test_compaction_waits_while_its_working_memory_does_not_fit(monkeypatch):
+	monkeypatch.setattr(rv, 'QUEUE_KEEP_EVENTS', 20)
+	monkeypatch.setattr(rv, 'QUEUE_COMPACT_EVENTS', 30)
+	monkeypatch.setattr(rv, 'MEMORY_CHECK_SECONDS', 10**6)
+	# room for the queue itself (30 unpacked events), but not for compacting them
+	_memory(monkeypatch, 20000, 16 << 30, 0.0)
+	assert 30 * rv.QUEUED_EVENT_BYTES <= (20000 + 30 * rv.QUEUED_EVENT_BYTES) * rv.QUEUE_MEMORY_SHARE < 30 * rv.COMPACTION_EVENT_BYTES * 4
+	monkeypatch.setattr(rv, 'MEMORY_LOW_FRACTION', 0.0)
+	queue = rv.ChangeEventQueue('/m')
+	for t in range(30):
+		queue.append(_ev(t, 'modify', '/m/log'))
+	assert len(queue) == 30 and not queue.full_scan_requested

@@ -1,8 +1,10 @@
 import os
+import sys
+import tracemalloc
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_committed_version, committed_versions, content_file_path
+from tests.harness import seed_monitor, write_committed_version, committed_versions, content_file_path, write_tree
 
 pytestmark = pytest.mark.unit
 
@@ -86,3 +88,32 @@ def test_inode_limit_i1_attempts_stepper(job, monkeypatch):
 		vaultInfo=rv.get_vault_info(job.job_vault),
 	)
 	assert called
+
+
+def test_stepper_memory_does_not_grow_with_the_version(job, monkeypatch):
+	# a big job's next version links 500k+ files: listing them all before moving any cost hundreds of MB per backup
+	def peak_for(files):
+		root = os.path.join(job.root, f'tree{files}')
+		v0 = os.path.join(root, 'V0--2021-01-01_00-00-00_-0800')
+		v1 = os.path.join(root, 'V1--2021-01-02_00-00-00_-0800')
+		names = [f'd{i % 50:02d}/{"a_fairly_long_file_name_" * 2}{i:05d}.txt' for i in range(files)]
+		write_tree(v0, dict.fromkeys(names, 'x'))
+		for name in names:
+			link = os.path.join(v1, name)
+			os.makedirs(os.path.dirname(link), exist_ok=True)
+			os.symlink(os.path.relpath(os.path.join(v0, name), os.path.dirname(link)), link)
+		versions = OrderedDict([(0, rv.VaultEntry(0, v0, 0, 1, 1)), (1, rv.VaultEntry(1, v1, 0, 1, 1))])
+		tracemalloc.start()
+		try:
+			before = tracemalloc.get_traced_memory()[0]
+			rv.decrement_stepper(versions)
+			peak = tracemalloc.get_traced_memory()[1] - before
+		finally:
+			tracemalloc.stop()
+		assert not os.path.exists(v0)
+		assert all(os.path.isfile(os.path.join(v1, name)) and not os.path.islink(os.path.join(v1, name)) for name in names)
+		return peak, sum(sys.getsizeof(os.path.join(v1, name)) + 8 for name in names)
+
+	small, small_paths = peak_for(1000)
+	large, large_paths = peak_for(4000)
+	assert large - small < (large_paths - small_paths) / 4

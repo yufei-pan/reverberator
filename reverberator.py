@@ -42,7 +42,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.35
+__version__ = 0.36
 
 ## WIP
 
@@ -290,13 +290,28 @@ class ChangeEventQueue:
 			self._packed_bytes += len(block[1])
 			self._recent = []
 		if self._count >= self._compact_at:
-			self.compact()
+			# compacting holds every distinct path it meets: check memory first, and wait while it would not fit
+			if self._count > QUEUE_KEEP_EVENTS and self._give_up_if_memory_short():
+				return
+			if self._count <= QUEUE_KEEP_EVENTS or self._compaction_fits():
+				self.compact()
+			else:
+				self._compact_at = 2 * self._count
 		if self._count > QUEUE_KEEP_EVENTS and time.monotonic() >= self._next_memory_check:
-			self._next_memory_check = time.monotonic() + MEMORY_CHECK_SECONDS
-			reason = self._memory_short()
-			if reason:
-				watcherTeeLogToTl(self.monitor_path,f'{self._count} events queued and {reason}: replacing them with a full scan',error=True)
-				self.append(ChangeEvent(time.monotonic(),False,'full_scan',self.monitor_path,None))
+			self._give_up_if_memory_short()
+
+	def _give_up_if_memory_short(self) -> bool:
+		'''Replace the queue with one full scan when memory is short, and say whether it did.'''
+		self._next_memory_check = time.monotonic() + MEMORY_CHECK_SECONDS
+		reason = self._memory_short()
+		if reason:
+			watcherTeeLogToTl(self.monitor_path,f'{self._count} events queued and {reason}: replacing them with a full scan',error=True)
+			self.append(ChangeEvent(time.monotonic(),False,'full_scan',self.monitor_path,None))
+		return bool(reason)
+
+	def _compaction_fits(self) -> bool:
+		available, _, _ = read_memory_state()
+		return available is None or self._count * COMPACTION_EVENT_BYTES <= available * QUEUE_MEMORY_SHARE
 
 	def prepend(self, events):
 		'''Put events back in front of the queue, as a backup that did not commit hands its batch back.'''
@@ -417,6 +432,9 @@ COOKIE_DICT_MAX_SIZE = 16384
 # queued change events are kept zlib compressed in blocks of this many, about 15 bytes an event instead of about 210
 QUEUE_BLOCK_EVENTS = 4096
 QUEUED_EVENT_BYTES = 210
+# compacting holds about this much per queued event at most, and writing pending transactions out about this much per row
+COMPACTION_EVENT_BYTES = 250
+PENDING_ROW_BYTES = 700
 # a queue this long drops the events the backup conversion would skip, and again each time it doubles
 QUEUE_COMPACT_EVENTS = 16384
 # a queue longer than this becomes one full scan when memory runs short: tasks stall on memory for MEMORY_STALL_PERCENT
@@ -1283,11 +1301,14 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			continue
 	return parentWatchDescriptor
 
-def iter_tree_entries(path:str, rel_prefix:str = ''):
+def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = False):
 	'''
 	Walk path depth first, yielding (entry_path, rel_path, is_dir) with each folder right before its contents.
 	Folder paths end with /. Symlinks to folders are not followed and come out as files.
 	Nothing is listed up front, so walking a tree of 500k entries holds only the open folders of one branch.
+	With list_folders_first, each folder is read in full before its entries are yielded, so the caller can replace
+	entries as it goes: renaming into a folder still being read can make the listing skip an entry (through mergerfs
+	the entry can move to another branch).
 
 	Examples:
 		>>> import tempfile
@@ -1303,11 +1324,13 @@ def iter_tree_entries(path:str, rel_prefix:str = ''):
 	'''
 	try:
 		with os.scandir(path) as entries:
+			if list_folders_first:
+				entries = list(entries)
 			for entry in entries:
 				rel_path = rel_prefix + entry.name
 				if entry.is_dir(follow_symlinks=False):
 					yield entry.path + '/', rel_path + '/', True
-					yield from iter_tree_entries(entry.path, rel_path + '/')
+					yield from iter_tree_entries(entry.path, rel_path + '/', list_folders_first)
 				else:
 					yield entry.path, rel_path, False
 	except Exception as e:
@@ -1316,8 +1339,6 @@ def iter_tree_entries(path:str, rel_prefix:str = ''):
 def get_all_folders(path):
 	return [entry_path for entry_path, _, is_dir in iter_tree_entries(path) if is_dir]
 
-def get_all_files(path):
-	return [entry_path for entry_path, _, is_dir in iter_tree_entries(path) if not is_dir]
 
 def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:ChangeEventQueue) -> bool:
 	# stored inside the per-job vault folder so jobs sharing a vault path do not clobber each other
@@ -2194,11 +2215,18 @@ def pending_transaction_rows(events) -> list:
 	return rows
 
 def persist_pending_transactions(job_name:str, vault_path:str, to_process:'ChangeEventQueue', to_process_lock:threading.Lock=None):
+	def rows_for(queue):
+		available, _, _ = read_memory_state()
+		if available is not None and len(queue) * PENDING_ROW_BYTES > available * QUEUE_MEMORY_SHARE:
+			# writing every row holds them all as Python objects: a full scan at the next start covers them instead
+			backuperTeeLogToTl(job_name, f'{len(queue)} pending transactions are too many to write out with the memory available, saving a full scan request instead', error=True)
+			return pending_transaction_rows([ChangeEvent(time.monotonic(), False, 'full_scan', getattr(queue, 'monitor_path', ''), None)])
+		return pending_transaction_rows(queue)
 	if to_process_lock is not None:
 		with to_process_lock:
-			pending_rows = pending_transaction_rows(to_process)
+			pending_rows = rows_for(to_process)
 	else:
-		pending_rows = pending_transaction_rows(to_process)
+		pending_rows = rows_for(to_process)
 	if not pending_rows:
 		return
 	job_vault = os.path.join(vault_path, job_name)
@@ -3348,12 +3376,15 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	# if it is in movedPath, we apply the new path to the symlink
 	# if it is not in movedPath, this means it is first reference, thus
 	#   we remove the symlink in the appying vault, move the file to the new location, and add the pair to movedPath
-	path_files = get_all_files(applyingVaultEntry.path)
-	backuperTeeLogToTl(path=referenceVaultPath,message=f"Dealing with {applyingVersionNumber}: {applyingVaultEntry.path} ({len(path_files)} files)")
+	backuperTeeLogToTl(path=referenceVaultPath,message=f"Dealing with {applyingVersionNumber}: {applyingVaultEntry.path}")
 	new_size = applyingVaultEntry.size
 	block_size = os.statvfs(referenceVaultPath).f_frsize
 	materialize_failed = False
-	for file in path_files:
+	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs).
+	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another
+	for file, _, is_dir in iter_tree_entries(applyingVaultEntry.path, list_folders_first=True):
+		if is_dir:
+			continue
 		if os.path.islink(file):
 			linkTarget = os.path.abspath(os.path.join(os.path.dirname(file), os.readlink(file)))
 			if linkTarget.startswith(referenceVaultPath):
