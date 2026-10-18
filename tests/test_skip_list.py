@@ -435,17 +435,8 @@ def test_skipped_content_does_not_prune_history(job, poll_fast):
 
 
 def _usage(paths):
-	'''Bytes and inodes of paths as du counts them: a file with several links only once.'''
-	size = inodes = 0
-	seen = set()
-	for path in paths:
-		st = os.lstat(path)
-		if (st.st_dev, st.st_ino) in seen:
-			continue
-		seen.add((st.st_dev, st.st_ino))
-		size += st.st_blocks * 512
-		inodes += 1
-	return size, inodes
+	'''Bytes and inodes of paths as the replay copies them: each name on its own.'''
+	return sum(os.lstat(path).st_blocks * 512 for path in paths), len(paths)
 
 
 def _nested_tree(root, depth=6):
@@ -506,19 +497,20 @@ def test_size_estimate_counts_creates_inside_a_sized_folder(job):
 	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == (size, 2)
 
 
-def test_size_estimate_counts_hard_links_once(job):
-	proj = os.path.join(job.monitor, 'proj')
-	other = os.path.join(job.monitor, 'other')
-	_write_random(os.path.join(proj, 'a.bin'), 1 << 20)
-	os.makedirs(os.path.join(proj, 'sub'))
-	os.makedirs(other)
-	os.link(os.path.join(proj, 'a.bin'), os.path.join(proj, 'sub', 'b.bin'))
-	os.link(os.path.join(proj, 'a.bin'), os.path.join(other, 'c.bin'))
+def test_size_estimate_counts_each_hard_link_name(job):
+	# the replay copies each name with its own cp, so a file with four names takes four copies in the new version
+	new = os.path.join(job.monitor, 'new')
+	_write_random(os.path.join(new, 'n0.bin'), 1 << 20)
+	for i in range(1, 4):
+		os.link(os.path.join(new, 'n0.bin'), os.path.join(new, f'n{i}.bin'))
 	sl = rv.SkipList(job.monitor, ['*.tmp'])
-	entries = OrderedDict([*_tree_entries(proj, sl, 'create').items(), *_tree_entries(other, sl, 'create').items()])
-	size, inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl)
-	assert (size, inodes) == _usage([proj, os.path.join(proj, 'a.bin'), os.path.join(proj, 'sub'), other])
-	assert (1 << 20) <= size < 2 << 20 and inodes == 4
+	expected = _usage([new] + [os.path.join(new, f'n{i}.bin') for i in range(4)])
+	assert expected[0] >= 4 << 20 and expected[1] == 5
+	entries = _tree_entries(new, sl, 'create')
+	assert len(entries) == 5
+	assert rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl) == expected
+	single = OrderedDict({new + '/': rv.BackupEntryValues('t', 'create', None)})
+	assert rv.get_backup_size_inode(single, True, job.job_vault, job.monitor, sl) == expected
 
 
 @pytest.mark.parametrize('patterns', [None, ['*.tmp']])
