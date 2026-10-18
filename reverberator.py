@@ -577,7 +577,8 @@ MEMORY_STALL_PERCENT = 10.0
 MEMORY_LOW_FRACTION = 0.05
 QUEUE_MEMORY_SHARE = 0.25
 MEMORY_CHECK_SECONDS = 30
-COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir'])
+# wds: for a folder, the watches at or below it when it moved away, so they can go if its move never pairs
+COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir','wds'],defaults=((),))
 
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
@@ -1295,7 +1296,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				if DEBUG:
 					watcherTeeLogToTl(monitor_path,f'Adding expired unmatched move_from as delete for cookie {cookie}')
 				# also drop the cookie so a late MOVED_TO is treated as a create instead of a move from a deleted source
-				cookieDic.pop(cookie,None)
+				cookie_value = cookieDic.pop(cookie,None)
+				if cookie_value is not None and cookie_value.wds:
+					# the folder left for a place with no watch (out of the tree, or into a skipped folder) and took its
+					# watches along: they would report its new contents under the old path. gone before its delete is queued
+					remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
 				append_change_event(to_process, to_process_lock, pendingMoveFromEvents.pop(cookie))
 			if not events:
 				if to_process and not to_process_flag.is_set() and time.monotonic() - lastReadTime > min_snapshot_delay_seconds:
@@ -1390,7 +1395,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						continue
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move from event detected for {eventPath}')
-					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir)
+					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir,watches_under(wdDic,eventPath) if isDir else ())
 					while len(cookieDic) > COOKIE_DICT_MAX_SIZE:
 						watcherTeeLogToTl(monitor_path,'Cookie dictionary is full, popping oldest item')
 						evicted_cookie,cookie_value = cookieDic.popitem(last=False)
@@ -1398,6 +1403,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						pendingMoveFromEvents.pop(evicted_cookie,None)
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Adding delete event for {cookie_value.path}')
+						if cookie_value.wds:
+							remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,cookie_value.isDir,'delete',cookie_value.path,None))
 					#append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,None))
 					pendingMoveFromEvents[event.cookie] = ChangeEvent(monTime,isDir,'delete',eventPath,None)
@@ -1540,6 +1547,12 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			continue
 	return parentWatchDescriptor
 
+def watches_under(wdDic:bidict,folder_path:str) -> tuple:
+	'''The watch descriptors mapped to folder_path or below it.'''
+	folder_norm = folder_path.rstrip('/')
+	prefix = folder_norm + '/'
+	return tuple(wd for wd, wd_path in wdDic.items() if wd_path.rstrip('/') == folder_norm or wd_path.startswith(prefix))
+
 def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str) -> int:
 	'''Remove the watch on folder_path and every watch below it; returns how many were removed.'''
 	folder_norm = folder_path.rstrip('/')
@@ -1549,6 +1562,44 @@ def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:ino
 		wd_norm = wd_path.rstrip('/')
 		if wd_norm != folder_norm and not wd_norm.startswith(prefix):
 			continue
+		try:
+			inotify_obj.rm_watch(wd)
+		except OSError:
+			pass
+		del wdDic[wd]
+		irm.decreaseUserWatches()
+		removed += 1
+	return removed
+
+def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str,wds,watch_flags:int) -> int:
+	'''
+	Remove the watches a folder took along when it moved away and its move never paired; returns how many were removed.
+	Of wds, the watches at or below folder_path when it moved, only those still mapped there go, and not one that inotify
+	hands back for the folder now at its path: a folder moved back brings its old watches, a folder created there has new ones.
+	'''
+	folder_norm = folder_path.rstrip('/')
+	prefix = folder_norm + '/'
+	removed = 0
+	for wd in wds:
+		wd_path = wdDic.get(wd)
+		if wd_path is None:
+			continue
+		wd_norm = wd_path.rstrip('/')
+		if wd_norm != folder_norm and not wd_norm.startswith(prefix):
+			continue
+		try:
+			# watching a folder that already has a watch returns that watch, unchanged with the same flags
+			current_wd = inotify_obj.add_watch(wd_norm, watch_flags | inotify_simple.flags.ONLYDIR | inotify_simple.flags.DONT_FOLLOW)
+		except OSError:
+			current_wd = None
+		if current_wd == wd:
+			continue
+		if current_wd is not None and current_wd not in wdDic:
+			# a folder there with no watch yet gets one when its create event is read
+			try:
+				inotify_obj.rm_watch(current_wd)
+			except OSError:
+				pass
 		try:
 			inotify_obj.rm_watch(wd)
 		except OSError:

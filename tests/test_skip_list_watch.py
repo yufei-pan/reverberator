@@ -23,11 +23,12 @@ def _wait_watch_ready(job, to_process, lock):
 	wait_until(ready, message='watcher not ready')
 
 
-def _start(job, patterns):
+def _start(job, patterns, to_process_flag=None):
 	to_process = rv.ChangeEventQueue(job.monitor)
 	lock = threading.Lock()
 	thread = threading.Thread(target=rv.watchFolder, kwargs=dict(
-		monitor_path=job.monitor, to_process=to_process, to_process_lock=lock, to_process_flag=threading.Event(),
+		monitor_path=job.monitor, to_process=to_process, to_process_lock=lock,
+		to_process_flag=threading.Event() if to_process_flag is None else to_process_flag,
 		irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=0, max_shapshot_delay_seconds=60,
 		skip_list=rv.SkipList(job.monitor, patterns)), daemon=True)
 	thread.start()
@@ -39,6 +40,14 @@ def _probe(job, to_process, lock, name='probe.txt'):
 	path = os.path.join(job.monitor, name)
 	open(path, 'a').write('p')
 	wait_until(lambda: any(event.path == path for event in _events(to_process, lock)), message='probe not seen')
+
+
+def _take_batch(to_process_flag):
+	# as the backuper does: once it takes a batch, the watcher records events in the folders it saw created again
+	wait_until(to_process_flag.is_set, message='watcher did not signal the backuper')
+	to_process_flag.clear()
+	# the watcher signals again only after it saw the flag cleared
+	wait_until(to_process_flag.is_set, message='watcher did not signal the backuper again')
 
 
 def _stop(thread):
@@ -165,5 +174,80 @@ def test_location_free_move_does_not_rewatch(job, poll_fast, monkeypatch):
 		os.rename(os.path.join(job.monitor, 'a'), os.path.join(job.monitor, 'b', 'a'))
 		wait_until(lambda: any(e.event == 'move' for e in _events(to_process, lock)), message='move not seen')
 		assert calls == []
+	finally:
+		_stop(thread)
+
+
+def test_folder_moved_into_unwatched_skipped_folder_loses_watches(job, poll_fast, monkeypatch):
+	# the skipped trash has no watch, so only MOVED_FROM arrives and the move expires into a delete
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
+	seed_monitor(job, {'data/sub/x': 'x', '.trash/': None})
+	thread, to_process, lock = _start(job, ['.trash/'])
+	try:
+		data = os.path.join(job.monitor, 'data')
+		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
+		wait_until(lambda: any(e.event == 'delete' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no delete')
+		mark = len(_events(to_process, lock))
+		open(os.path.join(job.monitor, '.trash', 'data', 'sub', 'y'), 'w').write('y')
+		_probe(job, to_process, lock)
+		later = _events(to_process, lock)[mark:]
+		assert [e for e in later if e.path.startswith(data + '/')] == []
+		assert _paths(to_process, lock, '.trash') == []
+	finally:
+		_stop(thread)
+
+
+def test_evicted_folder_move_loses_watches(job, poll_fast, monkeypatch):
+	monkeypatch.setattr(rv, 'COOKIE_DICT_MAX_SIZE', 1)
+	seed_monitor(job, {'data/sub/x': 'x', 'f.txt': 'f', '.trash/': None})
+	thread, to_process, lock = _start(job, ['.trash/'])
+	try:
+		data = os.path.join(job.monitor, 'data')
+		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
+		# a second unpaired move pushes the folder's move out of the cookie dictionary, long before it would expire
+		os.rename(os.path.join(job.monitor, 'f.txt'), os.path.join(job.monitor, '.trash', 'f.txt'))
+		wait_until(lambda: any(e.event == 'delete' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no delete')
+		mark = len(_events(to_process, lock))
+		open(os.path.join(job.monitor, '.trash', 'data', 'sub', 'y'), 'w').write('y')
+		_probe(job, to_process, lock)
+		assert [e for e in _events(to_process, lock)[mark:] if e.path.startswith(data + '/')] == []
+	finally:
+		_stop(thread)
+
+
+def test_folder_recreated_at_moved_away_path_keeps_its_watches(job, poll_fast, monkeypatch):
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
+	seed_monitor(job, {'data/sub/x': 'x', '.trash/': None})
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, ['.trash/'], flag)
+	try:
+		data = os.path.join(job.monitor, 'data')
+		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
+		# a new folder takes the old path before the move expires: its fresh watches stay
+		os.makedirs(os.path.join(data, 'sub'))
+		wait_until(lambda: any(e.event == 'delete' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no delete')
+		_take_batch(flag)
+		fresh = os.path.join(data, 'sub', 'z')
+		open(fresh, 'w').write('z')
+		wait_until(lambda: any(e.path == fresh for e in _events(to_process, lock)), message='recreated folder not watched')
+	finally:
+		_stop(thread)
+
+
+def test_folder_moved_back_before_its_move_expires_keeps_its_watches(job, poll_fast, monkeypatch):
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
+	seed_monitor(job, {'data/sub/x': 'x', '.trash/': None})
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, ['.trash/'], flag)
+	try:
+		data = os.path.join(job.monitor, 'data')
+		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
+		# restored from the trash: inotify hands back the watches the folder already had
+		os.rename(os.path.join(job.monitor, '.trash', 'data'), data)
+		wait_until(lambda: any(e.event == 'delete' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no delete')
+		_take_batch(flag)
+		restored = os.path.join(data, 'sub', 'y')
+		open(restored, 'w').write('y')
+		wait_until(lambda: any(e.path == restored for e in _events(to_process, lock)), message='restored folder not watched')
 	finally:
 		_stop(thread)
