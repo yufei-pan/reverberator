@@ -432,3 +432,109 @@ def test_skipped_content_does_not_prune_history(job, poll_fast):
 	assert committed and len(versions) == 5
 	assert os.path.isfile(os.path.join(versions[-1], 'proj', 'src.c'))
 	assert not os.path.lexists(os.path.join(versions[-1], 'proj', 'node_modules'))
+
+
+def _usage(paths):
+	'''Bytes and inodes of paths as du counts them: a file with several links only once.'''
+	size = inodes = 0
+	seen = set()
+	for path in paths:
+		st = os.lstat(path)
+		if (st.st_dev, st.st_ino) in seen:
+			continue
+		seen.add((st.st_dev, st.st_ino))
+		size += st.st_blocks * 512
+		inodes += 1
+	return size, inodes
+
+
+def _nested_tree(root, depth=6):
+	leaf = os.path.join(root, *[f'd{i}' for i in range(depth)])
+	_write_random(os.path.join(leaf, 'big.bin'), 1 << 20)
+	write_tree(root, {'top.txt': 't', 'd0/mid.txt': 'm'})
+	_write_random(os.path.join(root, 'd0', 'node_modules', 'cache.bin'), 1 << 20)
+	return leaf
+
+
+def _tree_entries(root, sl, event):
+	# what delta generation queues for a tree it has not seen: an entry for the folder and each one below it
+	entries = OrderedDict({root + '/': rv.BackupEntryValues('t', event, None)})
+	for entry_path, _, _ in rv.iter_tree_entries(root, sl.folder_rel(root), skip=sl.skips):
+		entries[entry_path] = rv.BackupEntryValues('t', event, None)
+	return entries
+
+
+def test_size_estimate_counts_nested_creates_once(job):
+	proj = os.path.join(job.monitor, 'proj')
+	_nested_tree(proj)
+	sl = rv.SkipList(job.monitor, ['node_modules/'])
+	entries = _tree_entries(proj, sl, 'create')
+	assert len(entries) == 10
+	expected = _usage([proj] + [path for path, _, _ in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips)])
+	assert expected[0] >= 1 << 20 and expected[1] == 10
+	assert rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl) == expected
+	single = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'create', None)})
+	assert rv.get_backup_size_inode(single, True, job.job_vault, job.monitor, sl) == expected
+
+
+def test_size_estimate_counts_nested_folder_attribs_once(job):
+	proj = os.path.join(job.monitor, 'proj')
+	_nested_tree(proj)
+	sl = rv.SkipList(job.monitor, ['node_modules/'])
+	# chmod -R: an attrib for every folder and file, sized when attributes are not only synced
+	entries = _tree_entries(proj, sl, 'attrib')
+	expected_size = _usage([proj] + [path for path, _, _ in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips)])[0]
+	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == (expected_size, 0)
+	# without patterns du gets the same size: it counts nested arguments once
+	no_cache = OrderedDict((path, values) for path, values in entries.items() if 'node_modules' not in path)
+	import shutil
+	shutil.rmtree(os.path.join(proj, 'd0', 'node_modules'))
+	assert rv.get_backup_size_inode(no_cache, False, job.job_vault, job.monitor) == (expected_size, 0)
+
+
+def test_size_estimate_counts_creates_inside_a_sized_folder(job):
+	proj = os.path.join(job.monitor, 'proj')
+	write_tree(proj, {'old.txt': 'o', 'new/f.txt': 'f'})
+	sl = rv.SkipList(job.monitor, ['*.tmp'])
+	entries = OrderedDict([
+		(proj + '/', rv.BackupEntryValues('t', 'attrib', None)),
+		(os.path.join(proj, 'new') + '/', rv.BackupEntryValues('t', 'create', None)),
+		(os.path.join(proj, 'new', 'f.txt'), rv.BackupEntryValues('t', 'create', None)),
+	])
+	# the folder walk holds the bytes of what is new below it, but the new folder and its file are still new inodes
+	size = _usage([proj, os.path.join(proj, 'old.txt'), os.path.join(proj, 'new'), os.path.join(proj, 'new', 'f.txt')])[0]
+	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == (size, 2)
+
+
+def test_size_estimate_counts_hard_links_once(job):
+	proj = os.path.join(job.monitor, 'proj')
+	other = os.path.join(job.monitor, 'other')
+	_write_random(os.path.join(proj, 'a.bin'), 1 << 20)
+	os.makedirs(os.path.join(proj, 'sub'))
+	os.makedirs(other)
+	os.link(os.path.join(proj, 'a.bin'), os.path.join(proj, 'sub', 'b.bin'))
+	os.link(os.path.join(proj, 'a.bin'), os.path.join(other, 'c.bin'))
+	sl = rv.SkipList(job.monitor, ['*.tmp'])
+	entries = OrderedDict([*_tree_entries(proj, sl, 'create').items(), *_tree_entries(other, sl, 'create').items()])
+	size, inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl)
+	assert (size, inodes) == _usage([proj, os.path.join(proj, 'a.bin'), os.path.join(proj, 'sub'), other])
+	assert (1 << 20) <= size < 2 << 20 and inodes == 4
+
+
+@pytest.mark.parametrize('patterns', [None, ['*.tmp']])
+def test_full_comparison_of_a_nested_tree_keeps_history(job, poll_fast, patterns):
+	sl = None if patterns is None else rv.SkipList(job.monitor, patterns)
+	seed_monitor(job, {'a.txt': 'a'})
+	_backup(job, skip_list=sl, backup_size_limit='3M')[1].close()
+	for i in range(3):
+		path = os.path.join(job.monitor, f'f{i}.txt')
+		open(path, 'w').write('x' * 100)
+		_backup(job, OrderedDict({path: rv.BackupEntryValues('t', 'create', None)}), skip_list=sl, backup_size_limit='3M')[1].close()
+	# a full comparison finds a new tree six folders deep holding 1 MiB, and queues a create for each entry in it
+	leaf = os.path.join(job.monitor, 'new', *[f'd{i}' for i in range(6)])
+	_write_random(os.path.join(leaf, 'big.bin'), 1 << 20)
+	_, manifest, committed = _backup(job, skip_list=sl, backup_size_limit='3M')
+	manifest.close()
+	versions = committed_versions(job)
+	assert committed and len(versions) == 5
+	assert os.path.isfile(os.path.join(versions[-1], 'new', *[f'd{i}' for i in range(6)], 'big.bin'))
