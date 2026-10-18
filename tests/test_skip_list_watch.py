@@ -35,8 +35,8 @@ def _start(job, patterns):
 	return thread, to_process, lock
 
 
-def _probe(job, to_process, lock):
-	path = os.path.join(job.monitor, 'probe.txt')
+def _probe(job, to_process, lock, name='probe.txt'):
+	path = os.path.join(job.monitor, name)
 	open(path, 'a').write('p')
 	wait_until(lambda: any(event.path == path for event in _events(to_process, lock)), message='probe not seen')
 
@@ -119,6 +119,22 @@ def test_folder_moved_into_skipped_name_loses_watches(job, poll_fast):
 		open(os.path.join(job.monitor, 'old_d', 'sub', 'x'), 'w').write('x')
 		_probe(job, to_process, lock)
 		assert _paths(to_process, lock, 'old_d') == []
+		assert [e for e in _events(to_process, lock) if e.path.startswith(os.path.join(job.monitor, 'd') + '/')] == []
+	finally:
+		_stop(thread)
+
+
+def test_folder_moved_into_skipped_name_inside_new_folder_loses_watches(job, poll_fast):
+	seed_monitor(job, {'d/sub/': None})
+	thread, to_process, lock = _start(job, ['old_*/'])
+	try:
+		os.makedirs(os.path.join(job.monitor, 't'))
+		_probe(job, to_process, lock, 'probe1.txt')
+		os.rename(os.path.join(job.monitor, 'd'), os.path.join(job.monitor, 't', 'old_d'))
+		_probe(job, to_process, lock, 'probe2.txt')
+		open(os.path.join(job.monitor, 't', 'old_d', 'sub', 'x'), 'w').write('x')
+		_probe(job, to_process, lock, 'probe3.txt')
+		assert [e for e in _events(to_process, lock) if e.path.startswith(os.path.join(job.monitor, 'd') + '/') or 'old_d' in e.path] == []
 	finally:
 		_stop(thread)
 
