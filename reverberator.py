@@ -398,7 +398,11 @@ class SkipList:
 	def __init__(self, monitor_path:str, lines=(), source:str = ''):
 		self.monitor_path = monitor_path
 		self.source = source
-		self._spec = pathspec.GitIgnoreSpec.from_lines(lines)
+		try:
+			self._spec = pathspec.GitIgnoreSpec.from_lines(lines)
+		except re.error as error:
+			# a pattern pathspec accepts can still compile to a bad regex, such as the reversed range in [z-a]
+			raise ValueError(f'Invalid skip pattern: {error}') from error
 		# comments and blank lines compile to no pattern, so they never reach the fingerprint
 		self.patterns = [p.pattern for p in self._spec.patterns if p.include is not None]
 		self.fingerprint = xxhash.xxh64('\n'.join(self.patterns)).hexdigest() if self.patterns else ''
@@ -406,7 +410,7 @@ class SkipList:
 
 	@classmethod
 	def load(cls, monitor_path:str, path:str):
-		'''Read a skip list file; OSError and ValueError (bad pattern or encoding) propagate.'''
+		'''Read a skip list file; OSError and ValueError (bad pattern, bad regex or encoding) propagate.'''
 		with open(path, 'r', encoding='utf-8-sig') as f:
 			return cls(monitor_path, f.read().splitlines(), path)
 

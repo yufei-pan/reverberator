@@ -70,6 +70,11 @@ def test_load_binary_list_fails(job):
 	assert rv.JobStartup(job.job_name, job.monitor, path).load(None) is False
 
 
+def test_load_bad_pattern_fails(job):
+	startup = rv.JobStartup(job.job_name, job.monitor, _skip_file(job, '[z-a]\n'))
+	assert startup.load(None) is False and startup.failed
+
+
 def test_load_refuses_losing_patterns_without_none(job):
 	assert rv.JobStartup(job.job_name, job.monitor).load('recorded') is False
 	assert rv.JobStartup(job.job_name, job.monitor, _skip_file(job, '# nothing\n')).load('recorded') is False
@@ -98,6 +103,14 @@ def test_backuper_loads_list_after_filesystem_ready(job, poll_fast):
 
 def test_backuper_with_missing_list_stops_only_its_job(job, poll_fast):
 	startup = rv.JobStartup(job.job_name, job.monitor, os.path.join(job.root, 'missing'))
+	thread = _run_backuper(job, startup)
+	thread.join(timeout=5)
+	assert not thread.is_alive() and startup.failed
+	assert rv.GREEN_LIGHT.is_set() and committed_versions(job) == []
+
+
+def test_backuper_with_bad_pattern_stops_only_its_job(job, poll_fast):
+	startup = rv.JobStartup(job.job_name, job.monitor, _skip_file(job, '[z-a]\n'))
 	thread = _run_backuper(job, startup)
 	thread.join(timeout=5)
 	assert not thread.is_alive() and startup.failed

@@ -78,6 +78,14 @@ def test_load_refuses_unreadable_lists(tmp_path):
 		rv.SkipList.load(str(tmp_path), str(tmp_path / 'bad'))
 
 
+def test_bad_bracket_range_is_a_value_error(tmp_path):
+	with pytest.raises(ValueError):
+		rv.SkipList(str(tmp_path), ['[z-a]'])
+	(tmp_path / 'range').write_text('**/[b-a]x\n')
+	with pytest.raises(ValueError):
+		rv.SkipList.load(str(tmp_path), str(tmp_path / 'range'))
+
+
 def test_names_starting_with_hash_or_bang(tmp_path):
 	sl = rv.SkipList(str(tmp_path), ['#notes', '\\#draft', '\\!important', 'my file.txt'])
 	assert not sl.skips('#notes')
