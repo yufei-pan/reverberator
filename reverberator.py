@@ -3025,6 +3025,11 @@ class VaultManifest:
 		'''Stop tracking folder and everything under it.'''
 		self.conn.execute('DELETE FROM entries WHERE path >= ? AND path < ?', (folder, folder_range_end(folder)))
 
+	def iter_under(self, folder:str):
+		'''Tracked paths strictly under folder (which ends with /), sorted.'''
+		for (path,) in self.conn.execute('SELECT path FROM entries WHERE path > ? AND path < ? ORDER BY path', (folder, folder_range_end(folder))):
+			yield path
+
 	def move_tree(self, src_folder:str, dst_folder:str):
 		'''
 		Track src_folder and everything under it as dst_folder instead, replacing what dst_folder held.
@@ -3695,6 +3700,28 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	def wait_for_async_commands(mcae):
 		while GREEN_LIGHT.is_set() and mcae.runningThreads:
 			mcae.wait(timeout=POLL_WAIT_SECONDS)
+	def recheck_moved_folder(folder_rel,mcae):
+		# a location-dependent pattern may judge the moved contents differently at the new place
+		under = list(manifest.iter_under(folder_rel))
+		newly_skipped = []
+		for rel in under:
+			if newly_skipped and rel.startswith(newly_skipped[-1]) and newly_skipped[-1].endswith('/'):
+				# inside a folder already collected, removing that folder removes this too
+				continue
+			if skip_list.skips(rel):
+				newly_skipped.append(rel)
+		for rel in newly_skipped:
+			delete_path(isDir=rel.endswith('/'),vault_real_path=os.path.join(backup_folder,rel),relative_path=rel.rstrip('/'),mcae=mcae)
+		wait_for_async_commands(mcae)
+		copied = None
+		for sub_real_path,sub_rel,sub_is_dir in iter_tree_entries(os.path.join(monitor_path,folder_rel),folder_rel,skip=skip_list.skips):
+			if copied is not None and sub_rel.startswith(copied):
+				continue
+			if manifest.lookup(sub_rel) is None:
+				copy_path(isDir=sub_is_dir,monitor_path=monitor_path,source_real_path=sub_real_path,
+				  source_relative_path=sub_rel.rstrip('/'),file_vault_real_path=os.path.join(backup_folder,sub_rel),
+				  backup_folder=backup_folder,mcae=mcae)
+				copied = sub_rel if sub_is_dir else None
 	# this function does the actual backup using a referenced version and a change list to copy the source from
 	# reverb backup flow:
 	#   do referenced copy of the last version to the current backup folder 
@@ -3785,6 +3812,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
 				  relative_path=link_source_relative_path,mcae=mcae)
 				wait_for_async_commands(mcae)
+			else:
+				if isDir and skip_list is not None and skip_list.location_dependent:
+					recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
 	if need_delete_barrier:
 		wait_for_async_commands(mcae)
 	wait_for_async_commands(mcae)

@@ -248,3 +248,49 @@ def test_interrupted_delta_keeps_old_fingerprint(job, poll_fast, monkeypatch):
 	rv.GREEN_LIGHT.set()
 	assert committed is False and manifest.skip_fingerprint == ''
 	manifest.close()
+
+
+def _move_entry(job, src_rel, dst_rel):
+	src = os.path.join(job.monitor, src_rel)
+	dst = os.path.join(job.monitor, dst_rel)
+	os.makedirs(os.path.dirname(dst), exist_ok=True)
+	os.rename(src, dst)
+	return OrderedDict({dst + '/': rv.BackupEntryValues('t', 'move', src + '/')})
+
+
+def test_folder_moved_out_of_location_pattern_copies_unskipped(job, poll_fast):
+	sl = rv.SkipList(job.monitor, ['projects/*/build/'])
+	seed_monitor(job, {'projects/foo/src.c': 's', 'projects/foo/build/a.o': 'o', 'archive/': None})
+	_backup(job, skip_list=sl)[1].close()
+	_, manifest, committed = _backup(job, _move_entry(job, 'projects/foo', 'archive/foo'), skip_list=sl)
+	assert committed and manifest.lookup('archive/foo/build/a.o') is not None
+	manifest.close()
+	v0, v1 = committed_versions(job)
+	assert not os.path.lexists(os.path.join(v0, 'projects', 'foo', 'build'))
+	assert open(os.path.join(v1, 'archive', 'foo', 'build', 'a.o')).read() == 'o'
+	assert os.path.lexists(os.path.join(v1, 'archive', 'foo', 'src.c'))
+
+
+def test_folder_moved_into_location_pattern_drops_newly_skipped(job, poll_fast):
+	sl = rv.SkipList(job.monitor, ['projects/*/build/'])
+	seed_monitor(job, {'archive/foo/src.c': 's', 'archive/foo/build/a.o': 'o', 'projects/': None})
+	_backup(job, skip_list=sl)[1].close()
+	_, manifest, committed = _backup(job, _move_entry(job, 'archive/foo', 'projects/foo'), skip_list=sl)
+	assert committed
+	assert manifest.lookup('projects/foo/build/') is None and manifest.lookup('projects/foo/build/a.o') is None
+	manifest.close()
+	v0, v1 = committed_versions(job)
+	assert os.path.isfile(os.path.join(v0, 'archive', 'foo', 'build', 'a.o'))
+	assert not os.path.lexists(os.path.join(v1, 'projects', 'foo', 'build'))
+	assert os.path.lexists(os.path.join(v1, 'projects', 'foo', 'src.c'))
+
+
+def test_location_free_patterns_skip_the_recheck(job, poll_fast, monkeypatch):
+	sl = rv.SkipList(job.monitor, ['*.tmp'])
+	seed_monitor(job, {'a/x.txt': 'x', 'b/': None})
+	_backup(job, skip_list=sl)[1].close()
+	walked = []
+	original = rv.iter_tree_entries
+	monkeypatch.setattr(rv, 'iter_tree_entries', lambda path, *args, **kwargs: walked.append(path) or original(path, *args, **kwargs))
+	_backup(job, _move_entry(job, 'a', 'b/a'), skip_list=sl)[1].close()
+	assert not any(path.rstrip('/') == os.path.join(job.monitor, 'b', 'a') for path in walked)
