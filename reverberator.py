@@ -5,6 +5,7 @@ import inotify_simple
 import Tee_Logger
 import argparse
 import xxhash
+import pathspec
 
 from collections import deque
 import time
@@ -388,6 +389,82 @@ class ChangeEventQueue:
 def append_change_event(to_process:ChangeEventQueue, to_process_lock:threading.Lock, event:ChangeEvent):
 	with to_process_lock:
 		to_process.append(event)
+
+class SkipList:
+	'''A gitignore-style list of paths below a monitored folder that are not backed up.
+	Patterns match paths relative to the monitored folder, folders carrying a trailing "/". The monitored folder itself is never skipped.'''
+	def __init__(self, monitor_path:str, lines=(), source:str = ''):
+		self.monitor_path = monitor_path
+		self.source = source
+		self._spec = pathspec.GitIgnoreSpec.from_lines(lines)
+		# comments and blank lines compile to no pattern, so they never reach the fingerprint
+		self.patterns = [p.pattern for p in self._spec.patterns if p.include is not None]
+		self.fingerprint = xxhash.xxh64('\n'.join(self.patterns)).hexdigest() if self.patterns else ''
+		self.location_dependent = any(self._location_dependent(p) for p in self.patterns)
+
+	@classmethod
+	def load(cls, monitor_path:str, path:str):
+		'''Read a skip list file; OSError and ValueError (bad pattern or encoding) propagate.'''
+		with open(path, 'r', encoding='utf-8-sig') as f:
+			return cls(monitor_path, f.read().splitlines(), path)
+
+	@staticmethod
+	def _location_dependent(pattern:str) -> bool:
+		'''Whether a pattern depends on where an entry sits, not only on its own name.
+		>>> [SkipList._location_dependent(p) for p in ['*.tmp','**/cache/','!keep','/top','a/b','!/top','a/**']]
+		[False, False, False, True, True, True, True]
+		'''
+		if pattern.startswith('!'):
+			pattern = pattern[1:]
+		while pattern.startswith('**/'):
+			pattern = pattern[3:]
+		if pattern.endswith('/'):
+			pattern = pattern[:-1]
+		return '/' in pattern
+
+	def __bool__(self) -> bool:
+		return bool(self.patterns)
+
+	def skips(self, rel:str) -> bool:
+		'''Whether a root-relative path (trailing "/" for folders) is skipped.
+		Callers guarantee its parent folder is not skipped, so only the entry itself is checked.'''
+		if rel in ('', '/') or not self.patterns:
+			return False
+		return self._spec.match_file(rel)
+
+	def skips_path(self, path:str, is_dir:bool) -> bool:
+		'''Like skips() for an absolute path; the root and paths outside it are never skipped.'''
+		root = self.monitor_path.rstrip('/')
+		path = path.rstrip('/')
+		if not path.startswith(root + '/'):
+			return False
+		return self.skips(path[len(root) + 1:] + ('/' if is_dir else ''))
+
+	def folder_rel(self, folder_path:str) -> str:
+		'''The root-relative path of a folder with a trailing "/", or "" for the root.'''
+		root = self.monitor_path.rstrip('/')
+		folder_path = folder_path.rstrip('/')
+		if folder_path == root:
+			return ''
+		return folder_path[len(root) + 1:] + '/'
+
+def skip_list_change(recorded, current:str, explicit_none:bool) -> str:
+	'''Compare a job's recorded skip list fingerprint (None when never recorded) with the current one.
+	Dropping a recorded list needs an explicit "none" so a missing or empty file cannot silently back up everything.
+	>>> skip_list_change(None, '', False), skip_list_change('a', 'a', False)
+	('unchanged', 'unchanged')
+	>>> skip_list_change(None, 'a', False), skip_list_change('a', 'b', True)
+	('changed', 'changed')
+	>>> skip_list_change('a', '', False), skip_list_change('a', '', True)
+	('refuse', 'changed')
+	'''
+	if recorded is None:
+		return 'unchanged' if current == '' else 'changed'
+	if recorded == current:
+		return 'unchanged'
+	if current == '' and not explicit_none:
+		return 'refuse'
+	return 'changed'
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
 VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER)
