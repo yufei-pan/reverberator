@@ -46,20 +46,30 @@ def tracked_manifest(job_vault: str, version_dir: str, files=(), folders=()) -> 
 	return manifest
 
 
+def rule_row(job: JobPaths, min_snapshot: str = '1', max_snapshot: str = '86400',
+		mon_fs_signature: str = 'N/A', vault_fs_signature: str = 'N/A',
+		keep_one_complete_backup: str = 'True', only_sync_attributes: str = 'True',
+		keep_n_versions: str = '0', backup_size_limit: str = '0', skip_list_file: str = '') -> list:
+	return [
+		job.job_name, job.monitor, job.vault, mon_fs_signature, min_snapshot, max_snapshot,
+		keep_one_complete_backup, only_sync_attributes, keep_n_versions, backup_size_limit,
+		vault_fs_signature, skip_list_file,
+	]
+
+
 def write_rule(job: JobPaths, min_snapshot: str = '1', max_snapshot: str = '86400',
 		mon_fs_signature: str = 'N/A', vault_fs_signature: str = 'N/A',
 		keep_one_complete_backup: str = 'True', only_sync_attributes: str = 'True',
-		keep_n_versions: str = '0', backup_size_limit: str = '0') -> str:
-	header = rv.REVERB_RULE_TSV_HEADER
-	row = [
-		job.job_name, job.monitor, job.vault, mon_fs_signature, min_snapshot, max_snapshot,
-		keep_one_complete_backup, only_sync_attributes, keep_n_versions, backup_size_limit,
-		vault_fs_signature,
-	]
+		keep_n_versions: str = '0', backup_size_limit: str = '0', skip_list_file: str = '',
+		extra_rows=()) -> str:
+	row = rule_row(job, min_snapshot, max_snapshot, mon_fs_signature, vault_fs_signature,
+		keep_one_complete_backup, only_sync_attributes, keep_n_versions, backup_size_limit, skip_list_file)
 	os.makedirs(os.path.dirname(job.rule_path) or '.', exist_ok=True)
 	with open(job.rule_path, 'w', encoding='utf-8') as f:
-		f.write('\t'.join(header) + '\n')
+		f.write('\t'.join(rv.REVERB_RULE_TSV_HEADER) + '\n')
 		f.write('\t'.join(row) + '\n')
+		for extra in extra_rows:
+			f.write(('\t'.join(extra) if not isinstance(extra, str) else extra) + '\n')
 	return job.rule_path
 
 
