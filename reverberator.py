@@ -1193,7 +1193,7 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 			watcherTeeLogToTl(monitor_path,f'Watch root disappeared for {monitor_path}; waiting for filesystem recovery',error=True)
 			monitor_fs_flag.clear()
 
-def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY):
+def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,skip_list:'SkipList' = None,watching:threading.Event = None):
 	global COOKIE_DICT_MAX_SIZE
 	global DEBUG
 	global GREEN_LIGHT
@@ -1208,10 +1208,12 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
 	irm.increaseUserInstances()
 	with inotify_simple.INotify() as inotify_obj:
-		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags)
+		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags,skip_list=skip_list)
 		if mainWatchDescriptor == -1:
 			watcherTeeLogToTl(monitor_path,f'Failed to initialize folder watchers for {monitor_path}',error=True)
 			return WATCH_RESULT_INIT_FAILED
+		if watching is not None:
+			watching.set()
 		lastReadTime = time.monotonic()
 		lastProcessTime = time.monotonic()
 		while GREEN_LIGHT.is_set():
@@ -1286,19 +1288,24 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				if event.wd not in wdDic:
 					watcherTeeLogToTl(monitor_path,f'Watch descriptor {event.wd} not found in wdDic {wdDic}, ignoring event')
 					continue
+				eventPath = os.path.join(wdDic[event.wd],event.name)
+				skipped = skip_list is not None and skip_list.skips_path(eventPath,isDir)
 				if discard_new_recursive_folder_events_until_read and event.wd in newDirWDs:
 					watcherTeeLogToTl(monitor_path,f'Discarding event for new recursive folder {wdDic[event.wd]}')
-					if isDir and event.mask & (flags.CREATE | flags.MOVED_TO):
+					if isDir and not skipped and event.mask & (flags.CREATE | flags.MOVED_TO):
 						# the recursive copy holds this folder, but it still needs watches for later changes,
 						# and a folder moved in keeps its watches under its old path until they are added again here
-						initializeFolderWatchers(inotify_obj,os.path.join(wdDic[event.wd],event.name),wdDic,irm,watch_flags,newDirWDs)
+						initializeFolderWatchers(inotify_obj,os.path.join(wdDic[event.wd],event.name),wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list)
 					continue
-				eventPath = os.path.join(wdDic[event.wd],event.name)
+				if skipped and not event.mask & (flags.MOVED_FROM | flags.MOVED_TO):
+					if DEBUG:
+						watcherTeeLogToTl(monitor_path,f'Skipping event for skipped path {eventPath}')
+					continue
 				if event.mask & flags.CREATE:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Create event detected for {eventPath}')
 					if isDir:
-						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs)
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list)
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.DELETE:
 					if DEBUG:
@@ -1309,6 +1316,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						watcherTeeLogToTl(monitor_path,f'Attrib event detected for {eventPath}')
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'attrib',eventPath,None))
 				elif event.mask & flags.MOVED_FROM:
+					if skipped:
+						# no cookie is recorded, so a matching MOVED_TO is handled as a create
+						if DEBUG:
+							watcherTeeLogToTl(monitor_path,f'Skipping move from event for skipped path {eventPath}')
+						continue
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move from event detected for {eventPath}')
 					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir)
@@ -1325,6 +1337,17 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				elif event.mask & flags.MOVED_TO:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move to event detected for {eventPath}')
+					if skipped:
+						# the destination is not backed up: a known source is gone from the backup, otherwise there is nothing to record
+						if event.cookie in cookieDic:
+							cookie_value = cookieDic.pop(event.cookie)
+							pendingMoveFromEvents.pop(event.cookie,None)
+							append_change_event(to_process, to_process_lock, ChangeEvent(monTime,cookie_value.isDir,'delete',cookie_value.path,None))
+							if cookie_value.isDir:
+								remove_watches_under(inotify_obj,wdDic,irm,cookie_value.path)
+						elif DEBUG:
+							watcherTeeLogToTl(monitor_path,f'Skipping move to event for skipped path {eventPath}')
+						continue
 					if event.cookie in cookieDic:
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Cookie found for {event.cookie}')
@@ -1352,12 +1375,14 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 								if DEBUG:
 									watcherTeeLogToTl(monitor_path,f'Updating wdDic entry {wd}: {wd_path} -> {new_wd_path}')
 								wdDic[wd] = new_wd_path
+							if skip_list is not None and skip_list.location_dependent:
+								rewatch_moved_folder(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list)
 					else:
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Cookie not found for {event.cookie}')
 							watcherTeeLogToTl(monitor_path,f'Treating move as create event for {eventPath}')
 						if isDir:
-							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs)
+							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.MODIFY:
 					if DEBUG:
@@ -1447,6 +1472,49 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			irm.decreaseUserWatches()
 			continue
 	return parentWatchDescriptor
+
+def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str) -> int:
+	'''Remove the watch on folder_path and every watch below it; returns how many were removed.'''
+	folder_norm = folder_path.rstrip('/')
+	prefix = folder_norm + '/'
+	removed = 0
+	for wd, wd_path in list(wdDic.items()):
+		wd_norm = wd_path.rstrip('/')
+		if wd_norm != folder_norm and not wd_norm.startswith(prefix):
+			continue
+		try:
+			inotify_obj.rm_watch(wd)
+		except OSError:
+			pass
+		del wdDic[wd]
+		irm.decreaseUserWatches()
+		removed += 1
+	return removed
+
+def rewatch_moved_folder(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,skip_list:'SkipList') -> None:
+	'''After a folder moved, make its watches match what the skip list wants at the new location.'''
+	wanted = get_all_folders(folder_path,skip_list)
+	wanted_norm = {folder.rstrip('/') for folder in wanted}
+	folder_norm = folder_path.rstrip('/')
+	prefix = folder_norm + '/'
+	watched = set()
+	for wd, wd_path in list(wdDic.items()):
+		wd_norm = wd_path.rstrip('/')
+		if wd_norm == folder_norm or not wd_norm.startswith(prefix):
+			continue
+		if wd_norm in wanted_norm:
+			watched.add(wd_norm)
+		else:
+			remove_watches_under(inotify_obj,wdDic,irm,wd_path)
+	for folder in wanted:
+		if folder.rstrip('/') in watched:
+			continue
+		irm.increaseUserWatches()
+		try:
+			wdDic[inotify_obj.add_watch(folder,watch_flags)] = folder
+		except Exception as e:
+			watcherTeeLogToTl(folder_path,f'Failed to add watch for {folder}: {e}',error=True)
+			irm.decreaseUserWatches()
 
 def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = False, skip = None):
 	'''

@@ -1,0 +1,153 @@
+import os
+import threading
+import pytest
+import reverberator as rv
+from tests.harness import seed_monitor, wait_until
+
+pytestmark = pytest.mark.inotify
+
+
+# same probes as tests/test_inotify.py, copied so this module does not import another test module
+def _events(to_process, lock):
+	with lock:
+		return list(to_process)
+
+
+def _wait_watch_ready(job, to_process, lock):
+	probe = os.path.join(job.monitor, '.watch_ready')
+	def ready():
+		if os.path.exists(probe):
+			os.remove(probe)
+		open(probe, 'w').write('1')
+		return any(e.event == 'create' and e.path.endswith('.watch_ready') for e in _events(to_process, lock))
+	wait_until(ready, message='watcher not ready')
+
+
+def _start(job, patterns):
+	to_process = rv.ChangeEventQueue(job.monitor)
+	lock = threading.Lock()
+	thread = threading.Thread(target=rv.watchFolder, kwargs=dict(
+		monitor_path=job.monitor, to_process=to_process, to_process_lock=lock, to_process_flag=threading.Event(),
+		irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=0, max_shapshot_delay_seconds=60,
+		skip_list=rv.SkipList(job.monitor, patterns)), daemon=True)
+	thread.start()
+	_wait_watch_ready(job, to_process, lock)
+	return thread, to_process, lock
+
+
+def _probe(job, to_process, lock):
+	path = os.path.join(job.monitor, 'probe.txt')
+	open(path, 'a').write('p')
+	wait_until(lambda: any(event.path == path for event in _events(to_process, lock)), message='probe not seen')
+
+
+def _stop(thread):
+	rv.GREEN_LIGHT.clear()
+	thread.join(timeout=2)
+	rv.GREEN_LIGHT.set()
+
+
+def _paths(to_process, lock, fragment):
+	return [event for event in _events(to_process, lock) if fragment in event.path or fragment in (event.moved_from or '')]
+
+
+def test_no_events_in_skipped_folder(job, poll_fast):
+	seed_monitor(job, {'cache/sub/': None, 'src/': None})
+	thread, to_process, lock = _start(job, ['cache/'])
+	try:
+		open(os.path.join(job.monitor, 'cache', 'sub', 'x'), 'w').write('x')
+		open(os.path.join(job.monitor, 'cache', 'y'), 'w').write('y')
+		_probe(job, to_process, lock)
+		assert _paths(to_process, lock, '/cache') == []
+	finally:
+		_stop(thread)
+
+
+def test_events_for_skipped_files_dropped(job, poll_fast):
+	thread, to_process, lock = _start(job, ['*.tmp'])
+	try:
+		open(os.path.join(job.monitor, 'a.tmp'), 'w').write('t')
+		_probe(job, to_process, lock)
+		assert _paths(to_process, lock, 'a.tmp') == []
+	finally:
+		_stop(thread)
+
+
+def test_created_folder_matching_pattern_gets_no_watch(job, poll_fast):
+	seed_monitor(job, {'src/': None})
+	thread, to_process, lock = _start(job, ['build/'])
+	try:
+		os.makedirs(os.path.join(job.monitor, 'src', 'build'))
+		open(os.path.join(job.monitor, 'src', 'build', 'f'), 'w').write('f')
+		_probe(job, to_process, lock)
+		assert _paths(to_process, lock, '/src/build') == []
+	finally:
+		_stop(thread)
+
+
+def test_move_into_skipped_name_is_delete(job, poll_fast):
+	seed_monitor(job, {'keep.txt': 'k'})
+	thread, to_process, lock = _start(job, ['*.tmp'])
+	try:
+		os.rename(os.path.join(job.monitor, 'keep.txt'), os.path.join(job.monitor, 'keep.tmp'))
+		src = os.path.join(job.monitor, 'keep.txt')
+		wait_until(lambda: any(e.event == 'delete' and e.path == src for e in _events(to_process, lock)), message='no delete')
+		assert [e for e in _events(to_process, lock) if e.event == 'move'] == []
+	finally:
+		_stop(thread)
+
+
+def test_move_out_of_skipped_name_is_create(job, poll_fast):
+	seed_monitor(job, {'a.tmp': 't'})
+	thread, to_process, lock = _start(job, ['*.tmp'])
+	try:
+		os.rename(os.path.join(job.monitor, 'a.tmp'), os.path.join(job.monitor, 'a.txt'))
+		dst = os.path.join(job.monitor, 'a.txt')
+		wait_until(lambda: any(e.event == 'create' and e.path == dst for e in _events(to_process, lock)), message='no create')
+		assert [e for e in _events(to_process, lock) if e.event == 'move'] == []
+	finally:
+		_stop(thread)
+
+
+def test_folder_moved_into_skipped_name_loses_watches(job, poll_fast):
+	seed_monitor(job, {'d/sub/': None})
+	thread, to_process, lock = _start(job, ['old_*/'])
+	try:
+		os.rename(os.path.join(job.monitor, 'd'), os.path.join(job.monitor, 'old_d'))
+		src = os.path.join(job.monitor, 'd')
+		wait_until(lambda: any(e.event == 'delete' and e.path == src and e.is_dir for e in _events(to_process, lock)), message='no delete')
+		open(os.path.join(job.monitor, 'old_d', 'sub', 'x'), 'w').write('x')
+		_probe(job, to_process, lock)
+		assert _paths(to_process, lock, 'old_d') == []
+	finally:
+		_stop(thread)
+
+
+def test_location_dependent_move_rewatches_subtree(job, poll_fast):
+	seed_monitor(job, {'projects/foo/build/': None, 'archive/bar/build/': None})
+	thread, to_process, lock = _start(job, ['projects/*/build/'])
+	try:
+		os.rename(os.path.join(job.monitor, 'projects', 'foo'), os.path.join(job.monitor, 'archive', 'foo'))
+		os.rename(os.path.join(job.monitor, 'archive', 'bar'), os.path.join(job.monitor, 'projects', 'bar'))
+		wait_until(lambda: len([e for e in _events(to_process, lock) if e.event == 'move']) == 2, message='moves not seen')
+		unskipped = os.path.join(job.monitor, 'archive', 'foo', 'build', 'x')
+		open(unskipped, 'w').write('x')
+		open(os.path.join(job.monitor, 'projects', 'bar', 'build', 'y'), 'w').write('y')
+		wait_until(lambda: any(e.path == unskipped for e in _events(to_process, lock)), message='unskipped folder not watched')
+		_probe(job, to_process, lock)
+		assert _paths(to_process, lock, '/projects/bar/build') == []
+	finally:
+		_stop(thread)
+
+
+def test_location_free_move_does_not_rewatch(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a/': None, 'b/': None})
+	calls = []
+	monkeypatch.setattr(rv, 'rewatch_moved_folder', lambda *args, **kwargs: calls.append(args))
+	thread, to_process, lock = _start(job, ['*.tmp'])
+	try:
+		os.rename(os.path.join(job.monitor, 'a'), os.path.join(job.monitor, 'b', 'a'))
+		wait_until(lambda: any(e.event == 'move' for e in _events(to_process, lock)), message='move not seen')
+		assert calls == []
+	finally:
+		_stop(thread)
