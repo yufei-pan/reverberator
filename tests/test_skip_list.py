@@ -195,3 +195,56 @@ def test_pending_resumes_when_only_skipped_paths_changed(job):
 	queue = rv.ChangeEventQueue(job.monitor)
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue, rv.SkipList(job.monitor, ['cache/'])) is True
 	assert [event.path for event in queue] == [a]
+
+
+def test_manifest_skip_fingerprint_round_trip(job):
+	os.makedirs(job.job_vault)
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.skip_fingerprint is None
+	manifest.begin()
+	manifest.set_skip_fingerprint('abc')
+	manifest.rollback()
+	assert manifest.skip_fingerprint is None
+	manifest.begin()
+	manifest.set_skip_fingerprint('abc')
+	manifest.commit()
+	manifest.close()
+	reopened = rv.VaultManifest(job.job_vault)
+	assert reopened.skip_fingerprint == 'abc'
+	reopened.close()
+
+
+def test_committed_version_records_fingerprint(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a'})
+	sl = rv.SkipList(job.monitor, ['*.tmp'])
+	_, manifest, _ = _backup(job, skip_list=sl)
+	assert manifest.skip_fingerprint == sl.fingerprint
+	manifest.close()
+	_, manifest, _ = _backup(job, {os.path.join(job.monitor, 'a.txt'): rv.BackupEntryValues('t', 'modify', None)})
+	assert manifest.skip_fingerprint == ''
+	manifest.close()
+
+
+def test_delta_with_no_differences_records_new_fingerprint(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a'})
+	_backup(job)[1].close()
+	sl = rv.SkipList(job.monitor, ['*.tmp'])
+	_, manifest, committed = _backup(job, skip_list=sl)
+	assert committed and len(committed_versions(job)) == 1
+	assert manifest.skip_fingerprint == sl.fingerprint
+	manifest.close()
+
+
+def test_interrupted_delta_keeps_old_fingerprint(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	_backup(job)[1].close()
+	original = rv.delta_generate_backup_entries
+	def interrupted(*args, **kwargs):
+		result = original(*args, **kwargs)
+		rv.GREEN_LIGHT.clear()
+		return result
+	monkeypatch.setattr(rv, 'delta_generate_backup_entries', interrupted)
+	_, manifest, committed = _backup(job, skip_list=rv.SkipList(job.monitor, ['*.tmp']))
+	rv.GREEN_LIGHT.set()
+	assert committed is False and manifest.skip_fingerprint == ''
+	manifest.close()

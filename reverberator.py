@@ -2273,6 +2273,10 @@ def do_backup(backup_entries:dict,
 				log_events_to_journal(backup_entries,journalPath)
 		if not backup_entries:
 			backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
+			# the walk completed with no differences, so the tree matches the manifest under this skip list
+			manifest.begin()
+			manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
+			manifest.commit()
 			if vaultInfo is None:
 				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 			return vaultInfo, manifest, True
@@ -2335,6 +2339,7 @@ def do_backup(backup_entries:dict,
 	content_file_content = [[path] + list(values) for path,values in backup_entries.items()]
 	# commit before the content file: without one the version is removed at startup, and a manifest
 	# describing a removed version is listed again from the vault
+	manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 	manifest.commit(backup_folder)
 	TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
 	backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
@@ -2970,6 +2975,16 @@ class VaultManifest:
 
 	def _set_version(self, version_path:str):
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (os.path.basename(os.path.normpath(version_path)),))
+
+	@property
+	def skip_fingerprint(self):
+		'''The skip list fingerprint recorded with the last committed state, or None when never recorded.'''
+		row = self.conn.execute("SELECT value FROM meta WHERE key = 'skip_fingerprint'").fetchone()
+		return None if row is None else row[0]
+
+	def set_skip_fingerprint(self, fingerprint:str):
+		'''Record fingerprint; the caller holds the transaction.'''
+		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('skip_fingerprint', ?)", (fingerprint,))
 
 	def describes(self, version_path:str) -> bool:
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
