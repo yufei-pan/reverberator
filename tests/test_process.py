@@ -4,7 +4,7 @@ import pytest
 import reverberator as rv
 from tests.harness import (
 	write_rule, seed_monitor, wait_for_committed_count, committed_versions,
-	write_incomplete_version, write_pending, wait_until,
+	write_incomplete_version, write_pending, wait_until, create_job, rule_row,
 )
 
 pytestmark = pytest.mark.process
@@ -83,3 +83,26 @@ def test_pending_resume_and_discard(job, run_reverberator):
 	run_reverberator(job.rule_path)
 	wait_for_committed_count(job, 1, timeout=10)
 	wait_until(lambda: not os.path.exists(pending), timeout=10, message='pending file not consumed')
+
+
+def test_skip_list_relative_to_rule_file_keeps_matches_out(job, run_reverberator):
+	seed_monitor(job, {'a.txt': 'a', 'x.tmp': 't'})
+	open(os.path.join(job.root, 'skip.txt'), 'w').write('*.tmp\n')
+	write_rule(job, skip_list_file='skip.txt')
+	run_reverberator(job.rule_path)
+	v0 = wait_for_committed_count(job, 1, timeout=10)[0]
+	assert os.path.isfile(os.path.join(v0, 'a.txt')) and not os.path.lexists(os.path.join(v0, 'x.tmp'))
+	open(os.path.join(job.monitor, 'y.tmp'), 'w').write('y')
+	open(os.path.join(job.monitor, 'b.txt'), 'w').write('b')
+	versions = wait_for_committed_count(job, 2, timeout=10)
+	assert os.path.lexists(os.path.join(versions[-1], 'b.txt')) and not os.path.lexists(os.path.join(versions[-1], 'y.tmp'))
+
+
+def test_job_with_missing_skip_list_does_not_stop_other_jobs(job, tmp_path, run_reverberator):
+	other = create_job(str(tmp_path / 'other'), 'other')
+	seed_monitor(job, {'a.txt': 'a'})
+	seed_monitor(other, {'b.txt': 'b'})
+	write_rule(job, skip_list_file=os.path.join(job.root, 'missing'), extra_rows=[rule_row(other)])
+	proc = run_reverberator(job.rule_path)
+	wait_for_committed_count(other, 1, timeout=10)
+	assert proc.poll() is None and committed_versions(job) == []
