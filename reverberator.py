@@ -3608,43 +3608,29 @@ def inside_folders(path:str, folders:set, start:int = 0) -> bool:
 		i = path.find('/', i + 1)
 	return False
 
-def count_entry_usage(st:os.stat_result, count_size:bool, count_inodes:bool, seen:tuple) -> tuple:
-	'''
-	The bytes and inodes one entry adds, counting a file with several hard links once for each, as du does.
-	seen is a pair of sets of (st_dev, st_ino): the files already counted for size, and for inodes.
-	'''
-	if st.st_nlink > 1 and not stat.S_ISDIR(st.st_mode):
-		key = (st.st_dev, st.st_ino)
-		if count_size:
-			count_size = key not in seen[0]
-			seen[0].add(key)
-		if count_inodes:
-			count_inodes = key not in seen[1]
-			seen[1].add(key)
-	return (st.st_blocks * 512 if count_size else 0), (1 if count_inodes else 0)
-
-def get_unskipped_size_inodes(path:str, skip_list:'SkipList', count_size:bool = True, count_inodes:bool = True, seen:tuple = None) -> tuple:
+def get_unskipped_size_inodes(path:str, skip_list:'SkipList', count_size:bool = True, count_inodes:bool = True) -> tuple:
 	'''
 	The disk usage in bytes and the inode count of path and, for a folder (ending with /), of what the skip list leaves
-	below it, as du -csP would report them for a copy that leaves the skipped paths out. Skipped folders are not
-	descended into. Entries that vanish are left out. Pass the same seen (see count_entry_usage) to several calls to
-	count a hard-linked file once across them.
+	below it, for a copy that leaves the skipped paths out. Skipped folders are not descended into, and entries that
+	vanish are left out. Each name is counted, as the replay copies each name of a hard-linked file on its own.
 	'''
-	if seen is None:
-		seen = (set(), set())
 	try:
-		size, inodes = count_entry_usage(os.lstat(path), count_size, count_inodes, seen)
+		blocks = os.lstat(path).st_blocks
 	except OSError:
 		return 0, 0
+	size = blocks * 512 if count_size else 0
+	inodes = 1 if count_inodes else 0
 	if not path.endswith('/'):
 		return size, inodes
 	for entry_path, _, _ in iter_tree_entries(path, skip_list.folder_rel(path), skip=skip_list.skips):
 		try:
-			entry_size, entry_inodes = count_entry_usage(os.lstat(entry_path), count_size, count_inodes, seen)
+			blocks = os.lstat(entry_path).st_blocks
 		except OSError:
 			continue
-		size += entry_size
-		inodes += entry_inodes
+		if count_size:
+			size += blocks * 512
+		if count_inodes:
+			inodes += 1
 	return size, inodes
 
 def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None): 
@@ -3683,7 +3669,6 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 					sized_folders.add(entry)
 				elif values.event == 'modify' or (not only_sync_attributes and values.event == 'attrib'):
 					sized_folders.add(entry)
-		seen = (set(), set())
 		# entries lie below the monitored folder, so only parents from it down can hold them
 		parents_from = len(monitor_path.rstrip('/'))
 	for entry in backup_entries:
@@ -3694,7 +3679,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 				# we do not count inode change for attrib / modify / move events
 				count_inodes = event == 'create' and not inside_folders(entry, created_folders, parents_from)
 				if count_size or count_inodes:
-					entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, count_size, count_inodes, seen)
+					entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, count_size, count_inodes)
 					total_size += entry_size
 					total_inode_change += entry_inodes
 			continue
