@@ -117,6 +117,27 @@ def test_backuper_with_bad_pattern_stops_only_its_job(job, poll_fast):
 	assert rv.GREEN_LIGHT.is_set() and committed_versions(job) == []
 
 
+def _load_raises(monkeypatch):
+	def load(cls, monitor_path, path):
+		raise RuntimeError('unexpected')
+	monkeypatch.setattr(rv.SkipList, 'load', classmethod(load))
+
+
+def test_load_unexpected_error_fails(job, monkeypatch):
+	_load_raises(monkeypatch)
+	startup = rv.JobStartup(job.job_name, job.monitor, _skip_file(job, '*.tmp\n'))
+	assert startup.load(None) is False and startup.failed and startup.loaded.is_set()
+
+
+def test_backuper_with_unexpected_load_error_stops_only_its_job(job, poll_fast, monkeypatch):
+	_load_raises(monkeypatch)
+	startup = rv.JobStartup(job.job_name, job.monitor, _skip_file(job, '*.tmp\n'))
+	thread = _run_backuper(job, startup)
+	thread.join(timeout=5)
+	assert not thread.is_alive() and startup.failed
+	assert rv.GREEN_LIGHT.is_set() and committed_versions(job) == []
+
+
 def test_watcher_exits_without_stopping_others_when_list_failed(job, poll_fast):
 	startup = rv.JobStartup(job.job_name, job.monitor, os.path.join(job.root, 'missing'))
 	startup.load(None)

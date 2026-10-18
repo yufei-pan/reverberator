@@ -515,6 +515,11 @@ class JobStartup:
 			backuperTeeLogToTl(self.job_name,f'Skip list: {len(skip_list.patterns)} patterns from {source}',ok=True)
 			ok = True
 			return True
+		except Exception:
+			# the backuper stops every job on an error it catches, so anything else stops only this one here
+			import traceback
+			backuperTeeLogToTl(self.job_name,f'Unexpected error loading skip list file {self.skip_list_path} for job {self.job_name}. Not backing up this job\n{traceback.format_exc()}',error=True)
+			return False
 		finally:
 			# the watcher reads failed once loaded is set, so an unexpected error counts as a failure too
 			self.failed = not ok
