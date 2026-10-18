@@ -65,6 +65,13 @@ def test_load_reads_crlf_and_bom_like_lf(tmp_path):
 	assert b.skips('x.tmp') and b.skips('cache/') and b.source == str(crlf)
 
 
+def test_load_splits_only_on_newlines(tmp_path):
+	# str.splitlines() also splits on form feeds, file separators and U+2028
+	path = tmp_path / 'odd'
+	path.write_bytes('a\x0cb.tmp\nc\u2028d/\n'.encode())
+	assert rv.SkipList.load(str(tmp_path), str(path)).patterns == ['a\x0cb.tmp', 'c\u2028d/']
+
+
 def test_load_refuses_unreadable_lists(tmp_path):
 	with pytest.raises(OSError):
 		rv.SkipList.load(str(tmp_path), str(tmp_path / 'missing'))
@@ -291,6 +298,76 @@ def test_folder_moved_into_location_pattern_drops_newly_skipped(job, poll_fast):
 	assert os.path.isfile(os.path.join(v0, 'archive', 'foo', 'build', 'a.o'))
 	assert not os.path.lexists(os.path.join(v1, 'projects', 'foo', 'build'))
 	assert os.path.lexists(os.path.join(v1, 'projects', 'foo', 'src.c'))
+
+
+def test_folder_moved_into_location_pattern_collapses_nested_skipped(job, poll_fast, monkeypatch):
+	sl = rv.SkipList(job.monitor, ['projects/**/build/'])
+	seed_monitor(job, {'archive/foo/src.c': 's', 'archive/foo/build/sub/build/deep.o': 'o', 'projects/': None})
+	_backup(job, skip_list=sl)[1].close()
+	removed = []
+	original = rv.VaultManifest.remove_tree
+	monkeypatch.setattr(rv.VaultManifest, 'remove_tree', lambda self, folder: removed.append(folder) or original(self, folder))
+	_, manifest, committed = _backup(job, _move_entry(job, 'archive/foo', 'projects/foo'), skip_list=sl)
+	assert committed
+	# the nested build/ folder goes with its skipped parent, not on its own
+	assert [folder for folder in removed if folder.startswith('projects/foo/build/')] == ['projects/foo/build/']
+	assert list(manifest.iter_under('projects/foo/')) == ['projects/foo/src.c']
+	manifest.close()
+	v1 = committed_versions(job)[1]
+	assert not os.path.lexists(os.path.join(v1, 'projects', 'foo', 'build'))
+
+
+def test_file_moved_into_location_pattern_is_dropped(job, poll_fast):
+	sl = rv.SkipList(job.monitor, ['projects/*/*.o'])
+	seed_monitor(job, {'archive/foo/src.c': 's', 'archive/foo/a.o': 'o', 'projects/': None})
+	_backup(job, skip_list=sl)[1].close()
+	_, manifest, committed = _backup(job, _move_entry(job, 'archive/foo', 'projects/foo'), skip_list=sl)
+	assert committed and manifest.lookup('projects/foo/a.o') is None and manifest.lookup('projects/foo/src.c') is not None
+	manifest.close()
+	v0, v1 = committed_versions(job)
+	assert os.path.isfile(os.path.join(v0, 'archive', 'foo', 'a.o'))
+	assert not os.path.lexists(os.path.join(v1, 'projects', 'foo', 'a.o'))
+	assert os.path.lexists(os.path.join(v1, 'projects', 'foo', 'src.c'))
+
+
+def test_unskipped_entries_below_a_tracked_folder_are_copied(job, poll_fast):
+	sl = rv.SkipList(job.monitor, ['projects/**/build/', 'projects/**/*.o'])
+	seed_monitor(job, {'projects/foo/lib/z.c': 'z', 'projects/foo/lib/x.o': 'x', 'projects/foo/lib/build/b.o': 'b',
+		'projects/foo/lib/build/sub/c.o': 'c', 'projects/foo/lib/y.c': 'y', 'archive/': None})
+	_backup(job, skip_list=sl)[1].close()
+	_, manifest, committed = _backup(job, _move_entry(job, 'projects/foo', 'archive/foo'), skip_list=sl)
+	assert committed
+	assert list(manifest.iter_under('archive/foo/')) == ['archive/foo/lib/', 'archive/foo/lib/build/', 'archive/foo/lib/build/b.o',
+		'archive/foo/lib/build/sub/', 'archive/foo/lib/build/sub/c.o', 'archive/foo/lib/x.o', 'archive/foo/lib/y.c', 'archive/foo/lib/z.c']
+	manifest.close()
+	lib = os.path.join(committed_versions(job)[1], 'archive', 'foo', 'lib')
+	assert open(os.path.join(lib, 'x.o')).read() == 'x'
+	assert open(os.path.join(lib, 'build', 'b.o')).read() == 'b'
+	assert open(os.path.join(lib, 'build', 'sub', 'c.o')).read() == 'c'
+	assert os.path.lexists(os.path.join(lib, 'y.c')) and os.path.lexists(os.path.join(lib, 'z.c'))
+
+
+def test_failed_vault_rename_still_drops_newly_skipped(job, poll_fast, monkeypatch):
+	sl = rv.SkipList(job.monitor, ['projects/*/build/'])
+	seed_monitor(job, {'archive/foo/src.c': 's', 'archive/foo/build/a.o': 'o', 'projects/': None})
+	_backup(job, skip_list=sl)[1].close()
+	original = os.rename
+	def rename(src, dst, *args, **kwargs):
+		if str(src).startswith(job.job_vault) and os.path.basename(str(src).rstrip('/')) == 'foo':
+			raise OSError(18, 'Invalid cross-device link')
+		return original(src, dst, *args, **kwargs)
+	entries = _move_entry(job, 'archive/foo', 'projects/foo')
+	monkeypatch.setattr(os, 'rename', rename)
+	# the vault rename fails, so the folder is copied from the source and the old one deleted
+	_, manifest, committed = _backup(job, entries, skip_list=sl)
+	monkeypatch.setattr(os, 'rename', original)
+	assert committed
+	assert manifest.lookup('projects/foo/build/') is None and manifest.lookup('projects/foo/build/a.o') is None
+	assert manifest.lookup('projects/foo/src.c') is not None and manifest.lookup('archive/foo/') is None
+	manifest.close()
+	v1 = committed_versions(job)[1]
+	assert not os.path.lexists(os.path.join(v1, 'projects', 'foo', 'build'))
+	assert os.path.lexists(os.path.join(v1, 'projects', 'foo', 'src.c')) and not os.path.lexists(os.path.join(v1, 'archive', 'foo'))
 
 
 def test_location_free_patterns_skip_the_recheck(job, poll_fast, monkeypatch):

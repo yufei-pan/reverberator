@@ -412,7 +412,8 @@ class SkipList:
 	def load(cls, monitor_path:str, path:str):
 		'''Read a skip list file; OSError and ValueError (bad pattern, bad regex or encoding) propagate.'''
 		with open(path, 'r', encoding='utf-8-sig') as f:
-			return cls(monitor_path, f.read().splitlines(), path)
+			# universal newlines already turned CR and CRLF into LF; splitlines() would also split on form feeds and the like
+			return cls(monitor_path, f.read().split('\n'), path)
 
 	@staticmethod
 	def _location_dependent(pattern:str) -> bool:
@@ -440,6 +441,8 @@ class SkipList:
 
 	def skips_path(self, path:str, is_dir:bool) -> bool:
 		'''Like skips() for an absolute path; the root and paths outside it are never skipped.'''
+		if not self.patterns:
+			return False
 		root = self.monitor_path.rstrip('/')
 		path = path.rstrip('/')
 		if not path.startswith(root + '/'):
@@ -858,6 +861,9 @@ def upgrade_rule_file_header(rule_file:str) -> bool:
 	try:
 		with os.fdopen(fd, 'w', newline='', encoding='utf-8') as f:
 			f.write('\n'.join(lines))
+			# on disk before the rename, so a crash cannot leave an empty rule file in its place
+			f.flush()
+			os.fsync(f.fileno())
 		original = os.stat(rule_file)
 		os.chmod(temp_path, stat.S_IMODE(original.st_mode))
 		try:
@@ -918,7 +924,8 @@ def parse_rules(rule_file:str):
 	try:
 		if upgrade_rule_file_header(rule_file):
 			tl.info(f'Upgraded rule file {rule_file} header with the Skip List File column.')
-	except OSError as e:
+	except (OSError, ValueError) as e:
+		# ValueError: a compressed or non UTF-8 rule file, which TSVZ still reads
 		tl.teelog(f'Warning: Cannot upgrade rule file {rule_file} ({e}). The Skip List File column cannot be used until the header is upgraded.',level='warning')
 
 	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=DEBUG)
@@ -3986,6 +3993,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				copy_path(isDir=sub_is_dir,monitor_path=monitor_path,source_real_path=sub_real_path,
 				  source_relative_path=sub_rel.rstrip('/'),file_vault_real_path=os.path.join(backup_folder,sub_rel),
 				  backup_folder=backup_folder,mcae=mcae)
+				# a copied folder took everything below it along; a copied file has nothing below it
 				copied = sub_rel if sub_is_dir else None
 	# this function does the actual backup using a referenced version and a change list to copy the source from
 	# reverb backup flow:
@@ -4077,9 +4085,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
 				  relative_path=link_source_relative_path,mcae=mcae)
 				wait_for_async_commands(mcae)
-			else:
-				if isDir and skip_list is not None and skip_list.location_dependent:
-					recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
+			# the copy fallback keeps the rows move_tree moved too, so both ways need the re-check
+			if isDir and skip_list is not None and skip_list.location_dependent:
+				recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
 	if need_delete_barrier:
 		wait_for_async_commands(mcae)
 	wait_for_async_commands(mcae)

@@ -173,6 +173,8 @@ def test_location_free_move_does_not_rewatch(job, poll_fast, monkeypatch):
 	try:
 		os.rename(os.path.join(job.monitor, 'a'), os.path.join(job.monitor, 'b', 'a'))
 		wait_until(lambda: any(e.event == 'move' for e in _events(to_process, lock)), message='move not seen')
+		# the probe is read after the move, so a re-walk of the moved folder would have happened by now
+		_probe(job, to_process, lock)
 		assert calls == []
 	finally:
 		_stop(thread)
