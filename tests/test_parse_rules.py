@@ -186,6 +186,7 @@ def _old_rule_file(job, newline='\n'):
 	lines = [
 		OLD_HEADER_LINE,
 		'# The name for the Job\t' + '\t'.join(['d'] * 10),
+		'# need to be unique\t' + '\t'.join(['e'] * 10),
 		'#_defaults_#\t\t/var/reverbs/\tauto\t60\t86400\tTrue\tTrue\t0\t5%,i5%\tauto',
 		'\t'.join(rule_row(job)[:11]),
 	]
@@ -201,7 +202,8 @@ def test_parse_rules_upgrades_old_header_in_place(job, newline):
 	got = open(job.rule_path, newline='').read().split(newline)
 	assert got[0] == '\t'.join(rv.REVERB_RULE_TSV_HEADER)
 	assert got[1] == lines[1] + '\t' + rv.SKIP_LIST_COLUMN_DESCRIPTIONS[0]
-	assert got[2:4] == lines[2:4] and got[4:] == ['']
+	assert got[2] == lines[2] + '\t' + rv.SKIP_LIST_COLUMN_DESCRIPTIONS[1]
+	assert got[3:5] == lines[3:5] and got[5:] == ['']
 	assert rv.upgrade_rule_file_header(job.rule_path) is False
 
 
@@ -244,3 +246,24 @@ def test_sample_rule_file_has_skip_column(tmp_path):
 	first = path.read_text().splitlines()[0].split('\t')
 	assert [cell.strip() for cell in first] == rv.REVERB_RULE_TSV_HEADER
 	assert rv.upgrade_rule_file_header(str(path)) is False
+
+
+def test_upgrade_follows_symlinked_rule_file(job, tmp_path):
+	_old_rule_file(job)
+	real = tmp_path / 'real.tsv'
+	os.replace(job.rule_path, real)
+	os.symlink(real, job.rule_path)
+	assert rv.upgrade_rule_file_header(job.rule_path) is True
+	assert os.path.islink(job.rule_path)
+	assert real.read_text().split('\n')[0] == '\t'.join(rv.REVERB_RULE_TSV_HEADER)
+
+
+def test_parse_rules_survives_failed_header_upgrade(job, monkeypatch):
+	_old_rule_file(job)
+	before = open(job.rule_path, newline='').read()
+	def deny(*args, **kwargs):
+		raise PermissionError('read-only')
+	monkeypatch.setattr(rv.tempfile, 'mkstemp', deny)
+	rules = rv.parse_rules(job.rule_path)
+	assert [rule.job_name for rule in rules] == [job.job_name]
+	assert open(job.rule_path, newline='').read() == before
