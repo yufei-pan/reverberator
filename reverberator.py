@@ -2459,7 +2459,7 @@ def do_backup(backup_entries:dict,
 			if vaultInfo is None:
 				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 			return vaultInfo, manifest, True
-		estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path)
+		estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path,skip_list = skip_list)
 		backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
 		estimated_backup_inode = latest_version_info.inode + estimated_backup_inode_change
 		backuperTeeLogToTl(job_name,f'Estimated backup inodes {estimated_backup_inode}')
@@ -3527,7 +3527,26 @@ def hash_file(path,size = ...,full_hash=False):
 				hasher.update(chunk)
 	return hasher.hexdigest()
 
-def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str): 
+def get_unskipped_size_inodes(folder_path:str, skip_list:'SkipList') -> tuple:
+	'''
+	The disk usage in bytes and the inode count of a folder and of what the skip list leaves below it, as du -csP
+	would report them for a copy that leaves the skipped paths out. Skipped folders are not descended into.
+	A file with several hard links is counted under each name, so the result can only overestimate. Entries that vanish are left out.
+	'''
+	try:
+		size = os.lstat(folder_path).st_blocks * 512
+	except OSError:
+		return 0, 0
+	inodes = 1
+	for entry_path, _, _ in iter_tree_entries(folder_path, skip_list.folder_rel(folder_path), skip=skip_list.skips):
+		try:
+			size += os.lstat(entry_path).st_blocks * 512
+		except OSError:
+			continue
+		inodes += 1
+	return size, inodes
+
+def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None): 
 	'''
 	This function gets the size of the backup entries
 
@@ -3536,6 +3555,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 		only_sync_attributes (bool): Whether to only sync the attributes
 		last_vault_version_path (str): The path of the last vault version
 		monitor_path (str): The path of the monitored path
+		skip_list (SkipList): The job's skip list; with patterns, folders are measured without their skipped contents
 
 	Returns:
 		tuple: The size and inode change compared to previous backup of the backup entries
@@ -3547,8 +3567,15 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	path_pending_to_get_size = []
 	path_pending_to_get_inode_add = []
 	path_pending_to_get_inode_del = []
+	# du would count skipped caches the copy leaves out, and the size limit would prune history to make room for them
+	walk_folders = bool(skip_list)
 	for entry in backup_entries:
 		if backup_entries[entry].event == 'create' :
+			if entry.endswith('/') and walk_folders:
+				folder_size, folder_inodes = get_unskipped_size_inodes(entry, skip_list)
+				total_size += folder_size
+				total_inode_change += folder_inodes
+				continue
 			path_pending_to_get_size.append(entry)
 			if entry.endswith('/'):
 				# this is a directory
@@ -3556,6 +3583,9 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 			else:
 				total_inode_change += 1
 		elif backup_entries[entry].event == 'modify' or (not only_sync_attributes and backup_entries[entry].event == 'attrib'):
+			if entry.endswith('/') and walk_folders:
+				total_size += get_unskipped_size_inodes(entry, skip_list)[0]
+				continue
 			path_pending_to_get_size.append(entry)
 			# we do not count inode change for attrib / modify / move events
 		elif backup_entries[entry].event == 'delete':

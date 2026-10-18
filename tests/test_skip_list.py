@@ -106,11 +106,11 @@ def test_skip_list_change(recorded, current, explicit_none, expected):
 	assert rv.skip_list_change(recorded, current, explicit_none) == expected
 
 
-def _backup(job, entries=None, skip_list=None, keep_one_complete_backup=True):
+def _backup(job, entries=None, skip_list=None, keep_one_complete_backup=True, backup_size_limit='0'):
 	return rv.do_backup(
 		OrderedDict() if entries is None else entries, job_name=job.job_name, monitor_path=job.monitor,
 		vault_path=job.vault, keep_one_complete_backup=keep_one_complete_backup, only_sync_attributes=True,
-		keep_n_versions=0, backup_size_limit='0', skip_list=skip_list,
+		keep_n_versions=0, backup_size_limit=backup_size_limit, skip_list=skip_list,
 	)
 
 
@@ -302,3 +302,56 @@ def test_location_free_patterns_skip_the_recheck(job, poll_fast, monkeypatch):
 	monkeypatch.setattr(rv, 'iter_tree_entries', lambda path, *args, **kwargs: walked.append(path) or original(path, *args, **kwargs))
 	_backup(job, _move_entry(job, 'a', 'b/a'), skip_list=sl)[1].close()
 	assert not any(path.rstrip('/') == os.path.join(job.monitor, 'b', 'a') for path in walked)
+
+
+def _write_random(path, size):
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	with open(path, 'wb') as f:
+		# random bytes so a compressing filesystem still allocates every block
+		f.write(os.urandom(size))
+
+
+def _project_with_skipped_cache(job, cache_files=3, cache_file_size=1 << 20):
+	proj = os.path.join(job.monitor, 'proj')
+	write_tree(proj, {'src.c': 's'})
+	for i in range(cache_files):
+		_write_random(os.path.join(proj, 'node_modules', f'big{i}.bin'), cache_file_size)
+	return proj
+
+
+def test_size_estimate_walks_around_skipped_content(job):
+	proj = _project_with_skipped_cache(job)
+	entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'create', None)})
+	full_size, full_inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor)
+	assert full_size >= 3 << 20 and full_inodes == 6
+	size, inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/']))
+	# proj/ and proj/src.c only
+	assert inodes == 2
+	assert 0 < size < 1 << 20
+	assert size == sum(os.lstat(path).st_blocks * 512 for path in (proj, os.path.join(proj, 'src.c')))
+	# a folder modify or attrib is sized by the same walk
+	for event in ('modify', 'attrib'):
+		entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', event, None)})
+		assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/'])) == (size, 0)
+	# no patterns keeps du
+	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, [])) == (full_size, 0)
+
+
+def test_skipped_content_does_not_prune_history(job, poll_fast):
+	sl = rv.SkipList(job.monitor, ['node_modules/'])
+	seed_monitor(job, {'a.txt': 'a'})
+	_backup(job, skip_list=sl, backup_size_limit='1M')[1].close()
+	for i in range(3):
+		path = os.path.join(job.monitor, f'f{i}.txt')
+		open(path, 'w').write('x' * 100)
+		_backup(job, OrderedDict({path: rv.BackupEntryValues('t', 'create', None)}), skip_list=sl, backup_size_limit='1M')[1].close()
+	assert len(committed_versions(job)) == 4
+	# a folder arrives already holding a skipped cache three times the size limit
+	proj = _project_with_skipped_cache(job)
+	entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'create', None)})
+	_, manifest, committed = _backup(job, entries, skip_list=sl, backup_size_limit='1M')
+	manifest.close()
+	versions = committed_versions(job)
+	assert committed and len(versions) == 5
+	assert os.path.isfile(os.path.join(versions[-1], 'proj', 'src.c'))
+	assert not os.path.lexists(os.path.join(versions[-1], 'proj', 'node_modules'))
