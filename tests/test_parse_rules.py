@@ -2,7 +2,7 @@ import os
 import pytest
 import TSVZ
 import reverberator as rv
-from tests.harness import write_rule
+from tests.harness import write_rule, rule_row, create_job
 
 pytestmark = pytest.mark.unit
 
@@ -175,3 +175,72 @@ def test_parse_rules_tsvz_defaults_fill_blank_min(job):
 	rules = rv.parse_rules(job.rule_path)
 	assert len(rules) == 1
 	assert rules[0].min_shapshot_time == '60'
+
+
+OLD_HEADER_LINE = ('Job Name (Unique Key)\tPath Monitoring\tVault Path\tMonitoring File System Signature\t'
+	'Minium snapshot interval\tMaximum snapshot interval\tKeep 1 Compelete Backup\t'
+	'Only Sync Attributes (permissions) \tKeep N versions\tBackup Size Limit\tVault File System Signature')
+
+
+def _old_rule_file(job, newline='\n'):
+	lines = [
+		OLD_HEADER_LINE,
+		'# The name for the Job\t' + '\t'.join(['d'] * 10),
+		'#_defaults_#\t\t/var/reverbs/\tauto\t60\t86400\tTrue\tTrue\t0\t5%,i5%\tauto',
+		'\t'.join(rule_row(job)[:11]),
+	]
+	with open(job.rule_path, 'w', newline='') as f:
+		f.write(newline.join(lines) + newline)
+	return lines
+
+
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_parse_rules_upgrades_old_header_in_place(job, newline):
+	lines = _old_rule_file(job, newline)
+	assert rv.parse_rules(job.rule_path)[0].skip_list_file == ''
+	got = open(job.rule_path, newline='').read().split(newline)
+	assert got[0] == '\t'.join(rv.REVERB_RULE_TSV_HEADER)
+	assert got[1] == lines[1] + '\t' + rv.SKIP_LIST_COLUMN_DESCRIPTIONS[0]
+	assert got[2:4] == lines[2:4] and got[4:] == ['']
+	assert rv.upgrade_rule_file_header(job.rule_path) is False
+
+
+def test_parse_rules_skip_list_value_survives_write_back(job):
+	_old_rule_file(job)
+	rv.parse_rules(job.rule_path)
+	with open(job.rule_path, 'a') as f:
+		f.write('\t'.join(rule_row(job, min_snapshot='auto', skip_list_file='skip.txt')) + '\n')
+	assert rv.parse_rules(job.rule_path)[0].skip_list_file == 'skip.txt'
+	# the auto fill above appended an updated row; reading that row back keeps the value
+	assert rv.parse_rules(job.rule_path)[0].skip_list_file == 'skip.txt'
+
+
+def test_parse_rules_defaults_row_fills_skip_list_and_none_opts_out(job, tmp_path):
+	other = create_job(str(tmp_path / 'other'), 'other')
+	rows = [
+		'\t'.join(rv.REVERB_RULE_TSV_HEADER),
+		'\t'.join(['#_defaults_#'] + [''] * 10 + ['shared.txt']),
+		'\t'.join(rule_row(job)),
+		'\t'.join(rule_row(other, skip_list_file='none')),
+	]
+	open(job.rule_path, 'w').write('\n'.join(rows) + '\n')
+	by_name = {rule.job_name: rule for rule in rv.parse_rules(job.rule_path)}
+	assert by_name[job.job_name].skip_list_file == 'shared.txt'
+	assert by_name['other'].skip_list_file == 'none'
+
+
+def test_resolve_skip_list_path(tmp_path):
+	rule = str(tmp_path / 'rules' / 'r.tsv')
+	assert rv.resolve_skip_list_path('skip.txt', rule) == str(tmp_path / 'rules' / 'skip.txt')
+	assert rv.resolve_skip_list_path('../s/skip.txt', rule) == str(tmp_path / 's' / 'skip.txt')
+	assert rv.resolve_skip_list_path('/etc/skip', rule) == '/etc/skip'
+	for cell in ('', '  ', 'auto', 'none', 'None ', 'AUTO'):
+		assert rv.resolve_skip_list_path(cell, rule) is None
+
+
+def test_sample_rule_file_has_skip_column(tmp_path):
+	path = tmp_path / 'sample.tsv'
+	path.write_text(rv.SAMPLE_REVERB_RULE_FILE.strip() + '\n')
+	first = path.read_text().splitlines()[0].split('\t')
+	assert [cell.strip() for cell in first] == rv.REVERB_RULE_TSV_HEADER
+	assert rv.upgrade_rule_file_header(str(path)) is False

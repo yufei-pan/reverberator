@@ -22,6 +22,7 @@ import re
 import glob
 import select
 import sqlite3
+import tempfile
 import stat
 import errno
 import fcntl
@@ -75,11 +76,12 @@ BACKUP_JOURNAL_HEADER = ['at_path','iso_time','event','source_path']
 REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Vault Path','Monitoring File System Signature', 
 		'Minium snapshot interval', 'Maximum snapshot interval','Keep 1 Compelete Backup', 
 		'Only Sync Attributes (permissions)', 'Keep N versions', 'Backup Size Limit', 
-		'Vault File System Signature']
+		'Vault File System Signature', 'Skip List File']
 REVERB_RULE_HEADER = ['job_name', 'mon_path','vault_path', 'mon_fs_signature', 
 		'min_shapshot_time','max_shapshot_time' , 'keep_one_complete_backup', 
 		'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
-		'vault_fs_signature']
+		'vault_fs_signature', 'skip_list_file']
+SKIP_LIST_COLUMN_DESCRIPTIONS = ('A gitignore style list of paths not to back up, matched relative to the monitored path', 'Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything')
 VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
 VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes']
 VAULT_TIMESTAMP_FORMAT = '%Y-%m-%d_%H-%M-%S_%z'
@@ -545,12 +547,12 @@ MANIFEST_BATCH_SIZE = 10000
 DEBUG = False
 
 SAMPLE_REVERB_RULE_FILE = '''
-Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signature	Minium snapshot interval	Maximum snapshot interval	Keep 1 Compelete Backup	Only Sync Attributes (permissions) 	Keep N versions	Backup Size Limit	Vault File System Signature
-# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	When vault is empty, copy entire monitorig path to vault instead of using links	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Stricter (smaller) limits take precedence	The UUID > Label > path for the vault file system
-# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS
+Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signature	Minium snapshot interval	Maximum snapshot interval	Keep 1 Compelete Backup	Only Sync Attributes (permissions) 	Keep N versions	Backup Size Limit	Vault File System Signature	Skip List File
+# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	When vault is empty, copy entire monitorig path to vault instead of using links	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Stricter (smaller) limits take precedence	The UUID > Label > path for the vault file system	A gitignore style list of paths not to back up, matched relative to the monitored path
+# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS	Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything
 # Incomplete V* directories (no .modified_contents.nsv) are removed on startup.
 # If you need data from a partial backup after a crash/stop, copy it out before restarting.
-#_defaults_#		/var/reverbs/	auto	60	86400	True	True	0	5%,i5%	auto
+#_defaults_#		/var/reverbs/	auto	60	86400	True	True	0	5%,i5%	auto	
 '''
 
 tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=False,noLog=True)
@@ -764,6 +766,63 @@ def get_args(args = None):
 	startArgs.append(f'\'{args.rule_path}\'')
 	return args, ' '.join(startArgs)
 
+def upgrade_rule_file_header(rule_file:str) -> bool:
+	'''
+	Upgrade an old 11 column rule file in place by adding the Skip List File column to the header
+	and to the stock comment rows. Every other byte, including line endings, is kept.
+
+	Args:
+		rule_file (str): The rule file
+
+	Returns:
+		changed (bool): Whether the file was rewritten
+	'''
+	with open(rule_file, 'r', newline='', encoding='utf-8') as f:
+		text = f.read()
+	lines = text.split('\n')
+	def cells_of(line:str) -> list:
+		return line.rstrip('\r').split('\t')
+	if [cell.strip() for cell in cells_of(lines[0])] != REVERB_RULE_TSV_HEADER[:-1]:
+		return False
+	def with_suffix(line:str, suffix:str) -> str:
+		body = line.rstrip('\r')
+		return body + suffix + line[len(body):]
+	lines[0] = '\t'.join(REVERB_RULE_TSV_HEADER) + lines[0][len(lines[0].rstrip('\r')):]
+	for i, line in enumerate(lines[1:], 1):
+		for index, prefix in enumerate(('# The name for the Job', '# need to be unique')):
+			if line.startswith(prefix) and len(cells_of(line)) == len(REVERB_RULE_TSV_HEADER) - 1:
+				lines[i] = with_suffix(line, '\t' + SKIP_LIST_COLUMN_DESCRIPTIONS[index])
+	directory = os.path.dirname(os.path.abspath(rule_file))
+	fd, temp_path = tempfile.mkstemp(dir=directory, prefix='.' + os.path.basename(rule_file) + '.')
+	try:
+		with os.fdopen(fd, 'w', newline='', encoding='utf-8') as f:
+			f.write('\n'.join(lines))
+		os.chmod(temp_path, stat.S_IMODE(os.stat(rule_file).st_mode))
+		os.replace(temp_path, rule_file)
+	except BaseException:
+		if os.path.exists(temp_path):
+			os.remove(temp_path)
+		raise
+	return True
+
+def resolve_skip_list_path(cell:str, rule_file:str) -> str:
+	'''
+	Resolve the Skip List File cell to a path, None when the job has no skip list.
+
+	>>> resolve_skip_list_path('', '/etc/r/rules.tsv') is None
+	True
+	>>> resolve_skip_list_path(' None ', '/etc/r/rules.tsv') is None
+	True
+	>>> resolve_skip_list_path('skip.txt', '/etc/r/rules.tsv')
+	'/etc/r/skip.txt'
+	>>> resolve_skip_list_path('/x/skip', '/etc/r/rules.tsv')
+	'/x/skip'
+	'''
+	cell = cell.strip()
+	if cell.lower() in ('', 'auto', 'none'):
+		return None
+	return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(rule_file)), cell))
+
 def parse_rules(rule_file:str):
 	'''
 	Parse the rule file using TSVZ and fill in the defaults and auto fields
@@ -790,6 +849,8 @@ def parse_rules(rule_file:str):
 	if not os.path.exists(rule_file):
 		tl.teeerror(f'Error: Rule file {rule_file} does not exist.')
 		sys.exit(1)
+	if upgrade_rule_file_header(rule_file):
+		tl.info(f'Upgraded rule file {rule_file} header with the Skip List File column.')
 
 	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=DEBUG)
 	if DEBUG:
@@ -803,7 +864,7 @@ def parse_rules(rule_file:str):
 	rulesToUpdate = []
 	returnReverbRules = []
 	for ruleName in rules:
-		ruleList = rules[ruleName]
+		ruleList = list(rules[ruleName]) + [''] * (len(REVERB_RULE_HEADER) - len(rules[ruleName]))
 		if DEBUG:
 			tl.teeprint(f'Checking rule: {ruleList}')
 		ruleUpdated = False
