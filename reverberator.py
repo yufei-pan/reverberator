@@ -777,6 +777,7 @@ def upgrade_rule_file_header(rule_file:str) -> bool:
 	Returns:
 		changed (bool): Whether the file was rewritten
 	'''
+	rule_file = os.path.realpath(rule_file)
 	with open(rule_file, 'r', newline='', encoding='utf-8') as f:
 		text = f.read()
 	lines = text.split('\n')
@@ -797,7 +798,12 @@ def upgrade_rule_file_header(rule_file:str) -> bool:
 	try:
 		with os.fdopen(fd, 'w', newline='', encoding='utf-8') as f:
 			f.write('\n'.join(lines))
-		os.chmod(temp_path, stat.S_IMODE(os.stat(rule_file).st_mode))
+		original = os.stat(rule_file)
+		os.chmod(temp_path, stat.S_IMODE(original.st_mode))
+		try:
+			os.chown(temp_path, original.st_uid, original.st_gid)
+		except OSError:
+			pass
 		os.replace(temp_path, rule_file)
 	except BaseException:
 		if os.path.exists(temp_path):
@@ -849,8 +855,11 @@ def parse_rules(rule_file:str):
 	if not os.path.exists(rule_file):
 		tl.teeerror(f'Error: Rule file {rule_file} does not exist.')
 		sys.exit(1)
-	if upgrade_rule_file_header(rule_file):
-		tl.info(f'Upgraded rule file {rule_file} header with the Skip List File column.')
+	try:
+		if upgrade_rule_file_header(rule_file):
+			tl.info(f'Upgraded rule file {rule_file} header with the Skip List File column.')
+	except OSError as e:
+		tl.teelog(f'Warning: Cannot upgrade rule file {rule_file} ({e}). The Skip List File column cannot be used until the header is upgraded.',level='warning')
 
 	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=DEBUG)
 	if DEBUG:
