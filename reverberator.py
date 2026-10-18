@@ -1420,7 +1420,7 @@ class bidict(dict):
 			del self.inverse[self[key]]
 		super(bidict, self).__delitem__(key)
 
-def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None):
+def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None):
 	if not os.path.exists(monitor_path):
 		return -1
 	irm.increaseUserWatches()
@@ -1433,7 +1433,7 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	if newDirWds is not None:
 		newDirWds.add(parentWatchDescriptor)
 	wdDic[parentWatchDescriptor] = monitor_path
-	allFolders = get_all_folders(monitor_path)
+	allFolders = get_all_folders(monitor_path,skip_list)
 	watcherTeeLogToTl(monitor_path,f'Adding watch for {len(allFolders)} sub folders')
 	irm.increaseUserWatches(len(allFolders))
 	for folder in allFolders:
@@ -1448,7 +1448,7 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			continue
 	return parentWatchDescriptor
 
-def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = False):
+def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = False, skip = None):
 	'''
 	Walk path depth first, yielding (entry_path, rel_path, is_dir) with each folder right before its contents.
 	Folder paths end with /. Symlinks to folders are not followed and come out as files.
@@ -1456,6 +1456,7 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 	With list_folders_first, each folder is read in full before its entries are yielded, so the caller can replace
 	entries as it goes: renaming into a folder still being read can make the listing skip an entry (through mergerfs
 	the entry can move to another branch).
+	skip(rel_path) -> bool leaves an entry out; a skipped folder is not descended into.
 
 	Examples:
 		>>> import tempfile
@@ -1467,6 +1468,8 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 		[('d/', True), ('d/e/', True), ('d/e/f', False), ('link', False)]
 		>>> [entry_path == os.path.join(root, rel_path) for entry_path, rel_path, _ in iter_tree_entries(root)]
 		[True, True, True, True]
+		>>> sorted(rel_path for _, rel_path, _ in iter_tree_entries(root, skip=lambda rel: rel == 'd/e/'))
+		['d/', 'link']
 		>>> import shutil; shutil.rmtree(root)
 	'''
 	try:
@@ -1476,18 +1479,24 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 			for entry in entries:
 				rel_path = rel_prefix + entry.name
 				if entry.is_dir(follow_symlinks=False):
+					if skip is not None and skip(rel_path + '/'):
+						continue
 					yield entry.path + '/', rel_path + '/', True
-					yield from iter_tree_entries(entry.path, rel_path + '/', list_folders_first)
+					yield from iter_tree_entries(entry.path, rel_path + '/', list_folders_first, skip)
 				else:
+					if skip is not None and skip(rel_path):
+						continue
 					yield entry.path, rel_path, False
 	except Exception as e:
 		watcherTeeLogToTl(path,f'Error scanning {path}: {e}',error=True)
 
-def get_all_folders(path):
-	return [entry_path for entry_path, _, is_dir in iter_tree_entries(path) if is_dir]
+def get_all_folders(path, skip_list:'SkipList' = None):
+	if skip_list is None:
+		return [entry_path for entry_path, _, is_dir in iter_tree_entries(path) if is_dir]
+	return [entry_path for entry_path, _, is_dir in iter_tree_entries(path, skip_list.folder_rel(path), skip=skip_list.skips) if is_dir]
 
 
-def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:ChangeEventQueue) -> bool:
+def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:ChangeEventQueue, skip_list:'SkipList' = None) -> bool:
 	# stored inside the per-job vault folder so jobs sharing a vault path do not clobber each other
 	pending_transactions_path = os.path.join(vault_path, job_name, PENDING_TRANSACTIONS_FILE_NAME)
 	if not os.path.exists(pending_transactions_path):
@@ -1497,7 +1506,7 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 	except Exception as e:
 		backuperTeeLogToTl(job_name, f'Failed to read pending transactions timestamp for {pending_transactions_path}: {e}', error=True)
 		return False
-	latest_monitor_change = get_monitor_path_most_recent_change_time(monitor_path)
+	latest_monitor_change = get_monitor_path_most_recent_change_time(monitor_path, skip_list)
 	# Resume only when the latest monitor-path mtime is at least 1 second older
 	# than the pending file (no filesystem changes after the pending snapshot).
 	should_resume = latest_monitor_change <= pending_mtime - 1.0
@@ -1566,7 +1575,7 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 		loaded_count = 0
 	return loaded_count > 0
 
-def get_monitor_path_most_recent_change_time(monitor_path:str) -> float:
+def get_monitor_path_most_recent_change_time(monitor_path:str, skip_list:'SkipList' = None) -> float:
 	latest_mtime = 0.0
 	paths_to_scan = [monitor_path]
 	while paths_to_scan:
@@ -1581,6 +1590,8 @@ def get_monitor_path_most_recent_change_time(monitor_path:str) -> float:
 			try:
 				with os.scandir(current_path) as entries:
 					for entry in entries:
+						if skip_list is not None and skip_list.skips_path(entry.path, entry.is_dir(follow_symlinks=False)):
+							continue
 						paths_to_scan.append(entry.path)
 			except Exception as e:
 				watcherTeeLogToTl(monitor_path, f'Error scanning {current_path}: {e}', error=True)
@@ -2176,7 +2187,7 @@ def do_backup(backup_entries:dict,
 			 keep_one_complete_backup:bool, 
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
-			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None):
+			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
 	# move events sync attrs from source where the vault entry is a real file/dir ( see do_reverb_backup )
 	global DEBUG
@@ -2187,6 +2198,7 @@ def do_backup(backup_entries:dict,
 	global GREEN_LIGHT
 	global BACKUP_ENTRY_VALUES_HEADER
 	# this function will do the actual backup
+	skip = None if skip_list is None else skip_list.skips
 	job_vault = os.path.join(vault_path,job_name)
 	if not os.path.lexists(job_vault):
 		try:
@@ -2227,7 +2239,7 @@ def do_backup(backup_entries:dict,
 			manifest.reset(backup_folder)
 			mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
 			# the walk yields each folder before its contents
-			for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path):
+			for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=skip):
 				backupEntryPath = os.path.join(backup_folder,relativePath)
 				manifest.add(relativePath,dirty=True)
 				if isDir:
@@ -2243,14 +2255,14 @@ def do_backup(backup_entries:dict,
 			backuperTeeLogToTl(job_name,f'Creating a referenced backup of {monitor_path} to {backup_folder}',ok=True)
 			if log_journal:
 				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_referenced_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
-			manifest.rebuild(backup_folder,tree_path=monitor_path)
+			manifest.rebuild(backup_folder,tree_path=monitor_path,skip=skip)
 			do_referenced_copy(monitor_path,backup_folder,manifest)
 	else:
 		# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 		latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
 		if not backup_entries:
 			backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
-			delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest)
+			delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list)
 			if not GREEN_LIGHT.is_set():
 				# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
 				backup_entries.clear()
@@ -2304,7 +2316,7 @@ def do_backup(backup_entries:dict,
 		backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
 		os.makedirs(backup_folder,exist_ok=True)
 		backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
-		do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path)
+		do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list)
 	backup_finished = GREEN_LIGHT.is_set()
 	if not backup_finished:
 		backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -2968,11 +2980,11 @@ class VaultManifest:
 		self.conn.execute('DELETE FROM entries')
 		self._set_version(version_path)
 
-	def rebuild(self, version_path:str, tree_path:str = None):
+	def rebuild(self, version_path:str, tree_path:str = None, skip = None):
 		'''Track everything under tree_path (version_path by default) as unverified, describing version_path.'''
 		self.reset(version_path)
 		batch = []
-		for _, rel, _ in iter_tree_entries(tree_path or version_path):
+		for _, rel, _ in iter_tree_entries(tree_path or version_path, skip=skip if tree_path else None):
 			batch.append((rel,))
 			if len(batch) >= MANIFEST_BATCH_SIZE:
 				self.conn.executemany('INSERT OR REPLACE INTO entries(path) VALUES (?)', batch)
@@ -3216,7 +3228,7 @@ def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_pat
 		backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error comparing {monitor_entry}: {e}, treating as modify')
 		return 'modify', found
 
-def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None) -> VaultManifest:
+def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None) -> VaultManifest:
 	'''
 	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest.
 
@@ -3251,7 +3263,7 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 				backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),event,None)
 	# results are taken in walk order, so a new tree still lists each folder before its contents
 	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
-		for monitor_entry, rel, _ in iter_tree_entries(monitor_path):
+		for monitor_entry, rel, _ in iter_tree_entries(monitor_path,skip=None if skip_list is None else skip_list.skips):
 			if not GREEN_LIGHT.is_set():
 				break
 			record = manifest.lookup(rel)
@@ -3614,7 +3626,7 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	return removingSize, removingInodes
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
-					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str) -> VaultManifest:
+					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
@@ -3635,7 +3647,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			manifest.add(as_folder_entry(source_relative_path),dirty=True)
 			os.makedirs(file_vault_real_path,exist_ok=True)
 			copy_file_meta(source_file=source_real_path,backup_file_path=file_vault_real_path)
-			for subRealPath, subRelativePath, subIsDir in iter_tree_entries(source_real_path,as_folder_entry(source_relative_path)):
+			for subRealPath, subRelativePath, subIsDir in iter_tree_entries(source_real_path,as_folder_entry(source_relative_path),skip=None if skip_list is None else skip_list.skips):
 				subVaultPath = os.path.join(backup_folder,subRelativePath)
 				if subIsDir:
 					manifest.add(subRelativePath,dirty=True)

@@ -1,6 +1,8 @@
+from collections import OrderedDict
 import os
 import pytest
 import reverberator as rv
+from tests.harness import seed_monitor, write_tree, write_pending, committed_versions
 
 pytestmark = pytest.mark.unit
 
@@ -94,3 +96,102 @@ def test_names_starting_with_hash_or_bang(tmp_path):
 ])
 def test_skip_list_change(recorded, current, explicit_none, expected):
 	assert rv.skip_list_change(recorded, current, explicit_none) == expected
+
+
+def _backup(job, entries=None, skip_list=None, keep_one_complete_backup=True):
+	return rv.do_backup(
+		OrderedDict() if entries is None else entries, job_name=job.job_name, monitor_path=job.monitor,
+		vault_path=job.vault, keep_one_complete_backup=keep_one_complete_backup, only_sync_attributes=True,
+		keep_n_versions=0, backup_size_limit='0', skip_list=skip_list,
+	)
+
+
+def test_iter_tree_entries_prunes_skipped_folders(tmp_path):
+	write_tree(str(tmp_path), {'keep/a.txt': 'a', 'cache/deep/b.txt': 'b', 'x.tmp': 't'})
+	sl = rv.SkipList(str(tmp_path), ['cache/', '*.tmp'])
+	asked = []
+	rels = sorted(rel for _, rel, _ in rv.iter_tree_entries(str(tmp_path), skip=lambda rel: asked.append(rel) or sl.skips(rel)))
+	assert rels == ['keep/', 'keep/a.txt']
+	assert 'cache/deep/' not in asked
+
+
+def test_complete_v0_leaves_out_skipped(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x', 'b.tmp': 't'})
+	_, manifest, committed = _backup(job, skip_list=rv.SkipList(job.monitor, ['cache/', '*.tmp']))
+	assert committed and manifest.files == ['a.txt'] and manifest.folders == []
+	manifest.close()
+	v0 = committed_versions(job)[0]
+	assert os.path.isfile(os.path.join(v0, 'a.txt'))
+	assert not os.path.lexists(os.path.join(v0, 'cache')) and not os.path.lexists(os.path.join(v0, 'b.tmp'))
+
+
+def test_referenced_v0_leaves_out_skipped(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x'})
+	_, manifest, committed = _backup(job, skip_list=rv.SkipList(job.monitor, ['cache/']), keep_one_complete_backup=False)
+	assert committed and manifest.files == ['a.txt']
+	manifest.close()
+	assert not os.path.lexists(os.path.join(committed_versions(job)[0], 'cache'))
+
+
+def test_skip_everything_still_commits_v0(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	_, manifest, committed = _backup(job, skip_list=rv.SkipList(job.monitor, ['*']))
+	assert committed and manifest.counts() == (0, 0)
+	manifest.close()
+	assert os.listdir(committed_versions(job)[0]) == []
+
+
+def test_newly_skipped_dropped_from_new_version_kept_in_old(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x'})
+	_backup(job)[1].close()
+	_backup(job, skip_list=rv.SkipList(job.monitor, ['cache/']))[1].close()
+	v0, v1 = committed_versions(job)
+	assert os.path.isfile(os.path.join(v0, 'cache', 'x.bin'))
+	assert not os.path.lexists(os.path.join(v1, 'cache')) and os.path.lexists(os.path.join(v1, 'a.txt'))
+
+
+def test_newly_unskipped_copied_into_new_version(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x'})
+	_backup(job, skip_list=rv.SkipList(job.monitor, ['cache/']))[1].close()
+	_backup(job, skip_list=rv.SkipList(job.monitor, []))[1].close()
+	v0, v1 = committed_versions(job)
+	assert not os.path.lexists(os.path.join(v0, 'cache'))
+	assert open(os.path.join(v1, 'cache', 'x.bin')).read() == 'x'
+
+
+def test_new_folder_copy_leaves_out_skipped(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a'})
+	_backup(job)[1].close()
+	write_tree(job.monitor, {'newdir/keep.txt': 'k', 'newdir/x.tmp': 't', 'newdir/cache/y': 'y'})
+	entries = OrderedDict({os.path.join(job.monitor, 'newdir') + '/': rv.BackupEntryValues('t', 'create', None)})
+	_, manifest, _ = _backup(job, entries, skip_list=rv.SkipList(job.monitor, ['*.tmp', 'cache/']))
+	assert manifest.lookup('newdir/x.tmp') is None and manifest.lookup('newdir/cache/') is None
+	manifest.close()
+	v1 = committed_versions(job)[1]
+	assert os.path.isfile(os.path.join(v1, 'newdir', 'keep.txt'))
+	assert not os.path.lexists(os.path.join(v1, 'newdir', 'x.tmp'))
+	assert not os.path.lexists(os.path.join(v1, 'newdir', 'cache'))
+
+
+def _age_tree(job, skipped_file):
+	for path in (job.monitor, os.path.join(job.monitor, 'a.txt'), os.path.join(job.monitor, 'cache')):
+		os.utime(path, (1000, 1000))
+	os.utime(skipped_file, (5000, 5000))
+
+
+def test_resume_check_ignores_changes_in_skipped_paths(job):
+	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x'})
+	_age_tree(job, os.path.join(job.monitor, 'cache', 'x.bin'))
+	assert rv.get_monitor_path_most_recent_change_time(job.monitor) == 5000
+	assert rv.get_monitor_path_most_recent_change_time(job.monitor, rv.SkipList(job.monitor, ['cache/'])) == 1000
+
+
+def test_pending_resumes_when_only_skipped_paths_changed(job):
+	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x'})
+	a = os.path.join(job.monitor, 'a.txt')
+	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
+	_age_tree(job, os.path.join(job.monitor, 'cache', 'x.bin'))
+	os.utime(pending, (2000, 2000))
+	queue = rv.ChangeEventQueue(job.monitor)
+	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue, rv.SkipList(job.monitor, ['cache/'])) is True
+	assert [event.path for event in queue] == [a]
