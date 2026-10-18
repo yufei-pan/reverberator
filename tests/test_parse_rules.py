@@ -267,3 +267,24 @@ def test_parse_rules_survives_failed_header_upgrade(job, monkeypatch):
 	rules = rv.parse_rules(job.rule_path)
 	assert [rule.job_name for rule in rules] == [job.job_name]
 	assert open(job.rule_path, newline='').read() == before
+
+
+@pytest.mark.parametrize('kind', ['non_utf8_comment', 'gzip'])
+def test_parse_rules_survives_rule_file_it_cannot_decode(job, capsys, kind):
+	# TSVZ reads these, but the header upgrade reads the file as UTF-8 text
+	lines = _old_rule_file(job)
+	if kind == 'gzip':
+		import gzip
+		rule_path = job.rule_path + '.gz'
+		with gzip.open(rule_path, 'wb') as f:
+			f.write(('\n'.join(lines) + '\n').encode())
+		os.remove(job.rule_path)
+	else:
+		rule_path = job.rule_path
+		with open(rule_path, 'wb') as f:
+			f.write(('\n'.join(lines[:3]) + '\n').encode() + b'# caf\xe9\n' + ('\n'.join(lines[3:]) + '\n').encode())
+	before = open(rule_path, 'rb').read()
+	rules = rv.parse_rules(rule_path)
+	assert [rule.job_name for rule in rules] == [job.job_name]
+	assert open(rule_path, 'rb').read() == before
+	assert 'Cannot upgrade rule file' in capsys.readouterr().out
