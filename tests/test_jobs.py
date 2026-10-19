@@ -368,3 +368,43 @@ def test_main_exits_1_with_a_marker_when_the_daemon_fails(monkeypatch, capsys):
 	assert exc.value.code == 1
 	out = capsys.readouterr()
 	assert 'reverberator EXITING with error: OSError: [Errno 5] Input/output error' in out.out + out.err
+
+
+def test_wait_for_path_alerts_after_grace_then_hourly(tmp_path, poll_fast, monkeypatch, capsys):
+	now = [0.0]
+	flag = threading.Event()
+	flag.set()
+	path = str(tmp_path / 'later')
+	control = rv.JobControl('j')
+	control.start_attempt()
+	steps = iter([0, 899, 901, 3000, 4502, 4600])
+	def clock():
+		value = next(steps, None)
+		if value is None:
+			os.makedirs(path, exist_ok=True)
+			return now[0]
+		now[0] = value
+		return value
+	assert rv.wait_for_path(control, flag, path, 'vault filesystem not ready', clock=clock) is True
+	out = capsys.readouterr()
+	lines = [l for l in (out.out + out.err).splitlines() if 'reverberator job j FAILED: waiting' in l]
+	assert len(lines) == 2 and 'waiting 15 min for ' + path in lines[0]
+
+
+def test_wait_for_path_stops_with_the_job(tmp_path, poll_fast):
+	control = rv.JobControl('j')
+	control.start_attempt()
+	flag = threading.Event()
+	threading.Timer(0.2, control.fail, args=('x',)).start()
+	assert rv.wait_for_path(control, flag, str(tmp_path), 'x') is False
+
+
+def test_fs_monitor_rechecks_failed_pairs_without_a_mount_change(tmp_path, monkeypatch, poll_fast):
+	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.1)
+	state = {'ok': False}
+	monkeypatch.setattr(rv, 'check_fs_signature', lambda path, signature: state['ok'])
+	monitor = rv.fs_signature_monitor()
+	flag = monitor.register(str(tmp_path), 'UUID-X')
+	wait_until(lambda: monitor.states.get((str(tmp_path), 'UUID-X')) is False, timeout=3, message='first check')
+	state['ok'] = True
+	wait_until(flag.is_set, timeout=3, message='not rechecked')

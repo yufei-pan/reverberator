@@ -1,5 +1,6 @@
 import os
 import signal
+import time
 import pytest
 import reverberator as rv
 from tests.harness import (
@@ -145,3 +146,16 @@ def test_sigterm_exits_0(job, run_reverberator):
 	wait_for_committed_count(job, 1, timeout=10)
 	proc.send_signal(signal.SIGTERM)
 	assert proc.wait(timeout=10) == 0
+
+
+def test_job_waits_for_a_monitored_path_that_appears_later(job, run_reverberator):
+	missing = os.path.join(job.root, 'late')
+	write_rule(job)
+	text = open(job.rule_path, encoding='utf-8').read().replace(job.monitor, missing)
+	open(job.rule_path, 'w', encoding='utf-8').write(text)
+	proc = run_reverberator(job.rule_path)
+	time.sleep(1)
+	assert committed_versions(job) == [] and proc.poll() is None
+	os.makedirs(missing)
+	open(os.path.join(missing, 'a.txt'), 'w').write('a')
+	wait_for_committed_count(job, 1, timeout=15)
