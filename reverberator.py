@@ -2471,28 +2471,34 @@ def skips_folder_or_parent(skip, rel:str) -> bool:
 	parts = rel.rstrip('/').split('/')
 	return any(skip('/'.join(parts[:depth]) + '/') for depth in range(1, len(parts) + 1))
 
-def inner_mount_rels(mount_table:list, monitor_path:str) -> set:
+def inner_mount_rels(mount_table:list, monitor_path:str, skip = None) -> set:
 	'''
-	The inner mount points in mount_table, as folder rels of monitor_path.
+	The inner mount points in mount_table, as folder rels of monitor_path, but those skip leaves out or that are in a
+	folder it leaves out.
 
 	Examples:
-		>>> sorted(inner_mount_rels([('/', ('1',)), ('/tmp/reverb_doctest/m/disk', ('2',)), ('/tmp/reverb_doctest/m/a/usb', ('3',))], '/tmp/reverb_doctest/m'))
+		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m/disk', ('2',)), ('/tmp/reverb_doctest/m/a/usb', ('3',))]
+		>>> sorted(inner_mount_rels(table, '/tmp/reverb_doctest/m'))
 		['a/usb/', 'disk/']
+		>>> sorted(inner_mount_rels(table, '/tmp/reverb_doctest/m', lambda rel: rel == 'a/'))
+		['disk/']
 	'''
 	real_root = os.path.realpath(monitor_path)
-	return {os.path.relpath(mount_point, real_root) + '/' for mount_point in inner_mount_points(mount_table, monitor_path)}
+	rels = {os.path.relpath(mount_point, real_root) + '/' for mount_point in inner_mount_points(mount_table, monitor_path)}
+	return {rel for rel in rels if not skips_folder_or_parent(skip, rel)}
 
-def paused_inner_mounts(monitor_path:str, remembered:list, mount_table:list) -> set:
+def paused_inner_mounts(monitor_path:str, remembered:list, mount_table:list, skip = None) -> set:
 	'''
 	The remembered inner mount points (folder rels of monitor_path) that are paused: not mounted in mount_table, with
-	their folder there and empty, as an unmounted disk leaves it. Walks leave a paused folder out and keep what the vault
-	holds for it. A folder that is gone, is not a folder, or holds entries of its own is not paused: it is backed up as
-	what it now is, which is how a user retires an inner disk.
+	their folder there and empty, as an unmounted disk leaves it, or a folder that cannot be looked at. Walks leave a
+	paused folder out and keep what the vault holds for it. A folder that is gone, is not a folder, or holds entries of
+	its own is not paused: it is backed up as what it now is, which is how a user retires an inner disk. Neither is one
+	that skip (a skip list's skips) leaves out, or that is in a folder it leaves out.
 	'''
 	mounted = inner_mount_rels(mount_table, monitor_path)
 	paused = set()
 	for rel in remembered:
-		if rel in mounted:
+		if rel in mounted or skips_folder_or_parent(skip, rel):
 			continue
 		folder = os.path.join(monitor_path, rel.rstrip('/'))
 		try:
@@ -2501,16 +2507,18 @@ def paused_inner_mounts(monitor_path:str, remembered:list, mount_table:list) -> 
 			with os.scandir(folder) as entries:
 				if next(entries, None) is None:
 					paused.add(rel)
-		except OSError:
-			# gone, or it cannot be read: a walk keeps what it cannot read
+		except (FileNotFoundError, NotADirectoryError):
 			continue
+		except OSError:
+			# whether its disk is back cannot be told: it stays paused, and remembered, until it can
+			paused.add(rel)
 	return paused
 
-def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mount_tables) -> list:
+def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mount_tables, skip = None) -> list:
 	'''
 	The inner mount points a backup records with its committed state: those mounted in any of mount_tables, the paused
 	ones, and the remembered ones inside a paused folder, which went away with its disk. Nothing is forgotten when no
-	table could be read.
+	table could be read. Those skip leaves out, or that are in a folder it leaves out, are not recorded.
 
 	Examples:
 		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m/new', ('2',))]
@@ -2518,15 +2526,17 @@ def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mou
 		['new/', 'old/', 'old/inner/']
 		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['retired/'], set(), [])
 		['retired/']
+		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['old/', 'old/inner/'], {'old/'}, table, skip=lambda rel: rel in ('new/', 'old/inner/'))
+		['old/']
 	'''
 	tables = [table for table in mount_tables if table]
 	if not tables:
-		return sorted(remembered)
+		return sorted(rel for rel in remembered if not skips_folder_or_parent(skip, rel))
 	kept = set(paused)
 	for table in tables:
-		kept |= inner_mount_rels(table, monitor_path)
+		kept |= inner_mount_rels(table, monitor_path, skip)
 	kept.update(rel for rel in remembered if any(rel.startswith(folder) for folder in paused))
-	return sorted(kept)
+	return sorted(rel for rel in kept if not skips_folder_or_parent(skip, rel))
 
 def skip_paused(skip, paused:set):
 	'''
@@ -2817,14 +2827,15 @@ FS_SIGNATURE_MONITOR = fs_signature_monitor()
 
 #%% ---- Backup ----
 def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,monitor_path:str,vault_path:str,vaultInfo:VaultInfo = None,
-			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None) -> tuple:
+			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None) -> tuple:
 	'''
 	Fold a batch's scan events (scan_folders, the folders they name) into its backup_entries: each scanned folder is
 	compared with the latest version, and what that finds replaces the batch's entries at or under it. A folder inside
 	another scanned one is compared with it, and one in a paused inner mount compares nothing.
 	Returns (vaultInfo, manifest, full_comparison): full_comparison asks for the whole tree instead, for a scan of the
 	monitored path itself or a vault with no version yet. JobFailure is raised, before anything is compared, when the
-	monitored path no longer shows the filesystem root_mount fingerprints.
+	monitored path no longer shows the filesystem root_mount fingerprints. reported holds the unreadable paths this batch
+	already logged.
 	'''
 	scopes = scan_scopes(monitor_path,scan_folders)
 	if scopes == ['']:
@@ -2845,10 +2856,11 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 		manifest = VaultManifest(job_vault)
 	try:
 		latest_version_info = vaultInfo.vault_info_dict[next(reversed(vaultInfo.vault_info_dict))]
-		paused = paused_inner_mounts(monitor_path,manifest.inner_mounts,mount_table)
+		paused = paused_inner_mounts(monitor_path,manifest.inner_mounts,mount_table,None if skip_list is None else skip_list.skips)
 		backuperTeeLogToTl(job_name,f'Comparing {", ".join(scopes)} with the vault')
 		drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in scopes])
-		reported = set()
+		if reported is None:
+			reported = set()
 		for scope_rel in scopes:
 			if not GREEN_LIGHT.is_set():
 				break
@@ -2968,22 +2980,28 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
 			if not running():
 				break
+			# an unreadable path is reported once for the batch, by its comparison or its backup
+			reported = set()
 			if scan_folders and not full_comparison:
 				vaultInfo,manifest,full_comparison = compare_scanned_folders(backupEntries,scan_folders,job_name,monitor_path,vault_path,
-					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount)
+					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported)
 				if not running():
 					break
 				if full_comparison:
 					backupEntries.clear()
 				elif not backupEntries:
 					backuperTeeLogToTl(job_name,'Compared folders match the vault; no new version for this batch',ok=True)
+					# done, as a full comparison finding no differences is
+					if job is not None:
+						job.mark_committed()
 			else:
 				# do_backup compares the whole tree for an empty batch
 				full_comparison = full_comparison or not backupEntries
 			if backupEntries or full_comparison:
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
-					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount)
+					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
+					  reported=reported)
 				if not committed:
 					# the batch goes back to the queue on the way out
 					if GREEN_LIGHT.is_set():
@@ -3345,9 +3363,10 @@ def do_backup(backup_entries:dict,
 			 keep_one_complete_backup:bool, 
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
-			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None):
+			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
 	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
+	# reported: the unreadable paths already logged for this batch, so each is logged once
 	# move events sync attrs from source where the vault entry is a real file/dir ( see do_reverb_backup )
 	global DEBUG
 	global BACKUP_SEMAPHORE
@@ -3368,7 +3387,8 @@ def do_backup(backup_entries:dict,
 				vaultInfo = VaultInfo({}, 0, 0)
 			return vaultInfo, manifest, False
 	# a manifest opened here is closed here if the backup raises, as the caller never gets it back
-	reported = set()
+	if reported is None:
+		reported = set()
 	opened_manifest = manifest is None
 	if opened_manifest:
 		manifest = VaultManifest(job_vault)
@@ -3378,7 +3398,7 @@ def do_backup(backup_entries:dict,
 		mount_table = current_mount_table()
 		check_monitored_mount(monitor_path,mount_table,root_mount)
 		remembered_mounts = manifest.inner_mounts
-		paused = paused_inner_mounts(monitor_path,remembered_mounts,mount_table)
+		paused = paused_inner_mounts(monitor_path,remembered_mounts,mount_table,skip)
 		if paused:
 			backuperTeeLogToTl(job_name,f'Inner mounts not mounted, keeping their last backed-up contents: {", ".join(sorted(paused))}')
 		walk_skip = skip_paused(skip,paused)
@@ -3452,6 +3472,16 @@ def do_backup(backup_entries:dict,
 					backup_entries.clear()
 					backuperTeeLogToTl(job_name, 'Delta generation interrupted; not creating a new version', error=True)
 					return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
+				# a disk unmounted while the walk ran was walked as the empty folder it left: what the walk found under it is
+				# dropped, so its rows are linked forward as for a disk paused before the walk. the same goes for the root
+				walked_table = current_mount_table()
+				check_monitored_mount(monitor_path,walked_table,root_mount)
+				seen_mounts = sorted(set(remembered_mounts) | inner_mount_rels(mount_table,monitor_path,skip))
+				unmounted = paused_inner_mounts(monitor_path,seen_mounts,walked_table,skip) - paused
+				if unmounted:
+					dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in unmounted])
+					backuperTeeLogToTl(job_name,f'Inner mounts unmounted during the comparison, keeping their last backed-up contents: {", ".join(sorted(unmounted))}; dropped {dropped} backup entries')
+					paused = paused | unmounted
 				if log_journal:
 					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'delta_generated_{len(backup_entries)}_differences',monitor_path],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 					log_events_to_journal(backup_entries,journalPath)
@@ -3468,7 +3498,7 @@ def do_backup(backup_entries:dict,
 				# manifest under this skip list
 				manifest.begin()
 				manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
-				manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table()))
+				manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
 				manifest.commit()
 				if vaultInfo is None:
 					vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
@@ -3533,7 +3563,7 @@ def do_backup(backup_entries:dict,
 		# describing a removed version is listed again from the vault
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 		# a disk mounted while this backup walked is remembered too
-		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table()))
+		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
 		manifest.commit(backup_folder)
 		TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
 		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
@@ -4788,7 +4818,7 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	if manifest is None:
 		manifest = VaultManifest(os.path.dirname(os.path.abspath(latest_version_info.path)))
 	if paused is None:
-		paused = paused_inner_mounts(monitor_path, manifest.inner_mounts, current_mount_table())
+		paused = paused_inner_mounts(monitor_path, manifest.inner_mounts, current_mount_table(), None if skip_list is None else skip_list.skips)
 	skip = skip_paused(None if skip_list is None else skip_list.skips, paused)
 	if scope_rel:
 		if skips_folder_or_parent(skip, scope_rel):

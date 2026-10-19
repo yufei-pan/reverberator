@@ -237,7 +237,7 @@ def test_a_watch_that_cannot_be_added_is_not_counted(tmp_path):
 
 
 from collections import OrderedDict
-from tests.harness import committed_versions, wait_for_committed_count
+from tests.harness import committed_versions, content_file_path, wait_for_committed_count
 
 
 def _backup(job, entries=None):
@@ -448,8 +448,10 @@ def test_scan_of_a_paused_mount_runs_no_backup(job, poll_fast, monkeypatch):
 	to_process_flag = threading.Event()
 	thread = _run_backuper(job, queue, control, to_process_flag, lock)
 	try:
-		# the next batch backs up as usual
 		wait_until(lambda: not queue, timeout=5, message='batch not taken')
+		# a batch that needs no new version still counts as a clean backup
+		assert control.committed.wait(5)
+		# the next batch backs up as usual
 		open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
 		with lock:
 			queue.append(rv.ChangeEvent(3.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
@@ -528,3 +530,112 @@ def test_scoped_delta_keeps_a_folder_it_cannot_look_at_and_drops_one_that_is_gon
 		assert {path: values.event for path, values in entries.items()} == {disk + '/': 'delete', disk + '/f.txt': 'delete'}
 	finally:
 		manifest.close()
+
+
+@pytest.mark.unit
+def test_inner_disk_unmounted_during_a_full_comparison_is_not_deleted(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	state = {'table': [('/', ('1',)), (os.path.join(job.monitor, 'disk'), ('d',))], 'unmounted': False}
+	monkeypatch.setattr(rv, 'current_mount_table', lambda: state['table'])
+	_backup(job)[1].close()
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
+	real = rv.paused_inner_mounts
+	def deciding_then_unmounting(*args, **kwargs):
+		result = real(*args, **kwargs)
+		if not state['unmounted']:
+			# the disk is unmounted right after do_backup decided what is paused, before the walk reaches it
+			state['unmounted'] = True
+			os.remove(os.path.join(job.monitor, 'disk', 'f.txt'))
+			state['table'] = [('/', ('1',))]
+		return result
+	monkeypatch.setattr(rv, 'paused_inner_mounts', deciding_then_unmounting)
+	_, manifest, _ = _backup(job)
+	try:
+		assert manifest.inner_mounts == ['disk/']
+	finally:
+		manifest.close()
+	v1 = committed_versions(job)[1]
+	assert os.path.lexists(os.path.join(v1, 'disk', 'f.txt'))
+	assert open(os.path.join(v1, 'a.txt')).read() == 'changed'
+	assert os.path.join(job.monitor, 'disk') not in open(content_file_path(v1)).read()
+
+
+@pytest.mark.unit
+def test_a_remembered_folder_that_cannot_be_inspected_stays_paused(job, poll_fast, monkeypatch):
+	import errno
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	disk = os.path.join(job.monitor, 'disk')
+	os.remove(os.path.join(disk, 'f.txt'))
+	_fake_mounts(monkeypatch, job, [])
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
+	real_lstat = os.lstat
+	def failing_lstat(path, *args, **kwargs):
+		if path == disk:
+			raise OSError(errno.EIO, 'Input/output error', path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'lstat', failing_lstat)
+	try:
+		assert rv.paused_inner_mounts(job.monitor, ['disk/'], rv.current_mount_table()) == {'disk/'}
+		_, manifest, _ = _backup(job)
+	finally:
+		monkeypatch.setattr(rv.os, 'lstat', real_lstat)
+	try:
+		assert manifest.inner_mounts == ['disk/']
+	finally:
+		manifest.close()
+	assert os.path.lexists(os.path.join(committed_versions(job)[1], 'disk', 'f.txt'))
+
+
+@pytest.mark.unit
+def test_a_skipped_inner_mount_is_neither_paused_nor_remembered(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	os.remove(os.path.join(job.monitor, 'disk', 'f.txt'))
+	os.makedirs(os.path.join(job.monitor, 'cache', 'usb'))
+	_fake_mounts(monkeypatch, job, ['cache/usb/'])
+	# the disk's folder is added to the skip list while it is unmounted, and a disk is mounted in a skipped folder
+	skip_list = rv.SkipList(job.monitor, ['disk/', 'cache/'])
+	assert rv.paused_inner_mounts(job.monitor, ['disk/'], rv.current_mount_table(), skip_list.skips) == set()
+	_, manifest, _ = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
+		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', skip_list=skip_list)
+	try:
+		assert manifest.inner_mounts == []
+	finally:
+		manifest.close()
+	assert not os.path.lexists(os.path.join(committed_versions(job)[-1], 'disk', 'f.txt'))
+
+
+@pytest.mark.unit
+def test_an_unreadable_folder_in_a_scanned_disk_is_reported_once(job, poll_fast, monkeypatch):
+	import errno
+	seed_monitor(job, {'a.txt': 'a', 'disk/': None})
+	_fake_mounts(monkeypatch, job, [])
+	_backup(job)[1].close()
+	# a disk is mounted on the folder, holding a folder that cannot be read
+	seed_monitor(job, {'disk/new.txt': 'n', 'disk/bad/x': 'x'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	bad = os.path.join(job.monitor, 'disk', 'bad')
+	original = os.scandir
+	def scandir(path='.'):
+		if os.path.abspath(path).rstrip('/') == bad:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return original(path)
+	monkeypatch.setattr(os, 'scandir', scandir)
+	lines = []
+	monkeypatch.setattr(rv, 'job_log', lambda job_name, text: lines.append(text) or text)
+	queue = rv.ChangeEventQueue(job.monitor)
+	queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	thread = _run_backuper(job, queue, control, threading.Event())
+	try:
+		v1 = wait_for_committed_count(job, 2)[1]
+		assert open(os.path.join(v1, 'disk', 'new.txt')).read() == 'n'
+		assert sum(line.startswith(f'UNREADABLE: {bad}:') for line in lines) == 1
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=5)
+		rv.GREEN_LIGHT.set()
