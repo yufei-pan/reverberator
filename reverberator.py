@@ -405,7 +405,7 @@ class SkipList:
 			raise ValueError(f'Invalid skip pattern: {error}') from error
 		# comments and blank lines compile to no pattern, so they never reach the fingerprint
 		self.patterns = [p.pattern for p in self._spec.patterns if p.include is not None]
-		self.fingerprint = xxhash.xxh64('\n'.join(self.patterns)).hexdigest() if self.patterns else ''
+		self.fingerprint = xxhash.xxh64('\n'.join(self.patterns).encode('utf-8')).hexdigest() if self.patterns else ''
 		self.location_dependent = any(self._location_dependent(p) for p in self.patterns)
 
 	@classmethod

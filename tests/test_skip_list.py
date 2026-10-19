@@ -530,3 +530,9 @@ def test_full_comparison_of_a_nested_tree_keeps_history(job, poll_fast, patterns
 	versions = committed_versions(job)
 	assert committed and len(versions) == 5
 	assert os.path.isfile(os.path.join(versions[-1], 'new', *[f'd{i}' for i in range(6)], 'big.bin'))
+
+
+def test_fingerprint_is_the_utf8_hash_of_the_patterns(tmp_path):
+	import xxhash
+	sl = rv.SkipList(str(tmp_path), ['*.tmp', 'ünïcode/'])
+	assert sl.fingerprint == xxhash.xxh64('*.tmp\nünïcode/'.encode('utf-8')).hexdigest()
