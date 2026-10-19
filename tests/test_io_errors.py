@@ -237,16 +237,16 @@ def test_two_copies_to_one_destination_both_finish(job):
 	manifest.rollback(); manifest.close()
 
 
-def _finish_one(job, src, stderr, temp_content=None, returncode=1):
-	'''Finish one failed copy of src over a version entry linked to the previous version; returns (dest, manifest).'''
+def _finish_one(job, src, stderr, temp_content=None, returncode=1, rel='a.txt'):
+	'''Finish one failed copy of src over the version entry rel, linked to the previous version; returns its path.'''
 	version = os.path.join(job.job_vault, 'V1--x')
-	os.makedirs(version, exist_ok=True)
-	dest = os.path.join(version, 'a.txt')
-	os.symlink('../V0--x/a.txt', dest)
+	dest = os.path.join(version, rel)
+	os.makedirs(os.path.dirname(dest), exist_ok=True)
+	os.symlink(os.path.relpath(os.path.join(job.job_vault, 'V0--x', rel), os.path.dirname(dest)), dest)
 	temp = rv.partial_copy_path(dest)
 	if temp_content is not None:
 		open(temp, 'w').write(temp_content)
-	manifest = _tracked(job, version, 'a.txt')
+	manifest = _tracked(job, version, rel)
 	try:
 		rv.finish_copies([rv.PendingCopy(FakeTask(returncode, [line.format(src=src, temp=temp) for line in stderr]), src, temp, dest)],
 			manifest, version, job.job_name)
@@ -284,20 +284,70 @@ def test_vault_error_named_by_cp_fails_the_job_whatever_the_source(job, monkeypa
 	assert 'cannot create regular file' in exc.value.reason and not _partial_files(job.vault)
 
 
-@pytest.mark.parametrize('arrived', [True, False])
-def test_metadata_only_failure_accepts_a_complete_copy(job, capsys, arrived):
+# 'a': the source grew after cp copied it, as an actively written file does
+@pytest.mark.parametrize('temp_content', ['abc', 'a', None])
+def test_metadata_only_failure_accepts_the_copy(job, capsys, temp_content):
 	src = os.path.join(job.monitor, 'a.txt')
 	open(src, 'w').write('abc')
 	stderr = ["cp: failed to preserve ownership for '{temp}': Operation not permitted", "cp: preserving times for '{temp}': Operation not permitted"]
-	if arrived:
-		dest = _finish_one(job, src, stderr, temp_content='abc')
-		assert not os.path.islink(dest) and open(dest).read() == 'abc'
+	if temp_content is not None:
+		dest = _finish_one(job, src, stderr, temp_content=temp_content)
+		assert not os.path.islink(dest) and open(dest).read() == temp_content
 		out = ''.join(capsys.readouterr())
 		assert 'without all of its metadata' in out and src in out and 'UNREADABLE' not in out
 	else:
+		# no partial file: nothing arrived to accept
 		with pytest.raises(rv.JobFailure):
-			_finish_one(job, src, stderr, temp_content='a')
+			_finish_one(job, src, stderr)
 	assert not _partial_files(job.vault)
+
+
+def test_copies_run_cp_with_the_c_locale(job, monkeypatch):
+	src = os.path.join(job.monitor, 'a.txt')
+	open(src, 'w').write('a')
+	version = os.path.join(job.job_vault, 'V1--x')
+	os.makedirs(version)
+	pending = []
+	mcae = rv.multiCMD.AsyncExecutor(semaphore=rv.BACKUP_SEMAPHORE, quiet=True)
+	task = rv.cp_af_copy_path(src, os.path.join(version, 'a.txt'), mcae, pending)
+	while mcae.runningThreads:
+		mcae.wait(timeout=0.1)
+	rv.discard_copies(pending)
+	commands = []
+	def run_command(command, **kwargs):
+		commands.append(command)
+		return 1
+	monkeypatch.setattr(rv.multiCMD, 'run_command', run_command)
+	rv.cp_af_copy_path(src, os.path.join(version, 'b.txt'))
+	for command in (task.command, commands[0]):
+		assert command[:3] == ['env', 'LC_ALL=C', 'cp'] and command[3:6] == ['-af', '--reflink=auto', '--sparse=always']
+
+
+def test_file_name_cannot_make_a_content_failure_look_metadata_only(job):
+	# the partial file sits in the folder mirroring the source's, whose name is cp's metadata phrase
+	src = os.path.join(job.monitor, 'failed to preserve ownership for', 'a.txt')
+	os.makedirs(os.path.dirname(src))
+	open(src, 'w').write('abc')
+	with pytest.raises(rv.JobFailure):
+		# full size, as when writing failed only once all of it was sent, so the size tells nothing either
+		_finish_one(job, src, ["cp: error writing '{temp}': No space left on device"], temp_content='abc', rel='failed to preserve ownership for/a.txt')
+	assert not _partial_files(job.vault)
+
+
+def test_file_name_with_the_partial_suffix_cannot_make_a_read_error_the_vaults(job, capsys):
+	src = os.path.join(job.monitor, 'x.reverberator-partial')
+	open(src, 'w').write('x')
+	dest = _finish_one(job, src, ["cp: error reading '{src}': Input/output error"], temp_content='part')
+	assert os.readlink(dest) == '../V0--x/a.txt'
+	assert f'UNREADABLE: {src}: ' in ''.join(capsys.readouterr())
+
+
+def test_file_name_cannot_make_a_read_error_look_vanished(job, capsys):
+	src = os.path.join(job.monitor, 'No such file or directory')
+	open(src, 'w').write('x')
+	dest = _finish_one(job, src, ["cp: error reading '{src}': Input/output error"], temp_content='part')
+	assert os.readlink(dest) == '../V0--x/a.txt'
+	assert f'UNREADABLE: {src}: ' in ''.join(capsys.readouterr())
 
 
 def test_stuck_copy_bounds_the_wait(job, poll_fast, monkeypatch, capsys):

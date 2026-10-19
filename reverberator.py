@@ -3479,6 +3479,16 @@ def source_readable(path:str) -> bool:
 		return False
 	return True
 
+def copy_command(source_path:str, dest_path:str) -> list:
+	'''
+	The cp command copying source_path to dest_path, run with the C locale so it reports in the words finish_copies() reads.
+
+	Examples:
+		>>> copy_command('/m/a', '/v/.t.reverberator-partial')
+		['env', 'LC_ALL=C', 'cp', '-af', '--reflink=auto', '--sparse=always', '/m/a', '/v/.t.reverberator-partial']
+	'''
+	return ['env', 'LC_ALL=C', 'cp', '-af', '--reflink=auto', '--sparse=always', source_path, dest_path]
+
 def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...,pending:list = None):
 	'''
 	Copy source_path to dest_path with cp -a, written under partial_copy_path(dest_path): dest_path stays as it is until
@@ -3515,7 +3525,7 @@ def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = 
 	while os.path.lexists(temp_path):
 		# only this copy ever removes or renames its partial file, so it never takes over a path already there
 		temp_path = partial_copy_path(dest_path)
-	command = ['cp','-af','--reflink=auto','--sparse=always',source_path,temp_path]
+	command = copy_command(source_path,temp_path)
 	if mcae is not ...:
 		task = mcae.run_command(command)
 		pending.append(PendingCopy(task, source_path, temp_path, dest_path))
@@ -3538,55 +3548,85 @@ def discard_copies(pending:list):
 			backuperTeeLogToTl(path=copy.temp_path,error=True,message=f'Failed to remove the partial copy {copy.temp_path}: {e}')
 	pending.clear()
 
-def copy_metadata_failure(line:str) -> bool:
+def cp_message(line:str) -> str:
 	'''
-	Whether a line cp wrote only says some metadata of a copy could not be kept.
+	What cp itself says in a line, before the first quoted path ( cp: <message> '<path>'... ), where no file name can put words.
 
 	Examples:
-		>>> copy_metadata_failure("cp: failed to preserve ownership for '/v/.x.reverberator-partial': Operation not permitted")
+		>>> cp_message("cp: preserving times for '/v/failed to preserve ownership/x': Operation not permitted")
+		'cp: preserving times for '
+	'''
+	return re.split('[\'"]', line, maxsplit=1)[0]
+
+def cp_error(line:str) -> str:
+	'''
+	What cp says in a line after the last quoted path ( ...'<path>': <error> ), where no file name can put words either.
+
+	Examples:
+		>>> cp_error("cp: error reading '/m/No such file or directory': Input/output error")
+		': Input/output error'
+	'''
+	return re.split('[\'"]', line)[-1]
+
+def copy_metadata_failure(line:str, temp_name:str) -> bool:
+	'''
+	Whether a line cp wrote only says some metadata of the copy written to the partial file named temp_name (a base
+	name) could not be kept: it names that file, and cp's message says so.
+
+	Examples:
+		>>> name = '.0f.reverberator-partial'
+		>>> copy_metadata_failure(f"cp: failed to preserve ownership for '/v/{name}': Operation not permitted", name)
 		True
-		>>> copy_metadata_failure("cp: error writing '/v/.x.reverberator-partial': No space left on device")
+		>>> copy_metadata_failure(f"cp: error writing '/v/failed to preserve ownership/{name}': No space left on device", name)
 		False
 	'''
-	return any(phrase in line for phrase in COPY_METADATA_FAILURES)
+	return temp_name in line and any(phrase in cp_message(line) for phrase in COPY_METADATA_FAILURES)
 
-def copy_arrived(source_path:str, temp_path:str) -> bool:
-	'''Whether temp_path holds an entry of source_path's type and, for a regular file, of its size.'''
-	try:
-		source_stat = os.lstat(source_path)
-		temp_stat = os.lstat(temp_path)
-	except OSError:
-		return False
-	if stat.S_IFMT(source_stat.st_mode) != stat.S_IFMT(temp_stat.st_mode):
-		return False
-	return not stat.S_ISREG(source_stat.st_mode) or source_stat.st_size == temp_stat.st_size
-
-def copy_failure_side(source_path:str, lines:list) -> str:
+def cp_shown_prefix(path:str) -> str:
 	'''
-	Where a failed copy of source_path failed, from the lines cp wrote: 'vanished' when the source is gone (or was
-	replaced under the copy), 'source' when it could not be read, and 'vault' when writing the copy failed. cp names the
-	path it failed on: a line naming the partial file is the vault's, whether or not the source is still there, and one
-	naming the source (or what is under it) the source's. Without such a line the source is tried, and what cannot be
-	told apart is the vault's.
+	The start of path that cp prints as it is under the C locale, which escapes bytes that are not printable ASCII and
+	quotes some characters.
 
 	Examples:
-		>>> copy_failure_side('/', ["cp: cannot create regular file '/v/.x.reverberator-partial': No such file or directory"])
+		>>> cp_shown_prefix('/m/a b.txt'), cp_shown_prefix('/m/café'), cp_shown_prefix("/m/a'b")
+		('/m/a b.txt', '/m/caf', '/m/a')
+	'''
+	for index, char in enumerate(path):
+		if not ' ' <= char <= '~' or char in '\'"\\$`':
+			return path[:index]
+	return path
+
+def copy_failure_side(source_path:str, temp_path:str, lines:list) -> str:
+	'''
+	Where a failed copy of source_path into temp_path failed, from the lines cp wrote: 'vanished' when the source is
+	gone (or was replaced under the copy), 'source' when it could not be read, and 'vault' when writing the copy failed.
+	cp names the path it failed on, and only what no file name can forge counts: a line naming this copy's own partial
+	file is the vault's, whether or not the source is still there; any other naming the source (or what is under it, as
+	far as cp prints it unescaped) is the source's, and gone when cp's error after the path says so. Without such a line
+	the source is tried, and what cannot be told apart is the vault's.
+
+	Examples:
+		>>> temp = '/v/.0f.reverberator-partial'
+		>>> copy_failure_side('/', temp, [f"cp: cannot create regular file '{temp}': No such file or directory"])
 		'vault'
-		>>> copy_failure_side('/', ["cp: error reading '/': Input/output error"])
+		>>> copy_failure_side('/', temp, ["cp: error reading '/': Input/output error"])
 		'source'
-		>>> copy_failure_side('/', ["cp: cannot stat '/': No such file or directory"]), copy_failure_side('/nowhere/gone', [])
+		>>> copy_failure_side('/', temp, ["cp: cannot stat '/': No such file or directory"]), copy_failure_side('/nowhere/gone', temp, [])
 		('vanished', 'vanished')
-		>>> copy_failure_side('/nowhere/gone', ["cp: error writing '/v/.x.reverberator-partial': No space left on device"])
+		>>> copy_failure_side('/nowhere/gone', temp, [f"cp: error writing '{temp}': No space left on device"])
 		'vault'
 	'''
 	vault = source = vanished = False
+	temp_name = os.path.basename(temp_path)
+	shown_source = cp_shown_prefix(source_path)
 	for line in lines:
-		if copy_metadata_failure(line):
+		if copy_metadata_failure(line, temp_name):
 			continue
-		if PARTIAL_COPY_SUFFIX in line:
+		if temp_name in line:
 			vault = True
-		elif source_path in line:
-			if os.strerror(errno.ENOENT) in line or COPY_SOURCE_REPLACED in line:
+		elif shown_source and shown_source in line:
+			error = cp_error(line)
+			if os.strerror(errno.ENOENT) in error or COPY_SOURCE_REPLACED in error:
 				vanished = True
 			else:
 				source = True
@@ -3604,10 +3644,10 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 	'''
 	Put the copies of pending in place once the executor has finished them, and empty pending.
 
-	A copy that succeeded takes its destination's place, as does one whose contents arrived while cp could only not keep
-	some metadata (a warning says so). One that failed leaves the destination as it was, keeping the last backed-up
-	copy, when its source failed: silently when the source is gone, with an UNREADABLE line (once per backup, with
-	reported) when it could not be read. A destination holding nothing then stops being tracked in manifest, whose paths
+	A copy that succeeded takes its destination's place, as does one for which cp only reported metadata of its partial
+	file it could not keep (a warning says so): a failed read or write of the contents gets a line of its own. One that
+	failed leaves the destination as it was, keeping the last backed-up copy, when its source failed: silently when the
+	source is gone, with an UNREADABLE line (once per backup, with reported) when it could not be read. A destination holding nothing then stops being tracked in manifest, whose paths
 	are relative to version_path. When writing into the vault is what failed, JobFailure is raised once every copy is
 	dealt with.
 	'''
@@ -3618,14 +3658,15 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 			lines = [line.strip() for line in copy.task.stderr if line.strip()]
 			error = '; '.join(lines)
 			succeeded = copy.task.returncode == 0
-			if not succeeded and lines and all(copy_metadata_failure(line) for line in lines) and copy_arrived(copy.source_path, copy.temp_path):
+			temp_name = os.path.basename(copy.temp_path)
+			if not succeeded and lines and all(copy_metadata_failure(line, temp_name) for line in lines) and os.path.lexists(copy.temp_path):
 				backuperTeeLogToTl(path=copy.source_path,warning=True,message=f'Copied {copy.source_path} to {copy.dest_path} without all of its metadata: {error}')
 				succeeded = True
 			if succeeded:
 				replace_entry(copy.temp_path, copy.dest_path)
 			else:
 				remove_entry(copy.temp_path)
-				side = copy_failure_side(copy.source_path, lines)
+				side = copy_failure_side(copy.source_path, copy.temp_path, lines)
 				if side == 'vault':
 					if failure is None:
 						cause = error or f'cp exited with {copy.task.returncode}'
