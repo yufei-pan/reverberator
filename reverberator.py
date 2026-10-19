@@ -3037,8 +3037,7 @@ def do_backup(backup_entries:dict,
 				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 			return vaultInfo, manifest, False
 		# check the size of the backup
-		this_size = get_path_size(backup_folder)
-		this_inodes = get_path_inodes(backup_folder)
+		this_size, this_inodes = measure_version_usage(manifest, backup_folder)
 		vault_size += this_size
 		vault_inodes += this_inodes
 		backup_size_str = format_bytes(this_size,use_1024_bytes=True,to_str=True).replace(' ','_')
@@ -3913,6 +3912,39 @@ def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:
 			if not rels:
 				return
 			manifest.set_records(zip(rels, pool.map(lambda rel: read_copied_record(version_path, rel, monitor_path), rels)))
+
+def count_batch(pool, batch:list, allocated, total_bytes:int, inodes:int) -> tuple:
+	for blocks in pool.map(allocated, batch):
+		if blocks is not None:
+			total_bytes += blocks
+			inodes += 1
+	return total_bytes, inodes
+
+def measure_version_usage(manifest:VaultManifest, version_path:str) -> tuple:
+	'''(bytes, inodes) a version holds, du style: allocated blocks of version_path and every row of manifest, lstat on a compare pool.'''
+	def allocated(rel:str):
+		try:
+			return os.lstat(os.path.join(version_path, rel)).st_blocks * 512
+		except OSError:
+			backuperTeeLogToTl(path=version_path, message=f'{rel} is missing from the version, not counted')
+			return None
+	try:
+		total_bytes = os.lstat(version_path).st_blocks * 512
+	except OSError:
+		return 0, 0
+	inodes = 1
+	def rows():
+		yield from manifest.iter_folders()
+		yield from manifest.iter_files()
+	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
+		batch = []
+		for rel in rows():
+			batch.append(rel)
+			if len(batch) >= MANIFEST_BATCH_SIZE:
+				total_bytes, inodes = count_batch(pool, batch, allocated, total_bytes, inodes)
+				batch = []
+		total_bytes, inodes = count_batch(pool, batch, allocated, total_bytes, inodes)
+	return total_bytes, inodes
 
 def compare_monitor_entry(monitor_entry:str, monitor_stat:os.stat_result, record:ManifestRecord):
 	'''The event monitor_entry needs against record, what the vault holds for it, or None when it is unchanged.'''
