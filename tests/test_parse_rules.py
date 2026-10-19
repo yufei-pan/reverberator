@@ -10,7 +10,7 @@ pytestmark = pytest.mark.unit
 def test_parse_rules_missing_file_exits(tmp_path):
 	with pytest.raises(SystemExit) as exc:
 		rv.parse_rules(str(tmp_path / 'nope.tsv'))
-	assert exc.value.code == 1
+	assert exc.value.code == rv.EXIT_ALL_STOPPED
 
 
 def test_parse_rules_header_only_exits(tmp_path):
@@ -18,7 +18,7 @@ def test_parse_rules_header_only_exits(tmp_path):
 	p.write_text('\t'.join(rv.REVERB_RULE_TSV_HEADER) + '\n', encoding='utf-8')
 	with pytest.raises(SystemExit) as exc:
 		rv.parse_rules(str(p))
-	assert exc.value.code == 1
+	assert exc.value.code == rv.EXIT_ALL_STOPPED
 
 
 def test_parse_rules_blank_only_key_exits(job):
@@ -30,7 +30,7 @@ def test_parse_rules_blank_only_key_exits(job):
 	# TSVZ skips empty unique keys, so a blank-only file is empty after parse.
 	with pytest.raises(SystemExit) as exc:
 		rv.parse_rules(job.rule_path)
-	assert exc.value.code == 1
+	assert exc.value.code == rv.EXIT_ALL_STOPPED
 
 
 def test_parse_rules_empty_job_name_row_dropped_keeps_valid(job):
@@ -339,6 +339,6 @@ def test_rewrite_rule_rows_keeps_other_lines_byte_for_byte(tmp_path):
 def test_parse_rules_missing_file_leaves_a_marker_line(tmp_path, capsys):
 	with pytest.raises(SystemExit) as exc:
 		rv.parse_rules(str(tmp_path / 'nope.tsv'))
-	assert exc.value.code == 1
+	assert exc.value.code == rv.EXIT_ALL_STOPPED
 	captured = capsys.readouterr()
 	assert 'reverberator EXITING with error: rule file' in captured.out + captured.err

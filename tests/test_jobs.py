@@ -1,5 +1,5 @@
-import fnmatch
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -392,6 +392,44 @@ def test_wait_for_path_alerts_after_grace_then_hourly(tmp_path, poll_fast, monke
 	assert len(lines) == 2 and 'waiting 15 min for ' + path in lines[0]
 
 
+def _run_watcher_until(control, path, seconds, monkeypatch):
+	flag = threading.Event()
+	flag.set()
+	thread = threading.Thread(target=rv.watcher, args=(flag, path, rv.ChangeEventQueue(path), threading.Lock(), threading.Event(),
+		rv.inotify_resource_manager(), 0, 60), kwargs=dict(job=control), daemon=True)
+	thread.start()
+	time.sleep(seconds)
+	control.fail('test done')
+	thread.join(timeout=2)
+	assert not thread.is_alive()
+
+
+def test_watcher_leaves_the_startup_wait_alert_to_the_backuper(tmp_path, poll_fast, monkeypatch, capsys):
+	# the backuper waits for the same monitored filesystem at startup, and its wait is the one that alerts
+	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 0.1)
+	control = rv.JobControl('j')
+	control.start_attempt()
+	_run_watcher_until(control, str(tmp_path / 'missing'), 0.6, monkeypatch)
+	out = capsys.readouterr()
+	assert 'reverberator job j FAILED: waiting' not in out.out + out.err
+
+
+def test_watcher_alerts_while_waiting_for_a_lost_root(tmp_path, poll_fast, monkeypatch, capsys):
+	# once the root is lost only the watcher waits for it: the backuper waits for batches
+	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 0.1)
+	root = tmp_path / 'root'
+	root.mkdir()
+	def lose_root(**kwargs):
+		root.rmdir()
+		return rv.WATCH_RESULT_SELF_DESTRUCT
+	monkeypatch.setattr(rv, 'watchFolder', lose_root)
+	control = rv.JobControl('j')
+	control.start_attempt()
+	_run_watcher_until(control, str(root), 0.6, monkeypatch)
+	out = capsys.readouterr()
+	assert f'reverberator job j FAILED: waiting 0 min for {root}: monitored filesystem not ready' in out.out + out.err
+
+
 def test_wait_for_path_stops_with_the_job(tmp_path, poll_fast):
 	control = rv.JobControl('j')
 	control.start_attempt()
@@ -409,6 +447,36 @@ def test_fs_monitor_rechecks_failed_pairs_without_a_mount_change(tmp_path, monke
 	wait_until(lambda: monitor.states.get((str(tmp_path), 'UUID-X')) is False, timeout=3, message='first check')
 	state['ok'] = True
 	wait_until(flag.is_set, timeout=3, message='not rechecked')
+
+
+def test_fs_monitor_rechecks_failed_pairs_through_mount_churn(tmp_path, monkeypatch, poll_fast):
+	# docker starting containers changes the mount table every few seconds, which must not keep putting the re-check off
+	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.3)
+	calls = []
+	monkeypatch.setattr(rv, 'check_fs_signature', lambda path, signature: calls.append(path) or False)
+	mountinfo = tmp_path / 'mountinfo'
+	mountinfo.write_text('22 1 8:1 / / rw - ext4 /dev/sda1 rw\n')
+	monitor = rv.fs_signature_monitor(mountinfo_path=str(mountinfo))
+	monitor.register(str(tmp_path), 'UUID-X')
+	thread = monitor.thread
+	stop = threading.Event()
+	def churn():
+		while not stop.is_set():
+			monitor.wake()
+			time.sleep(0.02)
+	churner = threading.Thread(target=churn, daemon=True)
+	churner.start()
+	try:
+		time.sleep(1.2)
+	finally:
+		stop.set()
+		churner.join(timeout=1)
+		rv.GREEN_LIGHT.clear()
+		monitor.wake()
+		thread.join(timeout=2)
+		rv.GREEN_LIGHT.set()
+	# the first check, then about every 0.3 s
+	assert len(calls) >= 3
 
 
 def test_fs_monitor_invalidate_clears_the_flag_and_rechecks(tmp_path, monkeypatch, poll_fast):
@@ -710,16 +778,69 @@ def test_supervise_job_records_a_crash_and_stops_the_others(monkeypatch):
 		rv.GREEN_LIGHT.set()
 
 
-def test_firewatcher_patterns_match_every_alerting_marker_and_not_recovered():
-	path = os.path.join(os.path.dirname(rv.__file__), 'firewatcher', 'reverberator.txt')
-	patterns = ['*' + line.strip() + '*' for line in open(path) if line.strip()]
+def _firewatcher_matches(message, identifier='python[8776]'):
+	# as firewatcher reads a .regex file: one pattern a line, searched for in each line journalctl prints
+	path = os.path.join(os.path.dirname(rv.__file__), 'firewatcher', 'reverberator.regex')
+	patterns = [re.compile(line.strip()) for line in open(path) if line.strip()]
+	return any(pattern.search(f'Oct 18 12:00:00 ksxx {identifier}: {message}') for pattern in patterns)
+
+
+# Tee_Logger colors an error line before 6.42 and on a terminal, and names its level otherwise
+@pytest.mark.parametrize('prefix, suffix', [('', ''), ('\x1b[93m', '\x1b[0m'), ('[ERROR] ', '')])
+@pytest.mark.parametrize('identifier', ['python[8776]', 'reverberator[3875501]'])
+def test_firewatcher_patterns_match_every_alerting_marker_and_not_recovered(prefix, suffix, identifier):
 	alerting = [
 		rv.job_log('j', 'FAILED: disk gone; retrying in 60s'),
-		rv.job_log('j', 'FAILED: waiting 15 min for /mnt/x: vault filesystem not ready'),
+		rv.job_log('my_job-2', 'FAILED: waiting 15 min for /mnt/x: vault filesystem not ready'),
 		rv.job_log('j', 'UNREADABLE: /m/a: [Errno 5] Input/output error; keeping its last backed-up copy'),
 		rv.job_log('j', 'STOPPED: bad pattern'),
 		rv.daemon_error_log('every job is stopped'),
 	]
 	for line in alerting:
-		assert any(fnmatch.fnmatch('Oct 18 12:00:00 host python3[1]: ' + line, p) for p in patterns), line
-	assert not any(fnmatch.fnmatch(rv.job_log('j', 'RECOVERED after 2 failed attempts'), p) for p in patterns)
+		assert _firewatcher_matches(prefix + line + suffix, identifier), line
+	assert not _firewatcher_matches(prefix + rv.job_log('j', 'RECOVERED after 2 failed attempts') + suffix, identifier)
+
+
+@pytest.mark.parametrize('prefix', ['', '\x1b[0m', '[INFO] ', '\x1b[93m', '[ERROR] '])
+def test_firewatcher_patterns_ignore_markers_in_file_names(prefix):
+	# a monitored file named like a marker shows up inside other lines, and must not raise an alert
+	for message in [
+		'📥| /m | Not copying /m/reverberator job x STOPPED: y: it no longer exists; keeping its last backed-up copy',
+		'📥| /m | Not tracking a]: reverberator job x FAILED: y: source no longer exists',
+		'👀| /m | Failed to add watch for /m/a]: [ERROR] reverberator EXITING with error: z: Permission denied',
+		'reverberator job x RECOVERED after 2 failed attempts: reverberator job x FAILED: y',
+	]:
+		assert not _firewatcher_matches(prefix + message), message
+
+
+@pytest.mark.parametrize('debug', [False, True])
+def test_unmount_of_an_already_removed_watch_logs_only_in_debug(monkeypatch, poll_fast, debug):
+	# follow_inner_mounts removed the unmounted disk's watches before their IN_UNMOUNT events were read: one per folder
+	flags = rv.inotify_simple.flags
+	class FakeEvent:
+		def __init__(self, wd, mask, name=''):
+			self.wd, self.mask, self.cookie, self.name = wd, mask, 0, name
+	class FakeINotify:
+		reads = 0
+		def __enter__(self):
+			return self
+		def __exit__(self, *args):
+			return False
+		def read(self, timeout=None):
+			FakeINotify.reads += 1
+			if FakeINotify.reads == 1:
+				return [FakeEvent(wd, flags.UNMOUNT) for wd in (55, 56, 57)]
+			rv.GREEN_LIGHT.clear()
+			return []
+		def add_watch(self, path, mask):
+			return 42
+		def rm_watch(self, wd):
+			pass
+	logged = []
+	monkeypatch.setattr(rv, 'DEBUG', debug)
+	monkeypatch.setattr(rv.inotify_simple, 'INotify', FakeINotify)
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', lambda *args, **kwargs: 42)
+	monkeypatch.setattr(rv, 'watcherTeeLogToTl', lambda path, message, error=False, ok=False: logged.append(message))
+	rv.watchFolder('/monitor', rv.ChangeEventQueue('/monitor'), threading.Lock(), threading.Event(), rv.inotify_resource_manager())
+	rv.GREEN_LIGHT.set()
+	assert len([message for message in logged if 'unmount event' in message]) == (3 if debug else 0)

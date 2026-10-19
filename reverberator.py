@@ -653,7 +653,8 @@ DISK_WAIT_GRACE_SECONDS = DEFAULT_DISK_WAIT_GRACE_SECONDS
 DISK_WAIT_REPEAT_SECONDS = 3600
 # the filesystem signature monitor re-checks a pair that failed this often, as a re-created path changes no mount
 FS_RECHECK_SECONDS = 60
-# the exit status when every job is stopped: only a rule or skip list fix helps, so systemd is told not to restart
+# the exit status when every job is stopped, or the rule file is missing or holds no job: only a rule or skip list fix
+# helps, so systemd is told not to restart
 EXIT_ALL_STOPPED = 3
 
 def env_seconds(name:str, default:float) -> float:
@@ -665,7 +666,10 @@ def env_seconds(name:str, default:float) -> float:
 	return value if 0 < value < float('inf') else default
 
 def apply_job_timing_from_env():
-	'''Set the job retry timing from REVERB_JOB_RETRY_FIRST_SECONDS and REVERB_JOB_RETRY_MAX_SECONDS. Invalid/missing → the defaults.'''
+	'''
+	Set the job retry timing from REVERB_JOB_RETRY_FIRST_SECONDS and REVERB_JOB_RETRY_MAX_SECONDS, and the disk wait's
+	grace period before its first alert from REVERB_DISK_WAIT_GRACE_SECONDS. Invalid/missing → the defaults.
+	'''
 	global JOB_RETRY_FIRST_SECONDS
 	global JOB_RETRY_MAX_SECONDS
 	global DISK_WAIT_GRACE_SECONDS
@@ -714,10 +718,11 @@ COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir','wds'],defaults=((
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
 
-def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic) -> bool:
+def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic, alert:bool = True) -> bool:
 	'''
 	Wait until flag is set and path is a directory. Returns False when the job (with job None, GREEN_LIGHT) says stop.
-	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS.
+	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS; with alert False,
+	never, for a wait another thread of the job alerts for.
 	'''
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	started = clock()
@@ -731,7 +736,7 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 		else:
 			flag.wait(POLL_WAIT_SECONDS)
 		now = clock()
-		if now >= next_alert and job is not None:
+		if now >= next_alert and job is not None and alert:
 			waited = now - started
 			job_log(job.job_name, f'FAILED: waiting {int(waited // 60)} min for {path}: {what}')
 			next_alert = now + DISK_WAIT_REPEAT_SECONDS
@@ -993,7 +998,7 @@ def run_daemon():
 	if not rules:
 		tl.teeerror(f'Error: Rule file {args.rule_path} appears empty after parsing.')
 		daemon_error_log(f'rule file {args.rule_path} has no rules')
-		sys.exit(1)
+		sys.exit(EXIT_ALL_STOPPED)
 	# one supervisor per job runs its watcher and backuper, and starts them again after a failure
 	supervisors = []
 	results = [None] * len(rules)
@@ -1309,7 +1314,7 @@ def parse_rules(rule_file:str):
 	if not os.path.exists(rule_file):
 		tl.teeerror(f'Error: Rule file {rule_file} does not exist.')
 		daemon_error_log(f'rule file {rule_file} does not exist')
-		sys.exit(1)
+		sys.exit(EXIT_ALL_STOPPED)
 	try:
 		if upgrade_rule_file_header(rule_file):
 			tl.info(f'Upgraded rule file {rule_file} header with the Skip List File column.')
@@ -1325,7 +1330,7 @@ def parse_rules(rule_file:str):
 	if not rules:
 		tl.teeerror(f'Error: Rule file {rule_file} appears empty after parsing.')
 		daemon_error_log(f'rule file {rule_file} has no rules')
-		sys.exit(1)
+		sys.exit(EXIT_ALL_STOPPED)
 	# fill in empty / auto and append:
 	rulesToUpdate = {}
 	returnReverbRules = []
@@ -1696,7 +1701,8 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	root_lost = False
 	while running():
-		if not wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready'):
+		# at the start the backuper waits for the same filesystem and alerts for both; once the root was lost only this waits
+		if not wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready', alert=root_lost):
 			return False
 		skip_list = watching = None
 		if startup is not None:
@@ -1741,17 +1747,31 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	cookieDic = OrderedDict()
 	wdDic = bidict()
 	pendingMoveFromEvents = OrderedDict()
+	# the same move-outs by normalized path (path -> {cookie: None}, oldest first), so a create finds those at its path
+	# without going through all of them. a path can have more than one: a folder renamed in brings another entry there
+	pendingMoveFromPaths = {}
+	def add_pending_move_from(cookie,change_event:ChangeEvent):
+		pop_pending_move_from(cookie)
+		pendingMoveFromEvents[cookie] = change_event
+		pendingMoveFromPaths.setdefault(change_event.path.rstrip('/'),{})[cookie] = None
+	def pop_pending_move_from(cookie) -> ChangeEvent:
+		change_event = pendingMoveFromEvents.pop(cookie,None)
+		if change_event is not None:
+			path_norm = change_event.path.rstrip('/')
+			cookies = pendingMoveFromPaths.get(path_norm)
+			if cookies is not None:
+				cookies.pop(cookie,None)
+				if not cookies:
+					del pendingMoveFromPaths[path_norm]
+		return change_event
 	def queue_pending_move_from_at(path:str,monTime:float):
 		# something new is at the path a folder or file moved away from: that move was not a deletion that can wait,
 		# or the delete it expires into would land after this create and remove what is there
-		path_norm = path.rstrip('/')
-		for cookie, pending in list(pendingMoveFromEvents.items()):
-			if pending.path.rstrip('/') != path_norm:
-				continue
+		for cookie in list(pendingMoveFromPaths.get(path.rstrip('/'),())):
 			cookie_value = cookieDic.pop(cookie,None)
 			if cookie_value is not None and cookie_value.wds:
 				remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
-			append_change_event(to_process, to_process_lock, pendingMoveFromEvents.pop(cookie))
+			append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	newDirWDs = set()
 	processPending = False
 	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
@@ -1807,7 +1827,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					# the folder left for a place with no watch (out of the tree, or into a skipped folder) and took its
 					# watches along: they would report its new contents under the old path. gone before its delete is queued
 					remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
-				append_change_event(to_process, to_process_lock, pendingMoveFromEvents.pop(cookie))
+				append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 			if not events:
 				if to_process and not to_process_flag.is_set() and time.monotonic() - lastReadTime > min_snapshot_delay_seconds:
 					watcherTeeLogToTl(monitor_path,'Timeout elapsed, signaling backuper to process')
@@ -1851,7 +1871,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, dropping the watch for {wdDic[event.wd]}')
 							del wdDic[event.wd]
 							irm.decreaseUserWatches()
-						else:
+						elif DEBUG:
+							# follow_inner_mounts already removed it, with every other watch of the disk: one line per folder
 							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, but watch not in wdDic found for {event.wd}')
 						continue
 					elif event.mask & flags.MOVE_SELF:
@@ -1912,14 +1933,14 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						watcherTeeLogToTl(monitor_path,'Cookie dictionary is full, popping oldest item')
 						evicted_cookie,cookie_value = cookieDic.popitem(last=False)
 						# drop the matching pending move_from so its expiry does not emit a second delete
-						pendingMoveFromEvents.pop(evicted_cookie,None)
+						pop_pending_move_from(evicted_cookie)
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Adding delete event for {cookie_value.path}')
 						if cookie_value.wds:
 							remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,cookie_value.isDir,'delete',cookie_value.path,None))
 					#append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,None))
-					pendingMoveFromEvents[event.cookie] = ChangeEvent(monTime,isDir,'delete',eventPath,None)
+					add_pending_move_from(event.cookie,ChangeEvent(monTime,isDir,'delete',eventPath,None))
 				elif event.mask & flags.MOVED_TO:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move to event detected for {eventPath}')
@@ -1927,7 +1948,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# the destination is not backed up: a known source is gone from the backup, otherwise there is nothing to record
 						if event.cookie in cookieDic:
 							cookie_value = cookieDic.pop(event.cookie)
-							pendingMoveFromEvents.pop(event.cookie,None)
+							pop_pending_move_from(event.cookie)
 							append_change_event(to_process, to_process_lock, ChangeEvent(monTime,cookie_value.isDir,'delete',cookie_value.path,None))
 							if cookie_value.isDir:
 								remove_watches_under(inotify_obj,wdDic,irm,cookie_value.path)
@@ -1939,7 +1960,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							watcherTeeLogToTl(monitor_path,f'Cookie found for {event.cookie}')
 							watcherTeeLogToTl(monitor_path,f'Adding move event for {cookieDic[event.cookie].path} to {eventPath}')
 						cookie_value = cookieDic.pop(event.cookie)
-						pendingMoveFromEvents.pop(event.cookie,None)
+						pop_pending_move_from(event.cookie)
 						# what moved away from the destination is gone before the move lands on its name, or its late
 						# delete would remove the moved-in entry
 						queue_pending_move_from_at(eventPath,monTime)
@@ -2876,13 +2897,16 @@ class fs_signature_monitor:
 					if not GREEN_LIGHT.is_set():
 						self.thread = None
 						return
+				recheck_failed = time.monotonic() >= recheck_at
 				try:
-					self.check_changed(recheck_failed=time.monotonic() >= recheck_at)
+					self.check_changed(recheck_failed=recheck_failed)
 				except Exception:
 					import traceback
 					watcherTeeLogToTl(self.mountinfo_path, traceback.format_exc(), error=True)
-				# a pair that failed is re-checked every FS_RECHECK_SECONDS: a deleted and re-created path changes no mount
-				recheck_at = time.monotonic() + FS_RECHECK_SECONDS
+				# a pair that failed is re-checked every FS_RECHECK_SECONDS: a deleted and re-created path changes no mount.
+				# counted from the pass that re-checked them, so mount table changes coming more often cannot put it off
+				if recheck_failed:
+					recheck_at = time.monotonic() + FS_RECHECK_SECONDS
 				while GREEN_LIGHT.is_set() and not poller.poll(int(max(POLL_WAIT_SECONDS * 1000, 1))):
 					if time.monotonic() >= recheck_at:
 						break
@@ -3529,8 +3553,10 @@ def do_backup(backup_entries:dict,
 					if GREEN_LIGHT.is_set():
 						finish_copies(pending,manifest,backup_folder,job_name,reported)
 				finally:
-					# however the backup ends, no copy is left writing into this version, nor a partial file in it
-					stop_copies(mcae,pending,backup_folder)
+					# however the backup ends, no copy is left writing into this version. a copy finish_copies did not reach
+					# means this V0 is not committed: the whole folder is removed as an orphan ( on the next attempt, or at
+					# startup after a stop ), so unlinking each partial file of a large tree first would only hold up the stop
+					stop_copies(mcae,pending,backup_folder,discard=False)
 				mcae.cleanup(timeout=POLL_WAIT_SECONDS)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
 				record_dirty_entries(manifest,backup_folder,monitor_path)
@@ -4209,13 +4235,15 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 	if failure is not None:
 		raise failure
 
-def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str):
+def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, discard:bool = True):
 	'''
 	Stop what still runs on mcae, then discard the copies of pending, which will not be finished.
 
 	Running commands are killed and waited for, as a retry removes the uncommitted version_path they write into: for
 	COPY_STOP_WAIT_SECONDS at most, COPY_STOP_GRACE_SECONDS once the daemon is stopping. The ones still running then are
 	named in an error line and left to finish on their own.
+	With discard False, pending is only emptied: for a version_path that is never committed now, whose partial files go
+	with it when it is removed.
 	'''
 	mcae.stop(timeout=0)
 	deadline = time.monotonic() + COPY_STOP_WAIT_SECONDS
@@ -4230,7 +4258,10 @@ def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str):
 		running = [' '.join(task.command) for task in mcae.tasks if task.is_alive()]
 		shown = '; '.join(running[:10]) + (f'; and {len(running) - 10} more' if len(running) > 10 else '')
 		backuperTeeLogToTl(path=version_path,error=True,message=f'{len(running)} stopped commands still running after {COPY_STOP_WAIT_SECONDS}s, no longer waiting for them: {shown}')
-	discard_copies(pending)
+	if discard:
+		discard_copies(pending)
+	else:
+		pending.clear()
 
 def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False) -> bool:
 	'''
