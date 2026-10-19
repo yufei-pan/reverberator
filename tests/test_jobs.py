@@ -470,3 +470,36 @@ def test_monitor_gate_registers_the_resolved_signature_before_the_job_starts(tmp
 		time.sleep(0.4)
 		assert not flag.is_set()
 	rv.FS_SIGNATURE_MONITOR.unregister(path, 'UUID-A', flag)
+
+
+def test_invalidate_during_a_running_check_keeps_the_flag_clear(tmp_path, monkeypatch):
+	monitor = rv.fs_signature_monitor(mountinfo_path=str(tmp_path / 'mountinfo'))
+	key = (str(tmp_path), 'UUID-X')
+	flag = threading.Event()
+	monitor.flags[key] = [flag]
+	def stale_check(path, signature):
+		monitor.invalidate(path, signature)
+		return True
+	monkeypatch.setattr(rv, 'check_fs_signature', stale_check)
+	monitor.check_changed()
+	assert not flag.is_set() and monitor.states.get(key) is not True
+
+
+def test_watcher_invalidates_its_signature_on_self_destruct_for_an_ordinary_job(tmp_path, monkeypatch, poll_fast):
+	path = str(tmp_path)
+	calls = []
+	monkeypatch.setattr(rv.FS_SIGNATURE_MONITOR, 'invalidate', lambda p, s: calls.append((p, s)))
+	results = iter([rv.WATCH_RESULT_SELF_DESTRUCT, rv.WATCH_RESULT_INIT_FAILED])
+	monkeypatch.setattr(rv, 'watchFolder', lambda *a, **k: next(results))
+	flag = threading.Event()
+	flag.set()
+	started = []
+	monkeypatch.setattr(rv, 'backuper', lambda *a, **k: a[-2].loaded.set())
+	real_watcher = rv.watcher
+	monkeypatch.setattr(rv, 'watcher', lambda *a, **k: started.append(real_watcher(*a, **k)))
+	starter = rv.job_attempt_starter('j', ('j', path), (flag, path, None, None, None, None, 1, 1), ('j', None, None, path, 'v', 'N/A', None, flag), None, 'UUID-RULE')
+	control = rv.JobControl('j')
+	control.start_attempt()
+	for t in starter(control, 1):
+		t.join(timeout=5)
+	assert calls == [(path, 'UUID-RULE')]

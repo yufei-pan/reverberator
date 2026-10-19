@@ -844,15 +844,16 @@ class MonitorGate:
 		self.flag, self.signature, self.resolved = new_flag, signature, True
 		return True
 
-def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, backuper_args:tuple, monitor_gate:MonitorGate = None):
+def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, backuper_args:tuple, monitor_gate:MonitorGate = None, monitor_signature:str = None):
 	'''
 	A start_attempt for run_job: each attempt starts the job's watcher and backuper, sharing a fresh JobStartup.
 	startup_args are JobStartup's, watcher_args and backuper_args their function's positional arguments before startup.
 	With a monitor_gate, nothing starts until it has resolved the monitored filesystem's signature, and its flag is
 	the monitored filesystem flag from then on (watcher_args[0] and backuper_args[7] are the ungated one).
+	monitor_signature is the rule's, which the watcher hands to the filesystem monitor when its root disappears.
 	'''
 	def start_attempt(job:JobControl, attempt:int) -> list:
-		w_args, b_args, signature = watcher_args, backuper_args, None
+		w_args, b_args, signature = watcher_args, backuper_args, monitor_signature
 		if monitor_gate is not None:
 			if not monitor_gate.resolve(job):
 				return []
@@ -995,7 +996,7 @@ def run_daemon():
 		gate = None
 		if not os.path.exists(monitor_path) and monitor_path_signature.strip().lower() in ('', 'auto'):
 			gate = MonitorGate(monitor_path, monitor_fs_flag, monitor_path_signature)
-		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate)
+		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate, monitor_path_signature)
 		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
 		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
 		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
@@ -2255,6 +2256,8 @@ class fs_signature_monitor:
 		self.fingerprints = {}
 		# (path, signature) -> result of its last check
 		self.states = {}
+		# (path, signature) -> bumped by invalidate(), so a check that started before it does not store its stale result
+		self.generations = {}
 		self.thread = None
 		self.wake_r, self.wake_w = os.pipe()
 		os.set_blocking(self.wake_r, False)
@@ -2303,6 +2306,7 @@ class fs_signature_monitor:
 			if key in self.flags:
 				self.states[key] = False
 			self.fingerprints.pop(key, None)
+			self.generations[key] = self.generations.get(key, 0) + 1
 		self.wake()
 
 	def wake(self):
@@ -2327,9 +2331,10 @@ class fs_signature_monitor:
 			with self.lock:
 				if self.fingerprints.get(key, ...) == fingerprint and (self.states.get(key) or not recheck_failed):
 					continue
+				generation = self.generations.get(key, 0)
 			fs_ok = check_fs_signature(path, signature)
 			with self.lock:
-				if key not in self.flags:
+				if key not in self.flags or self.generations.get(key, 0) != generation:
 					continue
 				changed = self.states.get(key) != fs_ok
 				self.fingerprints[key] = fingerprint
