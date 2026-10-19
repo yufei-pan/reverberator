@@ -4,7 +4,7 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, wait_until
+from tests.harness import seed_monitor, tracked_manifest, wait_until
 
 def _privileged():
 	return os.geteuid() == 0 or os.environ.get('REVERB_PRIVILEGED') == '1'
@@ -234,3 +234,297 @@ def test_a_watch_that_cannot_be_added_is_not_counted(tmp_path):
 	irm = rv.inotify_resource_manager()
 	assert rv.initializeFolderWatchers(Refusing(), str(tmp_path), rv.bidict(), irm, 0) == -1
 	assert irm.current_user_watches == 0
+
+
+from collections import OrderedDict
+from tests.harness import committed_versions, wait_for_committed_count
+
+
+def _backup(job, entries=None):
+	return rv.do_backup(OrderedDict() if entries is None else entries, job_name=job.job_name, monitor_path=job.monitor,
+		vault_path=job.vault, keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+
+
+def _fake_mounts(monkeypatch, job, mounted):
+	table = [('/', ('1',))] + [(os.path.join(job.monitor, rel.rstrip('/')), (rel,)) for rel in mounted]
+	monkeypatch.setattr(rv, 'current_mount_table', lambda: table)
+
+
+@pytest.mark.unit
+def test_unmounted_inner_disk_is_paused_not_deleted(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f', 'disk/sub/g.txt': 'g'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	for name in ('f.txt', 'sub/g.txt'):
+		os.remove(os.path.join(job.monitor, 'disk', name))
+	os.rmdir(os.path.join(job.monitor, 'disk', 'sub'))   # the mount point now looks like an empty folder
+	_fake_mounts(monkeypatch, job, [])
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
+	_, manifest, _ = _backup(job)
+	assert manifest.inner_mounts == ['disk/']
+	manifest.close()
+	v1 = committed_versions(job)[1]
+	assert os.path.lexists(os.path.join(v1, 'disk', 'f.txt')) and os.path.lexists(os.path.join(v1, 'disk', 'sub', 'g.txt'))
+
+
+@pytest.mark.unit
+def test_paused_mount_survives_restart(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	os.remove(os.path.join(job.monitor, 'disk', 'f.txt'))
+	_fake_mounts(monkeypatch, job, [])
+	open(os.path.join(job.monitor, 'b.txt'), 'w').write('b')
+	_backup(job)[1].close()          # a fresh manifest object, as after a restart
+	assert os.path.lexists(os.path.join(committed_versions(job)[-1], 'disk', 'f.txt'))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('retire', ['remove', 'repopulate'])
+def test_retiring_the_mount_point_ends_the_pause(job, poll_fast, monkeypatch, retire):
+	seed_monitor(job, {'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	os.remove(os.path.join(job.monitor, 'disk', 'f.txt'))
+	_fake_mounts(monkeypatch, job, [])
+	if retire == 'remove':
+		os.rmdir(os.path.join(job.monitor, 'disk'))
+	else:
+		open(os.path.join(job.monitor, 'disk', 'other.txt'), 'w').write('o')
+	_backup(job)[1].close()
+	latest = committed_versions(job)[-1]
+	assert not os.path.lexists(os.path.join(latest, 'disk', 'f.txt'))
+
+
+@pytest.mark.unit
+def test_scoped_delta_compares_only_the_scope(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_, manifest, _ = _backup(job)
+	latest = rv.get_vault_info(job.job_vault).vault_info_dict
+	latest = latest[next(reversed(latest))]
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('outside change')
+	open(os.path.join(job.monitor, 'disk', 'f.txt'), 'w').write('inside change')
+	entries = OrderedDict()
+	rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/')
+	manifest.close()
+	assert list(entries) == [os.path.join(job.monitor, 'disk', 'f.txt')]
+
+
+@pytest.mark.unit
+def test_backuper_handles_scan_events(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('outside')
+	open(os.path.join(job.monitor, 'disk', 'f.txt'), 'w').write('inside')
+	queue = rv.ChangeEventQueue(job.monitor)
+	queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+	queue.append(rv.ChangeEvent(2.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	flag = threading.Event()
+	flag.set()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, threading.Lock(), job.monitor, job.vault, 'N/A',
+		threading.Event(), flag), kwargs=dict(job=control), daemon=True)
+	thread.start()
+	try:
+		v1 = wait_for_committed_count(job, 2)[1]
+		assert open(os.path.join(v1, 'a.txt')).read() == 'outside'
+		assert open(os.path.join(v1, 'disk', 'f.txt')).read() == 'inside'
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=5)
+		rv.GREEN_LIGHT.set()
+
+
+@pytest.mark.privileged
+@needs_root
+def test_tmpfs_inner_disk_pause_and_remount(job, poll_fast):
+	inner = os.path.join(job.monitor, 'disk')
+	os.makedirs(inner)
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('a')
+	subprocess.check_call(['mount', '-t', 'tmpfs', 'tmpfs', inner])
+	try:
+		open(os.path.join(inner, 'f.txt'), 'w').write('f')
+		_backup(job)[1].close()
+		subprocess.check_call(['umount', inner])
+		open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
+		_backup(job)[1].close()
+		assert os.path.lexists(os.path.join(committed_versions(job)[1], 'disk', 'f.txt'))
+		subprocess.check_call(['mount', '-t', 'tmpfs', 'tmpfs', inner])
+		open(os.path.join(inner, 'f.txt'), 'w').write('remounted')
+		_, manifest, _ = _backup(job)
+		manifest.close()
+		assert open(os.path.join(committed_versions(job)[2], 'disk', 'f.txt')).read() == 'remounted'
+	finally:
+		subprocess.call(['umount', inner])
+
+
+@pytest.mark.unit
+def test_paused_inner_mounts_need_an_empty_unmounted_folder(tmp_path):
+	monitor = str(tmp_path / 'm')
+	for rel in ('empty/', 'full/', 'mounted/', 'outer/'):
+		os.makedirs(os.path.join(monitor, rel))
+	open(os.path.join(monitor, 'full', 'x'), 'w').close()
+	open(os.path.join(monitor, 'file'), 'w').close()
+	os.symlink('empty', os.path.join(monitor, 'link'))
+	table = [('/', ('1',)), (os.path.join(monitor, 'mounted'), ('2',))]
+	remembered = ['empty/', 'full/', 'mounted/', 'gone/', 'file/', 'link/', 'outer/', 'outer/inner/']
+	# outer/inner/ is gone with its outer disk, which keeps it
+	assert rv.paused_inner_mounts(monitor, remembered, table) == {'empty/', 'outer/'}
+
+
+@pytest.mark.unit
+def test_manifest_remembers_inner_mounts_and_lists_unseen_rows_of_a_folder(tmp_path):
+	version = str(tmp_path / 'V0--2021-01-01_00-00-00_-0800')
+	manifest = tracked_manifest(str(tmp_path), version, files=['a/x', 'a/y', 'ab', 'b/z'], folders=['a/', 'b/'])
+	try:
+		assert manifest.inner_mounts == []
+		manifest.begin()
+		manifest.set_inner_mounts(['a/', 'b/c/'])
+		manifest.commit()
+		manifest.clear_seen()
+		manifest.mark_seen(['a/x', 'b/z'])
+		assert manifest.unseen_under('a/') == ['a/', 'a/y']
+		assert manifest.unseen() == ['a/', 'a/y', 'ab', 'b/']
+	finally:
+		manifest.close()
+	reopened = rv.VaultManifest(str(tmp_path))
+	try:
+		assert reopened.inner_mounts == ['a/', 'b/c/']
+	finally:
+		reopened.close()
+
+
+@pytest.mark.unit
+def test_events_under_a_paused_mount_are_dropped(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f', 'disk/g.txt': 'g'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	for name in ('f.txt', 'g.txt'):
+		os.remove(os.path.join(job.monitor, 'disk', name))
+	_fake_mounts(monkeypatch, job, [])
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
+	# what the disk saw before it went, taken after it went
+	entries = rv.change_events_to_backup_entries([
+		rv.ChangeEvent(1.0, False, 'delete', os.path.join(job.monitor, 'disk', 'f.txt'), None),
+		rv.ChangeEvent(2.0, False, 'move', os.path.join(job.monitor, 'moved.txt'), os.path.join(job.monitor, 'disk', 'g.txt')),
+		rv.ChangeEvent(3.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None)])
+	open(os.path.join(job.monitor, 'moved.txt'), 'w').write('g')
+	_backup(job, entries)[1].close()
+	v1 = committed_versions(job)[1]
+	assert os.path.lexists(os.path.join(v1, 'disk', 'f.txt')) and os.path.lexists(os.path.join(v1, 'disk', 'g.txt'))
+	assert open(os.path.join(v1, 'moved.txt')).read() == 'g'
+	assert open(os.path.join(v1, 'a.txt')).read() == 'changed'
+
+
+def _run_backuper(job, queue, control, to_process_flag, lock=None):
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock or threading.Lock(), job.monitor, job.vault,
+		'N/A', to_process_flag), kwargs=dict(job=control), daemon=True)
+	thread.start()
+	return thread
+
+
+@pytest.mark.unit
+def test_scan_of_a_paused_mount_runs_no_backup(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	os.remove(os.path.join(job.monitor, 'disk', 'f.txt'))
+	_fake_mounts(monkeypatch, job, [])
+	scopes = []
+	delta = rv.delta_generate_backup_entries
+	def recording_delta(*args, **kwargs):
+		scopes.append(kwargs.get('scope_rel', ''))
+		return delta(*args, **kwargs)
+	monkeypatch.setattr(rv, 'delta_generate_backup_entries', recording_delta)
+	queue = rv.ChangeEventQueue(job.monitor)
+	lock = threading.Lock()
+	queue.append(rv.ChangeEvent(1.0, False, 'delete', os.path.join(job.monitor, 'disk', 'f.txt'), None))
+	queue.append(rv.ChangeEvent(2.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	to_process_flag = threading.Event()
+	thread = _run_backuper(job, queue, control, to_process_flag, lock)
+	try:
+		# the next batch backs up as usual
+		wait_until(lambda: not queue, timeout=5, message='batch not taken')
+		open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
+		with lock:
+			queue.append(rv.ChangeEvent(3.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+		to_process_flag.set()
+		v1 = wait_for_committed_count(job, 2)[1]
+		assert open(os.path.join(v1, 'a.txt')).read() == 'changed'
+		assert os.path.lexists(os.path.join(v1, 'disk', 'f.txt'))
+		# the paused scan neither compared the whole tree nor made a version of its own
+		assert '' not in scopes
+		assert len(committed_versions(job)) == 2
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=5)
+		rv.GREEN_LIGHT.set()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('event', ['scan', 'full_scan'])
+def test_a_changed_monitored_filesystem_fails_the_job_before_comparing(job, poll_fast, monkeypatch, event):
+	seed_monitor(job, {'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_backup(job)[1].close()
+	queue = rv.ChangeEventQueue(job.monitor)
+	lock = threading.Lock()
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	to_process_flag = threading.Event()
+	thread = _run_backuper(job, queue, control, to_process_flag, lock)
+	try:
+		# the startup comparison finds nothing new
+		assert control.committed.wait(5)
+		# the monitored disk is lazily unmounted: its inner mount leaves the table, and the path shows another
+		# filesystem, which has no disk folder
+		monkeypatch.setattr(rv, 'current_mount_table', lambda: [('/', ('1',)), (job.monitor, ('other',))])
+		import shutil
+		shutil.rmtree(os.path.join(job.monitor, 'disk'))
+		with lock:
+			queue.append(rv.ChangeEvent(5.0, True, event, os.path.join(job.monitor, 'disk') if event == 'scan' else job.monitor, None))
+		to_process_flag.set()
+		thread.join(timeout=5)
+		assert not thread.is_alive()
+		assert control.failure is not None and not control.failure.permanent
+		assert f'the monitored filesystem changed under {job.monitor}' in control.failure.reason
+		# the batch waits for the job's next attempt, and nothing was recorded as deleted
+		assert [e.event for e in queue] == [event]
+		assert len(committed_versions(job)) == 1
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=5)
+		rv.GREEN_LIGHT.set()
+
+
+@pytest.mark.unit
+def test_scoped_delta_keeps_a_folder_it_cannot_look_at_and_drops_one_that_is_gone(job, poll_fast, monkeypatch):
+	import errno
+	import shutil
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	_, manifest, _ = _backup(job)
+	try:
+		latest = rv.get_vault_info(job.job_vault).vault_info_dict
+		latest = latest[next(reversed(latest))]
+		disk = os.path.join(job.monitor, 'disk')
+		real_lstat = os.lstat
+		def failing_lstat(path, *args, **kwargs):
+			if path == disk:
+				raise OSError(errno.EIO, 'Input/output error', path)
+			return real_lstat(path, *args, **kwargs)
+		monkeypatch.setattr(rv.os, 'lstat', failing_lstat)
+		entries = OrderedDict()
+		rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/')
+		monkeypatch.setattr(rv.os, 'lstat', real_lstat)
+		assert entries == {}
+		shutil.rmtree(disk)
+		rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/')
+		assert {path: values.event for path, values in entries.items()} == {disk + '/': 'delete', disk + '/f.txt': 'delete'}
+	finally:
+		manifest.close()
