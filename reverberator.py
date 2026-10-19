@@ -854,23 +854,27 @@ class MonitorGate:
 		'''Returns False when the job (or the daemon) is stopped before the signature is known.'''
 		if self.resolved:
 			return True
-		always = threading.Event()
-		always.set()
-		if not wait_for_path(job, always, self.path, 'monitored path not there yet'):
-			return False
 		signature = None
 		started = time.monotonic()
 		next_alert = started + DISK_WAIT_GRACE_SECONDS
+		# a lookup runs df and lsblk: at once when the path is there, then again every FS_RECHECK_SECONDS while it is
+		looked_up_at = None
 		while job.should_run():
-			if os.path.isdir(self.path):
+			present = os.path.isdir(self.path)
+			if not present:
+				looked_up_at = None
+			elif looked_up_at is None or time.monotonic() - looked_up_at >= FS_RECHECK_SECONDS:
+				looked_up_at = time.monotonic()
 				signatures = get_fs_signatures(self.path)
 				if signatures and signatures[0]:
 					signature = signatures[0]
 					break
-			job.running.wait(min(FS_RECHECK_SECONDS, POLL_WAIT_SECONDS))
+			# job.running stays set while the job runs, so waiting on it would not wait at all
+			time.sleep(POLL_WAIT_SECONDS)
 			now = time.monotonic()
 			if now >= next_alert:
-				job_log(job.job_name, f'FAILED: waiting {int((now - started) // 60)} min for {self.path}: monitored filesystem signature unknown')
+				what = 'monitored filesystem signature unknown' if present else 'monitored path not there yet'
+				job_log(job.job_name, f'FAILED: waiting {int((now - started) // 60)} min for {self.path}: {what}')
 				next_alert = now + DISK_WAIT_REPEAT_SECONDS
 		if signature is None:
 			return False
