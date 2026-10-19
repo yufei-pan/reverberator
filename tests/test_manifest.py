@@ -2,7 +2,7 @@ import os
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, committed_versions, tracked_manifest
+from tests.harness import seed_monitor, tracked_manifest, run_backup, latest_version, event_entry
 
 pytestmark = pytest.mark.unit
 
@@ -10,22 +10,6 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(autouse=True)
 def _fast(poll_fast):
 	return poll_fast
-
-
-def backup(job, entries=None):
-	'''One backup as the backuper runs it: empty entries delta generate against the latest version.'''
-	_, manifest, committed = rv.do_backup(
-		OrderedDict() if entries is None else entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0',
-	)
-	manifest.close()
-	assert committed is True
-	return committed_versions(job)
-
-
-def latest_version(job):
-	info = rv.get_vault_info(job.job_vault)
-	return info.vault_info_dict[next(reversed(info.vault_info_dict))]
 
 
 def count_vault_reads(monkeypatch):
@@ -41,7 +25,7 @@ def count_vault_reads(monkeypatch):
 
 def test_backup_records_what_the_new_version_holds(job):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
-	v0 = backup(job)[0]
+	v0 = run_backup(job)[0]
 	manifest = rv.VaultManifest(job.job_vault)
 	assert manifest.describes(v0)
 	assert (manifest.folders, manifest.files) == (['sub/'], ['a.txt', 'sub/b.txt'])
@@ -55,32 +39,32 @@ def test_backup_records_what_the_new_version_holds(job):
 
 def test_cold_start_reads_each_copy_back_once_then_only_the_monitored_side(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
-	backup(job)
+	run_backup(job)
 	reads = count_vault_reads(monkeypatch)
-	assert len(backup(job)) == 1
+	assert len(run_backup(job)) == 1
 	assert sorted(reads) == ['a.txt', 'sub/b.txt']
 	reads.clear()
-	assert len(backup(job)) == 1
+	assert len(run_backup(job)) == 1
 	assert reads == []
 
 
 def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
 	# a crash mid copy can leave the size and mtime in place over space whose bytes never reached the disk
 	seed_monitor(job, {'a.txt': 'hello'})
-	copy = os.path.join(backup(job)[0], 'a.txt')
+	copy = os.path.join(run_backup(job)[0], 'a.txt')
 	st = os.lstat(copy)
 	with open(copy, 'r+b') as f:
 		f.write(b'\0' * st.st_size)
 	os.utime(copy, ns=(st.st_atime_ns, st.st_mtime_ns))
-	versions = backup(job)
+	versions = run_backup(job)
 	assert len(versions) == 2
 	assert open(os.path.join(versions[1], 'a.txt')).read() == 'hello'
 
 
 def test_content_rewritten_keeping_size_and_mtime_is_modify_without_reading_the_vault(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
-	backup(job)
-	backup(job)
+	run_backup(job)
+	run_backup(job)
 	source = os.path.join(job.monitor, 'a.txt')
 	st = os.lstat(source)
 	open(source, 'w').write('jello')
@@ -95,13 +79,13 @@ def test_content_rewritten_keeping_size_and_mtime_is_modify_without_reading_the_
 def test_relative_symlink_is_not_copied_again_at_each_start(job):
 	seed_monitor(job, {'lib/x.txt': 'x'})
 	os.symlink('lib', os.path.join(job.monitor, 'lib64'))
-	backup(job)
-	assert len(backup(job)) == 1
+	run_backup(job)
+	assert len(run_backup(job)) == 1
 
 
 def test_attribute_change_is_attrib(job):
 	seed_monitor(job, {'a.txt': 'hello'})
-	backup(job)
+	run_backup(job)
 	source = os.path.join(job.monitor, 'a.txt')
 	os.chmod(source, 0o600)
 	entries = OrderedDict()
@@ -111,28 +95,27 @@ def test_attribute_change_is_attrib(job):
 
 def test_moved_folder_is_read_from_the_vault_again(job, monkeypatch):
 	seed_monitor(job, {'sub/x.txt': 'x'})
-	backup(job)
+	run_backup(job)
 	os.rename(os.path.join(job.monitor, 'sub'), os.path.join(job.monitor, 'moved'))
-	backup(job, OrderedDict([
+	run_backup(job, OrderedDict([
 		(os.path.join(job.monitor, 'moved') + '/', rv.BackupEntryValues('t', 'move', os.path.join(job.monitor, 'sub') + '/')),
 	]))
 	reads = count_vault_reads(monkeypatch)
-	assert len(backup(job)) == 2
+	assert len(run_backup(job)) == 2
 	assert sorted(reads) == ['moved/', 'moved/x.txt']
 
 
-def test_folder_moved_to_another_depth_is_copied_again(job):
-	# the relative links inside a folder moved to another depth no longer reach the version holding the copies
+def test_folder_moved_to_another_depth_needs_no_copy(job):
+	# the links inside a folder moved to another depth are re-targeted, so they still reach the version holding the copies
 	seed_monitor(job, {'sub/x.txt': 'x', 'deep/er/p.txt': 'p'})
-	backup(job)
-	moved = os.path.join(job.monitor, 'deep', 'er', 'sub')
-	os.rename(os.path.join(job.monitor, 'sub'), moved)
-	backup(job, OrderedDict([(moved + '/', rv.BackupEntryValues('t', 'move', os.path.join(job.monitor, 'sub') + '/'))]))
+	run_backup(job)
+	os.rename(os.path.join(job.monitor, 'sub'), os.path.join(job.monitor, 'deep', 'er', 'sub'))
+	run_backup(job, OrderedDict([event_entry(job, 'deep/er/sub/', 'move', 'sub/')]))
 	entries = OrderedDict()
 	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
-	assert {path: values.event for path, values in entries.items()} == {os.path.join(moved, 'x.txt'): 'modify'}
-	versions = backup(job)
-	assert open(os.path.join(versions[-1], 'deep', 'er', 'sub', 'x.txt')).read() == 'x'
+	assert entries == {}
+	copy = os.path.join(latest_version(job).path, 'deep', 'er', 'sub', 'x.txt')
+	assert os.path.islink(copy) and open(copy).read() == 'x'
 
 
 def test_manifest_for_another_version_is_listed_again_from_the_vault(job):
@@ -151,7 +134,7 @@ def test_manifest_for_another_version_is_listed_again_from_the_vault(job):
 
 def test_interrupted_backup_leaves_the_manifest_on_the_previous_version(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
-	v0 = backup(job)[0]
+	v0 = run_backup(job)[0]
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('hello again')
 	real = rv.record_dirty_entries
 

@@ -1,6 +1,7 @@
 import os
 import time
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
+from datetime import datetime
 
 import TSVZ
 import reverberator as rv
@@ -137,6 +138,32 @@ def committed_versions(job: JobPaths) -> list:
 		if os.path.isfile(content_file_path(path)):
 			found.append(path)
 	return found
+
+
+def run_backup(job: JobPaths, entries=None, **kwargs) -> list:
+	'''
+	One committed backup as the backuper runs it: empty entries delta generate against the latest version.
+	kwargs override do_backup's keywords, such as keep_n_versions.
+	'''
+	options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+	options.update(kwargs)
+	_, manifest, committed = rv.do_backup(
+		OrderedDict() if entries is None else entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, **options,
+	)
+	manifest.close()
+	assert committed is True
+	return committed_versions(job)
+
+
+def latest_version(job: JobPaths) -> 'rv.VaultEntry':
+	info = rv.get_vault_info(job.job_vault)
+	return info.vault_info_dict[next(reversed(info.vault_info_dict))]
+
+
+def event_entry(job: JobPaths, rel: str, event: str, source_rel: str = None) -> tuple:
+	'''A backup entry for rel (a folder when it ends with /) as the backuper queues it, moved from source_rel for a move.'''
+	source = None if source_rel is None else os.path.join(job.monitor, source_rel)
+	return os.path.join(job.monitor, rel), rv.BackupEntryValues(datetime.now().isoformat(), event, source)
 
 
 def wait_until(predicate, timeout: float = 10.0, interval: float = 0.05, message: str = 'condition not met') -> None:
