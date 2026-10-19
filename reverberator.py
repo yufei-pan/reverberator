@@ -25,6 +25,7 @@ import glob
 import select
 import contextlib
 import sqlite3
+import json
 import tempfile
 import stat
 import errno
@@ -2448,13 +2449,173 @@ def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList
 	mounts = {}
 	for mount_point in inner_mount_points(mount_table, monitor_path):
 		rel = os.path.relpath(mount_point, real_root)
-		if skip_list is not None:
-			# skips() checks an entry alone, so every folder on the way down is checked
-			parts = rel.split('/')
-			if any(skip_list.skips('/'.join(parts[:depth]) + '/') for depth in range(1, len(parts) + 1)):
-				continue
+		if skip_list is not None and skips_folder_or_parent(skip_list.skips, rel + '/'):
+			continue
 		mounts[os.path.join(monitor_path, rel)] = mount_fingerprint(mount_table, mount_point)
 	return mounts
+
+def skips_folder_or_parent(skip, rel:str) -> bool:
+	'''
+	Whether skip(rel) leaves out the folder rel (ending with /) or a folder it is in: skip checks an entry alone.
+
+	Examples:
+		>>> skips_folder_or_parent(lambda rel: rel == 'a/', 'a/b/c/')
+		True
+		>>> skips_folder_or_parent(lambda rel: rel == 'a/', 'ab/')
+		False
+		>>> skips_folder_or_parent(None, 'a/')
+		False
+	'''
+	if skip is None:
+		return False
+	parts = rel.rstrip('/').split('/')
+	return any(skip('/'.join(parts[:depth]) + '/') for depth in range(1, len(parts) + 1))
+
+def inner_mount_rels(mount_table:list, monitor_path:str) -> set:
+	'''
+	The inner mount points in mount_table, as folder rels of monitor_path.
+
+	Examples:
+		>>> sorted(inner_mount_rels([('/', ('1',)), ('/tmp/reverb_doctest/m/disk', ('2',)), ('/tmp/reverb_doctest/m/a/usb', ('3',))], '/tmp/reverb_doctest/m'))
+		['a/usb/', 'disk/']
+	'''
+	real_root = os.path.realpath(monitor_path)
+	return {os.path.relpath(mount_point, real_root) + '/' for mount_point in inner_mount_points(mount_table, monitor_path)}
+
+def paused_inner_mounts(monitor_path:str, remembered:list, mount_table:list) -> set:
+	'''
+	The remembered inner mount points (folder rels of monitor_path) that are paused: not mounted in mount_table, with
+	their folder there and empty, as an unmounted disk leaves it. Walks leave a paused folder out and keep what the vault
+	holds for it. A folder that is gone, is not a folder, or holds entries of its own is not paused: it is backed up as
+	what it now is, which is how a user retires an inner disk.
+	'''
+	mounted = inner_mount_rels(mount_table, monitor_path)
+	paused = set()
+	for rel in remembered:
+		if rel in mounted:
+			continue
+		folder = os.path.join(monitor_path, rel.rstrip('/'))
+		try:
+			if not stat.S_ISDIR(os.lstat(folder).st_mode):
+				continue
+			with os.scandir(folder) as entries:
+				if next(entries, None) is None:
+					paused.add(rel)
+		except OSError:
+			# gone, or it cannot be read: a walk keeps what it cannot read
+			continue
+	return paused
+
+def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mount_tables) -> list:
+	'''
+	The inner mount points a backup records with its committed state: those mounted in any of mount_tables, the paused
+	ones, and the remembered ones inside a paused folder, which went away with its disk. Nothing is forgotten when no
+	table could be read.
+
+	Examples:
+		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m/new', ('2',))]
+		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['old/', 'old/inner/', 'retired/'], {'old/'}, table, [])
+		['new/', 'old/', 'old/inner/']
+		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['retired/'], set(), [])
+		['retired/']
+	'''
+	tables = [table for table in mount_tables if table]
+	if not tables:
+		return sorted(remembered)
+	kept = set(paused)
+	for table in tables:
+		kept |= inner_mount_rels(table, monitor_path)
+	kept.update(rel for rel in remembered if any(rel.startswith(folder) for folder in paused))
+	return sorted(kept)
+
+def skip_paused(skip, paused:set):
+	'''
+	A walk's skip predicate (or None) that also leaves out the paused folders.
+
+	Examples:
+		>>> skip = skip_paused(lambda rel: rel == 'cache/', {'disk/'})
+		>>> [skip(rel) for rel in ('disk/', 'cache/', 'disk', 'other/')]
+		[True, True, False, False]
+		>>> skip_paused(None, set()) is None
+		True
+	'''
+	if not paused:
+		return skip
+	if skip is None:
+		return lambda rel: rel in paused
+	return lambda rel: rel in paused or skip(rel)
+
+def check_monitored_mount(monitor_path:str, mount_table:list, root_mount) -> None:
+	'''
+	Raise JobFailure when the mount holding monitor_path is no longer root_mount (not checked when None): another
+	filesystem shown there, compared with the vault, would read as its entries deleted.
+
+	Examples:
+		>>> check_monitored_mount('/tmp/reverb_doctest/m', [('/', ('1',))], ('1',))
+		>>> try:
+		...     check_monitored_mount('/tmp/reverb_doctest/m', [('/', ('1',)), ('/tmp/reverb_doctest/m', ('2',))], ('1',))
+		... except JobFailure as e:
+		...     print(e.reason)
+		the monitored filesystem changed under /tmp/reverb_doctest/m
+	'''
+	if root_mount is not None and mount_fingerprint(mount_table, os.path.realpath(monitor_path)) != root_mount:
+		raise JobFailure(f'the monitored filesystem changed under {monitor_path}')
+
+def scan_scopes(monitor_path:str, folders) -> list:
+	'''
+	The folder rels of monitor_path that scan events naming folders ask to compare, outer folders absorbing the folders
+	inside them; [''] when one names monitor_path itself. A folder outside monitor_path is left out.
+
+	Examples:
+		>>> scan_scopes('/m', ['/m/a/b', '/m/c', '/m/a', '/m/a/b/', '/m/a b', '/elsewhere'])
+		['a b/', 'a/', 'c/']
+		>>> scan_scopes('/m/', ['/m/x', '/m'])
+		['']
+		>>> scan_scopes('/m', [])
+		[]
+	'''
+	root = os.path.abspath(monitor_path)
+	prefix = root.rstrip('/') + '/'
+	rels = set()
+	for folder in folders:
+		path = os.path.abspath(folder)
+		if path == root:
+			return ['']
+		if path.startswith(prefix):
+			rels.add(path[len(prefix):] + '/')
+	scopes = []
+	# sorted, a folder comes right before the folders inside it
+	for rel in sorted(rels):
+		if not scopes or not rel.startswith(scopes[-1]):
+			scopes.append(rel)
+	return scopes
+
+def drop_entries_under(backup_entries:dict, folder_paths:list) -> int:
+	'''
+	Drop the backup entries at or under any of folder_paths (absolute, ending with /), whose vault entries a comparison
+	of that folder, or its pause, decides instead; returns how many went. A move out of such a folder copies its
+	destination instead, as the vault entry it would take stays the folder's, and a move into one deletes its source.
+
+	Examples:
+		>>> entries = OrderedDict((path, BackupEntryValues('t', event, source)) for path, event, source in [
+		...     ('/m/d/', 'attrib', None), ('/m/d/f', 'modify', None), ('/m/d', 'create', None), ('/m/dx', 'modify', None),
+		...     ('/m/out/', 'move', '/m/d/sub/'), ('/m/d/in', 'move', '/m/src'), ('/m/e/in', 'move', '/m/d/x')])
+		>>> drop_entries_under(entries, ['/m/d/', '/m/e/'])
+		5
+		>>> [(path, values.event) for path, values in entries.items()]
+		[('/m/dx', 'modify'), ('/m/out/', 'create'), ('/m/src', 'delete')]
+	'''
+	def under(path):
+		return any(path == folder[:-1] or path.startswith(folder) for folder in folder_paths)
+	dropped = [path for path in backup_entries if under(path)]
+	for path, values in list(backup_entries.items()):
+		if values.event == 'move' and not under(path) and under(values.source_path):
+			backup_entries[path] = BackupEntryValues(values.iso_time, 'create', None)
+	for path in dropped:
+		values = backup_entries.pop(path)
+		if values.event == 'move' and not under(values.source_path):
+			backup_entries.setdefault(values.source_path, BackupEntryValues(values.iso_time, 'delete', None))
+	return len(dropped)
 
 class fs_signature_monitor:
 	'''
@@ -2655,6 +2816,57 @@ class fs_signature_monitor:
 FS_SIGNATURE_MONITOR = fs_signature_monitor()
 
 #%% ---- Backup ----
+def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,monitor_path:str,vault_path:str,vaultInfo:VaultInfo = None,
+			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None) -> tuple:
+	'''
+	Fold a batch's scan events (scan_folders, the folders they name) into its backup_entries: each scanned folder is
+	compared with the latest version, and what that finds replaces the batch's entries at or under it. A folder inside
+	another scanned one is compared with it, and one in a paused inner mount compares nothing.
+	Returns (vaultInfo, manifest, full_comparison): full_comparison asks for the whole tree instead, for a scan of the
+	monitored path itself or a vault with no version yet. JobFailure is raised, before anything is compared, when the
+	monitored path no longer shows the filesystem root_mount fingerprints.
+	'''
+	scopes = scan_scopes(monitor_path,scan_folders)
+	if scopes == ['']:
+		return vaultInfo, manifest, True
+	if not scopes:
+		return vaultInfo, manifest, False
+	mount_table = current_mount_table()
+	check_monitored_mount(monitor_path,mount_table,root_mount)
+	job_vault = os.path.join(vault_path,job_name)
+	if not vaultInfo or not vaultInfo.vault_info_dict:
+		vaultInfo = get_vault_info(job_vault_path=job_vault)
+	if not vaultInfo.vault_info_dict:
+		# nothing to compare with: the first backup copies the whole tree
+		return vaultInfo, manifest, True
+	# a manifest opened here is closed here if the comparison raises, as the caller never gets it back
+	opened_manifest = manifest is None
+	if opened_manifest:
+		manifest = VaultManifest(job_vault)
+	try:
+		latest_version_info = vaultInfo.vault_info_dict[next(reversed(vaultInfo.vault_info_dict))]
+		paused = paused_inner_mounts(monitor_path,manifest.inner_mounts,mount_table)
+		backuperTeeLogToTl(job_name,f'Comparing {", ".join(scopes)} with the vault')
+		drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in scopes])
+		reported = set()
+		for scope_rel in scopes:
+			if not GREEN_LIGHT.is_set():
+				break
+			found = OrderedDict()
+			delta_generate_backup_entries(found,latest_version_info,monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,
+				reported=reported,scope_rel=scope_rel,paused=paused)
+			backup_entries.update(found)
+	except BaseException:
+		if opened_manifest:
+			manifest.close()
+		raise
+	return vaultInfo, manifest, False
+
+def scan_events(scan_folders:list) -> list:
+	'''The scan events naming scan_folders, to hand a batch that did not commit back to the queue.'''
+	base = time.monotonic()
+	return [ChangeEvent(base + (i * 0.001),True,'scan',folder,None) for i, folder in enumerate(scan_folders)]
+
 def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,monitor_path:str,vault_path:str,vault_path_signature:str,
 			 to_process_flag:threading.Event,monitor_fs_flag:threading.Event=None,
 			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
@@ -2675,6 +2887,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	# the batch taken and not committed yet: however the backuper stops, it goes back to the front of the queue, a full
 	# comparison as a full scan request
 	backupEntries = OrderedDict()
+	# the folders its scan events name, compared with the vault before it is backed up
+	scan_folders = []
 	full_comparison = False
 	try:
 		# if the vault path does not exist, create it
@@ -2691,6 +2905,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
 		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
 		wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
+		# batches are compared with the vault only while the monitored path shows the filesystem it shows now
+		root_mount = mount_fingerprint(current_mount_table(),os.path.realpath(monitor_path))
 		if startup is not None and running():
 			# the list is read now that both filesystems are ready, so one on a disk that mounts late still loads
 			job_vault = os.path.join(vault_path,job_name)
@@ -2744,33 +2960,46 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				full_comparison = True
 			else:
 				backupEntries = change_events_to_backup_entries(to_process_temp)
-				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries')
+				scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
+				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 		vaultInfo = None
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while running():
 			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
 			if not running():
 				break
-			# do_backup compares the whole tree for an empty batch
-			full_comparison = full_comparison or not backupEntries
-			vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
-				  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
-				  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list)
-			if not committed:
-				# the batch goes back to the queue on the way out
-				if GREEN_LIGHT.is_set():
-					if job is None:
-						backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running; requesting shutdown',error=True)
-						GREEN_LIGHT.clear()
-					else:
-						backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running',error=True)
-						job.fail('backup did not commit')
-				break
+			if scan_folders and not full_comparison:
+				vaultInfo,manifest,full_comparison = compare_scanned_folders(backupEntries,scan_folders,job_name,monitor_path,vault_path,
+					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount)
+				if not running():
+					break
+				if full_comparison:
+					backupEntries.clear()
+				elif not backupEntries:
+					backuperTeeLogToTl(job_name,'Compared folders match the vault; no new version for this batch',ok=True)
+			else:
+				# do_backup compares the whole tree for an empty batch
+				full_comparison = full_comparison or not backupEntries
+			if backupEntries or full_comparison:
+				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
+					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
+					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount)
+				if not committed:
+					# the batch goes back to the queue on the way out
+					if GREEN_LIGHT.is_set():
+						if job is None:
+							backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running; requesting shutdown',error=True)
+							GREEN_LIGHT.clear()
+						else:
+							backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running',error=True)
+							job.fail('backup did not commit')
+					break
+				if job is not None:
+					job.mark_committed()
 			backupEntries.clear()
+			scan_folders = []
 			full_comparison = False
-			if job is not None:
-				job.mark_committed()
-			while not backupEntries and not full_comparison and running():
+			while not backupEntries and not full_comparison and not scan_folders and running():
 				while running() and not to_process_flag.is_set():
 					to_process_flag.wait(POLL_WAIT_SECONDS)
 				if not running():
@@ -2786,7 +3015,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					full_comparison = True
 				else:
 					backupEntries = change_events_to_backup_entries(to_process_temp)
-					backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries')
+					scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
+					backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 			if log_journal:
 				journalPath = os.path.join(vault_path,job_name,'journal.tsv')
 				log_events_to_journal(backupEntries,journalPath)
@@ -2804,13 +3034,14 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		else:
 			job.fail(f'{type(e).__name__}: {e}')
 	finally:
-		if full_comparison or backupEntries:
-			# for the job's next attempt, or the pending transactions when the daemon stops
+		if full_comparison or backupEntries or scan_folders:
+			# for the job's next attempt, or the pending transactions when the daemon stops. the scans go back too, so
+			# their folders are compared again with what is there then
 			with to_process_lock:
 				if full_comparison:
 					to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 				else:
-					to_process.prepend(backup_entries_to_change_events(backupEntries))
+					to_process.prepend(backup_entries_to_change_events(backupEntries) + scan_events(scan_folders))
 		if manifest is not None:
 			manifest.close()
 		if vault_fs_flag is not None:
@@ -3114,8 +3345,9 @@ def do_backup(backup_entries:dict,
 			 keep_one_complete_backup:bool, 
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
-			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None):
+			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
+	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
 	# move events sync attrs from source where the vault entry is a real file/dir ( see do_reverb_backup )
 	global DEBUG
 	global BACKUP_SEMAPHORE
@@ -3141,6 +3373,15 @@ def do_backup(backup_entries:dict,
 	if opened_manifest:
 		manifest = VaultManifest(job_vault)
 	try:
+		# inner mounts the backup has seen and that are unmounted now are paused: every walk below leaves them out, and
+		# they keep what the vault holds for them
+		mount_table = current_mount_table()
+		check_monitored_mount(monitor_path,mount_table,root_mount)
+		remembered_mounts = manifest.inner_mounts
+		paused = paused_inner_mounts(monitor_path,remembered_mounts,mount_table)
+		if paused:
+			backuperTeeLogToTl(job_name,f'Inner mounts not mounted, keeping their last backed-up contents: {", ".join(sorted(paused))}')
+		walk_skip = skip_paused(skip,paused)
 		if log_journal:
 			journalPath = os.path.join(job_vault,'journal.tsv')
 			TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'start_reverb_backup_{len(backup_entries)}_enties',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
@@ -3173,7 +3414,7 @@ def do_backup(backup_entries:dict,
 				try:
 					# the walk yields each folder before its contents
 					walk_errors = []
-					for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=skip,errors=walk_errors):
+					for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=walk_skip,errors=walk_errors):
 						backupEntryPath = os.path.join(backup_folder,relativePath)
 						manifest.add(relativePath,dirty=True)
 						if isDir:
@@ -3197,7 +3438,7 @@ def do_backup(backup_entries:dict,
 				if log_journal:
 					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_referenced_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 				walk_errors = []
-				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=skip,errors=walk_errors)
+				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
 				do_referenced_copy(monitor_path,backup_folder,manifest)
 		else:
@@ -3205,7 +3446,7 @@ def do_backup(backup_entries:dict,
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
 			if not backup_entries:
 				backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
-				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported)
+				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported,paused=paused)
 				if not GREEN_LIGHT.is_set():
 					# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
 					backup_entries.clear()
@@ -3214,11 +3455,20 @@ def do_backup(backup_entries:dict,
 				if log_journal:
 					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'delta_generated_{len(backup_entries)}_differences',monitor_path],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 					log_events_to_journal(backup_entries,journalPath)
+			elif paused:
+				# what the watcher saw in a paused folder before its disk went is compared when the disk is back
+				dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in paused])
+				if dropped:
+					backuperTeeLogToTl(job_name,f'Dropped {dropped} backup entries in unmounted inner mounts')
+					if not backup_entries:
+						backuperTeeLogToTl(job_name,'No backup entries left outside unmounted inner mounts',ok=True)
 			if not backup_entries:
 				backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
-				# the walk completed with no differences, so the tree matches the manifest under this skip list
+				# no differences after a complete walk, or none left outside paused folders: the tree matches the
+				# manifest under this skip list
 				manifest.begin()
 				manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
+				manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table()))
 				manifest.commit()
 				if vaultInfo is None:
 					vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
@@ -3282,6 +3532,8 @@ def do_backup(backup_entries:dict,
 		# commit before the content file: without one the version is removed at startup, and a manifest
 		# describing a removed version is listed again from the vault
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
+		# a disk mounted while this backup walked is remembered too
+		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table()))
 		manifest.commit(backup_folder)
 		TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
 		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
@@ -4180,6 +4432,16 @@ class VaultManifest:
 		'''Record fingerprint; the caller holds the transaction.'''
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('skip_fingerprint', ?)", (fingerprint,))
 
+	@property
+	def inner_mounts(self) -> list:
+		'''The inner mount points (folder rels ending with /) recorded with the last committed state, [] when never recorded.'''
+		row = self.conn.execute("SELECT value FROM meta WHERE key = 'inner_mounts'").fetchone()
+		return [] if row is None else json.loads(row[0])
+
+	def set_inner_mounts(self, rels:list):
+		'''Record the inner mount points (folder rels ending with /); the caller holds the transaction.'''
+		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('inner_mounts', ?)", (json.dumps(list(rels)),))
+
 	def describes(self, version_path:str) -> bool:
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
 		return row is not None and row[0] == os.path.basename(os.path.normpath(version_path))
@@ -4288,6 +4550,11 @@ class VaultManifest:
 	def unseen(self) -> list:
 		'''Tracked paths not marked seen since clear_seen().'''
 		return [rel for (rel,) in self.conn.execute('SELECT path FROM entries WHERE path NOT IN (SELECT path FROM temp.seen) ORDER BY path')]
+
+	def unseen_under(self, folder:str) -> list:
+		'''Tracked paths at or under folder (which ends with /) not marked seen since clear_seen().'''
+		return [rel for (rel,) in self.conn.execute('SELECT path FROM entries WHERE path >= ? AND path < ? AND path NOT IN (SELECT path FROM temp.seen) ORDER BY path',
+			(folder, folder_range_end(folder)))]
 
 	def prefetch(self):
 		'''Read the database file in one pass, so the lookups that follow do not each seek the vault disks.'''
@@ -4479,7 +4746,31 @@ def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_pat
 		backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error comparing {monitor_entry}: {e}, treating as modify')
 		return 'modify', found
 
-def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None) -> VaultManifest:
+def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list = None):
+	'''
+	Walk the folder scope_rel (ending with /) of monitor_path as iter_tree_entries walks the whole tree, the folder itself
+	first, as the walk of its parent would list it. Nothing is yielded when it is gone; when it cannot be looked at,
+	(scope_rel, error) is appended to errors like a folder that cannot be read.
+	'''
+	path = os.path.join(monitor_path, scope_rel.rstrip('/'))
+	try:
+		mode = os.lstat(path).st_mode
+	except (FileNotFoundError, NotADirectoryError):
+		return
+	except OSError as e:
+		if errors is not None:
+			errors.append((scope_rel, e))
+		backuperTeeLogToTl(path=path,error=True,message=f'Error scanning {path}: {e}')
+		return
+	if not stat.S_ISDIR(mode):
+		# no longer a folder: the entry in its place
+		if skip is None or not skip(scope_rel[:-1]):
+			yield path, scope_rel[:-1], False
+		return
+	yield path + '/', scope_rel, True
+	yield from iter_tree_entries(path, scope_rel, skip=skip, errors=errors)
+
+def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel:str = '',paused:set = None) -> VaultManifest:
 	'''
 	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest.
 
@@ -4488,10 +4779,26 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	crash may have left without their bytes.
 	A folder that cannot be read keeps its tracked entries and is logged as UNREADABLE; when the monitored root itself
 	cannot be read, JobFailure is raised before anything is recorded as deleted.
+	With scope_rel, a folder rel ending with /, only that folder is compared: it is looked up like any entry, and only
+	tracked rows at or under it can be found deleted.
+	The paused inner mounts (paused_inner_mounts, from the remembered ones and the mount table now when not given) are
+	not walked and keep their tracked rows; a scope that is skipped or inside a paused folder compares nothing.
 	Returns the manifest, opened in the job vault when none is given.
 	'''
 	if manifest is None:
 		manifest = VaultManifest(os.path.dirname(os.path.abspath(latest_version_info.path)))
+	if paused is None:
+		paused = paused_inner_mounts(monitor_path, manifest.inner_mounts, current_mount_table())
+	skip = skip_paused(None if skip_list is None else skip_list.skips, paused)
+	if scope_rel:
+		if skips_folder_or_parent(skip, scope_rel):
+			backuperTeeLogToTl(path=monitor_path,message=f'Not comparing {scope_rel}: it is skipped or in an unmounted inner mount')
+			return manifest
+		try:
+			# a scope missing along with the monitored root is not a deleted scope
+			os.stat(monitor_path)
+		except OSError as e:
+			raise JobFailure(f'cannot read {monitor_path}: {e}')
 	version_path = latest_version_info.path
 	start_time = time.monotonic()
 	manifest.prefetch()
@@ -4515,11 +4822,21 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 				recorded += 1
 			if event:
 				backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),event,None)
+	if scope_rel:
+		walk = iter_scope_entries(monitor_path,scope_rel,skip=skip,errors=walk_errors)
+		# the scope as a file, before it became a folder: no row under the scope, so not found deleted there
+		file_rel = scope_rel[:-1]
+		stale_file = manifest.lookup(file_rel) is not None
+	else:
+		walk = iter_tree_entries(monitor_path,skip=skip,errors=walk_errors)
+		stale_file = False
 	# results are taken in walk order, so a new tree still lists each folder before its contents
 	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
-		for monitor_entry, rel, _ in iter_tree_entries(monitor_path,skip=None if skip_list is None else skip_list.skips,errors=walk_errors):
+		for monitor_entry, rel, _ in walk:
 			if not GREEN_LIGHT.is_set():
 				break
+			if stale_file and rel == file_rel:
+				stale_file = False
 			record = manifest.lookup(rel)
 			if record is None:
 				pending.append((monitor_entry, rel, ('create', None)))
@@ -4537,17 +4854,27 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	if root_error is not None:
 		manifest.rollback()
 		raise JobFailure(f'cannot read {monitor_path}: {root_error}')
+	# a folder that could not be read keeps its entries, and so does the scope when it could not be looked at
+	manifest.mark_seen(rel for rel, _ in walk_errors)
 	for rel, _ in walk_errors:
+		manifest.mark_seen_under(rel)
+	# an unmounted inner disk keeps its last backed-up contents
+	manifest.mark_seen(paused)
+	for rel in paused:
 		manifest.mark_seen_under(rel)
 	log_unreadable(job_name, monitor_path, walk_errors, reported)
 	if GREEN_LIGHT.is_set():
 		# only a complete walk tells deleted entries from ones it did not reach
-		for rel in manifest.unseen():
+		deleted = manifest.unseen_under(scope_rel) if scope_rel else manifest.unseen()
+		if stale_file and not any(rel == scope_rel for rel, _ in walk_errors):
+			deleted.insert(0, file_rel)
+		for rel in deleted:
 			backuperTeeLogToTl(path=monitor_path,message=f'Deleted file/folder {os.path.join(monitor_path,rel)}')
 			backupEntries[os.path.join(monitor_path,rel)] = BackupEntryValues(datetime.datetime.now().isoformat(),'delete',None)
 	# what was read from the vault holds whether or not a new version follows
 	manifest.commit(version_path)
-	backuperTeeLogToTl(path=monitor_path,message=f'Compared {compared} tracked entries in {time.monotonic() - start_time:.1f}s, {recorded} read from the vault, {len(backupEntries)} differences')
+	compared_what = f' under {scope_rel}' if scope_rel else ''
+	backuperTeeLogToTl(path=monitor_path,message=f'Compared {compared} tracked entries{compared_what} in {time.monotonic() - start_time:.1f}s, {recorded} read from the vault, {len(backupEntries)} differences')
 	return manifest
 
 def hash_file(path,size = ...,full_hash=False):
