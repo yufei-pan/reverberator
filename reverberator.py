@@ -1929,6 +1929,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							watcherTeeLogToTl(monitor_path,f'Adding move event for {cookieDic[event.cookie].path} to {eventPath}')
 						cookie_value = cookieDic.pop(event.cookie)
 						pendingMoveFromEvents.pop(event.cookie,None)
+						# what moved away from the destination is gone before the move lands on its name, or its late
+						# delete would remove the moved-in entry
+						queue_pending_move_from_at(eventPath,monTime)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,cookie_value.path))
 						if isDir:
 							# we need to update wdDic to reflect the new path,

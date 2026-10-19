@@ -273,3 +273,27 @@ def test_folder_moved_away_and_back_is_not_deleted_later(job, tmp_path, poll_fas
 		assert events == [('delete', d), ('create', d)]
 	finally:
 		_stop(thread)
+
+
+def test_file_moved_over_a_moved_away_name_is_not_deleted_later(job, tmp_path, poll_fast, monkeypatch):
+	# as Nextcloud does: the old file goes to a trash outside the tree, then the upload is renamed onto its name
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	seed_monitor(job, {'a.txt': 'old a', 'b.txt': 'new content'})
+	thread, to_process, lock = _start(job, [])
+	try:
+		a = os.path.join(job.monitor, 'a.txt')
+		b = os.path.join(job.monitor, 'b.txt')
+		os.rename(a, str(outside / 'a.txt'))
+		os.rename(b, a)
+		wait_until(lambda: any(e.event == 'move' and e.path == a for e in _events(to_process, lock)), message='no move')
+		time.sleep(1.0)
+		_probe(job, to_process, lock, 'probe_after_expiry.txt')
+		events = [(e.event, e.path, e.moved_from) for e in _events(to_process, lock) if a in (e.path, e.moved_from) or b in (e.path, e.moved_from)]
+		assert events == [('delete', a, None), ('move', a, b)]
+		entries = rv.change_events_to_backup_entries(_events(to_process, lock))
+		assert entries[a].event == 'move' and entries[a].source_path == b
+		assert b not in entries
+	finally:
+		_stop(thread)
