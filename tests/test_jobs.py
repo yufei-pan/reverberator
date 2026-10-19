@@ -1,3 +1,4 @@
+import fnmatch
 import os
 import threading
 import time
@@ -667,3 +668,18 @@ def test_supervise_job_records_a_crash_and_stops_the_others(monkeypatch):
 		assert results == ['crashed'] and not rv.GREEN_LIGHT.is_set()
 	finally:
 		rv.GREEN_LIGHT.set()
+
+
+def test_firewatcher_patterns_match_every_alerting_marker_and_not_recovered():
+	path = os.path.join(os.path.dirname(rv.__file__), 'firewatcher', 'reverberator.txt')
+	patterns = ['*' + line.strip() + '*' for line in open(path) if line.strip()]
+	alerting = [
+		rv.job_log('j', 'FAILED: disk gone; retrying in 60s'),
+		rv.job_log('j', 'FAILED: waiting 15 min for /mnt/x: vault filesystem not ready'),
+		rv.job_log('j', 'UNREADABLE: /m/a: [Errno 5] Input/output error; keeping its last backed-up copy'),
+		rv.job_log('j', 'STOPPED: bad pattern'),
+		rv.daemon_error_log('every job is stopped'),
+	]
+	for line in alerting:
+		assert any(fnmatch.fnmatch('Oct 18 12:00:00 host python3[1]: ' + line, p) for p in patterns), line
+	assert not any(fnmatch.fnmatch(rv.job_log('j', 'RECOVERED after 2 failed attempts'), p) for p in patterns)
