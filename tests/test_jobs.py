@@ -473,6 +473,46 @@ def test_monitor_gate_registers_the_resolved_signature_before_the_job_starts(tmp
 	rv.FS_SIGNATURE_MONITOR.unregister(path, 'UUID-A', flag)
 
 
+def test_monitor_gate_looks_up_an_unknown_signature_once_per_recheck(tmp_path, monkeypatch, poll_fast):
+	# each lookup runs df and lsblk: a gate that cannot tell the signature yet must not spin on them
+	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.4)
+	calls = []
+	monkeypatch.setattr(rv, 'get_fs_signatures', lambda p: calls.append(p) or [])
+	gate = rv.MonitorGate(str(tmp_path), threading.Event(), 'auto')
+	control = rv.JobControl('j')
+	control.start_attempt()
+	result = []
+	thread = threading.Thread(target=lambda: result.append(gate.resolve(control)), daemon=True)
+	thread.start()
+	time.sleep(1.0)
+	control.fail('stop')
+	thread.join(timeout=1)
+	assert not thread.is_alive() and result == [False]
+	# at 0, 0.4 and 0.8 s
+	assert 2 <= len(calls) <= 4
+
+
+def test_monitor_gate_looks_up_a_path_as_soon_as_it_appears(tmp_path, monkeypatch, poll_fast):
+	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 60)
+	path = str(tmp_path / 'late')
+	monkeypatch.setattr(rv, 'get_fs_signatures', lambda p: ['UUID-A'] if os.path.isdir(p) else [])
+	gate = rv.MonitorGate(path, threading.Event(), 'auto')
+	control = rv.JobControl('j')
+	control.start_attempt()
+	result = []
+	thread = threading.Thread(target=lambda: result.append(gate.resolve(control)), daemon=True)
+	thread.start()
+	time.sleep(0.3)
+	os.makedirs(path)
+	thread.join(timeout=2)
+	try:
+		assert result == [True] and gate.signature == 'UUID-A'
+	finally:
+		control.fail('stop')
+		thread.join(timeout=1)
+		rv.FS_SIGNATURE_MONITOR.unregister(path, gate.signature, gate.flag)
+
+
 def test_invalidate_during_a_running_check_keeps_the_flag_clear(tmp_path, monkeypatch):
 	monitor = rv.fs_signature_monitor(mountinfo_path=str(tmp_path / 'mountinfo'))
 	key = (str(tmp_path), 'UUID-X')
