@@ -31,6 +31,7 @@ import fcntl
 import marshal
 import zlib
 from concurrent.futures import Future, ThreadPoolExecutor
+import shutil
 from shutil import copystat
 
 # for the lib wrapping aroung inotify, I tried
@@ -595,6 +596,8 @@ ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
 VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER)
 ManifestRecord = namedtuple('ManifestRecord', MANIFEST_RECORD_HEADER)
+# a copy queued on an executor, which finish_copies() puts in place
+PendingCopy = namedtuple('PendingCopy', ['task', 'source_path', 'temp_path', 'dest_path'])
 
 # by defualt, set the max backup threads to 2* the number of cores
 BACKUP_SEMAPHORE = threading.Semaphore(2*os.cpu_count())
@@ -737,6 +740,12 @@ COMPARE_THREADS = 32
 MAX_CHAINED_LINKS = 40
 # manifest rows written or read per statement: enough to amortise sqlite calls, little to hold
 MANIFEST_BATCH_SIZE = 10000
+# a copy is written under its destination's name with this suffix until it succeeded
+PARTIAL_COPY_SUFFIX = '.reverberator-partial'
+# the longest file name, in bytes, the filesystems a vault lives on allow
+MAX_FILE_NAME_BYTES = 255
+# a stopped command is killed within about a second ( multiCMD sends SIGKILL a second after SIGTERM )
+COPY_STOP_GRACE_SECONDS = 2
 
 DEBUG = False
 
@@ -2989,19 +2998,26 @@ def do_backup(backup_entries:dict,
 					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_complete_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 				manifest.reset(backup_folder)
 				mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
-				# the walk yields each folder before its contents
-				walk_errors = []
-				for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=skip,errors=walk_errors):
-					backupEntryPath = os.path.join(backup_folder,relativePath)
-					manifest.add(relativePath,dirty=True)
-					if isDir:
-						os.makedirs(backupEntryPath,exist_ok=True)
-						copy_file_meta(monitorEntry,backupEntryPath)
-					else:
-						cp_af_copy_path(monitorEntry,backupEntryPath,mcae)
-				# copies still running must stop writing before a failed root orphans this version
-				while GREEN_LIGHT.is_set() and mcae.runningThreads:
-					mcae.wait(timeout=POLL_WAIT_SECONDS)
+				pending = []
+				try:
+					# the walk yields each folder before its contents
+					walk_errors = []
+					for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=skip,errors=walk_errors):
+						backupEntryPath = os.path.join(backup_folder,relativePath)
+						manifest.add(relativePath,dirty=True)
+						if isDir:
+							os.makedirs(backupEntryPath,exist_ok=True)
+							copy_file_meta(monitorEntry,backupEntryPath)
+						else:
+							cp_af_copy_path(monitorEntry,backupEntryPath,mcae,pending)
+					# copies still running must stop writing before a failed root orphans this version
+					while GREEN_LIGHT.is_set() and mcae.runningThreads:
+						mcae.wait(timeout=POLL_WAIT_SECONDS)
+					if GREEN_LIGHT.is_set():
+						finish_copies(pending,manifest,backup_folder,job_name,reported)
+				finally:
+					# however the backup ends, no copy is left writing into this version, nor a partial file in it
+					stop_copies(mcae,pending)
 				mcae.cleanup(timeout=POLL_WAIT_SECONDS)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
 				record_dirty_entries(manifest,backup_folder,monitor_path)
@@ -3402,40 +3418,172 @@ def prepare_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 	'''Prune redundant child ops under dir creates, then order for safe replay.'''
 	return order_backup_entries_for_replay(prune_entries_covered_by_dir_creates(backup_entries))
 
-def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...):
+def partial_copy_path(dest_path:str) -> str:
+	'''
+	Where a copy to dest_path is written until it succeeded. A name too long to take the suffix is hashed instead.
+
+	Examples:
+		>>> partial_copy_path('/vault/job/V1--x/d/a.txt')
+		'/vault/job/V1--x/d/.a.txt.reverberator-partial'
+		>>> len(os.path.basename(partial_copy_path('/vault/job/V1--x/' + 'n' * 255))) < 255
+		True
+	'''
+	name = os.path.basename(dest_path)
+	temp_name = '.' + name + PARTIAL_COPY_SUFFIX
+	if len(os.fsencode(temp_name)) > MAX_FILE_NAME_BYTES:
+		temp_name = '.' + xxhash.xxh64(os.fsencode(name)).hexdigest() + PARTIAL_COPY_SUFFIX
+	return os.path.join(os.path.dirname(dest_path), temp_name)
+
+def remove_entry(path:str):
+	'''Remove what is at path, a folder with everything in it; nothing there is fine.'''
+	try:
+		if os.path.isdir(path) and not os.path.islink(path):
+			shutil.rmtree(path)
+		else:
+			os.remove(path)
+	except FileNotFoundError:
+		pass
+
+def replace_entry(temp_path:str, dest_path:str):
+	'''Put temp_path in dest_path's place. A real folder there is removed first, as is anything a folder cannot be renamed over.'''
+	if os.path.isdir(dest_path) and not os.path.islink(dest_path):
+		shutil.rmtree(dest_path)
+	elif os.path.isdir(temp_path) and not os.path.islink(temp_path) and os.path.lexists(dest_path):
+		os.remove(dest_path)
+	os.replace(temp_path, dest_path)
+
+def source_readable(path:str) -> bool:
+	'''
+	Whether path can be read: it can be looked up and, for a regular file, opened.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     open(os.path.join(folder, 'a.txt'), 'w').close()
+		...     print(source_readable(os.path.join(folder, 'a.txt')), source_readable(os.path.join(folder, 'gone.txt')))
+		True False
+	'''
+	try:
+		if stat.S_ISREG(os.lstat(path).st_mode):
+			os.close(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+	except OSError:
+		return False
+	return True
+
+def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...,pending:list = None):
+	'''
+	Copy source_path to dest_path with cp -a, written under partial_copy_path(dest_path): dest_path stays as it is until
+	the copy succeeded, so a failed copy never loses what the version held there.
+
+	Without mcae the copy runs now, takes dest_path's place when it succeeded, and its exit code is returned. On mcae it
+	is queued, appended to pending as a PendingCopy and its task returned; finish_copies() puts it in place. Returns False
+	when nothing is copied.
+	'''
 	global DEBUG
+	if mcae is not ... and pending is None:
+		raise ValueError(f'copying {source_path} on an executor needs a pending list to finish the copy from')
 	if not os.path.lexists(source_path):
 		# the source vanished between its event and this copy, which short lived
-		# files such as git's index.stash.<pid> do routinely. return before
-		# clearing dest: an inherited link there still references the previous
-		# version's copy, and dropping it would lose that reference for nothing.
+		# files such as git's index.stash.<pid> do routinely. dest is left alone:
+		# an inherited link there still references the previous version's copy,
+		# and dropping it would lose that reference for nothing.
 		backuperTeeLogToTl(path=source_path,error=True,message=f'Not copying {source_path} to {dest_path}: source no longer exists')
 		return False
 	if os.path.lexists(dest_path):
 		if dest_path == '/':
 			backuperTeeLogToTl(path=source_path,error=True,message='Cannot copy as root directory')
 			return False
-		# Clear symlinks before is_subpath(). realpath follows the link (e.g.
+		# a symlink there is replaced, never followed: realpath follows the link (e.g.
 		# .venv/bin/python3.13 -> python3 -> /usr/bin/python3), so dest and source
 		# can resolve to the same path and falsely trip the subpath guard.
-		# Removing a symlink never destroys source-tree contents.
-		if os.path.islink(dest_path):
-			os.remove(dest_path)
-		elif is_subpath(dest_path,source_path):
+		if not os.path.islink(dest_path) and is_subpath(dest_path,source_path):
 			backuperTeeLogToTl(path=source_path,error=True,message=f'Cannot copy {source_path} to {dest_path} as it is a subpath of the source')
 			return False
-		elif os.path.isfile(dest_path):
-			os.remove(dest_path)
-		elif os.path.isdir(dest_path):
-			import shutil
-			shutil.rmtree(dest_path)
 	dest_parent = os.path.dirname(dest_path)
 	if dest_parent and not os.path.isdir(dest_parent):
 		os.makedirs(dest_parent, exist_ok=True)
-	if mcae is ...:
-		return multiCMD.run_command(['cp','-af','--reflink=auto','--sparse=always',source_path,dest_path],quiet=not DEBUG,return_code_only=True,wait_for_return=True)
-	else:
-		return mcae.run_command(['cp','-af','--reflink=auto','--sparse=always',source_path,dest_path])
+	temp_path = partial_copy_path(dest_path)
+	# cp would copy a folder into one already there instead of over it
+	remove_entry(temp_path)
+	command = ['cp','-af','--reflink=auto','--sparse=always',source_path,temp_path]
+	if mcae is not ...:
+		task = mcae.run_command(command)
+		pending.append(PendingCopy(task, source_path, temp_path, dest_path))
+		return task
+	try:
+		returncode = multiCMD.run_command(command,quiet=not DEBUG,return_code_only=True,wait_for_return=True)
+		if returncode == 0:
+			replace_entry(temp_path, dest_path)
+	finally:
+		# gone once it took dest_path's place; a failed or interrupted copy leaves no partial file
+		remove_entry(temp_path)
+	return returncode
+
+def discard_copies(pending:list):
+	'''Remove the partial files of the copies in pending, which will not be finished, and empty it.'''
+	for copy in pending:
+		try:
+			remove_entry(copy.temp_path)
+		except OSError as e:
+			backuperTeeLogToTl(path=copy.temp_path,error=True,message=f'Failed to remove the partial copy {copy.temp_path}: {e}')
+	pending.clear()
+
+def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_name:str, reported:set = None) -> None:
+	'''
+	Put the copies of pending in place once the executor has finished them, and empty pending.
+
+	A copy that succeeded takes its destination's place. One that failed leaves the destination as it was: when its
+	source cannot be read, that keeps the last backed-up copy, an UNREADABLE line says so (once per backup, with
+	reported) and a destination holding nothing stops being tracked in manifest, whose paths are relative to
+	version_path. Otherwise writing into the vault is what failed, and JobFailure is raised once every copy is dealt with.
+	'''
+	failure = None
+	done = 0
+	try:
+		for copy in pending:
+			if copy.task.returncode == 0:
+				# a second copy to one destination shares its partial file, which the first one already put in place
+				if os.path.lexists(copy.temp_path) or not any(pending[index].temp_path == copy.temp_path for index in range(done)):
+					replace_entry(copy.temp_path, copy.dest_path)
+			else:
+				remove_entry(copy.temp_path)
+				error = '; '.join(line.strip() for line in copy.task.stderr if line.strip())
+				if source_readable(copy.source_path):
+					if failure is None:
+						cause = error or f'cp exited with {copy.task.returncode}'
+						failure = JobFailure(f'copying {copy.source_path} into the vault failed: {cause}')
+				else:
+					if reported is None or copy.source_path not in reported:
+						if reported is not None:
+							reported.add(copy.source_path)
+						job_log(job_name, f'UNREADABLE: {copy.source_path}: {error or "copy failed"}; keeping its last backed-up copy')
+					if not os.path.lexists(copy.dest_path):
+						manifest.discard(os.path.relpath(copy.dest_path, version_path))
+			done += 1
+	finally:
+		# an error above leaves no partial file of the copies it did not reach
+		rest = pending[done:]
+		pending.clear()
+		discard_copies(rest)
+	if failure is not None:
+		raise failure
+
+def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list):
+	'''
+	Stop what still runs on mcae, then discard the copies of pending, which will not be finished.
+
+	Running commands are killed and, while the daemon runs, waited for however long that takes: a retry removes the
+	uncommitted version, so nothing may still be writing into it. A stopping daemon waits COPY_STOP_GRACE_SECONDS at most.
+	'''
+	mcae.stop(timeout=0)
+	deadline = None
+	while mcae.runningThreads:
+		if deadline is None and not GREEN_LIGHT.is_set():
+			deadline = time.monotonic() + COPY_STOP_GRACE_SECONDS
+		wait = POLL_WAIT_SECONDS if deadline is None else min(POLL_WAIT_SECONDS, deadline - time.monotonic())
+		if wait <= 0:
+			break
+		mcae.wait(timeout=wait)
+	discard_copies(pending)
 
 def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False) -> bool:
 	'''
@@ -4563,12 +4711,12 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not tracking {subRelativePath}: source no longer exists')
 					continue
 				manifest.add(subRelativePath,dirty=True)
-				cp_af_copy_path(source_path=subRealPath,dest_path=subVaultPath,mcae=mcae)
+				cp_af_copy_path(source_path=subRealPath,dest_path=subVaultPath,mcae=mcae,pending=pending)
 			log_unreadable(monitor_path if job_name is None else job_name,monitor_path,walk_errors,reported)
 		else:
 			manifest.add(source_relative_path,dirty=True)
 		# we just copy the entire folder / file ( for recursive create purposes )
-			cp_af_copy_path(source_path=source_real_path,dest_path=file_vault_real_path,mcae=mcae)
+			cp_af_copy_path(source_path=source_real_path,dest_path=file_vault_real_path,mcae=mcae,pending=pending)
 	def delete_path(isDir,vault_real_path,relative_path,mcae):
 		if isDir:
 			# we just remove the folder
@@ -4586,6 +4734,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	def wait_for_async_commands(mcae):
 		while GREEN_LIGHT.is_set() and mcae.runningThreads:
 			mcae.wait(timeout=POLL_WAIT_SECONDS)
+		if GREEN_LIGHT.is_set():
+			# what was copied takes its place before anything renames, removes or records it
+			finish_copies(pending,manifest,backup_folder,monitor_path if job_name is None else job_name,reported)
 	def recheck_moved_folder(folder_rel,mcae):
 		# a location-dependent pattern may judge the moved contents differently at the new place
 		under = list(manifest.iter_under(folder_rel))
@@ -4623,90 +4774,96 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		return manifest
 	backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
 	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
+	# copies queued on mcae, put in place by each wait for it
+	pending = []
 	need_delete_barrier = False
-	for event_source_real_path, event_values in backup_entries.items():
-		backuperTeeLogToTl(path=monitor_path,message=f'Processing {event_source_real_path} {event_values}')
-		event_relative_path = os.path.relpath(path=event_source_real_path,start=monitor_path)
-		file_vault_target_path = os.path.join(backup_folder,event_relative_path)
-		isDir = event_source_real_path.endswith('/')
-		# create, modify, attrib, move, delete
-		if event_values.event == 'delete':
-			delete_path(isDir=isDir,vault_real_path=file_vault_target_path,relative_path=event_relative_path,mcae=mcae)
-			need_delete_barrier = True
-			continue
-		if need_delete_barrier:
-			# finish async rms before creates/moves recreate overlapping paths
-			wait_for_async_commands(mcae)
-			need_delete_barrier = False
-		if event_values.event in {'create','modify'}:
-			# we just over write the vault file with the source file
-			copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=event_source_real_path,
-			 source_relative_path=event_relative_path,
-			 file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
-		elif event_values.event == 'attrib':
-			if isDir:
-				# we just copy the folder metadata
-				os.makedirs(file_vault_target_path,exist_ok=True)
-				copy_file_meta(event_source_real_path,file_vault_target_path)
-				manifest.add(as_folder_entry(event_relative_path),dirty=True)
-			else:
-				if only_sync_attributes:
-					# we just copy the file metadata
-					# ensure parent exists when prior version lacked this path
-					parent_dir = os.path.dirname(file_vault_target_path)
-					if parent_dir:
-						os.makedirs(parent_dir, exist_ok=True)
-					copy_file_meta(event_source_real_path,file_vault_target_path)
-				else:
-					# we copy the file
-					cp_af_copy_path(source_path=event_source_real_path,dest_path=file_vault_target_path,mcae=mcae)
-				manifest.add(event_relative_path,dirty=True)
-		elif event_values.event == 'move':
-			link_source_relative_path = os.path.relpath(event_values.source_path,monitor_path)
-			link_target_relative_path = event_relative_path
-			if isDir:
-				if os.path.abspath(file_vault_target_path) == '/':
-					# we cannot remove root
-					backuperTeeLogToTl(path=file_vault_target_path,error=True,message='Attempting to move root, skipping')
-					continue
-				# also moves all the files and subfolders in the folder
-				manifest.move_tree(as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path))
-				manifest.add(as_folder_entry(link_target_relative_path))
-			else:
-				manifest.discard(link_source_relative_path)
-				manifest.add(link_target_relative_path)
-			# we need to wait for copy threads to finish to allow rename
-			wait_for_async_commands(mcae)
-			link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
-			link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
-			try:
-				if os.path.lexists(link_target_backup_real_path):
-					os.remove(link_target_backup_real_path)
-				os.rename(link_source_backup_real_path,link_target_backup_real_path)
-				backuperTeeLogToTl(path=monitor_path,message=f'Moved {link_source_backup_real_path} to {link_target_backup_real_path}')
-				# sync the current attrs from the source onto the moved vault entry,
-				# but never through a chained symlink: that would rewrite the previous version's metadata
-				if isDir or not os.path.islink(link_target_backup_real_path):
-					copy_file_meta(event_source_real_path,link_target_backup_real_path)
-			except Exception as _:
-				backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
-				import traceback
-				backuperTeeLogToTl(path=monitor_path,error=True,message=traceback.format_exc())
-				backuperTeeLogToTl(path=monitor_path,message='Doing delete & copy instead')
-				# if we fail to move, we just copy the file
-				copy_path(isDir=isDir,monitor_path=monitor_path,
-				  source_real_path=event_source_real_path,
-				  source_relative_path=event_relative_path,
-				  file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
-				delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
-				  relative_path=link_source_relative_path,mcae=mcae)
+	try:
+		for event_source_real_path, event_values in backup_entries.items():
+			backuperTeeLogToTl(path=monitor_path,message=f'Processing {event_source_real_path} {event_values}')
+			event_relative_path = os.path.relpath(path=event_source_real_path,start=monitor_path)
+			file_vault_target_path = os.path.join(backup_folder,event_relative_path)
+			isDir = event_source_real_path.endswith('/')
+			# create, modify, attrib, move, delete
+			if event_values.event == 'delete':
+				delete_path(isDir=isDir,vault_real_path=file_vault_target_path,relative_path=event_relative_path,mcae=mcae)
+				need_delete_barrier = True
+				continue
+			if need_delete_barrier:
+				# finish async rms before creates/moves recreate overlapping paths
 				wait_for_async_commands(mcae)
-			# the copy fallback keeps the rows move_tree moved too, so both ways need the re-check
-			if isDir and skip_list is not None and skip_list.location_dependent:
-				recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
-	if need_delete_barrier:
+				need_delete_barrier = False
+			if event_values.event in {'create','modify'}:
+				# we just over write the vault file with the source file
+				copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=event_source_real_path,
+				 source_relative_path=event_relative_path,
+				 file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
+			elif event_values.event == 'attrib':
+				if isDir:
+					# we just copy the folder metadata
+					os.makedirs(file_vault_target_path,exist_ok=True)
+					copy_file_meta(event_source_real_path,file_vault_target_path)
+					manifest.add(as_folder_entry(event_relative_path),dirty=True)
+				else:
+					if only_sync_attributes:
+						# we just copy the file metadata
+						# ensure parent exists when prior version lacked this path
+						parent_dir = os.path.dirname(file_vault_target_path)
+						if parent_dir:
+							os.makedirs(parent_dir, exist_ok=True)
+						copy_file_meta(event_source_real_path,file_vault_target_path)
+					else:
+						# we copy the file
+						cp_af_copy_path(source_path=event_source_real_path,dest_path=file_vault_target_path,mcae=mcae,pending=pending)
+					manifest.add(event_relative_path,dirty=True)
+			elif event_values.event == 'move':
+				link_source_relative_path = os.path.relpath(event_values.source_path,monitor_path)
+				link_target_relative_path = event_relative_path
+				if isDir:
+					if os.path.abspath(file_vault_target_path) == '/':
+						# we cannot remove root
+						backuperTeeLogToTl(path=file_vault_target_path,error=True,message='Attempting to move root, skipping')
+						continue
+					# also moves all the files and subfolders in the folder
+					manifest.move_tree(as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path))
+					manifest.add(as_folder_entry(link_target_relative_path))
+				else:
+					manifest.discard(link_source_relative_path)
+					manifest.add(link_target_relative_path)
+				# we need to wait for copy threads to finish to allow rename
+				wait_for_async_commands(mcae)
+				link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
+				link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
+				try:
+					if os.path.lexists(link_target_backup_real_path):
+						os.remove(link_target_backup_real_path)
+					os.rename(link_source_backup_real_path,link_target_backup_real_path)
+					backuperTeeLogToTl(path=monitor_path,message=f'Moved {link_source_backup_real_path} to {link_target_backup_real_path}')
+					# sync the current attrs from the source onto the moved vault entry,
+					# but never through a chained symlink: that would rewrite the previous version's metadata
+					if isDir or not os.path.islink(link_target_backup_real_path):
+						copy_file_meta(event_source_real_path,link_target_backup_real_path)
+				except Exception as _:
+					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
+					import traceback
+					backuperTeeLogToTl(path=monitor_path,error=True,message=traceback.format_exc())
+					backuperTeeLogToTl(path=monitor_path,message='Doing delete & copy instead')
+					# if we fail to move, we just copy the file
+					copy_path(isDir=isDir,monitor_path=monitor_path,
+					  source_real_path=event_source_real_path,
+					  source_relative_path=event_relative_path,
+					  file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
+					delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
+					  relative_path=link_source_relative_path,mcae=mcae)
+					wait_for_async_commands(mcae)
+				# the copy fallback keeps the rows move_tree moved too, so both ways need the re-check
+				if isDir and skip_list is not None and skip_list.location_dependent:
+					recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
+		if need_delete_barrier:
+			wait_for_async_commands(mcae)
 		wait_for_async_commands(mcae)
-	wait_for_async_commands(mcae)
+	finally:
+		# however the backup ends, no copy is left writing into this version, nor a partial file in it
+		stop_copies(mcae,pending)
 	if mcae.runningThreads or not GREEN_LIGHT.is_set():
 		backuperTeeLogToTl(path=monitor_path,error=True,message='Reverb backup interrupted before copy threads finished')
 		return manifest
