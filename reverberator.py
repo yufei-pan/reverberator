@@ -1690,6 +1690,7 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 	global GREEN_LIGHT
 	# main monitoring function to deal with one reverb. with a job, a failure stops only that job, and so does the job failing
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
+	root_lost = False
 	while running():
 		if not wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready'):
 			return False
@@ -1709,7 +1710,7 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 		if not running():
 			watcherTeeLogToTl(monitor_path,f'Exiting watcher thread for {monitor_path}',ok=True)
 			return False
-		result = watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_lock=to_process_lock,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds,skip_list=skip_list,watching=watching,job=job)
+		result = watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_lock=to_process_lock,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds,skip_list=skip_list,watching=watching,job=job,root_returned=root_lost)
 		if result == WATCH_RESULT_INIT_FAILED or result is False:
 			if job is None:
 				watcherTeeLogToTl(monitor_path,f'Watch init/loop failed for {monitor_path}; requesting shutdown',error=True)
@@ -1718,13 +1719,15 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 				watcherTeeLogToTl(monitor_path,f'Watch init/loop failed for {monitor_path}',error=True)
 				job.fail(f'watching {monitor_path} failed')
 			return False
+		# the self_destruct event queued for it changes nothing in the vault: the next watch of the root compares it
+		root_lost = result == WATCH_RESULT_SELF_DESTRUCT
 		if result == WATCH_RESULT_SELF_DESTRUCT:
 			watcherTeeLogToTl(monitor_path,f'Watch root disappeared for {monitor_path}; waiting for filesystem recovery',error=True)
 			if monitor_signature is not None:
 				# the flag stays set until the monitor sees the mount table change, which would let the wait pass at once
 				FS_SIGNATURE_MONITOR.invalidate(monitor_path, monitor_signature)
 
-def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,skip_list:'SkipList' = None,watching:threading.Event = None,job:JobControl = None):
+def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,skip_list:'SkipList' = None,watching:threading.Event = None,job:JobControl = None,root_returned:bool = False):
 	global COOKIE_DICT_MAX_SIZE
 	global DEBUG
 	global GREEN_LIGHT
@@ -1767,6 +1770,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			return WATCH_RESULT_INIT_FAILED
 		if watching is not None:
 			watching.set()
+		if root_returned:
+			# the root came back after it was lost (remounted, or deleted and made again): nothing tells what changed in
+			# it meanwhile, so the backuper compares the whole tree with the vault, now that its changes are watched
+			append_change_event(to_process, to_process_lock, ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 		lastReadTime = time.monotonic()
 		lastProcessTime = time.monotonic()
 		# with a job, also stop once it failed, so its supervisor can join this thread
