@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import pytest
 import reverberator as rv
 from tests.harness import seed_monitor, wait_until
@@ -251,5 +252,24 @@ def test_folder_moved_back_before_its_move_expires_keeps_its_watches(job, poll_f
 		restored = os.path.join(data, 'sub', 'y')
 		open(restored, 'w').write('y')
 		wait_until(lambda: any(e.path == restored for e in _events(to_process, lock)), message='restored folder not watched')
+	finally:
+		_stop(thread)
+
+
+def test_folder_moved_away_and_back_is_not_deleted_later(job, tmp_path, poll_fast, monkeypatch):
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	seed_monitor(job, {'d/sub/': None})
+	thread, to_process, lock = _start(job, [])
+	try:
+		os.rename(os.path.join(job.monitor, 'd'), str(outside / 'd'))
+		os.rename(str(outside / 'd'), os.path.join(job.monitor, 'd'))
+		d = os.path.join(job.monitor, 'd')
+		wait_until(lambda: any(e.event == 'create' and e.path == d for e in _events(to_process, lock)), message='no create')
+		time.sleep(1.0)
+		_probe(job, to_process, lock, 'probe_after_expiry.txt')
+		events = [(e.event, e.path) for e in _events(to_process, lock) if e.path == d]
+		assert events == [('delete', d), ('create', d)]
 	finally:
 		_stop(thread)

@@ -503,3 +503,167 @@ def test_watcher_invalidates_its_signature_on_self_destruct_for_an_ordinary_job(
 	for t in starter(control, 1):
 		t.join(timeout=5)
 	assert calls == [(path, 'UUID-RULE')]
+
+
+def test_interrupted_full_comparison_is_requeued(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	def interrupted(*args, **kwargs):
+		rv.GREEN_LIGHT.clear()
+		return None, None, False
+	monkeypatch.setattr(rv, 'do_backup', interrupted)
+	queue = rv.ChangeEventQueue(job.monitor)
+	queue.append(rv.ChangeEvent(1.0, False, 'full_scan', job.monitor, None))
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	thread, queue = _run_backuper(job, control, to_process=queue)
+	thread.join(timeout=5)
+	rv.GREEN_LIGHT.set()
+	pending = os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME)
+	assert 'full_scan' in open(pending).read()
+
+
+def test_untrusted_fingerprint_forces_a_comparison(job):
+	startup = rv.JobStartup(job.job_name, job.monitor)
+	assert startup.load('', trusted=False) is True and startup.change == 'changed'
+	refused = rv.JobStartup(job.job_name, job.monitor)
+	assert refused.load('recorded', trusted=False) is False
+
+
+def test_ignored_and_unknown_watch_events_log_quietly(monkeypatch, poll_fast):
+	flags = rv.inotify_simple.flags
+	class FakeEvent:
+		def __init__(self, wd, mask, name=''):
+			self.wd, self.mask, self.cookie, self.name = wd, mask, 0, name
+	class FakeINotify:
+		reads = 0
+		def __enter__(self):
+			return self
+		def __exit__(self, *args):
+			return False
+		def read(self, timeout=None):
+			FakeINotify.reads += 1
+			if FakeINotify.reads == 1:
+				return [FakeEvent(7, flags.IGNORED), FakeEvent(99, flags.MODIFY, 'x')]
+			rv.GREEN_LIGHT.clear()
+			return []
+		def add_watch(self, path, mask):
+			return 42
+		def rm_watch(self, wd):
+			pass
+	logged = []
+	monkeypatch.setattr(rv.inotify_simple, 'INotify', FakeINotify)
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', lambda *args, **kwargs: 42)
+	monkeypatch.setattr(rv, 'watcherTeeLogToTl', lambda path, message, error=False, ok=False: logged.append(message))
+	rv.watchFolder('/monitor', rv.ChangeEventQueue('/monitor'), threading.Lock(), threading.Event(), rv.inotify_resource_manager())
+	rv.GREEN_LIGHT.set()
+	assert not any('Event name not found' in message for message in logged)
+	unknown = [message for message in logged if 'not found' in message]
+	assert unknown and '{' not in unknown[0]
+
+
+def test_removing_many_watches_raises_the_queue_limit_first():
+	class FakeIrm:
+		max_queued_events = 10
+		def __init__(self):
+			self.raised = []
+		def increaseInotifyMaxQueueEvents(self, max_events):
+			self.raised.append(max_events)
+			self.max_queued_events = max_events
+			return True
+		def decreaseUserWatches(self, count=1):
+			pass
+	class FakeINotify:
+		def rm_watch(self, wd):
+			pass
+	wd_dic = rv.bidict({i: f'/m/d/{i}/' for i in range(30)})
+	wd_dic[100] = '/m/d'
+	irm = FakeIrm()
+	assert rv.remove_watches_under(FakeINotify(), wd_dic, irm, '/m/d') == 31
+	assert irm.raised and irm.raised[0] >= 62
+
+
+def _fake_inotify_with(events_first, monkeypatch):
+	flags = rv.inotify_simple.flags
+	class FakeINotify:
+		reads = 0
+		def __enter__(self):
+			return self
+		def __exit__(self, *args):
+			return False
+		def read(self, timeout=None):
+			FakeINotify.reads += 1
+			if FakeINotify.reads == 1:
+				return events_first
+			rv.GREEN_LIGHT.clear()
+			return []
+		def add_watch(self, path, mask):
+			return 42
+		def rm_watch(self, wd):
+			pass
+	monkeypatch.setattr(rv.inotify_simple, 'INotify', FakeINotify)
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', lambda *args, **kwargs: 42)
+	return flags
+
+
+def test_delete_self_for_an_unmapped_watch_does_not_decrement(monkeypatch, poll_fast):
+	class FakeEvent:
+		def __init__(self, wd, mask):
+			self.wd, self.mask, self.cookie, self.name = wd, mask, 0, ''
+	flags = rv.inotify_simple.flags
+	_fake_inotify_with([FakeEvent(77, flags.DELETE_SELF)], monkeypatch)
+	irm = rv.inotify_resource_manager()
+	decreased = []
+	monkeypatch.setattr(irm, 'decreaseUserWatches', lambda count=1: decreased.append(count))
+	monkeypatch.setattr(rv, 'watcherTeeLogToTl', lambda *args, **kwargs: None)
+	rv.watchFolder('/monitor', rv.ChangeEventQueue('/monitor'), threading.Lock(), threading.Event(), irm)
+	rv.GREEN_LIGHT.set()
+	# the watcher releases its own count (0 here) on exit; a DELETE_SELF decrement would be 1
+	assert 1 not in decreased
+
+
+def test_file_bind_mount_is_not_an_inner_mount(tmp_path):
+	monitor = tmp_path / 'm'
+	monitor.mkdir()
+	(monitor / 'file.cfg').write_text('x')
+	(monitor / 'dir').mkdir()
+	table = [('/', ('1',)), (str(monitor / 'file.cfg'), ('2',)), (str(monitor / 'dir'), ('3',))]
+	assert rv.watched_inner_mounts(table, str(monitor)) == {str(monitor / 'dir'): ('3',)}
+	inner = {}
+	queue = rv.ChangeEventQueue(str(monitor))
+	class FakeINotify:
+		def rm_watch(self, wd):
+			pass
+		def add_watch(self, path, mask):
+			return 1
+	rv.follow_inner_mounts(FakeINotify(), str(monitor), table[:2], inner, rv.bidict(), rv.inotify_resource_manager(), 0, queue, threading.Lock())
+	assert inner == {} and len(queue) == 0
+
+
+def test_run_job_counts_an_exception_from_start_attempt_as_a_failure(monkeypatch, poll_fast, capsys):
+	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.01)
+	def permanent(job, attempt):
+		raise rv.JobFailure('bad', permanent=True)
+	assert rv.run_job(rv.JobControl('j'), permanent) == 'stopped'
+	out = capsys.readouterr()
+	assert 'reverberator job j STOPPED: bad' in out.out + out.err
+	calls = []
+	def retryable(job, attempt):
+		calls.append(attempt)
+		if attempt == 2:
+			raise rv.JobFailure('done', permanent=True)
+		raise RuntimeError('boom')
+	assert rv.run_job(rv.JobControl('j'), retryable) == 'stopped'
+	out = capsys.readouterr()
+	assert 'reverberator job j FAILED: ' in out.out + out.err and 'boom' in out.out + out.err and calls == [1, 2]
+
+
+def test_supervise_job_records_a_crash_and_stops_the_others(monkeypatch):
+	def crashing(*args, **kwargs):
+		raise RuntimeError('supervisor bug')
+	monkeypatch.setattr(rv, 'run_job', crashing)
+	results = [None]
+	try:
+		rv.supervise_job(results, 0, rv.JobControl('j'), None, None)
+		assert results == ['crashed'] and not rv.GREEN_LIGHT.is_set()
+	finally:
+		rv.GREEN_LIGHT.set()

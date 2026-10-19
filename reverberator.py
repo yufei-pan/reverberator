@@ -504,8 +504,12 @@ class JobStartup:
 		self.loaded = threading.Event()
 		self.watching = threading.Event()
 
-	def load(self, recorded_fingerprint) -> bool:
-		'''Load the list and compare it with the vault's recorded fingerprint; False when the job must not run.'''
+	def load(self, recorded_fingerprint, trusted:bool = True) -> bool:
+		'''
+		Load the list and compare it with the vault's recorded fingerprint; False when the job must not run.
+		When the recorded fingerprint is not trusted (the manifest does not describe the latest version), a list that
+		looks unchanged counts as changed, so the whole tree is compared.
+		'''
 		ok = False
 		try:
 			try:
@@ -521,6 +525,8 @@ class JobStartup:
 				backuperTeeLogToTl(self.job_name,f'Cannot load skip list file {self.skip_list_path} for job {self.job_name}: {e}. Not backing up this job',error=True)
 				return False
 			self.change = skip_list_change(recorded_fingerprint, skip_list.fingerprint, self.explicit_none)
+			if self.change == 'unchanged' and not trusted:
+				self.change = 'changed'
 			if self.change == 'refuse':
 				reason = f'{self.skip_list_path} has no patterns' if self.skip_list_path is not None else 'its Skip List File names no file'
 				self.permanent = True
@@ -790,7 +796,15 @@ def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pendi
 		attempt += 1
 		job.start_attempt()
 		started = clock()
-		threads = start_attempt(job, attempt)
+		try:
+			threads = start_attempt(job, attempt)
+		except Exception as e:
+			# starting the attempt failed: it counts as that attempt's failure, with no thread to join
+			threads = []
+			if isinstance(e, JobFailure):
+				job.fail(e.reason, e.permanent)
+			else:
+				job.fail(f'{type(e).__name__}: {e}')
 		recovering = failures > 0
 		while GREEN_LIGHT.is_set() and job.failure is None:
 			if recovering and job.committed.is_set():
@@ -909,7 +923,16 @@ def persist_failed_job_queue(job_name:str, monitor_path:str, vault_path:str, to_
 
 def supervise_job(results:list, index:int, job:JobControl, start_attempt, persist_pending):
 	'''A job's supervisor thread: runs the job and records how it ended in results[index].'''
-	results[index] = run_job(job, start_attempt, persist_pending=persist_pending)
+	global GREEN_LIGHT
+	try:
+		results[index] = run_job(job, start_attempt, persist_pending=persist_pending)
+	except Exception as e:
+		import traceback
+		tl.teeerror(traceback.format_exc())
+		daemon_error_log(f'supervisor of job {job.job_name} crashed: {type(e).__name__}: {e}')
+		results[index] = 'crashed'
+		# the other jobs stop cleanly and save their pending transactions; main exits 1
+		GREEN_LIGHT.clear()
 
 def main():
 	'''The console entry point: runs the daemon, and exits 1 with a marker line when it fails.'''
@@ -1037,6 +1060,8 @@ def run_daemon():
 		tl.teeok(f'Started job {job_name} watching {monitor_path}:{monitor_path_signature} into vault {vault_path}:{vault_path_signature}')
 	for supervisor in supervisors:
 		supervisor.join()
+	if 'crashed' in results:
+		raise RuntimeError(f'a job supervisor crashed: {results}')
 	if not GREEN_LIGHT.is_set():
 		tl.teeok('All jobs have exited. Exiting main thread.')
 		return
@@ -1709,6 +1734,17 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	cookieDic = OrderedDict()
 	wdDic = bidict()
 	pendingMoveFromEvents = OrderedDict()
+	def queue_pending_move_from_at(path:str,monTime:float):
+		# something new is at the path a folder or file moved away from: that move was not a deletion that can wait,
+		# or the delete it expires into would land after this create and remove what is there
+		path_norm = path.rstrip('/')
+		for cookie, pending in list(pendingMoveFromEvents.items()):
+			if pending.path.rstrip('/') != path_norm:
+				continue
+			cookie_value = cookieDic.pop(cookie,None)
+			if cookie_value is not None and cookie_value.wds:
+				remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
+			append_change_event(to_process, to_process_lock, pendingMoveFromEvents.pop(cookie))
 	newDirWDs = set()
 	processPending = False
 	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
@@ -1793,8 +1829,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						return WATCH_RESULT_SELF_DESTRUCT
 					elif event.mask & flags.DELETE_SELF:
 						watcherTeeLogToTl(monitor_path,f'Sub dir delete self event detected, removing watch for {wdDic.get(event.wd,None)}')
-						wdDic.pop(event.wd, None)
-						irm.decreaseUserWatches()
+						if wdDic.pop(event.wd, None) is not None:
+							irm.decreaseUserWatches()
 						continue
 					elif event.mask & flags.UNMOUNT:
 						# the disk mounted inside the tree went away and took this watch along. watching the path again
@@ -1811,10 +1847,15 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						watcherTeeLogToTl(monitor_path,'Sub dir move self event detected, skipping')
 						continue
 				if not event.name:
+					if event.mask & flags.IGNORED:
+						# the kernel dropped a watch, as ours do when we remove one or its folder is deleted
+						if DEBUG:
+							watcherTeeLogToTl(monitor_path,f'Watch {event.wd} ignored by the kernel')
+						continue
 					watcherTeeLogToTl(monitor_path,'Event name not found, ignoring event')
 					continue
 				if event.wd not in wdDic:
-					watcherTeeLogToTl(monitor_path,f'Watch descriptor {event.wd} not found in wdDic {wdDic}, ignoring event')
+					watcherTeeLogToTl(monitor_path,f'Watch descriptor {event.wd} not found, ignoring event')
 					continue
 				eventPath = os.path.join(wdDic[event.wd],event.name)
 				skipped = skip_list is not None and skip_list.skips_path(eventPath,isDir)
@@ -1835,6 +1876,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				if event.mask & flags.CREATE:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Create event detected for {eventPath}')
+					queue_pending_move_from_at(eventPath,monTime)
 					if isDir:
 						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name)
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
@@ -1914,6 +1956,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Cookie not found for {event.cookie}')
 							watcherTeeLogToTl(monitor_path,f'Treating move as create event for {eventPath}')
+						queue_pending_move_from_at(eventPath,monTime)
 						if isDir:
 							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
@@ -2021,11 +2064,17 @@ def watches_under(wdDic:bidict,folder_path:str) -> tuple:
 	prefix = folder_norm + '/'
 	return tuple(wd for wd, wd_path in wdDic.items() if wd_path.rstrip('/') == folder_norm or wd_path.startswith(prefix))
 
+def raise_queue_limit_for_removals(irm:inotify_resource_manager,count:int):
+	'''Removing a watch queues an IN_IGNORED event: make room first when count of them would fill half the queue.'''
+	if count > irm.max_queued_events / 2:
+		irm.increaseInotifyMaxQueueEvents(max(irm.max_queued_events * 2, count * 2))
+
 def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str) -> int:
 	'''Remove the watch on folder_path and every watch below it; returns how many were removed.'''
 	folder_norm = folder_path.rstrip('/')
 	prefix = folder_norm + '/'
 	removed = 0
+	raise_queue_limit_for_removals(irm,len(watches_under(wdDic,folder_path)))
 	for wd, wd_path in list(wdDic.items()):
 		wd_norm = wd_path.rstrip('/')
 		if wd_norm != folder_norm and not wd_norm.startswith(prefix):
@@ -2079,6 +2128,7 @@ def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,ir
 	folder_norm = folder_path.rstrip('/')
 	prefix = folder_norm + '/'
 	removed = 0
+	raise_queue_limit_for_removals(irm,len(wds))
 	for wd in wds:
 		wd_path = wdDic.get(wd)
 		if wd_path is None:
@@ -2449,6 +2499,14 @@ def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList
 	mounts = {}
 	for mount_point in inner_mount_points(mount_table, monitor_path):
 		rel = os.path.relpath(mount_point, real_root)
+		try:
+			is_file_mount = not stat.S_ISDIR(os.lstat(mount_point).st_mode)
+		except OSError:
+			# a disk that does not answer stays followed: it is paused, not unmounted
+			is_file_mount = False
+		if is_file_mount:
+			# a file bind mount: no folder to watch or compare
+			continue
 		if skip_list is not None and skips_folder_or_parent(skip_list.skips, rel + '/'):
 			continue
 		mounts[os.path.join(monitor_path, rel)] = mount_fingerprint(mount_table, mount_point)
@@ -2926,7 +2984,12 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			if os.path.isdir(job_vault):
 				manifest = VaultManifest(job_vault)
 				recorded = manifest.skip_fingerprint
-			if not startup.load(recorded):
+			trusted = True
+			if manifest is not None:
+				# a manifest that does not describe the latest version cannot vouch for the fingerprint it recorded
+				latest_version = get_vault_info(job_vault).vault_info_dict
+				trusted = not latest_version or manifest.describes(latest_version[next(reversed(latest_version))].path)
+			if not startup.load(recorded,trusted):
 				# only this job stops: its watcher sees the failure and exits too
 				if job is not None:
 					job.fail(startup.failure_reason, permanent=startup.permanent)
@@ -2962,6 +3025,9 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				else:
 					# a full scan absorbs whatever the watcher queued meanwhile
 					to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
+		if not running():
+			# stopping: the restored events stay queued for the pending transactions
+			return
 		with to_process_lock:
 			if to_process:
 				backuperTeeLogToTl(job_name, f'Found {len(to_process)} events queued at startup')
