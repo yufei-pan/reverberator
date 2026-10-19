@@ -32,6 +32,7 @@ import marshal
 import zlib
 from concurrent.futures import Future, ThreadPoolExecutor
 import shutil
+import uuid
 from shutil import copystat
 
 # for the lib wrapping aroung inotify, I tried
@@ -740,12 +741,18 @@ COMPARE_THREADS = 32
 MAX_CHAINED_LINKS = 40
 # manifest rows written or read per statement: enough to amortise sqlite calls, little to hold
 MANIFEST_BATCH_SIZE = 10000
-# a copy is written under its destination's name with this suffix until it succeeded
+# a copy is written under a name of its own with this suffix, in its destination's folder, until it succeeded
 PARTIAL_COPY_SUFFIX = '.reverberator-partial'
-# the longest file name, in bytes, the filesystems a vault lives on allow
-MAX_FILE_NAME_BYTES = 255
-# a stopped command is killed within about a second ( multiCMD sends SIGKILL a second after SIGTERM )
+# how long a failed backup waits for its stopped copies before it gives up on them
+COPY_STOP_WAIT_SECONDS = 60
+# a stopping daemon waits less: a stopped command is killed within about a second ( multiCMD sends SIGKILL a second after SIGTERM )
 COPY_STOP_GRACE_SECONDS = 2
+# what cp says when a copy's contents arrived but some of its metadata could not be kept
+COPY_METADATA_FAILURES = ('failed to preserve ownership', 'failed to preserve authorship', 'preserving permissions for',
+	'preserving times for', 'setting permissions for', 'setting attribute', 'getting attribute', 'listing attributes',
+	'extended attributes', 'security context')
+# what cp says when the source changed under the copy, which a later event covers
+COPY_SOURCE_REPLACED = 'replaced while being copied'
 
 DEBUG = False
 
@@ -2660,7 +2667,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		if job is None or not GREEN_LIGHT.is_set():
 			persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
 
-def backuperTeeLogToTl(path:str,message:str,error=False,ok=False):
+def backuperTeeLogToTl(path:str,message:str,error=False,ok=False,warning=False,debug=False):
 	global tl
 	global DEBUG
 	message = f'{BACKUPER_LOG_PREFIX}| {path} | ' + message
@@ -2668,6 +2675,13 @@ def backuperTeeLogToTl(path:str,message:str,error=False,ok=False):
 		tl.teeerror(message,callerStackDepth=4)
 	elif ok:
 		tl.teeok(message,callerStackDepth=4)
+	elif warning:
+		tl.teewarning(message,callerStackDepth=4)
+	elif debug:
+		if DEBUG:
+			tl.teedebug(message,callerStackDepth=4)
+		else:
+			tl.debug(message,callerStackDepth=4)
 	elif DEBUG:
 		tl.teeprint(message,callerStackDepth=4)
 	else:
@@ -3017,7 +3031,7 @@ def do_backup(backup_entries:dict,
 						finish_copies(pending,manifest,backup_folder,job_name,reported)
 				finally:
 					# however the backup ends, no copy is left writing into this version, nor a partial file in it
-					stop_copies(mcae,pending)
+					stop_copies(mcae,pending,backup_folder)
 				mcae.cleanup(timeout=POLL_WAIT_SECONDS)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
 				record_dirty_entries(manifest,backup_folder,monitor_path)
@@ -3420,19 +3434,15 @@ def prepare_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 
 def partial_copy_path(dest_path:str) -> str:
 	'''
-	Where a copy to dest_path is written until it succeeded. A name too long to take the suffix is hashed instead.
+	A new name in dest_path's folder for one copy to dest_path to be written under until it succeeded. It is unique to
+	that copy, so it never names an entry of the version, whatever the monitored tree holds, nor another copy's file.
 
 	Examples:
-		>>> partial_copy_path('/vault/job/V1--x/d/a.txt')
-		'/vault/job/V1--x/d/.a.txt.reverberator-partial'
-		>>> len(os.path.basename(partial_copy_path('/vault/job/V1--x/' + 'n' * 255))) < 255
-		True
+		>>> first, second = partial_copy_path('/vault/job/V1--x/d/a.txt'), partial_copy_path('/vault/job/V1--x/d/a.txt')
+		>>> os.path.dirname(first), first.endswith(PARTIAL_COPY_SUFFIX), first != second
+		('/vault/job/V1--x/d', True, True)
 	'''
-	name = os.path.basename(dest_path)
-	temp_name = '.' + name + PARTIAL_COPY_SUFFIX
-	if len(os.fsencode(temp_name)) > MAX_FILE_NAME_BYTES:
-		temp_name = '.' + xxhash.xxh64(os.fsencode(name)).hexdigest() + PARTIAL_COPY_SUFFIX
-	return os.path.join(os.path.dirname(dest_path), temp_name)
+	return os.path.join(os.path.dirname(dest_path), '.' + uuid.uuid4().hex + PARTIAL_COPY_SUFFIX)
 
 def remove_entry(path:str):
 	'''Remove what is at path, a folder with everything in it; nothing there is fine.'''
@@ -3502,8 +3512,9 @@ def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = 
 	if dest_parent and not os.path.isdir(dest_parent):
 		os.makedirs(dest_parent, exist_ok=True)
 	temp_path = partial_copy_path(dest_path)
-	# cp would copy a folder into one already there instead of over it
-	remove_entry(temp_path)
+	while os.path.lexists(temp_path):
+		# only this copy ever removes or renames its partial file, so it never takes over a path already there
+		temp_path = partial_copy_path(dest_path)
 	command = ['cp','-af','--reflink=auto','--sparse=always',source_path,temp_path]
 	if mcae is not ...:
 		task = mcae.run_command(command)
@@ -3527,32 +3538,102 @@ def discard_copies(pending:list):
 			backuperTeeLogToTl(path=copy.temp_path,error=True,message=f'Failed to remove the partial copy {copy.temp_path}: {e}')
 	pending.clear()
 
+def copy_metadata_failure(line:str) -> bool:
+	'''
+	Whether a line cp wrote only says some metadata of a copy could not be kept.
+
+	Examples:
+		>>> copy_metadata_failure("cp: failed to preserve ownership for '/v/.x.reverberator-partial': Operation not permitted")
+		True
+		>>> copy_metadata_failure("cp: error writing '/v/.x.reverberator-partial': No space left on device")
+		False
+	'''
+	return any(phrase in line for phrase in COPY_METADATA_FAILURES)
+
+def copy_arrived(source_path:str, temp_path:str) -> bool:
+	'''Whether temp_path holds an entry of source_path's type and, for a regular file, of its size.'''
+	try:
+		source_stat = os.lstat(source_path)
+		temp_stat = os.lstat(temp_path)
+	except OSError:
+		return False
+	if stat.S_IFMT(source_stat.st_mode) != stat.S_IFMT(temp_stat.st_mode):
+		return False
+	return not stat.S_ISREG(source_stat.st_mode) or source_stat.st_size == temp_stat.st_size
+
+def copy_failure_side(source_path:str, lines:list) -> str:
+	'''
+	Where a failed copy of source_path failed, from the lines cp wrote: 'vanished' when the source is gone (or was
+	replaced under the copy), 'source' when it could not be read, and 'vault' when writing the copy failed. cp names the
+	path it failed on: a line naming the partial file is the vault's, whether or not the source is still there, and one
+	naming the source (or what is under it) the source's. Without such a line the source is tried, and what cannot be
+	told apart is the vault's.
+
+	Examples:
+		>>> copy_failure_side('/', ["cp: cannot create regular file '/v/.x.reverberator-partial': No such file or directory"])
+		'vault'
+		>>> copy_failure_side('/', ["cp: error reading '/': Input/output error"])
+		'source'
+		>>> copy_failure_side('/', ["cp: cannot stat '/': No such file or directory"]), copy_failure_side('/nowhere/gone', [])
+		('vanished', 'vanished')
+		>>> copy_failure_side('/nowhere/gone', ["cp: error writing '/v/.x.reverberator-partial': No space left on device"])
+		'vault'
+	'''
+	vault = source = vanished = False
+	for line in lines:
+		if copy_metadata_failure(line):
+			continue
+		if PARTIAL_COPY_SUFFIX in line:
+			vault = True
+		elif source_path in line:
+			if os.strerror(errno.ENOENT) in line or COPY_SOURCE_REPLACED in line:
+				vanished = True
+			else:
+				source = True
+	if vault:
+		return 'vault'
+	if not os.path.lexists(source_path):
+		return 'vanished'
+	if source:
+		return 'source'
+	if vanished:
+		return 'vanished'
+	return 'vault' if source_readable(source_path) else 'source'
+
 def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_name:str, reported:set = None) -> None:
 	'''
 	Put the copies of pending in place once the executor has finished them, and empty pending.
 
-	A copy that succeeded takes its destination's place. One that failed leaves the destination as it was: when its
-	source cannot be read, that keeps the last backed-up copy, an UNREADABLE line says so (once per backup, with
-	reported) and a destination holding nothing stops being tracked in manifest, whose paths are relative to
-	version_path. Otherwise writing into the vault is what failed, and JobFailure is raised once every copy is dealt with.
+	A copy that succeeded takes its destination's place, as does one whose contents arrived while cp could only not keep
+	some metadata (a warning says so). One that failed leaves the destination as it was, keeping the last backed-up
+	copy, when its source failed: silently when the source is gone, with an UNREADABLE line (once per backup, with
+	reported) when it could not be read. A destination holding nothing then stops being tracked in manifest, whose paths
+	are relative to version_path. When writing into the vault is what failed, JobFailure is raised once every copy is
+	dealt with.
 	'''
 	failure = None
 	done = 0
 	try:
 		for copy in pending:
-			if copy.task.returncode == 0:
-				# a second copy to one destination shares its partial file, which the first one already put in place
-				if os.path.lexists(copy.temp_path) or not any(pending[index].temp_path == copy.temp_path for index in range(done)):
-					replace_entry(copy.temp_path, copy.dest_path)
+			lines = [line.strip() for line in copy.task.stderr if line.strip()]
+			error = '; '.join(lines)
+			succeeded = copy.task.returncode == 0
+			if not succeeded and lines and all(copy_metadata_failure(line) for line in lines) and copy_arrived(copy.source_path, copy.temp_path):
+				backuperTeeLogToTl(path=copy.source_path,warning=True,message=f'Copied {copy.source_path} to {copy.dest_path} without all of its metadata: {error}')
+				succeeded = True
+			if succeeded:
+				replace_entry(copy.temp_path, copy.dest_path)
 			else:
 				remove_entry(copy.temp_path)
-				error = '; '.join(line.strip() for line in copy.task.stderr if line.strip())
-				if source_readable(copy.source_path):
+				side = copy_failure_side(copy.source_path, lines)
+				if side == 'vault':
 					if failure is None:
 						cause = error or f'cp exited with {copy.task.returncode}'
 						failure = JobFailure(f'copying {copy.source_path} into the vault failed: {cause}')
 				else:
-					if reported is None or copy.source_path not in reported:
+					if side == 'vanished':
+						backuperTeeLogToTl(path=copy.source_path,debug=True,message=f'Not copying {copy.source_path}: it no longer exists; keeping its last backed-up copy')
+					elif reported is None or copy.source_path not in reported:
 						if reported is not None:
 							reported.add(copy.source_path)
 						job_log(job_name, f'UNREADABLE: {copy.source_path}: {error or "copy failed"}; keeping its last backed-up copy')
@@ -3567,22 +3648,27 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 	if failure is not None:
 		raise failure
 
-def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list):
+def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str):
 	'''
 	Stop what still runs on mcae, then discard the copies of pending, which will not be finished.
 
-	Running commands are killed and, while the daemon runs, waited for however long that takes: a retry removes the
-	uncommitted version, so nothing may still be writing into it. A stopping daemon waits COPY_STOP_GRACE_SECONDS at most.
+	Running commands are killed and waited for, as a retry removes the uncommitted version_path they write into: for
+	COPY_STOP_WAIT_SECONDS at most, COPY_STOP_GRACE_SECONDS once the daemon is stopping. The ones still running then are
+	named in an error line and left to finish on their own.
 	'''
 	mcae.stop(timeout=0)
-	deadline = None
+	deadline = time.monotonic() + COPY_STOP_WAIT_SECONDS
 	while mcae.runningThreads:
-		if deadline is None and not GREEN_LIGHT.is_set():
-			deadline = time.monotonic() + COPY_STOP_GRACE_SECONDS
-		wait = POLL_WAIT_SECONDS if deadline is None else min(POLL_WAIT_SECONDS, deadline - time.monotonic())
+		if not GREEN_LIGHT.is_set():
+			deadline = min(deadline, time.monotonic() + COPY_STOP_GRACE_SECONDS)
+		wait = min(POLL_WAIT_SECONDS, deadline - time.monotonic())
 		if wait <= 0:
 			break
 		mcae.wait(timeout=wait)
+	if mcae.runningThreads:
+		running = [' '.join(task.command) for task in mcae.tasks if task.is_alive()]
+		shown = '; '.join(running[:10]) + (f'; and {len(running) - 10} more' if len(running) > 10 else '')
+		backuperTeeLogToTl(path=version_path,error=True,message=f'{len(running)} stopped commands still running after {COPY_STOP_WAIT_SECONDS}s, no longer waiting for them: {shown}')
 	discard_copies(pending)
 
 def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False) -> bool:
@@ -4863,7 +4949,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		wait_for_async_commands(mcae)
 	finally:
 		# however the backup ends, no copy is left writing into this version, nor a partial file in it
-		stop_copies(mcae,pending)
+		stop_copies(mcae,pending,backup_folder)
 	if mcae.runningThreads or not GREEN_LIGHT.is_set():
 		backuperTeeLogToTl(path=monitor_path,error=True,message='Reverb backup interrupted before copy threads finished')
 		return manifest
