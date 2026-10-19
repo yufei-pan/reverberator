@@ -259,3 +259,38 @@ def test_long_queue_becomes_one_full_scan_only_when_memory_is_short(job, poll_fa
 		rv.GREEN_LIGHT.clear()
 		thread.join(timeout=5)
 		rv.GREEN_LIGHT.set()
+
+
+def test_recreated_monitored_root_is_compared_with_the_vault(job, poll_fast, monkeypatch):
+	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.2)
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('a')
+	to_process = rv.ChangeEventQueue(job.monitor)
+	lock = threading.Lock()
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	flag = rv.FS_SIGNATURE_MONITOR.register(job.monitor, 'N/A')
+	watched = []
+	real_init = rv.initializeFolderWatchers
+	def counting_init(inotify_obj, path, *args, **kwargs):
+		result = real_init(inotify_obj, path, *args, **kwargs)
+		if path == job.monitor:
+			watched.append(result)
+		return result
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', counting_init)
+	thread = threading.Thread(target=rv.watcher, args=(flag, job.monitor, to_process, lock, threading.Event(),
+		rv.inotify_resource_manager(), 0, 60), kwargs=dict(job=control, monitor_signature='N/A'), daemon=True)
+	thread.start()
+	try:
+		wait_until(lambda: len(watched) == 1, message='root not watched')
+		assert not to_process.full_scan_requested
+		# the monitored root moves away and a new one takes its place: nothing tells what changed, so it is compared
+		os.rename(job.monitor, job.monitor + '.old')
+		os.makedirs(job.monitor)
+		open(os.path.join(job.monitor, 'new.txt'), 'w').write('new')
+		wait_until(lambda: len(watched) == 2, message='new root not watched')
+		wait_until(lambda: to_process.full_scan_requested, timeout=2, message='new root never compared')
+	finally:
+		control.fail('test done')
+		thread.join(timeout=3)
+		rv.FS_SIGNATURE_MONITOR.unregister(job.monitor, 'N/A', flag)
+	assert not thread.is_alive()
