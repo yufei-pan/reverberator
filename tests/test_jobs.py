@@ -408,3 +408,65 @@ def test_fs_monitor_rechecks_failed_pairs_without_a_mount_change(tmp_path, monke
 	wait_until(lambda: monitor.states.get((str(tmp_path), 'UUID-X')) is False, timeout=3, message='first check')
 	state['ok'] = True
 	wait_until(flag.is_set, timeout=3, message='not rechecked')
+
+
+def test_fs_monitor_invalidate_clears_the_flag_and_rechecks(tmp_path, monkeypatch, poll_fast):
+	state = {'ok': True}
+	monkeypatch.setattr(rv, 'check_fs_signature', lambda path, signature: state['ok'])
+	monitor = rv.fs_signature_monitor()
+	key = (str(tmp_path), 'UUID-X')
+	flag = monitor.register(*key)
+	wait_until(flag.is_set, timeout=3, message='first check')
+	state['ok'] = False
+	monitor.invalidate(*key)
+	assert not flag.is_set() and monitor.states[key] is False
+	wait_until(lambda: key in monitor.fingerprints, timeout=3, message='rechecked')
+	time.sleep(0.3)
+	assert not flag.is_set()
+
+
+def test_fs_monitor_invalidate_sets_the_flag_again_when_the_check_passes(tmp_path, monkeypatch, poll_fast):
+	monkeypatch.setattr(rv, 'check_fs_signature', lambda path, signature: True)
+	monitor = rv.fs_signature_monitor()
+	key = (str(tmp_path), 'UUID-X')
+	flag = monitor.register(*key)
+	wait_until(flag.is_set, timeout=3, message='first check')
+	monitor.invalidate(*key)
+	assert not flag.is_set()
+	wait_until(flag.is_set, timeout=3, message='set again')
+
+
+@pytest.mark.parametrize('check_result', [False, True])
+def test_monitor_gate_registers_the_resolved_signature_before_the_job_starts(tmp_path, monkeypatch, poll_fast, check_result):
+	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.1)
+	path = str(tmp_path / 'late')
+	monkeypatch.setattr(rv, 'get_fs_signatures', lambda p: ['UUID-A'] if os.path.isdir(p) else [])
+	monkeypatch.setattr(rv, 'check_fs_signature', lambda p, signature: check_result if signature == 'UUID-A' else True)
+	started = []
+	monkeypatch.setattr(rv, 'watcher', lambda *a, **k: started.append(('watcher', a)))
+	monkeypatch.setattr(rv, 'backuper', lambda *a, **k: started.append(('backuper', a)))
+	ungated = rv.FS_SIGNATURE_MONITOR.register(path, 'auto')
+	gate = rv.MonitorGate(path, ungated, 'auto')
+	starter = rv.job_attempt_starter('j', ('j', path), (ungated, path), ('j', None, None, path, 'v', 'N/A', None, ungated), gate)
+	control = rv.JobControl('j')
+	control.start_attempt()
+	result = []
+	thread = threading.Thread(target=lambda: result.append(starter(control, 1)), daemon=True)
+	thread.start()
+	time.sleep(0.3)
+	assert started == [] and thread.is_alive()
+	os.makedirs(path)
+	thread.join(timeout=5)
+	assert not thread.is_alive()
+	for t in result[0]:
+		t.join(timeout=2)
+	assert (path, 'UUID-A') in rv.FS_SIGNATURE_MONITOR.flags
+	assert (path, 'auto') not in rv.FS_SIGNATURE_MONITOR.flags or not rv.FS_SIGNATURE_MONITOR.flags[(path, 'auto')]
+	flag = dict(started)['backuper'][7]
+	assert flag is gate.flag and flag is not ungated
+	if check_result:
+		wait_until(flag.is_set, timeout=3, message='gated flag set')
+	else:
+		time.sleep(0.4)
+		assert not flag.is_set()
+	rv.FS_SIGNATURE_MONITOR.unregister(path, 'UUID-A', flag)

@@ -803,16 +803,66 @@ def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pendi
 		persist_pending()
 	return 'exit'
 
-def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, backuper_args:tuple):
+class MonitorGate:
+	'''
+	For a rule kept because its monitored path was missing at parse time, with no filesystem signature to gate on.
+	resolve() waits until the path exists and has a signature, then registers that pair with FS_SIGNATURE_MONITOR in
+	place of the ungated one, so the job never reads or watches the tree before its disk is identified.
+	'''
+	def __init__(self, path:str, flag:threading.Event, signature:str):
+		self.path = path
+		self.flag = flag
+		self.signature = signature
+		self.resolved = False
+
+	def resolve(self, job:JobControl) -> bool:
+		'''Returns False when the job (or the daemon) is stopped before the signature is known.'''
+		if self.resolved:
+			return True
+		always = threading.Event()
+		always.set()
+		if not wait_for_path(job, always, self.path, 'monitored path not there yet'):
+			return False
+		signature = None
+		started = time.monotonic()
+		next_alert = started + DISK_WAIT_GRACE_SECONDS
+		while job.should_run():
+			if os.path.isdir(self.path):
+				signatures = get_fs_signatures(self.path)
+				if signatures and signatures[0]:
+					signature = signatures[0]
+					break
+			job.running.wait(min(FS_RECHECK_SECONDS, POLL_WAIT_SECONDS))
+			now = time.monotonic()
+			if now >= next_alert:
+				job_log(job.job_name, f'FAILED: waiting {int((now - started) // 60)} min for {self.path}: monitored filesystem signature unknown')
+				next_alert = now + DISK_WAIT_REPEAT_SECONDS
+		if signature is None:
+			return False
+		new_flag = FS_SIGNATURE_MONITOR.register(self.path, signature)
+		FS_SIGNATURE_MONITOR.unregister(self.path, self.signature, self.flag)
+		self.flag, self.signature, self.resolved = new_flag, signature, True
+		return True
+
+def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, backuper_args:tuple, monitor_gate:MonitorGate = None):
 	'''
 	A start_attempt for run_job: each attempt starts the job's watcher and backuper, sharing a fresh JobStartup.
 	startup_args are JobStartup's, watcher_args and backuper_args their function's positional arguments before startup.
+	With a monitor_gate, nothing starts until it has resolved the monitored filesystem's signature, and its flag is
+	the monitored filesystem flag from then on (watcher_args[0] and backuper_args[7] are the ungated one).
 	'''
 	def start_attempt(job:JobControl, attempt:int) -> list:
+		w_args, b_args, signature = watcher_args, backuper_args, None
+		if monitor_gate is not None:
+			if not monitor_gate.resolve(job):
+				return []
+			w_args = (monitor_gate.flag, *watcher_args[1:])
+			b_args = (*backuper_args[:7], monitor_gate.flag, *backuper_args[8:])
+			signature = monitor_gate.signature
 		startup = JobStartup(*startup_args)
 		threads = [
-			threading.Thread(target=watcher, args=(*watcher_args, startup, job), name=f'{job_name} watcher', daemon=True),
-			threading.Thread(target=backuper, args=(*backuper_args, startup, job), name=f'{job_name} backuper', daemon=True),
+			threading.Thread(target=watcher, args=(*w_args, startup, job, signature), name=f'{job_name} watcher', daemon=True),
+			threading.Thread(target=backuper, args=(*b_args, startup, job), name=f'{job_name} backuper', daemon=True),
 		]
 		started = []
 		try:
@@ -942,7 +992,10 @@ def run_daemon():
 		startup_args = (job_name, monitor_path, resolve_skip_list_path(reverb_rule.skip_list_file, args.rule_path), reverb_rule.skip_list_file.strip().lower() == 'none')
 		watcher_args = (monitor_fs_flag,monitor_path,to_process,to_process_lock,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds)
 		backuper_args = (job_name,to_process,to_process_lock,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal)
-		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args)
+		gate = None
+		if not os.path.exists(monitor_path) and monitor_path_signature.strip().lower() in ('', 'auto'):
+			gate = MonitorGate(monitor_path, monitor_fs_flag, monitor_path_signature)
+		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate)
 		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
 		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
 		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
@@ -1521,7 +1574,7 @@ class inotify_usage:
 		return self.irm.decreaseUserWatches(count)
 
 #%% ---- Watcher ----
-def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,startup:JobStartup = None,job:JobControl = None):
+def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,startup:JobStartup = None,job:JobControl = None,monitor_signature:str = None):
 	global GREEN_LIGHT
 	# main monitoring function to deal with one reverb. with a job, a failure stops only that job, and so does the job failing
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
@@ -1555,6 +1608,9 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 			return False
 		if result == WATCH_RESULT_SELF_DESTRUCT:
 			watcherTeeLogToTl(monitor_path,f'Watch root disappeared for {monitor_path}; waiting for filesystem recovery',error=True)
+			if monitor_signature is not None:
+				# the flag stays set until the monitor sees the mount table change, which would let the wait pass at once
+				FS_SIGNATURE_MONITOR.invalidate(monitor_path, monitor_signature)
 
 def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,skip_list:'SkipList' = None,watching:threading.Event = None,job:JobControl = None):
 	global COOKIE_DICT_MAX_SIZE
@@ -2237,6 +2293,17 @@ class fs_signature_monitor:
 				self.flags.pop(key, None)
 				self.fingerprints.pop(key, None)
 				self.states.pop(key, None)
+
+	def invalidate(self, path:str, signature:str):
+		'''Clear every flag of a pair now and have the monitor check it again, as a watched root was unmounted or removed.'''
+		key = (path, signature)
+		with self.lock:
+			for fs_event in self.flags.get(key, []):
+				fs_event.clear()
+			if key in self.flags:
+				self.states[key] = False
+			self.fingerprints.pop(key, None)
+		self.wake()
 
 	def wake(self):
 		try:
