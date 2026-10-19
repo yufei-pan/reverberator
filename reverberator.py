@@ -4631,7 +4631,8 @@ class VaultManifest:
 	def move_tree(self, src_folder:str, dst_folder:str):
 		'''
 		Track src_folder and everything under it as dst_folder instead, replacing what dst_folder held.
-		The moved rows become unverified: a moved link that changed folder depth no longer resolves.
+		A move to another folder depth re-targets the links it carries (see retarget_moved_links); the moved rows stay
+		unverified, so the next comparison reads them once.
 		'''
 		if src_folder.startswith(dst_folder) or dst_folder.startswith(src_folder):
 			# a folder cannot move into itself or onto its parent
@@ -4735,6 +4736,85 @@ def vault_version_number(version_folder_name:str):
 	match = re.match(r'V(\d+)--', version_folder_name)
 	return int(match.group(1)) if match else None
 
+def chain_link_target(job_vault:str, link_text:str):
+	'''
+	Where a chain link with link_text points in job_vault, wherever the link now sits: the daemon writes a version's
+	link to an unchanged entry as ../ up to the job vault, then the version folder and the entry's path in it, and a
+	move to another folder depth keeps that text. None for any other link: a user's symlink backed up as one, or the
+	absolute link of a referenced backup.
+
+	Examples:
+		>>> chain_link_target('/v/j', '../V3--2021-01-01_00-00-00_-0800/a/x')
+		'/v/j/V3--2021-01-01_00-00-00_-0800/a/x'
+		>>> chain_link_target('/v/j', '../../V3--2021-01-01_00-00-00_-0800/a/x')
+		'/v/j/V3--2021-01-01_00-00-00_-0800/a/x'
+		>>> [chain_link_target('/v/j', text) for text in ('/abs/V3--2021-01-01_00-00-00_-0800/x', 'lib/x',
+		...     '../V3--2021-01-01_00-00-00_-0800', '../notaversion/x', '../V3--2021-01-01_00-00-00_-0800/a/../../../etc/x')]
+		[None, None, None, None, None]
+	'''
+	parts = link_text.split('/')
+	ups = 0
+	while ups < len(parts) and parts[ups] == '..':
+		ups += 1
+	rel = parts[ups + 1:]
+	# only the form the daemon writes: a .. after the version folder could name a path outside the vault
+	if not ups or not rel or vault_version_number(parts[ups]) is None or any(part in ('', '.', '..') for part in rel):
+		return None
+	return os.path.join(job_vault, parts[ups], *rel)
+
+def next_hop(job_vault:str, link_path:str, link_text:str) -> str:
+	'''
+	Where the link at link_path with link_text leads: a chain link to its target in job_vault, any other link to
+	where its text resolves from link_path's folder.
+
+	Examples:
+		>>> next_hop('/v/j', '/v/j/V4--2021-01-02_00-00-00_-0800/deep/er/x', '../V3--2021-01-01_00-00-00_-0800/a/x')
+		'/v/j/V3--2021-01-01_00-00-00_-0800/a/x'
+		>>> next_hop('/v/j', '/v/j/V4--2021-01-02_00-00-00_-0800/a/u', '../lib/x')
+		'/v/j/V4--2021-01-02_00-00-00_-0800/lib/x'
+	'''
+	target = chain_link_target(job_vault, link_text)
+	return target if target is not None else os.path.abspath(os.path.join(os.path.dirname(link_path), link_text))
+
+def retarget_chain_link(job_vault:str, link_path:str) -> bool:
+	'''
+	Rewrite the chain link at link_path to the relative text that reaches its target from where it now sits.
+	True if it was rewritten; a link already reaching it, or one that is not a chain link, keeps its text.
+	'''
+	link_text = os.readlink(link_path)
+	target = chain_link_target(job_vault, link_text)
+	if target is None:
+		return False
+	new_text = os.path.relpath(target, os.path.dirname(link_path))
+	if new_text == link_text:
+		return False
+	# put in place by a rename, so the link is never missing
+	temp_path = partial_copy_path(link_path)
+	os.symlink(new_text, temp_path)
+	try:
+		os.replace(temp_path, link_path)
+	except BaseException:
+		remove_entry(temp_path)
+		raise
+	return True
+
+def retarget_moved_links(job_vault:str, moved_path:str) -> int:
+	'''
+	retarget_chain_link() for the vault entry a move put at moved_path: the link itself, or every link under a folder.
+	Returns how many links were rewritten.
+	'''
+	if os.path.islink(moved_path):
+		return int(retarget_chain_link(job_vault, moved_path))
+	if not os.path.isdir(moved_path):
+		# a copy this backup made
+		return 0
+	rewritten = 0
+	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another
+	for path, _, is_dir in iter_tree_entries(moved_path, list_folders_first=True):
+		if not is_dir and os.path.islink(path):
+			rewritten += retarget_chain_link(job_vault, path)
+	return rewritten
+
 def is_chained_link(resolved:str, job_vault:str, link_path:str) -> bool:
 	'''
 	Whether the link at link_path, resolving to resolved, points into another version of job_vault: that is how a
@@ -4776,12 +4856,12 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str):
 			if not stat.S_ISLNK(st.st_mode):
 				break
 			target = os.readlink(entry)
-			resolved = os.path.abspath(os.path.join(os.path.dirname(entry), target))
+			resolved = next_hop(job_vault, entry, target)
 			if resolved == monitor_entry:
 				# a referenced backup links to the monitored file itself
 				return ManifestRecord('r', None, None, None, None, None, None, None, 0)
 			if not is_chained_link(resolved, job_vault, entry):
-				# a symlink that was backed up as one, or a moved link that no longer reaches its version
+				# a symlink that was backed up as one
 				return ManifestRecord('l', None, None, st.st_mode, st.st_uid, st.st_gid, None, target, 0)
 			entry = resolved
 		else:
@@ -5341,13 +5421,15 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	new_size = applyingVaultEntry.size
 	block_size = os.statvfs(referenceVaultPath).f_frsize
 	materialize_failed = False
+	job_vault = os.path.dirname(referenceVaultPath)
 	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs).
 	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another
 	for file, _, is_dir in iter_tree_entries(applyingVaultEntry.path, list_folders_first=True):
 		if is_dir:
 			continue
 		if os.path.islink(file):
-			linkTarget = os.path.abspath(os.path.join(os.path.dirname(file), os.readlink(file)))
+			# a link an older daemon moved to another folder depth still names its version, though its text no longer reaches it
+			linkTarget = next_hop(job_vault, file, os.readlink(file))
 			if linkTarget.startswith(referenceVaultPath):
 				# this means we need to move the file to the new location
 				# get the relative path of the target
@@ -5591,6 +5673,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						os.remove(link_target_backup_real_path)
 					os.rename(link_source_backup_real_path,link_target_backup_real_path)
 					backuperTeeLogToTl(path=monitor_path,message=f'Moved {link_source_backup_real_path} to {link_target_backup_real_path}')
+					if link_source_relative_path.rstrip('/').count('/') != link_target_relative_path.rstrip('/').count('/'):
+						# the relative links moved to another folder depth no longer reach the versions holding the copies
+						retarget_moved_links(os.path.dirname(backup_folder),link_target_backup_real_path)
 					# sync the current attrs from the source onto the moved vault entry,
 					# but never through a chained symlink: that would rewrite the previous version's metadata
 					if isDir or not os.path.islink(link_target_backup_real_path):
