@@ -4736,53 +4736,92 @@ def vault_version_number(version_folder_name:str):
 	match = re.match(r'V(\d+)--', version_folder_name)
 	return int(match.group(1)) if match else None
 
-def chain_link_target(job_vault:str, link_text:str):
+# chain links name few versions, so each name is parsed once for all the links naming it
+@functools.lru_cache(maxsize=1024)
+def is_version_folder_name(name:str) -> bool:
 	'''
-	Where a chain link with link_text points in job_vault, wherever the link now sits: the daemon writes a version's
-	link to an unchanged entry as ../ up to the job vault, then the version folder and the entry's path in it, and a
-	move to another folder depth keeps that text. None for any other link: a user's symlink backed up as one, or the
-	absolute link of a referenced backup.
+	Whether name is a whole version folder name: V<n>-- and the timestamp the version was made at.
 
 	Examples:
-		>>> chain_link_target('/v/j', '../V3--2021-01-01_00-00-00_-0800/a/x')
-		'/v/j/V3--2021-01-01_00-00-00_-0800/a/x'
-		>>> chain_link_target('/v/j', '../../V3--2021-01-01_00-00-00_-0800/a/x')
-		'/v/j/V3--2021-01-01_00-00-00_-0800/a/x'
-		>>> [chain_link_target('/v/j', text) for text in ('/abs/V3--2021-01-01_00-00-00_-0800/x', 'lib/x',
-		...     '../V3--2021-01-01_00-00-00_-0800', '../notaversion/x', '../V3--2021-01-01_00-00-00_-0800/a/../../../etc/x')]
-		[None, None, None, None, None]
+		>>> [is_version_folder_name(name) for name in ('V3--2021-01-01_00-00-00_-0800', 'V3--2021', 'current_version',
+		...     'V3--2021-01-01_00-00-00_-0800--1.00_KiB-1_ino.modified_contents.nsv')]
+		[True, False, False, False]
+	'''
+	if vault_version_number(name) is None:
+		return False
+	try:
+		datetime.datetime.strptime(name.partition('--')[2], VAULT_TIMESTAMP_FORMAT)
+	except ValueError:
+		return False
+	return True
+
+def chain_link_target(job_vault:str, link_text:str, link_path:str):
+	'''
+	Where the relative link at link_path with link_text points, if it is a chain link; None for any other link, such
+	as a user's symlink backed up as one, even one shaped like a chain link.
+	The daemon links an unchanged entry of a version to the version just before it: ../ up to the job vault, that
+	version's folder and the entry's path in it, a text a move to another folder depth keeps. Only that form counts:
+	the folder named must be the one numbered one below the version holding link_path, by its whole name, and exist.
+
+	Examples:
+		>>> import tempfile
+		>>> job_vault = tempfile.mkdtemp()
+		>>> for name in ('V2--2021-01-01_00-00-00_-0800', 'V3--2021-01-01_00-00-00_-0800', 'V3--x'):
+		...     os.makedirs(os.path.join(job_vault, name))
+		>>> link_path = os.path.join(job_vault, 'V4--2021-01-02_00-00-00_-0800', 'deep', 'er', 'x')
+		>>> [chain_link_target(job_vault, text, link_path)[len(job_vault):] for text in (
+		...     '../V3--2021-01-01_00-00-00_-0800/a/x', '../../../../V3--2021-01-01_00-00-00_-0800/a/x')]
+		['/V3--2021-01-01_00-00-00_-0800/a/x', '/V3--2021-01-01_00-00-00_-0800/a/x']
+		>>> [chain_link_target(job_vault, text, link_path) for text in ('/abs/V3--2021-01-01_00-00-00_-0800/x', 'lib/x',
+		...     '../V3--2021-01-01_00-00-00_-0800', '../notaversion/x', '../V3--2021-01-01_00-00-00_-0800/a/../../../etc/x',
+		...     '../V2--2021-01-01_00-00-00_-0800/a/x', '../V3--2020-01-01_00-00-00_-0800/a/x', '../V3--x/a/x')]
+		[None, None, None, None, None, None, None, None]
+		>>> chain_link_target(job_vault, '../V3--2021-01-01_00-00-00_-0800/a/x', os.path.join(job_vault, 'elsewhere', 'x')) is None
+		True
+		>>> import shutil; shutil.rmtree(job_vault)
 	'''
 	parts = link_text.split('/')
 	ups = 0
 	while ups < len(parts) and parts[ups] == '..':
 		ups += 1
 	rel = parts[ups + 1:]
-	# only the form the daemon writes: a .. after the version folder could name a path outside the vault
-	if not ups or not rel or vault_version_number(parts[ups]) is None or any(part in ('', '.', '..') for part in rel):
+	# a .. after the version folder could name a path outside the vault
+	if not ups or not rel or any(part in ('', '.', '..') for part in rel):
 		return None
-	return os.path.join(job_vault, parts[ups], *rel)
+	name = parts[ups]
+	number = vault_version_number(name)
+	vault = os.path.abspath(job_vault)
+	link_path = os.path.abspath(link_path)
+	if number is None or not link_path.startswith(vault + '/'):
+		return None
+	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
+	if own_number is None or number != own_number - 1 or not is_version_folder_name(name) or not os.path.isdir(os.path.join(vault, name)):
+		return None
+	return os.path.join(vault, name, *rel)
 
-def next_hop(job_vault:str, link_path:str, link_text:str) -> str:
+def chain_hop(job_vault:str, link_path:str, link_text:str):
 	'''
-	Where the link at link_path with link_text leads: a chain link to its target in job_vault, any other link to
-	where its text resolves from link_path's folder.
+	Where the link at link_path with link_text leads if it is a chain link, else None. A relative link is one by
+	chain_link_target(); an absolute one, as older daemons wrote them, when its text names another version of job_vault.
 
 	Examples:
-		>>> next_hop('/v/j', '/v/j/V4--2021-01-02_00-00-00_-0800/deep/er/x', '../V3--2021-01-01_00-00-00_-0800/a/x')
-		'/v/j/V3--2021-01-01_00-00-00_-0800/a/x'
-		>>> next_hop('/v/j', '/v/j/V4--2021-01-02_00-00-00_-0800/a/u', '../lib/x')
-		'/v/j/V4--2021-01-02_00-00-00_-0800/lib/x'
+		>>> chain_hop('/v/j', '/v/j/V4--2021-01-02_00-00-00_-0800/a/u', '/v/j/V3--2021-01-01_00-00-00_-0800/a/../a/u')
+		'/v/j/V3--2021-01-01_00-00-00_-0800/a/u'
+		>>> [chain_hop('/v/j', '/v/j/V4--2021-01-02_00-00-00_-0800/a/u', text) for text in ('/elsewhere/u', '../lib/x')]
+		[None, None]
 	'''
-	target = chain_link_target(job_vault, link_text)
-	return target if target is not None else os.path.abspath(os.path.join(os.path.dirname(link_path), link_text))
+	if not os.path.isabs(link_text):
+		return chain_link_target(job_vault, link_text, link_path)
+	resolved = os.path.normpath(link_text)
+	return resolved if is_chained_link(resolved, os.path.abspath(job_vault), os.path.abspath(link_path)) else None
 
 def retarget_chain_link(job_vault:str, link_path:str) -> bool:
 	'''
-	Rewrite the chain link at link_path to the relative text that reaches its target from where it now sits.
-	True if it was rewritten; a link already reaching it, or one that is not a chain link, keeps its text.
+	Rewrite the relative chain link at link_path (by chain_link_target()) to the text that reaches its target from where
+	it now sits. True if it was rewritten; a link already reaching it, or any other link, keeps its text.
 	'''
 	link_text = os.readlink(link_path)
-	target = chain_link_target(job_vault, link_text)
+	target = chain_link_target(job_vault, link_text, link_path)
 	if target is None:
 		return False
 	new_text = os.path.relpath(target, os.path.dirname(link_path))
@@ -4819,7 +4858,8 @@ def is_chained_link(resolved:str, job_vault:str, link_path:str) -> bool:
 	'''
 	Whether the link at link_path, resolving to resolved, points into another version of job_vault: that is how a
 	version links an unchanged entry (under its old name if it moved since). A symlink backed up as one resolves
-	within its own version, if into the vault at all.
+	within its own version, if into the vault at all. chain_hop() judges absolute links, as older daemons wrote them,
+	by it; relative ones go by chain_link_target().
 
 	Examples:
 		>>> is_chained_link('/v/job/V3--2021/a/b.txt', '/v/job', '/v/job/V4--2021/a/b.txt')
@@ -4856,11 +4896,11 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str):
 			if not stat.S_ISLNK(st.st_mode):
 				break
 			target = os.readlink(entry)
-			resolved = next_hop(job_vault, entry, target)
-			if resolved == monitor_entry:
-				# a referenced backup links to the monitored file itself
-				return ManifestRecord('r', None, None, None, None, None, None, None, 0)
-			if not is_chained_link(resolved, job_vault, entry):
+			resolved = chain_hop(job_vault, entry, target)
+			if resolved is None:
+				if os.path.isabs(target) and os.path.normpath(target) == monitor_entry:
+					# a referenced backup links to the monitored file itself
+					return ManifestRecord('r', None, None, None, None, None, None, None, 0)
 				# a symlink that was backed up as one
 				return ManifestRecord('l', None, None, st.st_mode, st.st_uid, st.st_gid, None, target, 0)
 			entry = resolved
@@ -5428,9 +5468,10 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 		if is_dir:
 			continue
 		if os.path.islink(file):
-			# a link an older daemon moved to another folder depth still names its version, though its text no longer reaches it
-			linkTarget = next_hop(job_vault, file, os.readlink(file))
-			if linkTarget.startswith(referenceVaultPath):
+			# a link an older daemon moved to another folder depth still names its version, though its text no longer reaches it.
+			# a user's symlink is left as it is, however it is shaped
+			linkTarget = chain_hop(job_vault, file, os.readlink(file))
+			if linkTarget is not None and linkTarget.startswith(referenceVaultPath):
 				# this means we need to move the file to the new location
 				# get the relative path of the target
 				if DEBUG:
@@ -5467,8 +5508,7 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 						backuperTeeLogToTl(path=referenceVaultPath,message=f'Removed dangling link {file} -> {linkTarget} as the target is already missing')
 					continue
 			elif DEBUG:
-				backuperTeeLogToTl(path=referenceVaultPath,message=f'Not moving {linkTarget} to {file}')
-				backuperTeeLogToTl(path=referenceVaultPath,message=f'{os.path.abspath(linkTarget)} not in {referenceVaultPath}')
+				backuperTeeLogToTl(path=referenceVaultPath,message=f'Not moving {linkTarget} to {file}: not a chain link into {referenceVaultPath}')
 	if materialize_failed:
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Aborting removal of {referenceVaultPath} because materializing linked files failed')
 		new_dict = OrderedDict()
