@@ -85,7 +85,10 @@ def _tracked(job, version, rel):
 	return manifest
 
 
-def test_unreadable_source_keeps_the_previous_entry(job, capsys):
+def test_unreadable_source_keeps_the_previous_entry(job, capsys, monkeypatch):
+	src = os.path.join(job.monitor, 'locked.txt')
+	open(src, 'w').write('locked')
+	monkeypatch.setattr(rv, 'source_readable', lambda path: False)
 	version = os.path.join(job.job_vault, 'V1--x')
 	os.makedirs(version)
 	dest = os.path.join(version, 'a.txt')
@@ -93,7 +96,7 @@ def test_unreadable_source_keeps_the_previous_entry(job, capsys):
 	temp = os.path.join(version, '.a.txt.reverberator-partial')
 	open(temp, 'w').write('partial')
 	manifest = _tracked(job, version, 'a.txt')
-	rv.finish_copies([rv.PendingCopy(FakeTask(1, ['Input/output error']), os.path.join(job.monitor, 'gone.txt'), temp, dest)],
+	rv.finish_copies([rv.PendingCopy(FakeTask(1, ['Input/output error']), src, temp, dest)],
 		manifest, version, job.job_name)
 	assert os.readlink(dest) == '../V0--x/a.txt' and not os.path.exists(temp)
 	assert 'UNREADABLE: ' in ''.join(capsys.readouterr())
@@ -202,7 +205,7 @@ def test_failed_backup_leaves_no_copy_running(job, poll_fast, monkeypatch, first
 			while tasks[0].start_time is None and time.monotonic() < deadline:
 				time.sleep(0.01)
 			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), dest_path)
-		temp = os.path.join(os.path.dirname(dest_path), '.' + os.path.basename(dest_path) + '.reverberator-partial')
+		temp = rv.partial_copy_path(dest_path)
 		open(temp, 'w').write('partial')
 		tasks.append(mcae.run_command(['sleep', '30']))
 		if pending is not None:
@@ -217,15 +220,125 @@ def test_failed_backup_leaves_no_copy_running(job, poll_fast, monkeypatch, first
 	assert not _partial_files(job.vault)
 
 
-def test_second_copy_to_one_destination_is_already_in_place(job):
+def test_two_copies_to_one_destination_both_finish(job):
 	src = os.path.join(job.monitor, 'a.txt')
 	open(src, 'w').write('new')
 	version = os.path.join(job.job_vault, 'V1--x')
 	os.makedirs(version)
 	dest = os.path.join(version, 'a.txt')
-	temp = rv.partial_copy_path(dest)
-	open(temp, 'w').write('new')
+	copies = []
+	for content in ('first', 'second'):
+		temp = rv.partial_copy_path(dest)
+		open(temp, 'w').write(content)
+		copies.append(rv.PendingCopy(FakeTask(0), src, temp, dest))
 	manifest = _tracked(job, version, 'a.txt')
-	rv.finish_copies([rv.PendingCopy(FakeTask(0), src, temp, dest)] * 2, manifest, version, job.job_name)
-	assert open(dest).read() == 'new' and not os.path.lexists(temp)
+	rv.finish_copies(copies, manifest, version, job.job_name)
+	assert open(dest).read() == 'second' and not _partial_files(job.vault)
 	manifest.rollback(); manifest.close()
+
+
+def _finish_one(job, src, stderr, temp_content=None, returncode=1):
+	'''Finish one failed copy of src over a version entry linked to the previous version; returns (dest, manifest).'''
+	version = os.path.join(job.job_vault, 'V1--x')
+	os.makedirs(version, exist_ok=True)
+	dest = os.path.join(version, 'a.txt')
+	os.symlink('../V0--x/a.txt', dest)
+	temp = rv.partial_copy_path(dest)
+	if temp_content is not None:
+		open(temp, 'w').write(temp_content)
+	manifest = _tracked(job, version, 'a.txt')
+	try:
+		rv.finish_copies([rv.PendingCopy(FakeTask(returncode, [line.format(src=src, temp=temp) for line in stderr]), src, temp, dest)],
+			manifest, version, job.job_name)
+	finally:
+		manifest.rollback(); manifest.close()
+	return dest
+
+
+@pytest.mark.parametrize('recreated', [False, True])
+def test_vanished_source_keeps_the_previous_entry_quietly(job, capsys, recreated):
+	src = os.path.join(job.monitor, 'gone.txt')
+	if recreated:
+		# gone while cp ran, back by the time the copy is looked at
+		open(src, 'w').write('back')
+	dest = _finish_one(job, src, ["cp: cannot stat '{src}': No such file or directory"], temp_content='partial')
+	assert os.readlink(dest) == '../V0--x/a.txt' and not _partial_files(job.vault)
+	assert 'UNREADABLE' not in ''.join(capsys.readouterr())
+
+
+def test_source_read_error_named_by_cp_keeps_the_previous_entry(job, capsys):
+	src = os.path.join(job.monitor, 'a.txt')
+	open(src, 'w').write('a')   # opens fine, yet a read failed
+	dest = _finish_one(job, src, ["cp: error reading '{src}': Input/output error"], temp_content='part')
+	assert os.readlink(dest) == '../V0--x/a.txt' and not _partial_files(job.vault)
+	assert f'reverberator job {job.job_name} UNREADABLE: {src}: ' in ''.join(capsys.readouterr())
+
+
+def test_vault_error_named_by_cp_fails_the_job_whatever_the_source(job, monkeypatch):
+	src = os.path.join(job.monitor, 'a.txt')
+	open(src, 'w').write('a')
+	monkeypatch.setattr(rv, 'source_readable', lambda path: False)
+	with pytest.raises(rv.JobFailure) as exc:
+		# the vault folder vanished: an ENOENT on the destination is not a vanished source
+		_finish_one(job, src, ["cp: cannot create regular file '{temp}': No such file or directory"])
+	assert 'cannot create regular file' in exc.value.reason and not _partial_files(job.vault)
+
+
+@pytest.mark.parametrize('arrived', [True, False])
+def test_metadata_only_failure_accepts_a_complete_copy(job, capsys, arrived):
+	src = os.path.join(job.monitor, 'a.txt')
+	open(src, 'w').write('abc')
+	stderr = ["cp: failed to preserve ownership for '{temp}': Operation not permitted", "cp: preserving times for '{temp}': Operation not permitted"]
+	if arrived:
+		dest = _finish_one(job, src, stderr, temp_content='abc')
+		assert not os.path.islink(dest) and open(dest).read() == 'abc'
+		out = ''.join(capsys.readouterr())
+		assert 'without all of its metadata' in out and src in out and 'UNREADABLE' not in out
+	else:
+		with pytest.raises(rv.JobFailure):
+			_finish_one(job, src, stderr, temp_content='a')
+	assert not _partial_files(job.vault)
+
+
+def test_stuck_copy_bounds_the_wait(job, poll_fast, monkeypatch, capsys):
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	monkeypatch.setattr(rv, 'COPY_STOP_WAIT_SECONDS', 0.5)
+	original = rv.multiCMD.AsyncExecutor
+	executors = []
+	class StubbornExecutor(original):
+		def __init__(self, *args, **kwargs):
+			super().__init__(*args, **kwargs)
+			executors.append(self)
+		def stop(self, timeout=None):
+			# its commands ignore being stopped
+			return self.tasks
+	monkeypatch.setattr(rv.multiCMD, 'AsyncExecutor', StubbornExecutor)
+	tasks = []
+	def slow_copy(source_path, dest_path, mcae=..., pending=None):
+		if tasks:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), dest_path)
+		tasks.append(mcae.run_command(['sleep', '30']))
+		pending.append(rv.PendingCopy(tasks[-1], source_path, rv.partial_copy_path(dest_path), dest_path))
+		return tasks[-1]
+	monkeypatch.setattr(rv, 'cp_af_copy_path', slow_copy)
+	start = time.monotonic()
+	try:
+		with pytest.raises(OSError):
+			_backup(job)
+		assert time.monotonic() - start < 10
+		out = capsys.readouterr()
+		assert 'stopped commands still running' in out.out + out.err and 'sleep 30' in out.out + out.err
+	finally:
+		original.stop(executors[0], timeout=10)
+
+
+def test_entry_named_like_a_partial_copy_is_backed_up_as_itself(job, poll_fast):
+	seed_monitor(job, {'foo': 'foo', '.foo.reverberator-partial': 'not a partial copy'})
+	_backup(job)[1].close()
+	open(os.path.join(job.monitor, 'foo'), 'w').write('foo changed')
+	_backup(job, OrderedDict({os.path.join(job.monitor, 'foo'): rv.BackupEntryValues('t', 'modify', None)}))[1].close()
+	versions = committed_versions(job)
+	assert len(versions) == 2
+	for version, foo in zip(versions, ('foo', 'foo changed')):
+		assert open(os.path.join(version, 'foo')).read() == foo
+		assert open(os.path.join(version, '.foo.reverberator-partial')).read() == 'not a partial copy'
