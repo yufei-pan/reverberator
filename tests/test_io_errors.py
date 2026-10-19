@@ -3,7 +3,7 @@ import os
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_tree, committed_versions
+from tests.harness import seed_monitor, committed_versions
 
 pytestmark = pytest.mark.unit
 
@@ -56,3 +56,14 @@ def test_resume_check_refuses_after_a_read_error(job, monkeypatch):
 	seed_monitor(job, {'d/a.txt': 'a'})
 	_fail_scandir(monkeypatch, os.path.join(job.monitor, 'd'), errno.EIO)
 	assert rv.get_monitor_path_most_recent_change_time(job.monitor) == float('inf')
+
+
+def test_new_unreadable_folder_is_logged_once(job, poll_fast, monkeypatch, capsys):
+	seed_monitor(job, {'a.txt': 'a'})
+	_backup(job)[1].close()
+	seed_monitor(job, {'new/x': 'x'})
+	_fail_scandir(monkeypatch, os.path.join(job.monitor, 'new'), errno.EIO)
+	capsys.readouterr()
+	_backup(job)[1].close()
+	out = capsys.readouterr()
+	assert (out.out + out.err).count(f'reverberator job {job.job_name} UNREADABLE: {os.path.join(job.monitor, "new")}') == 1

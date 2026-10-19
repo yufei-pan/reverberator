@@ -1961,7 +1961,7 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	unreadable_folders = {folder.rstrip('/') for folder, _ in unreadable if folder.rstrip('/') != monitor_path.rstrip('/')}
 	for folder, error in unreadable:
 		if folder.rstrip('/') in unreadable_folders:
-			job_log(monitor_path if job_name is None else job_name, f'UNREADABLE: {folder}: {error}; keeping its last backed-up copy')
+			watcherTeeLogToTl(monitor_path,f'Not watching unreadable folder {folder}: {error}',error=True)
 	allFolders = [folder for folder in allFolders if folder.rstrip('/') not in unreadable_folders]
 	watcherTeeLogToTl(monitor_path,f'Adding watch for {len(allFolders)} sub folders')
 	irm.increaseUserWatches(len(allFolders))
@@ -2116,10 +2116,16 @@ def unreadable_path(root:str, rel:str) -> str:
 	'''The absolute path of the folder rel (relative to root, '' for root itself).'''
 	return os.path.join(root, rel).rstrip('/') or '/'
 
-def log_unreadable(job_name:str, root:str, errors:list, rel_base:str = ''):
-	'''Log one UNREADABLE line for each unreadable folder in errors, as collected by a walk of root (started at rel_base).'''
+def log_unreadable(job_name:str, root:str, errors:list, reported:set = None):
+	'''Log one UNREADABLE line for each unreadable folder in errors, as collected by a walk of root.
+	reported holds the paths already logged by this backup, so a folder walked twice is logged once.'''
 	for rel, error in errors:
-		job_log(job_name, f'UNREADABLE: {unreadable_path(root, rel[len(rel_base):])}: {error}; keeping its last backed-up copy')
+		path = unreadable_path(root, rel)
+		if reported is not None:
+			if path in reported:
+				continue
+			reported.add(path)
+		job_log(job_name, f'UNREADABLE: {path}: {error}; keeping its last backed-up copy')
 
 def get_all_folders(path, skip_list:'SkipList' = None, errors:list = None):
 	'''The folders under path. Unreadable ones are in the list too, and appended to errors as (absolute path, error).'''
@@ -2914,14 +2920,14 @@ def backup_entries_to_change_events(backup_entries:dict) -> list:
 		events.append(ChangeEvent(base + (i * 0.001), is_dir, values.event, path, moved_from))
 	return events
 
-def check_walk_errors(job_name:str, monitor_path:str, errors:list, manifest:'VaultManifest' = None):
+def check_walk_errors(job_name:str, monitor_path:str, errors:list, manifest:'VaultManifest' = None, reported:set = None):
 	'''After a first-backup walk of monitor_path: fail the job when its root could not be read, else log each unreadable folder.'''
 	root_error = next((error for rel, error in errors if not rel), None)
 	if root_error is not None:
 		if manifest is not None:
 			manifest.rollback()
 		raise JobFailure(f'cannot read {monitor_path}: {root_error}')
-	log_unreadable(job_name, monitor_path, errors)
+	log_unreadable(job_name, monitor_path, errors, reported)
 
 def do_backup(backup_entries:dict,
 			 job_name:str,monitor_path:str,vault_path:str,
@@ -2950,6 +2956,7 @@ def do_backup(backup_entries:dict,
 				vaultInfo = VaultInfo({}, 0, 0)
 			return vaultInfo, manifest, False
 	# a manifest opened here is closed here if the backup raises, as the caller never gets it back
+	reported = set()
 	opened_manifest = manifest is None
 	if opened_manifest:
 		manifest = VaultManifest(job_vault)
@@ -2992,10 +2999,11 @@ def do_backup(backup_entries:dict,
 						copy_file_meta(monitorEntry,backupEntryPath)
 					else:
 						cp_af_copy_path(monitorEntry,backupEntryPath,mcae)
-				check_walk_errors(job_name,monitor_path,walk_errors,manifest)
+				# copies still running must stop writing before a failed root orphans this version
 				while GREEN_LIGHT.is_set() and mcae.runningThreads:
 					mcae.wait(timeout=POLL_WAIT_SECONDS)
 				mcae.cleanup(timeout=POLL_WAIT_SECONDS)
+				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
 				record_dirty_entries(manifest,backup_folder,monitor_path)
 			else:
 				backuperTeeLogToTl(job_name,f'Creating a referenced backup of {monitor_path} to {backup_folder}',ok=True)
@@ -3003,14 +3011,14 @@ def do_backup(backup_entries:dict,
 					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_referenced_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
 				walk_errors = []
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=skip,errors=walk_errors)
-				check_walk_errors(job_name,monitor_path,walk_errors,manifest)
+				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
 				do_referenced_copy(monitor_path,backup_folder,manifest)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
 			if not backup_entries:
 				backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
-				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name)
+				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported)
 				if not GREEN_LIGHT.is_set():
 					# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
 					backup_entries.clear()
@@ -3068,7 +3076,7 @@ def do_backup(backup_entries:dict,
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
 			os.makedirs(backup_folder,exist_ok=True)
 			backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
-			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name)
+			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -4039,7 +4047,7 @@ def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_pat
 		backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error comparing {monitor_entry}: {e}, treating as modify')
 		return 'modify', found
 
-def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '') -> VaultManifest:
+def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None) -> VaultManifest:
 	'''
 	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest.
 
@@ -4099,7 +4107,7 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 		raise JobFailure(f'cannot read {monitor_path}: {root_error}')
 	for rel, _ in walk_errors:
 		manifest.mark_seen_under(rel)
-	log_unreadable(job_name, monitor_path, walk_errors)
+	log_unreadable(job_name, monitor_path, walk_errors, reported)
 	if GREEN_LIGHT.is_set():
 		# only a complete walk tells deleted entries from ones it did not reach
 		for rel in manifest.unseen():
@@ -4519,7 +4527,7 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	return removingSize, removingInodes
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
-					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None) -> VaultManifest:
+					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
@@ -4527,6 +4535,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	'''
 	global BACKUP_SEMAPHORE
 	global GREEN_LIGHT
+	if reported is None:
+		reported = set()
 	backup_entries = prepare_backup_entries_for_replay(backup_entries)
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
 	def copy_path(isDir,monitor_path,source_real_path,source_relative_path,file_vault_real_path,backup_folder,mcae):
@@ -4554,7 +4564,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					continue
 				manifest.add(subRelativePath,dirty=True)
 				cp_af_copy_path(source_path=subRealPath,dest_path=subVaultPath,mcae=mcae)
-			log_unreadable(monitor_path if job_name is None else job_name,monitor_path,walk_errors)
+			log_unreadable(monitor_path if job_name is None else job_name,monitor_path,walk_errors,reported)
 		else:
 			manifest.add(source_relative_path,dirty=True)
 		# we just copy the entire folder / file ( for recursive create purposes )
@@ -4590,7 +4600,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			delete_path(isDir=rel.endswith('/'),vault_real_path=os.path.join(backup_folder,rel),relative_path=rel.rstrip('/'),mcae=mcae)
 		wait_for_async_commands(mcae)
 		copied = None
-		for sub_real_path,sub_rel,sub_is_dir in iter_tree_entries(os.path.join(monitor_path,folder_rel),folder_rel,skip=skip_list.skips):
+		walk_errors = []
+		for sub_real_path,sub_rel,sub_is_dir in iter_tree_entries(os.path.join(monitor_path,folder_rel),folder_rel,skip=skip_list.skips,errors=walk_errors):
 			if copied is not None and sub_rel.startswith(copied):
 				continue
 			if manifest.lookup(sub_rel) is None:
@@ -4599,6 +4610,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				  backup_folder=backup_folder,mcae=mcae)
 				# a copied folder took everything below it along; a copied file has nothing below it
 				copied = sub_rel if sub_is_dir else None
+		log_unreadable(monitor_path if job_name is None else job_name,monitor_path,walk_errors,reported)
 	# this function does the actual backup using a referenced version and a change list to copy the source from
 	# reverb backup flow:
 	#   do referenced copy of the last version to the current backup folder 
