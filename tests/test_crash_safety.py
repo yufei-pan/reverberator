@@ -70,7 +70,7 @@ class TestWatcherInitFailure(unittest.TestCase):
 			rv.watchFolder = lambda *a, **k: 'init_failed'
 			rv.watcher(
 				monitor_fs_flag,
-				'/nonexistent',
+				tempfile.gettempdir(),
 				deque(),
 				threading.Lock(),
 				threading.Event(),
@@ -125,6 +125,7 @@ class TestBackuperCommitFailure(unittest.TestCase):
 	def test_uncommitted_backup_while_green_light_set_requeues_and_clears_green_light(self):
 		with tempfile.TemporaryDirectory() as tmp:
 			rv.GREEN_LIGHT.set()
+			os.makedirs(os.path.join(tmp, 'monitor'))
 			original_do_backup = rv.do_backup
 			try:
 				rv.do_backup = lambda *a, **k: (None, None, False)

@@ -53,11 +53,13 @@ def test_parse_rules_empty_monitor_ignored(job):
 	assert rv.parse_rules(job.rule_path) == []
 
 
-def test_parse_rules_missing_monitor_ignored(job):
+def test_parse_rules_missing_monitor_is_kept_to_wait_for(job):
 	write_rule(job)
-	text = open(job.rule_path, encoding='utf-8').read().replace(job.monitor, str(os.path.join(job.root, 'does-not-exist')))
+	missing = os.path.join(job.root, 'not-mounted-yet')
+	text = open(job.rule_path, encoding='utf-8').read().replace(job.monitor, missing)
 	open(job.rule_path, 'w', encoding='utf-8').write(text)
-	assert rv.parse_rules(job.rule_path) == []
+	rules = rv.parse_rules(job.rule_path)
+	assert [rule.mon_path for rule in rules] == [missing]
 
 
 def test_parse_rules_vault_subpath_of_monitor_ignored(job):

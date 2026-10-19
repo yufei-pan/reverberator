@@ -632,6 +632,12 @@ DEFAULT_JOB_RETRY_MAX_SECONDS = 3600
 JOB_RETRY_FIRST_SECONDS = DEFAULT_JOB_RETRY_FIRST_SECONDS
 JOB_RETRY_MAX_SECONDS = DEFAULT_JOB_RETRY_MAX_SECONDS
 JOB_RETRY_RESET_SECONDS = 3600
+# a job waiting for a disk or path logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert every DISK_WAIT_REPEAT_SECONDS
+DEFAULT_DISK_WAIT_GRACE_SECONDS = 900
+DISK_WAIT_GRACE_SECONDS = DEFAULT_DISK_WAIT_GRACE_SECONDS
+DISK_WAIT_REPEAT_SECONDS = 3600
+# the filesystem signature monitor re-checks a pair that failed this often, as a re-created path changes no mount
+FS_RECHECK_SECONDS = 60
 # the exit status when every job is stopped: only a rule or skip list fix helps, so systemd is told not to restart
 EXIT_ALL_STOPPED = 3
 
@@ -647,8 +653,10 @@ def apply_job_timing_from_env():
 	'''Set the job retry timing from REVERB_JOB_RETRY_FIRST_SECONDS and REVERB_JOB_RETRY_MAX_SECONDS. Invalid/missing → the defaults.'''
 	global JOB_RETRY_FIRST_SECONDS
 	global JOB_RETRY_MAX_SECONDS
+	global DISK_WAIT_GRACE_SECONDS
 	JOB_RETRY_FIRST_SECONDS = env_seconds('REVERB_JOB_RETRY_FIRST_SECONDS', DEFAULT_JOB_RETRY_FIRST_SECONDS)
 	JOB_RETRY_MAX_SECONDS = env_seconds('REVERB_JOB_RETRY_MAX_SECONDS', DEFAULT_JOB_RETRY_MAX_SECONDS)
+	DISK_WAIT_GRACE_SECONDS = env_seconds('REVERB_DISK_WAIT_GRACE_SECONDS', DEFAULT_DISK_WAIT_GRACE_SECONDS)
 
 apply_job_timing_from_env()
 
@@ -690,6 +698,29 @@ COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir','wds'],defaults=((
 
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
+
+def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic) -> bool:
+	'''
+	Wait until flag is set and path is a directory. Returns False when the job (with job None, GREEN_LIGHT) says stop.
+	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS.
+	'''
+	running = GREEN_LIGHT.is_set if job is None else job.should_run
+	started = clock()
+	next_alert = started + DISK_WAIT_GRACE_SECONDS
+	while running():
+		if flag.is_set() and os.path.isdir(path):
+			return True
+		if flag.is_set():
+			# the filesystem is ready but the path is not there yet, so the flag cannot end the wait
+			time.sleep(POLL_WAIT_SECONDS)
+		else:
+			flag.wait(POLL_WAIT_SECONDS)
+		now = clock()
+		if now >= next_alert and job is not None:
+			waited = now - started
+			job_log(job.job_name, f'FAILED: waiting {int(waited // 60)} min for {path}: {what}')
+			next_alert = now + DISK_WAIT_REPEAT_SECONDS
+	return False
 
 WATCH_RESULT_OK = 'ok'
 WATCH_RESULT_INIT_FAILED = 'init_failed'
@@ -1165,10 +1196,10 @@ def parse_rules(rule_file:str):
 		if not inRule['mon_path']:
 			tl.teelog(f'Warning: Rule {ruleName} has empty Path Monitoring. Ignoring rule...',level='warning')
 			continue
-		if not os.path.exists(inRule['mon_path']):
-			tl.teeerror(f'Error: Rule {ruleName} has Path Monitoring: {inRule["mon_path"]} which does not exist. Ignoring rule...')
-			continue
-		newSourcePath = os.path.realpath(inRule['mon_path'])
+		mon_path_exists = os.path.exists(inRule['mon_path'])
+		if not mon_path_exists:
+			tl.teelog(f'Warning: Rule {ruleName} has Path Monitoring: {inRule["mon_path"]} which does not exist, the job will wait for it',level='warning')
+		newSourcePath = os.path.realpath(inRule['mon_path']) if mon_path_exists else inRule['mon_path']
 		if newSourcePath != inRule['mon_path']:
 			tl.teelog(f'Warning: Rule {ruleName} has dirty Path Monitoring. Changing to {newSourcePath}',level='warning')
 			inRule['mon_path'] = newSourcePath
@@ -1181,7 +1212,9 @@ def parse_rules(rule_file:str):
 			tl.teelog(f'Warning: Rule {ruleName} has Vault Path: {inRule["vault_path"]} which is a subpath of the source path. Ignoring rule...',level='warning')
 			continue
 		# mon_fs_signature
-		if not inRule["mon_fs_signature"] or inRule["mon_fs_signature"].lower() == 'auto':
+		if not mon_path_exists:
+			pass
+		elif not inRule["mon_fs_signature"] or inRule["mon_fs_signature"].lower() == 'auto':
 			signatures = get_fs_signatures(inRule["mon_path"])
 			if signatures and signatures[0]:
 				inRule["mon_fs_signature"] = signatures[0]
@@ -1493,8 +1526,8 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 	# main monitoring function to deal with one reverb. with a job, a failure stops only that job, and so does the job failing
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	while running():
-		while running() and not monitor_fs_flag.is_set():
-			monitor_fs_flag.wait(POLL_WAIT_SECONDS)
+		if not wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready'):
+			return False
 		skip_list = watching = None
 		if startup is not None:
 			# no watch is added until the backuper has loaded the job's skip list
@@ -1522,7 +1555,6 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 			return False
 		if result == WATCH_RESULT_SELF_DESTRUCT:
 			watcherTeeLogToTl(monitor_path,f'Watch root disappeared for {monitor_path}; waiting for filesystem recovery',error=True)
-			monitor_fs_flag.clear()
 
 def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,skip_list:'SkipList' = None,watching:threading.Event = None,job:JobControl = None):
 	global COOKIE_DICT_MAX_SIZE
@@ -2213,8 +2245,8 @@ class fs_signature_monitor:
 			# pipe full: a wake up is already pending
 			pass
 
-	def check_changed(self):
-		'''Re-check every pair whose containing mount changed since its last check.'''
+	def check_changed(self, recheck_failed:bool = False):
+		'''Re-check every pair whose containing mount changed since its last check, and with recheck_failed those whose last check failed.'''
 		try:
 			with open(self.mountinfo_path, 'rb') as f:
 				mount_table = parse_mount_table(f.read())
@@ -2226,7 +2258,7 @@ class fs_signature_monitor:
 			path, signature = key
 			fingerprint = mount_fingerprint(mount_table, os.path.realpath(path))
 			with self.lock:
-				if self.fingerprints.get(key, ...) == fingerprint:
+				if self.fingerprints.get(key, ...) == fingerprint and (self.states.get(key) or not recheck_failed):
 					continue
 			fs_ok = check_fs_signature(path, signature)
 			with self.lock:
@@ -2254,6 +2286,7 @@ class fs_signature_monitor:
 			poller.register(mountinfo_file.fileno(), select.POLLPRI)
 		except Exception as e:
 			watcherTeeLogToTl(self.mountinfo_path, f'Failed to watch mount table, fs signatures will not be re-checked on mount changes: {e}', error=True)
+		recheck_at = 0.0
 		try:
 			while True:
 				with self.lock:
@@ -2262,12 +2295,15 @@ class fs_signature_monitor:
 						self.thread = None
 						return
 				try:
-					self.check_changed()
+					self.check_changed(recheck_failed=time.monotonic() >= recheck_at)
 				except Exception:
 					import traceback
 					watcherTeeLogToTl(self.mountinfo_path, traceback.format_exc(), error=True)
+				# a pair that failed is re-checked every FS_RECHECK_SECONDS: a deleted and re-created path changes no mount
+				recheck_at = time.monotonic() + FS_RECHECK_SECONDS
 				while GREEN_LIGHT.is_set() and not poller.poll(int(max(POLL_WAIT_SECONDS * 1000, 1))):
-					pass
+					if time.monotonic() >= recheck_at:
+						break
 				try:
 					while os.read(self.wake_r, 4096):
 						pass
@@ -2314,10 +2350,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					job.fail(f'vault path {vault_path} does not exist and cannot be created: {e}')
 				return
 		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
-		while running() and not vault_fs_flag.is_set():
-			vault_fs_flag.wait(POLL_WAIT_SECONDS)
-		while running() and not monitor_fs_flag.is_set():
-			monitor_fs_flag.wait(POLL_WAIT_SECONDS)
+		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+		wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 		if startup is not None and running():
 			# the list is read now that both filesystems are ready, so one on a disk that mounts late still loads
 			job_vault = os.path.join(vault_path,job_name)
@@ -2375,8 +2409,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		vaultInfo = None
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while running():
-			while running() and not vault_fs_flag.is_set():
-				vault_fs_flag.wait(POLL_WAIT_SECONDS)
+			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
 			if not running():
 				break
 			# do_backup compares the whole tree for an empty batch
