@@ -490,6 +490,9 @@ class JobStartup:
 		# 'unchanged' or 'changed' against the fingerprint recorded in the vault, once loaded
 		self.change = None
 		self.failed = False
+		# once load failed: why, and whether only a config change can fix it (so the job is not retried)
+		self.failure_reason = None
+		self.permanent = False
 		self.loaded = threading.Event()
 		self.watching = threading.Event()
 
@@ -503,11 +506,17 @@ class JobStartup:
 				else:
 					skip_list = SkipList.load(self.monitor_path, self.skip_list_path)
 			except (OSError, ValueError) as e:
+				# a missing or unreadable file may be on a disk still on its way; an undecodable file or a bad pattern
+				# (ValueError, UnicodeDecodeError among them) needs a config change
+				self.permanent = isinstance(e, ValueError)
+				self.failure_reason = f'cannot load skip list file {self.skip_list_path}: {e}'
 				backuperTeeLogToTl(self.job_name,f'Cannot load skip list file {self.skip_list_path} for job {self.job_name}: {e}. Not backing up this job',error=True)
 				return False
 			self.change = skip_list_change(recorded_fingerprint, skip_list.fingerprint, self.explicit_none)
 			if self.change == 'refuse':
 				reason = f'{self.skip_list_path} has no patterns' if self.skip_list_path is not None else 'its Skip List File names no file'
+				self.permanent = True
+				self.failure_reason = f'backed up with skip patterns, but {reason}: set its Skip List File to none to back up everything'
 				backuperTeeLogToTl(self.job_name,f'Job {self.job_name} was backed up with skip patterns, but {reason}. Not backing up this job: set its Skip List File to none to back up everything',error=True)
 				return False
 			self.skip_list = skip_list
@@ -518,15 +527,67 @@ class JobStartup:
 			backuperTeeLogToTl(self.job_name,f'Skip list: {len(skip_list.patterns)} patterns from {source}',ok=True)
 			ok = True
 			return True
-		except Exception:
-			# the backuper stops every job on an error it catches, so anything else stops only this one here
+		except Exception as e:
+			# without a JobControl the backuper stops every job on an error it catches, so anything else fails only this
+			# one here; it is not permanent, as nothing says a config change would fix it
 			import traceback
+			self.failure_reason = f'unexpected error loading skip list file {self.skip_list_path}: {type(e).__name__}: {e}'
 			backuperTeeLogToTl(self.job_name,f'Unexpected error loading skip list file {self.skip_list_path} for job {self.job_name}. Not backing up this job\n{traceback.format_exc()}',error=True)
 			return False
 		finally:
 			# the watcher reads failed once loaded is set, so an unexpected error counts as a failure too
 			self.failed = not ok
 			self.loaded.set()
+
+class JobFailure(Exception):
+	'''Why a job cannot go on. Permanent failures need a config change, so the job is not retried.'''
+	def __init__(self, reason:str, permanent:bool = False):
+		super().__init__(reason)
+		self.reason = reason
+		self.permanent = permanent
+
+class JobControl:
+	'''
+	One job's state across its attempts, shared by its watcher and backuper.
+	The threads report a failure here instead of clearing GREEN_LIGHT, so only this job stops; the first failure of an
+	attempt is the one kept. committed is set once the attempt has committed a backup.
+	'''
+	def __init__(self, job_name:str):
+		self.job_name = job_name
+		self.running = threading.Event()
+		self.failure = None
+		self.committed = threading.Event()
+		self._lock = threading.Lock()
+
+	def start_attempt(self):
+		with self._lock:
+			self.failure = None
+			self.committed.clear()
+			self.running.set()
+
+	def fail(self, reason:str, permanent:bool = False):
+		with self._lock:
+			if self.failure is None:
+				self.failure = JobFailure(reason, permanent)
+			self.running.clear()
+
+	def should_run(self) -> bool:
+		return GREEN_LIGHT.is_set() and self.running.is_set()
+
+	def mark_committed(self):
+		self.committed.set()
+
+def job_log(job_name:str, text:str) -> str:
+	'''Log a job's marker line at error level, where log alerts look for it, and return it.'''
+	line = f'reverberator job {job_name} {text}'
+	tl.teeerror(line)
+	return line
+
+def daemon_error_log(reason:str) -> str:
+	'''Log the marker line for the daemon exiting on an error at error level, and return it.'''
+	line = f'reverberator EXITING with error: {reason}'
+	tl.teeerror(line)
+	return line
 
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
@@ -1242,35 +1303,43 @@ class inotify_resource_manager:
 		return self.current_user_watches
 
 #%% ---- Watcher ----
-def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,startup:JobStartup = None):
+def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,startup:JobStartup = None,job:JobControl = None):
 	global GREEN_LIGHT
-	# main monitoring function to deal with one reverb.
-	while GREEN_LIGHT.is_set():
-		while GREEN_LIGHT.is_set() and not monitor_fs_flag.is_set():
+	# main monitoring function to deal with one reverb. with a job, a failure stops only that job, and so does the job failing
+	running = GREEN_LIGHT.is_set if job is None else job.should_run
+	while running():
+		while running() and not monitor_fs_flag.is_set():
 			monitor_fs_flag.wait(POLL_WAIT_SECONDS)
 		skip_list = watching = None
 		if startup is not None:
 			# no watch is added until the backuper has loaded the job's skip list
-			while GREEN_LIGHT.is_set() and not startup.loaded.is_set():
+			while running() and not startup.loaded.is_set():
 				startup.loaded.wait(POLL_WAIT_SECONDS)
 			if startup.loaded.is_set() and startup.failed:
 				# only this job stops: the other jobs keep running
 				watcherTeeLogToTl(monitor_path,f'Skip list for {monitor_path} failed to load, not watching it',error=True)
+				if job is not None:
+					# the same failure the backuper reports, so whichever thread reports first, the job sees one verdict
+					job.fail(startup.failure_reason, permanent=startup.permanent)
 				return False
 			skip_list, watching = startup.skip_list, startup.watching
-		if not GREEN_LIGHT.is_set():
+		if not running():
 			watcherTeeLogToTl(monitor_path,f'Exiting watcher thread for {monitor_path}',ok=True)
 			return False
-		result = watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_lock=to_process_lock,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds,skip_list=skip_list,watching=watching)
+		result = watchFolder(monitor_path=monitor_path,to_process=to_process,to_process_lock=to_process_lock,to_process_flag=to_process_flag,irm=irm,min_snapshot_delay_seconds=min_snapshot_delay_seconds,max_shapshot_delay_seconds=max_shapshot_delay_seconds,skip_list=skip_list,watching=watching,job=job)
 		if result == WATCH_RESULT_INIT_FAILED or result is False:
-			watcherTeeLogToTl(monitor_path,f'Watch init/loop failed for {monitor_path}; requesting shutdown',error=True)
-			GREEN_LIGHT.clear()
+			if job is None:
+				watcherTeeLogToTl(monitor_path,f'Watch init/loop failed for {monitor_path}; requesting shutdown',error=True)
+				GREEN_LIGHT.clear()
+			else:
+				watcherTeeLogToTl(monitor_path,f'Watch init/loop failed for {monitor_path}',error=True)
+				job.fail(f'watching {monitor_path} failed')
 			return False
 		if result == WATCH_RESULT_SELF_DESTRUCT:
 			watcherTeeLogToTl(monitor_path,f'Watch root disappeared for {monitor_path}; waiting for filesystem recovery',error=True)
 			monitor_fs_flag.clear()
 
-def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,skip_list:'SkipList' = None,watching:threading.Event = None):
+def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,discard_new_recursive_folder_events_until_read:bool = True,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,skip_list:'SkipList' = None,watching:threading.Event = None,job:JobControl = None):
 	global COOKIE_DICT_MAX_SIZE
 	global DEBUG
 	global GREEN_LIGHT
@@ -1293,7 +1362,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			watching.set()
 		lastReadTime = time.monotonic()
 		lastProcessTime = time.monotonic()
-		while GREEN_LIGHT.is_set():
+		# with a job, also stop once it failed, so its supervisor can join this thread
+		running = GREEN_LIGHT.is_set if job is None else job.should_run
+		while running():
 			read_delay = max(min(POLL_WAIT_SECONDS, min_snapshot_delay_seconds), 0.00001)
 			events =  inotify_obj.read(timeout=read_delay * 1000)
 			if processPending and not to_process_flag.is_set():
@@ -2029,11 +2100,12 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			 to_process_flag:threading.Event,monitor_fs_flag:threading.Event=None,
 			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
-			 backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False, startup:JobStartup = None):
+			 backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False, startup:JobStartup = None, job:JobControl = None):
 	global BACKUP_SEMAPHORE
 	global BACKUP_ENTRY_VALUES_HEADER
 	global GREEN_LIGHT
-	# main function for handling the backup for one reverb
+	# main function for handling the backup for one reverb. with a job, a failure stops only that job, and so does the job failing
+	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	if monitor_fs_flag is None:
 		# no monitor fs gating requested: use an always-set event
 		monitor_fs_flag = threading.Event()
@@ -2041,20 +2113,28 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	vault_fs_flag = None
 	manifest = None
 	skip_list = None
+	# the batch taken and not committed yet: however the backuper stops, it goes back to the front of the queue, a full
+	# comparison as a full scan request
+	backupEntries = OrderedDict()
+	full_comparison = False
 	try:
 		# if the vault path does not exist, create it
 		if not os.path.lexists(vault_path):
 			try:
 				os.makedirs(vault_path,exist_ok=True)
-			except Exception as _:
-				watcherTeeLogToTl(monitor_path,f'Warning: Vault path {vault_path} does not exist and failed to create it. Backuper Stopped!',error=True)
+			except Exception as e:
+				if job is None:
+					watcherTeeLogToTl(monitor_path,f'Warning: Vault path {vault_path} does not exist and failed to create it. Backuper Stopped!',error=True)
+				else:
+					watcherTeeLogToTl(monitor_path,f'Vault path {vault_path} does not exist and failed to create it: {e}',error=True)
+					job.fail(f'vault path {vault_path} does not exist and cannot be created: {e}')
 				return
 		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
-		while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
+		while running() and not vault_fs_flag.is_set():
 			vault_fs_flag.wait(POLL_WAIT_SECONDS)
-		while GREEN_LIGHT.is_set() and not monitor_fs_flag.is_set():
+		while running() and not monitor_fs_flag.is_set():
 			monitor_fs_flag.wait(POLL_WAIT_SECONDS)
-		if startup is not None and GREEN_LIGHT.is_set():
+		if startup is not None and running():
 			# the list is read now that both filesystems are ready, so one on a disk that mounts late still loads
 			job_vault = os.path.join(vault_path,job_name)
 			recorded = None
@@ -2063,12 +2143,14 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				recorded = manifest.skip_fingerprint
 			if not startup.load(recorded):
 				# only this job stops: its watcher sees the failure and exits too
+				if job is not None:
+					job.fail(startup.failure_reason, permanent=startup.permanent)
 				return
 			skip_list = startup.skip_list
 			# events the watcher queues from here on are not missed by a replay of the pending transactions
-			while GREEN_LIGHT.is_set() and not startup.watching.is_set():
+			while running() and not startup.watching.is_set():
 				startup.watching.wait(POLL_WAIT_SECONDS)
-			if not GREEN_LIGHT.is_set():
+			if not running():
 				# stopping before deciding: leave the pending transactions file for the next start, unless the watcher
 				# already queued events, as saving those alone over it would drop the rest
 				with to_process_lock:
@@ -2095,7 +2177,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				else:
 					# a full scan absorbs whatever the watcher queued meanwhile
 					to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
-		backupEntries = OrderedDict()
 		with to_process_lock:
 			if to_process:
 				backuperTeeLogToTl(job_name, f'Found {len(to_process)} events queued at startup')
@@ -2103,31 +2184,40 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		if to_process_temp:
 			if to_process_temp.full_scan_requested:
 				backuperTeeLogToTl(job_name, 'Events queued at startup contain a full_scan request, forcing delta generation')
+				full_comparison = True
 			else:
 				backupEntries = change_events_to_backup_entries(to_process_temp)
 				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries')
 		vaultInfo = None
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
-		while GREEN_LIGHT.is_set():
-			while GREEN_LIGHT.is_set() and not vault_fs_flag.is_set():
+		while running():
+			while running() and not vault_fs_flag.is_set():
 				vault_fs_flag.wait(POLL_WAIT_SECONDS)
+			if not running():
+				break
+			# do_backup compares the whole tree for an empty batch
+			full_comparison = full_comparison or not backupEntries
 			vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 				  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 				  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list)
 			if not committed:
-				with to_process_lock:
-					to_process.prepend(backup_entries_to_change_events(backupEntries))
-				backupEntries.clear()
+				# the batch goes back to the queue on the way out
 				if GREEN_LIGHT.is_set():
-					backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running; requesting shutdown',error=True)
-					GREEN_LIGHT.clear()
+					if job is None:
+						backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running; requesting shutdown',error=True)
+						GREEN_LIGHT.clear()
+					else:
+						backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running',error=True)
+						job.fail('backup did not commit')
 				break
 			backupEntries.clear()
-			force_full_scan = False
-			while not backupEntries and not force_full_scan and GREEN_LIGHT.is_set():
-				while GREEN_LIGHT.is_set() and not to_process_flag.is_set():
+			full_comparison = False
+			if job is not None:
+				job.mark_committed()
+			while not backupEntries and not full_comparison and running():
+				while running() and not to_process_flag.is_set():
 					to_process_flag.wait(POLL_WAIT_SECONDS)
-				if not GREEN_LIGHT.is_set():
+				if not running():
 					break
 				with to_process_lock:
 					backuperTeeLogToTl(job_name,f'Backuper processing, {len(to_process)} events to process')
@@ -2137,23 +2227,41 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					# events were lost (e.g. inotify queue overflow): discard the partial batch and
 					# let do_backup delta-generate against the latest version instead
 					backuperTeeLogToTl(job_name,'Full scan requested, forcing delta generation')
-					force_full_scan = True
+					full_comparison = True
 				else:
 					backupEntries = change_events_to_backup_entries(to_process_temp)
 					backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries')
 			if log_journal:
 				journalPath = os.path.join(vault_path,job_name,'journal.tsv')
 				log_events_to_journal(backupEntries,journalPath)
-	except Exception:
+	except JobFailure as e:
+		backuperTeeLogToTl(job_name, f'Job failed: {e.reason}', error=True)
+		if job is None:
+			GREEN_LIGHT.clear()
+		else:
+			job.fail(e.reason, e.permanent)
+	except Exception as e:
 		import traceback
 		backuperTeeLogToTl(job_name, traceback.format_exc(), error=True)
-		GREEN_LIGHT.clear()
+		if job is None:
+			GREEN_LIGHT.clear()
+		else:
+			job.fail(f'{type(e).__name__}: {e}')
 	finally:
+		if full_comparison or backupEntries:
+			# for the job's next attempt, or the pending transactions when the daemon stops
+			with to_process_lock:
+				if full_comparison:
+					to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
+				else:
+					to_process.prepend(backup_entries_to_change_events(backupEntries))
 		if manifest is not None:
 			manifest.close()
 		if vault_fs_flag is not None:
 			FS_SIGNATURE_MONITOR.unregister(vault_path,vault_path_signature,vault_fs_flag)
-		persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
+		# on a job failure the daemon goes on: the queue stays in memory for the job's next attempt
+		if job is None or not GREEN_LIGHT.is_set():
+			persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
 
 def backuperTeeLogToTl(path:str,message:str,error=False,ok=False):
 	global tl
