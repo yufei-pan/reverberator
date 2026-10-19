@@ -71,7 +71,7 @@ def test_parse_rules_vault_subpath_of_monitor_ignored(job):
 	assert rv.parse_rules(job.rule_path) == []
 
 
-def test_parse_rules_slugifies_job_name_and_appends(job):
+def test_parse_rules_slugifies_job_name_in_place(job):
 	write_rule(job)
 	lines = open(job.rule_path, encoding='utf-8').read().splitlines()
 	cols = lines[1].split('\t')
@@ -82,12 +82,12 @@ def test_parse_rules_slugifies_job_name_and_appends(job):
 	assert len(rules) == 1
 	assert rules[0].job_name == 'my-job'
 	data_rows = open(job.rule_path, encoding='utf-8').read().splitlines()[1:]
-	assert dirty_line in data_rows
-	assert len(data_rows) == 2
-	assert data_rows[1].split('\t')[0] == 'my-job'
+	assert dirty_line not in data_rows
+	assert len(data_rows) == 1
+	assert data_rows[0].split('\t')[0] == 'my-job'
 
 
-def test_parse_rules_realpath_monitor_and_appends(job):
+def test_parse_rules_realpath_monitor_in_place(job):
 	write_rule(job)
 	dirty = os.path.join(job.monitor, '..', 'monitor')
 	canonical = os.path.realpath(dirty)
@@ -101,9 +101,9 @@ def test_parse_rules_realpath_monitor_and_appends(job):
 	assert len(rules) == 1
 	assert rules[0].mon_path == canonical
 	data_rows = open(job.rule_path, encoding='utf-8').read().splitlines()[1:]
-	assert dirty_line in data_rows
-	assert len(data_rows) == 2
-	assert data_rows[1].split('\t')[1] == canonical
+	assert dirty_line not in data_rows
+	assert len(data_rows) == 1
+	assert data_rows[0].split('\t')[1] == canonical
 
 
 def test_parse_rules_na_signatures_unchanged(job):
@@ -290,3 +290,55 @@ def test_parse_rules_survives_rule_file_it_cannot_decode(job, capsys, kind):
 	assert [rule.job_name for rule in rules] == [job.job_name]
 	assert open(rule_path, 'rb').read() == before
 	assert 'Cannot upgrade rule file' in capsys.readouterr().out
+
+
+def test_parse_rules_write_back_rewrites_the_row_in_place(job):
+	write_rule(job, min_snapshot='auto')
+	before = open(job.rule_path).read().splitlines()
+	rv.parse_rules(job.rule_path)
+	rv.parse_rules(job.rule_path)
+	after = open(job.rule_path).read().splitlines()
+	assert len(after) == len(before)
+	assert after[1].split('\t')[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
+
+
+def test_parse_rules_drops_old_appended_copies(job):
+	write_rule(job)
+	with open(job.rule_path, 'a') as f:
+		f.write('\t'.join(rule_row(job, min_snapshot='auto')) + '\n')
+	rv.parse_rules(job.rule_path)
+	rows = [line for line in open(job.rule_path).read().splitlines() if line.startswith(job.job_name + '\t')]
+	assert len(rows) == 1
+
+
+def test_parse_rules_slugified_name_does_not_spawn_a_second_job(job):
+	row = rule_row(job)
+	row[0] = 'My Job'
+	open(job.rule_path, 'w').write('\t'.join(rv.REVERB_RULE_TSV_HEADER) + '\n' + '\t'.join(row) + '\n')
+	assert [rule.job_name for rule in rv.parse_rules(job.rule_path)] == ['my-job']
+	assert [rule.job_name for rule in rv.parse_rules(job.rule_path)] == ['my-job']
+	assert 'My Job' not in open(job.rule_path).read()
+
+
+def test_parse_rules_never_rewrites_a_row_whose_name_collides(job):
+	twin = rule_row(job, min_snapshot='auto')
+	twin[0] = 'JOB'
+	write_rule(job, min_snapshot='auto', extra_rows=[twin])
+	before = open(job.rule_path).read()
+	assert len(rv.parse_rules(job.rule_path)) == 2
+	assert open(job.rule_path).read() == before
+
+
+def test_rewrite_rule_rows_keeps_other_lines_byte_for_byte(tmp_path):
+	path = tmp_path / 'rule.tsv'
+	path.write_bytes(b'head\tx\r\n# comment\t\r\nA\t1\r\n\r\nB\t2\r\nA\t3\r\nlast\t9')
+	rv.rewrite_rule_rows(str(path), {'A': ['a', '7']})
+	assert path.read_bytes() == b'head\tx\r\n# comment\t\r\n\r\nB\t2\r\na\t7\r\nlast\t9'
+
+
+def test_parse_rules_missing_file_leaves_a_marker_line(tmp_path, capsys):
+	with pytest.raises(SystemExit) as exc:
+		rv.parse_rules(str(tmp_path / 'nope.tsv'))
+	assert exc.value.code == 1
+	captured = capsys.readouterr()
+	assert 'reverberator EXITING with error: rule file' in captured.out + captured.err

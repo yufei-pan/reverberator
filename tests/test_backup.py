@@ -176,3 +176,19 @@ def test_copy_keeps_inherited_link_when_source_vanished(job):
 	assert rc is False
 	assert os.path.islink(dest)
 	assert os.path.exists(dest)
+
+
+def test_current_version_is_swapped_atomically(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	rv.do_backup({}, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, keep_one_complete_backup=True,
+		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')[1].close()
+	link = os.path.join(job.job_vault, 'current_version')
+	first = os.readlink(link)
+	removed = []
+	monkeypatch.setattr(rv.os, 'remove', lambda path, *a, **k: removed.append(path) if path == link else os.unlink(path))
+	open(os.path.join(job.monitor, 'b.txt'), 'w').write('b')
+	rv.do_backup({os.path.join(job.monitor, 'b.txt'): rv.BackupEntryValues('t', 'create', None)}, job_name=job.job_name,
+		monitor_path=job.monitor, vault_path=job.vault, keep_one_complete_backup=True, only_sync_attributes=True,
+		keep_n_versions=0, backup_size_limit='0')[1].close()
+	assert link not in removed and os.readlink(link) != first
+	assert not os.path.lexists(os.path.join(job.job_vault, '.current_version.tmp'))

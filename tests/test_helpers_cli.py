@@ -127,3 +127,16 @@ def test_signal_handler_first_clears_green_light_second_exits(monkeypatch):
 	rv.signal_handler(None, None)
 	assert exited == [1]
 
+
+
+def test_get_args_fallback_reports_the_given_arguments(capsys):
+	with pytest.raises(SystemExit) as exc:
+		rv.get_args(['--no-such-flag', 'rule.tsv'])
+	assert exc.value.code == 2
+	assert '--no-such-flag' in capsys.readouterr().err
+
+
+def test_colliding_job_names_counts_names_used_twice():
+	"""Two rows cleaning up to one name are both reported."""
+	rules = [rv.ReverbRule('a', *[''] * 11), rv.ReverbRule('b', *[''] * 11), rv.ReverbRule('a', *[''] * 11)]
+	assert rv.colliding_job_names(rules) == {'a': 2}

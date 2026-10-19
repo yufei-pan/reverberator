@@ -159,3 +159,16 @@ def test_job_waits_for_a_monitored_path_that_appears_later(job, run_reverberator
 	os.makedirs(missing)
 	open(os.path.join(missing, 'a.txt'), 'w').write('a')
 	wait_for_committed_count(job, 1, timeout=15)
+
+
+def test_colliding_job_names_are_both_stopped(job, tmp_path, run_reverberator):
+	other = create_job(str(tmp_path / 'other'), 'other')
+	seed_monitor(job, {'a.txt': 'a'})
+	seed_monitor(other, {'b.txt': 'b'})
+	twin = rule_row(other)
+	twin[0] = 'JOB'   # cleans up to 'job'
+	write_rule(job, extra_rows=[twin])
+	proc = run_reverberator(job.rule_path)
+	assert proc.wait(timeout=15) == 3
+	assert ''.join(proc._out_buf + proc._err_buf).count('reverberator job job STOPPED') == 2
+	assert any(line.startswith('JOB\t') for line in open(job.rule_path).read().splitlines())
