@@ -239,6 +239,9 @@ def test_failed_backup_leaves_no_copy_running(job, poll_fast, monkeypatch, first
 	assert executors and not executors[-1].runningThreads
 	assert started == [True] and tasks[0].returncode is not None and not tasks[0].is_alive()   # killed and reaped
 	assert semaphore._value == 4   # every permit is back
+	if first_backup:
+		# the uncommitted V0 keeps them until it is removed whole, as the next attempt does
+		rv.get_vault_info(job.job_vault)
 	assert not _partial_files(job.vault)
 
 
@@ -429,3 +432,46 @@ def test_backuper_log_needs_only_old_tee_logger_methods(monkeypatch, flags, debu
 	monkeypatch.setattr(rv, 'DEBUG', debug_mode)
 	rv.backuperTeeLogToTl('p', 'm', **flags)
 	assert len(lines) == 1 and lines[0].endswith('m')
+
+
+class _DoneTask:
+	returncode = 0
+	stderr = ()
+	command = ['cp']
+	def is_alive(self):
+		return False
+
+
+def test_interrupted_complete_v0_leaves_its_partial_files_to_the_sweep(job, poll_fast, monkeypatch):
+	# unlinking each partial file of a large first backup would only hold up the stop: the uncommitted version goes whole
+	seed_monitor(job, {f'f{i}.txt': str(i) for i in range(20)})
+	def copy(source_path, dest_path, mcae=..., pending=None):
+		temp = rv.partial_copy_path(dest_path)
+		open(temp, 'w').write('part')
+		pending.append(rv.PendingCopy(_DoneTask(), source_path, temp, dest_path))
+		rv.GREEN_LIGHT.clear()
+	monkeypatch.setattr(rv, 'cp_af_copy_path', copy)
+	removed = []
+	real_remove = rv.remove_entry
+	monkeypatch.setattr(rv, 'remove_entry', lambda path: removed.append(path) or real_remove(path))
+	try:
+		_, manifest, committed = _backup(job)
+		manifest.close()
+	finally:
+		rv.GREEN_LIGHT.set()
+	assert committed is False and committed_versions(job) == []
+	assert removed == []
+	assert _partial_files(job.vault)
+	rv.get_vault_info(job.job_vault)
+	assert not _partial_files(job.vault)
+
+
+def test_stopped_copies_lose_their_partial_files_by_default(job):
+	version = os.path.join(job.job_vault, 'V1--x')
+	os.makedirs(version)
+	temp = os.path.join(version, '.a.txt.reverberator-partial')
+	open(temp, 'w').write('part')
+	pending = [rv.PendingCopy(_DoneTask(), os.path.join(job.monitor, 'a.txt'), temp, os.path.join(version, 'a.txt'))]
+	mcae = rv.multiCMD.AsyncExecutor(semaphore=rv.BACKUP_SEMAPHORE, quiet=True)
+	rv.stop_copies(mcae, pending, version)
+	assert pending == [] and not os.path.lexists(temp)

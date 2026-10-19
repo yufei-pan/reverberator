@@ -16,8 +16,8 @@ dependencies = [
     "inotify-simple>=1.3.5",
     "multicmd>=1.51",
     "pathspec>=0.12.1",
-    "tee-logger>=6.34",
-    "tsvz>=3.25",
+    "tee-logger>=6.40",
+    "tsvz>=3.39",
     "xxhash>=3.5.0",
 ]
 

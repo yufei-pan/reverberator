@@ -1,0 +1,2 @@
+^[^\]]*\]: (?:\x1b\[[0-9;]*m)?(?:\[ERROR\] )?reverberator job [a-z0-9_-]+ (?:FAILED|UNREADABLE|STOPPED):
+^[^\]]*\]: (?:\x1b\[[0-9;]*m)?(?:\[ERROR\] )?reverberator EXITING with error:

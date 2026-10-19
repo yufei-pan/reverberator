@@ -139,6 +139,19 @@ def test_every_job_stopped_exits_3(job, run_reverberator):
 	assert 'reverberator job job STOPPED' in text and 'reverberator EXITING with error' in text
 
 
+@pytest.mark.parametrize('rule_file', ['missing', 'no_usable_row'])
+def test_a_rule_file_with_no_job_exits_3(job, run_reverberator, rule_file):
+	# only fixing the rule file helps, so systemd is told not to restart the daemon every 5 s
+	if rule_file == 'no_usable_row':
+		row = rule_row(job)
+		row[1] = ''   # an empty Path Monitoring drops the row
+		write_rule(job)
+		open(job.rule_path, 'w', encoding='utf-8').write('\t'.join(rv.REVERB_RULE_TSV_HEADER) + '\n' + '\t'.join(row) + '\n')
+	proc = run_reverberator(job.rule_path)
+	assert proc.wait(timeout=15) == rv.EXIT_ALL_STOPPED
+	assert 'reverberator EXITING with error: rule file' in ''.join(proc._out_buf + proc._err_buf)
+
+
 def test_sigterm_exits_0(job, run_reverberator):
 	seed_monitor(job, {'a.txt': 'a'})
 	write_rule(job)

@@ -1,4 +1,0 @@
-reverberator job * FAILED
-reverberator job * UNREADABLE
-reverberator job * STOPPED
-reverberator EXITING with error

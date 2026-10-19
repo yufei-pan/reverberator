@@ -297,3 +297,52 @@ def test_file_moved_over_a_moved_away_name_is_not_deleted_later(job, tmp_path, p
 		assert b not in entries
 	finally:
 		_stop(thread)
+
+
+def test_create_queues_every_pending_move_out_at_its_path_first(job, tmp_path, poll_fast, monkeypatch):
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 1.0)
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	seed_monitor(job, {'p/a.txt': 'p', 'q/a.txt': 'q'})
+	thread, to_process, lock = _start(job, [])
+	try:
+		a = os.path.join(job.monitor, 'p', 'a.txt')
+		os.rename(a, str(outside / 'a1'))
+		# folders renamed over each other bring another a.txt to the same path, which then moves away too
+		os.rename(os.path.join(job.monitor, 'p'), os.path.join(job.monitor, 'p_old'))
+		os.rename(os.path.join(job.monitor, 'q'), os.path.join(job.monitor, 'p'))
+		os.rename(a, str(outside / 'a2'))
+		open(a, 'w').write('new')
+		wait_until(lambda: any(e.event == 'create' and e.path == a for e in _events(to_process, lock)), message='no create')
+		time.sleep(1.5)
+		_probe(job, to_process, lock, 'probe_after_expiry.txt')
+		events = [e.event for e in _events(to_process, lock) if e.path == a]
+		assert events[:3] == ['delete', 'delete', 'create'] and 'delete' not in events[3:]
+	finally:
+		_stop(thread)
+
+
+def test_create_after_an_evicted_move_out_queues_no_second_delete(job, tmp_path, poll_fast, monkeypatch):
+	monkeypatch.setattr(rv, 'COOKIE_DICT_MAX_SIZE', 1)
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	thread, to_process, lock = _start(job, [])
+	try:
+		a = os.path.join(job.monitor, 'a.txt')
+		b = os.path.join(job.monitor, 'b.txt')
+		os.rename(a, str(outside / 'a.txt'))
+		# pushes a's move out of the cookie dictionary, which queues its delete
+		os.rename(b, str(outside / 'b.txt'))
+		open(a, 'w').write('new')
+		wait_until(lambda: any(e.event == 'create' and e.path == a for e in _events(to_process, lock)), message='no create')
+		time.sleep(1.0)
+		_probe(job, to_process, lock, 'probe_after_expiry.txt')
+		events = _events(to_process, lock)
+		assert None not in events
+		assert [e.event for e in events if e.path == a][:2] == ['delete', 'create']
+		assert [e.event for e in events if e.path == a].count('delete') == 1
+		assert [e.event for e in events if e.path == b] == ['delete']
+	finally:
+		_stop(thread)
