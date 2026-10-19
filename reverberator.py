@@ -8,6 +8,7 @@ import xxhash
 import pathspec
 
 from collections import deque
+from collections import Counter
 import time
 from collections import namedtuple
 from collections import OrderedDict
@@ -944,12 +945,23 @@ def run_daemon():
 	rules = parse_rules(args.rule_path)
 	if not rules:
 		tl.teeerror(f'Error: Rule file {args.rule_path} appears empty after parsing.')
+		daemon_error_log(f'rule file {args.rule_path} has no rules')
 		sys.exit(1)
 	# one supervisor per job runs its watcher and backuper, and starts them again after a failure
 	supervisors = []
 	results = [None] * len(rules)
+	colliding = colliding_job_names(rules)
 	for index, reverb_rule in enumerate(rules):
 		job_name = reverb_rule.job_name
+		if job_name in colliding:
+			# rows sharing a job name would share one vault folder: each is stopped at once, nothing of it starts
+			def start_colliding(job:JobControl, attempt:int, job_name = job_name) -> list:
+				job.fail(f'{colliding[job_name]} rows clean up to the job name {job_name}', permanent=True)
+				return []
+			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_colliding,None),name=f'{job_name} supervisor',daemon=True)
+			supervisor.start()
+			supervisors.append(supervisor)
+			continue
 		monitor_path = reverb_rule.mon_path
 		monitor_path_signature = reverb_rule.mon_fs_signature
 		min_snapshot_delay_seconds = DEFAULT_SNAPSHOT_DELAY
@@ -1100,7 +1112,7 @@ def get_args(args = None):
 	except Exception as _:
 		#eprint(f"Error while parsing arguments: {e!r}")
 		# try to parse the arguments using parse_known_args
-		args, unknown = parser.parse_known_args()
+		args, unknown = parser.parse_known_args(args)
 		# if there are unknown arguments, we will try to parse them again using parse_args
 		if unknown:
 			print(f"Error: Unrecognized arguments: {unknown!r}", file=sys.stderr)
@@ -1148,26 +1160,61 @@ def upgrade_rule_file_header(rule_file:str) -> bool:
 		for index, prefix in enumerate(('# The name for the Job', '# need to be unique')):
 			if line.startswith(prefix) and len(cells_of(line)) == len(REVERB_RULE_TSV_HEADER) - 1:
 				lines[i] = with_suffix(line, '\t' + SKIP_LIST_COLUMN_DESCRIPTIONS[index])
-	directory = os.path.dirname(os.path.abspath(rule_file))
-	fd, temp_path = tempfile.mkstemp(dir=directory, prefix='.' + os.path.basename(rule_file) + '.')
+	replace_file_text(rule_file, '\n'.join(lines))
+	return True
+
+def replace_file_text(path:str, text:str):
+	'''
+	Replace a text file's content through a temp file in the same folder, fsynced before the rename so a crash cannot
+	leave an empty file in its place. The mode and owner are kept; path must already be the real path.
+	'''
+	directory = os.path.dirname(os.path.abspath(path))
+	fd, temp_path = tempfile.mkstemp(dir=directory, prefix='.' + os.path.basename(path) + '.')
 	try:
 		with os.fdopen(fd, 'w', newline='', encoding='utf-8') as f:
-			f.write('\n'.join(lines))
-			# on disk before the rename, so a crash cannot leave an empty rule file in its place
+			f.write(text)
 			f.flush()
 			os.fsync(f.fileno())
-		original = os.stat(rule_file)
+		original = os.stat(path)
 		os.chmod(temp_path, stat.S_IMODE(original.st_mode))
 		try:
 			os.chown(temp_path, original.st_uid, original.st_gid)
 		except OSError:
 			pass
-		os.replace(temp_path, rule_file)
+		os.replace(temp_path, path)
 	except BaseException:
 		if os.path.exists(temp_path):
 			os.remove(temp_path)
 		raise
-	return True
+
+def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
+	'''
+	Replace rule rows in place. rows maps the job name cell as written in the file to its new full row.
+	For each key the last line whose first cell (stripped) equals it becomes the new row and earlier lines with that
+	key are removed (TSVZ already ignored them); every other line is kept byte for byte, line endings included.
+
+	Args:
+		rule_file (str): The rule file
+		rows (dict): Written job name cell -> new row (list of cells)
+	'''
+	if not rows:
+		return
+	rule_file = os.path.realpath(rule_file)
+	with open(rule_file, 'r', newline='', encoding='utf-8') as f:
+		lines = f.read().split('\n')
+	last_index = {}
+	for i, line in enumerate(lines):
+		key = line.split('\t', 1)[0].strip()
+		if key in rows and not key.startswith('#'):
+			last_index[key] = i
+	result = []
+	for i, line in enumerate(lines):
+		key = line.split('\t', 1)[0].strip()
+		if key not in last_index:
+			result.append(line)
+		elif last_index[key] == i:
+			result.append('\t'.join(rows[key]) + line[len(line.rstrip('\r')):])
+	replace_file_text(rule_file, '\n'.join(result))
 
 def resolve_skip_list_path(cell:str, rule_file:str) -> str:
 	'''
@@ -1212,6 +1259,7 @@ def parse_rules(rule_file:str):
 	global REVERB_RULE_TSV_HEADER
 	if not os.path.exists(rule_file):
 		tl.teeerror(f'Error: Rule file {rule_file} does not exist.')
+		daemon_error_log(f'rule file {rule_file} does not exist')
 		sys.exit(1)
 	try:
 		if upgrade_rule_file_header(rule_file):
@@ -1227,9 +1275,10 @@ def parse_rules(rule_file:str):
 		tl.info(f'Parsed rules: \n{rules}')
 	if not rules:
 		tl.teeerror(f'Error: Rule file {rule_file} appears empty after parsing.')
+		daemon_error_log(f'rule file {rule_file} has no rules')
 		sys.exit(1)
 	# fill in empty / auto and append:
-	rulesToUpdate = []
+	rulesToUpdate = {}
 	returnReverbRules = []
 	for ruleName in rules:
 		ruleList = list(rules[ruleName]) + [''] * (len(REVERB_RULE_HEADER) - len(rules[ruleName]))
@@ -1339,12 +1388,29 @@ def parse_rules(rule_file:str):
 		# check if the rule is explicit
 		if ruleUpdated:
 			tl.info(f'Updating rule {ruleName}: {inRule}')
-			rulesToUpdate.append(list(inRule.values()))
+			rulesToUpdate[ruleName] = list(inRule.values())
 		returnReverbRules.append(ReverbRule(**inRule))
-	# append all updated rows to tsv once (avoid cumulative duplicate appends)
+	# rewrite the updated rows in place once; a row whose cleaned name collides with another's is left as written,
+	# as renaming it would merge the two rows in the file
+	colliding = colliding_job_names(returnReverbRules)
+	rulesToUpdate = {name:row for name,row in rulesToUpdate.items() if row[0] not in colliding}
 	if rulesToUpdate:
-		TSVZ.appendLinesTabularFile(rule_file,rulesToUpdate,header=REVERB_RULE_TSV_HEADER,createIfNotExist=False,verifyHeader=True,verbose=DEBUG,strict=False)
+		try:
+			rewrite_rule_rows(rule_file,rulesToUpdate)
+		except (OSError, ValueError) as e:
+			# ValueError: a compressed or non UTF-8 rule file; the rules in memory are still right
+			tl.teelog(f'Warning: Cannot write the filled in rows back to {rule_file} ({e}).',level='warning')
 	return returnReverbRules
+
+def colliding_job_names(rules:list) -> dict:
+	'''
+	The job names used by more than one rule, with how many rules use each.
+
+	>>> colliding_job_names([ReverbRule('a', *['']*11), ReverbRule('b', *['']*11), ReverbRule('a', *['']*11)])
+	{'a': 2}
+	'''
+	counts = Counter(rule.job_name for rule in rules)
+	return {name:count for name,count in counts.items() if count > 1}
 
 def slugify(value, allow_unicode=False):
 	"""
@@ -2986,10 +3052,13 @@ def do_backup(backup_entries:dict,
 		TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
 		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
 		# create the current version symlink
-		if os.path.lexists(os.path.join(job_vault,'current_version')):
-			os.remove(os.path.join(job_vault,'current_version'))
 		vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder,this_timestamp,this_size,this_inodes)
-		os.symlink(os.path.basename(backup_folder),os.path.join(job_vault,'current_version'),target_is_directory=True)
+		# swapped in under a temporary name, so the link is never missing
+		temp_link = os.path.join(job_vault,'.current_version.tmp')
+		if os.path.lexists(temp_link):
+			os.unlink(temp_link)
+		os.symlink(os.path.basename(backup_folder),temp_link,target_is_directory=True)
+		os.replace(temp_link,os.path.join(job_vault,'current_version'))
 		if log_journal:
 			tracked_files, tracked_folders = manifest.counts()
 			TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'end_reverb_backup_{tracked_files}files_{tracked_folders}folders_tracked',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
