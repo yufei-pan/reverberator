@@ -23,6 +23,7 @@ import unicodedata
 import re
 import glob
 import select
+import contextlib
 import sqlite3
 import tempfile
 import stat
@@ -211,18 +212,20 @@ class ChangeEventQueue:
 	Events are kept zlib compressed in blocks of QUEUE_BLOCK_EVENTS. As the queue grows, it drops the modify and attrib
 	events the backup conversion would skip anyway, and once longer than QUEUE_KEEP_EVENTS it becomes one full scan
 	when memory runs short. A queued full scan absorbs every later event, as the backuper compares the whole tree for it.
+	A 'scan' event (compare that one folder with the vault) is kept like any other event.
 
 	Examples:
 		>>> queue = ChangeEventQueue('/m')
 		>>> for t in range(3):
 		...     queue.append(ChangeEvent(float(t), False, 'modify', '/m/log', None))
 		>>> queue.append(ChangeEvent(3.0, False, 'create', '/m/new', None))
+		>>> queue.append(ChangeEvent(3.5, True, 'scan', '/m/disk', None))
 		>>> queue.compact()
 		>>> [(event.monotonic_time, event.event) for event in queue]
-		[(2.0, 'modify'), (3.0, 'create')]
+		[(2.0, 'modify'), (3.0, 'create'), (3.5, 'scan')]
 		>>> taken = queue.take()
 		>>> (len(taken), len(queue))
-		(2, 0)
+		(3, 0)
 		>>> queue.append(ChangeEvent(4.0, False, 'full_scan', '/m', None))
 		>>> queue.append(ChangeEvent(5.0, False, 'modify', '/m/log', None))
 		>>> [event.event for event in queue]
@@ -1708,9 +1711,18 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	newDirWDs = set()
 	processPending = False
 	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
+	# the inner mounts followed (path -> fingerprint), from a table read before any watch is added: every mount change
+	# after it shows in a table the monitor hands over later
+	inner_mounts = watched_inner_mounts(current_mount_table(), monitor_path, skip_list)
+	# the newest mount table from the monitor, until the loop takes it
+	latest_mount_table = [None]
+	mount_table_lock = threading.Lock()
+	def store_mount_table(mount_table):
+		with mount_table_lock:
+			latest_mount_table[0] = mount_table
 	irm = inotify_usage(irm)
 	irm.increaseUserInstances()
-	with irm, inotify_simple.INotify() as inotify_obj:
+	with irm, inotify_simple.INotify() as inotify_obj, FS_SIGNATURE_MONITOR.subscription(store_mount_table):
 		job_name = None if job is None else job.job_name
 		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name)
 		if mainWatchDescriptor == -1:
@@ -1731,6 +1743,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				newDirWDs.clear()
 				processPending = False
 				lastProcessTime = time.monotonic()
+			with mount_table_lock:
+				mount_table, latest_mount_table[0] = latest_mount_table[0], None
+			if mount_table is not None and follow_inner_mounts(inotify_obj,monitor_path,mount_table,inner_mounts,wdDic,irm,watch_flags,to_process,to_process_lock,skip_list,job_name):
+				# like an event, so the backuper waits for the tree to settle before comparing the folders
+				lastReadTime = time.monotonic()
 			now = time.monotonic()
 			expired_move_cookies = [cookie for cookie, change_event in pendingMoveFromEvents.items() if now - change_event.monotonic_time > move_pair_timeout]
 			for cookie in expired_move_cookies:
@@ -1779,11 +1796,13 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						irm.decreaseUserWatches()
 						continue
 					elif event.mask & flags.UNMOUNT:
+						# the disk mounted inside the tree went away and took this watch along. watching the path again
+						# here raised for each of its folders that is gone now; the mount table change re-watches the
+						# mount point folder it uncovers (follow_inner_mounts)
 						if event.wd in wdDic:
-							unmount_path = wdDic[event.wd]
-							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, resetting watch for {unmount_path}')
-							wdDic.pop(event.wd, None)
-							wdDic[inotify_obj.add_watch(unmount_path, watch_flags)] = unmount_path
+							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, dropping the watch for {wdDic[event.wd]}')
+							del wdDic[event.wd]
+							irm.decreaseUserWatches()
 						else:
 							watcherTeeLogToTl(monitor_path,f'Sub dir unmount event detected, but watch not in wdDic found for {event.wd}')
 						continue
@@ -1967,6 +1986,8 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 		parentWatchDescriptor = inotify_obj.add_watch(monitor_path, watch_flags)
 	except Exception as e:
 		watcherTeeLogToTl(monitor_path,f'Failed to add watch for {monitor_path}: {e}',error=True)
+		# counted above but never taken: an inner mount that keeps failing would add up over a long run
+		irm.decreaseUserWatches()
 		return -1
 	if newDirWds is not None:
 		newDirWds.add(parentWatchDescriptor)
@@ -2016,6 +2037,37 @@ def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:ino
 		irm.decreaseUserWatches()
 		removed += 1
 	return removed
+
+def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None) -> int:
+	'''
+	Bring the watches in line with a new mount table. Each inner mount mounted, unmounted or replaced since inner_mounts
+	(path -> fingerprint, updated here) is watched again from what is there now, and gets a 'scan' event so the backuper
+	compares that folder with the vault. Returns how many folders it queued.
+	An unmounted disk's watches go with its IN_UNMOUNT events, or here if those come later (a lazy unmount sends none
+	while the disk is still in use); the mount point folder it uncovers is watched in their place.
+	'''
+	current = watched_inner_mounts(mount_table, monitor_path, skip_list)
+	queued = 0
+	for mount_point in sorted(current.keys() | inner_mounts.keys()):
+		fingerprint = current.get(mount_point)
+		if fingerprint == inner_mounts.get(mount_point):
+			continue
+		if fingerprint is not None and not os.path.isdir(mount_point):
+			# a file mounted over a file, or a disk that does not answer: nothing to watch, looked at again with the next table
+			continue
+		change = 'mounted' if mount_point not in inner_mounts else 'unmounted' if fingerprint is None else 'replaced'
+		watcherTeeLogToTl(monitor_path,f'Inner mount {mount_point} {change}, watching what is there now and comparing it with the vault')
+		remove_watches_under(inotify_obj,wdDic,irm,mount_point)
+		# not into newDirWDs: the scan compares what is there already, and later events in it are recorded as they come
+		initializeFolderWatchers(inotify_obj,mount_point,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name)
+		if fingerprint is None:
+			del inner_mounts[mount_point]
+		else:
+			inner_mounts[mount_point] = fingerprint
+		# queued after its watches are in place, so the comparison cannot run first and miss a change made in between
+		append_change_event(to_process, to_process_lock, ChangeEvent(time.monotonic(),True,'scan',mount_point,None))
+		queued += 1
+	return queued
 
 def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str,wds,watch_flags:int) -> int:
 	'''
@@ -2352,6 +2404,58 @@ def mount_fingerprint(mount_table:list, path:str):
 				fingerprint = mount_id
 	return fingerprint
 
+def inner_mount_points(mount_table:list, monitor_path:str) -> list:
+	'''
+	The mount points in mount_table (as parse_mount_table gives it) strictly under monitor_path once resolved, sorted.
+
+	Examples:
+		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m', ('2',)), ('/tmp/reverb_doctest/m/disk', ('3',)),
+		...     ('/tmp/reverb_doctest/m/a b', ('4',)), ('/tmp/reverb_doctest/m/disk', ('5',)), ('/tmp/reverb_doctest/mx', ('6',))]
+		>>> inner_mount_points(table, '/tmp/reverb_doctest/m/')
+		['/tmp/reverb_doctest/m/a b', '/tmp/reverb_doctest/m/disk']
+		>>> inner_mount_points(table, '/')[:2]
+		['/tmp/reverb_doctest/m', '/tmp/reverb_doctest/m/a b']
+		>>> inner_mount_points([], '/tmp/reverb_doctest/m')
+		[]
+	'''
+	root = os.path.realpath(monitor_path)
+	prefix = root.rstrip('/') + '/'
+	return sorted({mount_point for mount_point, _ in mount_table if mount_point != root and mount_point.startswith(prefix)})
+
+def current_mount_table() -> list:
+	'''The mount table now, as parse_mount_table gives it; [] when it cannot be read.'''
+	try:
+		with open(MOUNTINFO_PATH, 'rb') as f:
+			return parse_mount_table(f.read())
+	except Exception:
+		return []
+
+def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList' = None) -> dict:
+	'''
+	The inner mounts a watcher of monitor_path follows: each mount point strictly under it, as a path under monitor_path
+	as given, mapped to the fingerprint of what is mounted there (the topmost of stacked mounts). A mount point the skip
+	list leaves out, or one in a folder it leaves out, is not followed.
+
+	Examples:
+		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m/disk', ('2',)), ('/tmp/reverb_doctest/m/disk', ('3',)),
+		...     ('/tmp/reverb_doctest/m/cache/usb', ('4',))]
+		>>> watched_inner_mounts(table, '/tmp/reverb_doctest/m/')
+		{'/tmp/reverb_doctest/m/cache/usb': ('4',), '/tmp/reverb_doctest/m/disk': ('3',)}
+		>>> watched_inner_mounts(table, '/tmp/reverb_doctest/m', SkipList('/tmp/reverb_doctest/m', ['cache/']))
+		{'/tmp/reverb_doctest/m/disk': ('3',)}
+	'''
+	real_root = os.path.realpath(monitor_path)
+	mounts = {}
+	for mount_point in inner_mount_points(mount_table, monitor_path):
+		rel = os.path.relpath(mount_point, real_root)
+		if skip_list is not None:
+			# skips() checks an entry alone, so every folder on the way down is checked
+			parts = rel.split('/')
+			if any(skip_list.skips('/'.join(parts[:depth]) + '/') for depth in range(1, len(parts) + 1)):
+				continue
+		mounts[os.path.join(monitor_path, rel)] = mount_fingerprint(mount_table, mount_point)
+	return mounts
+
 class fs_signature_monitor:
 	'''
 	One shared daemon thread keeping a flag per (path, signature) pair set while the path lives
@@ -2360,7 +2464,8 @@ class fs_signature_monitor:
 	Replaces a findmnt --poll subprocess (plus its multiCMD threads) per path: /proc/self/mountinfo
 	raises POLLPRI on every mount table change, the same signal findmnt --poll waits on. A pair is
 	only re-checked (df + lsblk) when the mount containing its path changes, like findmnt --target,
-	and rules sharing a path share that check.
+	and rules sharing a path share that check. Every mount table it reads also goes to its subscribers
+	(watchers following the mounts inside their trees).
 	'''
 	def __init__(self, mountinfo_path:str = MOUNTINFO_PATH):
 		self.mountinfo_path = mountinfo_path
@@ -2373,6 +2478,8 @@ class fs_signature_monitor:
 		self.states = {}
 		# (path, signature) -> bumped by invalidate(), so a check that started before it does not store its stale result
 		self.generations = {}
+		# token -> callback(mount_table), told each time the mount table is read
+		self.subscribers = {}
 		self.thread = None
 		self.wake_r, self.wake_w = os.pipe()
 		os.set_blocking(self.wake_r, False)
@@ -2412,6 +2519,44 @@ class fs_signature_monitor:
 				self.fingerprints.pop(key, None)
 				self.states.pop(key, None)
 
+	def subscribe(self, callback) -> object:
+		'''
+		Have callback(mount_table) run on the monitor thread each time it reads the mount table: once right after
+		subscribing, then on every mount table change and every periodic re-check. Returns a token for unsubscribe().
+		The callback runs outside the monitor's lock (it takes its own) and must not block.
+		'''
+		token = object()
+		with self.lock:
+			self.subscribers[token] = callback
+		# start() wakes the monitor: its next pass is the call right after subscribing
+		self.start()
+		return token
+
+	def unsubscribe(self, token):
+		'''Stop calling a subscriber back; a pass already under way may still call it once.'''
+		with self.lock:
+			self.subscribers.pop(token, None)
+
+	@contextlib.contextmanager
+	def subscription(self, callback):
+		'''subscribe() for the length of a with block.'''
+		token = self.subscribe(callback)
+		try:
+			yield token
+		finally:
+			self.unsubscribe(token)
+
+	def notify(self, mount_table:list):
+		'''Hand a mount table to every subscriber; one that raises is logged and does not keep it from the others.'''
+		with self.lock:
+			callbacks = list(self.subscribers.values())
+		for callback in callbacks:
+			try:
+				callback(mount_table)
+			except Exception:
+				import traceback
+				watcherTeeLogToTl(self.mountinfo_path, traceback.format_exc(), error=True)
+
 	def invalidate(self, path:str, signature:str):
 		'''Clear every flag of a pair now and have the monitor check it again, as a watched root was unmounted or removed.'''
 		key = (path, signature)
@@ -2432,12 +2577,19 @@ class fs_signature_monitor:
 			pass
 
 	def check_changed(self, recheck_failed:bool = False):
-		'''Re-check every pair whose containing mount changed since its last check, and with recheck_failed those whose last check failed.'''
+		'''
+		Re-check every pair whose containing mount changed since its last check, and with recheck_failed those whose last
+		check failed. The mount table read for it goes to the subscribers first.
+		'''
 		try:
 			with open(self.mountinfo_path, 'rb') as f:
 				mount_table = parse_mount_table(f.read())
 		except Exception:
+			# not handed to the subscribers: they would take every inner mount for unmounted
 			mount_table = []
+		else:
+			# before the signature checks, so a slow df or lsblk does not hold back a watcher following an inner mount
+			self.notify(mount_table)
 		with self.lock:
 			keys = list(self.flags)
 		for key in keys:
@@ -2726,8 +2878,10 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 		...     ]))
 		>>> _out
 		OrderedDict()
+		>>> change_events_to_backup_entries(deque([ChangeEvent(1.0, True, 'scan', '/tmp/reverb_doctest/m', None)]))
+		OrderedDict()
 	'''
-	# possibile events are create, delete, attrib, move, modify
+	# possibile events are create, delete, attrib, move, modify ( and scan, a folder the backuper compares itself )
 	# CHANGED_EVENT_HEADER = ['monotonic_time', 'is_dir', 'event', 'path','moved_from']
 	# BACKUP_ENTRY_VALUES_HEADER = ['iso_time','event','source_path']
 	# collapse the change events
@@ -2769,6 +2923,9 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 			# do not turn this into vault operations ( we want to keep the existing history ),
 			# just surface it loudly and skip.
 			backuperTeeLogToTl(abs_path,f'Monitor root self destructed ({abs_path}), keeping existing vault content untouched',error=True)
+			continue
+		if event == 'scan':
+			# a folder to compare with the vault (an inner mount came or went), not an entry of its own
 			continue
 		# pre handle move events
 		if event == 'move':
