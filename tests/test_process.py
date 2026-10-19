@@ -106,3 +106,42 @@ def test_job_with_missing_skip_list_does_not_stop_other_jobs(job, tmp_path, run_
 	proc = run_reverberator(job.rule_path)
 	wait_for_committed_count(other, 1, timeout=10)
 	assert proc.poll() is None and committed_versions(job) == []
+
+
+def test_failing_job_retries_and_others_keep_running(job, tmp_path, run_reverberator, process_env):
+	process_env['REVERB_JOB_RETRY_FIRST_SECONDS'] = '0.5'
+	process_env['REVERB_JOB_RETRY_MAX_SECONDS'] = '1'
+	other = create_job(str(tmp_path / 'other'), 'other')
+	seed_monitor(job, {'a.txt': 'a'})
+	seed_monitor(other, {'b.txt': 'b'})
+	blocker = os.path.join(job.root, 'blocker')
+	open(blocker, 'w').write('x')
+	broken = rule_row(job)
+	broken[2] = os.path.join(blocker, 'vault')   # a vault path under a regular file cannot be created
+	write_rule(other, extra_rows=[broken])
+	proc = run_reverberator(other.rule_path)
+	wait_for_committed_count(other, 1, timeout=10)
+	wait_until(lambda: 'reverberator job job FAILED' in ''.join(proc._out_buf + proc._err_buf), timeout=10, message='no FAILED line')
+	os.remove(blocker)
+	os.makedirs(os.path.join(blocker, 'vault'))
+	wait_until(lambda: 'reverberator job job RECOVERED' in ''.join(proc._out_buf + proc._err_buf), timeout=15, message='no RECOVERED line')
+	assert proc.poll() is None
+
+
+def test_every_job_stopped_exits_3(job, run_reverberator):
+	seed_monitor(job, {'a.txt': 'a'})
+	open(os.path.join(job.root, 'skip.txt'), 'w').write('[z-a]\n')
+	write_rule(job, skip_list_file='skip.txt')
+	proc = run_reverberator(job.rule_path)
+	assert proc.wait(timeout=15) == 3
+	text = ''.join(proc._out_buf + proc._err_buf)
+	assert 'reverberator job job STOPPED' in text and 'reverberator EXITING with error' in text
+
+
+def test_sigterm_exits_0(job, run_reverberator):
+	seed_monitor(job, {'a.txt': 'a'})
+	write_rule(job)
+	proc = run_reverberator(job.rule_path)
+	wait_for_committed_count(job, 1, timeout=10)
+	proc.send_signal(signal.SIGTERM)
+	assert proc.wait(timeout=10) == 0
