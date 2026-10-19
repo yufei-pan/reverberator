@@ -3143,12 +3143,13 @@ def backuperTeeLogToTl(path:str,message:str,error=False,ok=False,warning=False,d
 	elif ok:
 		tl.teeok(message,callerStackDepth=4)
 	elif warning:
-		tl.teewarning(message,callerStackDepth=4)
+		# Tee_Logger before 6.42 has no teewarning or teedebug
+		getattr(tl,'teewarning',tl.teeprint)(message,callerStackDepth=4)
 	elif debug:
 		if DEBUG:
-			tl.teedebug(message,callerStackDepth=4)
+			getattr(tl,'teedebug',tl.teeprint)(message,callerStackDepth=4)
 		else:
-			tl.debug(message,callerStackDepth=4)
+			tl.info(message,callerStackDepth=4)
 	elif DEBUG:
 		tl.teeprint(message,callerStackDepth=4)
 	else:

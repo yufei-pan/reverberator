@@ -182,6 +182,24 @@ def test_failed_synchronous_copy_keeps_the_destination(job, monkeypatch):
 	assert os.readlink(dest) == '../V0--x/a.txt' and not _partial_files(job.vault)
 
 
+def _sleep_running():
+	'''Whether this process has a running `sleep 30` child.'''
+	me = os.getpid()
+	for entry in os.listdir('/proc'):
+		if not entry.isdigit():
+			continue
+		try:
+			with open(f'/proc/{entry}/stat') as stat:
+				ppid = int(stat.read().rsplit(')', 1)[1].split()[1])
+			with open(f'/proc/{entry}/cmdline', 'rb') as cmdline:
+				argv = cmdline.read().split(b'\0')[:2]
+		except (OSError, ValueError, IndexError):
+			continue
+		if ppid == me and argv == [b'sleep', b'30']:
+			return True
+	return False
+
+
 @pytest.mark.parametrize('first_backup', [True, False])
 def test_failed_backup_leaves_no_copy_running(job, poll_fast, monkeypatch, first_backup):
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
@@ -198,12 +216,16 @@ def test_failed_backup_leaves_no_copy_running(job, poll_fast, monkeypatch, first
 			executors.append(self)
 	monkeypatch.setattr(rv.multiCMD, 'AsyncExecutor', RecordingExecutor)
 	tasks = []
+	started = []
 	def slow_copy(source_path, dest_path, mcae=..., pending=None):
 		# the first copy is still running when the second one fails to reach the vault
 		if tasks:
 			deadline = time.monotonic() + 10
-			while tasks[0].start_time is None and time.monotonic() < deadline:
+			# multiCMD 1.51 and 1.54 differ in what a Task shows of a started command (1.54 sets thread before the
+			# process exists and clears it afterwards), so wait for the sleep process itself
+			while not _sleep_running() and time.monotonic() < deadline:
 				time.sleep(0.01)
+			started.append(_sleep_running())
 			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), dest_path)
 		temp = rv.partial_copy_path(dest_path)
 		open(temp, 'w').write('partial')
@@ -215,7 +237,7 @@ def test_failed_backup_leaves_no_copy_running(job, poll_fast, monkeypatch, first
 	with pytest.raises(OSError):
 		_backup(job, entries)
 	assert executors and not executors[-1].runningThreads
-	assert tasks[0].start_time is not None and tasks[0].returncode is not None and not tasks[0].is_alive()   # killed and reaped
+	assert started == [True] and tasks[0].returncode is not None and not tasks[0].is_alive()   # killed and reaped
 	assert semaphore._value == 4   # every permit is back
 	assert not _partial_files(job.vault)
 
@@ -392,3 +414,18 @@ def test_entry_named_like_a_partial_copy_is_backed_up_as_itself(job, poll_fast):
 	for version, foo in zip(versions, ('foo', 'foo changed')):
 		assert open(os.path.join(version, 'foo')).read() == foo
 		assert open(os.path.join(version, '.foo.reverberator-partial')).read() == 'not a partial copy'
+
+
+@pytest.mark.parametrize('flags', [{'warning': True}, {'debug': True}, {}])
+@pytest.mark.parametrize('debug_mode', [True, False])
+def test_backuper_log_needs_only_old_tee_logger_methods(monkeypatch, flags, debug_mode):
+	# Tee_Logger 6.40 has no teewarning, teedebug or debug
+	lines = []
+	class OldLogger:
+		def info(self, message, callerStackDepth=None):
+			lines.append(message)
+		teeprint = teeerror = teeok = teelog = info
+	monkeypatch.setattr(rv, 'tl', OldLogger())
+	monkeypatch.setattr(rv, 'DEBUG', debug_mode)
+	rv.backuperTeeLogToTl('p', 'm', **flags)
+	assert len(lines) == 1 and lines[0].endswith('m')
