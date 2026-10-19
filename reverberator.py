@@ -13,6 +13,7 @@ from collections import namedtuple
 from collections import OrderedDict
 import os
 import threading
+import functools
 import sys
 import signal
 import resource
@@ -624,6 +625,44 @@ apply_poll_wait_from_env()
 
 MOVE_PAIR_TIMEOUT_SECONDS = 30
 
+# a failed job waits JOB_RETRY_FIRST_SECONDS before its next attempt, twice as long after each failure in a row up to
+# JOB_RETRY_MAX_SECONDS, and starts over once an attempt ran JOB_RETRY_RESET_SECONDS before failing
+DEFAULT_JOB_RETRY_FIRST_SECONDS = 60
+DEFAULT_JOB_RETRY_MAX_SECONDS = 3600
+JOB_RETRY_FIRST_SECONDS = DEFAULT_JOB_RETRY_FIRST_SECONDS
+JOB_RETRY_MAX_SECONDS = DEFAULT_JOB_RETRY_MAX_SECONDS
+JOB_RETRY_RESET_SECONDS = 3600
+# the exit status when every job is stopped: only a rule or skip list fix helps, so systemd is told not to restart
+EXIT_ALL_STOPPED = 3
+
+def env_seconds(name:str, default:float) -> float:
+	'''Seconds from the environment variable name. Missing, unparsable, not above 0 or infinite → default.'''
+	try:
+		value = float(os.environ[name])
+	except (KeyError, ValueError):
+		return default
+	return value if 0 < value < float('inf') else default
+
+def apply_job_timing_from_env():
+	'''Set the job retry timing from REVERB_JOB_RETRY_FIRST_SECONDS and REVERB_JOB_RETRY_MAX_SECONDS. Invalid/missing → the defaults.'''
+	global JOB_RETRY_FIRST_SECONDS
+	global JOB_RETRY_MAX_SECONDS
+	JOB_RETRY_FIRST_SECONDS = env_seconds('REVERB_JOB_RETRY_FIRST_SECONDS', DEFAULT_JOB_RETRY_FIRST_SECONDS)
+	JOB_RETRY_MAX_SECONDS = env_seconds('REVERB_JOB_RETRY_MAX_SECONDS', DEFAULT_JOB_RETRY_MAX_SECONDS)
+
+apply_job_timing_from_env()
+
+def job_retry_delay(failures:int) -> float:
+	'''
+	Seconds before the next attempt of a job that failed this many attempts in a row.
+
+	Examples:
+		>>> [job_retry_delay(n) for n in (1, 2, 3, 7, 8)] == [60, 120, 240, 3600, 3600]
+		True
+	'''
+	# the exponent stops growing long after the cap is reached, so months of failures cannot overflow a float
+	return min(JOB_RETRY_FIRST_SECONDS * 2 ** min(failures - 1, 64), JOB_RETRY_MAX_SECONDS)
+
 MOUNTINFO_PATH = '/proc/self/mountinfo'
 
 ARG_MAX = os.sysconf('SC_ARG_MAX')
@@ -681,7 +720,105 @@ Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signatur
 tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=False,noLog=True)
 
 #%% ---- Main CLI Functions ----
+def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pending = None) -> str:
+	'''
+	Supervise one job: run its attempts until the daemon stops ('exit') or the job fails for good ('stopped').
+
+	start_attempt(job, attempt) starts an attempt's threads and returns them. An attempt ends when the job fails or one
+	of its threads ends, and all of its threads have exited before anything else happens, so the next attempt never
+	races them. A failure only a config change can fix stops the job. Any other is retried after job_retry_delay, which
+	grows with each failed attempt in a row and starts over once an attempt ran JOB_RETRY_RESET_SECONDS.
+	persist_pending() runs when the daemon stops after the job failed, as the backuper keeps a failed job's queue in
+	memory for its next attempt.
+	'''
+	global GREEN_LIGHT
+	failures = 0
+	attempt = 0
+	while GREEN_LIGHT.is_set():
+		attempt += 1
+		job.start_attempt()
+		started = clock()
+		threads = start_attempt(job, attempt)
+		recovering = failures > 0
+		while GREEN_LIGHT.is_set() and job.failure is None:
+			if recovering and job.committed.is_set():
+				job_log(job.job_name, f'RECOVERED after {failures} failed attempts')
+				recovering = False
+			ended = next((thread for thread in threads if not thread.is_alive()), None)
+			# read after the thread ended: one that ended as the daemon stops is not a failure
+			if ended is not None and GREEN_LIGHT.is_set():
+				job.fail(f'{ended.name} exited unexpectedly')
+				break
+			time.sleep(POLL_WAIT_SECONDS)
+		job.running.clear()
+		for thread in threads:
+			thread.join()
+		ran = clock() - started
+		if recovering and job.committed.is_set():
+			job_log(job.job_name, f'RECOVERED after {failures} failed attempts')
+		if not GREEN_LIGHT.is_set():
+			break
+		failure = job.failure
+		if failure.permanent:
+			job_log(job.job_name, f'STOPPED: {failure.reason}')
+			return 'stopped'
+		failures = 1 if ran >= JOB_RETRY_RESET_SECONDS else failures + 1
+		delay = job_retry_delay(failures)
+		job_log(job.job_name, f'FAILED: {failure.reason}; retrying in {int(delay)}s')
+		deadline = time.monotonic() + delay
+		while GREEN_LIGHT.is_set() and time.monotonic() < deadline:
+			time.sleep(max(min(POLL_WAIT_SECONDS, deadline - time.monotonic()), 0))
+	if job.failure is not None and persist_pending is not None:
+		persist_pending()
+	return 'exit'
+
+def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, backuper_args:tuple):
+	'''
+	A start_attempt for run_job: each attempt starts the job's watcher and backuper, sharing a fresh JobStartup.
+	startup_args are JobStartup's, watcher_args and backuper_args their function's positional arguments before startup.
+	'''
+	def start_attempt(job:JobControl, attempt:int) -> list:
+		startup = JobStartup(*startup_args)
+		threads = [
+			threading.Thread(target=watcher, args=(*watcher_args, startup, job), name=f'{job_name} watcher', daemon=True),
+			threading.Thread(target=backuper, args=(*backuper_args, startup, job), name=f'{job_name} backuper', daemon=True),
+		]
+		started = []
+		try:
+			for thread in threads:
+				thread.start()
+				started.append(thread)
+		except RuntimeError as e:
+			# out of threads: the attempt fails once the ones that did start have ended, and is retried
+			job.fail(f'cannot start its threads: {e}')
+		return started
+	return start_attempt
+
+def persist_failed_job_queue(job_name:str, monitor_path:str, vault_path:str, to_process:ChangeEventQueue, to_process_lock:threading.Lock):
+	'''
+	Save a failed job's queue as its pending transactions when the daemon stops.
+	Nothing was watched since the job failed, so replaying the queue would miss what changed meanwhile: it is saved as
+	a full scan request (which the queue folds everything queued into), as the job's next attempt would have done.
+	'''
+	with to_process_lock:
+		to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
+	persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
+
+def supervise_job(results:list, index:int, job:JobControl, start_attempt, persist_pending):
+	'''A job's supervisor thread: runs the job and records how it ended in results[index].'''
+	results[index] = run_job(job, start_attempt, persist_pending=persist_pending)
+
 def main():
+	'''The console entry point: runs the daemon, and exits 1 with a marker line when it fails.'''
+	try:
+		run_daemon()
+	except Exception as e:
+		import traceback
+		tl.teeerror(traceback.format_exc())
+		daemon_error_log(f'{type(e).__name__}: {e}')
+		sys.exit(1)
+
+def run_daemon():
 	global BACKUP_SEMAPHORE
 	global COMPARE_THREADS
 	global tl
@@ -694,6 +831,7 @@ def main():
 	global DEFAULT_BACKUP_SIZE_LIMIT
 	global DEBUG
 	apply_poll_wait_from_env()
+	apply_job_timing_from_env()
 	signal.signal(signal.SIGINT, signal_handler)
 	signal.signal(signal.SIGTERM, signal_handler)
 	args, argString = get_args()
@@ -725,9 +863,10 @@ def main():
 	if not rules:
 		tl.teeerror(f'Error: Rule file {args.rule_path} appears empty after parsing.')
 		sys.exit(1)
-	# start the main loop
-	main_threads = []
-	for reverb_rule in rules:
+	# one supervisor per job runs its watcher and backuper, and starts them again after a failure
+	supervisors = []
+	results = [None] * len(rules)
+	for index, reverb_rule in enumerate(rules):
 		job_name = reverb_rule.job_name
 		monitor_path = reverb_rule.mon_path
 		monitor_path_signature = reverb_rule.mon_fs_signature
@@ -763,25 +902,32 @@ def main():
 		vault_path_signature = reverb_rule.vault_fs_signature
 		job_vault = os.path.join(vault_path, job_name)
 		remove_incomplete_vault_versions(job_vault)
+		# kept across the job's attempts, so a retry loses nothing queued
 		to_process = ChangeEventQueue(monitor_path)
 		to_process_lock = threading.Lock()
-		# the backuper loads the skip list once the job's filesystems are ready, then decides on resuming pending transactions
-		startup = JobStartup(job_name, monitor_path, resolve_skip_list_path(reverb_rule.skip_list_file, args.rule_path), reverb_rule.skip_list_file.strip().lower() == 'none')
 		to_process_flag = threading.Event()
-		tl.teeprint(f'Starting path watcher {job_name} for {monitor_path}')
 		monitor_fs_flag = FS_SIGNATURE_MONITOR.register(monitor_path,monitor_path_signature)
-		watcherThread = threading.Thread(target=watcher,args=(monitor_fs_flag,monitor_path,to_process,to_process_lock,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds,startup),daemon=True)
-		watcherThread.start()
-		main_threads.append(watcherThread)
-		tl.teeok(f'Started reverb monitor for {job_name} with monitor path {monitor_path}:{monitor_path_signature}')
-		backup_thread = threading.Thread(target=backuper,args=(job_name,to_process,to_process_lock,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal,startup),daemon=True)
+		# every attempt loads the skip list again once the job's filesystems are ready, then decides on resuming pending transactions
+		startup_args = (job_name, monitor_path, resolve_skip_list_path(reverb_rule.skip_list_file, args.rule_path), reverb_rule.skip_list_file.strip().lower() == 'none')
+		watcher_args = (monitor_fs_flag,monitor_path,to_process,to_process_lock,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds)
+		backuper_args = (job_name,to_process,to_process_lock,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal)
+		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args)
+		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
 		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
-		backup_thread.start()
-		main_threads.append(backup_thread)
-		tl.teeok(f'Started backup thread for {job_name} with vault path {vault_path}:{vault_path_signature}')
-	for thread in main_threads:
-		thread.join()
-	tl.teeok('All threads have exited. Exiting main thread.')
+		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
+		supervisor.start()
+		supervisors.append(supervisor)
+		tl.teeok(f'Started job {job_name} watching {monitor_path}:{monitor_path_signature} into vault {vault_path}:{vault_path_signature}')
+	for supervisor in supervisors:
+		supervisor.join()
+	if not GREEN_LIGHT.is_set():
+		tl.teeok('All jobs have exited. Exiting main thread.')
+		return
+	if all(result == 'stopped' for result in results):
+		daemon_error_log('every job is stopped')
+		sys.exit(EXIT_ALL_STOPPED)
+	# only a stop ends a job's supervisor without stopping the job, so one of them failed
+	raise RuntimeError(f'job supervisors ended without a stop: {results}')
 
 def signal_handler(sig, frame):
 	global GREEN_LIGHT
@@ -1302,6 +1448,45 @@ class inotify_resource_manager:
 		self.current_user_watches -= count
 		return self.current_user_watches
 
+class inotify_usage:
+	'''
+	What one watchFolder run took from the shared inotify_resource_manager, which it forwards everything to.
+	Closing a run's inotify instance frees all of its watches, so leaving the with block gives back exactly what the run
+	counted, however it ends: a job's retries do not add up in the shared counts.
+	'''
+	def __init__(self, irm:inotify_resource_manager):
+		self.irm = irm
+		self.instances = 0
+		self.watches = 0
+
+	def __getattr__(self, name):
+		return getattr(self.irm, name)
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc_info):
+		self.irm.decreaseUserWatches(self.watches)
+		self.irm.decreaseUserInstances(self.instances)
+		self.watches = self.instances = 0
+		return False
+
+	def increaseUserInstances(self,count:int = 1):
+		self.instances += count
+		return self.irm.increaseUserInstances(count)
+
+	def decreaseUserInstances(self,count:int = 1):
+		self.instances -= count
+		return self.irm.decreaseUserInstances(count)
+
+	def increaseUserWatches(self,count:int = 1):
+		self.watches += count
+		return self.irm.increaseUserWatches(count)
+
+	def decreaseUserWatches(self,count:int = 1):
+		self.watches -= count
+		return self.irm.decreaseUserWatches(count)
+
 #%% ---- Watcher ----
 def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,to_process_flag:threading.Event,irm:inotify_resource_manager,min_snapshot_delay_seconds:int=DEFAULT_SNAPSHOT_DELAY,max_shapshot_delay_seconds:int=DEFAULT_MAX_DELAY,startup:JobStartup = None,job:JobControl = None):
 	global GREEN_LIGHT
@@ -1352,8 +1537,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	newDirWDs = set()
 	processPending = False
 	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
+	irm = inotify_usage(irm)
 	irm.increaseUserInstances()
-	with inotify_simple.INotify() as inotify_obj:
+	with irm, inotify_simple.INotify() as inotify_obj:
 		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags,skip_list=skip_list)
 		if mainWatchDescriptor == -1:
 			watcherTeeLogToTl(monitor_path,f'Failed to initialize folder watchers for {monitor_path}',error=True)
@@ -1413,8 +1599,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					if event.wd == mainWatchDescriptor:
 						# if UNMOUNT or IGNORED or DELETE_SELF, MOVE_SELF, return false
 						watcherTeeLogToTl(monitor_path,'Main dir self destruct event detected, terminating')
-						irm.decreaseUserWatches(len(wdDic))
-						irm.decreaseUserInstances()
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'self_destruct',monitor_path,None))
 						return WATCH_RESULT_SELF_DESTRUCT
 					elif event.mask & flags.DELETE_SELF:
@@ -2558,150 +2742,157 @@ def do_backup(backup_entries:dict,
 			if vaultInfo is None:
 				vaultInfo = VaultInfo({}, 0, 0)
 			return vaultInfo, manifest, False
-	if manifest is None:
+	# a manifest opened here is closed here if the backup raises, as the caller never gets it back
+	opened_manifest = manifest is None
+	if opened_manifest:
 		manifest = VaultManifest(job_vault)
-	if log_journal:
-		journalPath = os.path.join(job_vault,'journal.tsv')
-		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'start_reverb_backup_{len(backup_entries)}_enties',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
-	backuperTeeLogToTl(job_name,'-'* 60)
-	backuperTeeLogToTl(job_name,f'Backing up {monitor_path} to {job_vault}')
-	# NOTE: intentionally not holding BACKUP_SEMAPHORE here: the AsyncExecutors below
-	# acquire permits from the same semaphore per command, and holding a permit while
-	# waiting for them deadlocks when permits are exhausted (e.g. --threads 1).
-	# do the actual backup
-	# get the latest current version path
-	if not vaultInfo or not vaultInfo.vault_info_dict:
-		vaultInfo = get_vault_info(job_vault_path=job_vault)
-	vault_info_dict = vaultInfo.vault_info_dict
-	vault_size = vaultInfo.vault_size
-	vault_inodes = vaultInfo.vault_inodes
-	if not vault_info_dict:
-		backuperTeeLogToTl(job_name,f'Failed to get any version for {job_vault}, treating the vault as new.',error=True)
-		this_version_number = 0
-		this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
-		backup_folder = os.path.join(job_vault,f'V0--{this_timestamp}')
-		os.makedirs(backup_folder,exist_ok=True)
-		manifest.begin()
-		if keep_one_complete_backup:
-			backuperTeeLogToTl(job_name,f'Creating a complete backup of {monitor_path} to {backup_folder}',ok=True)
-			if log_journal:
-				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_complete_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
-			manifest.reset(backup_folder)
-			mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
-			# the walk yields each folder before its contents
-			for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=skip):
-				backupEntryPath = os.path.join(backup_folder,relativePath)
-				manifest.add(relativePath,dirty=True)
-				if isDir:
-					os.makedirs(backupEntryPath,exist_ok=True)
-					copy_file_meta(monitorEntry,backupEntryPath)
-				else:
-					cp_af_copy_path(monitorEntry,backupEntryPath,mcae)
-			while GREEN_LIGHT.is_set() and mcae.runningThreads:
-				mcae.wait(timeout=POLL_WAIT_SECONDS)
-			mcae.cleanup(timeout=POLL_WAIT_SECONDS)
-			record_dirty_entries(manifest,backup_folder,monitor_path)
-		else:
-			backuperTeeLogToTl(job_name,f'Creating a referenced backup of {monitor_path} to {backup_folder}',ok=True)
-			if log_journal:
-				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_referenced_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
-			manifest.rebuild(backup_folder,tree_path=monitor_path,skip=skip)
-			do_referenced_copy(monitor_path,backup_folder,manifest)
-	else:
-		# Now we have made sure the vault is within the size limit, we can proceed to do the backup
-		latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
-		if not backup_entries:
-			backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
-			delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list)
-			if not GREEN_LIGHT.is_set():
-				# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
-				backup_entries.clear()
-				backuperTeeLogToTl(job_name, 'Delta generation interrupted; not creating a new version', error=True)
-				return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
-			if log_journal:
-				TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'delta_generated_{len(backup_entries)}_differences',monitor_path],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
-				log_events_to_journal(backup_entries,journalPath)
-		if not backup_entries:
-			backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
-			# the walk completed with no differences, so the tree matches the manifest under this skip list
+	try:
+		if log_journal:
+			journalPath = os.path.join(job_vault,'journal.tsv')
+			TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'start_reverb_backup_{len(backup_entries)}_enties',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+		backuperTeeLogToTl(job_name,'-'* 60)
+		backuperTeeLogToTl(job_name,f'Backing up {monitor_path} to {job_vault}')
+		# NOTE: intentionally not holding BACKUP_SEMAPHORE here: the AsyncExecutors below
+		# acquire permits from the same semaphore per command, and holding a permit while
+		# waiting for them deadlocks when permits are exhausted (e.g. --threads 1).
+		# do the actual backup
+		# get the latest current version path
+		if not vaultInfo or not vaultInfo.vault_info_dict:
+			vaultInfo = get_vault_info(job_vault_path=job_vault)
+		vault_info_dict = vaultInfo.vault_info_dict
+		vault_size = vaultInfo.vault_size
+		vault_inodes = vaultInfo.vault_inodes
+		if not vault_info_dict:
+			backuperTeeLogToTl(job_name,f'Failed to get any version for {job_vault}, treating the vault as new.',error=True)
+			this_version_number = 0
+			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
+			backup_folder = os.path.join(job_vault,f'V0--{this_timestamp}')
+			os.makedirs(backup_folder,exist_ok=True)
 			manifest.begin()
-			manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
-			manifest.commit()
+			if keep_one_complete_backup:
+				backuperTeeLogToTl(job_name,f'Creating a complete backup of {monitor_path} to {backup_folder}',ok=True)
+				if log_journal:
+					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_complete_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+				manifest.reset(backup_folder)
+				mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
+				# the walk yields each folder before its contents
+				for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=skip):
+					backupEntryPath = os.path.join(backup_folder,relativePath)
+					manifest.add(relativePath,dirty=True)
+					if isDir:
+						os.makedirs(backupEntryPath,exist_ok=True)
+						copy_file_meta(monitorEntry,backupEntryPath)
+					else:
+						cp_af_copy_path(monitorEntry,backupEntryPath,mcae)
+				while GREEN_LIGHT.is_set() and mcae.runningThreads:
+					mcae.wait(timeout=POLL_WAIT_SECONDS)
+				mcae.cleanup(timeout=POLL_WAIT_SECONDS)
+				record_dirty_entries(manifest,backup_folder,monitor_path)
+			else:
+				backuperTeeLogToTl(job_name,f'Creating a referenced backup of {monitor_path} to {backup_folder}',ok=True)
+				if log_journal:
+					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_referenced_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=skip)
+				do_referenced_copy(monitor_path,backup_folder,manifest)
+		else:
+			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
+			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
+			if not backup_entries:
+				backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
+				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list)
+				if not GREEN_LIGHT.is_set():
+					# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
+					backup_entries.clear()
+					backuperTeeLogToTl(job_name, 'Delta generation interrupted; not creating a new version', error=True)
+					return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
+				if log_journal:
+					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'delta_generated_{len(backup_entries)}_differences',monitor_path],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+					log_events_to_journal(backup_entries,journalPath)
+			if not backup_entries:
+				backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
+				# the walk completed with no differences, so the tree matches the manifest under this skip list
+				manifest.begin()
+				manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
+				manifest.commit()
+				if vaultInfo is None:
+					vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
+				return vaultInfo, manifest, True
+			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path,skip_list = skip_list)
+			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
+			estimated_backup_inode = latest_version_info.inode + estimated_backup_inode_change
+			backuperTeeLogToTl(job_name,f'Estimated backup inodes {estimated_backup_inode}')
+			vault_fs_size, vault_fs_inode = get_path_fs_info(vault_path)
+			backuperTeeLogToTl(job_name,f'Got vault fs size {vault_fs_size} and vault fs inode {vault_fs_inode}')
+			backup_limit_size, backup_limit_inode = get_backup_limits_from_str(backup_size_limit=backup_size_limit,vault_fs_size=vault_fs_size,vault_fs_inode=vault_fs_inode)
+			backuperTeeLogToTl(job_name,f'Calculated backup size limit {backup_limit_size} and backup inode limit {backup_limit_inode}')
+			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
+			if backup_limit_size:
+				while vault_size + estimated_backup_size > backup_limit_size:
+					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size} exceeds backup size limit {backup_limit_size}')
+					# we need to remove the oldest version
+					removed_size, removed_inodes = decrement_stepper(vault_info_dict)
+					vault_size -= removed_size
+					vault_inodes -= removed_inodes
+					if not removed_size and not removed_inodes:
+						break
+			if backup_limit_inode:
+				while vault_inodes + estimated_backup_inode > backup_limit_inode:
+					backuperTeeLogToTl(job_name,f'Vault inodes {vault_inodes} + estimated backup inodes {estimated_backup_inode} exceeds backup inode limit {backup_limit_inode}')
+					# we need to remove the oldest version
+					removed_size, removed_inodes = decrement_stepper(vault_info_dict)
+					vault_size -= removed_size
+					vault_inodes -= removed_inodes
+					if not removed_size and not removed_inodes:
+						break
+			while keep_n_versions and len(vault_info_dict) >= keep_n_versions:
+				backuperTeeLogToTl(job_name,f'Vault has {len(vault_info_dict)} versions, exceeding keep n versions {keep_n_versions}')
+				# we need to remove the oldest version
+				removed_size, removed_inodes = decrement_stepper(vault_info_dict)
+				vault_size -= removed_size
+				vault_inodes -= removed_inodes
+				if not removed_size and not removed_inodes:
+					break
+			this_version_number = latest_version_info.version_number + 1
+			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
+			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
+			os.makedirs(backup_folder,exist_ok=True)
+			backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
+			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list)
+		backup_finished = GREEN_LIGHT.is_set()
+		if not backup_finished:
+			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
+			manifest.rollback()
 			if vaultInfo is None:
 				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
-			return vaultInfo, manifest, True
-		estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path,skip_list = skip_list)
-		backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
-		estimated_backup_inode = latest_version_info.inode + estimated_backup_inode_change
-		backuperTeeLogToTl(job_name,f'Estimated backup inodes {estimated_backup_inode}')
-		vault_fs_size, vault_fs_inode = get_path_fs_info(vault_path)
-		backuperTeeLogToTl(job_name,f'Got vault fs size {vault_fs_size} and vault fs inode {vault_fs_inode}')
-		backup_limit_size, backup_limit_inode = get_backup_limits_from_str(backup_size_limit=backup_size_limit,vault_fs_size=vault_fs_size,vault_fs_inode=vault_fs_inode)
-		backuperTeeLogToTl(job_name,f'Calculated backup size limit {backup_limit_size} and backup inode limit {backup_limit_inode}')
-		backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
-		if backup_limit_size:
-			while vault_size + estimated_backup_size > backup_limit_size:
-				backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size} exceeds backup size limit {backup_limit_size}')
-				# we need to remove the oldest version
-				removed_size, removed_inodes = decrement_stepper(vault_info_dict)
-				vault_size -= removed_size
-				vault_inodes -= removed_inodes
-				if not removed_size and not removed_inodes:
-					break
-		if backup_limit_inode:
-			while vault_inodes + estimated_backup_inode > backup_limit_inode:
-				backuperTeeLogToTl(job_name,f'Vault inodes {vault_inodes} + estimated backup inodes {estimated_backup_inode} exceeds backup inode limit {backup_limit_inode}')
-				# we need to remove the oldest version
-				removed_size, removed_inodes = decrement_stepper(vault_info_dict)
-				vault_size -= removed_size
-				vault_inodes -= removed_inodes
-				if not removed_size and not removed_inodes:
-					break
-		while keep_n_versions and len(vault_info_dict) >= keep_n_versions:
-			backuperTeeLogToTl(job_name,f'Vault has {len(vault_info_dict)} versions, exceeding keep n versions {keep_n_versions}')
-			# we need to remove the oldest version
-			removed_size, removed_inodes = decrement_stepper(vault_info_dict)
-			vault_size -= removed_size
-			vault_inodes -= removed_inodes
-			if not removed_size and not removed_inodes:
-				break
-		this_version_number = latest_version_info.version_number + 1
-		this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
-		backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
-		os.makedirs(backup_folder,exist_ok=True)
-		backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
-		do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list)
-	backup_finished = GREEN_LIGHT.is_set()
-	if not backup_finished:
-		backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
-		manifest.rollback()
-		if vaultInfo is None:
-			vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
-		return vaultInfo, manifest, False
-	# check the size of the backup
-	this_size = get_path_size(backup_folder)
-	this_inodes = get_path_inodes(backup_folder)
-	vault_size += this_size
-	vault_inodes += this_inodes
-	backup_size_str = format_bytes(this_size,use_1024_bytes=True,to_str=True).replace(' ','_')
-	backup_inode_str = format_bytes(this_inodes,use_1024_bytes=False,to_str=True).replace(' ','')
-	content_file_name = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
-	content_file_content = [[path] + list(values) for path,values in backup_entries.items()]
-	# commit before the content file: without one the version is removed at startup, and a manifest
-	# describing a removed version is listed again from the vault
-	manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
-	manifest.commit(backup_folder)
-	TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
-	backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
-	# create the current version symlink
-	if os.path.lexists(os.path.join(job_vault,'current_version')):
-		os.remove(os.path.join(job_vault,'current_version'))
-	vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder,this_timestamp,this_size,this_inodes)
-	os.symlink(os.path.basename(backup_folder),os.path.join(job_vault,'current_version'),target_is_directory=True)
-	if log_journal:
-		tracked_files, tracked_folders = manifest.counts()
-		TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'end_reverb_backup_{tracked_files}files_{tracked_folders}folders_tracked',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
-	return VaultInfo(vault_info_dict,vault_size,vault_inodes), manifest, True
+			return vaultInfo, manifest, False
+		# check the size of the backup
+		this_size = get_path_size(backup_folder)
+		this_inodes = get_path_inodes(backup_folder)
+		vault_size += this_size
+		vault_inodes += this_inodes
+		backup_size_str = format_bytes(this_size,use_1024_bytes=True,to_str=True).replace(' ','_')
+		backup_inode_str = format_bytes(this_inodes,use_1024_bytes=False,to_str=True).replace(' ','')
+		content_file_name = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+		content_file_content = [[path] + list(values) for path,values in backup_entries.items()]
+		# commit before the content file: without one the version is removed at startup, and a manifest
+		# describing a removed version is listed again from the vault
+		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
+		manifest.commit(backup_folder)
+		TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
+		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
+		# create the current version symlink
+		if os.path.lexists(os.path.join(job_vault,'current_version')):
+			os.remove(os.path.join(job_vault,'current_version'))
+		vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder,this_timestamp,this_size,this_inodes)
+		os.symlink(os.path.basename(backup_folder),os.path.join(job_vault,'current_version'),target_is_directory=True)
+		if log_journal:
+			tracked_files, tracked_folders = manifest.counts()
+			TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'end_reverb_backup_{tracked_files}files_{tracked_folders}folders_tracked',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+		return VaultInfo(vault_info_dict,vault_size,vault_inodes), manifest, True
+	except BaseException:
+		if opened_manifest:
+			manifest.close()
+		raise
 
 def pending_transaction_rows(events) -> list:
 	'''

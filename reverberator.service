@@ -16,6 +16,8 @@ ExecStart=/usr/bin/env python3 /opt/reverberator/reverberator.py /etc/reverberat
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=5
+# Exit status 3: every job is stopped until its rule or skip list is fixed, so restarting would only fail again.
+RestartPreventExitStatus=3
 
 # Optional hardening/tuning.
 NoNewPrivileges=true
