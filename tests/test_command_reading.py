@@ -159,12 +159,38 @@ def test_resolve_referenced_link(job):
 	assert got.kind == 'referenced'
 
 
-def test_resolve_chain_longer_than_the_limit(job, monkeypatch):
-	three_versions(job)
+def test_resolve_chain_longer_than_the_kernel_limit(job):
+	# V1..V45 each link to the one below, as the daemon writes them: more than the 40 links the kernel follows
+	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp='2021-01-01_00-00-00_-0800')
+	previous = v0
+	for n in range(1, 46):
+		folder = write_committed_version(job, n, {'a/': None}, timestamp=f'2021-01-01_00-00-{n:02d}_-0800')
+		os.symlink(f'../../{os.path.basename(previous)}/a/x', os.path.join(folder, 'a/x'))
+		previous = folder
+	got = rv.resolve_version_entry(job.job_vault, previous, 'a/x', job.monitor)
+	assert got.kind == 'file' and got.path == os.path.join(v0, 'a/x')
+
+
+def test_resolve_through_a_user_folder_symlink_is_missing(job):
+	# lib is a user symlink to a folder outside the vault, chained through V1 and V2
+	outside = os.path.join(job.root, 'outside')
+	os.makedirs(outside)
+	open(os.path.join(outside, 'secret'), 'w').write('live')
+	seed_monitor(job, {'keep': 'k'})
+	os.symlink(outside, os.path.join(job.monitor, 'lib'))
+	run_backup(job)
 	paths = more_versions(job, 2)
-	monkeypatch.setattr(rv, 'MAX_CHAINED_LINKS', 2)
-	got = rv.resolve_version_entry(job.job_vault, paths[4], 'a/x', job.monitor)
-	assert got.kind == 'dangling' and 'too many' in got.detail
+	assert os.path.islink(os.path.join(paths[2], 'lib'))
+	got = rv.resolve_version_entry(job.job_vault, paths[2], 'lib/secret', job.monitor)
+	assert got.kind == 'missing' and 'lib is a symlink' in got.detail
+	assert rv.resolve_version_entry(job.job_vault, paths[2], 'lib', job.monitor).kind == 'symlink'
+
+
+def test_resolve_through_a_relative_user_folder_symlink_is_missing(job):
+	paths = three_versions(job)
+	os.symlink('a', os.path.join(paths[2], 'rel'))
+	got = rv.resolve_version_entry(job.job_vault, paths[2], 'rel/x', job.monitor)
+	assert got.kind == 'missing' and 'rel is a symlink' in got.detail
 	assert rv.resolve_version_entry(job.job_vault, paths[2], 'a/x', job.monitor).kind == 'file'
 
 

@@ -6026,7 +6026,7 @@ def chain_form_missing_version(job_vault:str, link_path:str, link_text:str):
 def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path:str) -> ResolvedEntry:
 	'''
 	Where the content of rel in the version at version_path really is, following the links that chain an unchanged entry
-	back to the version holding its copy (the rule read_vault_record() follows, up to MAX_CHAINED_LINKS of them).
+	back to the version holding its copy (the rule read_vault_record() follows, however many versions back).
 	The kind is 'file' or 'folder' (path is the real copy), 'symlink' (a user's symlink backed up as one; path is the
 	link), 'referenced' (a link to the monitored file itself; path is the link), 'missing' (the version has no such
 	entry), 'dangling' (a chain leads to nothing, or is too long) or 'unreadable' (a link or folder could not be
@@ -6035,6 +6035,23 @@ def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path
 	vault = os.path.abspath(job_vault)
 	entry = os.path.abspath(os.path.join(version_path, rel))
 	hops = 0
+	# every hop goes down a version, so the walk ends by itself; this only bounds it should a link ever not
+	own_number = vault_version_number(os.path.basename(os.path.abspath(version_path)))
+	max_hops = (own_number or 0) + 1
+	# lstat follows the symlinks among rel's folders, so they must be real ones: a backed-up folder symlink holds no
+	# files of the version, and what lies behind it is the live file
+	version_top = os.path.abspath(version_path)
+	try:
+		real_folders = is_real_folder_under(version_top, os.path.dirname(entry))
+	except UncheckedVaultLink as e:
+		return ResolvedEntry('unreadable', entry, str(e))
+	if not real_folders:
+		path = version_top
+		for part in os.path.dirname(entry)[len(version_top) + 1:].split('/'):
+			path = os.path.join(path, part) if part else path
+			if os.path.islink(path):
+				return ResolvedEntry('missing', entry, f'{part} is a symlink in {os.path.basename(version_top)}')
+		return ResolvedEntry('missing', entry, f'{rel} is not in {os.path.basename(version_top)}')
 	while True:
 		# the entry's path in the version it is found in, which a move since the link was made may have changed
 		in_vault = entry.startswith(vault + '/')
@@ -6062,8 +6079,8 @@ def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path
 				return ResolvedEntry('referenced', entry, text)
 			return ResolvedEntry('symlink', entry, text)
 		hops += 1
-		if hops > MAX_CHAINED_LINKS:
-			return ResolvedEntry('dangling', entry, f'too many links in the chain (more than {MAX_CHAINED_LINKS})')
+		if hops > max_hops:
+			return ResolvedEntry('dangling', entry, 'too many links in the chain')
 		entry = hop
 
 ChangeRow = namedtuple('ChangeRow', ['path', 'iso_time', 'event', 'source_path'])
