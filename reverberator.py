@@ -447,6 +447,23 @@ class SkipList:
 			return False
 		return self._spec.match_file(rel)
 
+	def deciding_pattern(self, rel:str, is_dir:bool) -> str:
+		'''
+		The pattern that skips a root-relative path, or the first skipped folder above it, as the walk never goes into a
+		skipped folder; None when nothing skips it.
+		>>> skip = SkipList('/m', ['build/', '*.tmp', '!keep.tmp', 'cache/', '!cache/keep'])
+		>>> [skip.deciding_pattern(rel, is_dir) for rel, is_dir in (('build/x', False), ('cache/keep', False),
+		...     ('a/b.tmp', False), ('a/keep.tmp', False), ('build', True), ('build', False), ('', True))]
+		['build/', 'cache/', '*.tmp', None, 'build/', None, None]
+		'''
+		parts = rel.strip('/').split('/') if self.patterns and rel.strip('/') else []
+		for depth in range(1, len(parts) + 1):
+			entry = '/'.join(parts[:depth]) + ('/' if depth < len(parts) or is_dir else '')
+			result = self._spec.check_file(entry)
+			if result.include:
+				return self._spec.patterns[result.index].pattern
+		return None
+
 	def skips_path(self, path:str, is_dir:bool) -> bool:
 		'''Like skips() for an absolute path; the root and paths outside it are never skipped.'''
 		if not self.patterns:
@@ -6513,6 +6530,260 @@ def status_command(args) -> int:
 	print(format_status(status, load_command_rules(rule_path), rule_path))
 	return 0
 
+HistoryRow = namedtuple('HistoryRow', ['version', 'event', 'size', 'source', 'counts', 'files'])
+
+# what a change list row can record, as a folder's history counts them
+CHANGE_EVENTS = ('create', 'modify', 'attrib', 'move', 'delete')
+
+PathChanges = namedtuple('PathChanges', ['row', 'moved_from', 'moved_to', 'counts', 'files'])
+
+def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool = True) -> PathChanges:
+	'''
+	What the change list at change_list says about path, an absolute monitored path, read once as it streams in: the
+	path's own row (None when it has none); where a move of it, or of a folder above it, took it from (moved_from) or
+	to (moved_to), else None; and for a folder, how many rows lie below it by event (counts) and each one's
+	(event, path below the folder) in the list's order, folders keeping their trailing '/' (files; None unless
+	list_files). The folder's own row is not counted below it.
+	'''
+	own = path.rstrip('/')
+	prefix = own + '/'
+	row_found = moved_from = moved_to = None
+	# the nearest folder above the path that moved tells where it went
+	from_depth = to_depth = 0
+	counts = dict.fromkeys(CHANGE_EVENTS, 0) if folder else None
+	files = [] if folder and list_files else None
+	for row in iter_change_list(change_list):
+		its_own = row.path.rstrip('/') == own
+		if its_own:
+			row_found = row
+		elif folder and row.path.startswith(prefix) and row.event in counts:
+			counts[row.event] += 1
+			if files is not None:
+				files.append((row.event, row.path[len(prefix):]))
+		if row.event != 'move' or not row.source_path:
+			continue
+		source = row.source_path
+		if its_own:
+			moved_from, from_depth = source.rstrip('/'), len(prefix)
+		elif row.path.endswith('/') and prefix.startswith(row.path) and len(row.path) > from_depth:
+			moved_from, from_depth = source.rstrip('/') + '/' + own[len(row.path):], len(row.path)
+		if source.rstrip('/') == own:
+			moved_to, to_depth = row.path.rstrip('/'), len(prefix)
+		elif source.endswith('/') and prefix.startswith(source) and len(source) > to_depth:
+			moved_to, to_depth = row.path.rstrip('/') + '/' + own[len(source):], len(source)
+	return PathChanges(row_found, moved_from, moved_to, counts, files)
+
+def history_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str) -> tuple:
+	'''
+	How version holds rel: its ResolvedEntry, and the path the entry's own chain link (by chain_hop()) names in the
+	older version it links to, None when the entry is not a chain link.
+	'''
+	resolved = resolve_version_entry(job_vault, version.path, rel, monitor_path)
+	if resolved.kind == 'missing' or not rel:
+		return resolved, None
+	vault = os.path.abspath(job_vault)
+	entry = os.path.join(os.path.abspath(version.path), rel)
+	try:
+		hop = chain_hop(vault, entry, os.readlink(entry))
+	except (OSError, ValueError):
+		# not a link
+		hop = None
+	return resolved, None if hop is None else hop[len(vault) + 1:].partition('/')[2]
+
+def resolved_size(resolved:ResolvedEntry):
+	'''The size of the file a version holds, None for anything else or a copy that cannot be looked at.'''
+	if resolved.kind != 'file':
+		return None
+	try:
+		return os.lstat(resolved.path).st_size
+	except OSError:
+		return None
+
+def held_event(changes:PathChanges, resolved:ResolvedEntry, moved_from:str, held_before:bool) -> tuple:
+	'''
+	(event, source) for a version that holds a path and changed it: its change list row's event when that fits a path
+	the version holds; else a move when the entry came from another path; else a creation when the version below
+	lacked it, or 'changed'. A link that leads nowhere or cannot be read is 'changed' unless its row says more.
+	'''
+	row = changes.row
+	if row is not None and row.event in ('create', 'modify', 'attrib', 'move'):
+		return row.event, changes.moved_from if row.event == 'move' else None
+	if resolved.kind in ('dangling', 'unreadable'):
+		return 'changed', None
+	if moved_from is not None:
+		return 'move', moved_from
+	return ('changed' if held_before else 'create'), None
+
+def path_history(job_vault:str, versions:list, monitor_path:str, rel:str, folder:bool, list_files:bool = True) -> list:
+	'''file_history() or folder_history(): the version folders tell when the path changed, the change lists what.'''
+	path = os.path.join(monitor_path, rel) if rel else monitor_path
+	rows = []
+	held_before = False
+	for index, version in enumerate(versions):
+		resolved, hop_rel = history_entry(job_vault, version, monitor_path, rel)
+		held = resolved.kind != 'missing'
+		size = None if folder else resolved_size(resolved)
+		if not index:
+			# not a change: what it changed from is no longer kept, so its change list is not read
+			if held:
+				rows.append(HistoryRow(version, 'oldest', size, None, dict.fromkeys(CHANGE_EVENTS, 0) if folder else None,
+					[] if folder and list_files else None))
+		else:
+			changes = path_changes(version.change_list, path, folder, list_files)
+			if held:
+				# a version's folders are real folders; a file is unchanged when it links to the same path in an older version
+				changed = (not held_before or changes.row is not None or (folder and any(changes.counts.values()))
+					or (not folder and hop_rel != rel))
+				if changed:
+					moved_from = os.path.join(monitor_path, hop_rel) if hop_rel not in (None, rel) else changes.moved_from
+					event, source = held_event(changes, resolved, moved_from, held_before)
+					rows.append(HistoryRow(version, event, size, source, changes.counts, changes.files))
+			elif held_before:
+				event = 'delete' if changes.moved_to is None else 'moved_away'
+				rows.append(HistoryRow(version, event, None, changes.moved_to, changes.counts, changes.files))
+		held_before = held
+	return rows[::-1]
+
+def path_kind(job_vault:str, versions:list, monitor_path:str, rel:str) -> str:
+	'''
+	Whether rel is a 'folder' or a 'file' (anything else held for it too, such as a symlink) in the newest version that
+	holds it, None when no kept version does. The monitored path itself is a folder.
+	'''
+	if not rel:
+		return 'folder'
+	found = None
+	for version in reversed(versions):
+		kind = resolve_version_entry(job_vault, version.path, rel, monitor_path).kind
+		if kind == 'folder':
+			return 'folder'
+		if kind == 'unreadable':
+			# held, but an older version may still tell what it is
+			found = 'file'
+		elif kind != 'missing':
+			return 'file'
+	return found
+
+def file_history(job_vault:str, versions:list, monitor_path:str, rel:str) -> list:
+	'''
+	The HistoryRows of a file (or symlink) at rel, newest first, from the kept versions (oldest first, as list_versions()
+	gives them). A version is listed when its entry is not a chain link to the same path in an older version (a chain
+	link to another path is a move from it), when it lacks the entry the version below held (delete, or moved_away when
+	its change list moved the path, or a folder above it, elsewhere), or when its change list has a row for the path
+	(such as an attribute change, which the version's link does not show); the row gives the event when it has one.
+	The oldest kept version is listed as 'oldest' when it holds the entry. Each change list is read once, streamed.
+	'''
+	return path_history(job_vault, versions, monitor_path, rel, folder=False)
+
+def folder_history(job_vault:str, versions:list, monitor_path:str, rel:str, list_files:bool = True) -> list:
+	'''
+	The HistoryRows of the folder at rel ('' for the monitored path), newest first: a version is listed when its change
+	list has rows below the folder (counted by event, and each with its path below the folder in files unless
+	list_files is False), or a row for the folder itself, or when the folder appears or goes in it (as its own row or a
+	move of a folder above it says, else create or delete); the oldest kept version holding it is listed as 'oldest'.
+	'''
+	return path_history(job_vault, versions, monitor_path, rel, folder=True, list_files=list_files)
+
+HISTORY_LABELS = {'create': 'created', 'modify': 'modified', 'attrib': 'attributes changed', 'delete': 'deleted',
+	'changed': 'changed', 'oldest': 'oldest kept copy'}
+
+def history_label(row:HistoryRow) -> str:
+	'''
+	What happened to the path in a row's version, for people.
+	>>> version = KeptVersion(1, '/v/V1', 'V1', 0.0, 0, 0, '/v/V1.nsv')
+	>>> [history_label(HistoryRow(version, event, None, source, None, None)) for event, source in (
+	...     ('modify', None), ('move', '/m/a'), ('moved_away', '/m/b'), ('oldest', None))]
+	['modified', 'moved from /m/a', 'moved to /m/b', 'oldest kept copy']
+	'''
+	if row.event == 'move':
+		return f'moved from {row.source}' if row.source else 'moved'
+	if row.event == 'moved_away':
+		return f'moved to {row.source}'
+	return HISTORY_LABELS.get(row.event, row.event)
+
+def counts_phrase(counts:dict) -> str:
+	'''
+	What changed under a folder in a version, for people.
+	>>> counts_phrase({'create': 2, 'modify': 0, 'attrib': 1, 'move': 0, 'delete': 3})
+	'2 created, 0 modified, 3 deleted, 1 attributes changed'
+	'''
+	phrase = f'{counts["create"]} created, {counts["modify"]} modified, {counts["delete"]} deleted'
+	if counts['move']:
+		phrase += f', {counts["move"]} moved'
+	if counts['attrib']:
+		phrase += f', {counts["attrib"]} attributes changed'
+	return phrase
+
+def format_history_row(row:HistoryRow, kind:str) -> str:
+	'''
+	A version's line in a history: its number and time, then for a file what happened and the size of the copy, for a
+	folder the counts of what changed under it, after what happened to the folder itself if anything did.
+	'''
+	line = f'V{row.version.number}  {show_time(row.version.timestamp)}  '
+	if kind != 'folder':
+		return line + history_label(row) + ('' if row.size is None else f'  {show_size(row.size)}')
+	if row.event == 'changed':
+		return line + counts_phrase(row.counts)
+	return line + history_label(row) + (f'; {counts_phrase(row.counts)}' if any(row.counts.values()) else '')
+
+def format_history(rule:ReverbRule, job_vault:str, rows:list, kind:str, show_files:bool) -> str:
+	'''The history command's text: the job and its vault, then a line per row, a folder's changed paths under each when show_files.'''
+	lines = [f'job {rule.job_name}, vault {job_vault}']
+	for row in rows:
+		lines.append(format_history_row(row, kind))
+		if show_files and row.files:
+			lines += [f'    {event} {rel}' for event, rel in row.files]
+	return '\n'.join(lines)
+
+def never_backed_up(rule:ReverbRule, rule_path:str, rel:str) -> str:
+	'''Say the path at rel was never backed up, naming the pattern that skips it when the job's skip list reads and has one.'''
+	path = os.path.join(rule.mon_path, rel) if rel else rule.mon_path
+	message = f'{path} was never backed up'
+	skip_list_path = resolve_skip_list_path(rule.skip_list_file, rule_path)
+	if skip_list_path is None:
+		return message
+	try:
+		skip_list = SkipList.load(rule.mon_path, skip_list_path)
+	except (OSError, ValueError):
+		return message
+	pattern = skip_list.deciding_pattern(rel, os.path.isdir(path) and not os.path.islink(path))
+	return message if pattern is None else f'{message}; it matches the skip pattern {pattern}'
+
+@contextlib.contextmanager
+def command_restore_lock(job_name:str, state_dir:str = None):
+	'''Hold job_name's RestoreLock for a command; a lock it cannot take is a CommandError, not a traceback.'''
+	lock = RestoreLock(job_name, state_dir, stream=sys.stderr)
+	try:
+		lock.__enter__()
+	except OSError as e:
+		raise CommandError(f'Cannot take the restore lock of job {job_name}, which keeps its versions while they are read: {e}', EXIT_COMMAND_FAILED)
+	try:
+		yield lock
+	finally:
+		lock.__exit__(None, None, None)
+
+def history_command(args) -> int:
+	'''Print the versions in which a file or folder changed, newest first. Exits 0 once shown, a path never backed up too.'''
+	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
+	rule, rel = find_job(load_command_rules(rule_path), args.path, args.job)
+	job_vault = job_vault_path(rule)
+	# taken before the versions are listed, so the list is the one left by a removal of the oldest version under way
+	with command_restore_lock(rule.job_name, args.state_dir):
+		try:
+			versions = list_versions(job_vault)
+			kind = path_kind(job_vault, versions, rule.mon_path, rel) if versions else None
+			if kind == 'folder':
+				rows = folder_history(job_vault, versions, rule.mon_path, rel, list_files=args.files)
+			elif kind == 'file':
+				rows = file_history(job_vault, versions, rule.mon_path, rel)
+		except OSError as e:
+			raise CommandError(f'Cannot read the vault {job_vault}: {e}', EXIT_COMMAND_FAILED)
+	if kind is None:
+		# the header alone, then why there is nothing to show
+		print(format_history(rule, job_vault, [], 'file', False) + '\n' + never_backed_up(rule, rule_path, rel))
+	else:
+		print(format_history(rule, job_vault, rows, kind, args.files))
+	return 0
+
 def run_command(argv:list) -> int:
 	'''Run the command argv names and return its exit status; a CommandError prints its message on stderr.'''
 	global tl
@@ -6534,8 +6805,8 @@ def run_command(argv:list) -> int:
 	finally:
 		tl = old_tl
 
-# the history and restore commands add their functions here
-COMMAND_FUNCTIONS = {'status': status_command}
+# the restore command adds its function here
+COMMAND_FUNCTIONS = {'status': status_command, 'history': history_command}
 
 if __name__ == "__main__":
 	main()
