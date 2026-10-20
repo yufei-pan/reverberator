@@ -3770,7 +3770,7 @@ def do_backup(backup_entries:dict,
 				while vault_size + estimated_backup_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size} exceeds backup size limit {backup_limit_size}')
 					# we need to remove the oldest version
-					removed_size, removed_inodes = decrement_stepper(vault_info_dict)
+					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name)
 					vault_size -= removed_size
 					vault_inodes -= removed_inodes
 					if not removed_size and not removed_inodes:
@@ -3779,7 +3779,7 @@ def do_backup(backup_entries:dict,
 				while vault_inodes + estimated_backup_inode > backup_limit_inode:
 					backuperTeeLogToTl(job_name,f'Vault inodes {vault_inodes} + estimated backup inodes {estimated_backup_inode} exceeds backup inode limit {backup_limit_inode}')
 					# we need to remove the oldest version
-					removed_size, removed_inodes = decrement_stepper(vault_info_dict)
+					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name)
 					vault_size -= removed_size
 					vault_inodes -= removed_inodes
 					if not removed_size and not removed_inodes:
@@ -3787,7 +3787,7 @@ def do_backup(backup_entries:dict,
 			while keep_n_versions and len(vault_info_dict) >= keep_n_versions:
 				backuperTeeLogToTl(job_name,f'Vault has {len(vault_info_dict)} versions, exceeding keep n versions {keep_n_versions}')
 				# we need to remove the oldest version
-				removed_size, removed_inodes = decrement_stepper(vault_info_dict)
+				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name)
 				vault_size -= removed_size
 				vault_inodes -= removed_inodes
 				if not removed_size and not removed_inodes:
@@ -5676,6 +5676,65 @@ def refresh_vault_entry_size_metadata(entry:VaultEntry) -> VaultEntry:
 	elif not os.path.lexists(new_content) and not os.path.lexists(old_content):
 		pass
 	return VaultEntry(entry.version_number,entry.path,entry.timestamp,new_size,new_inode)
+
+def restore_lock_path(job_name:str, state_dir:str = None) -> str:
+	'''
+	The lock file a restore shares with the daemon's pruning of job_name.
+	>>> restore_lock_path('j', '/x')
+	'/x/job-j.restore.lock'
+	'''
+	return os.path.join(state_dir_path(state_dir), f'job-{job_name}.restore.lock')
+
+class RestoreLock:
+	'''
+	Held while a command reads old versions of a job: the daemon keeps backing up but postpones removing the oldest
+	version meanwhile. A shared flock, so it goes with the process and a killed restore never leaves it behind.
+	'''
+	def __init__(self, job_name:str, state_dir:str = None, stream = sys.stderr):
+		self.job_name = job_name
+		self.state_dir = state_dir
+		self.stream = stream
+		self.fd = None
+
+	def __enter__(self):
+		os.makedirs(state_dir_path(self.state_dir), exist_ok=True)
+		self.fd = os.open(restore_lock_path(self.job_name, self.state_dir), os.O_RDWR | os.O_CREAT, 0o600)
+		try:
+			try:
+				fcntl.flock(self.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+			except BlockingIOError:
+				print(f'Waiting for reverberator to finish removing an old version of {self.job_name}', file=self.stream, flush=True)
+				fcntl.flock(self.fd, fcntl.LOCK_SH)
+		except BaseException:
+			os.close(self.fd)
+			self.fd = None
+			raise
+		return self
+
+	def __exit__(self, *exc_info):
+		if self.fd is not None:
+			os.close(self.fd)
+			self.fd = None
+		return False
+
+def prune_oldest(vault_info_dict:OrderedDict, job_name:str) -> tuple:
+	'''
+	decrement_stepper while no restore holds the job's lock; when one does, postpone and return (0, 0) so the retention
+	loops stop. A lock file that cannot be opened (no state folder) does not hold pruning back.
+	'''
+	try:
+		fd = os.open(restore_lock_path(job_name), os.O_RDWR | os.O_CREAT, 0o600)
+	except OSError:
+		return decrement_stepper(vault_info_dict)
+	try:
+		try:
+			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+		except BlockingIOError:
+			backuperTeeLogToTl(job_name,'Postponing removal of the oldest version: a restore is reading the vault')
+			return 0, 0
+		return decrement_stepper(vault_info_dict)
+	finally:
+		os.close(fd)
 
 def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	'''
