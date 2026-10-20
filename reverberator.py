@@ -572,6 +572,14 @@ class JobControl:
 		self.failure = None
 		self.committed = threading.Event()
 		self._lock = threading.Lock()
+		self.last_success = None
+		self._state = 'starting'
+		self._detail = ''
+		self._since = time.time()
+		self._retry_at = None
+		self._failures = 0
+		# the waits for a disk now going on, oldest first, as [token, path, what, started]
+		self._waits = []
 
 	def start_attempt(self):
 		with self._lock:
@@ -590,6 +598,100 @@ class JobControl:
 
 	def mark_committed(self):
 		self.committed.set()
+		with self._lock:
+			self.last_success = time.time()
+			self._publish()
+
+	def set_state(self, state:str, detail:str = '', retry_at:float = None, failures:int = 0):
+		'''Record the job's state (starting, running, retrying or stopped) and publish it; a wait going on shows over it.'''
+		with self._lock:
+			self._state, self._detail, self._since = state, detail, time.time()
+			self._retry_at, self._failures = retry_at, failures
+			self._publish()
+
+	def begin_wait(self, path:str, what:str) -> object:
+		'''Note the job waiting for path, and return the token end_wait takes.'''
+		token = object()
+		with self._lock:
+			self._waits.append([token, path, what, time.time()])
+			self._publish()
+		return token
+
+	def end_wait(self, token):
+		with self._lock:
+			self._waits = [wait for wait in self._waits if wait[0] is not token]
+			self._publish()
+
+	def _publish(self):
+		'''Publish the record to the status board. The caller holds the lock, which keeps the records in order.'''
+		board = STATUS_BOARD
+		if board is None:
+			return
+		state, detail, since = self._state, self._detail, self._since
+		if self._waits:
+			state, detail, since = 'waiting', f'{self._waits[0][1]}: {self._waits[0][2]}', self._waits[0][3]
+		board.write_job(self.job_name, {'job': self.job_name, 'state': state, 'detail': detail, 'since': since,
+			'retry_at': self._retry_at, 'failures': self._failures, 'last_success': self.last_success, 'updated': time.time()})
+
+DEFAULT_STATE_DIR = '/run/reverberator'
+
+def state_dir_path(override:str = None) -> str:
+	'''
+	The folder the daemon publishes its status in: override, else $REVERB_STATE_DIR, else DEFAULT_STATE_DIR.
+	>>> state_dir_path('/x')
+	'/x'
+	'''
+	return override or os.environ.get('REVERB_STATE_DIR') or DEFAULT_STATE_DIR
+
+def process_start_ticks(pid:int) -> int:
+	'''
+	When process pid started, in clock ticks after boot (field 22 of its /proc stat), or None when unreadable.
+	With the pid it tells a running daemon from a stale file whose pid another process took.
+	>>> process_start_ticks(os.getpid()) > 0
+	True
+	'''
+	try:
+		with open(f'/proc/{pid}/stat', 'rb') as f:
+			text = f.read().decode('utf-8', 'replace')
+		# the command name in the first fields can hold spaces and brackets, so count from the last )
+		return int(text[text.rindex(')') + 1:].split()[19])
+	except (OSError, ValueError, IndexError):
+		return None
+
+class StatusBoard:
+	'''
+	The daemon's status files in state_dir: daemon.json for the daemon and job-<name>.json for each job, for the status
+	command. A write never raises: the first error is logged and the rest are not, as a status must not stop a backup.
+	'''
+	def __init__(self, state_dir:str, rule_path:str):
+		self.state_dir = state_dir
+		self._failed = False
+		self._write('daemon.json', {'pid': os.getpid(), 'start_ticks': process_start_ticks(os.getpid()), 'version': __version__,
+			'started_at': time.time(), 'rule_path': rule_path})
+
+	def write_job(self, job_name:str, record:dict):
+		self._write(f'job-{job_name}.json', record)
+
+	def _write(self, name:str, record:dict):
+		temp = None
+		try:
+			os.makedirs(self.state_dir, exist_ok=True)
+			fd, temp = tempfile.mkstemp(prefix='.tmp-', dir=self.state_dir)
+			with os.fdopen(fd, 'w', encoding='utf-8') as f:
+				json.dump(record, f)
+			os.chmod(temp, 0o644)
+			os.replace(temp, os.path.join(self.state_dir, name))
+			temp = None
+		except (OSError, ValueError, TypeError) as e:
+			if not self._failed:
+				self._failed = True
+				tl.teeerror(f'Cannot write status files in {self.state_dir}: {e}')
+		finally:
+			if temp is not None:
+				with contextlib.suppress(OSError):
+					os.remove(temp)
+
+STATUS_BOARD = None
 
 def job_log(job_name:str, text:str) -> str:
 	'''Log a job's marker line at error level, where log alerts look for it, and return it.'''
@@ -730,20 +832,27 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	started = clock()
 	next_alert = started + DISK_WAIT_GRACE_SECONDS
-	while running():
-		if flag.is_set() and os.path.isdir(path):
-			return True
-		if flag.is_set():
-			# the filesystem is ready but the path is not there yet, so the flag cannot end the wait
-			time.sleep(POLL_WAIT_SECONDS)
-		else:
-			flag.wait(POLL_WAIT_SECONDS)
-		now = clock()
-		if now >= next_alert and job is not None and alert:
-			waited = now - started
-			job_log(job.job_name, f'FAILED: waiting {int(waited // 60)} min for {path}: {what}')
-			next_alert = now + DISK_WAIT_REPEAT_SECONDS
-	return False
+	token = None
+	try:
+		while running():
+			if flag.is_set() and os.path.isdir(path):
+				return True
+			if token is None and job is not None:
+				token = job.begin_wait(path, what)
+			if flag.is_set():
+				# the filesystem is ready but the path is not there yet, so the flag cannot end the wait
+				time.sleep(POLL_WAIT_SECONDS)
+			else:
+				flag.wait(POLL_WAIT_SECONDS)
+			now = clock()
+			if now >= next_alert and job is not None and alert:
+				waited = now - started
+				job_log(job.job_name, f'FAILED: waiting {int(waited // 60)} min for {path}: {what}')
+				next_alert = now + DISK_WAIT_REPEAT_SECONDS
+		return False
+	finally:
+		if token is not None:
+			job.end_wait(token)
 
 WATCH_RESULT_OK = 'ok'
 WATCH_RESULT_INIT_FAILED = 'init_failed'
@@ -805,6 +914,7 @@ def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pendi
 	while GREEN_LIGHT.is_set():
 		attempt += 1
 		job.start_attempt()
+		job.set_state('starting')
 		started = clock()
 		try:
 			threads = start_attempt(job, attempt)
@@ -815,6 +925,8 @@ def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pendi
 				job.fail(e.reason, e.permanent)
 			else:
 				job.fail(f'{type(e).__name__}: {e}')
+		if job.failure is None:
+			job.set_state('running')
 		recovering = failures > 0
 		while GREEN_LIGHT.is_set() and job.failure is None:
 			if recovering and job.committed.is_set():
@@ -837,10 +949,12 @@ def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pendi
 		failure = job.failure
 		if failure.permanent:
 			job_log(job.job_name, f'STOPPED: {failure.reason}')
+			job.set_state('stopped', failure.reason, failures=failures)
 			return 'stopped'
 		failures = 1 if ran >= JOB_RETRY_RESET_SECONDS else failures + 1
 		delay = job_retry_delay(failures)
 		job_log(job.job_name, f'FAILED: {failure.reason}; retrying in {int(delay)}s')
+		job.set_state('retrying', failure.reason, time.time() + delay, failures)
 		deadline = time.monotonic() + delay
 		while GREEN_LIGHT.is_set() and time.monotonic() < deadline:
 			time.sleep(max(min(POLL_WAIT_SECONDS, deadline - time.monotonic()), 0))
@@ -869,23 +983,30 @@ class MonitorGate:
 		next_alert = started + DISK_WAIT_GRACE_SECONDS
 		# a lookup runs df and lsblk: at once when the path is there, then again every FS_RECHECK_SECONDS while it is
 		looked_up_at = None
-		while job.should_run():
-			present = os.path.isdir(self.path)
-			if not present:
-				looked_up_at = None
-			elif looked_up_at is None or time.monotonic() - looked_up_at >= FS_RECHECK_SECONDS:
-				looked_up_at = time.monotonic()
-				signatures = get_fs_signatures(self.path)
-				if signatures and signatures[0]:
-					signature = signatures[0]
-					break
-			# job.running stays set while the job runs, so waiting on it would not wait at all
-			time.sleep(POLL_WAIT_SECONDS)
-			now = time.monotonic()
-			if now >= next_alert:
+		token = None
+		try:
+			while job.should_run():
+				present = os.path.isdir(self.path)
+				if not present:
+					looked_up_at = None
+				elif looked_up_at is None or time.monotonic() - looked_up_at >= FS_RECHECK_SECONDS:
+					looked_up_at = time.monotonic()
+					signatures = get_fs_signatures(self.path)
+					if signatures and signatures[0]:
+						signature = signatures[0]
+						break
 				what = 'monitored filesystem signature unknown' if present else 'monitored path not there yet'
-				job_log(job.job_name, f'FAILED: waiting {int((now - started) // 60)} min for {self.path}: {what}')
-				next_alert = now + DISK_WAIT_REPEAT_SECONDS
+				if token is None:
+					token = job.begin_wait(self.path, what)
+				# job.running stays set while the job runs, so waiting on it would not wait at all
+				time.sleep(POLL_WAIT_SECONDS)
+				now = time.monotonic()
+				if now >= next_alert:
+					job_log(job.job_name, f'FAILED: waiting {int((now - started) // 60)} min for {self.path}: {what}')
+					next_alert = now + DISK_WAIT_REPEAT_SECONDS
+		finally:
+			if token is not None:
+				job.end_wait(token)
 		if signature is None:
 			return False
 		new_flag = FS_SIGNATURE_MONITOR.register(self.path, signature)
@@ -970,6 +1091,7 @@ def run_daemon():
 	global DEFAULT_KEEP_N_VERSIONS
 	global DEFAULT_BACKUP_SIZE_LIMIT
 	global DEBUG
+	global STATUS_BOARD
 	apply_poll_wait_from_env()
 	apply_job_timing_from_env()
 	signal.signal(signal.SIGINT, signal_handler)
@@ -985,6 +1107,10 @@ def run_daemon():
 			f.write(SAMPLE_REVERB_RULE_FILE.strip() + '\n')
 		tl.teeok(f'Dropped sample rule file at {rule_path}')
 		return
+	try:
+		STATUS_BOARD = StatusBoard(state_dir_path(), os.path.abspath(args.rule_path))
+	except Exception as e:
+		tl.teeerror(f'Cannot publish status files: {e}')
 	# warn the user if reverberator is not run as root
 	if os.geteuid() != 0:
 		tl.teeerror('Warning: reverberator is not run as root, dynamic nofile tuning will not work. And file permissions can cause errors.')

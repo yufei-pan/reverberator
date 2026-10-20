@@ -9,10 +9,13 @@ from tests.harness import create_job, reverberator_script
 
 
 @pytest.fixture(autouse=True)
-def restore_runtime_globals():
+def restore_runtime_globals(tmp_path, monkeypatch):
 	old_poll = rv.POLL_WAIT_SECONDS
 	rv.GREEN_LIGHT.set()
+	# the daemon publishes status files: keep them out of /run/reverberator
+	monkeypatch.setenv('REVERB_STATE_DIR', str(tmp_path / 'state'))
 	yield
+	rv.STATUS_BOARD = None
 	rv.POLL_WAIT_SECONDS = old_poll
 	rv.GREEN_LIGHT.set()
 
@@ -29,8 +32,9 @@ def poll_fast():
 
 
 @pytest.fixture
-def process_env():
+def process_env(tmp_path):
 	env = os.environ.copy()
+	env['REVERB_STATE_DIR'] = str(tmp_path / 'state')
 	env['REVERB_POLL_WAIT_SECONDS'] = '0.05'
 	env['PYTHONUNBUFFERED'] = '1'
 	return env
