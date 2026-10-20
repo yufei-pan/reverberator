@@ -1069,8 +1069,13 @@ def supervise_job(results:list, index:int, job:JobControl, start_attempt, persis
 		# the other jobs stop cleanly and save their pending transactions; main exits 1
 		GREEN_LIGHT.clear()
 
-def main():
-	'''The console entry point: runs the daemon, and exits 1 with a marker line when it fails.'''
+COMMANDS = ('status', 'history', 'restore')
+
+def main(argv:list = None):
+	'''The console entry point: runs a command when argv starts with one, else the daemon, and exits 1 with a marker line when it fails.'''
+	argv = sys.argv[1:] if argv is None else argv
+	if argv and argv[0] in COMMANDS:
+		sys.exit(run_command(argv))
 	try:
 		run_daemon()
 	except Exception as e:
@@ -6241,6 +6246,225 @@ def iter_change_list(path:str):
 			fields += [''] * (4 - len(fields))
 			source = fields[3]
 			yield ChangeRow(fields[0], fields[1], fields[2], None if source in ('', 'None') else source)
+
+# --- the commands: status here, history and restore behind the same front door ---
+
+def get_command_args(argv:list) -> argparse.Namespace:
+	'''
+	Parse a command's arguments: argv[0] is the command.
+
+	Examples:
+		>>> get_command_args(['status', '--rule', 'r.tsv']).rule
+		'r.tsv'
+		>>> get_command_args(['history', '/a/b', '--files']).files
+		True
+		>>> get_command_args(['restore', '/a/b', '--version', '3', '--yes']).version
+		3
+	'''
+	common = argparse.ArgumentParser(add_help=False)
+	common.add_argument('--rule', metavar='PATH', default=None, help='The rule file; by default the one the running (or last run) daemon recorded')
+	common.add_argument('--state_dir', metavar='DIR', default=None, help=f'The daemon status folder, default $REVERB_STATE_DIR or {DEFAULT_STATE_DIR}')
+	where = argparse.ArgumentParser(add_help=False)
+	where.add_argument('path', help='A file or folder under a monitored path')
+	where.add_argument('--job', metavar='NAME', default=None, help='The job, when the path is relative to its monitored path')
+	parser = argparse.ArgumentParser(prog='reverberator.py', description='Look at what the daemon backs up, and restore it')
+	commands = parser.add_subparsers(dest='command', required=True)
+	commands.add_parser('status', parents=[common], help='Show the daemon and each job')
+	history = commands.add_parser('history', parents=[common, where], help='Show the versions that changed a path')
+	history.add_argument('--files', action='store_true', help='For a folder, list each changed file')
+	restore = commands.add_parser('restore', parents=[common, where], help='Copy a path back from a version')
+	restore.add_argument('dest', nargs='?', default=None, help='Where to restore to')
+	restore.add_argument('--version', type=int, default=None, help='The version number to restore from')
+	restore.add_argument('--at', default=None, help='Restore the newest version at or before this time')
+	restore.add_argument('--in-place', dest='in_place', action='store_true', help='Restore over the original path')
+	restore.add_argument('--threads', type=int, default=os.cpu_count(), help='Copies to run at once')
+	restore.add_argument('--yes', action='store_true', help='Do not ask for confirmation')
+	return parser.parse_args(argv)
+
+DaemonStatus = namedtuple('DaemonStatus', ['record', 'alive', 'jobs'])
+
+def read_json_record(path:str):
+	'''The JSON object in the file at path, or None when it is unreadable or not an object.'''
+	try:
+		with open(path, 'r', encoding='utf-8') as f:
+			record = json.load(f)
+	except (OSError, ValueError):
+		return None
+	return record if isinstance(record, dict) else None
+
+def read_status(state_dir:str) -> DaemonStatus:
+	'''
+	What the daemon published in state_dir: its record (None when missing), whether that daemon is alive (its pid runs
+	with the recorded start time, so a pid another process took does not count) and each job's record by job name.
+	Unreadable or malformed files read as missing. Nothing is written.
+	'''
+	record = read_json_record(os.path.join(state_dir, 'daemon.json'))
+	if record is not None and not (isinstance(record.get('pid'), int) and isinstance(record.get('start_ticks'), int)
+			and isinstance(record.get('started_at'), (int, float)) and not isinstance(record.get('pid'), bool)):
+		record = None
+	alive = record is not None and process_start_ticks(record['pid']) == record['start_ticks']
+	jobs = {}
+	try:
+		names = sorted(os.listdir(state_dir))
+	except OSError:
+		names = []
+	for name in names:
+		if name.startswith('job-') and name.endswith('.json'):
+			job_record = read_json_record(os.path.join(state_dir, name))
+			if job_record is not None and isinstance(job_record.get('job'), str) and job_record.get('state') in JOB_STATES:
+				jobs[job_record['job']] = job_record
+	return DaemonStatus(record, alive, jobs)
+
+JOB_STATES = ('starting', 'running', 'waiting', 'retrying', 'stopped')
+
+def command_rule_path(args, status:DaemonStatus) -> str:
+	'''The rule file a command reads: --rule, else the one the daemon recorded (running or not), else a CommandError.'''
+	if args.rule:
+		return args.rule
+	if status.record is not None and status.record.get('rule_path'):
+		return status.record['rule_path']
+	raise CommandError('No running daemon recorded a rule file here: give the rule file with --rule PATH')
+
+def load_command_rules(rule_path:str) -> list:
+	'''The rules in the rule file for a command, read without changing anything and without printing anything.'''
+	try:
+		# TSVZ prints a header mismatch dump for a rule file whose header was never upgraded
+		with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+			rules = parse_rules(rule_path, read_only=True)
+	except RuleFileError as e:
+		raise CommandError(str(e))
+	except (OSError, ValueError) as e:
+		raise CommandError(f'Cannot read rule file {rule_path}: {e}')
+	if not rules:
+		raise CommandError(f'Rule file {rule_path} has no jobs')
+	return rules
+
+VaultNumbers = namedtuple('VaultNumbers', ['present', 'versions', 'size', 'inodes', 'size_limit', 'inode_limit', 'keep_n'])
+
+def vault_numbers(rule:ReverbRule) -> VaultNumbers:
+	'''What a job's vault holds and what limits it: sizes summed from its versions, limits as the backuper works them out.'''
+	versions = list_versions(job_vault_path(rule))
+	size_limit, inode_limit = get_backup_limits_from_str(rule.backup_size_limit, *get_path_fs_info(rule.vault_path))
+	try:
+		keep_n = int(rule.keep_n_versions)
+	except ValueError:
+		keep_n = 0
+	return VaultNumbers(os.path.isdir(job_vault_path(rule)), len(versions), sum(v.size for v in versions),
+		sum(v.inodes for v in versions), size_limit, inode_limit, keep_n)
+
+def show_size(size:int, limit:int = None) -> str:
+	'''
+	A byte count for people, or 'no limit' when limit is 0.
+	>>> show_size(1536), show_size(0, 0)
+	('1.50 KiB', 'no limit')
+	'''
+	if limit == 0:
+		return 'no limit'
+	return format_bytes(size, use_1024_bytes=True, to_str=True).rstrip() + 'B'
+
+def show_count(count:int, limit:int = None) -> str:
+	'''
+	A count for people, or 'no limit' when limit is 0.
+	>>> show_count(126750), show_count(5, 0)
+	('126.75 K', 'no limit')
+	'''
+	if limit == 0:
+		return 'no limit'
+	return format_bytes(count, use_1024_bytes=False, to_str=True).strip()
+
+def show_time(epoch:float, clock_only:bool = False) -> str:
+	'''A local time for people: date and minute, or only the minute of the day.'''
+	return time.strftime('%H:%M' if clock_only else '%Y-%m-%d %H:%M', time.localtime(epoch))
+
+def job_state_phrase(record, daemon_alive:bool, daemon_started) -> str:
+	'''
+	How a job is doing, from its status record (None when it has none): last known when the daemon is not alive or the
+	record is older than this daemon run.
+	>>> job_state_phrase(None, True, 0)
+	'unknown'
+	>>> job_state_phrase({'state': 'stopped', 'detail': 'why', 'updated': 5}, False, 0)
+	'last known: stopped: why'
+	'''
+	if record is None:
+		return 'unknown'
+	state, detail = record['state'], record.get('detail') or ''
+	number = lambda key, default = 0: record.get(key) if isinstance(record.get(key), (int, float)) else default
+	if state == 'waiting':
+		phrase = f'waiting for disk since {show_time(number("since"), True)}: {detail}'
+	elif state == 'retrying':
+		phrase = f'retrying at {show_time(number("retry_at"), True)} after {int(number("failures"))} failed attempts: {detail}'
+	elif state == 'stopped':
+		phrase = f'stopped: {detail}'
+	else:
+		phrase = state
+	stale = daemon_started is not None and number('updated') < daemon_started
+	return phrase if daemon_alive and not stale else f'last known: {phrase}'
+
+def format_job_status(rule:ReverbRule, record, status:DaemonStatus, width:int) -> list:
+	'''The lines for one job, the name first and the rest indented under it.'''
+	started = status.record['started_at'] if status.record is not None else None
+	indent = ' ' * (width + 2)
+	lines = [f'{rule.job_name:<{width}}  {job_state_phrase(record, status.alive, started)}']
+	numbers = vault_numbers(rule)
+	versions = list_versions(job_vault_path(rule))
+	if versions:
+		newest, oldest = versions[-1], versions[0]
+		lines.append(f'{indent}last backup {show_time(newest.timestamp)} (V{newest.number})')
+		lines.append(f'{indent}{numbers.versions} versions (limit {numbers.keep_n or "no limit"}), oldest V{oldest.number} {show_time(oldest.timestamp)}')
+	else:
+		lines.append(f'{indent}no versions yet')
+	if not os.path.isdir(rule.vault_path) or not os.listdir(rule.vault_path):
+		lines.append(f'{indent}vault not mounted: {rule.vault_path}')
+	elif numbers.present:
+		lines.append(f'{indent}vault {show_size(numbers.size)} / limit {show_size(numbers.size_limit, numbers.size_limit)}, '
+			f'{show_count(numbers.inodes)} inodes / limit {show_count(numbers.inode_limit, numbers.inode_limit)}')
+	return lines
+
+def format_status(status:DaemonStatus, rules:list, rule_path:str) -> str:
+	'''The status command's text: the daemon, then each job in the rule file.'''
+	record = status.record
+	if record is None:
+		header = 'reverberator is not running'
+	elif status.alive:
+		header = f'reverberator {record.get("version", "?")}, running since {show_time(record["started_at"])} (pid {record["pid"]}), rules {rule_path}'
+	else:
+		header = f'reverberator is not running (last started {show_time(record["started_at"])})'
+	width = max(len(rule.job_name) for rule in rules)
+	lines = [header, '']
+	for rule in rules:
+		lines += format_job_status(rule, status.jobs.get(rule.job_name), status, width)
+	return '\n'.join(lines)
+
+def status_command(args) -> int:
+	'''Print the daemon's and each job's state. Exits 0 whatever it finds.'''
+	status = read_status(state_dir_path(args.state_dir))
+	rule_path = command_rule_path(args, status)
+	print(format_status(status, load_command_rules(rule_path), rule_path))
+	return 0
+
+def run_command(argv:list) -> int:
+	'''Run the command argv names and return its exit status; a CommandError prints its message on stderr.'''
+	global tl
+	args = get_command_args(argv)
+	old_tl = tl
+	# library logging stays off the output
+	tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=True, noLog=True)
+	try:
+		command = COMMAND_FUNCTIONS.get(args.command)
+		if command is None:
+			raise CommandError(f'The {args.command} command is not available yet')
+		return command(args)
+	except CommandError as e:
+		print(e.message, file=sys.stderr)
+		return e.code
+	except KeyboardInterrupt:
+		print('Interrupted', file=sys.stderr)
+		return EXIT_COMMAND_FAILED
+	finally:
+		tl = old_tl
+
+# the history and restore commands add their functions here
+COMMAND_FUNCTIONS = {'status': status_command}
 
 if __name__ == "__main__":
 	main()
