@@ -893,6 +893,16 @@ PARTIAL_COPY_SUFFIX = '.reverberator-partial'
 COPY_STOP_WAIT_SECONDS = 60
 # a stopping daemon waits less: a stopped command is killed within about a second ( multiCMD sends SIGKILL a second after SIGTERM )
 COPY_STOP_GRACE_SECONDS = 2
+# a restore puts its copies in place every RESTORE_COPY_BATCH of them, so a whole job's are never all waiting at once
+RESTORE_COPY_BATCH = 1000
+# a restore's progress line is rewritten this often on a terminal, and written again this often anywhere else
+RESTORE_PROGRESS_TERMINAL_SECONDS = 1
+RESTORE_PROGRESS_LINE_SECONDS = 60
+# while a restore copies, these signals only set RESTORE_STOP, which it looks at every RESTORE_WAIT_SECONDS at most:
+# a KeyboardInterrupt raised inside the executor's bookkeeping can leave it waiting forever for a thread long gone
+RESTORE_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+RESTORE_STOP = threading.Event()
+RESTORE_WAIT_SECONDS = 0.1
 # what cp says when a copy's contents arrived but some of its metadata could not be kept
 COPY_METADATA_FAILURES = ('failed to preserve ownership', 'failed to preserve authorship', 'preserving permissions for',
 	'preserving times for', 'setting permissions for', 'setting attribute', 'getting attribute', 'listing attributes',
@@ -4485,7 +4495,8 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 		st = os.stat(source_file)
 		if os.name == 'posix':
 			os.chown(backup_file_path, st.st_uid, st.st_gid)
-		os.utime(backup_file_path, (st.st_atime, st.st_mtime))
+		# to the nanosecond, as copystat set them: times passed as floats come back up to a few hundred ns off
+		os.utime(backup_file_path, ns=(st.st_atime_ns, st.st_mtime_ns))
 		return True
 	except Exception as _:
 		backuperTeeLogToTl(path=source_file,error=True,message=f'Failed to copy metadata {source_file} -> {backup_file_path}')
@@ -6796,6 +6807,18 @@ def command_restore_lock(job_name:str, state_dir:str = None):
 	finally:
 		lock.__exit__(None, None, None)
 
+def require_job_vault(job_vault:str):
+	'''
+	A CommandError unless job_vault is a folder: a disk not mounted leaves an empty mount point, which is no reason to say
+	nothing was backed up. Any other error looking at it is raised as it is.
+	'''
+	try:
+		there = stat.S_ISDIR(os.stat(job_vault).st_mode)
+	except (FileNotFoundError, NotADirectoryError):
+		there = False
+	if not there:
+		raise CommandError(f'The vault {job_vault} is not there (is its disk mounted?)', EXIT_COMMAND_FAILED)
+
 def history_command(args) -> int:
 	'''Print the versions in which a file or folder changed, newest first. Exits 0 once shown, a path never backed up too.'''
 	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
@@ -6804,13 +6827,7 @@ def history_command(args) -> int:
 	# taken before the versions are listed, so the list is the one left by a removal of the oldest version under way
 	with command_restore_lock(rule.job_name, args.state_dir):
 		try:
-			try:
-				there = stat.S_ISDIR(os.stat(job_vault).st_mode)
-			except (FileNotFoundError, NotADirectoryError):
-				there = False
-			if not there:
-				# a disk not mounted leaves an empty mount point: that is no reason to say nothing was backed up
-				raise CommandError(f'The vault {job_vault} is not there (is its disk mounted?)', EXIT_COMMAND_FAILED)
+			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
 			kind = path_kind(job_vault, versions, rule.mon_path, rel) if versions else None
 			if kind == 'folder':
@@ -6825,6 +6842,377 @@ def history_command(args) -> int:
 	else:
 		print(format_history(rule, job_vault, rows, kind, args.files))
 	return 0
+
+# --- restore: a file, a folder or a whole job copied out of a kept version ---
+
+# the times --at reads besides a version folder's own, all in local time
+AT_TIME_FORMATS = ('%Y-%m-%d', '%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M', '%Y-%m-%dT%H:%M:%S')
+
+def parse_at_time(text:str) -> float:
+	'''
+	The time --at names, as an epoch: YYYY-MM-DD, YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS (a T in place of the space too)
+	in local time, or a version folder's time with its offset. Anything else is a CommandError.
+	>>> parse_at_time('2021-01-01_00-00-00_-0800')
+	1609488000.0
+	'''
+	text = text.strip()
+	for time_format in (VAULT_TIMESTAMP_FORMAT,) + AT_TIME_FORMATS:
+		try:
+			# a time without an offset is a naive one, which timestamp() takes as local
+			return datetime.datetime.strptime(text, time_format).timestamp()
+		except ValueError:
+			continue
+	raise CommandError(f"Cannot read the time {text}: give YYYY-MM-DD, YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS in local time, or a version folder's time such as 2021-01-01_00-00-00_-0800")
+
+def version_ranges(numbers) -> str:
+	'''
+	Version numbers for people, each run of them as a range.
+	>>> version_ranges([0, 1, 2, 5, 7, 8]), version_ranges([])
+	('V0-V2, V5, V7-V8', 'none')
+	'''
+	runs = []
+	for number in numbers:
+		if runs and number == runs[-1][1] + 1:
+			runs[-1][1] = number
+		else:
+			runs.append([number, number])
+	return ', '.join(f'V{first}' if first == last else f'V{first}-V{last}' for first, last in runs) or 'none'
+
+def restore_candidates(job_vault:str, versions:list, monitor_path:str, rel:str, kind:str) -> list:
+	'''The HistoryRows of the versions that hold rel, a 'file' or a 'folder' as kind says, and differ: newest first, as history lists them.'''
+	if kind == 'folder':
+		# the picker shows no paths, and a whole job's would all be held at once
+		rows = folder_history(job_vault, versions, monitor_path, rel, list_files=False)
+	else:
+		rows = file_history(job_vault, versions, monitor_path, rel)
+	return [row for row in rows if row.event not in ('delete', 'moved_away')]
+
+def choose_version(candidates:list, versions:list, holds, version:int = None, at:str = None, stdin = None, stdout = None) -> KeptVersion:
+	'''
+	The kept version (of versions, oldest first) to restore from, holds(KeptVersion) saying whether a version holds the
+	path: number version; else the newest from at or before the time at; else the only one of candidates (as
+	restore_candidates() gives them), named on stdout; else the one the user picks from a numbered list of them, asked
+	on stdin, which must be a terminal. A version not kept or not holding the path, no version at or before at and no
+	terminal to ask on are CommandErrors; a pick cancelled with q (or the end of stdin) is one with EXIT_COMMAND_FAILED.
+	stdin and stdout are sys.stdin and sys.stdout unless given.
+	'''
+	stdin = sys.stdin if stdin is None else stdin
+	stdout = sys.stdout if stdout is None else stdout
+	holding = lambda: version_ranges(kept.number for kept in versions if holds(kept))
+	if version is not None and at is not None:
+		raise CommandError('Give --version or --at, not both')
+	if version is not None:
+		chosen = next((kept for kept in versions if kept.number == version), None)
+		if chosen is None:
+			raise CommandError(f'V{version} is not kept; the kept versions are {version_ranges(kept.number for kept in versions)}')
+		if not holds(chosen):
+			raise CommandError(f'V{version} does not hold that path; the kept versions holding it are {holding()}')
+		return chosen
+	if at is not None:
+		limit = parse_at_time(at)
+		for kept in reversed(versions):
+			if kept.timestamp <= limit and holds(kept):
+				return kept
+		raise CommandError(f'No kept version holding that path is from {at} or before; the kept versions holding it are {holding()}')
+	if stdin is None or not stdin.isatty():
+		raise CommandError('Choose the version to restore with --version N or --at TIME (the history command lists them): there is no terminal to ask on')
+	if not candidates:
+		raise CommandError('No kept version holds that path')
+	# a folder's rows count what changed under it
+	kind = 'file' if candidates[0].counts is None else 'folder'
+	if len(candidates) == 1:
+		print(f'Restoring the one version that differs: {format_history_row(candidates[0], kind)}', file=stdout)
+		return candidates[0].version
+	width = len(str(len(candidates)))
+	print('The versions that differ, newest first:', file=stdout)
+	for number, row in enumerate(candidates, 1):
+		print(f'  {number:>{width}}  {format_history_row(row, kind)}', file=stdout)
+	while True:
+		print(f'Restore which version? [1-{len(candidates)}, q to cancel] ', end='', file=stdout, flush=True)
+		answer = stdin.readline()
+		# nothing at all is the end of stdin, unlike an empty line
+		if not answer or answer.strip().lower() == 'q':
+			raise CommandError('Cancelled', EXIT_COMMAND_FAILED)
+		try:
+			number = int(answer.strip())
+		except ValueError:
+			number = 0
+		if 1 <= number <= len(candidates):
+			return candidates[number - 1].version
+		print(f'Enter a number from 1 to {len(candidates)}, or q to cancel', file=stdout)
+
+class RestoreReport:
+	'''
+	What a restore did: the entries it restored and their bytes, the entries it kept as an earlier run had restored them,
+	and failures and warnings as (path below the monitored path, reason). restore_entry() fills in the version, the
+	path and the target it restores.
+	'''
+	def __init__(self):
+		self.version = None
+		self.rel = ''
+		self.target = None
+		self.restored = 0
+		self.kept = 0
+		self.bytes = 0
+		self.failures = []
+		self.warnings = []
+		# the first line comes a period after the start, so a quick restore writes none
+		self.progress_at = time.monotonic()
+		self.progress_width = 0
+
+	def entry_rel(self, path:str) -> str:
+		'''The path below the monitored path that path, in the target, restores.'''
+		below = os.path.relpath(path, self.target)
+		if below == '.':
+			return self.rel
+		return os.path.join(self.rel, below) if self.rel else below
+
+	def progress(self, stream, done:bool = False):
+		'''
+		Write the progress line on stream: rewritten in place on a terminal, at most every RESTORE_PROGRESS_TERMINAL_SECONDS,
+		and a line every RESTORE_PROGRESS_LINE_SECONDS anywhere else. done ends a terminal's line once the restore is over.
+		'''
+		terminal = stream.isatty()
+		if done and not (terminal and self.progress_width):
+			return
+		now = time.monotonic()
+		if not done and now - self.progress_at < (RESTORE_PROGRESS_TERMINAL_SECONDS if terminal else RESTORE_PROGRESS_LINE_SECONDS):
+			return
+		self.progress_at = now
+		line = f'restored {self.restored} entries, {show_size(self.bytes)}'
+		if terminal:
+			# padded over what a longer line before it left
+			stream.write('\r' + line.ljust(self.progress_width) + ('\n' if done else ''))
+			self.progress_width = max(self.progress_width, len(line))
+		else:
+			stream.write(line + '\n')
+		stream.flush()
+
+	def summary(self) -> str:
+		'''What was restored, from which version to where, then each entry restored without all of its metadata and each one not restored.'''
+		head = f'Restored {self.restored} entries ({show_size(self.bytes)})'
+		if self.version is not None:
+			head += f' from V{self.version.number} to {self.target}'
+		if self.kept:
+			head += f', keeping {self.kept} already there'
+		lines = [head]
+		lines += [f'WARNING {rel or "."}: {reason}' for rel, reason in self.warnings]
+		lines += [f'FAILED {rel or "."}: {reason}' for rel, reason in self.failures]
+		# the paths, details and cp's messages can quote monitored names
+		return '\n'.join(shown(line) for line in lines)
+
+def finish_restore_copies(pending:list, report:RestoreReport) -> None:
+	'''
+	Put the copies of pending in place once the executor has finished them, as finish_copies() does for a backup, and
+	empty pending. A copy that succeeded takes its destination's place and counts as restored, as does one for which cp
+	only reported metadata it could not keep (a warning says so); one that failed leaves no partial file and is a
+	failure saying what cp said.
+	'''
+	done = 0
+	try:
+		for copy in pending:
+			rel = report.entry_rel(copy.dest_path)
+			lines = [line.strip() for line in copy.task.stderr if line.strip()]
+			error = '; '.join(lines)
+			succeeded = copy.task.returncode == 0
+			temp_name = os.path.basename(copy.temp_path)
+			if not succeeded and lines and all(copy_metadata_failure(line, temp_name) for line in lines) and os.path.lexists(copy.temp_path):
+				report.warnings.append((rel, f'copied without all of its metadata: {error}'))
+				succeeded = True
+			if succeeded:
+				try:
+					replace_entry(copy.temp_path, copy.dest_path)
+				except OSError as e:
+					succeeded, error = False, str(e)
+			if succeeded:
+				report.restored += 1
+				try:
+					st = os.lstat(copy.dest_path)
+				except OSError:
+					st = None
+				if st is not None and stat.S_ISREG(st.st_mode):
+					# the contents restored: a symlink's text is no file's
+					report.bytes += st.st_size
+			else:
+				report.failures.append((rel, error or f'cp exited with {copy.task.returncode}'))
+				discard_copies([copy])
+			done += 1
+	finally:
+		# an error above leaves no partial file of the copies it did not reach
+		rest = pending[done:]
+		pending.clear()
+		discard_copies(rest)
+
+def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
+	'''Why the entry version holds, as resolve_version_entry() found it, cannot be copied out: None for a file or a user's symlink.'''
+	if resolved.kind in ('file', 'symlink'):
+		return None
+	if resolved.kind == 'dangling':
+		return f'dangling vault link: {resolved.detail}'
+	if resolved.kind == 'referenced':
+		# the link leads to the live file, which is not that version's
+		return 'not held in the vault (referenced backup)'
+	if resolved.kind == 'unreadable':
+		return f'unreadable in the vault: {resolved.detail}'
+	if resolved.kind == 'missing':
+		return f'not in V{version.number}: {resolved.detail}'
+	# a folder where the walk found a link
+	return f'a vault link to a folder: {resolved.path}'
+
+def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False) -> None:
+	'''
+	Copy what version holds at rel ('' for the monitored path) to target, filling report in. Nothing in the vault is
+	written: it is only read from.
+
+	A file or a user's symlink is one checked copy of the entry its chain links lead to (cp -a copies a symlink as a
+	symlink). A folder is walked in the version: its folders are made as they are met and its files copied, threads at
+	a time, each copy put in place every RESTORE_COPY_BATCH of them; once all are, each folder gets the vault folder's
+	metadata, the ones inside it first, so nothing copied into it changes its times afterwards. A dangling chain, a link
+	to the live file of a referenced backup, an entry that cannot be read, a failed copy or an OSError is a failure of
+	that entry alone. However the restore ends, no partial file is left in target: a RESTORE_STOP_SIGNALS signal stops
+	it, as a KeyboardInterrupt, once its copies can be stopped.
+	resume is for picking up an earlier restore into target, which this does not do yet.
+	'''
+	report.version, report.rel, report.target = version, rel, target
+	RESTORE_STOP.clear()
+	handlers = {}
+	mcae = multiCMD.AsyncExecutor(semaphore=threading.Semaphore(max(1, threads)), quiet=not DEBUG)
+	pending = []
+	# (vault folder, restored folder, rel) in walk order: each folder before what is in it
+	folders = []
+
+	def check_stop():
+		if RESTORE_STOP.is_set():
+			raise KeyboardInterrupt
+
+	def finish_batch():
+		while mcae.runningThreads:
+			mcae.wait(timeout=RESTORE_WAIT_SECONDS)
+			check_stop()
+			report.progress(sys.stderr)
+		finish_restore_copies(pending, report)
+		# the executor keeps every task it ran, which for a whole job would add up
+		mcae.cleanup(timeout=0)
+
+	def restore_one(resolved:ResolvedEntry, entry_rel:str, dest:str):
+		reason = restore_failure(resolved, version)
+		if reason is None and cp_af_copy_path(resolved.path, dest, mcae, pending) is False:
+			reason = f'{resolved.path} is gone from the vault'
+		if reason is not None:
+			report.failures.append((entry_rel, reason))
+
+	try:
+		if threading.current_thread() is threading.main_thread():
+			# only the main thread can set them, and only it gets them
+			for sig in RESTORE_STOP_SIGNALS:
+				handlers[sig] = signal.signal(sig, lambda signum, frame: RESTORE_STOP.set())
+		resolved = resolve_version_entry(job_vault, version.path, rel, monitor_path)
+		if resolved.kind != 'folder':
+			try:
+				restore_one(resolved, rel, target)
+			except OSError as e:
+				report.failures.append((rel, str(e)))
+		else:
+			try:
+				os.makedirs(target, exist_ok=True)
+			except OSError as e:
+				report.failures.append((rel, str(e)))
+				return
+			report.restored += 1
+			folders.append((resolved.path, target, rel))
+			errors = []
+			for entry_path, walk_rel, is_dir in iter_tree_entries(resolved.path, errors=errors):
+				below = walk_rel.rstrip('/')
+				entry_rel = os.path.join(rel, below) if rel else below
+				dest = os.path.join(target, below)
+				try:
+					if is_dir:
+						os.makedirs(dest, exist_ok=True)
+						report.restored += 1
+						folders.append((entry_path.rstrip('/'), dest, entry_rel))
+					else:
+						restore_one(resolve_version_entry(job_vault, version.path, entry_rel, monitor_path), entry_rel, dest)
+				except OSError as e:
+					report.failures.append((entry_rel, str(e)))
+				check_stop()
+				if len(pending) >= RESTORE_COPY_BATCH:
+					finish_batch()
+				report.progress(sys.stderr)
+			for walk_rel, error in errors:
+				below = walk_rel.rstrip('/')
+				report.failures.append((os.path.join(rel, below) if rel else below, f'unreadable in the vault: {error}'))
+		finish_batch()
+		# the walk lists a folder before what is in it, so backwards every folder comes after the folders inside it
+		for source, dest, entry_rel in reversed(folders):
+			if not copy_file_meta(source, dest):
+				report.warnings.append((entry_rel, 'restored without all of its metadata'))
+	finally:
+		try:
+			# however the restore ends, no copy is left writing into target, nor a partial file in it
+			stop_copies(mcae, pending, target)
+		finally:
+			for sig, handler in handlers.items():
+				# None: a handler set from outside Python, which cannot be set back
+				signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+
+def restore_target(rules:list, dest:str, rel:str, monitor_path:str) -> str:
+	'''
+	Where restoring rel into the folder dest puts it: dest/<its name>, the monitored path's own name for the whole job.
+	A CommandError when dest is not a folder, when that lies inside any job's vault (through symlinks too), or when
+	something is already there.
+	'''
+	if not os.path.isdir(dest):
+		raise CommandError(f'{dest} is not a folder: give an existing folder to restore into')
+	target = os.path.join(os.path.abspath(dest), os.path.basename(rel) or os.path.basename(monitor_path.rstrip('/')))
+	for rule in rules:
+		if is_subpath(target, rule.vault_path):
+			raise CommandError(f'{target} is inside the vault {rule.vault_path}: restore somewhere else')
+	if os.path.lexists(target):
+		raise CommandError(f'{target} already exists: restore into another folder, or move it out of the way first')
+	return target
+
+def restore_command(args) -> int:
+	'''
+	Copy a file, a folder or a whole job out of a kept version into a destination folder. Exits 0 once everything was
+	restored, EXIT_COMMAND_FAILED when anything was not (each named), EXIT_USAGE when it cannot start.
+	'''
+	if args.in_place and args.dest is not None:
+		raise CommandError('Give a destination folder or --in-place, not both')
+	if args.in_place:
+		raise CommandError('Restoring in place is not available yet: give a destination folder')
+	if args.dest is None:
+		raise CommandError('Give the folder to restore into')
+	if args.threads is None or args.threads < 1:
+		raise CommandError('--threads must be at least 1')
+	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
+	rules = load_command_rules(rule_path)
+	rule, rel = find_job(rules, args.path, args.job)
+	job_vault = job_vault_path(rule)
+	# taken before the versions are listed and held to the last copy, so the daemon removes none of them meanwhile
+	with command_restore_lock(rule.job_name, args.state_dir):
+		try:
+			require_job_vault(job_vault)
+			versions = list_versions(job_vault)
+			kind = path_kind(job_vault, versions, rule.mon_path, rel) if versions else None
+			if kind is None:
+				raise CommandError(never_backed_up(rule, rule_path, rel))
+			# refused before a version is picked, and again once one is, as picking can take a while
+			restore_target(rules, args.dest, rel, rule.mon_path)
+			holds = lambda version: resolve_version_entry(job_vault, version.path, rel, rule.mon_path).kind != 'missing'
+			# only the picker shows them, and for a whole job they come from every change list
+			picking = args.version is None and args.at is None and sys.stdin is not None and sys.stdin.isatty()
+			candidates = restore_candidates(job_vault, versions, rule.mon_path, rel, kind) if picking else []
+			version = choose_version(candidates, versions, holds, args.version, args.at, sys.stdin, sys.stdout)
+		except OSError as e:
+			raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
+		target = restore_target(rules, args.dest, rel, rule.mon_path)
+		report = RestoreReport()
+		try:
+			restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report)
+		finally:
+			report.progress(sys.stderr, done=True)
+	print(report.summary())
+	return EXIT_COMMAND_FAILED if report.failures else 0
 
 def run_command(argv:list) -> int:
 	'''Run the command argv names and return its exit status; a CommandError prints its message on stderr.'''
@@ -6848,8 +7236,7 @@ def run_command(argv:list) -> int:
 	finally:
 		tl = old_tl
 
-# the restore command adds its function here
-COMMAND_FUNCTIONS = {'status': status_command, 'history': history_command}
+COMMAND_FUNCTIONS = {'status': status_command, 'history': history_command, 'restore': restore_command}
 
 if __name__ == "__main__":
 	main()
