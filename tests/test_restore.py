@@ -264,8 +264,11 @@ def test_restore_reports_dangling_and_continues(job, tmp_path, capsys):
 	lines = stdout.rstrip('\n').split('\n')
 	assert lines[0].startswith('Restored 3 entries')
 	assert lines[1].startswith('FAILED proj/b.txt: dangling vault link: proj/b.txt is missing from V0--')
-	assert len(lines) == 2
-	assert tree(os.path.join(out, 'proj')) == {'a.txt': 'a', 'c.txt': 'c1'}
+	target = os.path.join(out, 'proj')
+	# not everything is there: nobody else may look in, or put anything in for a later run to write through
+	assert lines[2:] == [f'Left {target} private (mode 0700), as not everything was restored']
+	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o700
+	assert tree(target) == {'a.txt': 'a', 'c.txt': 'c1'}
 	assert partial_files(out) == []
 
 
@@ -363,8 +366,9 @@ def test_restore_reports_a_version_removed_mid_restore(job, tmp_path, monkeypatc
 	assert 'Traceback' not in err
 	lines = stdout.rstrip('\n').split('\n')
 	assert lines[0] == f'Restored 4 entries ({rv.show_size(2)}) from V1 to {out}/monitor'
-	assert sorted(line.partition(': ')[0] for line in lines[1:]) == ['FAILED proj/b.txt', 'FAILED proj/sub/c.txt']
-	assert all(': dangling vault link: ' in line for line in lines[1:])
+	assert sorted(line.partition(': ')[0] for line in lines[1:-1]) == ['FAILED proj/b.txt', 'FAILED proj/sub/c.txt']
+	assert all(': dangling vault link: ' in line for line in lines[1:-1])
+	assert lines[-1] == f'Left {out}/monitor private (mode 0700), as not everything was restored'
 	assert tree(os.path.join(out, 'monitor')) == {'proj/': None, 'proj/a.txt': 'a1', 'proj/sub/': None}
 	assert partial_files(out) == []
 
@@ -466,6 +470,8 @@ def test_restore_stops_cleanly_on_a_signal(job, tmp_path, capsys, monkeypatch):
 	assert len(restored) == 20 * len(finished) and all(files[rel] == text for rel, text in restored.items())
 	assert partial_files(out) == []
 	assert {sig: signal.getsignal(sig) for sig in handlers} == handlers
+	# what it left stays private
+	assert stat.S_IMODE(os.lstat(os.path.join(out, 'monitor')).st_mode) == 0o700
 
 
 def test_restore_failure_reasons():
@@ -477,3 +483,82 @@ def test_restore_failure_reasons():
 	assert entry('unreadable', 'Input/output error') == 'unreadable in the vault: Input/output error'
 	# met while walking a folder: a folder above it became a symlink, or the version went
 	assert entry('missing', 'd is a symlink in V3--x') == 'not in V3: d is a symlink in V3--x'
+
+
+def test_restore_folder_target_made_exclusively_and_private(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'proj/a.txt': 'a', 'proj/sub/b.txt': 'b'})
+	os.chmod(f'{job.monitor}/proj', 0o751)
+	run_backup(job)
+	write_rule(job)
+	held = os.stat(os.path.join(version_path(job, 0), 'proj'))
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	modes = []
+	cp_af_copy_path = rv.cp_af_copy_path
+
+	def watching(*args, **kwargs):
+		modes.append(stat.S_IMODE(os.lstat(target).st_mode))
+		return cp_af_copy_path(*args, **kwargs)
+	monkeypatch.setattr(rv, 'cp_af_copy_path', watching)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert (code, err) == (0, '')
+	# private while it fills, the vault folder's own once complete
+	assert modes and set(modes) == {0o700}
+	st = os.lstat(target)
+	assert (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_mtime_ns) == (0o751, held.st_uid, held.st_gid, held.st_mtime_ns)
+	# a target planted between the check and the making of it (here a symlink to another folder) is never written through
+	out = destination(tmp_path, 'raced')
+	target = os.path.join(out, 'proj')
+	elsewhere = destination(tmp_path, 'elsewhere')
+	mkdir = os.mkdir
+
+	def planting(path, *args, **kwargs):
+		if os.fspath(path) == target and not os.path.lexists(target):
+			os.symlink(elsewhere, target)
+		return mkdir(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'mkdir', planting)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert (code, stdout) == (rv.EXIT_USAGE, '')
+	assert f'{target} already exists' in err
+	assert os.readlink(target) == elsewhere and os.listdir(elsewhere) == []
+	assert sorted(os.listdir(out)) == ['proj']
+
+
+def test_restore_file_never_replaces_what_appeared(job, tmp_path, capsys, monkeypatch):
+	three_versions(job)
+	# a user's symlink, held as one
+	os.symlink('a.txt', os.path.join(version_path(job, 2), 'l'))
+	out = destination(tmp_path)
+	target = os.path.join(out, 'a.txt')
+	finish_restore_copies = rv.finish_restore_copies
+
+	def appearing(pending, report):
+		with open(target, 'w', encoding='utf-8') as f:
+			f.write('theirs')
+		return finish_restore_copies(pending, report)
+	monkeypatch.setattr(rv, 'finish_restore_copies', appearing)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/a.txt', out, '--version', '1')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert stdout.split('\n')[1] == f'FAILED a.txt: {target} appeared while restoring; left untouched'
+	assert tree(out) == {'a.txt': 'theirs'} and partial_files(out) == []
+	monkeypatch.setattr(rv, 'finish_restore_copies', finish_restore_copies)
+	# put in place as a hard link of the copy, a symlink as the symlink itself
+	out = destination(tmp_path, 'links')
+	assert restore(tmp_path, capsys, f'{job.monitor}/a.txt', out, '--version', '1')[0] == 0
+	assert restore(tmp_path, capsys, f'{job.monitor}/l', out, '--version', '2')[0] == 0
+	assert tree(out) == {'a.txt': 'v1', 'l': ('->', 'a.txt')} and partial_files(out) == []
+	assert os.lstat(os.path.join(out, 'a.txt')).st_nlink == 1
+	# where the filesystem has no hard links, a rename once the name is still free
+
+	def no_links(*args, **kwargs):
+		raise PermissionError(1, 'Operation not permitted')
+	monkeypatch.setattr(os, 'link', no_links)
+	out = destination(tmp_path, 'renamed')
+	assert restore(tmp_path, capsys, f'{job.monitor}/a.txt', out, '--version', '1')[0] == 0
+	assert tree(out) == {'a.txt': 'v1'}
+	out = destination(tmp_path, 'renamed_raced')
+	target = os.path.join(out, 'a.txt')
+	monkeypatch.setattr(rv, 'finish_restore_copies', appearing)
+	code, stdout, _ = restore(tmp_path, capsys, f'{job.monitor}/a.txt', out, '--version', '1')
+	assert code == rv.EXIT_COMMAND_FAILED and 'appeared while restoring; left untouched' in stdout
+	assert tree(out) == {'a.txt': 'theirs'} and partial_files(out) == []

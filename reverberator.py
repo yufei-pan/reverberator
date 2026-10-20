@@ -6945,7 +6945,7 @@ class RestoreReport:
 	'''
 	What a restore did: the entries it restored and their bytes, the entries it kept as an earlier run had restored them,
 	and failures and warnings as (path below the monitored path, reason). restore_entry() fills in the version, the
-	path and the target it restores.
+	path and the target it restores, and whether it left a folder target private as not everything was restored.
 	'''
 	def __init__(self):
 		self.version = None
@@ -6956,6 +6956,7 @@ class RestoreReport:
 		self.bytes = 0
 		self.failures = []
 		self.warnings = []
+		self.left_private = False
 		# the first line comes a period after the start, so a quick restore writes none
 		self.progress_at = time.monotonic()
 		self.progress_width = 0
@@ -6998,15 +6999,37 @@ class RestoreReport:
 		lines = [head]
 		lines += [f'WARNING {rel or "."}: {reason}' for rel, reason in self.warnings]
 		lines += [f'FAILED {rel or "."}: {reason}' for rel, reason in self.failures]
+		if self.left_private:
+			lines.append(f'Left {self.target} private (mode 0700), as not everything was restored')
 		# the paths, details and cp's messages can quote monitored names
 		return '\n'.join(shown(line) for line in lines)
+
+def place_new_entry(temp_path:str, dest_path:str):
+	'''
+	Put temp_path at dest_path only while nothing is there, never replacing what is: as a hard link of temp_path itself
+	(a symlink too), which leaves temp_path for the caller to remove, or where the filesystem has no hard links by a
+	rename once dest_path is found free. FileExistsError when something is there.
+	'''
+	try:
+		os.link(temp_path, dest_path, follow_symlinks=False)
+	except FileExistsError:
+		raise
+	except OSError as e:
+		if e.errno not in (errno.EPERM, errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP):
+			raise
+		# the name could still be taken between the look and the rename, which only a link rules out
+		if os.path.lexists(dest_path):
+			raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dest_path)
+		os.rename(temp_path, dest_path)
 
 def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 	'''
 	Put the copies of pending in place once the executor has finished them, as finish_copies() does for a backup, and
 	empty pending. A copy that succeeded takes its destination's place and counts as restored, as does one for which cp
 	only reported metadata it could not keep (a warning says so); one that failed leaves no partial file and is a
-	failure saying what cp said.
+	failure saying what cp said. The report's target itself, a restored file or symlink in a folder anyone may write
+	in, never replaces what appeared there meanwhile (place_new_entry()); what is inside a folder target, which only
+	this restore can write in, takes its destination's place.
 	'''
 	done = 0
 	try:
@@ -7021,7 +7044,14 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 				succeeded = True
 			if succeeded:
 				try:
-					replace_entry(copy.temp_path, copy.dest_path)
+					if copy.dest_path == report.target:
+						place_new_entry(copy.temp_path, copy.dest_path)
+						# the hard link left it, a rename did not
+						discard_copies([copy])
+					else:
+						replace_entry(copy.temp_path, copy.dest_path)
+				except FileExistsError:
+					succeeded, error = False, f'{copy.dest_path} appeared while restoring; left untouched'
 				except OSError as e:
 					succeeded, error = False, str(e)
 			if succeeded:
@@ -7065,9 +7095,11 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	written: it is only read from.
 
 	A file or a user's symlink is one checked copy of the entry its chain links lead to (cp -a copies a symlink as a
-	symlink). A folder is walked in the version: its folders are made as they are met and its files copied, threads at
-	a time, each copy put in place every RESTORE_COPY_BATCH of them; once all are, each folder gets the vault folder's
-	metadata, the ones inside it first, so nothing copied into it changes its times afterwards. A dangling chain, a link
+	symlink), put at target only while nothing is there. A folder target is made by this restore alone (anything there
+	is a CommandError) with mode 0700, and the folder is walked in the version: its folders are made as they are met
+	and its files copied, threads at a time, each copy put in place every RESTORE_COPY_BATCH of them; once all are, each
+	folder gets the vault folder's metadata, the ones inside it first and the target last, so nothing copied into it
+	changes its times afterwards. The target stays 0700 when anything failed or the restore stops. A dangling chain, a link
 	to the live file of a referenced backup, an entry that cannot be read, a failed copy or an OSError is a failure of
 	that entry alone. However the restore ends, no partial file is left in target: a RESTORE_STOP_SIGNALS signal stops
 	it, as a KeyboardInterrupt, once its copies can be stopped.
@@ -7113,11 +7145,21 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			except OSError as e:
 				report.failures.append((rel, str(e)))
 		else:
+			# made by this restore alone, and private until it is complete: nobody else can look in, nor put anything in
+			# for the copies to write through
 			try:
-				os.makedirs(target, exist_ok=True)
+				os.mkdir(target, 0o700)
+			except FileExistsError:
+				raise target_exists(target)
 			except OSError as e:
 				report.failures.append((rel, str(e)))
 				return
+			try:
+				st = os.lstat(target)
+			except OSError:
+				st = None
+			if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+				raise CommandError(f'{target} was replaced as it was made: nothing was restored into it')
 			report.restored += 1
 			folders.append((resolved.path, target, rel))
 			errors = []
@@ -7142,8 +7184,12 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 				below = walk_rel.rstrip('/')
 				report.failures.append((os.path.join(rel, below) if rel else below, f'unreadable in the vault: {error}'))
 		finish_batch()
-		# the walk lists a folder before what is in it, so backwards every folder comes after the folders inside it
+		# the walk lists a folder before what is in it, so backwards every folder comes after the folders inside it and
+		# the target itself comes last; it stays private while anything failed, as a run that stops before here leaves it
 		for source, dest, entry_rel in reversed(folders):
+			if dest == target and report.failures:
+				report.left_private = True
+				continue
 			if not copy_file_meta(source, dest):
 				report.warnings.append((entry_rel, 'restored without all of its metadata'))
 	finally:
@@ -7154,6 +7200,10 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			for sig, handler in handlers.items():
 				# None: a handler set from outside Python, which cannot be set back
 				signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+
+def target_exists(target:str) -> CommandError:
+	'''The refusal of a restore whose target is already there.'''
+	return CommandError(f'{target} already exists: restore into another folder, or move it out of the way first')
 
 def restore_target(rules:list, dest:str, rel:str, monitor_path:str) -> str:
 	'''
@@ -7168,7 +7218,7 @@ def restore_target(rules:list, dest:str, rel:str, monitor_path:str) -> str:
 		if is_subpath(target, rule.vault_path):
 			raise CommandError(f'{target} is inside the vault {rule.vault_path}: restore somewhere else')
 	if os.path.lexists(target):
-		raise CommandError(f'{target} already exists: restore into another folder, or move it out of the way first')
+		raise target_exists(target)
 	return target
 
 def restore_command(args) -> int:
