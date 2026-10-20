@@ -4767,11 +4767,19 @@ def is_version_folder_name(name:str) -> bool:
 REAL_VAULT_FOLDERS = OrderedDict()
 REAL_VAULT_FOLDERS_LOCK = threading.Lock()
 
+class UncheckedVaultLink(Exception):
+	'''
+	Whether a vault link is a chain link cannot be told, as a folder on the way to its target cannot be looked at (an
+	I/O error, say). The link may be its version's only way to a file, so reading and pruning never take it for a
+	user's symlink.
+	'''
+
 def is_real_folder_under(top:str, folder:str) -> bool:
 	'''
 	Whether a path through folder stays in top: top is a real folder, and folder is top or under it with no symlink
-	from top down to folder. A missing folder on the way, or a file, is fine, as nothing goes through it; a folder that
-	cannot be looked at is not. Never raises.
+	from top down to folder. A missing folder on the way, or a file, is fine, as nothing goes through it; a name too
+	long for any folder is not. Raises UncheckedVaultLink, and nothing else, when a folder on the way cannot be looked
+	at, as that tells neither way.
 
 	Examples:
 		>>> import tempfile
@@ -4784,6 +4792,11 @@ def is_real_folder_under(top:str, folder:str) -> bool:
 		[False, False, False]
 		>>> is_real_folder_under(top, os.path.join(top, 'a' * 300, 'b'))
 		False
+		>>> try:
+		...     is_real_folder_under(top, os.path.join(top, 'a' + chr(0), 'b'))
+		... except UncheckedVaultLink:
+		...     print('cannot tell')
+		cannot tell
 		>>> import shutil; shutil.rmtree(top)
 	'''
 	if folder != top and not folder.startswith(top + '/'):
@@ -4803,8 +4816,13 @@ def is_real_folder_under(top:str, folder:str) -> bool:
 		except (FileNotFoundError, NotADirectoryError):
 			# nothing goes through a missing folder, but the version folder must be there
 			return depth > 0
-		except (OSError, ValueError):
-			return False
+		except OSError as e:
+			if e.errno == errno.ENAMETOOLONG:
+				# a name or path too long to use: the daemon reaches its copies by path, so none is behind it
+				return False
+			raise UncheckedVaultLink(e) from e
+		except ValueError as e:
+			raise UncheckedVaultLink(e) from e
 		if not stat.S_ISDIR(mode):
 			# a symlink could lead anywhere, nothing goes through anything else
 			return depth > 0 and not stat.S_ISLNK(mode)
@@ -4822,7 +4840,8 @@ def chain_link_target(job_vault:str, link_text:str, link_path:str):
 	version's folder and the entry's path in it, a text a move to another folder depth keeps. Only that form counts:
 	the folder named must be the one numbered one below the version holding link_path, by its whole name, and a real
 	folder with no symlink down to the target's parent (by is_real_folder_under()), so a backed-up folder symlink never
-	leads out of it. A chain link whose target is gone is still one.
+	leads out of it. A chain link whose target is gone is still one. Raises UncheckedVaultLink as is_real_folder_under()
+	does.
 
 	Examples:
 		>>> import tempfile
@@ -4865,11 +4884,12 @@ def chain_link_target(job_vault:str, link_text:str, link_path:str):
 	target = os.path.join(vault, name, *rel)
 	return target if is_real_folder_under(os.path.join(vault, name), os.path.dirname(target)) else None
 
-def chain_hop(job_vault:str, link_path:str, link_text:str):
+def strict_chain_hop(job_vault:str, link_path:str, link_text:str):
 	'''
 	Where the link at link_path with link_text leads if it is a chain link, else None. A relative link is one by
 	chain_link_target(); an absolute one, as older daemons wrote them, when its text names an older version of
-	job_vault and no symlink in that version lies on the way to the target (by is_real_folder_under()). Never raises.
+	job_vault and no symlink in that version lies on the way to the target (by is_real_folder_under()). Raises
+	UncheckedVaultLink, and nothing else, when that cannot be told.
 
 	Examples:
 		>>> import tempfile
@@ -4877,9 +4897,9 @@ def chain_hop(job_vault:str, link_path:str, link_text:str):
 		>>> os.makedirs(os.path.join(job_vault, 'V3--2021-01-01_00-00-00_-0800', 'a'))
 		>>> os.symlink(job_vault, os.path.join(job_vault, 'V3--2021-01-01_00-00-00_-0800', 'l'))
 		>>> link_path = os.path.join(job_vault, 'V4--2021-01-02_00-00-00_-0800', 'a', 'u')
-		>>> chain_hop(job_vault, link_path, job_vault + '/V3--2021-01-01_00-00-00_-0800/a/../a/u')[len(job_vault):]
+		>>> strict_chain_hop(job_vault, link_path, job_vault + '/V3--2021-01-01_00-00-00_-0800/a/../a/u')[len(job_vault):]
 		'/V3--2021-01-01_00-00-00_-0800/a/u'
-		>>> [chain_hop(job_vault, link_path, text) for text in ('/elsewhere/u', '../lib/x', job_vault + '/V3--2021-01-01_00-00-00_-0800/l/u',
+		>>> [strict_chain_hop(job_vault, link_path, text) for text in ('/elsewhere/u', '../lib/x', job_vault + '/V3--2021-01-01_00-00-00_-0800/l/u',
 		...     job_vault + '/V5--2021-01-03_00-00-00_-0800/a/u')]
 		[None, None, None, None]
 		>>> import shutil; shutil.rmtree(job_vault)
@@ -4898,13 +4918,24 @@ def chain_hop(job_vault:str, link_path:str, link_text:str):
 		return None
 	return resolved if is_real_folder_under(os.path.join(vault, version), os.path.dirname(resolved)) else None
 
+def chain_hop(job_vault:str, link_path:str, link_text:str):
+	'''strict_chain_hop(), but None (not a chain link) also when that cannot be told. Never raises.'''
+	try:
+		return strict_chain_hop(job_vault, link_path, link_text)
+	except UncheckedVaultLink:
+		return None
+
 def retarget_chain_link(job_vault:str, link_path:str) -> bool:
 	'''
 	Rewrite the relative chain link at link_path (by chain_link_target()) to the text that reaches its target from where
 	it now sits. True if it was rewritten; a link already reaching it, or any other link, keeps its text.
 	'''
 	link_text = os.readlink(link_path)
-	target = chain_link_target(job_vault, link_text, link_path)
+	try:
+		target = chain_link_target(job_vault, link_text, link_path)
+	except UncheckedVaultLink:
+		# reading and pruning still find its version, whatever folder depth its text is for
+		return False
 	if target is None:
 		return False
 	new_text = os.path.relpath(target, os.path.dirname(link_path))
@@ -4941,8 +4972,8 @@ def is_chained_link(resolved:str, job_vault:str, link_path:str) -> bool:
 	'''
 	Whether the link at link_path, resolving to resolved, points into another version of job_vault: that is how a
 	version links an unchanged entry (under its old name if it moved since). A symlink backed up as one resolves
-	within its own version, if into the vault at all. chain_hop() judges absolute links, as older daemons wrote them,
-	by it; relative ones go by chain_link_target().
+	within its own version, if into the vault at all. strict_chain_hop() judges absolute links, as older daemons wrote
+	them, by it; relative ones go by chain_link_target().
 
 	Examples:
 		>>> is_chained_link('/v/job/V3--2021/a/b.txt', '/v/job', '/v/job/V4--2021/a/b.txt')
@@ -4963,7 +4994,7 @@ def is_chained_link(resolved:str, job_vault:str, link_path:str) -> bool:
 def read_vault_record(version_path:str, rel:str, monitor_path:str):
 	'''
 	Record what version_path holds at rel, following the links that chain an unchanged entry back to its copy.
-	Returns None when there is nothing readable there.
+	Returns None when there is nothing readable there, or a link there cannot be told for a chain link or not.
 	'''
 	entry = os.path.abspath(os.path.join(version_path, rel))
 	try:
@@ -4979,7 +5010,7 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str):
 			if not stat.S_ISLNK(st.st_mode):
 				break
 			target = os.readlink(entry)
-			resolved = chain_hop(job_vault, entry, target)
+			resolved = strict_chain_hop(job_vault, entry, target)
 			if resolved is None:
 				if os.path.isabs(target) and os.path.normpath(target) == monitor_entry:
 					# a referenced backup links to the monitored file itself
@@ -4992,7 +5023,7 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str):
 		kind = entry_kind(st.st_mode)
 		file_hash = hash_file(entry, st.st_size) if kind == 'f' else None
 		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 0)
-	except OSError:
+	except (OSError, UncheckedVaultLink):
 		return None
 
 def read_copied_record(version_path:str, rel:str, monitor_path:str):
@@ -5553,7 +5584,13 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 		if os.path.islink(file):
 			# a link an older daemon moved to another folder depth still names its version, though its text no longer reaches it.
 			# a user's symlink is left as it is, however it is shaped
-			linkTarget = chain_hop(job_vault, file, os.readlink(file))
+			try:
+				linkTarget = strict_chain_hop(job_vault, file, os.readlink(file))
+			except UncheckedVaultLink as e:
+				# it may be this version's only way to a file in the reference vault, so keep that, as for a failed move
+				materialize_failed = True
+				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error checking whether {file} links into {referenceVaultPath}: {e}')
+				continue
 			if linkTarget is not None and linkTarget.startswith(referenceVaultPath):
 				# this means we need to move the file to the new location
 				# get the relative path of the target

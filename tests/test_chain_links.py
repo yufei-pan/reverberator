@@ -1,3 +1,4 @@
+import errno
 import os
 from collections import OrderedDict
 import pytest
@@ -240,6 +241,33 @@ def test_a_link_naming_too_long_a_folder_does_not_stop_a_prune(job):
 	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
 	assert not os.path.exists(v0)
 	assert os.readlink(f'{v1}/u') == text
+
+
+@pytest.mark.parametrize('absolute', [False, True])
+def test_a_chain_link_whose_folders_cannot_be_looked_at_keeps_the_version_being_pruned(job, monkeypatch, capsys, absolute):
+	v0 = write_committed_version(job, 0, {'a/b/x': 'x'}, timestamp=T, current=False)
+	v1 = write_committed_version(job, 1, {'a/b/': None}, timestamp=T)
+	# as the daemon writes it, or as an older daemon did
+	text = f'{v0}/a/b/x' if absolute else f'../../../V0--{T}/a/b/x'
+	os.symlink(text, f'{v1}/a/b/x')
+	lstat = os.lstat
+	def lstat_failing_on_a(path, *args, **kwargs):
+		if path == f'{v0}/a':
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return lstat(path, *args, **kwargs)
+	with monkeypatch.context() as patch:
+		patch.setattr(rv.os, 'lstat', lstat_failing_on_a)
+		# the link may be V1's only way to x, so V0 stays
+		assert rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict) == (0, 0)
+		assert open(f'{v0}/a/b/x').read() == 'x'
+		assert os.readlink(f'{v1}/a/b/x') == text
+		out = capsys.readouterr().out
+		assert f'{v1}/a/b/x' in out and os.strerror(errno.EIO) in out
+		# unreadable, never a user's symlink
+		assert rv.read_vault_record(v1, 'a/b/x', job.monitor) is None
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	assert not os.path.exists(v0)
+	assert not os.path.islink(f'{v1}/a/b/x') and open(f'{v1}/a/b/x').read() == 'x'
 
 
 def test_a_refused_or_missing_folder_is_looked_at_again(tmp_path):
