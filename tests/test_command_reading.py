@@ -282,3 +282,11 @@ def test_find_job_unknown_name_and_path_outside_the_job(two_jobs):
 	assert 'top' in e.value.message and 'sub' in e.value.message
 	with pytest.raises(rv.CommandError):
 		rv.find_job(rules, '/elsewhere/x', job_name='top')
+
+
+def test_resolve_a_version_root_and_a_top_level_entry(job):
+	paths = three_versions(job)
+	got = rv.resolve_version_entry(job.job_vault, paths[2], '', job.monitor)
+	assert got.kind == 'folder' and got.path == paths[2]
+	got = rv.resolve_version_entry(job.job_vault, paths[2], 'keep', job.monitor)
+	assert got.kind == 'file' and got.path == os.path.join(paths[2], 'keep')
