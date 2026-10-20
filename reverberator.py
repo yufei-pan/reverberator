@@ -4755,27 +4755,64 @@ def is_version_folder_name(name:str) -> bool:
 		return False
 	return True
 
+# a chain resolves through the same few folders of each version, so each is looked at once for all the links through it
+@functools.lru_cache(maxsize=16384)
+def is_real_folder_under(top:str, folder:str) -> bool:
+	'''
+	Whether a path through folder stays in top: top is a real folder, and folder is top or under it with no symlink
+	from top down to folder. A missing folder on the way is fine, as nothing goes through it. A version's folders are
+	written only by the daemon, and a version folder's name is never used again, so the answer is kept.
+
+	Examples:
+		>>> import tempfile
+		>>> top = tempfile.mkdtemp()
+		>>> os.makedirs(os.path.join(top, 'a', 'b'))
+		>>> os.symlink(os.path.join(top, 'a'), os.path.join(top, 'l'))
+		>>> [is_real_folder_under(top, os.path.join(top, *rel)) for rel in ((), ('a',), ('a', 'b'), ('l',), ('l', 'b'), ('missing', 'b'))]
+		[True, True, True, False, False, True]
+		>>> [is_real_folder_under(os.path.join(top, *rel), top) for rel in (('a',), ('l',), ('missing',))]
+		[False, False, False]
+		>>> import shutil; shutil.rmtree(top)
+	'''
+	if folder == top:
+		try:
+			return stat.S_ISDIR(os.lstat(top).st_mode)
+		except (FileNotFoundError, NotADirectoryError):
+			return False
+	if not folder.startswith(top + '/') or not is_real_folder_under(top, os.path.dirname(folder)):
+		return False
+	try:
+		return not stat.S_ISLNK(os.lstat(folder).st_mode)
+	except (FileNotFoundError, NotADirectoryError):
+		return True
+
 def chain_link_target(job_vault:str, link_text:str, link_path:str):
 	'''
 	Where the relative link at link_path with link_text points, if it is a chain link; None for any other link, such
 	as a user's symlink backed up as one, even one shaped like a chain link.
 	The daemon links an unchanged entry of a version to the version just before it: ../ up to the job vault, that
 	version's folder and the entry's path in it, a text a move to another folder depth keeps. Only that form counts:
-	the folder named must be the one numbered one below the version holding link_path, by its whole name, and exist.
+	the folder named must be the one numbered one below the version holding link_path, by its whole name, and a real
+	folder with no symlink down to the target's parent (by is_real_folder_under()), so a backed-up folder symlink never
+	leads out of it. A chain link whose target is gone is still one.
 
 	Examples:
 		>>> import tempfile
 		>>> job_vault = tempfile.mkdtemp()
 		>>> for name in ('V2--2021-01-01_00-00-00_-0800', 'V3--2021-01-01_00-00-00_-0800', 'V3--x'):
-		...     os.makedirs(os.path.join(job_vault, name))
+		...     os.makedirs(os.path.join(job_vault, name, 'a'))
+		>>> os.symlink(job_vault, os.path.join(job_vault, 'V3--2021-01-01_00-00-00_-0800', 'l'))
 		>>> link_path = os.path.join(job_vault, 'V4--2021-01-02_00-00-00_-0800', 'deep', 'er', 'x')
 		>>> [chain_link_target(job_vault, text, link_path)[len(job_vault):] for text in (
 		...     '../V3--2021-01-01_00-00-00_-0800/a/x', '../../../../V3--2021-01-01_00-00-00_-0800/a/x')]
 		['/V3--2021-01-01_00-00-00_-0800/a/x', '/V3--2021-01-01_00-00-00_-0800/a/x']
 		>>> [chain_link_target(job_vault, text, link_path) for text in ('/abs/V3--2021-01-01_00-00-00_-0800/x', 'lib/x',
 		...     '../V3--2021-01-01_00-00-00_-0800', '../notaversion/x', '../V3--2021-01-01_00-00-00_-0800/a/../../../etc/x',
-		...     '../V2--2021-01-01_00-00-00_-0800/a/x', '../V3--2020-01-01_00-00-00_-0800/a/x', '../V3--x/a/x')]
-		[None, None, None, None, None, None, None, None]
+		...     '../V2--2021-01-01_00-00-00_-0800/a/x', '../V3--2020-01-01_00-00-00_-0800/a/x', '../V3--x/a/x',
+		...     '../V3--2021-01-01_00-00-00_-0800/l/a/x')]
+		[None, None, None, None, None, None, None, None, None]
+		>>> chain_link_target(job_vault, '../V3--2021-01-01_00-00-00_-0800/missing/x', link_path)[len(job_vault):]
+		'/V3--2021-01-01_00-00-00_-0800/missing/x'
 		>>> chain_link_target(job_vault, '../V3--2021-01-01_00-00-00_-0800/a/x', os.path.join(job_vault, 'elsewhere', 'x')) is None
 		True
 		>>> import shutil; shutil.rmtree(job_vault)
@@ -4795,25 +4832,37 @@ def chain_link_target(job_vault:str, link_text:str, link_path:str):
 	if number is None or not link_path.startswith(vault + '/'):
 		return None
 	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
-	if own_number is None or number != own_number - 1 or not is_version_folder_name(name) or not os.path.isdir(os.path.join(vault, name)):
+	if own_number is None or number != own_number - 1 or not is_version_folder_name(name):
 		return None
-	return os.path.join(vault, name, *rel)
+	target = os.path.join(vault, name, *rel)
+	return target if is_real_folder_under(os.path.join(vault, name), os.path.dirname(target)) else None
 
 def chain_hop(job_vault:str, link_path:str, link_text:str):
 	'''
 	Where the link at link_path with link_text leads if it is a chain link, else None. A relative link is one by
-	chain_link_target(); an absolute one, as older daemons wrote them, when its text names another version of job_vault.
+	chain_link_target(); an absolute one, as older daemons wrote them, when its text names another version of job_vault
+	and no symlink in that version lies on the way to the target (by is_real_folder_under()).
 
 	Examples:
-		>>> chain_hop('/v/j', '/v/j/V4--2021-01-02_00-00-00_-0800/a/u', '/v/j/V3--2021-01-01_00-00-00_-0800/a/../a/u')
-		'/v/j/V3--2021-01-01_00-00-00_-0800/a/u'
-		>>> [chain_hop('/v/j', '/v/j/V4--2021-01-02_00-00-00_-0800/a/u', text) for text in ('/elsewhere/u', '../lib/x')]
-		[None, None]
+		>>> import tempfile
+		>>> job_vault = tempfile.mkdtemp()
+		>>> os.makedirs(os.path.join(job_vault, 'V3--2021-01-01_00-00-00_-0800', 'a'))
+		>>> os.symlink(job_vault, os.path.join(job_vault, 'V3--2021-01-01_00-00-00_-0800', 'l'))
+		>>> link_path = os.path.join(job_vault, 'V4--2021-01-02_00-00-00_-0800', 'a', 'u')
+		>>> chain_hop(job_vault, link_path, job_vault + '/V3--2021-01-01_00-00-00_-0800/a/../a/u')[len(job_vault):]
+		'/V3--2021-01-01_00-00-00_-0800/a/u'
+		>>> [chain_hop(job_vault, link_path, text) for text in ('/elsewhere/u', '../lib/x', job_vault + '/V3--2021-01-01_00-00-00_-0800/l/u')]
+		[None, None, None]
+		>>> import shutil; shutil.rmtree(job_vault)
 	'''
 	if not os.path.isabs(link_text):
 		return chain_link_target(job_vault, link_text, link_path)
 	resolved = os.path.normpath(link_text)
-	return resolved if is_chained_link(resolved, os.path.abspath(job_vault), os.path.abspath(link_path)) else None
+	vault = os.path.abspath(job_vault)
+	if not is_chained_link(resolved, vault, os.path.abspath(link_path)):
+		return None
+	version_folder = os.path.join(vault, resolved[len(vault) + 1:].partition('/')[0])
+	return resolved if is_real_folder_under(version_folder, os.path.dirname(resolved)) else None
 
 def retarget_chain_link(job_vault:str, link_path:str) -> bool:
 	'''

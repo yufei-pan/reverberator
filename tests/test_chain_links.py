@@ -160,3 +160,33 @@ def test_link_naming_another_folder_for_the_previous_version_is_not_a_chain_link
 	# another timestamp than the previous version's folder has, and a folder whose name holds no timestamp
 	assert rv.chain_link_target(job_vault, f'../V0--{INNER_T}/a/x', link_path) is None
 	assert rv.chain_link_target(job_vault, '../V0--notatime/a/x', link_path) is None
+
+
+@pytest.mark.parametrize('absolute', [False, True])
+def test_link_through_a_backed_up_folder_symlink_is_not_followed_or_pruned_onto(job, absolute):
+	outside = os.path.join(job.root, 'outside')
+	write_tree(outside, {'x': 'not the vault\'s'})
+	v0 = write_committed_version(job, 0, {'keep': 'k'}, timestamp=T, current=False)
+	# a user's symlink to a folder, backed up as one
+	os.symlink(outside, f'{v0}/a')
+	v1 = write_committed_version(job, 1, {'deep/': None}, timestamp=T)
+	# shaped like a chain link an older daemon moved deeper, or like an older daemon's absolute one
+	text = f'{v0}/a/x' if absolute else f'../V0--{T}/a/x'
+	os.symlink(text, f'{v1}/deep/u')
+	record = rv.read_vault_record(v1, 'deep/u', job.monitor)
+	assert (record.kind, record.link) == ('l', text)
+	assert rv.retarget_moved_links(job.job_vault, f'{v1}/deep') == 0
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	assert not os.path.exists(v0)
+	assert open(os.path.join(outside, 'x')).read() == 'not the vault\'s'
+	assert os.readlink(f'{v1}/deep/u') == text
+
+
+def test_pruning_drops_a_chain_link_whose_folder_is_gone(job):
+	# nothing to materialise: as for a link whose file is gone, keeping it would hand the broken reference on
+	v0 = write_committed_version(job, 0, {'keep': 'k'}, timestamp=T, current=False)
+	v1 = write_committed_version(job, 1, {'sub/': None}, timestamp=T)
+	os.symlink(f'../../V0--{T}/sub/x', f'{v1}/sub/x')
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	assert not os.path.exists(v0)
+	assert not os.path.lexists(f'{v1}/sub/x')
