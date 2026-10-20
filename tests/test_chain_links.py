@@ -190,3 +190,75 @@ def test_pruning_drops_a_chain_link_whose_folder_is_gone(job):
 	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
 	assert not os.path.exists(v0)
 	assert not os.path.lexists(f'{v1}/sub/x')
+
+
+DEEP = 'a/' * 1000
+
+
+@pytest.mark.parametrize('absolute', [False, True])
+def test_a_link_a_thousand_folders_deep_stops_neither_a_backup_nor_a_prune(job, absolute):
+	seed_monitor(job, {'keep.txt': 'k'})
+	v0 = run_backup(job)[0]
+	# a user's symlink shaped like a chain link into a V0 folder the vault does not have, a thousand folders down
+	text = (f'{job.job_vault}/V0--{T}/' if absolute else f'../V0--{T}/') + DEEP + 'x'
+	os.symlink(text, f'{job.monitor}/u')
+	# copied into V1, then read back to record it
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'u', 'create')]))[-1]
+	record = rv.read_vault_record(v1, 'u', job.monitor)
+	assert (record.kind, record.link) == ('l', text)
+	open(f'{job.monitor}/keep.txt', 'w').write('k2')
+	run_backup(job, OrderedDict([event_entry(job, 'keep.txt', 'modify')]), keep_n_versions=2)
+	assert not os.path.exists(v0) and latest_version(job).version_number == 2
+	assert not os.path.islink(f'{v1}/keep.txt') and open(f'{v1}/keep.txt').read() == 'k'
+	assert os.readlink(f'{v1}/u') == text
+
+
+def test_a_chain_a_thousand_folders_deep_resolves_and_prunes(job):
+	v0 = write_committed_version(job, 0, {}, timestamp=T, current=False)
+	# one folder at a time, as os.makedirs recurses once a folder
+	folder = v0
+	for _ in range(DEEP.count('/')):
+		folder = os.path.join(folder, 'a')
+		os.mkdir(folder)
+	write_tree(folder, {'x': 'x'})
+	v1 = write_committed_version(job, 1, {}, timestamp=T)
+	# as an older daemon left it after moving the file to the top
+	os.symlink(f'../V0--{T}/{DEEP}x', f'{v1}/x')
+	assert rv.read_vault_record(v1, 'x', job.monitor).kind == 'f'
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	assert not os.path.exists(v0)
+	assert not os.path.islink(f'{v1}/x') and open(f'{v1}/x').read() == 'x'
+
+
+def test_a_link_naming_too_long_a_folder_does_not_stop_a_prune(job):
+	v0 = write_committed_version(job, 0, {'keep': 'k'}, timestamp=T, current=False)
+	v1 = write_committed_version(job, 1, {'other': 'o'}, timestamp=T)
+	# no folder can have a name this long
+	text = f'../V0--{T}/' + 'a' * 300 + '/x'
+	os.symlink(text, f'{v1}/u')
+	assert rv.read_vault_record(v1, 'u', job.monitor).kind == 'l'
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	assert not os.path.exists(v0)
+	assert os.readlink(f'{v1}/u') == text
+
+
+def test_a_refused_or_missing_folder_is_looked_at_again(tmp_path):
+	job_vault = str(tmp_path / 'job')
+	v0 = f'{job_vault}/V0--{T}'
+	link_path = f'{job_vault}/V1--{T}/u'
+	texts = (f'{v0}/a/x', f'../V0--{T}/a/x')
+	# V0 is not there yet
+	assert [rv.chain_hop(job_vault, link_path, text) for text in texts] == [None, None]
+	os.makedirs(v0)
+	# V0/a is not there yet, so nothing goes through it
+	assert [rv.chain_hop(job_vault, link_path, text) for text in texts] == [f'{v0}/a/x'] * 2
+	os.symlink(str(tmp_path), f'{v0}/a')
+	assert [rv.chain_hop(job_vault, link_path, text) for text in texts] == [None, None]
+
+
+def test_an_absolute_link_into_a_later_version_is_not_a_chain_link(tmp_path):
+	job_vault = str(tmp_path / 'job')
+	write_tree(f'{job_vault}/V2--{T}', {'a/x': 'x'})
+	target = f'{job_vault}/V2--{T}/a/x'
+	assert rv.chain_hop(job_vault, f'{job_vault}/V1--{T}/u', target) is None
+	assert rv.chain_hop(job_vault, f'{job_vault}/V3--{T}/u', target) == target
