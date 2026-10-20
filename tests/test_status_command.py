@@ -140,6 +140,17 @@ def test_status_vault_not_mounted(job, tmp_path, capsys):
 	assert code == 0 and f'vault not mounted: {job.vault}' in out and 'no versions yet' in out
 
 
+def test_status_shows_a_detail_with_control_characters_escaped(job, tmp_path, capsys):
+	# a job's detail can quote a monitored path, which anyone writing there names
+	two_versions(job)
+	write_state(tmp_path, 'daemon.json', daemon_record(job))
+	write_state(tmp_path, f'job-{job.job_name}.json', job_record(job, state='stopped', detail='cannot read /m/\x1b[2Jx\nnext \udcff'))
+	code, out, err = status(tmp_path, capsys)
+	assert (code, err) == (0, '')
+	assert 'stopped: cannot read /m/\\x1b[2Jx\\x0anext \\xff\n' in out
+	assert '\x1b' not in out
+
+
 def test_status_numbers_match_the_vault(job, tmp_path):
 	two_versions(job, keep='4')
 	rules = rv.parse_rules(job.rule_path, read_only=True)

@@ -389,4 +389,103 @@ def test_history_vault_it_cannot_read_is_an_error(job, tmp_path, capsys, monkeyp
 	monkeypatch.setattr(rv, 'list_versions', unreadable)
 	code, out, err = history(tmp_path, capsys, f'{job.monitor}/a.txt')
 	assert (code, out) == (rv.EXIT_COMMAND_FAILED, '')
-	assert f'Cannot read the vault {job.job_vault}' in err and 'not connected' in err
+	assert f'The vault {job.job_vault} cannot be read: ' in err and 'not connected' in err
+
+
+def test_history_of_a_stale_vault_mount_is_an_error(job, tmp_path, capsys, monkeypatch):
+	a_txt_lifetime(job)
+	write_rule(job)
+	real_stat = os.stat
+
+	def stale(path, *args, **kwargs):
+		if str(path) == job.job_vault:
+			raise OSError(107, 'Transport endpoint is not connected', path)
+		return real_stat(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'stat', stale)
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/a.txt')
+	assert (code, out) == (rv.EXIT_COMMAND_FAILED, '')
+	assert f'The vault {job.job_vault} cannot be read: ' in err and 'not connected' in err
+
+
+def test_history_says_when_the_vault_is_not_there(job, tmp_path, capsys):
+	a_txt_lifetime(job)
+	write_rule(job)
+	# the vault's disk not mounted: its mount point is an empty folder
+	shutil.rmtree(job.vault)
+	os.makedirs(job.vault)
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/a.txt')
+	assert (code, out) == (rv.EXIT_COMMAND_FAILED, '')
+	assert err == f'The vault {job.job_vault} is not there (is its disk mounted?)\n'
+	# a vault that is there with no versions yet: nothing was backed up
+	os.makedirs(job.job_vault)
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/a.txt')
+	assert (code, err) == (0, '')
+	assert out.split('\n')[1] == f'{job.monitor}/a.txt was never backed up'
+
+
+def test_folder_history_counts_what_moved_out_as_deleted(job):
+	seed_monitor(job, {'proj/a': 'a', 'proj/sub/b': 'b', 'proj/keep': 'k', 'other/': None})
+	run_backup(job)
+	os.rename(f'{job.monitor}/proj/a', f'{job.monitor}/other/a')
+	backup(job, ('other/a', 'move', 'proj/a'))
+	os.rename(f'{job.monitor}/proj/sub', f'{job.monitor}/other/sub')
+	backup(job, ('other/sub/', 'move', 'proj/sub/'))
+	rows = folder_hist(job, 'proj')
+	assert events(rows) == [(2, 'changed'), (1, 'changed'), (0, 'oldest')]
+	assert [(row.counts['delete'], row.files) for row in rows[:2]] == [(1, [('moved_away', 'sub/')]), (1, [('moved_away', 'a')])]
+	assert [(row.counts['move'], row.files) for row in folder_hist(job, 'other')[:2]] == [(1, [('move', 'sub/')]), (1, [('move', 'a')])]
+	rule = rv.ReverbRule(*rule_row(job))
+	assert rv.format_history(rule, job.job_vault, rows, 'folder', True).split('\n')[1:5] == [
+		f'V2  {at(job, 2)}  0 created, 0 modified, 1 deleted',
+		'    moved_away sub/',
+		f'V1  {at(job, 1)}  0 created, 0 modified, 1 deleted',
+		'    moved_away a',
+	]
+
+
+def test_history_shows_odd_names_escaped(job, tmp_path, capsys):
+	# monitored names are anyone's to choose: a name must not drive the terminal or pass for another line
+	seed_monitor(job, {'keep': 'k'})
+	run_backup(job)
+	write(job, 'evil\x1b[31m.txt', 'e')
+	backup(job, ('evil\x1b[31m.txt', 'create'))
+	os.rename(f'{job.monitor}/evil\x1b[31m.txt', f'{job.monitor}/two\nlines.txt')
+	backup(job, ('two\nlines.txt', 'move', 'evil\x1b[31m.txt'))
+	write_rule(job)
+	code, out, err = history(tmp_path, capsys, job.monitor, '--files')
+	assert (code, err) == (0, '')
+	assert out.split('\n')[1:5] == [
+		f'V2  {at(job, 2)}  0 created, 0 modified, 0 deleted, 1 moved',
+		'    move two\\x0alines.txt',
+		f'V1  {at(job, 1)}  1 created, 0 modified, 0 deleted',
+		'    create evil\\x1b[31m.txt',
+	]
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/two\nlines.txt')
+	assert (code, err) == (0, '')
+	assert out.split('\n')[1] == f'V2  {at(job, 2)}  moved from {job.monitor}/evil\\x1b[31m.txt  {rv.show_size(1)}'
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/never\x1b]0;title\x07')
+	assert code == 0 and out.split('\n')[1] == f'{job.monitor}/never\\x1b]0;title\\x07 was never backed up'
+	# and what a command refuses with
+	code, out, err = history(tmp_path, capsys, '/elsewhere/\x1b[2J')
+	assert code == rv.EXIT_USAGE and err.startswith('/elsewhere/\\x1b[2J is not under')
+	assert '\x1b' not in out + err
+
+
+def test_history_prints_a_name_that_is_not_utf8(job, tmp_path, capsys):
+	name = os.fsdecode(b'bad\xff.txt')
+	write_committed_version(job, 0, {'keep': 'k'}, timestamp=T0, current=False)
+	v1 = write_committed_version(job, 1, {'keep': 'k'}, timestamp=T1)
+	with open(os.path.join(os.fsencode(v1), b'bad\xff.txt'), 'w') as f:
+		f.write('x')
+	change_list = versions(job)[1].change_list
+	with open(change_list, 'ab') as f:
+		f.write(os.fsencode(job.monitor) + b'/bad\xff.txt\x002021-01-02T00:00:00\x00create\x00None\n')
+	write_rule(job)
+	code, out, err = history(tmp_path, capsys, job.monitor, '--files')
+	assert (code, err) == (0, '')
+	assert '    create bad\\xff.txt' in out.split('\n')
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/{name}')
+	assert (code, err) == (0, '')
+	assert out.split('\n')[1] == f'V1  {at(job, 1)}  created  {rv.show_size(1)}'
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/other{name}')
+	assert code == 0 and out.split('\n')[1] == f'{job.monitor}/otherbad\\xff.txt was never backed up'

@@ -6460,6 +6460,30 @@ def show_time(epoch:float, clock_only:bool = False) -> str:
 	'''A local time for people: date and minute, or only the minute of the day.'''
 	return time.strftime('%H:%M' if clock_only else '%Y-%m-%d %H:%M', time.localtime(epoch))
 
+def shown(text) -> str:
+	'''
+	text as it is safe to print on a terminal, as monitored names are anyone's to choose and the commands run as root:
+	each control or format character (a newline, an escape...) and each line or paragraph separator as a visible
+	escape, and a byte of a name that is not UTF-8 (a lone surrogate, as os.fsdecode() gives it) as that byte.
+	>>> print(shown('café \\x1b[31mred\\tnext\\nline \\udcff\\u202e'), shown('plain'))
+	café \\x1b[31mred\\x09next\\x0aline \\xff\\u202e plain
+	'''
+	text = str(text)
+	if text.isprintable():
+		return text
+	pieces = []
+	for c in text:
+		category = unicodedata.category(c)
+		if category[0] != 'C' and category not in ('Zl', 'Zp'):
+			pieces.append(c)
+			continue
+		code = ord(c)
+		if 0xdc80 <= code <= 0xdcff:
+			# the byte os.fsdecode() could not decode
+			code -= 0xdc00
+		pieces.append(f'\\x{code:02x}' if code < 0x100 else f'\\u{code:04x}' if code < 0x10000 else f'\\U{code:08x}')
+	return ''.join(pieces)
+
 def job_state_phrase(record, daemon_alive:bool, daemon_started) -> str:
 	'''
 	How a job is doing, from its status record (None when it has none): last known when the daemon is not alive or the
@@ -6521,7 +6545,8 @@ def format_status(status:DaemonStatus, rules:list, rule_path:str) -> str:
 	lines = [header, '']
 	for rule in rules:
 		lines += format_job_status(rule, status.jobs.get(rule.job_name), status, width)
-	return '\n'.join(lines)
+	# details and paths can quote monitored names
+	return '\n'.join(shown(line) for line in lines)
 
 def status_command(args) -> int:
 	'''Print the daemon's and each job's state. Exits 0 whatever it finds.'''
@@ -6543,7 +6568,8 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 	path's own row (None when it has none); where a move of it, or of a folder above it, took it from (moved_from) or
 	to (moved_to), else None; and for a folder, how many rows lie below it by event (counts) and each one's
 	(event, path below the folder) in the list's order, folders keeping their trailing '/' (files; None unless
-	list_files). The folder's own row is not counted below it.
+	list_files). The folder's own row is not counted below it; a move out of the folder counts as a delete, listed as
+	('moved_away', the path it left).
 	'''
 	own = path.rstrip('/')
 	prefix = own + '/'
@@ -6560,6 +6586,11 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 			counts[row.event] += 1
 			if files is not None:
 				files.append((row.event, row.path[len(prefix):]))
+		elif folder and row.event == 'move' and row.source_path and row.source_path.startswith(prefix) and row.source_path != prefix:
+			# moved out of the folder: gone from it
+			counts['delete'] += 1
+			if files is not None:
+				files.append(('moved_away', row.source_path[len(prefix):]))
 		if row.event != 'move' or not row.source_path:
 			continue
 		source = row.source_path
@@ -6720,33 +6751,37 @@ def format_history_row(row:HistoryRow, kind:str) -> str:
 	'''
 	line = f'V{row.version.number}  {show_time(row.version.timestamp)}  '
 	if kind != 'folder':
-		return line + history_label(row) + ('' if row.size is None else f'  {show_size(row.size)}')
-	if row.event == 'changed':
-		return line + counts_phrase(row.counts)
-	return line + history_label(row) + (f'; {counts_phrase(row.counts)}' if any(row.counts.values()) else '')
+		line += history_label(row) + ('' if row.size is None else f'  {show_size(row.size)}')
+	elif row.event == 'changed':
+		line += counts_phrase(row.counts)
+	else:
+		line += history_label(row) + (f'; {counts_phrase(row.counts)}' if any(row.counts.values()) else '')
+	# a moved-from or moved-to path is a monitored name
+	return shown(line)
 
 def format_history(rule:ReverbRule, job_vault:str, rows:list, kind:str, show_files:bool) -> str:
 	'''The history command's text: the job and its vault, then a line per row, a folder's changed paths under each when show_files.'''
-	lines = [f'job {rule.job_name}, vault {job_vault}']
+	lines = [shown(f'job {rule.job_name}, vault {job_vault}')]
 	for row in rows:
 		lines.append(format_history_row(row, kind))
 		if show_files and row.files:
-			lines += [f'    {event} {rel}' for event, rel in row.files]
+			lines += [shown(f'    {event} {rel}') for event, rel in row.files]
 	return '\n'.join(lines)
 
 def never_backed_up(rule:ReverbRule, rule_path:str, rel:str) -> str:
 	'''Say the path at rel was never backed up, naming the pattern that skips it when the job's skip list reads and has one.'''
 	path = os.path.join(rule.mon_path, rel) if rel else rule.mon_path
-	message = f'{path} was never backed up'
 	skip_list_path = resolve_skip_list_path(rule.skip_list_file, rule_path)
-	if skip_list_path is None:
-		return message
-	try:
-		skip_list = SkipList.load(rule.mon_path, skip_list_path)
-	except (OSError, ValueError):
-		return message
-	pattern = skip_list.deciding_pattern(rel, os.path.isdir(path) and not os.path.islink(path))
-	return message if pattern is None else f'{message}; it matches the skip pattern {pattern}'
+	pattern = None
+	if skip_list_path is not None:
+		try:
+			skip_list = SkipList.load(rule.mon_path, skip_list_path)
+		except (OSError, ValueError):
+			skip_list = None
+		if skip_list is not None:
+			pattern = skip_list.deciding_pattern(rel, os.path.isdir(path) and not os.path.islink(path))
+	message = f'{path} was never backed up'
+	return shown(message if pattern is None else f'{message}; it matches the skip pattern {pattern}')
 
 @contextlib.contextmanager
 def command_restore_lock(job_name:str, state_dir:str = None):
@@ -6769,6 +6804,13 @@ def history_command(args) -> int:
 	# taken before the versions are listed, so the list is the one left by a removal of the oldest version under way
 	with command_restore_lock(rule.job_name, args.state_dir):
 		try:
+			try:
+				there = stat.S_ISDIR(os.stat(job_vault).st_mode)
+			except (FileNotFoundError, NotADirectoryError):
+				there = False
+			if not there:
+				# a disk not mounted leaves an empty mount point: that is no reason to say nothing was backed up
+				raise CommandError(f'The vault {job_vault} is not there (is its disk mounted?)', EXIT_COMMAND_FAILED)
 			versions = list_versions(job_vault)
 			kind = path_kind(job_vault, versions, rule.mon_path, rel) if versions else None
 			if kind == 'folder':
@@ -6776,7 +6818,7 @@ def history_command(args) -> int:
 			elif kind == 'file':
 				rows = file_history(job_vault, versions, rule.mon_path, rel)
 		except OSError as e:
-			raise CommandError(f'Cannot read the vault {job_vault}: {e}', EXIT_COMMAND_FAILED)
+			raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
 	if kind is None:
 		# the header alone, then why there is nothing to show
 		print(format_history(rule, job_vault, [], 'file', False) + '\n' + never_backed_up(rule, rule_path, rel))
@@ -6797,7 +6839,8 @@ def run_command(argv:list) -> int:
 			raise CommandError(f'The {args.command} command is not available yet')
 		return command(args)
 	except CommandError as e:
-		print(e.message, file=sys.stderr)
+		# it can quote a typed or a monitored path
+		print(shown(e.message), file=sys.stderr)
 		return e.code
 	except KeyboardInterrupt:
 		print('Interrupted', file=sys.stderr)
