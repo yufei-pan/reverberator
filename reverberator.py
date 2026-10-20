@@ -6042,7 +6042,8 @@ def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path
 	# files of the version, and what lies behind it is the live file
 	version_top = os.path.abspath(version_path)
 	try:
-		real_folders = is_real_folder_under(version_top, os.path.dirname(entry))
+		# the version's own root has no folders above it in the version, and its lstat below checks it
+		real_folders = not rel or is_real_folder_under(version_top, os.path.dirname(entry))
 	except UncheckedVaultLink as e:
 		return ResolvedEntry('unreadable', entry, str(e))
 	if not real_folders:
