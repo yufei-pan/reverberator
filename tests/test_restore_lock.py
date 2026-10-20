@@ -1,3 +1,4 @@
+import errno
 import fcntl
 import os
 import signal
@@ -96,3 +97,45 @@ def test_pruning_without_a_state_folder_proceeds(job, tmp_path, monkeypatch):
 	_three_versions(job)
 	run_backup(job, _change(job, 3), keep_n_versions=3)
 	assert _numbers(job)[0] >= 1
+
+
+def _logged_errors(monkeypatch):
+	errors = []
+	real = rv.backuperTeeLogToTl
+	def record(*args, **kwargs):
+		if kwargs.get('error'):
+			errors.append(kwargs.get('message', args[1] if len(args) > 1 else ''))
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', record)
+	return errors
+
+
+@pytest.mark.parametrize('code', [errno.EMFILE, errno.EACCES])
+def test_pruning_is_postponed_when_the_lock_file_cannot_be_opened(job, monkeypatch, code):
+	_three_versions(job)
+	errors = _logged_errors(monkeypatch)
+	lock_path = rv.restore_lock_path('job')
+	real_open = os.open
+	def fake_open(path, *args, **kwargs):
+		if path == lock_path:
+			raise OSError(code, os.strerror(code))
+		return real_open(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', fake_open)
+	run_backup(job, _change(job, 3), keep_n_versions=3)
+	assert _numbers(job) == [0, 1, 2, 3]
+	assert errors
+
+
+def test_pruning_is_postponed_when_the_lock_cannot_be_taken(job, monkeypatch):
+	_three_versions(job)
+	os.makedirs(os.path.dirname(rv.restore_lock_path('job')), exist_ok=True)
+	errors = _logged_errors(monkeypatch)
+	real_flock = fcntl.flock
+	def fake_flock(fd, operation):
+		if operation == fcntl.LOCK_EX | fcntl.LOCK_NB:
+			raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+		return real_flock(fd, operation)
+	monkeypatch.setattr(fcntl, 'flock', fake_flock)
+	run_backup(job, _change(job, 3), keep_n_versions=3)
+	assert _numbers(job) == [0, 1, 2, 3]
+	assert errors

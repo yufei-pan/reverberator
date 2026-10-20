@@ -5720,17 +5720,25 @@ class RestoreLock:
 def prune_oldest(vault_info_dict:OrderedDict, job_name:str) -> tuple:
 	'''
 	decrement_stepper while no restore holds the job's lock; when one does, postpone and return (0, 0) so the retention
-	loops stop. A lock file that cannot be opened (no state folder) does not hold pruning back.
+	loops stop. Without a state folder nothing can hold the lock, so it prunes; any other failure to lock postpones too.
 	'''
 	try:
 		fd = os.open(restore_lock_path(job_name), os.O_RDWR | os.O_CREAT, 0o600)
-	except OSError:
+	except (FileNotFoundError, NotADirectoryError):
+		# no state folder, so no restore can be holding a lock
 		return decrement_stepper(vault_info_dict)
+	except OSError as e:
+		# the lock may be held right now: a check that failed is never taken as permission to remove
+		backuperTeeLogToTl(job_name,f'Postponing removal of the oldest version: cannot open the restore lock: {e}',error=True)
+		return 0, 0
 	try:
 		try:
 			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 		except BlockingIOError:
 			backuperTeeLogToTl(job_name,'Postponing removal of the oldest version: a restore is reading the vault')
+			return 0, 0
+		except OSError as e:
+			backuperTeeLogToTl(job_name,f'Postponing removal of the oldest version: cannot take the restore lock: {e}',error=True)
 			return 0, 0
 		return decrement_stepper(vault_info_dict)
 	finally:
