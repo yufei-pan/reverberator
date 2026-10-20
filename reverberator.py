@@ -656,6 +656,9 @@ FS_RECHECK_SECONDS = 60
 # the exit status when every job is stopped, or the rule file is missing or holds no job: only a rule or skip list fix
 # helps, so systemd is told not to restart
 EXIT_ALL_STOPPED = 3
+# the exit statuses of the status, history and restore commands: what was asked could not be done, or was asked wrongly
+EXIT_COMMAND_FAILED = 1
+EXIT_USAGE = 2
 
 def env_seconds(name:str, default:float) -> float:
 	'''Seconds from the environment variable name. Missing, unparsable, not above 0 or infinite → default.'''
@@ -1290,12 +1293,15 @@ def resolve_skip_list_path(cell:str, rule_file:str) -> str:
 		return None
 	return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(rule_file)), cell))
 
-def parse_rules(rule_file:str):
+def parse_rules(rule_file:str, read_only:bool = False):
 	'''
 	Parse the rule file using TSVZ and fill in the defaults and auto fields
 
 	Args:
 		rule_file (str): The rule file
+		read_only (bool): For the commands: change nothing on disk, so no header upgrade, no vault folder made, no
+			signature looked up (those cells stay as written) and nothing written back, and a missing or empty
+			rule file raises RuleFileError rather than ending the process
 
 	Returns:
 		rules (list): The rules
@@ -1314,11 +1320,15 @@ def parse_rules(rule_file:str):
 	global tl
 	global REVERB_RULE_TSV_HEADER
 	if not os.path.exists(rule_file):
+		if read_only:
+			raise RuleFileError(f'Rule file {rule_file} does not exist.')
 		tl.teeerror(f'Error: Rule file {rule_file} does not exist.')
 		daemon_error_log(f'rule file {rule_file} does not exist')
 		sys.exit(EXIT_ALL_STOPPED)
 	try:
-		if upgrade_rule_file_header(rule_file):
+		if read_only:
+			pass
+		elif upgrade_rule_file_header(rule_file):
 			tl.info(f'Upgraded rule file {rule_file} header with the Skip List File column.')
 	except (OSError, ValueError) as e:
 		# ValueError: a compressed or non UTF-8 rule file, which TSVZ still reads
@@ -1330,6 +1340,8 @@ def parse_rules(rule_file:str):
 	else:
 		tl.info(f'Parsed rules: \n{rules}')
 	if not rules:
+		if read_only:
+			raise RuleFileError(f'Rule file {rule_file} has no rules.')
 		tl.teeerror(f'Error: Rule file {rule_file} appears empty after parsing.')
 		daemon_error_log(f'rule file {rule_file} has no rules')
 		sys.exit(EXIT_ALL_STOPPED)
@@ -1371,7 +1383,7 @@ def parse_rules(rule_file:str):
 			tl.teelog(f'Warning: Rule {ruleName} has Vault Path: {inRule["vault_path"]} which is a subpath of the source path. Ignoring rule...',level='warning')
 			continue
 		# mon_fs_signature
-		if not mon_path_exists:
+		if not mon_path_exists or read_only:
 			pass
 		elif not inRule["mon_fs_signature"] or inRule["mon_fs_signature"].lower() == 'auto':
 			signatures = get_fs_signatures(inRule["mon_path"])
@@ -1425,7 +1437,9 @@ def parse_rules(rule_file:str):
 			tl.info(f'Auto filled Backup Size Limit for {ruleName}: {inRule["backup_size_limit"]}')
 			ruleUpdated = True
 		# vault_fs_signature
-		if not inRule["vault_fs_signature"] or inRule["vault_fs_signature"].lower() == 'auto':
+		if read_only:
+			pass
+		elif not inRule["vault_fs_signature"] or inRule["vault_fs_signature"].lower() == 'auto':
 			if not os.path.exists(inRule["vault_path"]):
 				# try create it 
 				try:
@@ -1450,7 +1464,7 @@ def parse_rules(rule_file:str):
 	# as renaming it would merge the two rows in the file
 	colliding = colliding_job_names(returnReverbRules)
 	rulesToUpdate = {name:row for name,row in rulesToUpdate.items() if row[0] not in colliding}
-	if rulesToUpdate:
+	if rulesToUpdate and not read_only:
 		try:
 			rewrite_rule_rows(rule_file,rulesToUpdate)
 		except (OSError, ValueError) as e:
@@ -5867,6 +5881,222 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		return manifest
 	record_dirty_entries(manifest,backup_folder,monitor_path)
 	return manifest
+
+# --- the status, history and restore commands read the vault through these, and write nothing ---
+
+class CommandError(Exception):
+	'''A command cannot do what was asked: message is for the user, code the exit status (a usage error unless said).'''
+	def __init__(self, message:str, code:int = EXIT_USAGE):
+		super().__init__(message)
+		self.message = message
+		self.code = code
+
+class RuleFileError(Exception):
+	'''The rule file is missing or holds no rule, as parse_rules(read_only=True) finds it.'''
+
+def job_vault_path(rule:ReverbRule) -> str:
+	'''The folder a job keeps its versions in.'''
+	return os.path.join(rule.vault_path, rule.job_name)
+
+def find_job(rules:list, path:str, job_name:str = None) -> tuple:
+	'''
+	The rule monitoring path, and path relative to its monitored path: (rule, rel), rel '' for the monitored path
+	itself, with no leading or trailing slash. A relative path is relative to the working folder, or to the job's
+	monitored path when job_name names the job. Of the jobs whose monitored path holds the path (on a folder
+	boundary), the one with the longest monitored path is taken. Raises CommandError, naming what there is, when no
+	job fits.
+
+	Examples:
+		>>> rules = [ReverbRule('top', '/m', *['']*10), ReverbRule('sub', '/m/sub', *['']*10)]
+		>>> [(rule.job_name, rel) for rule, rel in (find_job(rules, p) for p in ('/m/sub/x', '/m/subway/x', '/m/sub/', '/m'))]
+		[('sub', 'x'), ('top', 'subway/x'), ('sub', ''), ('top', '')]
+		>>> find_job(rules, 'a/b', job_name='top')[1]
+		'a/b'
+		>>> try:
+		...     find_job(rules, '/elsewhere')
+		... except CommandError as e:
+		...     print(e.message)
+		/elsewhere is not under any job's monitored path (/m, /m/sub)
+	'''
+	if job_name is not None:
+		candidates = [rule for rule in rules if rule.job_name == job_name]
+		if not candidates:
+			raise CommandError(f'No job named {job_name}; the jobs are {", ".join(rule.job_name for rule in rules)}')
+		path = os.path.join(candidates[0].mon_path, path)
+	else:
+		candidates = rules
+	path = os.path.abspath(path)
+	best = None
+	for rule in candidates:
+		mon_path = rule.mon_path.rstrip('/')
+		if (path == mon_path or path.startswith(mon_path + '/')) and (best is None or len(mon_path) > len(best[1])):
+			best = (rule, mon_path)
+	if best is None:
+		where = f"job {job_name}'s monitored path ({candidates[0].mon_path})" if job_name is not None else f"any job's monitored path ({', '.join(rule.mon_path for rule in rules)})"
+		raise CommandError(f'{path} is not under {where}')
+	return best[0], path[len(best[1]) + 1:]
+
+KeptVersion = namedtuple('KeptVersion', ['number', 'path', 'name', 'timestamp', 'size', 'inodes', 'change_list'])
+
+def parse_change_list_name(name:str):
+	'''
+	The version a change list file name stands for: (number, folder name, timestamp, size, inodes), None when name is not
+	one. The name is the version folder's, then --<size>-<inodes>_ino and the change list extension.
+
+	Examples:
+		>>> parse_change_list_name('V3--2021-01-01_00-00-00_-0800--1.50_KiB-12_ino.modified_contents.nsv')[:2]
+		(3, 'V3--2021-01-01_00-00-00_-0800')
+		>>> parse_change_list_name('V3--2021-01-01_00-00-00_-0800') is None
+		True
+		>>> parse_change_list_name('V3--x--1_KiB-1_ino.modified_contents.nsv') is None
+		True
+	'''
+	if not name.endswith(CONTENT_FILE_EXTENSION_NAME):
+		return None
+	number = vault_version_number(name)
+	folder_name, _, size_inodes = strip_suffix(name, CONTENT_FILE_EXTENSION_NAME).rpartition('--')
+	if number is None or not is_version_folder_name(folder_name):
+		return None
+	try:
+		timestamp = datetime.datetime.strptime(folder_name.partition('--')[2], VAULT_TIMESTAMP_FORMAT).timestamp()
+		size = format_bytes(size_inodes.partition('-')[0].replace('_',''), to_int=True)
+		inodes = format_bytes(size_inodes.rpartition('-')[2].replace('_ino',''), to_int=True)
+	except Exception:
+		return None
+	return number, folder_name, timestamp, size, inodes
+
+def list_versions(job_vault:str) -> list:
+	'''
+	The versions job_vault keeps, oldest first, as KeptVersion. A version is kept when its folder and its change list are
+	both there; one without the other, such as an unfinished backup, is left out and left alone.
+	'''
+	try:
+		names = os.listdir(job_vault)
+	except (FileNotFoundError, NotADirectoryError):
+		return []
+	versions = []
+	for name in names:
+		parsed = parse_change_list_name(name)
+		if parsed is None:
+			continue
+		number, folder_name, timestamp, size, inodes = parsed
+		path = os.path.join(job_vault, folder_name)
+		if os.path.isdir(path):
+			versions.append(KeptVersion(number, path, folder_name, timestamp, size, inodes, os.path.join(job_vault, name)))
+	return sorted(versions, key=lambda version: version.number)
+
+ResolvedEntry = namedtuple('ResolvedEntry', ['kind', 'path', 'detail'])
+
+def chain_form_missing_version(job_vault:str, link_path:str, link_text:str):
+	'''
+	The name of the version folder a relative link names when the link has the form of a chain link, (../)+<name>/<rel>
+	with <name> the version just below the link's own, but that folder does not exist; else None.
+
+	Examples:
+		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '../../V3--2021-01-01_00-00-00_-0800/a/x')
+		'V3--2021-01-01_00-00-00_-0800'
+		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '../../V2--2021-01-01_00-00-00_-0800/a/x') is None
+		True
+		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '/abs/V3--2021-01-01_00-00-00_-0800/a/x') is None
+		True
+	'''
+	parts = link_text.split('/')
+	ups = 0
+	while ups < len(parts) and parts[ups] == '..':
+		ups += 1
+	rel = parts[ups + 1:]
+	if not ups or not rel or any(part in ('', '.', '..') for part in rel):
+		return None
+	name = parts[ups]
+	vault = os.path.abspath(job_vault)
+	link_path = os.path.abspath(link_path)
+	if not link_path.startswith(vault + '/') or not is_version_folder_name(name):
+		return None
+	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
+	if own_number is None or vault_version_number(name) != own_number - 1:
+		return None
+	try:
+		os.lstat(os.path.join(vault, name))
+	except (FileNotFoundError, NotADirectoryError):
+		return name
+	except (OSError, ValueError):
+		pass
+	return None
+
+def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path:str) -> ResolvedEntry:
+	'''
+	Where the content of rel in the version at version_path really is, following the links that chain an unchanged entry
+	back to the version holding its copy (the rule read_vault_record() follows, up to MAX_CHAINED_LINKS of them).
+	The kind is 'file' or 'folder' (path is the real copy), 'symlink' (a user's symlink backed up as one; path is the
+	link), 'referenced' (a link to the monitored file itself; path is the link), 'missing' (the version has no such
+	entry), 'dangling' (a chain leads to nothing, or is too long) or 'unreadable' (a link or folder could not be
+	looked at); detail says what and where for the last two.
+	'''
+	vault = os.path.abspath(job_vault)
+	entry = os.path.abspath(os.path.join(version_path, rel))
+	hops = 0
+	while True:
+		# the entry's path in the version it is found in, which a move since the link was made may have changed
+		in_vault = entry.startswith(vault + '/')
+		entry_rel = entry[len(vault) + 1:].partition('/')[2] if in_vault else rel
+		try:
+			st = os.lstat(entry)
+		except (FileNotFoundError, NotADirectoryError):
+			if not hops:
+				return ResolvedEntry('missing', entry, f'{rel} is not in {os.path.basename(version_path)}')
+			return ResolvedEntry('dangling', entry, f'{entry_rel} is missing from {entry[len(vault) + 1:].partition("/")[0]}')
+		except OSError as e:
+			return ResolvedEntry('unreadable', entry, str(e))
+		if not stat.S_ISLNK(st.st_mode):
+			return ResolvedEntry('folder' if stat.S_ISDIR(st.st_mode) else 'file', entry, '')
+		try:
+			text = os.readlink(entry)
+			hop = strict_chain_hop(vault, entry, text)
+		except (OSError, UncheckedVaultLink) as e:
+			return ResolvedEntry('unreadable', entry, str(e))
+		if hop is None:
+			missing = chain_form_missing_version(vault, entry, text)
+			if missing is not None:
+				return ResolvedEntry('dangling', entry, f'{missing} is missing')
+			if os.path.isabs(text) and os.path.normpath(text) == os.path.join(monitor_path, entry_rel):
+				return ResolvedEntry('referenced', entry, text)
+			return ResolvedEntry('symlink', entry, text)
+		hops += 1
+		if hops > MAX_CHAINED_LINKS:
+			return ResolvedEntry('dangling', entry, f'too many links in the chain (more than {MAX_CHAINED_LINKS})')
+		entry = hop
+
+ChangeRow = namedtuple('ChangeRow', ['path', 'iso_time', 'event', 'source_path'])
+
+CHANGE_LIST_ESCAPES = {'</sep/>':'<sep>', '</LF/>':'<LF>', '<sep>':'\0', '<LF>':'\n'}
+CHANGE_LIST_ESCAPE_PATTERN = re.compile('|'.join(re.escape(token) for token in CHANGE_LIST_ESCAPES))
+
+def unescape_change_list_field(text:str) -> str:
+	'''
+	The field as it was before TSVZ wrote it into a change list: its <sep> and <LF> stand for a delimiter and a line feed,
+	and </sep/> and </LF/> for the text <sep> and <LF>. Read in one pass, so no replacement is read again, and
+	trailing spaces are kept.
+
+	Examples:
+		>>> unescape_change_list_field('a</sep/>b</LF/>c<LF>d<sep>e ')
+		'a<sep>b<LF>c\\nd\\x00e '
+		>>> unescape_change_list_field('</LF/>')
+		'<LF>'
+	'''
+	return CHANGE_LIST_ESCAPE_PATTERN.sub(lambda match: CHANGE_LIST_ESCAPES[match.group(0)], text)
+
+def iter_change_list(path:str):
+	'''Yield each ChangeRow of the change list at path (a header, then NUL separated fields to a line), reading line by line.'''
+	with open(path, 'r', encoding='utf-8', errors='surrogateescape', newline='\n') as f:
+		next(f, None)
+		for line in f:
+			line = line.rstrip('\n')
+			if not line:
+				continue
+			fields = [unescape_change_list_field(field) for field in line.split('\0')]
+			fields += [''] * (4 - len(fields))
+			source = fields[3]
+			yield ChangeRow(fields[0], fields[1], fields[2], None if source in ('', 'None') else source)
 
 if __name__ == "__main__":
 	main()
