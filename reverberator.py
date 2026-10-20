@@ -6405,19 +6405,23 @@ def format_job_status(rule:ReverbRule, record, status:DaemonStatus, width:int) -
 	started = status.record['started_at'] if status.record is not None else None
 	indent = ' ' * (width + 2)
 	lines = [f'{rule.job_name:<{width}}  {job_state_phrase(record, status.alive, started)}']
-	numbers = vault_numbers(rule)
-	versions = list_versions(job_vault_path(rule))
-	if versions:
-		newest, oldest = versions[-1], versions[0]
-		lines.append(f'{indent}last backup {show_time(newest.timestamp)} (V{newest.number})')
-		lines.append(f'{indent}{numbers.versions} versions (limit {numbers.keep_n or "no limit"}), oldest V{oldest.number} {show_time(oldest.timestamp)}')
-	else:
-		lines.append(f'{indent}no versions yet')
-	if not os.path.isdir(rule.vault_path) or not os.listdir(rule.vault_path):
-		lines.append(f'{indent}vault not mounted: {rule.vault_path}')
-	elif numbers.present:
-		lines.append(f'{indent}vault {show_size(numbers.size)} / limit {show_size(numbers.size_limit, numbers.size_limit)}, '
-			f'{show_count(numbers.inodes)} inodes / limit {show_count(numbers.inode_limit, numbers.inode_limit)}')
+	try:
+		numbers = vault_numbers(rule)
+		versions = list_versions(job_vault_path(rule))
+		if versions:
+			newest, oldest = versions[-1], versions[0]
+			lines.append(f'{indent}last backup {show_time(newest.timestamp)} (V{newest.number})')
+			lines.append(f'{indent}{numbers.versions} versions (limit {numbers.keep_n or "no limit"}), oldest V{oldest.number} {show_time(oldest.timestamp)}')
+		else:
+			lines.append(f'{indent}no versions yet')
+		if not os.path.isdir(rule.vault_path) or not os.listdir(rule.vault_path):
+			lines.append(f'{indent}vault not mounted: {rule.vault_path}')
+		elif numbers.present:
+			lines.append(f'{indent}vault {show_size(numbers.size)} / limit {show_size(numbers.size_limit, numbers.size_limit)}, '
+				f'{show_count(numbers.inodes)} inodes / limit {show_count(numbers.inode_limit, numbers.inode_limit)}')
+	except OSError as e:
+		# a stale mount or a permission error on one vault must not stop the others showing
+		lines = lines[:1] + [f'{indent}vault not readable: {rule.vault_path}: {e}']
 	return lines
 
 def format_status(status:DaemonStatus, rules:list, rule_path:str) -> str:
