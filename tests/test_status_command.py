@@ -1,3 +1,4 @@
+import errno
 import json
 import shutil
 import os
@@ -6,7 +7,7 @@ import sys
 import time
 import pytest
 import reverberator as rv
-from tests.harness import write_rule, write_committed_version, reverberator_script
+from tests.harness import create_job, rule_row, write_rule, write_committed_version, reverberator_script
 
 pytestmark = pytest.mark.unit
 
@@ -214,3 +215,20 @@ def test_status_runs_as_a_subprocess(job, tmp_path, process_env):
 	done = subprocess.run([sys.executable, reverberator_script(), 'status', '--rule', job.rule_path, '--state_dir', state_dir(tmp_path)],
 		capture_output=True, text=True, env=process_env, timeout=60)
 	assert done.returncode == 0 and job.job_name in done.stdout
+
+
+def test_status_shows_an_unreadable_vault_and_the_other_jobs(job, tmp_path, capsys, monkeypatch):
+	two_versions(job)
+	other = create_job(str(tmp_path / 'other'), 'second')
+	write_committed_version(other, 0, {'a': 'x'})
+	write_rule(job, extra_rows=[rule_row(other)])
+	real_listdir = os.listdir
+	def listdir(path = '.'):
+		if os.fspath(path) in (job.vault, job.job_vault):
+			raise OSError(errno.ENOTCONN, 'Transport endpoint is not connected')
+		return real_listdir(path)
+	monkeypatch.setattr(os, 'listdir', listdir)
+	code, out, err = status(tmp_path, capsys, '--rule', job.rule_path)
+	assert code == 0 and 'Traceback' not in err
+	assert f'vault not readable: {job.vault}: ' in out and 'not connected' in out
+	assert 'last backup' in out and out.index('second') > out.index('vault not readable')
