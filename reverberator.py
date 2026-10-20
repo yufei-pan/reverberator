@@ -754,6 +754,8 @@ HASH_SIZE = 1<<16
 COMPARE_THREADS = 32
 # the kernel also gives up resolving a path after 40 links
 MAX_CHAINED_LINKS = 40
+# vault folders known to be real, kept so the many links through one folder look at it once
+REAL_VAULT_FOLDERS_KEPT = 16384
 # manifest rows written or read per statement: enough to amortise sqlite calls, little to hold
 MANIFEST_BATCH_SIZE = 10000
 # a copy is written under a name of its own with this suffix, in its destination's folder, until it succeeded
@@ -4734,7 +4736,11 @@ def vault_version_number(version_folder_name:str):
 		True
 	'''
 	match = re.match(r'V(\d+)--', version_folder_name)
-	return int(match.group(1)) if match else None
+	try:
+		return int(match.group(1)) if match else None
+	except ValueError:
+		# more digits than int() reads from a string: a link's text, never a version folder
+		return None
 
 # chain links name few versions, so each name is parsed once for all the links naming it
 @functools.lru_cache(maxsize=1024)
@@ -4755,13 +4761,17 @@ def is_version_folder_name(name:str) -> bool:
 		return False
 	return True
 
-# a chain resolves through the same few folders of each version, so each is looked at once for all the links through it
-@functools.lru_cache(maxsize=16384)
+# (version folder, folder) pairs found real: the folder is a real folder reached from the version folder through real
+# folders only. only those answers are kept, as the daemon alone writes a version's folders and never uses a version
+# folder's name again, while a folder missing or refused now may be a version's real folder later
+REAL_VAULT_FOLDERS = OrderedDict()
+REAL_VAULT_FOLDERS_LOCK = threading.Lock()
+
 def is_real_folder_under(top:str, folder:str) -> bool:
 	'''
 	Whether a path through folder stays in top: top is a real folder, and folder is top or under it with no symlink
-	from top down to folder. A missing folder on the way is fine, as nothing goes through it. A version's folders are
-	written only by the daemon, and a version folder's name is never used again, so the answer is kept.
+	from top down to folder. A missing folder on the way, or a file, is fine, as nothing goes through it; a folder that
+	cannot be looked at is not. Never raises.
 
 	Examples:
 		>>> import tempfile
@@ -4772,19 +4782,37 @@ def is_real_folder_under(top:str, folder:str) -> bool:
 		[True, True, True, False, False, True]
 		>>> [is_real_folder_under(os.path.join(top, *rel), top) for rel in (('a',), ('l',), ('missing',))]
 		[False, False, False]
+		>>> is_real_folder_under(top, os.path.join(top, 'a' * 300, 'b'))
+		False
 		>>> import shutil; shutil.rmtree(top)
 	'''
-	if folder == top:
-		try:
-			return stat.S_ISDIR(os.lstat(top).st_mode)
-		except (FileNotFoundError, NotADirectoryError):
-			return False
-	if not folder.startswith(top + '/') or not is_real_folder_under(top, os.path.dirname(folder)):
+	if folder != top and not folder.startswith(top + '/'):
 		return False
-	try:
-		return not stat.S_ISLNK(os.lstat(folder).st_mode)
-	except (FileNotFoundError, NotADirectoryError):
+	if (top, folder) in REAL_VAULT_FOLDERS:
 		return True
+	parts = folder[len(top) + 1:].split('/') if folder != top else []
+	path = top
+	# walked down from top, so a crafted link thousands of folders deep stops at its first folder that is not real
+	for depth in range(len(parts) + 1):
+		if depth:
+			path = f'{path}/{parts[depth - 1]}'
+		if (top, path) in REAL_VAULT_FOLDERS:
+			continue
+		try:
+			mode = os.lstat(path).st_mode
+		except (FileNotFoundError, NotADirectoryError):
+			# nothing goes through a missing folder, but the version folder must be there
+			return depth > 0
+		except (OSError, ValueError):
+			return False
+		if not stat.S_ISDIR(mode):
+			# a symlink could lead anywhere, nothing goes through anything else
+			return depth > 0 and not stat.S_ISLNK(mode)
+		with REAL_VAULT_FOLDERS_LOCK:
+			REAL_VAULT_FOLDERS[(top, path)] = None
+			if len(REAL_VAULT_FOLDERS) > REAL_VAULT_FOLDERS_KEPT:
+				REAL_VAULT_FOLDERS.popitem(last=False)
+	return True
 
 def chain_link_target(job_vault:str, link_text:str, link_path:str):
 	'''
@@ -4840,8 +4868,8 @@ def chain_link_target(job_vault:str, link_text:str, link_path:str):
 def chain_hop(job_vault:str, link_path:str, link_text:str):
 	'''
 	Where the link at link_path with link_text leads if it is a chain link, else None. A relative link is one by
-	chain_link_target(); an absolute one, as older daemons wrote them, when its text names another version of job_vault
-	and no symlink in that version lies on the way to the target (by is_real_folder_under()).
+	chain_link_target(); an absolute one, as older daemons wrote them, when its text names an older version of
+	job_vault and no symlink in that version lies on the way to the target (by is_real_folder_under()). Never raises.
 
 	Examples:
 		>>> import tempfile
@@ -4851,18 +4879,24 @@ def chain_hop(job_vault:str, link_path:str, link_text:str):
 		>>> link_path = os.path.join(job_vault, 'V4--2021-01-02_00-00-00_-0800', 'a', 'u')
 		>>> chain_hop(job_vault, link_path, job_vault + '/V3--2021-01-01_00-00-00_-0800/a/../a/u')[len(job_vault):]
 		'/V3--2021-01-01_00-00-00_-0800/a/u'
-		>>> [chain_hop(job_vault, link_path, text) for text in ('/elsewhere/u', '../lib/x', job_vault + '/V3--2021-01-01_00-00-00_-0800/l/u')]
-		[None, None, None]
+		>>> [chain_hop(job_vault, link_path, text) for text in ('/elsewhere/u', '../lib/x', job_vault + '/V3--2021-01-01_00-00-00_-0800/l/u',
+		...     job_vault + '/V5--2021-01-03_00-00-00_-0800/a/u')]
+		[None, None, None, None]
 		>>> import shutil; shutil.rmtree(job_vault)
 	'''
 	if not os.path.isabs(link_text):
 		return chain_link_target(job_vault, link_text, link_path)
 	resolved = os.path.normpath(link_text)
 	vault = os.path.abspath(job_vault)
-	if not is_chained_link(resolved, vault, os.path.abspath(link_path)):
+	link_path = os.path.abspath(link_path)
+	if not is_chained_link(resolved, vault, link_path):
 		return None
-	version_folder = os.path.join(vault, resolved[len(vault) + 1:].partition('/')[0])
-	return resolved if is_real_folder_under(version_folder, os.path.dirname(resolved)) else None
+	version = resolved[len(vault) + 1:].partition('/')[0]
+	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
+	# the daemon only ever linked a version to an older one
+	if own_number is None or vault_version_number(version) >= own_number:
+		return None
+	return resolved if is_real_folder_under(os.path.join(vault, version), os.path.dirname(resolved)) else None
 
 def retarget_chain_link(job_vault:str, link_path:str) -> bool:
 	'''
