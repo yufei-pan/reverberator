@@ -562,3 +562,39 @@ def test_restore_file_never_replaces_what_appeared(job, tmp_path, capsys, monkey
 	code, stdout, _ = restore(tmp_path, capsys, f'{job.monitor}/a.txt', out, '--version', '1')
 	assert code == rv.EXIT_COMMAND_FAILED and 'appeared while restoring; left untouched' in stdout
 	assert tree(out) == {'a.txt': 'theirs'} and partial_files(out) == []
+
+
+def test_restore_refuses_a_destination_others_could_change(job, tmp_path, capsys):
+	three_versions(job)
+	path = f'{job.monitor}/a.txt'
+
+	def under(name, mode, uid=None):
+		folder = tmp_path / name
+		(folder / 'out').mkdir(parents=True)
+		os.chmod(folder, mode)
+		if uid is not None:
+			os.chown(folder, uid, uid)
+		return str(folder), str(folder / 'out')
+	# a folder anyone may write in, without the sticky bit: they could swap the destination out from under the restore
+	cases = [under('open', 0o777)]
+	if os.geteuid() == 0:
+		# another user's folder
+		cases.append(under('theirs', 0o755, uid=65534))
+	for folder, out in cases:
+		code, stdout, err = restore(tmp_path, capsys, path, out, '--version', '1')
+		assert (code, stdout) == (rv.EXIT_USAGE, ''), folder
+		assert folder in err and 'only you (or root) can write to' in err, err
+		assert os.listdir(out) == []
+		assert rv.unsafe_folder_on_path(out) == folder
+	# the destination itself counts
+	open_out = tmp_path / 'open_out'
+	open_out.mkdir()
+	os.chmod(open_out, 0o777)
+	assert restore(tmp_path, capsys, path, str(open_out), '--version', '1')[0] == rv.EXIT_USAGE
+	assert os.listdir(open_out) == []
+	# as /tmp is: anyone may make entries there, but only remove or rename their own
+	shared, out = under('shared', 0o1777)
+	assert rv.unsafe_folder_on_path(out) is None
+	assert restore(tmp_path, capsys, path, out, '--version', '1')[0] == 0
+	assert tree(out) == {'a.txt': 'v1'}
+	assert rv.unsafe_folder_on_path('/') is None

@@ -7201,6 +7201,35 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 				# None: a handler set from outside Python, which cannot be set back
 				signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
+def unsafe_folder_on_path(path:str):
+	'''
+	The first folder from / down to path (itself a folder, its symlinks resolved) that a user other than root and this
+	process's could change: owned by someone else, or writable by its group or others without the sticky bit, so that
+	whoever writes there could rename what lies below it and put a symlink in its place. None when there is none; a
+	folder that cannot be looked at counts as one.
+	>>> top = tempfile.mkdtemp()
+	>>> os.makedirs(os.path.join(top, 'open', 'mine'))
+	>>> os.chmod(os.path.join(top, 'open'), 0o777)
+	>>> unsafe_folder_on_path(os.path.join(top, 'open', 'mine')) == os.path.join(os.path.realpath(top), 'open')
+	True
+	>>> os.chmod(os.path.join(top, 'open'), 0o1777)
+	>>> unsafe_folder_on_path(os.path.join(top, 'open', 'mine')) is None
+	True
+	>>> shutil.rmtree(top)
+	'''
+	parts = [part for part in os.path.realpath(path).split('/') if part]
+	for depth in range(len(parts) + 1):
+		folder = '/' + '/'.join(parts[:depth])
+		try:
+			st = os.lstat(folder)
+		except OSError:
+			return folder
+		if st.st_uid not in (0, os.geteuid()):
+			return folder
+		if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not st.st_mode & stat.S_ISVTX:
+			return folder
+	return None
+
 def target_exists(target:str) -> CommandError:
 	'''The refusal of a restore whose target is already there.'''
 	return CommandError(f'{target} already exists: restore into another folder, or move it out of the way first')
@@ -7208,11 +7237,16 @@ def target_exists(target:str) -> CommandError:
 def restore_target(rules:list, dest:str, rel:str, monitor_path:str) -> str:
 	'''
 	Where restoring rel into the folder dest puts it: dest/<its name>, the monitored path's own name for the whole job.
-	A CommandError when dest is not a folder, when that lies inside any job's vault (through symlinks too), or when
-	something is already there.
+	A CommandError when dest is not a folder, when another user could change a folder on the way to it
+	(unsafe_folder_on_path()), when that lies inside any job's vault (through symlinks too), or when something is
+	already there.
 	'''
 	if not os.path.isdir(dest):
 		raise CommandError(f'{dest} is not a folder: give an existing folder to restore into')
+	unsafe = unsafe_folder_on_path(dest)
+	if unsafe is not None:
+		# the copies are written by path: one who can rename a folder on the way could send them anywhere
+		raise CommandError(f'Not restoring into {dest}: another user can change {unsafe}; pick a destination only you (or root) can write to')
 	target = os.path.join(os.path.abspath(dest), os.path.basename(rel) or os.path.basename(monitor_path.rstrip('/')))
 	for rule in rules:
 		if is_subpath(target, rule.vault_path):
