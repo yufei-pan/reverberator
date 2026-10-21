@@ -721,7 +721,9 @@ def test_failures_are_streamed_and_the_summary_repeats_the_first_twenty(capsys):
 	lines = report.summary().split('\n')
 	assert [line for line in lines if line.startswith('FAILED ')] == [f'FAILED proj/f{number:02}: dangling vault link: x' for number in range(20)]
 	assert '5 more failed: shown above as they happened' in lines
-	assert lines[-1].startswith('Left /out/proj private') or 'failed' in lines[-1]
+	assert lines[0] == 'Restored 0 entries (0 B)'
+	# the head, the warning, 20 failures and the count of the rest
+	assert len(lines) == 23 and lines[-1] == '5 more failed: shown above as they happened'
 
 
 def test_a_streamed_failure_starts_a_line_of_its_own_on_a_terminal(monkeypatch):
@@ -767,7 +769,7 @@ def test_a_stop_during_the_metadata_pass_is_noticed(job, tmp_path, capsys, monke
 	monkeypatch.setattr(rv, 'restore_folder_meta', stopping)
 	out = destination(tmp_path)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	assert code == rv.EXIT_COMMAND_FAILED and 'Interrupted: run the same restore again' in err
+	assert code == rv.EXIT_COMMAND_FAILED and 'stopped while giving its folders their owners' in err
 	# the deepest folder only: the rest waited for the next check, and the marker stayed
 	assert handed == [os.path.join(out, 'proj/sub/deeper')]
 	assert os.path.isfile(os.path.join(out, 'proj', rv.RESTORE_MARKER_NAME))
