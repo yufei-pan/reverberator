@@ -60,6 +60,8 @@ def run_reverberator(tmp_path, process_env):
 			stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE,
 			text=True,
+			# a byte that is not UTF-8 must show in the capture, not end the reading of it
+			errors='surrogateescape',
 		)
 		p._out_buf = []
 		p._err_buf = []

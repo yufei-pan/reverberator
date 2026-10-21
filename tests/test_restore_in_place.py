@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import os
@@ -1030,3 +1031,29 @@ def test_a_stop_while_handing_folders_over_points_at_accept(job, tmp_path, capsy
 	assert code == 0
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
 	assert metadata(target) == metadata(os.path.join(version_path(job, 0), 'proj'))
+
+
+def test_a_marker_that_would_not_go_is_not_rewritten_into_a_folder_being_handed_over(job, tmp_path, capsys, monkeypatch):
+	files = twenty_files(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	mark(target, job, 'proj', versions(job)[0].name)
+	# an earlier run left f00.txt without all of its metadata: this one copies it afresh, so its marker would change
+	rv.write_restore_marker(target, job.job_name, 'proj', versions(job)[0], ['proj/f00.txt'])
+	marker = os.path.join(target, rv.RESTORE_MARKER_NAME)
+	unlink, restore_folder_meta, write_restore_marker = os.unlink, rv.restore_folder_meta, rv.write_restore_marker
+	written = []
+	def stuck(path, *args, **kwargs):
+		if os.fspath(path) == marker:
+			raise PermissionError(errno.EPERM, 'Operation not permitted', path)
+		return unlink(path, *args, **kwargs)
+	def stopped(source, dest):
+		if dest == target:
+			raise KeyboardInterrupt
+		return restore_folder_meta(source, dest)
+	monkeypatch.setattr(os, 'unlink', stuck)
+	monkeypatch.setattr(rv, 'restore_folder_meta', stopped)
+	monkeypatch.setattr(rv, 'write_restore_marker', lambda *args, **kwargs: written.append(args[4:]) or write_restore_marker(*args, **kwargs))
+	restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	# only the claim wrote it, before anything was handed over
+	assert len(written) == 1

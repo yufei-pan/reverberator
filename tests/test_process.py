@@ -3,6 +3,7 @@ import signal
 import time
 import pytest
 import reverberator as rv
+from tests.test_log_text import alerting_lines
 from tests.harness import (
 	write_rule, seed_monitor, wait_for_committed_count, committed_versions,
 	write_incomplete_version, write_pending, wait_until, create_job, rule_row,
@@ -185,3 +186,34 @@ def test_colliding_job_names_are_both_stopped(job, tmp_path, run_reverberator):
 	assert proc.wait(timeout=15) == 3
 	assert ''.join(proc._out_buf + proc._err_buf).count('reverberator job job STOPPED') == 2
 	assert any(line.startswith('JOB\t') for line in open(job.rule_path).read().splitlines())
+
+
+@pytest.mark.parametrize('verbose', [False, True])
+def test_names_that_are_not_text_are_kept_exactly_and_never_alert(job, run_reverberator, process_env, verbose):
+	process_env['LANG'] = process_env['LC_ALL'] = 'C.UTF-8'
+	seed_monitor(job, {'keep': 'k'})
+	write_rule(job)
+	proc = run_reverberator(job.rule_path, extra_args=('-v',) if verbose else ())
+	wait_for_committed_count(job, 1, timeout=15)
+	m = os.fsencode(job.monitor)
+	forged = b'reverberator job job FAILED: forged'
+	files = {b'bad\xff.txt': b'bad', b'd\xfe/x\xfd': b'nested', b'nl\n' + forged: b'newline', b'esc\x1b[31mred': b'esc'}
+	os.makedirs(m + b'/d\xfe')
+	for name, content in files.items():
+		with open(m + b'/' + name, 'wb') as f:
+			f.write(content)
+	def kept():
+		latest = committed_versions(job)[-1]
+		return all(os.path.lexists(os.path.join(os.fsencode(latest), name)) for name in files)
+	wait_until(kept, timeout=30, message='the names were not backed up')
+	latest = os.fsencode(committed_versions(job)[-1])
+	for name, content in files.items():
+		assert open(os.path.join(latest, name), 'rb').read() == content
+	assert os.path.isdir(os.path.join(latest, b'd\xfe'))
+	time.sleep(1)
+	assert proc.poll() is None
+	proc.send_signal(signal.SIGTERM)
+	proc.wait(timeout=15)
+	output = ''.join(proc._out_buf + proc._err_buf)
+	assert alerting_lines(output) == []
+	assert '\x1b[31mred' not in output and '\udcff' not in output

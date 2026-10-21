@@ -430,6 +430,29 @@ def test_a_recopy_is_checked_like_any_copy(job, monkeypatch):
 	assert lookup(job, kept) == records[kept]
 
 
+def test_a_failed_recopy_keeps_the_link_and_the_recorded_copy_version(job, monkeypatch):
+	name = name_with_threshold(32)
+	seed_monitor(job, {name: 'kept', 'c.txt': 'c'})
+	backup(job)
+	for _ in range(32):
+		backup(job, 'c.txt')
+	assert copy_versions(job)[name] == 0
+	copy_command = rv.copy_command
+	# a cp that cannot read its source and exits non-zero, for the file due for a copy only
+	failing = ['sh', '-c', 'echo "cp: error reading \'$1\': Input/output error" >&2; exit 1', 'sh']
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: failing + [source] if os.path.basename(source) == name else copy_command(source, dest))
+	before = chain_length(os.path.join(latest_version(job).path, name))
+	version = backup(job, 'c.txt')
+	assert version.number == 33
+	path = os.path.join(version.path, name)
+	assert os.path.islink(path) and chain_length(path) == before + 1
+	with open(path) as f:
+		assert f.read() == 'kept'
+	assert changes(job, version) == [('c.txt', 'modify')]
+	assert copy_versions(job)[name] == 0
+	assert not [entry for entry in os.listdir(version.path) if entry.endswith('.reverberator-partial')]
+
+
 def test_a_batch_s_own_changes_to_a_due_file(job):
 	modified, deleted, moved, gone = (name_with_threshold(32, stem) for stem in ('m', 'd', 'v', 'g'))
 	vault_size = fast_forward_to_32(job, {modified: BIG, deleted: 'd', moved: 'v', gone: 'gone'})

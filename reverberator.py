@@ -1574,7 +1574,7 @@ def parse_rules(rule_file:str, read_only:bool = False):
 		# ValueError: a compressed or non UTF-8 rule file, which TSVZ still reads
 		tl.teelog(log_text(f'Warning: Cannot upgrade rule file {rule_file} ({e}). The Skip List File column cannot be used until the header is upgraded.'),level='warning')
 
-	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=DEBUG)
+	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=False)
 	if DEBUG:
 		tl.teeprint(log_text(f'Parsed rules: \n{rules}'))
 	else:
@@ -2589,7 +2589,7 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 			header=CHANGED_EVENT_HEADER,
 			verifyHeader=True,
 			strict=False,
-			verbose=DEBUG,
+			verbose=False,
 			defaults=[],
 			correctColumnNum=len(CHANGED_EVENT_HEADER)
 		)
@@ -2685,11 +2685,11 @@ def get_fs_signatures(path:str) -> list:
 	global DEBUG
 	# df --no-sync --output=source,ipcent,pcent,target for use percentage
 	# lsblk --raw --paths --output=kname,label,model,name,partlabel,partuuid,uuid,serial,fstype,wwn <dev> for infos
-	rtnHost = multiCMD.run_command(['df','--no-sync','--output=source',path],timeout=60,quiet=not DEBUG,return_object=True)
+	rtnHost = multiCMD.run_command(['df','--no-sync','--output=source',path],timeout=60,quiet=True,return_object=True)
 	if rtnHost.returncode != 0 or not rtnHost.stdout or len(rtnHost.stdout) <= 1:
 		return []
 	deviceName = rtnHost.stdout[1].split()[0]
-	rtnHost = multiCMD.run_command(['lsblk','--raw','--output=uuid,label,partuuid,partlabel,wwn,serial,model,name,kname,pkname',deviceName],timeout=60,quiet=not DEBUG,return_object=True)
+	rtnHost = multiCMD.run_command(['lsblk','--raw','--output=uuid,label,partuuid,partlabel,wwn,serial,model,name,kname,pkname',deviceName],timeout=60,quiet=True,return_object=True)
 	if rtnHost.returncode != 0 or not rtnHost.stdout or len(rtnHost.stdout) <= 1:
 		return [deviceName]
 	fields = rtnHost.stdout[1].split()
@@ -3830,7 +3830,7 @@ def do_backup(backup_entries:dict,
 				if log_journal:
 					log_to_journal(journalPath,monitor_path,'initial_complete_backup',backup_folder)
 				manifest.reset(backup_folder)
-				mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
+				mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
 				pending = []
 				try:
 					# the walk yields each folder before its contents
@@ -3995,7 +3995,7 @@ def do_backup(backup_entries:dict,
 		# a disk mounted while this backup walked is remembered too
 		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
 		manifest.commit(backup_folder)
-		TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
+		TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=False)
 		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
 		# create the current version symlink
 		vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder,this_timestamp,this_size,this_inodes)
@@ -4071,7 +4071,7 @@ def persist_pending_transactions(job_name:str, vault_path:str, to_process:'Chang
 			verifyHeader=True,
 			strict=False,
 			teeLogger=tl,
-			verbose=DEBUG
+			verbose=False
 		)
 		backuperTeeLogToTl(job_name, f'Saved {len(pending_rows)} pending transactions to {pending_transactions_path}')
 	except Exception as e:
@@ -4119,7 +4119,7 @@ def remove_incomplete_vault_versions(job_vault_path: str) -> list:
 			error=True,
 		)
 		try:
-			multiCMD.run_command(['rm', '-rf', vault_dir], quiet=not DEBUG, return_code_only=True)
+			multiCMD.run_command(['rm', '-rf', vault_dir], quiet=True, return_code_only=True)
 			deleted.append(vault_dir)
 		except Exception as e:
 			backuperTeeLogToTl(job_vault_path, f'Failed to remove incomplete version {vault_dir}: {e}', error=True)
@@ -4205,7 +4205,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 				error=True,
 			)
 			try:
-				multiCMD.run_command(['rm', '-rf', entry], quiet=not DEBUG, return_code_only=True)
+				multiCMD.run_command(['rm', '-rf', entry], quiet=True, return_code_only=True)
 			except Exception as e:
 				backuperTeeLogToTl(job_vault_path, f'Error removing orphan {entry}: {e}', error=True)
 	except PermissionError:
@@ -4403,7 +4403,7 @@ def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = 
 		pending.append(PendingCopy(task, source_path, temp_path, dest_path))
 		return task
 	try:
-		returncode = multiCMD.run_command(command,quiet=not DEBUG,return_code_only=True,wait_for_return=True)
+		returncode = multiCMD.run_command(command,quiet=True,return_code_only=True,wait_for_return=True)
 		if returncode == 0:
 			replace_entry(temp_path, dest_path)
 	finally:
@@ -4669,7 +4669,7 @@ def get_path_size(*path:str):
 	# du --bytes -s <path>
 	if DEBUG:
 		startTime = time.perf_counter()
-	rtn = multiCMD.run_command(['du','--block-size=1','-csP',*path],quiet=not DEBUG)
+	rtn = multiCMD.run_command(['du','--block-size=1','-csP',*path],quiet=True)
 	if DEBUG:
 		backuperTeeLogToTl(path='get_path_size',message=f'took {time.perf_counter()-startTime} seconds')
 	if rtn and rtn[-1] and rtn[-1].partition('\t')[0].isdigit():
@@ -4683,7 +4683,7 @@ def get_path_inodes(*path:str):
 	# df --inodes -s <path>
 	if DEBUG:
 		startTime = time.perf_counter()
-	rtn = multiCMD.run_command(['du','--inodes','-csP',*path],quiet=not DEBUG)
+	rtn = multiCMD.run_command(['du','--inodes','-csP',*path],quiet=True)
 	if DEBUG:
 		backuperTeeLogToTl(path='get_path_inodes',message=f'took {time.perf_counter()-startTime} seconds')
 	if rtn and rtn[-1] and rtn[-1].partition('\t')[0].isdigit():
@@ -6164,7 +6164,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 def get_path_fs_info(path:str):
 	# this function gets the filesystem usage information of a path
 	# df --no-sync --output=size,itotal <path>
-	# rtn = multiCMD.run_command(['df','--no-sync','--output=size,itotal',path],quiet=not DEBUG)
+	# rtn = multiCMD.run_command(['df','--no-sync','--output=size,itotal',path],quiet=True)
 	# if rtn and rtn[-1]:
 	# 	try:
 	# 		size, inodes = rtn[-1].split(maxsplit=1)
@@ -6484,7 +6484,7 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 		else:
 			backuperTeeLogToTl(path=referenceVaultPath,message=f'Creating content file {new_content_file_path}')
 			try:
-				TSVZ.appendTabularFile(new_content_file_path,[],header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=DEBUG)
+				TSVZ.appendTabularFile(new_content_file_path,[],header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=False)
 			except Exception as e:
 				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error creating content file {new_content_file_path}: {e}')
 				#continue
@@ -6497,7 +6497,7 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	removingInodes = get_path_inodes(referenceVaultPath)
 	#os.remove(path=reference_content_file_path)
 	paths_to_remove = glob.glob(referenceVaultPath+'*',recursive=False)
-	multiCMD.run_command(['rm','-rf',*paths_to_remove],quiet=not DEBUG,return_code_only=True)
+	multiCMD.run_command(['rm','-rf',*paths_to_remove],quiet=True,return_code_only=True)
 	forget_real_vault_folders(referenceVaultPath)
 	return removingSize, removingInodes
 
@@ -6608,7 +6608,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True):
 		return manifest
 	backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
-	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
+	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
 	# copies queued on mcae, put in place by each wait for it
 	pending = []
 	need_delete_barrier = False
@@ -7720,6 +7720,8 @@ class RestoreReport:
 		self.left_private = False
 		# set once the folders began to be given their owners, which a stop leaves half done
 		self.handing_over = False
+		# set once the target itself began to be given its owner: nothing is written by its path after that
+		self.target_handing_over = False
 		# with --accept: kept as it was, and how many folders it handed to their owners
 		self.accepted = False
 		self.handed_over = 0
@@ -8181,7 +8183,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	report.version, report.rel, report.target = version, rel, target
 	RESTORE_STOP.clear()
 	handlers = {}
-	mcae = multiCMD.AsyncExecutor(semaphore=threading.Semaphore(max(1, threads)), quiet=not DEBUG)
+	mcae = multiCMD.AsyncExecutor(semaphore=threading.Semaphore(max(1, threads)), quiet=True)
 	pending = []
 	# (vault folder, restored folder, rel) in walk order: each folder before what is in it
 	folders = []
@@ -8329,7 +8331,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			# however the restore ends, no copy is left writing into target, nor a partial file in it
 			stop_copies(mcae, pending, target)
 		finally:
-			if report.marker is not None:
+			if report.marker is not None and not report.target_handing_over:
 				# the marker this run leaves: what it knows of, and what it did not get to meet again
 				unset = list(report.unset) + [entry for entry in earlier if entry not in report.unset]
 				if unset != written:
@@ -8360,6 +8362,8 @@ def hand_over_folders(folders:list, report:RestoreReport, check_stop = None) -> 
 			except OSError as e:
 				report.warn(entry_rel, f'{RESTORE_MARKER_NAME} could not be removed: {e}')
 		report.handing_over = True
+		if dest == report.target:
+			report.target_handing_over = True
 		error = restore_folder_meta(source, dest)
 		if error is None:
 			report.handed_over += 1
