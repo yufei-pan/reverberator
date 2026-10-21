@@ -256,6 +256,24 @@ def test_restore_refuses_destination_inside_vault(job, tmp_path, capsys):
 	assert code == rv.EXIT_USAGE and 'not a folder' in err
 
 
+def test_restore_reports_an_old_absolute_link_to_a_removed_version(job, tmp_path, capsys):
+	seed_monitor(job, {'proj/a.txt': 'a', 'proj/b.txt': 'b'})
+	run_backup(job)
+	write(job, 'proj/a.txt', 'a1')
+	backup(job, ('proj/a.txt', 'modify'))
+	write_rule(job)
+	v0, v1 = version_path(job, 0), version_path(job, 1)
+	# as an older daemon linked b.txt, to a version since removed by hand
+	os.remove(os.path.join(v1, 'proj/b.txt'))
+	os.symlink(os.path.join(job.job_vault, f'V0--2021-01-01_00-00-00_-0800/proj/b.txt'), os.path.join(v1, 'proj/b.txt'))
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '1')
+	assert code == rv.EXIT_COMMAND_FAILED and 'Traceback' not in err
+	assert 'FAILED proj/b.txt: dangling vault link: V0--2021-01-01_00-00-00_-0800 is missing' in stdout.split('\n')
+	assert not os.path.lexists(os.path.join(out, 'proj/b.txt'))
+	assert os.path.isdir(v0)
+
+
 def test_restore_reports_dangling_and_continues(job, tmp_path, capsys):
 	seed_monitor(job, {'proj/a.txt': 'a', 'proj/b.txt': 'b', 'proj/c.txt': 'c'})
 	run_backup(job)

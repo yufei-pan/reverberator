@@ -151,6 +151,29 @@ def test_in_place_folder_is_restored_exactly(job, tmp_path, capsys):
 	assert sorted(os.listdir(job.monitor)) == sorted(['proj', aside, 'other.txt'])
 
 
+def test_in_place_folder_taken_right_after_the_move_aside(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'proj/a.txt': 'a'})
+	run_backup(job)
+	write_rule(job)
+	write(job, 'proj/a.txt', 'a2')
+	target = f'{job.monitor}/proj'
+	move_aside = rv.move_aside
+
+	def taken_meanwhile(path):
+		aside = move_aside(path)
+		# as by another program writing there
+		os.mkdir(path)
+		write(job, 'proj/new.txt', 'new')
+		return aside
+	monkeypatch.setattr(rv, 'move_aside', taken_meanwhile)
+	code, stdout, err = restore(tmp_path, capsys, target, '--in-place', '--version', '0')
+	[aside] = asides(job.monitor, 'proj')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert stdout == f'Moved {target} aside to {job.monitor}/{aside}\n'
+	assert err == f'{target} was taken meanwhile, right after what was there was moved aside to {job.monitor}/{aside}: nothing was restored; run the restore again to move that aside too\n'
+	assert tree(os.path.join(job.monitor, aside)) == {'a.txt': 'a2'} and tree(target) == {'new.txt': 'new'}
+
+
 def test_in_place_root_needs_an_empty_root(job, tmp_path, capsys):
 	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b', 'lost+found/': None})
 	os.chmod(f'{job.monitor}/lost+found', 0o700)
@@ -727,6 +750,43 @@ def test_in_place_root_shows_the_disk_and_refuses_too_little_space(job, tmp_path
 	assert (code, stdout) == (rv.EXIT_USAGE, '')
 	assert rv.show_size(1024) in err and rv.show_size(version.size) in err and mount_point in err
 	assert os.listdir(job.monitor) == []
+
+
+def test_in_place_root_weighs_free_space_against_the_whole_tree(job, tmp_path, capsys, monkeypatch):
+	# V0 holds the whole tree, V1 only what changed after it
+	seed_monitor(job, {'big.txt': 'a' * 200000, 'small.txt': 's'})
+	run_backup(job)
+	write(job, 'small.txt', 's2')
+	backup(job, ('small.txt', 'modify'))
+	write_rule(job)
+	for rel in ('big.txt', 'small.txt'):
+		os.remove(f'{job.monitor}/{rel}')
+	v0, v1 = versions(job)
+	assert v1.size < v0.size
+	mount_point, source = rv.mount_holding(rv.current_mount_table(), job.monitor)
+	statvfs = os.statvfs
+	def free_space(free):
+		result = os.statvfs_result((4096, 1, free, free, free, 100, 50, 50, 0, 255))
+		monkeypatch.setattr(os, 'statvfs', lambda path: result if os.fspath(path) == job.monitor else statvfs(path))
+		return (f'Restoring the whole job into {job.monitor}, on the filesystem mounted at {mount_point} ({source}): '
+			f'{rv.show_size(free)} free, V0 to V1 took {rv.show_size(v0.size + v1.size)} in the vault')
+	# room for what V1 copied, but not for the tree the oldest version holds
+	free_space(v0.size - 1)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1', '--yes')
+	assert (code, stdout) == (rv.EXIT_USAGE, '')
+	assert rv.show_size(v0.size - 1) in err and rv.show_size(v0.size) in err and 'V0' in err and mount_point in err
+	assert os.listdir(job.monitor) == []
+	# room for the oldest version's tree, but not for every version up to V1
+	shown_disk = free_space(v0.size)
+	monkeypatch.setattr(sys, 'stdin', Terminal('n\n'))
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1')
+	assert code == rv.EXIT_COMMAND_FAILED and 'Cancelled' in err
+	assert stdout == f'{shown_disk}\nV1 may not fit: its files can come from any of V0 to V1, more than the free space\nContinue? [y/N] '
+	shown_disk = free_space(v0.size + v1.size)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1', '--yes')
+	assert (code, err) == (0, '')
+	assert stdout.startswith(f'{shown_disk}\nRestored ')
+	assert tree(job.monitor) == {'big.txt': 'a' * 200000, 'small.txt': 's2'}
 
 
 def test_resume_never_replaces_a_folder_where_a_file_goes(job, tmp_path, capsys):
