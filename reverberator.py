@@ -7007,6 +7007,8 @@ def get_command_args(argv:list) -> argparse.Namespace:
 	Examples:
 		>>> get_command_args(['status', '--rule', 'r.tsv']).rule
 		'r.tsv'
+		>>> get_command_args(['status', '--json']).json, get_command_args(['status']).json
+		(True, False)
 		>>> get_command_args(['history', '/a/b', '--files']).files
 		True
 		>>> get_command_args(['restore', '/a/b', '--version', '3', '--yes']).version
@@ -7020,7 +7022,8 @@ def get_command_args(argv:list) -> argparse.Namespace:
 	where.add_argument('--job', metavar='NAME', default=None, help='The job, when the path is relative to its monitored path')
 	parser = argparse.ArgumentParser(prog='reverberator.py', description='Look at what the daemon backs up, and restore it')
 	commands = parser.add_subparsers(dest='command', required=True)
-	commands.add_parser('status', parents=[common], help='Show the daemon and each job')
+	status = commands.add_parser('status', parents=[common], help='Show the daemon and each job')
+	status.add_argument('--json', action='store_true', help='Print it as one JSON object, made from the same data as the text')
 	history = commands.add_parser('history', parents=[common, where], help='Show the versions that changed a path')
 	history.add_argument('--files', action='store_true', help='For a folder, list each changed file')
 	restore = commands.add_parser('restore', parents=[common, where], help='Copy a path back from a version')
@@ -7093,17 +7096,24 @@ def load_command_rules(rule_path:str) -> list:
 
 VaultNumbers = namedtuple('VaultNumbers', ['present', 'versions', 'size', 'inodes', 'size_limit', 'inode_limit', 'keep_n'])
 
+def rule_keep_n(rule:ReverbRule) -> int:
+	'''
+	How many versions a rule keeps, 0 for no limit (and for a value that is not a number).
+	>>> rule_keep_n(ReverbRule('j', '/m', '/v', *[''] * 5, '5', *[''] * 3)), rule_keep_n(ReverbRule('j', '/m', '/v', *[''] * 9))
+	(5, 0)
+	'''
+	try:
+		return int(rule.keep_n_versions)
+	except (TypeError, ValueError):
+		return 0
+
 def vault_numbers(rule:ReverbRule, versions:list = None) -> VaultNumbers:
 	'''What a job's vault holds and what limits it: sizes summed from its versions (list_versions() unless given), limits as the backuper works them out.'''
 	if versions is None:
 		versions = list_versions(job_vault_path(rule))
 	size_limit, inode_limit = get_backup_limits_from_str(rule.backup_size_limit, *get_path_fs_info(rule.vault_path))
-	try:
-		keep_n = int(rule.keep_n_versions)
-	except ValueError:
-		keep_n = 0
 	return VaultNumbers(os.path.isdir(job_vault_path(rule)), len(versions), sum(v.size for v in versions),
-		sum(v.inodes for v in versions), size_limit, inode_limit, keep_n)
+		sum(v.inodes for v in versions), size_limit, inode_limit, rule_keep_n(rule))
 
 def show_size(size:int, limit:int = None) -> str:
 	'''
@@ -7188,6 +7198,26 @@ def shown(text) -> str:
 		pieces.append(f'\\x{code:02x}' if code < 0x100 else f'\\u{code:04x}' if code < 0x10000 else f'\\U{code:08x}')
 	return ''.join(pieces)
 
+def record_number(record, key:str):
+	'''
+	The number a status record holds at key, or None when it has no record or no number there.
+	>>> record_number({'a': 3, 'b': 'x'}, 'a'), record_number({'a': 3, 'b': 'x'}, 'b'), record_number(None, 'a')
+	(3, None, None)
+	'''
+	value = record.get(key) if record is not None else None
+	return value if isinstance(value, (int, float)) else None
+
+def job_record_last_known(record, daemon_alive:bool, daemon_started) -> bool:
+	'''
+	Whether a job's status record (None when it has none) gives only its last known state: the daemon is not alive, or
+	the record is older than this daemon run. A job with no record is unknown, not last known.
+	>>> job_record_last_known({'updated': 5}, True, 4), job_record_last_known({'updated': 5}, True, 6), job_record_last_known(None, False, None)
+	(False, True, False)
+	'''
+	if record is None:
+		return False
+	return not daemon_alive or (daemon_started is not None and (record_number(record, 'updated') or 0) < daemon_started)
+
 def job_state_phrase(record, daemon_alive:bool, daemon_started) -> str:
 	'''
 	How a job is doing, from its status record (None when it has none): last known when the daemon is not alive or the
@@ -7200,7 +7230,7 @@ def job_state_phrase(record, daemon_alive:bool, daemon_started) -> str:
 	if record is None:
 		return 'unknown'
 	state, detail = record['state'], record.get('detail') or ''
-	number = lambda key, default = 0: record.get(key) if isinstance(record.get(key), (int, float)) else default
+	number = lambda key: record_number(record, key) or 0
 	if state == 'waiting':
 		phrase = f'waiting for disk since {show_time(number("since"), True)}: {detail}'
 	elif state == 'retrying':
@@ -7209,59 +7239,123 @@ def job_state_phrase(record, daemon_alive:bool, daemon_started) -> str:
 		phrase = f'stopped: {detail}'
 	else:
 		phrase = state
-	stale = daemon_started is not None and number('updated') < daemon_started
-	return phrase if daemon_alive and not stale else f'last known: {phrase}'
+	return f'last known: {phrase}' if job_record_last_known(record, daemon_alive, daemon_started) else phrase
 
-def format_job_status(rule:ReverbRule, record, status:DaemonStatus, width:int) -> list:
-	'''The lines for one job, the name first and the rest indented under it.'''
+def daemon_view(status:DaemonStatus, rule_path:str) -> dict:
+	'''
+	The daemon as the status command shows it: whether it is alive, and the pid, version and start time it recorded
+	(None when it left no record; a daemon that is not alive keeps those of its last run), and the rule file read.
+	'''
+	record = status.record or {}
+	version = record.get('version')
+	return {'alive': status.alive, 'pid': record.get('pid'), 'version': shown(version) if isinstance(version, str) else version,
+		'started_at': record.get('started_at'), 'rule_path': shown(rule_path)}
+
+def job_view(rule:ReverbRule, record, status:DaemonStatus, rule_path:str) -> dict:
+	'''
+	One job as the status command shows it, from its status record (None when it has none) and its vault: its state
+	(unknown with no record), the phrase status prints for it (job_state_phrase()) and whether that is only the last
+	known state, the record's detail, failures, retry_at and since; the number and time of the newest kept version
+	(last_backup, the time the version folder is named with) and of the oldest one, None when there is none; how many
+	versions are kept and the limit (keep, 0 for none); and the vault: its path, whether it is mounted, its size and
+	inodes with their limits (0 for none, None where status prints no vault line), or the error that kept it from
+	being read (mounted and versions are then None). A job whose name cleans up to nothing is stopped from the rule
+	file alone, whether or not the daemon runs, and has no vault folder (vault None). Texts are escaped as shown()
+	prints them, as they can quote monitored names.
+	'''
+	view = {'job': shown(raw_job_name(rule)), 'state': 'unknown', 'phrase': '', 'last_known': False, 'detail': '', 'failures': 0,
+		'retry_at': None, 'since': None, 'last_backup': None, 'last_version': None, 'oldest_backup': None, 'oldest_version': None,
+		'versions': 0, 'keep': rule_keep_n(rule), 'vault': None}
+	if not rule.job_name:
+		reason = nameless_reason(rule_path)
+		view.update(state='stopped', phrase=shown(f'stopped: {reason}'), detail=shown(reason))
+		return view
 	started = status.record['started_at'] if status.record is not None else None
-	indent = ' ' * (width + 2)
-	lines = [f'{rule.job_name:<{width}}  {job_state_phrase(record, status.alive, started)}']
+	view.update(phrase=shown(job_state_phrase(record, status.alive, started)), last_known=job_record_last_known(record, status.alive, started))
+	if record is not None:
+		view.update(state=record['state'], detail=shown(record.get('detail') or ''), failures=int(record_number(record, 'failures') or 0),
+			retry_at=record_number(record, 'retry_at'), since=record_number(record, 'since'))
+	vault = view['vault'] = {'path': shown(rule.vault_path), 'mounted': None, 'error': None, 'size': None, 'size_limit': None,
+		'inodes': None, 'inode_limit': None}
 	try:
 		versions = list_versions(job_vault_path(rule))
 		numbers = vault_numbers(rule, versions)
-		if versions:
-			newest, oldest = versions[-1], versions[0]
-			lines.append(f'{indent}last backup {show_time(newest.timestamp)} (V{newest.number})')
-			lines.append(f'{indent}{numbers.versions} versions ({f"limit {numbers.keep_n}" if numbers.keep_n else "no limit"}), oldest V{oldest.number} {show_time(oldest.timestamp)}')
-		else:
-			lines.append(f'{indent}no versions yet')
-		if not os.path.isdir(rule.vault_path) or not os.listdir(rule.vault_path):
-			lines.append(f'{indent}vault not mounted: {rule.vault_path}')
-		elif numbers.present:
-			size_limit = 'no limit' if numbers.size_limit == 0 else f'limit {show_size(numbers.size_limit)}'
-			inode_limit = 'no limit' if numbers.inode_limit == 0 else f'limit {show_count(numbers.inode_limit)}'
-			lines.append(f'{indent}vault {show_size(numbers.size)} / {size_limit}, {show_count(numbers.inodes)} inodes / {inode_limit}')
+		mounted = os.path.isdir(rule.vault_path) and bool(os.listdir(rule.vault_path))
 	except OSError as e:
 		# a stale mount or a permission error on one vault must not stop the others showing
-		lines = lines[:1] + [f'{indent}vault not readable: {rule.vault_path}: {e}']
+		vault['error'] = shown(e)
+		view['versions'] = None
+		return view
+	vault['mounted'] = mounted
+	view['versions'] = len(versions)
+	if versions:
+		newest, oldest = versions[-1], versions[0]
+		view.update(last_backup=newest.timestamp, last_version=newest.number, oldest_backup=oldest.timestamp, oldest_version=oldest.number)
+	if mounted and numbers.present:
+		vault.update(size=numbers.size, size_limit=numbers.size_limit, inodes=numbers.inodes, inode_limit=numbers.inode_limit)
+	return view
+
+def status_view(status:DaemonStatus, rules:list, rule_path:str) -> dict:
+	'''
+	What the status command shows, which its text (status_text()) and --json are both made from: the daemon
+	(daemon_view()) and each job in the rule file's order (job_view()).
+	'''
+	return {'daemon': daemon_view(status, rule_path),
+		'jobs': [job_view(rule, status.jobs.get(rule.job_name) if rule.job_name else None, status, rule_path) for rule in rules]}
+
+def format_job_status(view:dict, width:int) -> list:
+	'''The lines for one job of status_view(), the name first and the rest indented under it.'''
+	indent = ' ' * (width + 2)
+	lines = [f'{view["job"]:<{width}}  {view["phrase"]}']
+	vault = view['vault']
+	if vault is None:
+		return lines
+	if vault['error'] is not None:
+		return lines + [f'{indent}vault not readable: {vault["path"]}: {vault["error"]}']
+	if view['last_version'] is not None:
+		keep = f'limit {view["keep"]}' if view['keep'] else 'no limit'
+		lines.append(f'{indent}last backup {show_time(view["last_backup"])} (V{view["last_version"]})')
+		lines.append(f'{indent}{view["versions"]} versions ({keep}), oldest V{view["oldest_version"]} {show_time(view["oldest_backup"])}')
+	else:
+		lines.append(f'{indent}no versions yet')
+	if not vault['mounted']:
+		lines.append(f'{indent}vault not mounted: {vault["path"]}')
+	elif vault['size'] is not None:
+		size_limit = 'no limit' if vault['size_limit'] == 0 else f'limit {show_size(vault["size_limit"])}'
+		inode_limit = 'no limit' if vault['inode_limit'] == 0 else f'limit {show_count(vault["inode_limit"])}'
+		lines.append(f'{indent}vault {show_size(vault["size"])} / {size_limit}, {show_count(vault["inodes"])} inodes / {inode_limit}')
 	return lines
+
+def status_text(view:dict) -> str:
+	'''The status command's text for a status_view(): the daemon, then each job in the rule file.'''
+	daemon = view['daemon']
+	if daemon['started_at'] is None:
+		header = 'reverberator is not running'
+	elif daemon['alive']:
+		version = '?' if daemon['version'] is None else daemon['version']
+		header = f'reverberator {version}, running since {show_time(daemon["started_at"])} (pid {daemon["pid"]}), rules {daemon["rule_path"]}'
+	else:
+		header = f'reverberator is not running (last started {show_time(daemon["started_at"])})'
+	width = max(len(job['job']) for job in view['jobs'])
+	lines = [header, '']
+	for job in view['jobs']:
+		lines += format_job_status(job, width)
+	# the view's texts are escaped already; this keeps any line that is not
+	return '\n'.join(shown(line) for line in lines)
 
 def format_status(status:DaemonStatus, rules:list, rule_path:str) -> str:
 	'''The status command's text: the daemon, then each job in the rule file.'''
-	record = status.record
-	if record is None:
-		header = 'reverberator is not running'
-	elif status.alive:
-		header = f'reverberator {record.get("version", "?")}, running since {show_time(record["started_at"])} (pid {record["pid"]}), rules {rule_path}'
-	else:
-		header = f'reverberator is not running (last started {show_time(record["started_at"])})'
-	width = max(len(raw_job_name(rule)) for rule in rules)
-	lines = [header, '']
-	for rule in rules:
-		if not rule.job_name:
-			# stopped from the rule file alone, whether or not the daemon runs; it has no vault folder
-			lines.append(f'{raw_job_name(rule):<{width}}  stopped: {nameless_reason(rule_path)}')
-			continue
-		lines += format_job_status(rule, status.jobs.get(rule.job_name), status, width)
-	# details and paths can quote monitored names
-	return '\n'.join(shown(line) for line in lines)
+	return status_text(status_view(status, rules, rule_path))
 
 def status_command(args) -> int:
-	'''Print the daemon's and each job's state. Exits 0 whatever it finds.'''
+	'''
+	Print the daemon's and each job's state: as text, or with --json as one JSON object on one line, both made from
+	status_view() so that they cannot disagree. Exits 0 whatever it finds.
+	'''
 	status = read_status(state_dir_path(args.state_dir))
 	rule_path = command_rule_path(args, status)
-	print(format_status(status, load_command_rules(rule_path), rule_path))
+	view = status_view(status, load_command_rules(rule_path), rule_path)
+	print(json.dumps(view) if args.json else status_text(view))
 	return 0
 
 HistoryRow = namedtuple('HistoryRow', ['version', 'event', 'size', 'source', 'counts', 'files'])

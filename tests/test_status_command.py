@@ -269,3 +269,151 @@ def test_status_lists_each_vault_once(job, tmp_path, capsys, monkeypatch):
 	monkeypatch.setattr(rv, 'list_versions', lambda path: listed.append(path) or real(path))
 	assert status(tmp_path, capsys, '--rule', job.rule_path)[0] == 0
 	assert listed == [job.job_vault]
+
+
+def status_json(tmp_path, capsys, *extra):
+	code, out, err = status(tmp_path, capsys, '--json', *extra)
+	return code, json.loads(out) if out else None, err
+
+
+def test_status_json_with_a_live_daemon(job, tmp_path, capsys):
+	two_versions(job, keep='5')
+	record = daemon_record(job)
+	write_state(tmp_path, 'daemon.json', record)
+	write_state(tmp_path, f'job-{job.job_name}.json', job_record(job, since=1000.5))
+	code, view, err = status_json(tmp_path, capsys)
+	assert code == 0 and err == ''
+	assert view['daemon'] == {'alive': True, 'pid': os.getpid(), 'version': 0.38, 'started_at': record['started_at'], 'rule_path': job.rule_path}
+	versions = rv.list_versions(job.job_vault)
+	numbers = rv.vault_numbers(rv.parse_rules(job.rule_path, read_only=True)[0])
+	assert view['jobs'] == [{'job': job.job_name, 'state': 'running', 'phrase': 'running', 'last_known': False, 'detail': '',
+		'failures': 0, 'retry_at': None, 'since': 1000.5, 'last_backup': versions[1].timestamp, 'last_version': 1,
+		'oldest_backup': versions[0].timestamp, 'oldest_version': 0, 'versions': 2, 'keep': 5,
+		'vault': {'path': job.vault, 'mounted': True, 'error': None, 'size': numbers.size, 'size_limit': numbers.size_limit,
+			'inodes': numbers.inodes, 'inode_limit': numbers.inode_limit}}]
+
+
+def test_status_json_prints_one_line(job, tmp_path, capsys):
+	two_versions(job)
+	code, out, err = status(tmp_path, capsys, '--json', '--rule', job.rule_path)
+	assert code == 0 and out.count('\n') == 1 and out.endswith('}\n')
+
+
+def test_status_json_and_text_say_the_same(job, tmp_path, capsys):
+	# both are made from status_view(): each phrase and number the text shows is in the JSON
+	two_versions(job, keep='5')
+	write_state(tmp_path, 'daemon.json', daemon_record(job))
+	at = time.mktime((2026, 10, 19, 8, 40, 0, 0, 0, -1))
+	for fields in (dict(state='retrying', detail='boom', failures=3, retry_at=at), dict(state='waiting', detail='/mnt/x: not mounted', since=at),
+			dict(state='stopped', detail='skip list lost', failures=2), dict(state='starting')):
+		write_state(tmp_path, f'job-{job.job_name}.json', job_record(job, **fields))
+		code, text, err = status(tmp_path, capsys)
+		code_json, view, err_json = status_json(tmp_path, capsys)
+		assert (code, err) == (code_json, err_json) == (0, '')
+		found = view['jobs'][0]
+		assert f'{job.job_name}  {found["phrase"]}\n' in text
+		assert found['state'] == fields['state'] and found['detail'] == fields.get('detail', '')
+		assert found['failures'] == fields.get('failures', 0) and found['retry_at'] == fields.get('retry_at')
+		assert f'last backup {rv.show_time(found["last_backup"])} (V{found["last_version"]})' in text
+		assert f'{found["versions"]} versions (limit {found["keep"]}), oldest V{found["oldest_version"]} {rv.show_time(found["oldest_backup"])}' in text
+	assert found['phrase'] == 'starting'
+
+
+def test_status_json_after_the_daemon_died(job, tmp_path, capsys):
+	two_versions(job)
+	proc = subprocess.Popen([sys.executable, '-c', 'pass'])
+	proc.wait()
+	record = daemon_record(job)
+	record['pid'] = proc.pid
+	write_state(tmp_path, 'daemon.json', record)
+	write_state(tmp_path, f'job-{job.job_name}.json', job_record(job))
+	code, view, err = status_json(tmp_path, capsys)
+	assert code == 0
+	assert view['daemon']['alive'] is False and view['daemon']['pid'] == proc.pid and view['daemon']['started_at'] == record['started_at']
+	assert view['jobs'][0]['state'] == 'running' and view['jobs'][0]['last_known'] is True
+	assert view['jobs'][0]['phrase'] == 'last known: running'
+
+
+def test_status_json_without_a_daemon_record(job, tmp_path, capsys):
+	two_versions(job)
+	code, view, err = status_json(tmp_path, capsys, '--rule', job.rule_path)
+	assert code == 0
+	assert view['daemon'] == {'alive': False, 'pid': None, 'version': None, 'started_at': None, 'rule_path': job.rule_path}
+	assert view['jobs'][0]['state'] == 'unknown' and view['jobs'][0]['phrase'] == 'unknown' and view['jobs'][0]['last_known'] is False
+	assert view['jobs'][0]['last_version'] == 1
+
+
+def test_status_json_lists_jobs_in_rule_file_order(job, tmp_path, capsys):
+	other = create_job(str(tmp_path / 'other'), 'aaa_first_by_name')
+	write_committed_version(other, 0, {'a': 'x'})
+	write_rule(job, extra_rows=[rule_row(other), ['!!!', '/m', str(tmp_path), *[''] * 9]])
+	code, view, err = status_json(tmp_path, capsys, '--rule', job.rule_path)
+	assert code == 0
+	assert [found['job'] for found in view['jobs']] == [job.job_name, 'aaa_first_by_name', '!!!']
+	fresh, second, nameless = view['jobs']
+	# its vault folder is empty, which status takes for a disk that is not mounted, as the text says
+	assert fresh['versions'] == 0 and fresh['last_backup'] is None and fresh['last_version'] is None and fresh['vault']['mounted'] is False
+	assert second['versions'] == 1 and second['last_version'] == 0
+	assert nameless['state'] == 'stopped' and nameless['vault'] is None
+	assert nameless['phrase'] == f'stopped: {nameless["detail"]}' and 'rename it in' in nameless['detail']
+
+
+def test_status_json_vault_not_mounted(job, tmp_path, capsys):
+	two_versions(job)
+	write_state(tmp_path, 'daemon.json', daemon_record(job))
+	shutil.rmtree(job.vault)
+	code, view, err = status_json(tmp_path, capsys)
+	vault = view['jobs'][0]['vault']
+	assert code == 0 and vault['mounted'] is False and vault['error'] is None and vault['size'] is None
+	assert view['jobs'][0]['versions'] == 0 and view['jobs'][0]['last_backup'] is None
+
+
+def test_status_json_shows_an_unreadable_vault_and_the_other_jobs(job, tmp_path, capsys, monkeypatch):
+	two_versions(job)
+	other = create_job(str(tmp_path / 'other'), 'second')
+	write_committed_version(other, 0, {'a': 'x'})
+	write_rule(job, extra_rows=[rule_row(other)])
+	real_listdir = os.listdir
+	def listdir(path = '.'):
+		if os.fspath(path) in (job.vault, job.job_vault):
+			raise OSError(errno.ENOTCONN, 'Transport endpoint is not connected')
+		return real_listdir(path)
+	monkeypatch.setattr(os, 'listdir', listdir)
+	code, view, err = status_json(tmp_path, capsys, '--rule', job.rule_path)
+	assert code == 0 and 'Traceback' not in err
+	broken, second = view['jobs']
+	assert 'not connected' in broken['vault']['error'] and broken['vault']['mounted'] is None
+	assert broken['versions'] is None and broken['last_backup'] is None
+	assert second['vault']['error'] is None and second['last_version'] == 0
+
+
+def test_status_json_escapes_control_characters(job, tmp_path, capsys):
+	two_versions(job)
+	write_state(tmp_path, 'daemon.json', daemon_record(job))
+	write_state(tmp_path, f'job-{job.job_name}.json', job_record(job, state='stopped', detail='cannot read /m/\x1b[2Jx\nnext \udcff'))
+	code, out, err = status(tmp_path, capsys, '--json')
+	assert (code, err) == (0, '') and '\x1b' not in out
+	found = json.loads(out)['jobs'][0]
+	assert found['detail'] == 'cannot read /m/\\x1b[2Jx\\x0anext \\xff' and found['phrase'] == f'stopped: {found["detail"]}'
+
+
+def test_status_json_needs_a_rule_without_a_record(tmp_path, capsys):
+	code, out, err = status(tmp_path, capsys, '--json')
+	assert code == rv.EXIT_USAGE and '--rule' in err and out == ''
+
+
+def test_status_json_writes_nothing(job, tmp_path, capsys):
+	two_versions(job)
+	write_state(tmp_path, 'daemon.json', daemon_record(job))
+	before = sorted(os.walk(str(tmp_path)))
+	assert status(tmp_path, capsys, '--json')[0] == 0
+	assert sorted(os.walk(str(tmp_path))) == before
+
+
+@pytest.mark.process
+def test_status_json_runs_as_a_subprocess(job, tmp_path, process_env):
+	two_versions(job)
+	done = subprocess.run([sys.executable, reverberator_script(), 'status', '--json', '--rule', job.rule_path, '--state_dir', state_dir(tmp_path)],
+		capture_output=True, text=True, env=process_env, timeout=60)
+	assert done.returncode == 0 and done.stderr == ''
+	assert json.loads(done.stdout)['jobs'][0]['job'] == job.job_name
