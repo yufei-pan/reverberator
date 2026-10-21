@@ -3779,7 +3779,9 @@ def do_backup(backup_entries:dict,
 				if log_journal:
 					log_to_journal(journalPath,monitor_path,'initial_referenced_backup',backup_folder)
 				walk_errors = []
-				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors)
+				# its files are links to the monitored ones, not copies, but the chains of later versions end in it as they
+				# would at a copy ( a re-copy copies such a link as it is ), so they count as copied in V0
+				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors,copy_version=this_version_number)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
 				do_referenced_copy(monitor_path,backup_folder,manifest)
 		else:
@@ -4411,11 +4413,13 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 	file it could not keep (a warning says so): a failed read or write of the contents gets a line of its own. One that
 	failed leaves the destination as it was, keeping the last backed-up copy, when its source failed: silently when the
 	source is gone, with an UNREADABLE line (once per backup, with reported) when it could not be read. A destination holding nothing then stops being tracked in manifest, whose paths
-	are relative to version_path. When writing into the vault is what failed, JobFailure is raised once every copy is
-	dealt with.
+	are relative to version_path. Each copy put in place is recorded in manifest as held by version_path, in the
+	transaction committing that version. When writing into the vault is what failed, JobFailure is raised once every
+	copy is dealt with.
 	'''
 	failure = None
 	done = 0
+	copied = []
 	try:
 		for copy in pending:
 			lines = [line.strip() for line in copy.task.stderr if line.strip()]
@@ -4427,6 +4431,7 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 				succeeded = True
 			if succeeded:
 				replace_entry(copy.temp_path, copy.dest_path)
+				copied.append(os.path.relpath(copy.dest_path, version_path))
 			else:
 				remove_entry(copy.temp_path)
 				side = copy_failure_side(copy.source_path, copy.temp_path, lines)
@@ -4444,6 +4449,9 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 					if not os.path.lexists(copy.dest_path):
 						manifest.discard(os.path.relpath(copy.dest_path, version_path))
 			done += 1
+		version = vault_version_number(os.path.basename(os.path.normpath(version_path)))
+		if version is not None:
+			manifest.set_copy_version(copied, version)
 	finally:
 		# an error above leaves no partial file of the copies it did not reach
 		rest = pending[done:]
@@ -4771,7 +4779,9 @@ class VaultManifest:
 	unchecked until delta generation reads the copy back from the vault, as a crash can keep its bytes from the disk.
 	Paths and link targets are stored through storable_name() and read back through stored_name(), so a name that is
 	not UTF-8 is tracked like any other; rows sort by stored path, in which a folder still comes right before the paths
-	under it. copy_version, the number of the version holding a file's copy, is NULL when not known.
+	under it. copy_version is the number of the version a backup copied a file into (set_copy_version()), kept while
+	later versions link to that copy and when the file moves, NULL when not known. Pruning moves copies into the oldest
+	version kept without changing it, which effective_copy_version() allows for.
 
 	Examples:
 		>>> import tempfile
@@ -4916,16 +4926,19 @@ class VaultManifest:
 		self.conn.execute('DELETE FROM entries')
 		self._set_version(version_path)
 
-	def rebuild(self, version_path:str, tree_path:str = None, skip = None, errors:list = None):
-		'''Track everything under tree_path (version_path by default) as unverified, describing version_path.'''
+	def rebuild(self, version_path:str, tree_path:str = None, skip = None, errors:list = None, copy_version:int = None):
+		'''
+		Track everything under tree_path (version_path by default) as unverified, describing version_path, each file with
+		copy_version (None: not known).
+		'''
 		self.reset(version_path)
 		batch = []
-		for _, rel, _ in iter_tree_entries(tree_path or version_path, skip=skip if tree_path else None, errors=errors):
-			batch.append((storable_name(rel),))
+		for _, rel, is_dir in iter_tree_entries(tree_path or version_path, skip=skip if tree_path else None, errors=errors):
+			batch.append((storable_name(rel), None if is_dir else copy_version))
 			if len(batch) >= MANIFEST_BATCH_SIZE:
-				self.conn.executemany('INSERT OR REPLACE INTO entries(path) VALUES (?)', batch)
+				self.conn.executemany('INSERT OR REPLACE INTO entries(path, copy_version) VALUES (?, ?)', batch)
 				batch.clear()
-		self.conn.executemany('INSERT OR REPLACE INTO entries(path) VALUES (?)', batch)
+		self.conn.executemany('INSERT OR REPLACE INTO entries(path, copy_version) VALUES (?, ?)', batch)
 
 	def lookup(self, rel:str):
 		'''The record for rel (all None when unverified), or None when rel is not tracked.'''
@@ -4936,8 +4949,14 @@ class VaultManifest:
 		return record if record.link is None else record._replace(link=stored_name(record.link))
 
 	def add(self, rel:str, dirty:bool = False):
-		'''Track rel without a record: dirty when this backup wrote it, so it is recorded before the backup commits.'''
-		self.conn.execute('INSERT OR REPLACE INTO entries(path, dirty) VALUES (?, ?)', (storable_name(rel), int(dirty)))
+		'''
+		Track rel without a record: dirty when this backup wrote it, so it is recorded before the backup commits. A
+		tracked rel keeps its copy version, as its entry still leads to that copy until a new copy is recorded (one that
+		failed, or an attribute change synced onto a link, leaves the link there).
+		'''
+		path = storable_name(rel)
+		self.conn.execute('INSERT OR REPLACE INTO entries(path, dirty, copy_version) VALUES (?, ?, (SELECT copy_version FROM entries WHERE path = ?))',
+			(path, int(dirty), path))
 
 	def discard(self, rel:str):
 		self.conn.execute('DELETE FROM entries WHERE path = ?', (storable_name(rel),))
@@ -4972,6 +4991,15 @@ class VaultManifest:
 		self.conn.execute(f'UPDATE entries SET path = ? || substr(path, ?), {self.UNVERIFIED} WHERE path >= ? AND path < ?',
 			(dst, len(src) + 1, src, folder_range_end(src)))
 
+	def move_file(self, src:str, dst:str):
+		'''
+		Track the file src as dst instead, replacing what dst held, as move_tree() does for a folder: unverified, and with
+		src's copy version, as the vault entry moving with it leads to the same copy. dst is tracked even when src is not.
+		'''
+		self.discard(dst)
+		if not self.conn.execute(f'UPDATE entries SET path = ?, {self.UNVERIFIED} WHERE path = ?', (storable_name(dst), storable_name(src))).rowcount:
+			self.add(dst)
+
 	def set_records(self, records):
 		'''Store (rel, record) pairs, leaving rel unverified where the record is None, and clear their dirty marks.'''
 		unverified = []
@@ -4987,6 +5015,10 @@ class VaultManifest:
 		self.conn.executemany('UPDATE entries SET kind = ?, size = ?, mtime_ns = ?, mode = ?, uid = ?, gid = ?, hash = ?, link = ?, '
 			'unchecked = ?, dirty = 0 WHERE path = ?', recorded)
 
+	def set_copy_version(self, rels, version:int):
+		'''Record that the version numbered version holds the copy of each file of rels; the caller holds the transaction.'''
+		self.conn.executemany('UPDATE entries SET copy_version = ? WHERE path = ?', ((version, storable_name(rel)) for rel in rels))
+
 	def take_dirty(self, limit:int) -> list:
 		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty LIMIT ?', (limit,))]
 
@@ -4998,6 +5030,11 @@ class VaultManifest:
 	def iter_files(self):
 		for (rel,) in self.conn.execute("SELECT path FROM entries WHERE substr(path, -1) != '/' ORDER BY path"):
 			yield stored_name(rel)
+
+	def iter_files_with_copy_version(self):
+		'''(rel, copy version) of every tracked file, sorted; the copy version is None when not known.'''
+		for rel, copy_version in self.conn.execute("SELECT path, copy_version FROM entries WHERE substr(path, -1) != '/' ORDER BY path"):
+			yield stored_name(rel), copy_version
 
 	@property
 	def folders(self) -> list:
@@ -5322,6 +5359,45 @@ def is_chained_link(resolved:str, job_vault:str, link_path:str) -> bool:
 		return False
 	target_version = resolved[len(prefix):].partition('/')[0]
 	return vault_version_number(target_version) is not None and target_version != link_path[len(prefix):].partition('/')[0]
+
+def effective_copy_version(recorded, oldest_kept:int):
+	'''
+	The number of the version holding a file's copy, from the one recorded when it was copied (None when not known) and
+	the oldest version kept. Pruning a version moves its copies into the next one, which is then the oldest kept, so a
+	recorded version older than that names where the copy is now.
+
+	Examples:
+		>>> effective_copy_version(4, 2), effective_copy_version(0, 5), effective_copy_version(None, 5)
+		(4, 5, None)
+	'''
+	return None if recorded is None else max(recorded, oldest_kept)
+
+def learn_copy_version(job_vault:str, version_path:str, rel:str):
+	'''
+	The number of the version whose folder holds the end of the chain starting at version_path's file rel: a copy, a
+	user's symlink backed up as one or a referenced backup's link. Each hop names an older version than the last, so the
+	walk ends within as many hops as there are versions below version_path, however many more links than the kernel
+	follows that is. None when the chain cannot be followed: an entry on it is missing or cannot be read, or a link on it
+	cannot be told for a chain link or not (strict_chain_hop()).
+	'''
+	vault = os.path.abspath(job_vault)
+	number = vault_version_number(os.path.basename(os.path.normpath(version_path)))
+	entry = os.path.abspath(os.path.join(version_path, rel))
+	while number is not None:
+		try:
+			if not stat.S_ISLNK(os.lstat(entry).st_mode):
+				return number
+			hop = strict_chain_hop(vault, entry, os.readlink(entry))
+		except (OSError, UncheckedVaultLink):
+			return None
+		if hop is None:
+			return number
+		hop_number = vault_version_number(hop[len(vault) + 1:].partition('/')[0])
+		if hop_number is None or hop_number >= number:
+			# never so for a chain link, which names an older version: the walk only goes down
+			return None
+		entry, number = hop, hop_number
+	return None
 
 def read_vault_record(version_path:str, rel:str, monitor_path:str):
 	'''
@@ -6229,19 +6305,19 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			elif event_values.event == 'move':
 				link_source_relative_path = os.path.relpath(event_values.source_path,monitor_path)
 				link_target_relative_path = event_relative_path
+				if isDir and os.path.abspath(file_vault_target_path) == '/':
+					# we cannot remove root
+					backuperTeeLogToTl(path=file_vault_target_path,error=True,message='Attempting to move root, skipping')
+					continue
+				# we need to wait for copy threads to finish to allow rename, and the copies they made are recorded under
+				# the names they were made for before those rows move
+				wait_for_async_commands(mcae)
 				if isDir:
-					if os.path.abspath(file_vault_target_path) == '/':
-						# we cannot remove root
-						backuperTeeLogToTl(path=file_vault_target_path,error=True,message='Attempting to move root, skipping')
-						continue
 					# also moves all the files and subfolders in the folder
 					manifest.move_tree(as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path))
 					manifest.add(as_folder_entry(link_target_relative_path))
 				else:
-					manifest.discard(link_source_relative_path)
-					manifest.add(link_target_relative_path)
-				# we need to wait for copy threads to finish to allow rename
-				wait_for_async_commands(mcae)
+					manifest.move_file(link_source_relative_path,link_target_relative_path)
 				link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
 				link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
 				try:
