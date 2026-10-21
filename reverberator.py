@@ -895,6 +895,9 @@ COPY_STOP_WAIT_SECONDS = 60
 COPY_STOP_GRACE_SECONDS = 2
 # a restore puts its copies in place every RESTORE_COPY_BATCH of them, so a whole job's are never all waiting at once
 RESTORE_COPY_BATCH = 1000
+# copies a restore runs at once unless --threads says otherwise: enough to keep a disk busy, not so many that the
+# daemon's own backups to the same vault disk crawl meanwhile
+DEFAULT_RESTORE_THREADS = 4
 # a restore's progress line is rewritten this often on a terminal, and written again this often anywhere else
 RESTORE_PROGRESS_TERMINAL_SECONDS = 1
 RESTORE_PROGRESS_LINE_SECONDS = 60
@@ -6252,32 +6255,48 @@ ResolvedEntry = namedtuple('ResolvedEntry', ['kind', 'path', 'detail'])
 
 def chain_form_missing_version(job_vault:str, link_path:str, link_text:str):
 	'''
-	The name of the version folder a relative link names when the link has the form of a chain link, (../)+<name>/<rel>
-	with <name> the version just below the link's own, but that folder does not exist; else None.
+	The name of the version folder a link names when the link has the form of a chain link but that folder does not
+	exist; else None. A relative link has that form when it is (../)+<name>/<rel> with <name> the version just below the
+	link's own; an absolute one, as older daemons wrote them, when it names an older version of job_vault by
+	is_chained_link().
 
 	Examples:
 		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '../../V3--2021-01-01_00-00-00_-0800/a/x')
 		'V3--2021-01-01_00-00-00_-0800'
 		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '../../V2--2021-01-01_00-00-00_-0800/a/x') is None
 		True
-		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '/abs/V3--2021-01-01_00-00-00_-0800/a/x') is None
-		True
+		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '/v/job/V2--2021-01-01_00-00-00_-0800/a/x')
+		'V2--2021-01-01_00-00-00_-0800'
+		>>> [chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', text) for text in (
+		...     '/abs/V3--2021-01-01_00-00-00_-0800/a/x', '/v/job/V5--2021-01-03_00-00-00_-0800/a/x', '/v/job/lib/x')]
+		[None, None, None]
 	'''
-	parts = link_text.split('/')
-	ups = 0
-	while ups < len(parts) and parts[ups] == '..':
-		ups += 1
-	rel = parts[ups + 1:]
-	if not ups or not rel or any(part in ('', '.', '..') for part in rel):
-		return None
-	name = parts[ups]
 	vault = os.path.abspath(job_vault)
 	link_path = os.path.abspath(link_path)
-	if not link_path.startswith(vault + '/') or not is_version_folder_name(name):
+	if not link_path.startswith(vault + '/'):
 		return None
 	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
-	if own_number is None or vault_version_number(name) != own_number - 1:
+	if own_number is None:
 		return None
+	if os.path.isabs(link_text):
+		resolved = os.path.normpath(link_text)
+		if not is_chained_link(resolved, vault, link_path):
+			return None
+		name = resolved[len(vault) + 1:].partition('/')[0]
+		# the daemon only ever linked a version to an older one
+		if vault_version_number(name) >= own_number:
+			return None
+	else:
+		parts = link_text.split('/')
+		ups = 0
+		while ups < len(parts) and parts[ups] == '..':
+			ups += 1
+		rel = parts[ups + 1:]
+		if not ups or not rel or any(part in ('', '.', '..') for part in rel):
+			return None
+		name = parts[ups]
+		if not is_version_folder_name(name) or vault_version_number(name) != own_number - 1:
+			return None
 	try:
 		os.lstat(os.path.join(vault, name))
 	except (FileNotFoundError, NotADirectoryError):
@@ -6409,7 +6428,7 @@ def get_command_args(argv:list) -> argparse.Namespace:
 	restore.add_argument('--version', type=int, default=None, help='The version number to restore from')
 	restore.add_argument('--at', default=None, help='Restore the newest version at or before this time')
 	restore.add_argument('--in-place', dest='in_place', action='store_true', help='Restore at the original path, moving what is there aside first')
-	restore.add_argument('--threads', type=int, default=os.cpu_count(), help='Copies to run at once')
+	restore.add_argument('--threads', type=int, default=DEFAULT_RESTORE_THREADS, help=f'Copies to run at once (default {DEFAULT_RESTORE_THREADS})')
 	restore.add_argument('--yes', action='store_true', help='Do not ask for confirmation')
 	restore.add_argument('--accept', action='store_true', help='Keep the result of a folder restore that did not complete as it is: copy nothing, give its folders their metadata and end it')
 	return parser.parse_args(argv)
@@ -7362,21 +7381,22 @@ def claim_restore_target(target:str) -> int:
 		raise
 	return fd
 
-def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False) -> None:
+def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None) -> None:
 	'''
 	Copy what version holds at rel ('' for the monitored path) to target, filling report in. Nothing in the vault is
 	written: it is only read from.
 
 	A file or a user's symlink is one checked copy of the entry its chain links lead to (cp -a copies a symlink as a
 	symlink), put at target only while nothing is there. A folder target is made by this restore alone (anything there
-	is a CommandError) with mode 0700, or with resume is the folder already there, made 0700: the unfinished output of
-	an earlier run of this same restore, or for the whole job in place the empty monitored path (the caller checks
-	which). It is marked as this restore's own (write_restore_marker()) before anything is copied, and the folder is
-	walked in the version: its folders are made as they are met and its files copied, threads at a time, each copy put
-	in place every RESTORE_COPY_BATCH of them. Once all are, and nothing failed, the marker goes and each folder gets
-	the vault folder's metadata, the ones inside it first and the target last, so nothing copied into it changes its
-	times afterwards. While anything failed, or when the restore stops, the marker stays and every folder is left as
-	this restore made it, the target 0700, for a run of the same restore to pick up.
+	is a CommandError, naming aside, where a restore in place moved what was there) with mode 0700, or with resume is
+	the folder already there, made 0700: the unfinished output of an earlier run of this same restore, or for the whole
+	job in place the empty monitored path (the caller checks which). It is marked as this restore's own
+	(write_restore_marker()) before anything is copied, and the folder is walked in the version: its folders are made as
+	they are met and its files copied, threads at a time, each copy put in place every RESTORE_COPY_BATCH of them. Once
+	all are, and nothing failed, the marker goes and each folder gets the vault folder's metadata, the ones inside it
+	first and the target last, so nothing copied into it changes its times afterwards. While anything failed, or when
+	the restore stops, the marker stays and every folder is left as this restore made it, the target 0700, for a run of
+	the same restore to pick up.
 	A dangling chain, a link to the live file of a referenced backup, an entry that cannot be read, a failed copy or an
 	OSError is a failure of that entry alone; so is a folder whose place holds a symlink, something else or another
 	user's folder, which is left as it is and never written through: nothing in it is restored. With resume, an entry
@@ -7440,6 +7460,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 					try:
 						os.mkdir(target, 0o700)
 					except FileExistsError:
+						if aside is not None:
+							raise CommandError(f'{target} was taken meanwhile, right after what was there was moved aside to {aside}: nothing was restored; run the restore again to move that aside too', EXIT_COMMAND_FAILED)
 						raise target_exists(target)
 				lock = claim_restore_target(target)
 			except OSError as e:
@@ -7711,8 +7733,8 @@ def nothing_to_accept(target:str) -> CommandError:
 
 def move_target_aside(target:str):
 	'''
-	Move what is at target, the path a restore in place goes to, aside (move_aside()) and say where. A folder another
-	run of the restore is filling, just made and not marked yet, is not: a CommandError says so.
+	Move what is at target, the path a restore in place goes to, aside (move_aside()), say where and return it. A
+	folder another run of the restore is filling, just made and not marked yet, is not: a CommandError says so.
 	'''
 	lock = None
 	try:
@@ -7726,6 +7748,7 @@ def move_target_aside(target:str):
 		if lock is not None:
 			os.close(lock)
 	print(shown(f'Moved {target} aside to {aside}'), flush=True)
+	return aside
 
 def check_target(target:str, job_name:str, rel:str, in_place:bool, version:KeptVersion = None) -> str:
 	'''
@@ -7749,15 +7772,17 @@ def check_target(target:str, job_name:str, rel:str, in_place:bool, version:KeptV
 	require_empty_root(target)
 	return 'into root'
 
-def confirm_whole_job_in_place(job_name:str, version:KeptVersion, root:str, status:DaemonStatus, yes:bool, resuming:bool, stdin = None, stdout = None):
+def confirm_whole_job_in_place(job_name:str, version:KeptVersion, versions:list, root:str, status:DaemonStatus, yes:bool, resuming:bool, stdin = None, stdout = None):
 	'''
-	Before the whole job is restored in place into root: say which filesystem that writes to (the mount holding root as
-	the mount table has it, so an empty mount point whose disk is not mounted shows the disk under it) with its free
-	space and what version took in the vault, and while status shows the daemon alive and job_name not stopped, that
-	the job will back the restore up as one large change; then, unless yes, ask whether to go on. Less free space than
-	version took is a CommandError when starting afresh (a restore picked up has some of it in place), as is no terminal
-	on stdin to ask on, and any answer but yes (with EXIT_COMMAND_FAILED). stdin and stdout are sys.stdin and sys.stdout
-	unless given.
+	Before the whole job is restored in place into root from version, one of versions (the kept ones, oldest first): say
+	which filesystem that writes to (the mount holding root as the mount table has it, so an empty mount point whose
+	disk is not mounted shows the disk under it) with its free space and what the versions up to version took in the
+	vault, and while status shows the daemon alive and job_name not stopped, that the job will back the restore up as
+	one large change; then, unless yes, ask whether to go on. A version's recorded size is only what it copied, but the
+	oldest kept version holds the whole tree it was made from: less free space than that is a CommandError when
+	starting afresh (a restore picked up has some of it in place), and less than all of them together up to version is
+	said to be a restore that may not fit. No terminal on stdin to ask on is a CommandError, as is any answer but yes
+	(with EXIT_COMMAND_FAILED). stdin and stdout are sys.stdin and sys.stdout unless given.
 	'''
 	stdin = sys.stdin if stdin is None else stdin
 	stdout = sys.stdout if stdout is None else stdout
@@ -7770,9 +7795,15 @@ def confirm_whole_job_in_place(job_name:str, version:KeptVersion, root:str, stat
 	except OSError as e:
 		raise CommandError(f'Cannot tell how much space {there} has: {e}', EXIT_COMMAND_FAILED)
 	free = st.f_bavail * st.f_frsize
-	if not resuming and free < version.size:
-		raise CommandError(f'Not restoring the whole job into {root}: {where} has {show_size(free)} free, less than the {show_size(version.size)} V{version.number} took in the vault; is the right disk mounted there? Restore into a folder instead')
-	lines = [f'Restoring the whole job into {root}, on {where}: {show_size(free)} free, V{version.number} took {show_size(version.size)} in the vault']
+	oldest = versions[0]
+	# each file of version is a copy one of these made: at most all of them together
+	most = sum(kept.size for kept in versions if kept.number <= version.number)
+	if not resuming and free < oldest.size:
+		raise CommandError(f'Not restoring the whole job into {root}: {where} has {show_size(free)} free, less than the {show_size(oldest.size)} the oldest kept version, V{oldest.number}, took in the vault; is the right disk mounted there? Restore into a folder instead')
+	took = f'V{oldest.number}' if oldest.number == version.number else f'V{oldest.number} to V{version.number}'
+	lines = [f'Restoring the whole job into {root}, on {where}: {show_size(free)} free, {took} took {show_size(most)} in the vault']
+	if not resuming and free < most:
+		lines.append(f'V{version.number} may not fit: its files can come from any of {took}, more than the free space')
 	record = status.jobs.get(job_name)
 	if status.alive and (record is None or record['state'] != 'stopped'):
 		lines.append(f'reverberator is running job {job_name}, which will back the restore up as one large change')
@@ -7831,19 +7862,18 @@ def restore_command(args) -> int:
 		if args.in_place and not rel and not args.accept:
 			# the daemon as it is now, not before the picking; asked before the monitored path is looked at for the last
 			# time, as an answer can take a while
-			confirm_whole_job_in_place(rule.job_name, version, target, read_status(state_dir_path(args.state_dir)), args.yes, first == 'resume', sys.stdin, sys.stdout)
+			confirm_whole_job_in_place(rule.job_name, version, versions, target, read_status(state_dir_path(args.state_dir)), args.yes, first == 'resume', sys.stdin, sys.stdout)
 		if args.accept and read_restore_marker(target) is None:
 			raise nothing_to_accept(target)
 		# with --accept, a marker there is one of this restore's or a CommandError
 		found = check_target(target, rule.job_name, rel, args.in_place, version)
-		if found == 'move aside':
-			move_target_aside(target)
+		aside = move_target_aside(target) if found == 'move aside' else None
 		report = RestoreReport()
 		try:
 			if args.accept:
 				accept_restore(job_vault, version, rule.mon_path, rel, target, report)
 			else:
-				restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report, resume=found in ('resume', 'into root'))
+				restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report, resume=found in ('resume', 'into root'), aside=aside)
 		except KeyboardInterrupt:
 			if report.marker is None:
 				raise
@@ -7861,10 +7891,7 @@ def run_command(argv:list) -> int:
 	# library logging stays off the output
 	tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=True, noLog=True)
 	try:
-		command = COMMAND_FUNCTIONS.get(args.command)
-		if command is None:
-			raise CommandError(f'The {args.command} command is not available yet')
-		return command(args)
+		return COMMAND_FUNCTIONS[args.command](args)
 	except CommandError as e:
 		# it can quote a typed or a monitored path
 		print(shown(e.message), file=sys.stderr)

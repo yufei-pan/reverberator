@@ -60,15 +60,16 @@ def test_main_dispatches_commands_and_keeps_the_daemon_argv(monkeypatch):
 def test_command_args_define_all_three_commands():
 	args = rv.get_command_args(['restore', 'p', 'd', '--job', 'j', '--version', '3', '--at', 'x', '--in-place', '--threads', '2', '--yes', '--rule', 'r', '--state_dir', 's'])
 	assert (args.command, args.path, args.dest, args.job, args.version, args.at, args.in_place, args.threads, args.yes, args.rule, args.state_dir) == ('restore', 'p', 'd', 'j', 3, 'x', True, 2, True, 'r', 's')
-	assert rv.get_command_args(['restore', 'p']).threads == os.cpu_count()
 	assert rv.get_command_args(['history', 'p', '--files']).files is True
 	assert rv.get_command_args(['status']).rule is None
 
 
-def test_history_and_restore_are_not_available_yet_without_their_functions(monkeypatch, capsys):
-	monkeypatch.setattr(rv, 'COMMAND_FUNCTIONS', {})
-	assert rv.run_command(['history', 'p']) == rv.EXIT_USAGE
-	assert 'not available yet' in capsys.readouterr().err
+def test_restore_runs_four_copies_at_once_by_default(capsys):
+	# however many processors there are, so a restore does not keep the vault disk busy with more by default
+	assert rv.get_command_args(['restore', 'p']).threads == 4
+	with pytest.raises(SystemExit):
+		rv.get_command_args(['restore', '--help'])
+	assert 'Copies to run at once (default 4)' in ' '.join(capsys.readouterr().out.split())
 
 
 def test_status_with_a_live_daemon(job, tmp_path, capsys):
