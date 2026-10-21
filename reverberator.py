@@ -599,6 +599,10 @@ class JobControl:
 		self._failures = 0
 		# the waits for a disk now going on, oldest first, as [token, path, what, started]
 		self._waits = []
+		# the status records, taken in order under _lock and written outside it, one at a time ( _write() )
+		self._writing = threading.Lock()
+		self._published = 0
+		self._written = 0
 
 	def start_attempt(self):
 		with self._lock:
@@ -619,38 +623,65 @@ class JobControl:
 		self.committed.set()
 		with self._lock:
 			self.last_success = time.time()
-			self._publish()
+			record = self._publish()
+		self._write(record)
 
 	def set_state(self, state:str, detail:str = '', retry_at:float = None, failures:int = 0):
 		'''Record the job's state (starting, running, retrying or stopped) and publish it; a wait going on shows over it.'''
 		with self._lock:
 			self._state, self._detail, self._since = state, detail, time.time()
 			self._retry_at, self._failures = retry_at, failures
-			self._publish()
+			record = self._publish()
+		self._write(record)
 
 	def begin_wait(self, path:str, what:str) -> object:
-		'''Note the job waiting for path, and return the token end_wait takes.'''
+		'''Note the job waiting for path, and return the token update_wait and end_wait take.'''
 		token = object()
 		with self._lock:
 			self._waits.append([token, path, what, time.time()])
-			self._publish()
+			record = self._publish()
+		self._write(record)
 		return token
+
+	def update_wait(self, token, what:str):
+		'''Say what the wait of token waits for now, publishing it when that changed; the wait keeps its start.'''
+		with self._lock:
+			wait = next((wait for wait in self._waits if wait[0] is token), None)
+			if wait is None or wait[2] == what:
+				return
+			wait[2] = what
+			record = self._publish()
+		self._write(record)
 
 	def end_wait(self, token):
 		with self._lock:
 			self._waits = [wait for wait in self._waits if wait[0] is not token]
-			self._publish()
+			record = self._publish()
+		self._write(record)
 
-	def _publish(self):
-		'''Publish the record to the status board. The caller holds the lock, which keeps the records in order.'''
-		board = STATUS_BOARD
-		if board is None:
-			return
+	def _publish(self) -> tuple:
+		'''
+		The record for the status board, as (its number in the order taken, the record). The caller holds the lock and
+		hands it to _write() once it has let go of it, so a status folder that stalls holds up no thread that only takes
+		the lock, such as fail() or should_run().
+		'''
 		state, detail, since = self._state, self._detail, self._since
 		if self._waits:
 			state, detail, since = 'waiting', f'{self._waits[0][1]}: {self._waits[0][2]}', self._waits[0][3]
-		board.write_job(self.job_name, {'job': self.job_name, 'state': state, 'detail': detail, 'since': since,
-			'retry_at': self._retry_at, 'failures': self._failures, 'last_success': self.last_success, 'updated': time.time()})
+		self._published += 1
+		return self._published, {'job': self.job_name, 'state': state, 'detail': detail, 'since': since,
+			'retry_at': self._retry_at, 'failures': self._failures, 'last_success': self.last_success, 'updated': time.time()}
+
+	def _write(self, published:tuple):
+		'''Write a record _publish() took to the status board, unless one taken after it is written already.'''
+		board = STATUS_BOARD
+		if board is None:
+			return
+		number, record = published
+		with self._writing:
+			if number > self._written:
+				self._written = number
+				board.write_job(self.job_name, record)
 
 DEFAULT_STATE_DIR = '/run/reverberator'
 
@@ -684,6 +715,8 @@ class StatusBoard:
 	'''
 	def __init__(self, state_dir:str, rule_path:str):
 		self.state_dir = state_dir
+		# the jobs' threads write at the same time, and only one of them logs the first error
+		self._failed_lock = threading.Lock()
 		self._failed = False
 		self._write('daemon.json', {'pid': os.getpid(), 'start_ticks': process_start_ticks(os.getpid()), 'version': __version__,
 			'started_at': time.time(), 'rule_path': rule_path})
@@ -702,8 +735,9 @@ class StatusBoard:
 			os.replace(temp, os.path.join(self.state_dir, name))
 			temp = None
 		except (OSError, ValueError, TypeError) as e:
-			if not self._failed:
-				self._failed = True
+			with self._failed_lock:
+				first, self._failed = not self._failed, True
+			if first:
 				tl.teeerror(log_text(f'Cannot write status files in {self.state_dir}: {e}'))
 		finally:
 			if temp is not None:
@@ -1050,6 +1084,9 @@ class MonitorGate:
 				what = 'monitored filesystem signature unknown' if present else 'monitored path not there yet'
 				if token is None:
 					token = job.begin_wait(self.path, what)
+				else:
+					# the path can appear, or go again, while the wait lasts
+					job.update_wait(token, what)
 				# job.running stays set while the job runs, so waiting on it would not wait at all
 				time.sleep(POLL_WAIT_SECONDS)
 				now = time.monotonic()
@@ -3889,11 +3926,13 @@ def do_backup(backup_entries:dict,
 			backup_limit_size, backup_limit_inode = get_backup_limits_from_str(backup_size_limit=backup_size_limit,vault_fs_size=vault_fs_size,vault_fs_inode=vault_fs_inode)
 			backuperTeeLogToTl(job_name,f'Calculated backup size limit {backup_limit_size} and backup inode limit {backup_limit_inode}')
 			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
+			# why the loops below postponed removing a version: each loop tries again, but only the first says so
+			postponed = []
 			if backup_limit_size:
 				while vault_size + estimated_backup_size + recopies_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size + recopies_size} exceeds backup size limit {backup_limit_size}')
 					# we need to remove the oldest version
-					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name)
+					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,postponed)
 					vault_size -= removed_size
 					vault_inodes -= removed_inodes
 					if not removed_size and not removed_inodes:
@@ -3904,7 +3943,7 @@ def do_backup(backup_entries:dict,
 				while vault_inodes + estimated_backup_inode > backup_limit_inode:
 					backuperTeeLogToTl(job_name,f'Vault inodes {vault_inodes} + estimated backup inodes {estimated_backup_inode} exceeds backup inode limit {backup_limit_inode}')
 					# we need to remove the oldest version
-					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name)
+					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,postponed)
 					vault_size -= removed_size
 					vault_inodes -= removed_inodes
 					if not removed_size and not removed_inodes:
@@ -3912,7 +3951,7 @@ def do_backup(backup_entries:dict,
 			while keep_n_versions and len(vault_info_dict) >= keep_n_versions:
 				backuperTeeLogToTl(job_name,f'Vault has {len(vault_info_dict)} versions, exceeding keep n versions {keep_n_versions}')
 				# we need to remove the oldest version
-				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name)
+				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,postponed)
 				vault_size -= removed_size
 				vault_inodes -= removed_inodes
 				if not removed_size and not removed_inodes:
@@ -5202,9 +5241,27 @@ def is_version_folder_name(name:str) -> bool:
 
 # (version folder, folder) pairs found real: the folder is a real folder reached from the version folder through real
 # folders only. only those answers are kept, as the daemon alone writes a version's folders and never uses a version
-# folder's name again, while a folder missing or refused now may be a version's real folder later
+# folder's name again, while a folder missing or refused now may be a version's real folder later. pruning a version
+# drops its pairs ( forget_real_vault_folders() ), as a link naming it is no chain link from then on
 REAL_VAULT_FOLDERS = OrderedDict()
 REAL_VAULT_FOLDERS_LOCK = threading.Lock()
+
+def forget_real_vault_folders(version_path:str):
+	'''
+	Drop the pairs REAL_VAULT_FOLDERS holds for the version folder version_path (absolute and normalised), as pruning
+	removed it: a link naming it is no chain link from then on.
+
+	Examples:
+		>>> REAL_VAULT_FOLDERS[('/v/V1', '/v/V1/a')] = REAL_VAULT_FOLDERS[('/v/V10', '/v/V10/a')] = None
+		>>> forget_real_vault_folders('/v/V1')
+		>>> [('/v/V1', '/v/V1/a') in REAL_VAULT_FOLDERS, ('/v/V10', '/v/V10/a') in REAL_VAULT_FOLDERS]
+		[False, True]
+		>>> forget_real_vault_folders('/v/V10')
+	'''
+	under = version_path + '/'
+	with REAL_VAULT_FOLDERS_LOCK:
+		for key in [key for key in REAL_VAULT_FOLDERS if key[1] == version_path or key[1].startswith(under)]:
+			del REAL_VAULT_FOLDERS[key]
 
 class UncheckedVaultLink(Exception):
 	'''
@@ -5218,7 +5275,8 @@ def is_real_folder_under(top:str, folder:str) -> bool:
 	Whether a path through folder stays in top: top is a real folder, and folder is top or under it with no symlink
 	from top down to folder. A missing folder on the way, or a file, is fine, as nothing goes through it; a name too
 	long for any folder is not. Raises UncheckedVaultLink, and nothing else, when a folder on the way cannot be looked
-	at, as that tells neither way.
+	at, as that tells neither way. Both paths must be absolute and normalised (no '.', '..', '//' or trailing /), as
+	the callers make them: folder is matched against top as text, so '/v/V3/../x' would count as under '/v/V3'.
 
 	Examples:
 		>>> import tempfile
@@ -5271,16 +5329,60 @@ def is_real_folder_under(top:str, folder:str) -> bool:
 				REAL_VAULT_FOLDERS.popitem(last=False)
 	return True
 
+def parse_chain_text(job_vault:str, link_text:str, link_path:str):
+	'''
+	The version folder name and the parts of the path in it that the relative link at link_path with link_text names,
+	as (version_name, rel_parts), when the text has the form of a chain link; else None. The form is (../)+<name>/<rel>:
+	<name> the whole name of the version folder numbered one below the one in job_vault holding link_path, and <rel> one
+	or more parts, none of them '', '.' or '..', which could lead out of that version. How many ../ there are is not
+	looked at, as daemons before 0.39 kept the text when a move took the link to another folder depth. Nothing on disk
+	is looked at either: chain_link_target() checks the folders on the way, chain_form_missing_version() the version.
+
+	Examples:
+		>>> link_path = '/v/job/V4--2021-01-02_00-00-00_-0800/deep/x'
+		>>> parse_chain_text('/v/job', '../../V3--2021-01-01_00-00-00_-0800/a/x', link_path)
+		('V3--2021-01-01_00-00-00_-0800', ['a', 'x'])
+		>>> parse_chain_text('/v/job/', '../V3--2021-01-01_00-00-00_-0800/x', link_path)
+		('V3--2021-01-01_00-00-00_-0800', ['x'])
+		>>> [parse_chain_text('/v/job', text, link_path) for text in ('/v/job/V3--2021-01-01_00-00-00_-0800/x',
+		...     'V3--2021-01-01_00-00-00_-0800/x', '../V3--2021-01-01_00-00-00_-0800', '../V3--2021-01-01_00-00-00_-0800/',
+		...     '../V3--2021-01-01_00-00-00_-0800/a/../x', '../V3--2021-01-01_00-00-00_-0800/./x', '../V3--2021-01-01_00-00-00_-0800//x',
+		...     '../V2--2021-01-01_00-00-00_-0800/x', '../V3--x/x', '../notaversion/x')]
+		[None, None, None, None, None, None, None, None, None, None]
+		>>> [parse_chain_text('/v/job', '../V3--2021-01-01_00-00-00_-0800/x', path) for path in (
+		...     '/elsewhere/V4--2021-01-02_00-00-00_-0800/x', '/v/job/current_version/x')]
+		[None, None]
+	'''
+	parts = link_text.split('/')
+	ups = 0
+	while ups < len(parts) and parts[ups] == '..':
+		ups += 1
+	rel = parts[ups + 1:]
+	# a .. after the version folder could name a path outside the vault
+	if not ups or not rel or any(part in ('', '.', '..') for part in rel):
+		return None
+	name = parts[ups]
+	number = vault_version_number(name)
+	vault = os.path.abspath(job_vault)
+	link_path = os.path.abspath(link_path)
+	if number is None or not link_path.startswith(vault + '/'):
+		return None
+	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
+	if own_number is None or number != own_number - 1 or not is_version_folder_name(name):
+		return None
+	return name, rel
+
 def chain_link_target(job_vault:str, link_text:str, link_path:str):
 	'''
-	Where the relative link at link_path with link_text points, if it is a chain link; None for any other link, such
-	as a user's symlink backed up as one, even one shaped like a chain link.
+	Where the relative link at link_path with link_text points, if it is a chain link by the rule; None for any other
+	link, such as a user's symlink backed up as one.
 	The daemon links an unchanged entry of a version to the version just before it: ../ up to the job vault, that
-	version's folder and the entry's path in it, a text a move to another folder depth keeps. Only that form counts:
-	the folder named must be the one numbered one below the version holding link_path, by its whole name, and a real
-	folder with no symlink down to the target's parent (by is_real_folder_under()), so a backed-up folder symlink never
-	leads out of it. A chain link whose target is gone is still one. Raises UncheckedVaultLink as is_real_folder_under()
-	does.
+	version's folder and the entry's path in it. A link counts when its text has that form (parse_chain_text(), which
+	does not count the ../), the version folder it names is there, and the folders from it down to the target's parent
+	are real folders or missing ones (by is_real_folder_under()), so a backed-up folder symlink never leads out of it.
+	The rule cannot tell a user's symlink of that very form, naming the previous version's folder by its whole name,
+	from a chain link, and takes it for one. A chain link whose target is gone is still one. Raises UncheckedVaultLink
+	as is_real_folder_under() does.
 
 	Examples:
 		>>> import tempfile
@@ -5303,23 +5405,11 @@ def chain_link_target(job_vault:str, link_text:str, link_path:str):
 		True
 		>>> import shutil; shutil.rmtree(job_vault)
 	'''
-	parts = link_text.split('/')
-	ups = 0
-	while ups < len(parts) and parts[ups] == '..':
-		ups += 1
-	rel = parts[ups + 1:]
-	# a .. after the version folder could name a path outside the vault
-	if not ups or not rel or any(part in ('', '.', '..') for part in rel):
+	parsed = parse_chain_text(job_vault, link_text, link_path)
+	if parsed is None:
 		return None
-	name = parts[ups]
-	number = vault_version_number(name)
+	name, rel = parsed
 	vault = os.path.abspath(job_vault)
-	link_path = os.path.abspath(link_path)
-	if number is None or not link_path.startswith(vault + '/'):
-		return None
-	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
-	if own_number is None or number != own_number - 1 or not is_version_folder_name(name):
-		return None
 	target = os.path.join(vault, name, *rel)
 	return target if is_real_folder_under(os.path.join(vault, name), os.path.dirname(target)) else None
 
@@ -5390,21 +5480,35 @@ def retarget_chain_link(job_vault:str, link_path:str) -> bool:
 		raise
 	return True
 
-def retarget_moved_links(job_vault:str, moved_path:str) -> int:
+def retarget_moved_links(job_vault:str, moved_path:str, errors:list = None) -> int:
 	'''
 	retarget_chain_link() for the vault entry a move put at moved_path: the link itself, or every link under a folder.
-	Returns how many links were rewritten.
+	Returns how many links were rewritten. With errors, a link that cannot be rewritten and a folder that cannot be read
+	are appended to it as (path, error) and the others are rewritten all the same: the links left keep their text,
+	which still names their versions, so reading and pruning find their copies (chain_link_target() does not count the
+	../). Without, the first link that cannot be rewritten raises.
 	'''
+	def retarget(path:str) -> bool:
+		if errors is None:
+			return retarget_chain_link(job_vault, path)
+		try:
+			return retarget_chain_link(job_vault, path)
+		except OSError as e:
+			errors.append((path, e))
+			return False
 	if os.path.islink(moved_path):
-		return int(retarget_chain_link(job_vault, moved_path))
+		return int(retarget(moved_path))
 	if not os.path.isdir(moved_path):
 		# a copy this backup made
 		return 0
 	rewritten = 0
+	walk_errors = None if errors is None else []
 	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another
-	for path, _, is_dir in iter_tree_entries(moved_path, list_folders_first=True):
+	for path, _, is_dir in iter_tree_entries(moved_path, list_folders_first=True, errors=walk_errors):
 		if not is_dir and os.path.islink(path):
-			rewritten += retarget_chain_link(job_vault, path)
+			rewritten += retarget(path)
+	if walk_errors:
+		errors.extend((unreadable_path(moved_path, rel), error) for rel, error in walk_errors)
 	return rewritten
 
 def is_chained_link(resolved:str, job_vault:str, link_path:str) -> bool:
@@ -6182,7 +6286,8 @@ class RestoreLock:
 
 	def __enter__(self):
 		os.makedirs(state_dir_path(self.state_dir), exist_ok=True)
-		self.fd = os.open(restore_lock_path(self.job_name, self.state_dir), os.O_RDWR | os.O_CREAT, 0o600)
+		# never through a symlink, which could lead to a file elsewhere when the state folder can be written by others
+		self.fd = os.open(restore_lock_path(self.job_name, self.state_dir), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 		try:
 			try:
 				fcntl.flock(self.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -6201,29 +6306,51 @@ class RestoreLock:
 			self.fd = None
 		return False
 
-def prune_oldest(vault_info_dict:OrderedDict, job_name:str) -> tuple:
+# job name -> when the FAILED marker saying its restore lock cannot be checked is next due, by the clock prune_oldest()
+# is given, while it cannot be. each job's backuper alone sets its own key
+RESTORE_LOCK_UNCHECKED = {}
+
+def prune_oldest(vault_info_dict:OrderedDict, job_name:str, postponed:list = None, clock = time.monotonic) -> tuple:
 	'''
 	decrement_stepper while no restore holds the job's lock; when one does, postpone and return (0, 0) so the retention
 	loops stop. Without a state folder nothing can hold the lock, so it prunes; any other failure to lock postpones too.
+	A lock that cannot be checked (opened, or tried) for DISK_WAIT_GRACE_SECONDS gets a FAILED marker, repeated every
+	DISK_WAIT_REPEAT_SECONDS while it lasts, as no version is removed meanwhile and the vault keeps growing.
+	postponed is a list a backup hands each of its calls: a call that postpones appends why, and only the first of them
+	logs it, so a backup says it once.
 	'''
+	lock_path = restore_lock_path(job_name)
+	def postpone(reason:str, cannot_check:OSError = None) -> tuple:
+		if cannot_check is None:
+			RESTORE_LOCK_UNCHECKED.pop(job_name, None)
+		else:
+			now = clock()
+			if now >= RESTORE_LOCK_UNCHECKED.setdefault(job_name, now + DISK_WAIT_GRACE_SECONDS):
+				job_log(job_name, f'FAILED: cannot check the restore lock {lock_path}: {cannot_check}; pruning postponed')
+				RESTORE_LOCK_UNCHECKED[job_name] = now + DISK_WAIT_REPEAT_SECONDS
+		if not postponed:
+			backuperTeeLogToTl(job_name,f'Postponing removal of the oldest version: {reason}',error=cannot_check is not None)
+		if postponed is not None:
+			postponed.append(reason)
+		return 0, 0
 	try:
-		fd = os.open(restore_lock_path(job_name), os.O_RDWR | os.O_CREAT, 0o600)
+		# never through a symlink, which could lead to a file elsewhere when the state folder can be written by others
+		fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 	except (FileNotFoundError, NotADirectoryError):
 		# no state folder, so no restore can be holding a lock
+		RESTORE_LOCK_UNCHECKED.pop(job_name, None)
 		return decrement_stepper(vault_info_dict)
 	except OSError as e:
 		# the lock may be held right now: a check that failed is never taken as permission to remove
-		backuperTeeLogToTl(job_name,f'Postponing removal of the oldest version: cannot open the restore lock: {e}',error=True)
-		return 0, 0
+		return postpone(f'cannot open the restore lock: {e}', e)
 	try:
 		try:
 			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 		except BlockingIOError:
-			backuperTeeLogToTl(job_name,'Postponing removal of the oldest version: a restore is reading the vault')
-			return 0, 0
+			return postpone('a restore is reading the vault')
 		except OSError as e:
-			backuperTeeLogToTl(job_name,f'Postponing removal of the oldest version: cannot take the restore lock: {e}',error=True)
-			return 0, 0
+			return postpone(f'cannot take the restore lock: {e}', e)
+		RESTORE_LOCK_UNCHECKED.pop(job_name, None)
 		return decrement_stepper(vault_info_dict)
 	finally:
 		os.close(fd)
@@ -6363,6 +6490,7 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	#os.remove(path=reference_content_file_path)
 	paths_to_remove = glob.glob(referenceVaultPath+'*',recursive=False)
 	multiCMD.run_command(['rm','-rf',*paths_to_remove],quiet=not DEBUG,return_code_only=True)
+	forget_real_vault_folders(referenceVaultPath)
 	return removingSize, removingInodes
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
@@ -6555,8 +6683,18 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					os.rename(link_source_backup_real_path,link_target_backup_real_path)
 					backuperTeeLogToTl(path=monitor_path,message=f'Moved {link_source_backup_real_path} to {link_target_backup_real_path}')
 					if link_source_relative_path.rstrip('/').count('/') != link_target_relative_path.rstrip('/').count('/'):
-						# the relative links moved to another folder depth no longer reach the versions holding the copies
-						retarget_moved_links(os.path.dirname(backup_folder),link_target_backup_real_path)
+						# the relative links moved to another folder depth no longer reach the versions holding the copies.
+						# the move stands when some cannot be rewritten: their text still names their versions, and the
+						# rows move_tree / move_file moved stay unverified, so the next comparison reads them ( and copies
+						# again a file whose link the kernel cannot follow )
+						retarget_errors = []
+						try:
+							retarget_moved_links(os.path.dirname(backup_folder),link_target_backup_real_path,retarget_errors)
+						except Exception as e:
+							retarget_errors.append((link_target_backup_real_path,e))
+						for retarget_path,retarget_error in retarget_errors:
+							backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot re-target the links at {retarget_path}, moved to another folder depth: {retarget_error}; '
+								'they keep their text, which still names their versions, and the next comparison checks them')
 					# sync the current attrs from the source onto the moved vault entry,
 					# but never through a chained symlink: that would rewrite the previous version's metadata
 					if isDir or not os.path.islink(link_target_backup_real_path):
@@ -6697,9 +6835,8 @@ ResolvedEntry = namedtuple('ResolvedEntry', ['kind', 'path', 'detail'])
 def chain_form_missing_version(job_vault:str, link_path:str, link_text:str):
 	'''
 	The name of the version folder a link names when the link has the form of a chain link but that folder does not
-	exist; else None. A relative link has that form when it is (../)+<name>/<rel> with <name> the version just below the
-	link's own; an absolute one, as older daemons wrote them, when it names an older version of job_vault by
-	is_chained_link().
+	exist; else None. A relative link has that form by parse_chain_text(); an absolute one, as older daemons wrote them,
+	when it names an older version of job_vault by is_chained_link().
 
 	Examples:
 		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '../../V3--2021-01-01_00-00-00_-0800/a/x')
@@ -6728,16 +6865,10 @@ def chain_form_missing_version(job_vault:str, link_path:str, link_text:str):
 		if vault_version_number(name) >= own_number:
 			return None
 	else:
-		parts = link_text.split('/')
-		ups = 0
-		while ups < len(parts) and parts[ups] == '..':
-			ups += 1
-		rel = parts[ups + 1:]
-		if not ups or not rel or any(part in ('', '.', '..') for part in rel):
+		parsed = parse_chain_text(vault, link_text, link_path)
+		if parsed is None:
 			return None
-		name = parts[ups]
-		if not is_version_folder_name(name) or vault_version_number(name) != own_number - 1:
-			return None
+		name = parsed[0]
 	try:
 		os.lstat(os.path.join(vault, name))
 	except (FileNotFoundError, NotADirectoryError):
@@ -6799,7 +6930,8 @@ def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path
 			missing = chain_form_missing_version(vault, entry, text)
 			if missing is not None:
 				return ResolvedEntry('dangling', entry, f'{missing} is missing')
-			if os.path.isabs(text) and os.path.normpath(text) == os.path.join(monitor_path, entry_rel):
+			# a rule keeps a monitored path that is missing as typed, so it is normalised as the link's text is
+			if os.path.isabs(text) and os.path.normpath(text) == os.path.abspath(os.path.join(monitor_path, entry_rel)):
 				return ResolvedEntry('referenced', entry, text)
 			return ResolvedEntry('symlink', entry, text)
 		hops += 1

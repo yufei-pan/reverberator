@@ -329,3 +329,78 @@ def test_a_healthy_chain_moved_to_another_depth_is_not_copied_again(job):
 	versions = run_backup(job)
 	assert len(versions) == 3
 	assert os.path.islink(os.path.join(versions[-1], 'deep/er/x.txt'))
+
+
+def logged_lines(monkeypatch):
+	'''(message, is an error) for each line the backuper logs from now on.'''
+	lines = []
+	real = rv.backuperTeeLogToTl
+	def record(path, message, **kwargs):
+		lines.append((str(message), bool(kwargs.get('error'))))
+		return real(path, message, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', record)
+	return lines
+
+
+def test_a_link_that_cannot_be_retargeted_keeps_the_move(job, monkeypatch):
+	seed_monitor(job, {'a/x.txt': 'x', 'deep/er/keep.txt': 'k'})
+	v0 = run_backup(job)[0]
+	lines = logged_lines(monkeypatch)
+	def refuse(job_vault, link_path):
+		raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), link_path)
+	monkeypatch.setattr(rv, 'retarget_chain_link', refuse)
+	os.rename(f'{job.monitor}/a/x.txt', f'{job.monitor}/deep/er/x.txt')
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'deep/er/x.txt', 'move', 'a/x.txt')]))[-1]
+	moved = os.path.join(v1, 'deep/er/x.txt')
+	# moved, not copied again: the link keeps the text it had at a/x.txt, which still names V0's copy
+	assert os.path.islink(moved) and os.readlink(moved) == os.path.relpath(os.path.join(v0, 'a/x.txt'), os.path.join(v1, 'a'))
+	assert rv.read_vault_record(v1, 'deep/er/x.txt', job.monitor).kind == 'f'
+	assert not any('Failed to move' in message or 'delete & copy' in message for message, _ in lines)
+	assert [message for message, error in lines if error and 're-target' in message and moved in message and os.strerror(errno.EACCES) in message]
+
+
+def test_an_unreadable_folder_of_a_moved_folder_is_named_and_compared_next(job, monkeypatch):
+	seed_monitor(job, {'sub/x.txt': 'x', 'sub/inner/y.txt': 'y', 'deep/er/keep.txt': 'k'})
+	v0 = run_backup(job)[0]
+	lines = logged_lines(monkeypatch)
+	real_scandir = os.scandir
+	def scandir(path='.'):
+		if str(path).startswith(job.job_vault) and str(path).endswith('/deep/er/sub/inner'):
+			raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+		return real_scandir(path)
+	os.rename(f'{job.monitor}/sub', f'{job.monitor}/deep/er/sub')
+	with monkeypatch.context() as patch:
+		patch.setattr(rv.os, 'scandir', scandir)
+		v1 = run_backup(job, OrderedDict([event_entry(job, 'deep/er/sub/', 'move', 'sub/')]))[-1]
+	inner = os.path.join(v1, 'deep/er/sub/inner')
+	assert_links_to(os.path.join(v1, 'deep/er/sub/x.txt'), os.path.join(v0, 'sub/x.txt'), 'x')
+	# the text y.txt had at sub/inner/y.txt, which still names V0's copy
+	assert os.readlink(f'{inner}/y.txt') == os.path.relpath(os.path.join(v0, 'sub/inner/y.txt'), os.path.join(v1, 'sub/inner'))
+	assert [message for message, error in lines if error and 're-target' in message and inner in message and os.strerror(errno.EACCES) in message]
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		assert manifest.lookup('deep/er/sub/inner/y.txt').kind is None
+	finally:
+		manifest.close()
+	# unverified, so the next comparison reads it, and copies it again as the kernel cannot follow its link
+	versions = run_backup(job)
+	assert len(versions) == 3
+	newest = os.path.join(versions[-1], 'deep/er/sub/inner/y.txt')
+	assert not os.path.islink(newest) and open(newest).read() == 'y'
+	assert os.path.islink(os.path.join(versions[-1], 'deep/er/sub/x.txt'))
+
+
+def test_pruning_forgets_the_real_folders_of_the_version_it_removes(job):
+	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp=T, current=False)
+	v1 = write_committed_version(job, 1, {'a/': None}, timestamp=T)
+	os.symlink(f'../../V0--{T}/a/x', f'{v1}/a/x')
+	# read through V0's folders, which are found real
+	assert rv.read_vault_record(v1, 'a/x', job.monitor).kind == 'f'
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	assert not os.path.exists(v0)
+	# a user's symlink naming the version just removed is not a chain link: it is no version of the vault now
+	text = f'../V0--{T}/a/x'
+	os.symlink(text, f'{v1}/u')
+	assert rv.chain_hop(job.job_vault, f'{v1}/u', text) is None
+	record = rv.read_vault_record(v1, 'u', job.monitor)
+	assert (record.kind, record.link) == ('l', text)
