@@ -3741,8 +3741,9 @@ def do_backup(backup_entries:dict,
 		vault_info_dict = vaultInfo.vault_info_dict
 		vault_size = vaultInfo.vault_size
 		vault_inodes = vaultInfo.vault_inodes
-		# the files the new version copied again from the vault
+		# the files the new version copied again from the vault, and those of them its batch then wrote over
 		recopied = []
+		recopies_rewritten = set()
 		if not vault_info_dict:
 			backuperTeeLogToTl(job_name,f'Failed to get any version for {job_vault}, treating the vault as new.',error=True)
 			this_version_number = 0
@@ -3839,18 +3840,16 @@ def do_backup(backup_entries:dict,
 			# the files whose link chains would pass their threshold are copied again from the vault, so the size limit
 			# counts them too ( a copy in a link's place takes no inode more ). removing the oldest version moves its
 			# copies into the next one, which shortens their chains: they are counted again after each removal.
-			# a file this batch deletes is not copied again; one it writes is, so a copy of it that fails leaves no chain
-			# past its threshold, but its bytes are counted once. the batch is read for that only when a file is due
-			batch_rels = []
+			# a file this batch deletes is not copied again; one it writes over is ( batch_rewrites() ), so a copy of it that
+			# fails leaves no chain past its threshold, but its bytes are counted once, and its own entry, not a recopy row,
+			# says what the version did with it. the batch is read for that only when a file is due
 			def count_recopies():
 				oldest_kept = next(iter(vault_info_dict))
 				rels = recopy_rels(manifest,this_version_number,oldest_kept,job_vault,latest_version_info.path)
-				if rels and not batch_rels:
-					batch_rels.extend(batch_rewrites(backup_entries,monitor_path))
-				rewritten, deleted = batch_rels or (set(), set())
+				rewritten, deleted = batch_rewrites(backup_entries,monitor_path,only_sync_attributes,rels) if rels else (set(), set())
 				rels = [rel for rel in rels if rel not in deleted]
-				return oldest_kept, rels, recopy_size(manifest,[rel for rel in rels if rel not in rewritten],job_vault,latest_version_info.path)
-			recopies_oldest, recopies, recopies_size = count_recopies()
+				return oldest_kept, rels, rewritten, recopy_size([rel for rel in rels if rel not in rewritten],job_vault,latest_version_info.path)
+			recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
 			if recopies:
 				backuperTeeLogToTl(job_name,f'{len(recopies)} files to copy again from the vault, as their link chains would pass their limit: estimated size {recopies_size}')
 			estimated_backup_inode = latest_version_info.inode + estimated_backup_inode_change
@@ -3870,7 +3869,7 @@ def do_backup(backup_entries:dict,
 					if not removed_size and not removed_inodes:
 						break
 					if recopies:
-						recopies_oldest, recopies, recopies_size = count_recopies()
+						recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
 			if backup_limit_inode:
 				while vault_inodes + estimated_backup_inode > backup_limit_inode:
 					backuperTeeLogToTl(job_name,f'Vault inodes {vault_inodes} + estimated backup inodes {estimated_backup_inode} exceeds backup inode limit {backup_limit_inode}')
@@ -3889,7 +3888,7 @@ def do_backup(backup_entries:dict,
 				if not removed_size and not removed_inodes:
 					break
 			if recopies and next(iter(vault_info_dict)) != recopies_oldest:
-				recopies_oldest, recopies, recopies_size = count_recopies()
+				recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
 			os.makedirs(backup_folder,exist_ok=True)
@@ -3912,7 +3911,7 @@ def do_backup(backup_entries:dict,
 		content_file_name = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
 		# a copy made again is no change: its own event, which history and the restore picker pass over
 		recopy_time = datetime.datetime.now().isoformat()
-		content_file_content = [entry_row(os.path.join(monitor_path,rel),BackupEntryValues(recopy_time,'recopy',None)) for rel in recopied]
+		content_file_content = [entry_row(os.path.join(monitor_path,rel),BackupEntryValues(recopy_time,'recopy',None)) for rel in recopied if rel not in recopies_rewritten]
 		content_file_content += [entry_row(path,values) for path,values in backup_entries.items()]
 		# commit before the content file: without one the version is removed at startup, and a manifest
 		# describing a removed version is listed again from the vault
@@ -5518,39 +5517,57 @@ def recopy_rels(manifest:VaultManifest, new_version:int, oldest_kept:int, job_va
 		manifest.commit()
 	return sorted(due)
 
-def batch_rewrites(backup_entries:dict, monitor_path:str) -> tuple:
+def batch_rewrites(backup_entries:dict, monitor_path:str, only_sync_attributes:bool, rels) -> tuple:
 	'''
-	(rewritten, deleted): the rels of the files backup_entries creates or modifies, and of those it deletes, by their own
-	entries. The replay deletes before it copies and copies before it moves, so a file's copy made again from the vault
-	is overwritten or removed before anything moves it.
+	(rewritten, deleted): which files of rels the batch backup_entries writes over, or removes, in the version it makes,
+	by its own entry or that of a folder above it. The replay deletes first, then copies, then moves.
+	- deleted: the file or a folder above it is deleted, so a copy of it made again from the vault would be gone before
+	  anything else happens to it.
+	- rewritten: the batch creates or modifies it, moves another file onto it, copies it for an attribute change (when
+	  not only_sync_attributes), or creates or moves onto a folder above it, whose tree it copies file by file.
+	A file moved away, or in a folder moved away, is neither, as the move takes its entry along.
 
 	Examples:
 		>>> entries = OrderedDict((path, BackupEntryValues('t', event, source)) for path, event, source in (('/m/a', 'modify', None),
-		...     ('/m/d/b', 'create', None), ('/m/c', 'delete', None), ('/m/e/', 'delete', None), ('/m/f', 'move', '/m/g'), ('/m/h', 'attrib', None)))
-		>>> [sorted(rels) for rels in batch_rewrites(entries, '/m')]
-		[['a', 'd/b'], ['c']]
+		...     ('/m/d/', 'create', None), ('/m/c', 'delete', None), ('/m/e/', 'delete', None), ('/m/f', 'move', '/m/g'),
+		...     ('/m/h', 'attrib', None), ('/m/k/', 'move', '/m/n/'), ('/m/d/p', 'move', '/m/d/q')))
+		>>> rels = ['a', 'd/b', 'c', 'e/x', 'e/d/b', 'f', 'g', 'h', 'k/y', 'n/z', 'd/q', 'o']
+		>>> [sorted(found) for found in batch_rewrites(entries, '/m', True, rels)]
+		[['a', 'd/b', 'f', 'k/y'], ['c', 'e/d/b', 'e/x']]
+		>>> 'h' in batch_rewrites(entries, '/m', False, rels)[0]
+		True
 	'''
-	rewritten, deleted = set(), set()
+	written, written_folders, deleted_files, deleted_folders, moved, moved_folders = set(), set(), set(), set(), set(), set()
 	for path, values in backup_entries.items():
-		if path.endswith('/'):
+		rel = os.path.relpath(path, monitor_path)
+		if rel == '.':
 			continue
-		if values.event in ('create', 'modify'):
-			rewritten.add(os.path.relpath(path, monitor_path))
-		elif values.event == 'delete':
-			deleted.add(os.path.relpath(path, monitor_path))
+		# a folder's rel ends with /, as inside_folders() reads them
+		folder = path.endswith('/')
+		suffix = '/' if folder else ''
+		if values.event == 'delete':
+			(deleted_folders if folder else deleted_files).add(rel + suffix)
+		elif values.event in ('create', 'modify', 'move') or (values.event == 'attrib' and not only_sync_attributes and not folder):
+			(written_folders if folder else written).add(rel + suffix)
+		if values.event == 'move' and values.source_path:
+			(moved_folders if folder else moved).add(os.path.relpath(values.source_path, monitor_path) + suffix)
+	rewritten, deleted = set(), set()
+	for rel in rels:
+		if rel in deleted_files or inside_folders(rel, deleted_folders):
+			deleted.add(rel)
+		elif rel in moved or inside_folders(rel, moved_folders):
+			continue
+		elif rel in written or inside_folders(rel, written_folders):
+			rewritten.add(rel)
 	return rewritten, deleted
 
-def recopy_size(manifest:VaultManifest, rels:list, job_vault:str, latest_version_path:str) -> int:
+def recopy_size(rels:list, job_vault:str, latest_version_path:str) -> int:
 	'''
-	The bytes copying rels again from the vault adds to a version: the size each one's record holds (none for a link),
-	else the size of what its chain in the latest version ends at.
+	The bytes copying rels again from the vault adds to a version: the size of the file each one's chain in the latest
+	version ends at, nothing for a link, nor for a chain that cannot be followed, which keeps its link.
 	'''
 	total = 0
 	for rel in rels:
-		record = manifest.lookup(rel)
-		if record is not None and record.kind is not None:
-			total += record.size or 0
-			continue
 		end = chain_end(job_vault, latest_version_path, rel)
 		if end is not None and stat.S_ISREG(end.st.st_mode):
 			total += end.st.st_size
