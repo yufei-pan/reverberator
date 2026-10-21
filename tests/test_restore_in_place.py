@@ -195,10 +195,10 @@ def test_in_place_root_needs_an_empty_root(job, tmp_path, capsys):
 	os.remove(f'{job.monitor}/lost+found/#1234')
 	shown_disk = disk_line(job.monitor, versions(job)[0])
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
-	assert (code, err) == (0, '')
+	assert code == 0 and err.startswith('Restoring the whole job into ')
 	assert tree(job.monitor) == {'a.txt': 'a', 'd/': None, 'd/b.txt': 'b', 'lost+found/': None}
 	# the root and lost+found, the new disk's own, with the version's metadata
-	assert stdout == f'{shown_disk}\nRestored 5 entries ({rv.show_size(2)}) from V0 to {job.monitor}\n'
+	assert (err, stdout) == (f'{shown_disk}\n', f'Restored 5 entries ({rv.show_size(2)}) from V0 to {job.monitor}\n')
 	assert metadata(job.monitor) == metadata(version_path(job, 0))
 	assert metadata(f'{job.monitor}/lost+found') == metadata(os.path.join(version_path(job, 0), 'lost+found'))
 
@@ -380,24 +380,24 @@ def test_in_place_root_asks_while_the_daemon_runs_the_job(job, tmp_path, capsys,
 	monkeypatch.setattr(sys, 'stdin', Terminal('n\n'))
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED and 'Cancelled' in err
-	assert stdout == f'{shown_disk}\n{running}\nContinue? [y/N] '
+	assert err == f'{shown_disk}\n{running}\nContinue? [y/N] Cancelled\n' and stdout == ''
 	assert os.listdir(job.monitor) == []
 	monkeypatch.setattr(sys, 'stdin', Terminal('y\n'))
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0')
-	assert (code, err) == (0, '')
+	assert code == 0 and err.startswith('Restoring the whole job into ')
 	assert tree(job.monitor) == {'a.txt': 'a'}
 	os.remove(f'{job.monitor}/a.txt')
 	monkeypatch.setattr(sys, 'stdin', io.StringIO(''))
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
-	assert (code, err) == (0, '')
-	assert stdout.startswith(f'{shown_disk}\n{running}\nRestored ') and tree(job.monitor) == {'a.txt': 'a'}
+	assert code == 0 and err.startswith('Restoring the whole job into ')
+	assert err == f'{shown_disk}\n{running}\n' and stdout.startswith('Restored ') and tree(job.monitor) == {'a.txt': 'a'}
 	# a stopped job backs nothing up: the disk is still shown and asked about
 	os.remove(f'{job.monitor}/a.txt')
 	write_state(tmp_path, f'job-{job.job_name}.json', job_record(job, state='stopped'))
 	monkeypatch.setattr(sys, 'stdin', Terminal('y\n'))
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0')
-	assert (code, err) == (0, '')
-	assert stdout.startswith(f'{shown_disk}\nContinue? [y/N] Restored ')
+	assert code == 0 and err.startswith('Restoring the whole job into ')
+	assert err == f'{shown_disk}\nContinue? [y/N] ' and stdout.startswith('Restored ')
 
 
 @pytest.mark.skipif(not ROOT, reason='needs root to hand folders to another user')
@@ -593,7 +593,7 @@ def test_in_place_root_is_private_while_restoring(job, tmp_path, capsys, monkeyp
 		return cp_af_copy_path(*args, **kwargs)
 	monkeypatch.setattr(rv, 'cp_af_copy_path', watching)
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
-	assert (code, err) == (0, '')
+	assert code == 0 and err.startswith('Restoring the whole job into ')
 	# private while it fills, marked before the first copy; the version's own once complete
 	assert seen and set(seen) == {(0o700, 0o600)}
 	assert metadata(job.monitor) == metadata(held)
@@ -615,8 +615,8 @@ def test_in_place_root_is_private_while_restoring(job, tmp_path, capsys, monkeyp
 	with open(os.path.join(held, 'd/c.txt'), 'w', encoding='utf-8') as f:
 		f.write('c')
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
-	assert (code, err) == (0, '')
-	assert stdout.endswith(f'\nRestored 3 entries ({rv.show_size(1)}) from V0 to {job.monitor}, keeping 2 already there\n')
+	assert code == 0 and err.startswith('Restoring the whole job into ')
+	assert stdout == f'Restored 3 entries ({rv.show_size(1)}) from V0 to {job.monitor}, keeping 2 already there\n'
 	assert tree(job.monitor) == {'a.txt': 'a', 'd/': None, 'd/b.txt': 'b', 'd/c.txt': 'c'}
 	assert metadata(job.monitor) == metadata(held)
 
@@ -742,8 +742,8 @@ def test_in_place_root_shows_the_disk_and_refuses_too_little_space(job, tmp_path
 	monkeypatch.setattr(sys, 'stdin', Terminal('n\n'))
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED and 'Cancelled' in err
-	assert stdout == f'{disk_line(job.monitor, version)}\nContinue? [y/N] '
-	assert f'mounted at {mount_point} ({source})' in stdout
+	assert err == f'{disk_line(job.monitor, version)}\nContinue? [y/N] Cancelled\n' and stdout == ''
+	assert f'mounted at {mount_point} ({source})' in err
 	assert os.listdir(job.monitor) == []
 	# less free space there than the version took in the vault
 	statvfs = os.statvfs
@@ -784,11 +784,11 @@ def test_in_place_root_weighs_free_space_against_the_whole_tree(job, tmp_path, c
 	monkeypatch.setattr(sys, 'stdin', Terminal('n\n'))
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1')
 	assert code == rv.EXIT_COMMAND_FAILED and 'Cancelled' in err
-	assert stdout == f'{shown_disk}\nV1 may not fit: its files can come from any of V0 to V1, more than the free space\nContinue? [y/N] '
+	assert err == f'{shown_disk}\nV1 may not fit: its files can come from any of V0 to V1, more than the free space\nContinue? [y/N] Cancelled\n' and stdout == ''
 	shown_disk = free_space(v0.size + v1.size)
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1', '--yes')
-	assert (code, err) == (0, '')
-	assert stdout.startswith(f'{shown_disk}\nRestored ')
+	assert code == 0 and err.startswith('Restoring the whole job into ')
+	assert err.startswith(shown_disk + '\n') and stdout.startswith('Restored ')
 	assert tree(job.monitor) == {'big.txt': 'a' * 200000, 'small.txt': 's2'}
 
 
@@ -905,16 +905,18 @@ def test_the_claim_looks_at_the_marker_again_under_the_lock(job, tmp_path, capsy
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
 	marker = mark(target, job, 'proj', versions(job)[0].name)
-	claim_restore_target = rv.claim_restore_target
+	lock_restore_target = rv.lock_restore_target
 
-	def finishing(path):
-		fd = claim_restore_target(path)
-		# the run that held it finished, and removed its marker, before this one got the lock
+	def finishing(fd, path):
+		lock_restore_target(fd, path)
+		# the run that held it finished, handing the folder over with its own mode, before this one got the lock
 		os.unlink(marker)
-		return fd
-	monkeypatch.setattr(rv, 'claim_restore_target', finishing)
+		os.fchmod(fd, 0o755)
+	monkeypatch.setattr(rv, 'lock_restore_target', finishing)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == rv.EXIT_USAGE and 'no longer holds an unfinished restore' in err
+	# refused before the claim made it private
+	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o755
 	assert os.listdir(target) == []
 
 
@@ -943,3 +945,31 @@ def test_accept_without_a_marker_is_nothing_to_accept_and_moves_nothing(job, tmp
 		monkeypatch.setattr(rv, 'read_restore_marker', read_restore_marker)
 		assert asides(job.monitor, 'proj') == [], vanishing_look
 		assert os.path.isdir(target)
+
+
+def test_a_stop_while_handing_folders_over_points_at_accept(job, tmp_path, capsys, monkeypatch):
+	if not ROOT:
+		pytest.skip('needs another uid to own folders')
+	seed_monitor(job, {'proj/a.txt': 'a', 'proj/sub/b.txt': 'b', 'proj/sub/deeper/c.txt': 'c'})
+	for folder in ('proj/sub', 'proj/sub/deeper'):
+		os.chown(f'{job.monitor}/{folder}', OTHER, OTHER)
+	run_backup(job)
+	write_rule(job)
+	restore_folder_meta = rv.restore_folder_meta
+
+	def stopping(source, dest):
+		rv.RESTORE_STOP.set()
+		return restore_folder_meta(source, dest)
+	monkeypatch.setattr(rv, 'restore_folder_meta', stopping)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	monkeypatch.setattr(rv, 'restore_folder_meta', restore_folder_meta)
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert 'stopped while giving its folders their owners' in err and 'again with --accept' in err and 'run the same restore again' not in err
+	assert os.lstat(os.path.join(target, 'sub/deeper')).st_uid == OTHER
+	# running it again refuses the folders already handed over; --accept finishes it
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0', '--accept')
+	assert code == 0
+	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
+	assert metadata(target) == metadata(os.path.join(version_path(job, 0), 'proj'))
