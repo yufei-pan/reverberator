@@ -1,6 +1,7 @@
 import errno
 import itertools
 import os
+import shutil
 import sqlite3
 import stat
 from collections import OrderedDict
@@ -430,42 +431,106 @@ def test_a_recopy_is_checked_like_any_copy(job, monkeypatch):
 
 
 def test_a_batch_s_own_changes_to_a_due_file(job):
-	modified, deleted, moved = name_with_threshold(32, 'm'), name_with_threshold(32, 'd'), name_with_threshold(32, 'v')
-	seed_monitor(job, {modified: 'x' * 256 * 1024, deleted: 'd', moved: 'v', 'c.txt': 'c'})
-	backup(job)
-	for _ in range(32):
-		backup(job, 'c.txt')
+	modified, deleted, moved, gone = (name_with_threshold(32, stem) for stem in ('m', 'd', 'v', 'g'))
+	vault_size = fast_forward_to_32(job, {modified: BIG, deleted: 'd', moved: 'v', gone: 'gone'})
 	# room for the new contents of modified, not for its old copy as well, overwritten as soon as it is made
-	limit = rv.get_vault_info(job.job_vault).vault_size + 320 * 1024
+	limit = vault_size + 320 * 1024
 	seed_monitor(job, {modified: 'y' * 256 * 1024})
 	os.remove(os.path.join(job.monitor, deleted))
 	os.rename(os.path.join(job.monitor, moved), os.path.join(job.monitor, 'w.txt'))
+	# gone is modified, then removed before the backup copies it
+	os.remove(os.path.join(job.monitor, gone))
 	version = backup(job, events=[event_entry(job, modified, 'modify'), event_entry(job, deleted, 'delete'),
-		event_entry(job, 'w.txt', 'move', moved)], backup_size_limit=str(limit))
+		event_entry(job, 'w.txt', 'move', moved), event_entry(job, gone, 'modify')], backup_size_limit=str(limit))
 	assert version.number == 33 and rv.list_versions(job.job_vault)[0].number == 0
 	assert rv.get_vault_info(job.job_vault).vault_size <= limit
-	# a modified file is copied again all the same, so a copy of it that fails leaves no chain past its threshold; a
-	# deleted one is not; a moved one takes its new copy along
-	assert sorted(changes(job, version)) == sorted([(modified, 'recopy'), (moved, 'recopy'), (modified, 'modify'), (deleted, 'delete'),
-		('w.txt', 'move')])
+	# a deleted file is not copied again; a moved one takes its new copy along; one the batch writes is copied again all
+	# the same, so a copy of it that fails leaves no chain past its threshold, but its own row says what the version did
+	assert sorted(changes(job, version)) == sorted([(moved, 'recopy'), (modified, 'modify'), (deleted, 'delete'), ('w.txt', 'move'),
+		(gone, 'modify')])
 	assert not os.path.lexists(os.path.join(version.path, deleted)) and not os.path.islink(os.path.join(version.path, 'w.txt'))
 	with open(os.path.join(version.path, modified)) as f:
 		assert f.read() == 'y' * 256 * 1024
-	assert copy_versions(job) == {modified: 33, 'w.txt': 33, 'c.txt': 32}
+	with open(os.path.join(version.path, gone)) as f:
+		assert not os.path.islink(os.path.join(version.path, gone)) and f.read() == 'gone'
+	assert copy_versions(job) == {modified: 33, 'w.txt': 33, gone: 33, 'c.txt': 32}
 
 
 def test_a_due_file_whose_chain_is_broken_is_named(job, monkeypatch):
 	name = name_with_threshold(32)
-	seed_monitor(job, {name: 'gone', 'c.txt': 'c'})
-	backup(job)
-	for _ in range(32):
-		backup(job, 'c.txt')
+	vault_size = fast_forward_to_32(job, {name: BIG})
 	# the copy the chains of name lead to is lost from the vault
 	os.remove(os.path.join(rv.list_versions(job.job_vault)[0].path, name))
 	logged = []
 	log = rv.backuperTeeLogToTl
 	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda *args, **kwargs: logged.append((args, kwargs)) or log(*args, **kwargs))
-	version = backup(job, 'c.txt')
+	# its record still holds its size, but nothing is copied, so nothing is counted
+	version = backup(job, 'c.txt', backup_size_limit=str(vault_size + 64 * 1024))
+	assert version.number == 33 and rv.list_versions(job.job_vault)[0].number == 0
 	assert changes(job, version) == [('c.txt', 'modify')] and os.path.islink(os.path.join(version.path, name))
 	errors = [kwargs.get('message', args[1] if len(args) > 1 else '') for args, kwargs in logged if kwargs.get('error')]
 	assert any(name in message and 'cannot be followed' in message for message in errors), errors
+
+
+BIG = 'x' * 256 * 1024
+
+
+def fast_forward_to_32(job, tree):
+	'''V0 holding tree and c.txt, then V1 to V32 changing c.txt only, so a threshold-32 file of tree is due in V33. Returns the vault's size.'''
+	seed_monitor(job, {**tree, 'c.txt': 'c'})
+	backup(job)
+	for _ in range(32):
+		backup(job, 'c.txt')
+	return rv.get_vault_info(job.job_vault).vault_size
+
+
+def oldest_kept(job):
+	return rv.list_versions(job.job_vault)[0].number
+
+
+def test_a_folder_the_batch_deletes(job):
+	due = name_with_threshold(32, 'e/f')
+	vault_size = fast_forward_to_32(job, {due: BIG})
+	# only the folder's delete, as for a folder moved out of the tree
+	shutil.rmtree(os.path.join(job.monitor, 'e'))
+	version = backup(job, events=[event_entry(job, 'e/', 'delete')], backup_size_limit=str(vault_size + 64 * 1024))
+	assert version.number == 33 and oldest_kept(job) == 0
+	assert changes(job, version) == [('e', 'delete')] and not os.path.lexists(os.path.join(version.path, 'e'))
+
+
+def test_a_folder_the_batch_copies_anew(job):
+	due = name_with_threshold(32, 'e/f')
+	vault_size = fast_forward_to_32(job, {due: BIG})
+	# the folder is replaced in one go, as by one moved in from outside the tree: only the folder's own create
+	shutil.rmtree(os.path.join(job.monitor, 'e'))
+	seed_monitor(job, {due: 'y' * 256 * 1024})
+	version = backup(job, events=[event_entry(job, 'e/', 'create')], backup_size_limit=str(vault_size + 320 * 1024))
+	assert version.number == 33 and oldest_kept(job) == 0
+	assert changes(job, version) == [('e', 'create')]
+	with open(os.path.join(version.path, due)) as f:
+		assert f.read() == 'y' * 256 * 1024
+	# the new copy is a change, as history lists it
+	versions = rv.list_versions(job.job_vault)
+	assert [(row.version.number, row.event) for row in rv.file_history(job.job_vault, versions, job.monitor, due)] == [(33, 'changed'), (0, 'oldest')]
+
+
+def test_a_file_the_batch_moves_onto(job):
+	due, other = name_with_threshold(32, 'g'), name_with_threshold(36, 'h')
+	vault_size = fast_forward_to_32(job, {due: BIG, other: 'moved'})
+	os.replace(os.path.join(job.monitor, other), os.path.join(job.monitor, due))
+	version = backup(job, events=[event_entry(job, due, 'move', other)], backup_size_limit=str(vault_size + 64 * 1024))
+	assert version.number == 33 and oldest_kept(job) == 0
+	assert changes(job, version) == [(due, 'move')]
+	with open(os.path.join(version.path, due)) as f:
+		assert f.read() == 'moved'
+
+
+def test_a_file_the_batch_copies_for_its_attributes(job):
+	due = name_with_threshold(32, 'a')
+	vault_size = fast_forward_to_32(job, {due: BIG})
+	os.chmod(os.path.join(job.monitor, due), 0o600)
+	version = backup(job, events=[event_entry(job, due, 'attrib')], only_sync_attributes=False, backup_size_limit=str(vault_size + 320 * 1024))
+	assert version.number == 33 and oldest_kept(job) == 0
+	assert changes(job, version) == [(due, 'attrib')]
+	copied = os.lstat(os.path.join(version.path, due))
+	assert stat.S_ISREG(copied.st_mode) and stat.S_IMODE(copied.st_mode) == 0o600
