@@ -566,3 +566,39 @@ def test_never_backed_up_knows_a_folder_from_its_trailing_slash(job, tmp_path, c
 	assert pattern in history(tmp_path, capsys, f'{job.monitor}/cache/')[1]
 	os.makedirs(f'{job.monitor}/cache')
 	assert pattern in history(tmp_path, capsys, f'{job.monitor}/cache')[1]
+
+
+class ClosedAfter:
+	'''A stdout whose reader went away after the first line.'''
+	def __init__(self):
+		self.written = []
+
+	def write(self, text):
+		if self.written:
+			raise BrokenPipeError(32, 'Broken pipe')
+		self.written.append(text)
+		return len(text)
+
+	def flush(self):
+		pass
+
+
+def test_history_on_a_closed_output_stops_quietly(job, tmp_path, capsys, monkeypatch):
+	a_txt_lifetime(job)
+	write_rule(job)
+	capsys.readouterr()
+	out = ClosedAfter()
+	monkeypatch.setattr('sys.stdout', out)
+	code = rv.run_command(['history', f'{job.monitor}/a.txt', '--rule', str(tmp_path / 'rule.tsv'), '--state_dir', state_dir(tmp_path)])
+	assert code == rv.EXIT_COMMAND_FAILED and out.written
+	assert capsys.readouterr().err == ''
+
+
+def test_history_vault_error_part_way_is_still_the_vault(job, tmp_path, capsys, monkeypatch):
+	a_txt_lifetime(job)
+	write_rule(job)
+	def failing(change_list, *args, **kwargs):
+		raise OSError(5, 'Input/output error')
+	monkeypatch.setattr(rv, 'path_changes', failing)
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/a.txt')
+	assert code == rv.EXIT_COMMAND_FAILED and f'The vault {job.job_vault} cannot be read' in err

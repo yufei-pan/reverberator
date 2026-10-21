@@ -7524,18 +7524,37 @@ def history_command(args) -> int:
 	rule, rel = find_job(load_command_rules(rule_path), args.path, args.job)
 	job_vault = job_vault_path(rule)
 	# taken before the versions are listed, so the list is the one left by a removal of the oldest version under way
+	output_closed = False
 	with command_restore_lock(rule.job_name, args.state_dir):
 		try:
 			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
 			kind = path_kind(job_vault, versions, rule.mon_path, rel) if versions else None
 			if kind is not None:
-				# each row is printed as it is found, so a job's whole history is never held (nor its restore lock let go before)
+				# each row is printed as it is found, so a job's whole history is never held; the lock is held all the while,
+				# so pruning waits for the output to be read (in a pager, say)
 				rows = path_history(job_vault, versions, rule.mon_path, rel, folder=kind == 'folder', list_files=args.files and kind == 'folder')
-				for line in history_lines(rule, job_vault, rows, kind, args.files):
-					print(line)
+				lines = history_lines(rule, job_vault, rows, kind, args.files)
+				# an OSError from the next line is the vault's; one from writing it is the reader's going away
+				for line in lines:
+					try:
+						print(line)
+					except OSError:
+						output_closed = True
+						break
+				try:
+					sys.stdout.flush()
+				except OSError:
+					output_closed = True
 		except OSError as e:
 			raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
+	if output_closed:
+		# nobody is reading: stop without a message, and without Python's error for the buffered text at exit
+		try:
+			os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+		except (OSError, ValueError, AttributeError):
+			pass
+		return EXIT_COMMAND_FAILED
 	if kind is None:
 		# the header alone, then why there is nothing to show
 		print(format_history(rule, job_vault, [], 'file', False) + '\n' + never_backed_up(rule, rule_path, rel, args.path.endswith('/')))
