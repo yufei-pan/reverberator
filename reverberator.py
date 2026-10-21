@@ -50,7 +50,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.39
+__version__ = 0.40
 
 ## WIP
 
@@ -447,7 +447,7 @@ class SkipList:
 			return False
 		return self._spec.match_file(rel)
 
-	def deciding_pattern(self, rel:str, is_dir:bool) -> str:
+	def deciding_pattern(self, rel:str, is_dir:bool) -> 'str | None':
 		'''
 		The pattern that skips a root-relative path, or the first skipped folder above it, as the walk never goes into a
 		skipped folder; None when nothing skips it.
@@ -693,7 +693,7 @@ def state_dir_path(override:str = None) -> str:
 	'''
 	return override or os.environ.get('REVERB_STATE_DIR') or DEFAULT_STATE_DIR
 
-def process_start_ticks(pid:int) -> int:
+def process_start_ticks(pid:int) -> 'int | None':
 	'''
 	When process pid started, in clock ticks after boot (field 22 of its /proc stat), or None when unreadable.
 	With the pid it tells a running daemon from a stale file whose pid another process took.
@@ -1513,7 +1513,7 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 			result.append('\t'.join(rows[key]) + line[len(line.rstrip('\r')):])
 	replace_file_text(rule_file, '\n'.join(result))
 
-def resolve_skip_list_path(cell:str, rule_file:str) -> str:
+def resolve_skip_list_path(cell:str, rule_file:str) -> 'str | None':
 	'''
 	Resolve the Skip List File cell to a path, None when the job has no skip list.
 

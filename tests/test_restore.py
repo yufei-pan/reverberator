@@ -93,7 +93,7 @@ def snapshot(top):
 		for name in names + files:
 			path = os.path.join(folder, name)
 			st = os.lstat(path)
-			found[path] = (st.st_mode, st.st_size, st.st_mtime_ns, os.readlink(path) if os.path.islink(path) else None)
+			found[path] = (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_uid, st.st_gid, os.readlink(path) if os.path.islink(path) else None)
 	return found
 
 
@@ -449,6 +449,38 @@ def test_parse_at_time_forms():
 	with pytest.raises(rv.CommandError) as e:
 		rv.parse_at_time('2021-13-01')
 	assert e.value.code == rv.EXIT_USAGE
+
+
+@pytest.fixture
+def new_york_time():
+	# a POSIX rule rather than a zone name, so no tz database is needed
+	before = os.environ.get('TZ')
+	os.environ['TZ'] = 'EST5EDT,M3.2.0,M11.1.0'
+	time.tzset()
+	yield
+	if before is None:
+		del os.environ['TZ']
+	else:
+		os.environ['TZ'] = before
+	time.tzset()
+
+
+def test_parse_at_time_across_daylight_saving_changes(new_york_time):
+	utc = lambda *fields: rv.datetime.datetime(*fields, tzinfo=rv.datetime.timezone.utc).timestamp()
+	# the clocks went forward on 2021-03-14 and back on 2021-11-07: a local day is 23 and 25 hours long
+	assert rv.parse_at_time('2021-03-14') == utc(2021, 3, 14, 5)
+	assert rv.parse_at_time('2021-03-15') == utc(2021, 3, 15, 4)
+	assert rv.parse_at_time('2021-03-15') - rv.parse_at_time('2021-03-14') == 23 * 3600
+	assert rv.parse_at_time('2021-11-08') - rv.parse_at_time('2021-11-07') == 25 * 3600
+	assert rv.parse_at_time('2021-07-01 12:00') == utc(2021, 7, 1, 16)
+	assert rv.parse_at_time('2021-01-01 12:00') == utc(2021, 1, 1, 17)
+	# a version folder's time carries its own offset, whatever the local one is
+	assert rv.parse_at_time('2021-07-01_12-00-00_-0800') == utc(2021, 7, 1, 20)
+	# 01:30 on 2021-11-07 happened twice, and 02:30 on 2021-03-14 never did: each is one moment, within the hour of the change
+	ambiguous = rv.parse_at_time('2021-11-07 01:30')
+	assert utc(2021, 11, 7, 5, 30) <= ambiguous <= utc(2021, 11, 7, 6, 30)
+	missing = rv.parse_at_time('2021-03-14 02:30')
+	assert utc(2021, 3, 14, 6, 30) <= missing <= utc(2021, 3, 14, 7, 30)
 
 
 def test_restore_needs_one_destination(job, tmp_path, capsys):
@@ -862,3 +894,62 @@ def test_a_refused_destination_shows_the_path_as_typed_and_as_resolved(job, tmp_
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/a.txt', str(link), '--version', '1')
 	assert (code, stdout) == (rv.EXIT_USAGE, '')
 	assert f'{link} (resolved to {real / "out"})' in err and f'another user can change {real}' in err
+
+
+def test_a_target_replaced_as_it_was_made_is_never_claimed(tmp_path):
+	real = tmp_path / 'real'
+	real.mkdir()
+	os.chmod(real, 0o755)
+	(tmp_path / 'file').write_text('x')
+	os.symlink(str(real), str(tmp_path / 'link'))
+	for name in ('link', 'file', 'absent'):
+		with pytest.raises(rv.CommandError) as e:
+			rv.claim_restore_target(str(tmp_path / name))
+		assert 'is not a folder to restore into' in e.value.message, name
+	# what the link led to was not made private
+	assert stat.S_IMODE(os.lstat(real).st_mode) == 0o755
+	# a folder of this user's is claimed and made private, and a second claim waits for the first
+	own = tmp_path / 'own'
+	own.mkdir(0o755)
+	os.chmod(own, 0o755)
+	fd = rv.claim_restore_target(str(own))
+	try:
+		assert stat.S_IMODE(os.lstat(own).st_mode) == 0o700
+		with pytest.raises(rv.CommandError) as e:
+			rv.claim_restore_target(str(own))
+		assert 'another run of this restore' in e.value.message
+	finally:
+		os.close(fd)
+	# a refusal by the caller's check comes before anything is changed
+	own2 = tmp_path / 'own2'
+	own2.mkdir()
+	os.chmod(own2, 0o755)
+	def refuse():
+		raise rv.CommandError('gone meanwhile')
+	with pytest.raises(rv.CommandError):
+		rv.claim_restore_target(str(own2), refuse)
+	assert stat.S_IMODE(os.lstat(own2).st_mode) == 0o755
+	# the lock was let go with it
+	os.close(rv.claim_restore_target(str(own2)))
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason='needs root to give a folder to another user')
+def test_a_folder_of_another_user_is_not_claimed_or_made(tmp_path):
+	theirs = tmp_path / 'theirs'
+	theirs.mkdir()
+	os.chown(theirs, 4242, 4242)
+	with pytest.raises(rv.CommandError) as e:
+		rv.claim_restore_target(str(theirs))
+	assert 'belongs to uid 4242' in e.value.message
+	assert rv.make_restore_folder(str(theirs)) == 'the folder in its place belongs to uid 4242'
+
+
+def test_make_restore_folder_never_follows_or_replaces_what_is_in_the_way(tmp_path):
+	assert rv.make_restore_folder(str(tmp_path / 'new')) is None and os.path.isdir(tmp_path / 'new')
+	# one an earlier run made is used as it is
+	assert rv.make_restore_folder(str(tmp_path / 'new')) is None
+	os.symlink(str(tmp_path / 'new'), str(tmp_path / 'link'))
+	assert rv.make_restore_folder(str(tmp_path / 'link')) == 'a symlink is in its place, which is not followed'
+	(tmp_path / 'file').write_text('x')
+	assert rv.make_restore_folder(str(tmp_path / 'file')) == 'something other than a folder is in its place'
+	assert (tmp_path / 'file').read_text() == 'x' and os.path.islink(tmp_path / 'link')

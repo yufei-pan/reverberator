@@ -215,7 +215,7 @@ def test_status_writes_nothing(job, tmp_path, capsys):
 				for name in names + files:
 					path = os.path.join(folder, name)
 					found[path] = os.lstat(path)
-		return {path: (st.st_mtime_ns, st.st_size, st.st_mode) for path, st in found.items()}, open(job.rule_path, 'rb').read()
+		return {path: (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_mode, st.st_uid, st.st_gid) for path, st in found.items()}, open(job.rule_path, 'rb').read()
 	before = snapshot()
 	assert status(tmp_path, capsys)[0] == 0
 	assert snapshot() == before

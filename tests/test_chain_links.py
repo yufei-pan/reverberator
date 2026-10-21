@@ -404,3 +404,41 @@ def test_pruning_forgets_the_real_folders_of_the_version_it_removes(job):
 	assert rv.chain_hop(job.job_vault, f'{v1}/u', text) is None
 	record = rv.read_vault_record(v1, 'u', job.monitor)
 	assert (record.kind, record.link) == ('l', text)
+
+
+def test_a_two_hop_read_passes_a_link_an_old_move_broke_in_the_middle(job):
+	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp=T, current=False)
+	v1 = write_committed_version(job, 1, {'deep/er/': None}, timestamp=T, current=False)
+	v2 = write_committed_version(job, 2, {'deep/er/': None}, timestamp=T)
+	# V1's link was broken by a move to another depth (it names V0 two folders up from where the move left it); V2's is whole
+	os.symlink(f'../../V0--{T}/a/x', f'{v1}/deep/er/x')
+	os.symlink(f'../../../V1--{T}/deep/er/x', f'{v2}/deep/er/x')
+	assert not os.path.exists(f'{v2}/deep/er/x')
+	record = rv.read_vault_record(v2, 'deep/er/x', job.monitor)
+	assert (record.kind, record.size) == ('f', os.path.getsize(os.path.join(v0, 'a/x')))
+	got = rv.resolve_version_entry(job.job_vault, v2, 'deep/er/x', job.monitor)
+	assert got.kind == 'file' and got.path == os.path.join(v0, 'a/x')
+
+
+def test_pruning_the_oldest_version_after_a_retargeted_move_leaves_a_real_copy(job):
+	seed_monitor(job, {'a/x.txt': 'x', 'deep/er/keep.txt': 'k'})
+	v0 = run_backup(job)[0]
+	os.rename(f'{job.monitor}/a/x.txt', f'{job.monitor}/deep/er/x.txt')
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'deep/er/x.txt', 'move', 'a/x.txt')]))[-1]
+	assert_links_to(os.path.join(v1, 'deep/er/x.txt'), os.path.join(v0, 'a/x.txt'), 'x')
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	assert not os.path.exists(v0)
+	assert not os.path.islink(os.path.join(v1, 'deep/er/x.txt')) and open(os.path.join(v1, 'deep/er/x.txt')).read() == 'x'
+
+
+def test_a_referenced_link_after_a_move_still_leads_to_the_live_file(job):
+	seed_monitor(job, {'a/x.txt': 'x', 'deep/er/keep.txt': 'k'})
+	v0 = run_backup(job, keep_one_complete_backup=False)[0]
+	assert os.path.islink(os.path.join(v0, 'a/x.txt'))
+	os.rename(f'{job.monitor}/a/x.txt', f'{job.monitor}/deep/er/x.txt')
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'deep/er/x.txt', 'move', 'a/x.txt')]))[-1]
+	moved = os.path.join(v1, 'deep/er/x.txt')
+	# the link was retargeted like any other, and still leads through V0's link to the file the first version referenced
+	assert os.readlink(moved) == os.path.relpath(os.path.join(v0, 'a/x.txt'), os.path.join(v1, 'deep/er'))
+	got = rv.resolve_version_entry(job.job_vault, v1, 'deep/er/x.txt', job.monitor)
+	assert got.kind == 'referenced' and got.detail == os.path.join(job.monitor, 'a/x.txt')

@@ -29,7 +29,8 @@ def read_job(tmp_path):
 
 def test_status_board_writes_the_daemon_record(tmp_path):
 	rv.StatusBoard(str(tmp_path / 's'), '/etc/r.tsv')
-	record = json.load(open(tmp_path / 's' / 'daemon.json'))
+	with open(tmp_path / 's' / 'daemon.json') as f:
+		record = json.load(f)
 	assert record['pid'] == os.getpid() and record['start_ticks'] == rv.process_start_ticks(os.getpid())
 	assert record['version'] == rv.__version__ and record['rule_path'] == '/etc/r.tsv'
 
@@ -179,6 +180,19 @@ def test_status_board_logs_one_error_for_writes_failing_together(tmp_path, capsy
 	board.write_job('j', {})
 	for other in board.others:
 		other.join(5)
+	assert capsys.readouterr().out.count('Cannot write status files') == 1
+
+
+def test_a_failed_status_write_leaves_no_temp_file_and_logs_once(tmp_path, capsys):
+	state = tmp_path / 'state'
+	board = rv.StatusBoard(str(state), '/r.tsv')
+	capsys.readouterr()
+	# a record json cannot write fails after the temp file was made: the file must not stay, the old record must
+	board.write_job('j', {'state': 'running'})
+	board.write_job('j', {'state': object()})
+	board.write_job('k', {'state': object()})
+	assert sorted(os.listdir(state)) == ['daemon.json', 'job-j.json']
+	assert _read(state / 'job-j.json') == {'state': 'running'}
 	assert capsys.readouterr().out.count('Cannot write status files') == 1
 
 

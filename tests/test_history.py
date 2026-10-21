@@ -334,7 +334,7 @@ def snapshot(top):
 		for name in names + files:
 			path = os.path.join(folder, name)
 			st = os.lstat(path)
-			found[path] = (st.st_mode, st.st_size, st.st_mtime_ns, os.readlink(path) if os.path.islink(path) else None)
+			found[path] = (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_uid, st.st_gid, os.readlink(path) if os.path.islink(path) else None)
 	return found
 
 
@@ -602,3 +602,52 @@ def test_history_vault_error_part_way_is_still_the_vault(job, tmp_path, capsys, 
 	monkeypatch.setattr(rv, 'path_changes', failing)
 	code, out, err = history(tmp_path, capsys, f'{job.monitor}/a.txt')
 	assert code == rv.EXIT_COMMAND_FAILED and f'The vault {job.job_vault} cannot be read' in err
+
+
+def test_history_of_a_name_with_a_carriage_return(job, tmp_path, capsys):
+	# a \r is a line break to some readers, and a name holding one must stay one row, one path, and print escaped
+	seed_monitor(job, {'keep': 'k'})
+	run_backup(job)
+	write(job, 'a\rb.txt', 'x')
+	backup(job, ('a\rb.txt', 'create'))
+	write(job, 'a\rb.txt', 'xy')
+	backup(job, ('a\rb.txt', 'modify'))
+	write_rule(job)
+	assert events(hist(job, 'a\rb.txt')) == [(2, 'modify'), (1, 'create')]
+	code, out, err = history(tmp_path, capsys, job.monitor, '--files')
+	assert (code, err) == (0, '')
+	assert '\r' not in out and out.split('\n').count('    create a\\x0db.txt') == 1 and '    modify a\\x0db.txt' in out.split('\n')
+	code, out, err = history(tmp_path, capsys, f'{job.monitor}/a\rb.txt')
+	assert (code, err) == (0, '') and '\r' not in out
+	assert out.split('\n')[1] == f'V2  {at(job, 2)}  modified  {rv.show_size(2)}'
+
+
+def test_a_file_moved_to_another_depth_and_back_has_each_move_in_its_history(job):
+	seed_monitor(job, {'keep.txt': 'k', 'deep/er/': None})
+	run_backup(job)
+	write(job, 'a.txt', 'a1')
+	backup(job, ('a.txt', 'create'))
+	os.rename(f'{job.monitor}/a.txt', f'{job.monitor}/deep/er/a.txt')
+	backup(job, ('deep/er/a.txt', 'move', 'a.txt'))
+	os.rename(f'{job.monitor}/deep/er/a.txt', f'{job.monitor}/a.txt')
+	backup(job, ('a.txt', 'move', 'deep/er/a.txt'))
+	# V3 moved it back: at a.txt it is a move from deep, then what V2 took away, then its creation
+	assert moves(hist(job, 'a.txt')) == [(3, 'move', f'{job.monitor}/deep/er/a.txt'), (2, 'moved_away', f'{job.monitor}/deep/er/a.txt'), (1, 'create', None)]
+	assert moves(hist(job, 'deep/er/a.txt')) == [(3, 'moved_away', f'{job.monitor}/a.txt'), (2, 'move', f'{job.monitor}/a.txt')]
+	# the copy a read reaches is still V1's, through the links both moves kept
+	assert rv.read_vault_record(versions(job)[3].path, 'a.txt', job.monitor).size == 2
+
+
+def test_a_file_deleted_and_made_again_shows_both_lives(job):
+	seed_monitor(job, {'keep.txt': 'k'})
+	run_backup(job)
+	write(job, 'a.txt', 'a1')
+	backup(job, ('a.txt', 'create'))
+	os.remove(f'{job.monitor}/a.txt')
+	backup(job, ('a.txt', 'delete'))
+	write(job, 'a.txt', 'a333')
+	backup(job, ('a.txt', 'create'))
+	rows = hist(job, 'a.txt')
+	assert events(rows) == [(3, 'create'), (2, 'delete'), (1, 'create')]
+	assert [row.size for row in rows] == [4, None, 2]
+	assert rv.path_kind(job.job_vault, versions(job), job.monitor, 'a.txt') == 'file'

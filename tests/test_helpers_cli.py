@@ -140,3 +140,17 @@ def test_colliding_job_names_counts_names_used_twice():
 	"""Two rows cleaning up to one name are both reported."""
 	rules = [rv.ReverbRule('a', *[''] * 11), rv.ReverbRule('b', *[''] * 11), rv.ReverbRule('a', *[''] * 11)]
 	assert rv.colliding_job_names(rules) == {'a': 2}
+
+
+def test_copy_file_meta_keeps_times_to_the_nanosecond(tmp_path):
+	source, dest = tmp_path / 'source', tmp_path / 'dest'
+	source.write_text('x')
+	dest.write_text('x')
+	# not a multiple of a microsecond, so a float round trip would move them
+	os.utime(source, ns=(1_600_000_000_123_456_789, 1_500_000_000_987_654_321))
+	os.chmod(source, 0o640)
+	assert rv.copy_file_meta(str(source), str(dest)) is True
+	st, copy = os.stat(source), os.stat(dest)
+	assert (copy.st_atime_ns, copy.st_mtime_ns) == (1_600_000_000_123_456_789, 1_500_000_000_987_654_321)
+	assert (copy.st_mode, copy.st_uid, copy.st_gid) == (st.st_mode, st.st_uid, st.st_gid)
+	assert rv.copy_file_meta(str(source), str(tmp_path / 'absent')) is False
