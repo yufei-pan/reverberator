@@ -10,6 +10,7 @@ import pytest
 import reverberator as rv
 from collections import OrderedDict
 from tests.harness import seed_monitor, run_backup, event_entry
+from tests.test_log_text import alerting_lines
 
 pytestmark = pytest.mark.unit
 
@@ -139,3 +140,86 @@ def test_pruning_is_postponed_when_the_lock_cannot_be_taken(job, monkeypatch):
 	run_backup(job, _change(job, 3), keep_n_versions=3)
 	assert _numbers(job) == [0, 1, 2, 3]
 	assert errors
+
+
+def _logged_lines(monkeypatch):
+	lines = []
+	real = rv.backuperTeeLogToTl
+	def record(path, message, **kwargs):
+		lines.append(str(message))
+		return real(path, message, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', record)
+	return lines
+
+
+def test_a_postponed_removal_is_logged_once_per_backup(job, monkeypatch):
+	_three_versions(job)
+	lines = _logged_lines(monkeypatch)
+	with rv.RestoreLock('job'):
+		# over the size limit, the inode limit and the version count: each retention loop tries to remove a version
+		run_backup(job, _change(job, 3), keep_n_versions=3, backup_size_limit='1B,i1')
+	assert _numbers(job) == [0, 1, 2, 3]
+	assert len([line for line in lines if line.startswith('Postponing removal of the oldest version')]) == 1
+
+
+def test_the_lock_file_is_never_opened_through_a_symlink(job, tmp_path):
+	_three_versions(job)
+	lock_path = rv.restore_lock_path('job')
+	os.makedirs(os.path.dirname(lock_path))
+	elsewhere = tmp_path / 'elsewhere'
+	os.symlink(elsewhere, lock_path)
+	# pruning is postponed, as for any lock that cannot be checked, and a restore cannot take it
+	run_backup(job, _change(job, 3), keep_n_versions=3)
+	assert _numbers(job) == [0, 1, 2, 3]
+	with pytest.raises(OSError) as raised:
+		with rv.RestoreLock('job'):
+			pass
+	assert raised.value.errno == errno.ELOOP
+	assert not os.path.lexists(elsewhere)
+
+
+def _unopenable_locks(monkeypatch, failing):
+	real_open = os.open
+	def fake_open(path, *args, **kwargs):
+		if str(path).endswith('.restore.lock') and failing[0]:
+			raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+		return real_open(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', fake_open)
+
+
+def _unlockable_locks(monkeypatch, failing):
+	real_flock = fcntl.flock
+	def fake_flock(fd, operation):
+		if operation == fcntl.LOCK_EX | fcntl.LOCK_NB and failing[0]:
+			raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+		return real_flock(fd, operation)
+	monkeypatch.setattr(fcntl, 'flock', fake_flock)
+
+
+@pytest.mark.parametrize('make_failing', [_unopenable_locks, _unlockable_locks])
+def test_a_lock_that_cannot_be_checked_raises_an_hourly_marker_after_the_grace(tmp_path, monkeypatch, capsys, make_failing):
+	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 900)
+	monkeypatch.setattr(rv, 'DISK_WAIT_REPEAT_SECONDS', 3600)
+	monkeypatch.setattr(rv, 'RESTORE_LOCK_UNCHECKED', {})
+	os.makedirs(tmp_path / 'state')
+	failing = [True]
+	make_failing(monkeypatch, failing)
+	def prune_at(now, job_name='job'):
+		capsys.readouterr()
+		assert rv.prune_oldest(OrderedDict(), job_name, clock=lambda: now) == (0, 0)
+		return alerting_lines(capsys.readouterr().out)
+	assert prune_at(0) == [] and prune_at(899) == []
+	markers = prune_at(900)
+	lock_path = rv.restore_lock_path('job')
+	assert len(markers) == 1 and f'reverberator job job FAILED: cannot check the restore lock {lock_path}: ' in markers[0]
+	error = os.strerror(errno.EACCES if make_failing is _unopenable_locks else errno.ENOLCK)
+	assert error in markers[0].partition(lock_path)[2] and markers[0].count('; pruning postponed') == 1
+	# tracked per job: another job's lock fails from now on
+	assert prune_at(900, 'other') == []
+	assert prune_at(1000) == [] and prune_at(1799, 'other') == [] and len(prune_at(1800, 'other')) == 1
+	assert prune_at(4499) == [] and len(prune_at(4500)) == 1
+	# checked again, the lock starts a new grace when it next fails
+	failing[0] = False
+	assert prune_at(5000) == []
+	failing[0] = True
+	assert prune_at(5001) == [] and prune_at(5900) == [] and len(prune_at(5901)) == 1

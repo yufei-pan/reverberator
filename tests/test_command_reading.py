@@ -174,6 +174,15 @@ def test_resolve_referenced_link(job):
 	assert got.kind == 'referenced'
 
 
+@pytest.mark.parametrize('typed', ['{root}/./monitor', '{root}//monitor/', '{root}/monitor/../monitor'])
+def test_resolve_referenced_link_for_a_monitored_path_kept_as_typed(job, typed):
+	# a rule keeps a monitored path that is missing as it was typed, as it cannot be resolved
+	paths = three_versions(job)
+	os.symlink(os.path.join(job.monitor, 'ref'), os.path.join(paths[2], 'ref'))
+	got = rv.resolve_version_entry(job.job_vault, paths[2], 'ref', typed.format(root=job.root))
+	assert got.kind == 'referenced'
+
+
 def test_resolve_chain_longer_than_the_kernel_limit(job):
 	# V1..V45 each link to the one below, as the daemon writes them: more than the 40 links the kernel follows
 	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp='2021-01-01_00-00-00_-0800')
