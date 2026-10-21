@@ -2525,6 +2525,7 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 			to_process.append(ChangeEvent(time.monotonic(), False, 'full_scan', monitor_path, None))
 			loaded_count += 1
 		for row in pending_rows_raw.values():
+			# the paths as pending_transaction_rows() wrote them
 			moved_from = row[4]
 			if moved_from == '':
 				moved_from = None
@@ -2532,8 +2533,8 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 				float(row[0]),
 				row[1] in (True, 'True', 'true', '1', 1),
 				row[2],
-				row[3],
-				moved_from
+				stored_name(row[3]),
+				None if moved_from is None else stored_name(moved_from)
 			))
 			loaded_count += 1
 		try:
@@ -3630,13 +3631,29 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 		backuperTeeLogToTl('convertor','\n'+multiCMD.pretty_format_table(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER))
 	return backup_entries
 
+def entry_row(path:str, values:'BackupEntryValues') -> list:
+	'''
+	The row a change list or the journal records the backup entry of path with. TSVZ writes a lone surrogate as '?', so
+	both paths are written as storable_name() gives them, which iter_change_list() turns back.
+
+	Examples:
+		>>> entry_row('/m/b\\udcff', BackupEntryValues('t', 'move', '/m/a')), entry_row('/m/c', BackupEntryValues('t', 'create', None))
+		(['/m/b\\U0010fe00\\U0010ffff', 't', 'move', '/m/a'], ['/m/c', 't', 'create', None])
+	'''
+	source = values.source_path
+	return [storable_name(path), values.iso_time, values.event, source if source is None else storable_name(source)]
+
+def log_to_journal(journal_path:str, at_path:str, event:str, source_path:str):
+	'''Add a row for one step of a backup to the journal, its paths as entry_row() writes them.'''
+	TSVZ.appendTabularFile(journal_path,[storable_name(at_path),datetime.datetime.now().isoformat(),event,storable_name(source_path)],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+
 def log_events_to_journal(backup_entries:dict,journal_path:str):
 	# this function will log the journal of the changes
 	# the journal will be a nsv file with the following fields:
 	# monotonic_time, event, type, path
 	# this will be used to recover the changes in the case of a crash
 	global tl
-	lines = [[path,entry.iso_time,entry.event,entry.source_path] for path,entry in backup_entries.items()]
+	lines = [entry_row(path,entry) for path,entry in backup_entries.items()]
 	TSVZ.appendLinesTabularFile(journal_path,lines,header = BACKUP_JOURNAL_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl)
 
 def backup_entries_to_change_events(backup_entries:dict) -> list:
@@ -3706,7 +3723,7 @@ def do_backup(backup_entries:dict,
 		walk_skip = skip_paused(skip,paused)
 		if log_journal:
 			journalPath = os.path.join(job_vault,'journal.tsv')
-			TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'start_reverb_backup_{len(backup_entries)}_enties',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+			log_to_journal(journalPath,monitor_path,f'start_reverb_backup_{len(backup_entries)}_enties',job_vault)
 		backuperTeeLogToTl(job_name,'-'* 60)
 		backuperTeeLogToTl(job_name,f'Backing up {monitor_path} to {job_vault}')
 		# NOTE: intentionally not holding BACKUP_SEMAPHORE here: the AsyncExecutors below
@@ -3729,7 +3746,7 @@ def do_backup(backup_entries:dict,
 			if keep_one_complete_backup:
 				backuperTeeLogToTl(job_name,f'Creating a complete backup of {monitor_path} to {backup_folder}',ok=True)
 				if log_journal:
-					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_complete_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+					log_to_journal(journalPath,monitor_path,'initial_complete_backup',backup_folder)
 				manifest.reset(backup_folder)
 				mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=not DEBUG)
 				pending = []
@@ -3760,7 +3777,7 @@ def do_backup(backup_entries:dict,
 			else:
 				backuperTeeLogToTl(job_name,f'Creating a referenced backup of {monitor_path} to {backup_folder}',ok=True)
 				if log_journal:
-					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),'initial_referenced_backup',backup_folder],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+					log_to_journal(journalPath,monitor_path,'initial_referenced_backup',backup_folder)
 				walk_errors = []
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
@@ -3787,7 +3804,7 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name,f'Inner mounts unmounted during the comparison, keeping their last backed-up contents: {", ".join(sorted(unmounted))}; dropped {dropped} backup entries')
 					paused = paused | unmounted
 				if log_journal:
-					TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'delta_generated_{len(backup_entries)}_differences',monitor_path],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+					log_to_journal(journalPath,monitor_path,f'delta_generated_{len(backup_entries)}_differences',monitor_path)
 					log_events_to_journal(backup_entries,journalPath)
 			elif paused:
 				# what the watcher saw in a paused folder before its disk went is compared when the disk is back
@@ -3862,7 +3879,7 @@ def do_backup(backup_entries:dict,
 		backup_size_str = format_bytes(this_size,use_1024_bytes=True,to_str=True).replace(' ','_')
 		backup_inode_str = format_bytes(this_inodes,use_1024_bytes=False,to_str=True).replace(' ','')
 		content_file_name = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
-		content_file_content = [[path] + list(values) for path,values in backup_entries.items()]
+		content_file_content = [entry_row(path,values) for path,values in backup_entries.items()]
 		# commit before the content file: without one the version is removed at startup, and a manifest
 		# describing a removed version is listed again from the vault
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
@@ -3881,7 +3898,7 @@ def do_backup(backup_entries:dict,
 		os.replace(temp_link,os.path.join(job_vault,'current_version'))
 		if log_journal:
 			tracked_files, tracked_folders = manifest.counts()
-			TSVZ.appendTabularFile(journalPath,[monitor_path,datetime.datetime.now().isoformat(),f'end_reverb_backup_{tracked_files}files_{tracked_folders}folders_tracked',job_vault],teeLogger=tl,header=BACKUP_JOURNAL_HEADER,createIfNotExist=True,verifyHeader=True,strict=False)
+			log_to_journal(journalPath,monitor_path,f'end_reverb_backup_{tracked_files}files_{tracked_folders}folders_tracked',job_vault)
 		return VaultInfo(vault_info_dict,vault_size,vault_inodes), manifest, True
 	except BaseException:
 		if opened_manifest:
@@ -3895,6 +3912,8 @@ def pending_transaction_rows(events) -> list:
 	Examples:
 		>>> [row[0] for row in pending_transaction_rows([ChangeEvent(5.0, False, 'create', '/m/a', None), ChangeEvent(5.0, False, 'create', '/m/b', None)])]
 		[5.0, 5.000001]
+		>>> pending_transaction_rows([ChangeEvent(1.0, False, 'move', '/m/b\\udcff', '/m/a')])[0][3:]
+		['/m/b\\U0010fe00\\U0010ffff', '/m/a']
 	'''
 	rows = []
 	last_time = None
@@ -3904,12 +3923,13 @@ def pending_transaction_rows(events) -> list:
 		if last_time is not None and event_time <= last_time:
 			event_time = last_time + 1e-6
 		last_time = event_time
+		# TSVZ writes a lone surrogate as '?': the paths go in as storable_name() gives them
 		rows.append([
 			event_time,
 			event.is_dir,
 			event.event,
-			event.path,
-			event.moved_from if event.moved_from is not None else ''
+			storable_name(event.path),
+			storable_name(event.moved_from) if event.moved_from is not None else ''
 		])
 	return rows
 
@@ -6512,7 +6532,8 @@ def iter_change_list(path:str):
 			fields = [unescape_change_list_field(field) for field in line.split('\0')]
 			fields += [''] * (4 - len(fields))
 			source = fields[3]
-			yield ChangeRow(fields[0], fields[1], fields[2], None if source in ('', 'None') else source)
+			# the paths as entry_row() wrote them; a list written before 0.40 holds no NAME_ESCAPE, so reads as it is
+			yield ChangeRow(stored_name(fields[0]), fields[1], fields[2], None if source in ('', 'None') else stored_name(source))
 
 # --- the commands: status here, history and restore behind the same front door ---
 
