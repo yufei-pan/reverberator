@@ -4664,14 +4664,66 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_forma
 			backuperTeeLogToTl(path='format_bytes',error=True,message="Invalid size: {size}")
 		return 0
 
+# a name os.fsdecode() gives with a lone surrogate for each byte that is not UTF-8 cannot go into sqlite or TSVZ as it
+# is: it is stored with each such byte as NAME_ESCAPE and one of U+10FF80..U+10FFFF, and NAME_ESCAPE itself doubled.
+# all of them are at the very end of Unicode, where names hardly go, and every UTF-8 name without NAME_ESCAPE is
+# stored as it is
+NAME_ESCAPE = '\U0010fe00'
+STORABLE_NAME_ESCAPES = re.compile(f'[{NAME_ESCAPE}\udc80-\udcff]')
+STORED_NAME_ESCAPES = re.compile(f'{NAME_ESCAPE}([{NAME_ESCAPE}\U0010ff80-\U0010ffff])')
+
+def storable_name(text:str) -> str:
+	'''
+	text, a name or path as os.fsdecode() gives it, as valid Unicode that stored_name() turns back into text exactly.
+	Each character is escaped on its own, so a folder's stored path starts every stored path under it.
+
+	Examples:
+		>>> storable_name('café'), storable_name('a/b/')
+		('café', 'a/b/')
+		>>> storable_name('bad\\udcff.txt') == 'bad' + NAME_ESCAPE + '\\U0010ffff' + '.txt'
+		True
+		>>> storable_name(NAME_ESCAPE) == NAME_ESCAPE * 2
+		True
+		>>> storable_name('d\\udcff/' + 'x\\udc80') == storable_name('d\\udcff/') + storable_name('x\\udc80')
+		True
+		>>> all(storable_name(os.fsdecode(bytes([byte]))).encode('utf-8') for byte in range(0x80, 0x100))
+		True
+	'''
+	if text.isascii():
+		return text
+	return STORABLE_NAME_ESCAPES.sub(lambda match: NAME_ESCAPE + (NAME_ESCAPE if match.group(0) == NAME_ESCAPE else chr(ord(match.group(0)) - 0xdc00 + 0x10ff00)), text)
+
+def stored_name(text:str) -> str:
+	'''
+	The name storable_name() gave text for, exactly. NAME_ESCAPE followed by anything else, which storable_name() never
+	writes, is kept as it is.
+
+	Examples:
+		>>> lookalike = 'x' + NAME_ESCAPE + '\\U0010ff80'
+		>>> stored_name(storable_name(lookalike)) == lookalike, stored_name(lookalike) == 'x\\udc80'
+		(True, True)
+		>>> names = [os.fsdecode(bytes([byte])) for byte in range(0x80, 0x100)]
+		>>> [stored_name(storable_name(name)) for name in names] == names
+		True
+		>>> stored_name('café'), stored_name(NAME_ESCAPE + 'a') == NAME_ESCAPE + 'a'
+		('café', True)
+	'''
+	if NAME_ESCAPE not in text:
+		return text
+	return STORED_NAME_ESCAPES.sub(lambda match: NAME_ESCAPE if match.group(1) == NAME_ESCAPE else chr(ord(match.group(1)) - 0x10ff00 + 0xdc00), text)
+
 def folder_range_end(folder:str) -> str:
 	'''
 	Smallest path sorting after every path under folder (which ends with /), to select a folder's rows as a range.
+	A folder's stored path (storable_name()) ends with / too, and bounds the stored paths under it.
 
 	Examples:
 		>>> folder_range_end('a/b/')
 		'a/b0'
 		>>> 'a/b/' < 'a/b/zz' < folder_range_end('a/b/') <= 'a/b0'
+		True
+		>>> folder = storable_name('d\\udcff/')
+		>>> folder < storable_name('d\\udcff/' + NAME_ESCAPE) < folder_range_end(folder) <= storable_name('d\\udcff0')
 		True
 	'''
 	return folder[:-1] + chr(ord(folder[-1]) + 1)
@@ -4686,6 +4738,9 @@ class VaultManifest:
 	version, before its changes commit. kind is d (folder), f (regular file), o (other file type), l (symlink, its
 	target in link) or r (a referenced backup's link to the monitored file itself). A file copied by a backup stays
 	unchecked until delta generation reads the copy back from the vault, as a crash can keep its bytes from the disk.
+	Paths and link targets are stored through storable_name() and read back through stored_name(), so a name that is
+	not UTF-8 is tracked like any other; rows sort by stored path, in which a folder still comes right before the paths
+	under it. copy_version, the number of the version holding a file's copy, is NULL when not known.
 
 	Examples:
 		>>> import tempfile
@@ -4703,7 +4758,7 @@ class VaultManifest:
 		...     reopened.close()
 		True ['d/'] ['c.txt', 'd/x.txt', 'd/y.txt']
 	'''
-	SCHEMA = '1'
+	SCHEMA = '2'
 	UNVERIFIED = 'kind = NULL, size = NULL, mtime_ns = NULL, mode = NULL, uid = NULL, gid = NULL, hash = NULL, link = NULL, unchecked = NULL, dirty = 0'
 
 	def __init__(self, job_vault:str):
@@ -4726,17 +4781,52 @@ class VaultManifest:
 		try:
 			self.conn.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID')
 			schema = self.conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
-			if schema is None or schema[0] != self.SCHEMA:
+			if schema is not None and schema[0] == '1':
+				self._upgrade()
+			elif schema is None or schema[0] != self.SCHEMA:
 				self.conn.execute('DROP TABLE IF EXISTS entries')
 				self.conn.execute('DELETE FROM meta')
 				self.conn.execute("INSERT INTO meta VALUES ('schema', ?)", (self.SCHEMA,))
+			# copy_version comes last, where upgrading a schema '1' database adds it
 			self.conn.execute('CREATE TABLE IF NOT EXISTS entries(path TEXT PRIMARY KEY, kind TEXT, size INTEGER, mtime_ns INTEGER, '
-				'mode INTEGER, uid INTEGER, gid INTEGER, hash TEXT, link TEXT, unchecked INTEGER, dirty INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID')
+				'mode INTEGER, uid INTEGER, gid INTEGER, hash TEXT, link TEXT, unchecked INTEGER, dirty INTEGER NOT NULL DEFAULT 0, '
+				'copy_version INTEGER) WITHOUT ROWID')
 			self.conn.execute('CREATE INDEX IF NOT EXISTS dirty_entries ON entries(path) WHERE dirty')
 			self.conn.execute('CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY) WITHOUT ROWID')
 		except BaseException:
 			self.conn.close()
 			raise
+
+	def _upgrade(self):
+		'''
+		Upgrade a schema '1' database in place, in one transaction: every row and what meta holds (the version described,
+		the skip list fingerprint, the inner mounts) stay, so no full comparison follows and nothing is read from the vault.
+		'''
+		try:
+			self.begin()
+			self._upgrade_from_schema_1()
+			self.commit()
+		except sqlite3.OperationalError as e:
+			# a locked, full or failing disk: closing the connection rolls the upgrade back, and the database stays at
+			# schema '1' for the job's next attempt instead of being discarded at the cost of a full comparison
+			raise JobFailure(f'cannot upgrade the vault database {self.path}: {e}') from e
+
+	def _upgrade_from_schema_1(self):
+		'''The statements upgrading a schema '1' database, in the transaction _upgrade() holds.'''
+		self.conn.execute('ALTER TABLE entries ADD COLUMN copy_version INTEGER')
+		# schema '1' stored names as they are: NAME_ESCAPE in one (rare, as it is a private use code point) is doubled to
+		# read back the same. the rows holding it move out and back in, as sqlite checks the key row by row, and a name
+		# doubled first can be another row's name until that one is doubled too
+		self.conn.execute('CREATE TEMP TABLE escaped AS SELECT * FROM entries WHERE instr(path, ?)', (NAME_ESCAPE,))
+		self.conn.execute('DELETE FROM entries WHERE path IN (SELECT path FROM temp.escaped)')
+		self.conn.execute('UPDATE temp.escaped SET path = replace(path, ?, ?)', (NAME_ESCAPE, NAME_ESCAPE * 2))
+		self.conn.execute('INSERT INTO entries SELECT * FROM temp.escaped')
+		self.conn.execute('DROP TABLE temp.escaped')
+		self.conn.execute('UPDATE entries SET link = replace(link, ?, ?) WHERE instr(link, ?)', (NAME_ESCAPE, NAME_ESCAPE * 2, NAME_ESCAPE))
+		# json.dumps() wrote the inner mounts in ASCII, NAME_ESCAPE as the \u escapes of its UTF-16 pair
+		escape = json.dumps(NAME_ESCAPE)[1:-1]
+		self.conn.execute("UPDATE meta SET value = replace(value, ?, ?) WHERE key = 'inner_mounts'", (escape, escape * 2))
+		self.conn.execute("UPDATE meta SET value = ? WHERE key = 'schema'", (self.SCHEMA,))
 
 	def close(self):
 		if self.conn is not None:
@@ -4776,11 +4866,11 @@ class VaultManifest:
 	def inner_mounts(self) -> list:
 		'''The inner mount points (folder rels ending with /) recorded with the last committed state, [] when never recorded.'''
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'inner_mounts'").fetchone()
-		return [] if row is None else json.loads(row[0])
+		return [] if row is None else [stored_name(rel) for rel in json.loads(row[0])]
 
 	def set_inner_mounts(self, rels:list):
 		'''Record the inner mount points (folder rels ending with /); the caller holds the transaction.'''
-		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('inner_mounts', ?)", (json.dumps(list(rels)),))
+		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('inner_mounts', ?)", (json.dumps([storable_name(rel) for rel in rels]),))
 
 	def describes(self, version_path:str) -> bool:
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
@@ -4796,7 +4886,7 @@ class VaultManifest:
 		self.reset(version_path)
 		batch = []
 		for _, rel, _ in iter_tree_entries(tree_path or version_path, skip=skip if tree_path else None, errors=errors):
-			batch.append((rel,))
+			batch.append((storable_name(rel),))
 			if len(batch) >= MANIFEST_BATCH_SIZE:
 				self.conn.executemany('INSERT OR REPLACE INTO entries(path) VALUES (?)', batch)
 				batch.clear()
@@ -4804,27 +4894,32 @@ class VaultManifest:
 
 	def lookup(self, rel:str):
 		'''The record for rel (all None when unverified), or None when rel is not tracked.'''
-		row = self.conn.execute('SELECT kind, size, mtime_ns, mode, uid, gid, hash, link, unchecked FROM entries WHERE path = ?', (rel,)).fetchone()
-		return None if row is None else ManifestRecord(*row)
+		row = self.conn.execute('SELECT kind, size, mtime_ns, mode, uid, gid, hash, link, unchecked FROM entries WHERE path = ?', (storable_name(rel),)).fetchone()
+		if row is None:
+			return None
+		record = ManifestRecord(*row)
+		return record if record.link is None else record._replace(link=stored_name(record.link))
 
 	def add(self, rel:str, dirty:bool = False):
 		'''Track rel without a record: dirty when this backup wrote it, so it is recorded before the backup commits.'''
-		self.conn.execute('INSERT OR REPLACE INTO entries(path, dirty) VALUES (?, ?)', (rel, int(dirty)))
+		self.conn.execute('INSERT OR REPLACE INTO entries(path, dirty) VALUES (?, ?)', (storable_name(rel), int(dirty)))
 
 	def discard(self, rel:str):
-		self.conn.execute('DELETE FROM entries WHERE path = ?', (rel,))
+		self.conn.execute('DELETE FROM entries WHERE path = ?', (storable_name(rel),))
 
 	def discard_many(self, rels):
-		self.conn.executemany('DELETE FROM entries WHERE path = ?', ((rel,) for rel in rels))
+		self.conn.executemany('DELETE FROM entries WHERE path = ?', ((storable_name(rel),) for rel in rels))
 
 	def remove_tree(self, folder:str):
 		'''Stop tracking folder and everything under it.'''
+		folder = storable_name(folder)
 		self.conn.execute('DELETE FROM entries WHERE path >= ? AND path < ?', (folder, folder_range_end(folder)))
 
 	def iter_under(self, folder:str):
 		'''Tracked paths strictly under folder (which ends with /), sorted.'''
+		folder = storable_name(folder)
 		for (path,) in self.conn.execute('SELECT path FROM entries WHERE path > ? AND path < ? ORDER BY path', (folder, folder_range_end(folder))):
-			yield path
+			yield stored_name(path)
 
 	def move_tree(self, src_folder:str, dst_folder:str):
 		'''
@@ -4837,8 +4932,10 @@ class VaultManifest:
 			return
 		self.remove_tree(dst_folder)
 		self.discard(dst_folder[:-1])
+		# substr() counts characters, as len() does on the stored path
+		src, dst = storable_name(src_folder), storable_name(dst_folder)
 		self.conn.execute(f'UPDATE entries SET path = ? || substr(path, ?), {self.UNVERIFIED} WHERE path >= ? AND path < ?',
-			(dst_folder, len(src_folder) + 1, src_folder, folder_range_end(src_folder)))
+			(dst, len(src) + 1, src, folder_range_end(src)))
 
 	def set_records(self, records):
 		'''Store (rel, record) pairs, leaving rel unverified where the record is None, and clear their dirty marks.'''
@@ -4846,24 +4943,26 @@ class VaultManifest:
 		recorded = []
 		for rel, record in records:
 			if record is None:
-				unverified.append((rel,))
+				unverified.append((storable_name(rel),))
 			else:
-				recorded.append((*record, rel))
+				if record.link is not None:
+					record = record._replace(link=storable_name(record.link))
+				recorded.append((*record, storable_name(rel)))
 		self.conn.executemany(f'UPDATE entries SET {self.UNVERIFIED} WHERE path = ?', unverified)
 		self.conn.executemany('UPDATE entries SET kind = ?, size = ?, mtime_ns = ?, mode = ?, uid = ?, gid = ?, hash = ?, link = ?, '
 			'unchecked = ?, dirty = 0 WHERE path = ?', recorded)
 
 	def take_dirty(self, limit:int) -> list:
-		return [rel for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty LIMIT ?', (limit,))]
+		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty LIMIT ?', (limit,))]
 
 	def iter_folders(self):
 		# sorted, so every folder comes before the folders inside it
 		for (rel,) in self.conn.execute("SELECT path FROM entries WHERE substr(path, -1) = '/' ORDER BY path"):
-			yield rel
+			yield stored_name(rel)
 
 	def iter_files(self):
 		for (rel,) in self.conn.execute("SELECT path FROM entries WHERE substr(path, -1) != '/' ORDER BY path"):
-			yield rel
+			yield stored_name(rel)
 
 	@property
 	def folders(self) -> list:
@@ -4882,19 +4981,21 @@ class VaultManifest:
 		self.conn.execute('DELETE FROM temp.seen')
 
 	def mark_seen(self, rels):
-		self.conn.executemany('INSERT OR IGNORE INTO temp.seen VALUES (?)', ((rel,) for rel in rels))
+		self.conn.executemany('INSERT OR IGNORE INTO temp.seen VALUES (?)', ((storable_name(rel),) for rel in rels))
 
 	def mark_seen_under(self, folder:str):
 		'''Mark every tracked row strictly under folder (which ends with /) seen: a folder that could not be read keeps its entries.'''
+		folder = storable_name(folder)
 		self.conn.execute('INSERT OR IGNORE INTO temp.seen SELECT path FROM entries WHERE path > ? AND path < ?', (folder, folder_range_end(folder)))
 
 	def unseen(self) -> list:
 		'''Tracked paths not marked seen since clear_seen().'''
-		return [rel for (rel,) in self.conn.execute('SELECT path FROM entries WHERE path NOT IN (SELECT path FROM temp.seen) ORDER BY path')]
+		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE path NOT IN (SELECT path FROM temp.seen) ORDER BY path')]
 
 	def unseen_under(self, folder:str) -> list:
 		'''Tracked paths at or under folder (which ends with /) not marked seen since clear_seen().'''
-		return [rel for (rel,) in self.conn.execute('SELECT path FROM entries WHERE path >= ? AND path < ? AND path NOT IN (SELECT path FROM temp.seen) ORDER BY path',
+		folder = storable_name(folder)
+		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE path >= ? AND path < ? AND path NOT IN (SELECT path FROM temp.seen) ORDER BY path',
 			(folder, folder_range_end(folder)))]
 
 	def prefetch(self):
