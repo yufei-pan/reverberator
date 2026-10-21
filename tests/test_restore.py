@@ -488,6 +488,9 @@ def test_restore_failure_reasons():
 def test_restore_folder_target_made_exclusively_and_private(job, tmp_path, capsys, monkeypatch):
 	seed_monitor(job, {'proj/a.txt': 'a', 'proj/sub/b.txt': 'b'})
 	os.chmod(f'{job.monitor}/proj', 0o751)
+	if os.geteuid() == 0:
+		# handed to another user only once everything else about it is set
+		os.chown(f'{job.monitor}/proj', 65534, 65534)
 	run_backup(job)
 	write_rule(job)
 	held = os.stat(os.path.join(version_path(job, 0), 'proj'))
@@ -598,3 +601,80 @@ def test_restore_refuses_a_destination_others_could_change(job, tmp_path, capsys
 	assert restore(tmp_path, capsys, path, out, '--version', '1')[0] == 0
 	assert tree(out) == {'a.txt': 'v1'}
 	assert rv.unsafe_folder_on_path('/') is None
+
+
+def test_restore_writes_only_into_the_destination_as_checked(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'proj/a.txt': 'a'})
+	run_backup(job)
+	write_rule(job)
+	first, second = destination(tmp_path, 'first'), destination(tmp_path, 'second')
+	link = str(tmp_path / 'link')
+	restore_entry = rv.restore_entry
+
+	def repointing(*args, **kwargs):
+		# the typed path leads elsewhere once every check is done
+		os.remove(link)
+		os.symlink(second, link)
+		return restore_entry(*args, **kwargs)
+	monkeypatch.setattr(rv, 'restore_entry', repointing)
+	for path, name in ((f'{job.monitor}/proj', 'proj'), (f'{job.monitor}/proj/a.txt', 'a.txt')):
+		if os.path.lexists(link):
+			os.remove(link)
+		os.symlink(first, link)
+		code, stdout, err = restore(tmp_path, capsys, path, link, '--version', '0')
+		assert (code, err) == (0, ''), path
+		assert stdout.startswith('Restored ') and stdout.rstrip('\n').endswith(f' to {first}/{name}')
+	assert tree(first) == {'proj/': None, 'proj/a.txt': 'a', 'a.txt': 'a'}
+	assert os.listdir(second) == []
+	monkeypatch.setattr(rv, 'restore_entry', restore_entry)
+	# <another user's folder>/<link>/.. is where the link leads, up one: never the other user's folder itself
+	eve = tmp_path / 'eve'
+	eve.mkdir()
+	inner = tmp_path / 'safe' / 'inner'
+	inner.mkdir(parents=True)
+	os.symlink(inner, eve / 'link')
+	if os.geteuid() == 0:
+		os.chown(eve, 65534, 65534)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj/a.txt', f'{eve}/link/..', '--version', '0')
+	assert (code, err) == (0, '')
+	assert os.listdir(eve) == ['link']
+	assert tree(tmp_path / 'safe') == {'inner/': None, 'a.txt': 'a'}
+
+
+def test_restore_folder_meta_hands_the_folder_over_last(tmp_path, monkeypatch):
+	source, dest = tmp_path / 'source', tmp_path / 'dest'
+	source.mkdir()
+	dest.mkdir()
+	os.chmod(source, 0o2751)
+	try:
+		os.setxattr(source, 'user.note', b'kept')
+		xattrs = True
+	except OSError:
+		xattrs = False
+	if os.geteuid() == 0:
+		os.chown(source, 65534, 65534)
+	os.utime(source, ns=(1_600_000_000_123_456_789, 1_600_000_000_123_456_789))
+	calls = []
+
+	def recording(name, real):
+		return lambda target, *args, **kwargs: calls.append((name, target)) or real(target, *args, **kwargs)
+	for name in ('chmod', 'utime', 'chown', 'setxattr'):
+		monkeypatch.setattr(os, name, recording(name, getattr(os, name)))
+	assert rv.restore_folder_meta(str(source), str(dest)) is True
+	monkeypatch.undo()
+	# all on the folder as opened, never by its path, and the owner handed over last
+	assert calls and all(isinstance(target, int) for _, target in calls)
+	names = [name for name, _ in calls]
+	assert names[-1] == 'chown' and names.count('chown') == 1 and names.index('utime') < names.index('chown')
+	st, held = os.lstat(dest), os.lstat(source)
+	assert (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_mtime_ns) == (stat.S_IMODE(held.st_mode), held.st_uid, held.st_gid, held.st_mtime_ns)
+	if xattrs:
+		assert os.getxattr(dest, 'user.note') == b'kept'
+	# a symlink in the folder's place is not followed
+	elsewhere = tmp_path / 'elsewhere'
+	elsewhere.mkdir()
+	before = os.lstat(elsewhere)
+	os.symlink(elsewhere, tmp_path / 'swapped')
+	assert rv.restore_folder_meta(str(source), str(tmp_path / 'swapped')) is False
+	after = os.lstat(elsewhere)
+	assert (after.st_mode, after.st_uid, after.st_mtime_ns) == (before.st_mode, before.st_uid, before.st_mtime_ns)

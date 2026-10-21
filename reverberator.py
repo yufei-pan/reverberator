@@ -7089,6 +7089,41 @@ def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
 	# a folder where the walk found a link
 	return f'a vault link to a folder: {resolved.path}'
 
+def restore_folder_meta(source:str, dest:str) -> bool:
+	'''
+	Give dest, a folder a restore made, the vault folder source's extended attributes, mode and times, then its owner
+	as the very last step. All of it is done on dest as opened, not followed if it is a symlink: once another user owns
+	the folder they could rename it and put a symlink in its place, and nothing may reach through that. False when any
+	of it could not be done. (copy_file_meta() works by path, as the daemon's vault is no other user's to change.)
+	'''
+	try:
+		held = os.lstat(source)
+		fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+	except OSError:
+		return False
+	try:
+		try:
+			names = os.listxattr(source, follow_symlinks=False)
+		except OSError as e:
+			if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
+				raise
+			names = []
+		for name in names:
+			try:
+				os.setxattr(fd, name, os.getxattr(source, name, follow_symlinks=False))
+			except OSError as e:
+				# what copystat() lets go too: an attribute this filesystem or user cannot set
+				if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
+					raise
+		os.chmod(fd, stat.S_IMODE(held.st_mode))
+		os.utime(fd, ns=(held.st_atime_ns, held.st_mtime_ns))
+		os.chown(fd, held.st_uid, held.st_gid)
+		return True
+	except OSError:
+		return False
+	finally:
+		os.close(fd)
+
 def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False) -> None:
 	'''
 	Copy what version holds at rel ('' for the monitored path) to target, filling report in. Nothing in the vault is
@@ -7190,7 +7225,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			if dest == target and report.failures:
 				report.left_private = True
 				continue
-			if not copy_file_meta(source, dest):
+			if not restore_folder_meta(source, dest):
 				report.warnings.append((entry_rel, 'restored without all of its metadata'))
 	finally:
 		try:
@@ -7236,18 +7271,20 @@ def target_exists(target:str) -> CommandError:
 
 def restore_target(rules:list, dest:str, rel:str, monitor_path:str) -> str:
 	'''
-	Where restoring rel into the folder dest puts it: dest/<its name>, the monitored path's own name for the whole job.
-	A CommandError when dest is not a folder, when another user could change a folder on the way to it
-	(unsafe_folder_on_path()), when that lies inside any job's vault (through symlinks too), or when something is
-	already there.
+	Where restoring rel into the folder dest puts it: dest/<its name>, the monitored path's own name for the whole job,
+	built on dest with its symlinks resolved, the folder every check is made on. A CommandError when dest is not a
+	folder, when another user could change a folder on the way to it (unsafe_folder_on_path()), when that lies inside
+	any job's vault, or when something is already there.
 	'''
+	# a symlink on the way could be pointed elsewhere after the checks: only the folder found now is used
+	dest = os.path.realpath(dest)
 	if not os.path.isdir(dest):
 		raise CommandError(f'{dest} is not a folder: give an existing folder to restore into')
 	unsafe = unsafe_folder_on_path(dest)
 	if unsafe is not None:
 		# the copies are written by path: one who can rename a folder on the way could send them anywhere
 		raise CommandError(f'Not restoring into {dest}: another user can change {unsafe}; pick a destination only you (or root) can write to')
-	target = os.path.join(os.path.abspath(dest), os.path.basename(rel) or os.path.basename(monitor_path.rstrip('/')))
+	target = os.path.join(dest, os.path.basename(rel) or os.path.basename(monitor_path.rstrip('/')))
 	for rule in rules:
 		if is_subpath(target, rule.vault_path):
 			raise CommandError(f'{target} is inside the vault {rule.vault_path}: restore somewhere else')
@@ -7268,6 +7305,8 @@ def restore_command(args) -> int:
 		raise CommandError('Give the folder to restore into')
 	if args.threads is None or args.threads < 1:
 		raise CommandError('--threads must be at least 1')
+	# resolved once: the typed path is not looked at again, whatever its symlinks point to later
+	dest = os.path.realpath(args.dest)
 	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
 	rules = load_command_rules(rule_path)
 	rule, rel = find_job(rules, args.path, args.job)
@@ -7281,7 +7320,7 @@ def restore_command(args) -> int:
 			if kind is None:
 				raise CommandError(never_backed_up(rule, rule_path, rel))
 			# refused before a version is picked, and again once one is, as picking can take a while
-			restore_target(rules, args.dest, rel, rule.mon_path)
+			restore_target(rules, dest, rel, rule.mon_path)
 			holds = lambda version: resolve_version_entry(job_vault, version.path, rel, rule.mon_path).kind != 'missing'
 			# only the picker shows them, and for a whole job they come from every change list
 			picking = args.version is None and args.at is None and sys.stdin is not None and sys.stdin.isatty()
@@ -7289,7 +7328,7 @@ def restore_command(args) -> int:
 			version = choose_version(candidates, versions, holds, args.version, args.at, sys.stdin, sys.stdout)
 		except OSError as e:
 			raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
-		target = restore_target(rules, args.dest, rel, rule.mon_path)
+		target = restore_target(rules, dest, rel, rule.mon_path)
 		report = RestoreReport()
 		try:
 			restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report)
