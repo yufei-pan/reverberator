@@ -962,6 +962,11 @@ RESTORE_PROGRESS_LINE_SECONDS = 60
 RESTORE_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 RESTORE_STOP = threading.Event()
 RESTORE_WAIT_SECONDS = 0.1
+# a restore's summary repeats this many of its failures, and of its warnings: each was written as it happened
+RESTORE_SUMMARY_LINES = 20
+# the entries a restore's marker names as kept without all of their metadata: at most this many, and this many bytes of them
+RESTORE_MARKER_UNSET_LIMIT = 1000
+RESTORE_MARKER_UNSET_BYTES = 1 << 20
 # what cp says when a copy's contents arrived but some of its metadata could not be kept
 COPY_METADATA_FAILURES = ('failed to preserve ownership', 'failed to preserve authorship', 'preserving permissions for',
 	'preserving times for', 'setting permissions for', 'setting attribute', 'getting attribute', 'listing attributes',
@@ -6278,9 +6283,10 @@ class RestoreLock:
 	Held while a command reads old versions of a job: the daemon keeps backing up but postpones removing the oldest
 	version meanwhile. A shared flock, so it goes with the process and a killed restore never leaves it behind.
 	'''
-	def __init__(self, job_name:str, state_dir:str = None, stream = sys.stderr):
+	def __init__(self, job_name:str, state_dir:str = None, stream = None):
 		self.job_name = job_name
 		self.state_dir = state_dir
+		# None: sys.stderr as it is when the lock is taken, not as it was at import
 		self.stream = stream
 		self.fd = None
 
@@ -6292,7 +6298,7 @@ class RestoreLock:
 			try:
 				fcntl.flock(self.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
 			except BlockingIOError:
-				print(f'Waiting for reverberator to finish removing an old version of {self.job_name}', file=self.stream, flush=True)
+				print(f'Waiting for reverberator to finish removing an old version of {self.job_name}', file=sys.stderr if self.stream is None else self.stream, flush=True)
 				fcntl.flock(self.fd, fcntl.LOCK_SH)
 		except BaseException:
 			os.close(self.fd)
@@ -7496,7 +7502,7 @@ def never_backed_up(rule:ReverbRule, rule_path:str, rel:str, typed_folder:bool =
 @contextlib.contextmanager
 def command_restore_lock(job_name:str, state_dir:str = None):
 	'''Hold job_name's RestoreLock for a command; a lock it cannot take is a CommandError, not a traceback.'''
-	lock = RestoreLock(job_name, state_dir, stream=sys.stderr)
+	lock = RestoreLock(job_name, state_dir)
 	try:
 		lock.__enter__()
 	except OSError as e:
@@ -7608,17 +7614,18 @@ def restore_candidates(job_vault:str, versions:list, monitor_path:str, rel:str, 
 		rows = file_history(job_vault, versions, monitor_path, rel)
 	return [row for row in rows if row.event not in ('delete', 'moved_away')]
 
-def choose_version(candidates:list, versions:list, holds, version:int = None, at:str = None, stdin = None, stdout = None) -> KeptVersion:
+def choose_version(candidates:list, versions:list, holds, version:int = None, at:str = None, stdin = None, stderr = None) -> KeptVersion:
 	'''
 	The kept version (of versions, oldest first) to restore from, holds(KeptVersion) saying whether a version holds the
 	path: number version; else the newest from at or before the time at; else the only one of candidates (as
-	restore_candidates() gives them), named on stdout; else the one the user picks from a numbered list of them, asked
-	on stdin, which must be a terminal. A version not kept or not holding the path, no version at or before at and no
+	restore_candidates() gives them), named on stderr; else the one the user picks from a numbered list of them, asked
+	on stdin, which must be a terminal. The list and the question go to stderr, which stays on the terminal when the
+	restore's own output is redirected. A version not kept or not holding the path, no version at or before at and no
 	terminal to ask on are CommandErrors; a pick cancelled with q (or the end of stdin) is one with EXIT_COMMAND_FAILED.
-	stdin and stdout are sys.stdin and sys.stdout unless given.
+	stdin and stderr are sys.stdin and sys.stderr unless given.
 	'''
 	stdin = sys.stdin if stdin is None else stdin
-	stdout = sys.stdout if stdout is None else stdout
+	stderr = sys.stderr if stderr is None else stderr
 	holding = lambda: version_ranges(kept.number for kept in versions if holds(kept))
 	if version is not None and at is not None:
 		raise CommandError('Give --version or --at, not both')
@@ -7642,14 +7649,14 @@ def choose_version(candidates:list, versions:list, holds, version:int = None, at
 	# a folder's rows count what changed under it
 	kind = 'file' if candidates[0].counts is None else 'folder'
 	if len(candidates) == 1:
-		print(f'Restoring the one version that differs: {format_history_row(candidates[0], kind)}', file=stdout)
+		print(f'Restoring the one version that differs: {format_history_row(candidates[0], kind)}', file=stderr)
 		return candidates[0].version
 	width = len(str(len(candidates)))
-	print('The versions that differ, newest first:', file=stdout)
+	print('The versions that differ, newest first:', file=stderr)
 	for number, row in enumerate(candidates, 1):
-		print(f'  {number:>{width}}  {format_history_row(row, kind)}', file=stdout)
+		print(f'  {number:>{width}}  {format_history_row(row, kind)}', file=stderr)
 	while True:
-		print(f'Restore which version? [1-{len(candidates)}, q to cancel] ', end='', file=stdout, flush=True)
+		print(f'Restore which version? [1-{len(candidates)}, q to cancel] ', end='', file=stderr, flush=True)
 		answer = stdin.readline()
 		# nothing at all is the end of stdin, unlike an empty line
 		if not answer or answer.strip().lower() == 'q':
@@ -7660,7 +7667,7 @@ def choose_version(candidates:list, versions:list, holds, version:int = None, at
 			number = 0
 		if 1 <= number <= len(candidates):
 			return candidates[number - 1].version
-		print(f'Enter a number from 1 to {len(candidates)}, or q to cancel', file=stdout)
+		print(f'Enter a number from 1 to {len(candidates)}, or q to cancel', file=stderr)
 
 def unfinished_note(target:str) -> str:
 	'''What a folder restore that did not complete leaves at target until it is run again, with or without --accept.'''
@@ -7670,9 +7677,11 @@ def unfinished_note(target:str) -> str:
 class RestoreReport:
 	'''
 	What a restore did: the entries it restored and their bytes, the entries it kept as an earlier run had restored them,
-	and failures and warnings as (path below the monitored path, reason). restore_entry() fills in the version, the
-	path and the target it restores, the marker of a folder target while it is there, and whether it left a folder
-	target private as not everything was restored.
+	and failures and warnings as (path below the monitored path, reason). Each is written to stderr by fail() and warn()
+	as it happens, and counted; only the first RESTORE_SUMMARY_LINES of each are kept, for the summary, as a restore of
+	a damaged vault can have hundreds of thousands. restore_entry() fills in the version, the path and the target it
+	restores, the marker of a folder target while it is there, and whether it left a folder target private as not
+	everything was restored.
 	'''
 	def __init__(self):
 		self.version = None
@@ -7683,7 +7692,11 @@ class RestoreReport:
 		self.kept = 0
 		self.bytes = 0
 		self.failures = []
+		self.failed = 0
 		self.warnings = []
+		self.warned = 0
+		# the entries (rels, in the order they came) kept or restored without all of their metadata, as far as a marker records
+		self.unset = {}
 		self.left_private = False
 		# with --accept: kept as it was, and how many folders it handed to their owners
 		self.accepted = False
@@ -7691,6 +7704,38 @@ class RestoreReport:
 		# the first line comes a period after the start, so a quick restore writes none
 		self.progress_at = time.monotonic()
 		self.progress_width = 0
+		# set once a write of the progress fails (a closed pipe, a hung-up terminal): it is not tried again
+		self.progress_failed = False
+
+	def note(self, word:str, rel:str, reason:str) -> None:
+		'''Write the line "word rel: reason" on stderr now, starting a line of its own where a progress line is being rewritten.'''
+		try:
+			if self.progress_width and sys.stderr.isatty():
+				sys.stderr.write('\r' + ' ' * self.progress_width + '\r')
+			sys.stderr.write(shown(f'{word} {rel or "."}: {reason}') + '\n')
+			sys.stderr.flush()
+		except (OSError, ValueError):
+			# nowhere to write it: the summary has the first of them
+			pass
+
+	def fail(self, rel:str, reason:str) -> None:
+		'''Record that rel was not restored, and say so now.'''
+		self.failed += 1
+		if len(self.failures) < RESTORE_SUMMARY_LINES:
+			self.failures.append((rel, reason))
+		self.note('FAILED', rel, reason)
+
+	def warn(self, rel:str, reason:str) -> None:
+		'''Record a warning about rel, and say so now.'''
+		self.warned += 1
+		if len(self.warnings) < RESTORE_SUMMARY_LINES:
+			self.warnings.append((rel, reason))
+		self.note('WARNING', rel, reason)
+
+	def note_unset(self, rel:str) -> None:
+		'''Remember rel as an entry without all of its metadata, for the marker, up to RESTORE_MARKER_UNSET_LIMIT of them.'''
+		if len(self.unset) < RESTORE_MARKER_UNSET_LIMIT:
+			self.unset[rel] = None
 
 	def entry_rel(self, path:str) -> str:
 		'''The path below the monitored path that path, in the target, restores.'''
@@ -7704,6 +7749,8 @@ class RestoreReport:
 		Write the progress line on stream: rewritten in place on a terminal, at most every RESTORE_PROGRESS_TERMINAL_SECONDS,
 		and a line every RESTORE_PROGRESS_LINE_SECONDS anywhere else. done ends a terminal's line once the restore is over.
 		'''
+		if self.progress_failed:
+			return
 		terminal = stream.isatty()
 		if done and not (terminal and self.progress_width):
 			return
@@ -7712,13 +7759,17 @@ class RestoreReport:
 			return
 		self.progress_at = now
 		line = f'restored {self.restored} entries, {show_size(self.bytes)}'
-		if terminal:
-			# padded over what a longer line before it left
-			stream.write('\r' + line.ljust(self.progress_width) + ('\n' if done else ''))
-			self.progress_width = max(self.progress_width, len(line))
-		else:
-			stream.write(line + '\n')
-		stream.flush()
+		try:
+			if terminal:
+				# padded over what a longer line before it left
+				stream.write('\r' + line.ljust(self.progress_width) + ('\n' if done else ''))
+				self.progress_width = max(self.progress_width, len(line))
+			else:
+				stream.write(line + '\n')
+			stream.flush()
+		except (OSError, ValueError):
+			# a broken pipe, or EIO once the terminal hung up: the restore carries on without progress lines
+			self.progress_failed = True
 
 	def summary(self) -> str:
 		'''What was restored, from which version to where, then each entry restored without all of its metadata and each one not restored.'''
@@ -7732,9 +7783,13 @@ class RestoreReport:
 				head += f', keeping {self.kept} already there'
 		lines = [head]
 		lines += [f'WARNING {rel or "."}: {reason}' for rel, reason in self.warnings]
+		if self.warned > len(self.warnings):
+			lines.append(f'{self.warned - len(self.warnings)} more warnings: shown above as they happened')
 		lines += [f'FAILED {rel or "."}: {reason}' for rel, reason in self.failures]
-		if self.failures and self.marker is not None:
-			lines.append(f'{len(self.failures)} failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {unfinished_note(self.target)}')
+		if self.failed > len(self.failures):
+			lines.append(f'{self.failed - len(self.failures)} more failed: shown above as they happened')
+		if self.failed and self.marker is not None:
+			lines.append(f'{self.failed} failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {unfinished_note(self.target)}')
 		elif self.left_private:
 			lines.append(f'Left {self.target} private (mode 0700), as not everything was restored')
 		# the paths, details and cp's messages can quote monitored names
@@ -7776,7 +7831,8 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 			succeeded = copy.task.returncode == 0
 			temp_name = os.path.basename(copy.temp_path)
 			if not succeeded and lines and all(copy_metadata_failure(line, temp_name) for line in lines) and os.path.lexists(copy.temp_path):
-				report.warnings.append((rel, f'copied without all of its metadata: {error}'))
+				report.warn(rel, f'copied without all of its metadata: {error}')
+				report.note_unset(rel)
 				succeeded = True
 			if succeeded:
 				try:
@@ -7800,7 +7856,7 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 					# the contents restored: a symlink's text is no file's
 					report.bytes += st.st_size
 			else:
-				report.failures.append((rel, error or f'cp exited with {copy.task.returncode}'))
+				report.fail(rel, error or f'cp exited with {copy.task.returncode}')
 				discard_copies([copy])
 			done += 1
 	finally:
@@ -7825,18 +7881,19 @@ def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
 	# a folder where the walk found a link
 	return f'a vault link to a folder: {resolved.path}'
 
-def restore_folder_meta(source:str, dest:str) -> bool:
+def restore_folder_meta(source:str, dest:str):
 	'''
 	Give dest, a folder a restore made, the vault folder source's extended attributes, mode and times, then its owner
 	as the very last step. All of it is done on dest as opened, not followed if it is a symlink: once another user owns
-	the folder they could rename it and put a symlink in its place, and nothing may reach through that. False when any
-	of it could not be done. (copy_file_meta() works by path, as the daemon's vault is no other user's to change.)
+	the folder they could rename it and put a symlink in its place, and nothing may reach through that. None once all
+	of it is done, else the error that stopped it, for the warning. (copy_file_meta() works by path, as the daemon's
+	vault is no other user's to change.)
 	'''
 	try:
 		held = os.lstat(source)
 		fd = os.open(dest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-	except OSError:
-		return False
+	except OSError as e:
+		return str(e)
 	try:
 		try:
 			names = os.listxattr(source, follow_symlinks=False)
@@ -7854,15 +7911,16 @@ def restore_folder_meta(source:str, dest:str) -> bool:
 		os.chmod(fd, stat.S_IMODE(held.st_mode))
 		os.utime(fd, ns=(held.st_atime_ns, held.st_mtime_ns))
 		os.chown(fd, held.st_uid, held.st_gid)
-		return True
-	except OSError:
-		return False
+		return None
+	except OSError as e:
+		return str(e)
 	finally:
 		os.close(fd)
 
 def read_restore_marker(target:str):
 	'''
-	What the marker of an unfinished folder restore at the top of target holds, {"job", "path", "version"}; None when
+	What the marker of an unfinished folder restore at the top of target holds, {"job", "path", "version"} and, when
+	it names any, "unset": the rels of the entries kept without all of their metadata; None when
 	target is not a folder (a symlink to one is not) or holds no marker. Picking a marker up lets a restore write into
 	the folder, so only one this user wrote counts: a marker in a folder another user owns or can write to, one that is
 	not a regular file of this user's, or one that cannot be read is a CommandError saying what was found.
@@ -7900,8 +7958,8 @@ def read_restore_marker(target:str):
 			opened = os.fstat(fd)
 			if (opened.st_dev, opened.st_ino) != (held.st_dev, held.st_ino):
 				raise ValueError('it was replaced while being read')
-			# a marker is a short line: more than this is no marker
-			data = os.read(fd, 1 << 16)
+			# a marker is a short line, and a long list of rels: more than this is no marker
+			data = os.read(fd, RESTORE_MARKER_UNSET_BYTES + (1 << 16))
 		finally:
 			os.close(fd)
 		record = json.loads(data.decode('utf-8'))
@@ -7909,18 +7967,34 @@ def read_restore_marker(target:str):
 		raise unreadable(e)
 	if not isinstance(record, dict) or not all(isinstance(record.get(key), str) for key in ('job', 'path', 'version')):
 		raise unreadable('it does not name a job, a path and a version')
-	return {key: record[key] for key in ('job', 'path', 'version')}
+	found = {key: record[key] for key in ('job', 'path', 'version')}
+	if 'unset' in record:
+		if not isinstance(record['unset'], list) or not all(isinstance(rel, str) for rel in record['unset']):
+			raise unreadable('its list of entries without all of their metadata is not a list of paths')
+		found['unset'] = record['unset']
+	return found
 
-def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion) -> str:
+def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion, unset:list = ()) -> str:
 	'''
 	Mark target, the folder a restore of rel of job_name from version writes into, as its own unfinished output, and
 	return the marker's path. It is written under a partial name, readable by this user alone, and renamed into place,
-	so the marker is there whole or not at all.
+	so the marker is there whole or not at all. unset, the rels of the entries kept without all of their metadata, is
+	written as far as RESTORE_MARKER_UNSET_LIMIT of them and RESTORE_MARKER_UNSET_BYTES go; written again, the marker
+	replaces the one before.
 	'''
 	marker = os.path.join(target, RESTORE_MARKER_NAME)
 	temp = partial_copy_path(marker)
 	# ASCII, a name that is not UTF-8 included
-	data = json.dumps({'job': job_name, 'path': rel, 'version': version.name}).encode('ascii')
+	record = {'job': job_name, 'path': rel, 'version': version.name}
+	listed, size = [], 0
+	for entry in unset:
+		size += len(json.dumps(entry)) + 2
+		if len(listed) >= RESTORE_MARKER_UNSET_LIMIT or size > RESTORE_MARKER_UNSET_BYTES:
+			break
+		listed.append(entry)
+	if listed:
+		record['unset'] = listed
+	data = json.dumps(record).encode('ascii')
 	fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
 	try:
 		with os.fdopen(fd, 'wb') as f:
@@ -7981,14 +8055,26 @@ def folder_refusal(st:os.stat_result):
 		return f'the folder in its place belongs to uid {st.st_uid}'
 	return None
 
+def extended_attributes(path:str) -> dict:
+	'''The extended attributes of path itself (a symlink is not followed) as name -> value, without the SELinux label, which the policy gives a new file whatever the copy says.'''
+	try:
+		names = os.listxattr(path, follow_symlinks=False)
+	except OSError as e:
+		if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
+			raise
+		return {}
+	return {name: os.getxattr(path, name, follow_symlinks=False) for name in names if name != 'security.selinux'}
+
 def already_restored(source:str, dest:str) -> bool:
 	'''
 	Whether dest is what restoring source, a vault file or a user's symlink, leaves: a regular file, or a symlink with
-	source's text, of source's type and mode, size, mtime and owner. Neither is followed.
+	source's text, of source's type and mode, size, mtime, owner and extended attributes. Neither is followed.
 	'''
 	try:
 		held, there = os.lstat(source), os.lstat(dest)
 		if (there.st_mode, there.st_size, there.st_mtime_ns, there.st_uid, there.st_gid) != (held.st_mode, held.st_size, held.st_mtime_ns, held.st_uid, held.st_gid):
+			return False
+		if extended_attributes(source) != extended_attributes(dest):
 			return False
 		if stat.S_ISLNK(held.st_mode):
 			return os.readlink(source) == os.readlink(dest)
@@ -8016,7 +8102,7 @@ def lock_restore_target(fd:int, target:str):
 	try:
 		fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 	except BlockingIOError:
-		raise CommandError(f'{target}: another run of this restore is under way; let it finish first')
+		raise CommandError(f'{target}: another run of this restore, or another program, holds a lock on it; let that finish first')
 	except OSError:
 		pass
 
@@ -8041,7 +8127,7 @@ def claim_restore_target(target:str) -> int:
 		raise
 	return fd
 
-def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None) -> None:
+def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None, marked:bool = False) -> None:
 	'''
 	Copy what version holds at rel ('' for the monitored path) to target, filling report in. Nothing in the vault is
 	written: it is only read from.
@@ -8061,7 +8147,10 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	OSError is a failure of that entry alone; so is a folder whose place holds a symlink, something else or another
 	user's folder, which is left as it is and never written through: nothing in it is restored. With resume, an entry
 	already there as restoring it leaves it (already_restored()) is kept, anything else in its place is replaced by a
-	copy, and partial files a killed run left are removed. However the restore ends, no partial file is left in target:
+	copy, and partial files a killed run left are removed. With marked, the folder target was found holding this
+	restore's marker: it is read again once the target is locked, and a CommandError when it has gone meanwhile; the
+	entries it names as kept without all of their metadata come back as warnings when they are kept again, and the
+	marker a run leaves names those it knows of (RESTORE_MARKER_UNSET_LIMIT at most). However the restore ends, no partial file is left in target:
 	a RESTORE_STOP_SIGNALS signal stops it, as a KeyboardInterrupt, once its copies can be stopped.
 	'''
 	report.version, report.rel, report.target = version, rel, target
@@ -8073,6 +8162,9 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	folders = []
 	# the folder target's fd, holding the lock that keeps another run of this restore out until this one is done
 	lock = None
+	# what an earlier run's marker names as kept without all of its metadata, less what this run has met again
+	earlier = {}
+	written = []
 
 	def check_stop():
 		if RESTORE_STOP.is_set():
@@ -8080,7 +8172,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 
 	def finish_batch():
 		while mcae.runningThreads:
-			mcae.wait(timeout=RESTORE_WAIT_SECONDS)
+			# the executor may give each thread that long, so one check never waits much more than RESTORE_WAIT_SECONDS
+			mcae.wait(timeout=RESTORE_WAIT_SECONDS / max(1, len(mcae.runningThreads)))
 			check_stop()
 			report.progress(sys.stderr)
 		finish_restore_copies(pending, report)
@@ -8092,13 +8185,13 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 		if reason is None and cp_af_copy_path(resolved.path, dest, mcae, pending) is False:
 			reason = f'{resolved.path} is gone from the vault'
 		if reason is not None:
-			report.failures.append((entry_rel, reason))
+			report.fail(entry_rel, reason)
 
 	def clear_partials(folder:str, held:str, entry_rel:str):
 		try:
 			remove_stale_partials(folder, held)
 		except OSError as e:
-			report.warnings.append((entry_rel, f'partial files an earlier run left could not be removed: {e}'))
+			report.warn(entry_rel, f'partial files an earlier run left could not be removed: {e}')
 
 	try:
 		if threading.current_thread() is threading.main_thread():
@@ -8110,7 +8203,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			try:
 				restore_one(resolved, rel, target)
 			except OSError as e:
-				report.failures.append((rel, str(e)))
+				report.fail(rel, str(e))
 		else:
 			# private until it is complete: nobody else can look in, nor put anything in for the copies to write through;
 			# and this run's alone
@@ -8124,16 +8217,20 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 							raise CommandError(f'{target} was taken meanwhile, right after what was there was moved aside to {aside}: nothing was restored; run the restore again to move that aside too', EXIT_COMMAND_FAILED)
 						raise target_exists(target)
 				lock = claim_restore_target(target)
+				if marked:
+					# the run whose output this was may have finished while this one waited for the lock
+					earlier = dict.fromkeys(held_marker(target, os.path.basename(job_vault), rel, version).get('unset', ()))
+					written = list(earlier)
 			except OSError as e:
-				report.failures.append((rel, str(e)))
+				report.fail(rel, str(e))
 				return
 			report.restored += 1
 			folders.append((resolved.path, target, rel))
 			try:
 				# the job vault's folder bears the job's name
-				report.marker = write_restore_marker(target, os.path.basename(job_vault), rel, version)
+				report.marker = write_restore_marker(target, os.path.basename(job_vault), rel, version, written)
 			except OSError as e:
-				report.failures.append((rel, f"cannot mark it as this restore's output: {e}"))
+				report.fail(rel, f"cannot mark it as this restore's output: {e}")
 				report.left_private = True
 				return
 			if resume:
@@ -8150,7 +8247,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 					if os.path.basename(below) == RESTORE_MARKER_NAME:
 						# backed up while a restore into the monitored path was under way: this restore's own stays in its
 						# place, and one deeper down marks an unfinished restore that is none of this one's
-						report.warnings.append((entry_rel, 'not restored: it is the marker of a restore under way when this version was taken'))
+						report.warn(entry_rel, 'not restored: it is the marker of a restore under way when this version was taken')
 						if is_dir:
 							refused.add(walk_rel)
 					elif is_dir:
@@ -8159,7 +8256,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 						except OSError as e:
 							reason = str(e)
 						if reason is not None:
-							report.failures.append((entry_rel, f'{reason}: nothing in it was restored'))
+							report.fail(entry_rel, f'{reason}: nothing in it was restored')
 							refused.add(walk_rel)
 						else:
 							if resume:
@@ -8176,56 +8273,71 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 								pass
 						if there is not None and stat.S_ISDIR(there.st_mode):
 							# a copy put in its place would remove the folder with all in it
-							report.failures.append((entry_rel, 'a folder is in its place, which is left as it is'))
+							report.fail(entry_rel, 'a folder is in its place, which is left as it is')
 						elif there is not None and restore_failure(entry, version) is None and already_restored(entry.path, dest):
 							report.kept += 1
+							if entry_rel in earlier:
+								del earlier[entry_rel]
+								report.warn(entry_rel, 'kept as an earlier run restored it, which could not set all of its metadata')
+								report.note_unset(entry_rel)
 						else:
+							earlier.pop(entry_rel, None)
 							restore_one(entry, entry_rel, dest)
 				except OSError as e:
-					report.failures.append((entry_rel, str(e)))
+					report.fail(entry_rel, str(e))
 				check_stop()
 				if len(pending) >= RESTORE_COPY_BATCH:
 					finish_batch()
 				report.progress(sys.stderr)
 			for walk_rel, error in errors:
 				below = walk_rel.rstrip('/')
-				report.failures.append((os.path.join(rel, below) if rel else below, f'unreadable in the vault: {error}'))
+				report.fail(os.path.join(rel, below) if rel else below, f'unreadable in the vault: {error}')
 		finish_batch()
-		if report.failures:
+		if report.failed:
 			# a folder handed to its owner now could be swapped for a symlink before a re-run writes into it
 			report.left_private = bool(folders)
 			return
-		hand_over_folders(folders, report)
+		hand_over_folders(folders, report, check_stop)
 	finally:
 		try:
 			# however the restore ends, no copy is left writing into target, nor a partial file in it
 			stop_copies(mcae, pending, target)
 		finally:
+			if report.marker is not None:
+				# the marker this run leaves: what it knows of, and what it did not get to meet again
+				unset = list(report.unset) + [entry for entry in earlier if entry not in report.unset]
+				if unset != written:
+					with contextlib.suppress(OSError):
+						write_restore_marker(target, os.path.basename(job_vault), rel, version, unset)
 			for sig, handler in handlers.items():
 				# None: a handler set from outside Python, which cannot be set back
 				signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 			if lock is not None:
 				os.close(lock)
 
-def hand_over_folders(folders:list, report:RestoreReport) -> None:
+def hand_over_folders(folders:list, report:RestoreReport, check_stop = None) -> None:
 	'''
 	Give each of folders, (vault folder, restored folder, rel) in walk order with the target first, the vault folder's
 	metadata (restore_folder_meta()), counting in report.handed_over those given all of it: backwards, so every folder
 	comes after the folders inside it and the target last. Its marker goes just before the target's own metadata: a run
 	stopped among the folders before still leaves a restore to pick up, and removing it later would change the
-	target's times.
+	target's times. check_stop, when given, is called before each folder (so before the marker goes), and may raise to
+	stop the run.
 	'''
 	for source, dest, entry_rel in reversed(folders):
+		if check_stop is not None:
+			check_stop()
 		if dest == report.target and report.marker is not None:
 			try:
 				os.unlink(report.marker)
 				report.marker = None
 			except OSError as e:
-				report.warnings.append((entry_rel, f'{RESTORE_MARKER_NAME} could not be removed: {e}'))
-		if restore_folder_meta(source, dest):
+				report.warn(entry_rel, f'{RESTORE_MARKER_NAME} could not be removed: {e}')
+		error = restore_folder_meta(source, dest)
+		if error is None:
 			report.handed_over += 1
 		else:
-			report.warnings.append((entry_rel, 'restored without all of its metadata'))
+			report.warn(entry_rel, f'restored without all of its metadata: {error}')
 
 def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, report:RestoreReport) -> None:
 	'''
@@ -8240,6 +8352,9 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 	report.marker = os.path.join(target, RESTORE_MARKER_NAME)
 	lock = claim_restore_target(target)
 	try:
+		# the run whose output this was may have finished while this one waited for the lock
+		for unset in held_marker(target, os.path.basename(job_vault), rel, version, accept=True).get('unset', ()):
+			report.warn(unset, 'kept without all of its metadata: an earlier run could not set it')
 		resolved = resolve_version_entry(job_vault, version.path, rel, monitor_path)
 		if resolved.kind != 'folder':
 			raise CommandError(f'Cannot keep {target} as it is: V{version.number} holds no folder there now ({restore_failure(resolved, version) or resolved.kind})', EXIT_COMMAND_FAILED)
@@ -8252,7 +8367,7 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 			try:
 				remove_stale_partials(folder, held)
 			except OSError as e:
-				report.warnings.append((entry_rel, f'partial files an earlier run left could not be removed: {e}'))
+				report.warn(entry_rel, f'partial files an earlier run left could not be removed: {e}')
 		clear_partials(target, resolved.path, rel)
 		for entry_path, walk_rel, is_dir in iter_tree_entries(resolved.path, skip=skip, errors=errors):
 			if not is_dir:
@@ -8269,7 +8384,7 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 				continue
 			except OSError as e:
 				refused.add(walk_rel)
-				report.warnings.append((entry_rel, f'{e}: left as it is'))
+				report.warn(entry_rel, f'{e}: left as it is')
 				continue
 			reason = folder_refusal(st)
 			if reason is None and os.path.basename(below) != RESTORE_MARKER_NAME:
@@ -8284,10 +8399,10 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 			if stat.S_ISDIR(st.st_mode) and vault_st is not None and (st.st_uid, st.st_gid) == (vault_st.st_uid, vault_st.st_gid):
 				# handed over already, deepest first, so all under it was too
 				continue
-			report.warnings.append((entry_rel, f'{reason or "not one this restore made"}: left as it is'))
+			report.warn(entry_rel, f'{reason or "not one this restore made"}: left as it is')
 		for walk_rel, error in errors:
 			below = walk_rel.rstrip('/')
-			report.warnings.append((os.path.join(rel, below) if rel else below, f'unreadable in the vault: {error}; the folders under it keep what the restore gave them'))
+			report.warn(os.path.join(rel, below) if rel else below, f'unreadable in the vault: {error}; the folders under it keep what the restore gave them')
 		hand_over_folders(folders, report)
 	finally:
 		os.close(lock)
@@ -8321,18 +8436,27 @@ def unsafe_folder_on_path(path:str):
 			return folder
 	return None
 
+def unsafe_folder_reason(folder:str) -> str:
+	'''Why unsafe_folder_on_path() named folder: it cannot be looked at (and why), or another user can change it.'''
+	try:
+		os.lstat(folder)
+	except OSError as e:
+		return f'{folder} cannot be looked at: {e}'
+	return f'another user can change {folder}'
+
 def target_exists(target:str) -> CommandError:
 	'''The refusal of a restore whose target is already there.'''
 	return CommandError(f'{target} already exists: restore into another folder, or move it out of the way first')
 
-def restore_target(rules:list, dest:str, rel:str, monitor_path:str) -> str:
+def restore_target(rules:list, dest:str, rel:str, monitor_path:str, typed:str = None) -> str:
 	'''
 	Where restoring rel puts it: into the folder dest, dest/<its name> (the monitored path's own name for the whole
 	job); with dest None, in place, its own path in the monitored path. It is built on the folder it goes in with its
 	symlinks resolved, the folder every check is made on (for the whole job in place, the monitored path itself is
 	resolved). A CommandError when that folder is not one, when another user could change a folder on the way to it
 	(unsafe_folder_on_path()), when in place a symlink on the way leads somewhere else now, when the target lies inside
-	any job's vault, or in place holds one. What is at the target is check_target()'s to look at.
+	any job's vault, or in place holds one. typed is the destination as it was typed, which a message shows beside the
+	folder it resolved to when they differ. What is at the target is check_target()'s to look at.
 	'''
 	if dest is not None:
 		# a symlink on the way could be pointed elsewhere after the checks: only the folder found now is used
@@ -8348,16 +8472,18 @@ def restore_target(rules:list, dest:str, rel:str, monitor_path:str) -> str:
 		# the monitored path is restored into, not replaced
 		target = os.path.realpath(monitor_path)
 		folder = os.path.dirname(target)
+	# the destination as typed, and where it leads
+	named = folder if typed is None or typed == folder else f'{typed} (resolved to {folder})'
 	if not os.path.isdir(folder):
 		if dest is not None:
-			raise CommandError(f'{folder} is not a folder: give an existing folder to restore into')
+			raise CommandError(f'{named} is not a folder: give an existing folder to restore into')
 		raise CommandError(f'Not restoring in place: {folder} is not a folder now; restore the folder it was in place first, or restore into a folder')
 	unsafe = unsafe_folder_on_path(folder)
 	if unsafe is not None:
 		# the copies are written by path: one who can rename a folder on the way could send them anywhere
 		if dest is None:
-			raise CommandError(f'Not restoring in place: another user can change {unsafe}; restore into a folder only you (or root) can write to instead')
-		raise CommandError(f'Not restoring into {folder}: another user can change {unsafe}; pick a destination only you (or root) can write to')
+			raise CommandError(f'Not restoring in place: {unsafe_folder_reason(unsafe)}; restore into a folder only you (or root) can write to instead')
+		raise CommandError(f'Not restoring into {named}: {unsafe_folder_reason(unsafe)}; pick a destination only you (or root) can write to')
 	for rule in rules:
 		if is_subpath(target, rule.vault_path):
 			raise CommandError(f'{target} is inside the vault {rule.vault_path}: restore somewhere else')
@@ -8391,6 +8517,25 @@ def nothing_to_accept(target:str) -> CommandError:
 	'''The refusal of --accept where no unfinished restore of the same path and version is.'''
 	return CommandError(f'{target} holds no unfinished restore to keep: --accept keeps the result of a folder restore that did not complete, given the same path and version')
 
+def check_marker_matches(target:str, marker:dict, job_name:str, rel:str, version:KeptVersion = None) -> None:
+	'''A CommandError unless marker, which read_restore_marker() read at target, is the one of a restore of rel of job_name (from version, once it is picked).'''
+	if (marker['job'], marker['path']) != (job_name, rel) or (version is not None and marker['version'] != version.name):
+		raise CommandError(f'{target} holds the unfinished restore of job {marker["job"]}, path {marker["path"] or "."}, version {marker["version"]}: run that restore again to finish it, or move it out of the way')
+
+def held_marker(target:str, job_name:str, rel:str, version:KeptVersion, accept:bool = False) -> dict:
+	'''
+	The marker of the restore at target, read again once this run holds the lock on it: the run whose output it was may
+	have finished, or been replaced, since check_target() looked. A CommandError when there is none (with accept, the
+	refusal of an --accept with nothing to accept) or it is another restore's.
+	'''
+	marker = read_restore_marker(target)
+	if marker is None:
+		if accept:
+			raise nothing_to_accept(target)
+		raise CommandError(f'{target} no longer holds an unfinished restore: another run finished it, or moved it away, meanwhile; run the restore again')
+	check_marker_matches(target, marker, job_name, rel, version)
+	return marker
+
 def move_target_aside(target:str):
 	'''
 	Move what is at target, the path a restore in place goes to, aside (move_aside()), say where and return it. A
@@ -8410,19 +8555,21 @@ def move_target_aside(target:str):
 	print(shown(f'Moved {target} aside to {aside}'), flush=True)
 	return aside
 
-def check_target(target:str, job_name:str, rel:str, in_place:bool, version:KeptVersion = None) -> str:
+def check_target(target:str, job_name:str, rel:str, in_place:bool, version:KeptVersion = None, accept:bool = False) -> str:
 	'''
 	What restoring rel of job_name (from version, once it is picked) to target does with what is there: 'new' when
 	nothing is, 'resume' when an earlier run of this same restore left its unfinished output there (as
 	read_restore_marker() reads its marker), in place 'move aside' when anything else is, and 'into root' for the whole
 	job, restored into its empty monitored path (require_empty_root()). A CommandError otherwise: the marker of another
-	restore, or a destination's name already taken.
+	restore, or a destination's name already taken. With accept, whatever is there but a marker is nothing to accept
+	(nothing_to_accept()): the marker is read once, here, and 'resume' is the only answer that goes on.
 	'''
 	marker = read_restore_marker(target)
 	if marker is not None:
-		if (marker['job'], marker['path']) != (job_name, rel) or (version is not None and marker['version'] != version.name):
-			raise CommandError(f'{target} holds the unfinished restore of job {marker["job"]}, path {marker["path"] or "."}, version {marker["version"]}: run that restore again to finish it, or move it out of the way')
+		check_marker_matches(target, marker, job_name, rel, version)
 		return 'resume'
+	if accept:
+		raise nothing_to_accept(target)
 	if not os.path.lexists(target):
 		return 'new'
 	if not in_place:
@@ -8507,33 +8654,37 @@ def restore_command(args) -> int:
 			if kind is None:
 				raise CommandError(never_backed_up(rule, rule_path, rel, args.path.endswith('/')))
 			# refused before a version is picked, and again once one is, as picking can take a while
-			target = restore_target(rules, dest, rel, rule.mon_path)
-			if args.accept and read_restore_marker(target) is None:
-				raise nothing_to_accept(target)
-			first = check_target(target, rule.job_name, rel, args.in_place)
+			target = restore_target(rules, dest, rel, rule.mon_path, args.dest)
+			first = check_target(target, rule.job_name, rel, args.in_place, accept=args.accept)
 			holds = lambda version: resolve_version_entry(job_vault, version.path, rel, rule.mon_path).kind != 'missing'
 			# only the picker shows them, and for a whole job they come from every change list
 			picking = args.version is None and args.at is None and sys.stdin is not None and sys.stdin.isatty()
 			candidates = restore_candidates(job_vault, versions, rule.mon_path, rel, kind) if picking else []
-			version = choose_version(candidates, versions, holds, args.version, args.at, sys.stdin, sys.stdout)
+			version = choose_version(candidates, versions, holds, args.version, args.at, sys.stdin, sys.stderr)
 		except OSError as e:
 			raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
-		target = restore_target(rules, dest, rel, rule.mon_path)
+		target = restore_target(rules, dest, rel, rule.mon_path, args.dest)
 		if args.in_place and not rel and not args.accept:
 			# the daemon as it is now, not before the picking; asked before the monitored path is looked at for the last
 			# time, as an answer can take a while
 			confirm_whole_job_in_place(rule.job_name, version, versions, target, read_status(state_dir_path(args.state_dir)), args.yes, first == 'resume', sys.stdin, sys.stdout)
-		if args.accept and read_restore_marker(target) is None:
-			raise nothing_to_accept(target)
 		# with --accept, a marker there is one of this restore's or a CommandError
-		found = check_target(target, rule.job_name, rel, args.in_place, version)
-		aside = move_target_aside(target) if found == 'move aside' else None
+		found = check_target(target, rule.job_name, rel, args.in_place, version, accept=args.accept)
+		aside = None
+		if found == 'move aside':
+			# the live entry is moved only for a version that can put something in its place
+			try:
+				entry = resolve_version_entry(job_vault, version.path, rel, rule.mon_path)
+			except OSError:
+				entry = None
+			if entry is None or entry.kind == 'folder' or restore_failure(entry, version) is None:
+				aside = move_target_aside(target)
 		report = RestoreReport()
 		try:
 			if args.accept:
 				accept_restore(job_vault, version, rule.mon_path, rel, target, report)
 			else:
-				restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report, resume=found in ('resume', 'into root'), aside=aside)
+				restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report, resume=found in ('resume', 'into root'), aside=aside, marked=found == 'resume')
 		except KeyboardInterrupt:
 			if report.marker is None:
 				raise
@@ -8541,7 +8692,7 @@ def restore_command(args) -> int:
 		finally:
 			report.progress(sys.stderr, done=True)
 	print(report.summary())
-	return EXIT_COMMAND_FAILED if report.failures else 0
+	return EXIT_COMMAND_FAILED if report.failed else 0
 
 def run_command(argv:list) -> int:
 	'''Run the command argv names and return its exit status; a CommandError prints its message on stderr.'''
