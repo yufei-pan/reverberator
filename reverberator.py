@@ -50,7 +50,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.38
+__version__ = 0.39
 
 ## WIP
 
@@ -1301,6 +1301,10 @@ def get_args(args = None):
 			"Examples:\n"
 			"  reverberator reverb_rule.tsv\n"
 			"  reverberator --verbose --threads 4 /etc/reverb/custom_rules.tsv\n\n"
+			"Commands (see each one's --help):\n"
+			"  reverberator status\n"
+			"  reverberator history PATH\n"
+			"  reverberator restore PATH [DEST | --in-place]\n\n"
 			"Thread mode:\n"
 			"  --threads < 0 : multiplier of CPU count (e.g. -2 => 2x CPU count)\n"
 			"  --threads = 0 : use a very large worker pool (200000)\n"
