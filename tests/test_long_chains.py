@@ -253,8 +253,9 @@ def test_recopy_comes_from_the_vault(job):
 	assert (recopied.st_mode, recopied.st_mtime_ns, recopied.st_size) == (copy.st_mode, copy.st_mtime_ns, copy.st_size)
 	with open(os.path.join(version.path, name)) as f:
 		assert f.read() == 'backed up'
-	# recorded as the copy it came from, so the next comparison reads only the monitored change
-	assert lookup(job, name) == record
+	# recorded as the copy it came from, unchecked as any new copy is: the next comparison reads it back, and finds
+	# only the monitored change
+	assert lookup(job, name) == record._replace(unchecked=1)
 	found = OrderedDict()
 	rv.delta_generate_backup_entries(found, latest_version(job), job.monitor).close()
 	assert [(path, values.event) for path, values in found.items()] == [(live, 'modify')]
@@ -399,3 +400,72 @@ def test_a_chain_through_a_folder_symlink_is_not_followed(job):
 	assert rv.chain_end(job.job_vault, version, 'd/x') is None and rv.learn_copy_version(job.job_vault, version, 'd/x') is None
 	end = rv.chain_end(job.job_vault, version, 'e/x')
 	assert (end.number, end.path, stat.S_ISREG(end.st.st_mode)) == (3, os.path.join(version, 'e/x'), True)
+
+
+def test_a_recopy_is_checked_like_any_copy(job, monkeypatch):
+	kept, lost = name_with_threshold(32, 'k'), name_with_threshold(32, 'l')
+	seed_monitor(job, {kept: 'kept', lost: 'lost', 'c.txt': 'c'})
+	backup(job)
+	backup(job)
+	records = {name: lookup(job, name) for name in (kept, lost)}
+	for _ in range(33):
+		version = backup(job, 'c.txt')
+	assert sorted(changes(job, version)) == sorted([(kept, 'recopy'), (lost, 'recopy'), ('c.txt', 'modify')])
+	assert {name: lookup(job, name) for name in (kept, lost)} == {name: record._replace(unchecked=1) for name, record in records.items()}
+	# a crash soon after can leave a copy its size and mtime, but not its bytes
+	path = os.path.join(version.path, lost)
+	st = os.lstat(path)
+	with open(path, 'r+b') as f:
+		f.write(bytes(st.st_size))
+	os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+	reads = []
+	read_vault_record = rv.read_vault_record
+	monkeypatch.setattr(rv, 'read_vault_record', lambda *args: reads.append(args[1]) or read_vault_record(*args))
+	version = backup(job)
+	assert {kept, lost} <= set(reads)
+	assert version.number == 34 and changes(job, version) == [(lost, 'modify')]
+	with open(os.path.join(version.path, lost)) as f:
+		assert f.read() == 'lost'
+	assert lookup(job, kept) == records[kept]
+
+
+def test_a_batch_s_own_changes_to_a_due_file(job):
+	modified, deleted, moved = name_with_threshold(32, 'm'), name_with_threshold(32, 'd'), name_with_threshold(32, 'v')
+	seed_monitor(job, {modified: 'x' * 256 * 1024, deleted: 'd', moved: 'v', 'c.txt': 'c'})
+	backup(job)
+	for _ in range(32):
+		backup(job, 'c.txt')
+	# room for the new contents of modified, not for its old copy as well, overwritten as soon as it is made
+	limit = rv.get_vault_info(job.job_vault).vault_size + 320 * 1024
+	seed_monitor(job, {modified: 'y' * 256 * 1024})
+	os.remove(os.path.join(job.monitor, deleted))
+	os.rename(os.path.join(job.monitor, moved), os.path.join(job.monitor, 'w.txt'))
+	version = backup(job, events=[event_entry(job, modified, 'modify'), event_entry(job, deleted, 'delete'),
+		event_entry(job, 'w.txt', 'move', moved)], backup_size_limit=str(limit))
+	assert version.number == 33 and rv.list_versions(job.job_vault)[0].number == 0
+	assert rv.get_vault_info(job.job_vault).vault_size <= limit
+	# a modified file is copied again all the same, so a copy of it that fails leaves no chain past its threshold; a
+	# deleted one is not; a moved one takes its new copy along
+	assert sorted(changes(job, version)) == sorted([(modified, 'recopy'), (moved, 'recopy'), (modified, 'modify'), (deleted, 'delete'),
+		('w.txt', 'move')])
+	assert not os.path.lexists(os.path.join(version.path, deleted)) and not os.path.islink(os.path.join(version.path, 'w.txt'))
+	with open(os.path.join(version.path, modified)) as f:
+		assert f.read() == 'y' * 256 * 1024
+	assert copy_versions(job) == {modified: 33, 'w.txt': 33, 'c.txt': 32}
+
+
+def test_a_due_file_whose_chain_is_broken_is_named(job, monkeypatch):
+	name = name_with_threshold(32)
+	seed_monitor(job, {name: 'gone', 'c.txt': 'c'})
+	backup(job)
+	for _ in range(32):
+		backup(job, 'c.txt')
+	# the copy the chains of name lead to is lost from the vault
+	os.remove(os.path.join(rv.list_versions(job.job_vault)[0].path, name))
+	logged = []
+	log = rv.backuperTeeLogToTl
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda *args, **kwargs: logged.append((args, kwargs)) or log(*args, **kwargs))
+	version = backup(job, 'c.txt')
+	assert changes(job, version) == [('c.txt', 'modify')] and os.path.islink(os.path.join(version.path, name))
+	errors = [kwargs.get('message', args[1] if len(args) > 1 else '') for args, kwargs in logged if kwargs.get('error')]
+	assert any(name in message and 'cannot be followed' in message for message in errors), errors
