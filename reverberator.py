@@ -583,8 +583,10 @@ class JobControl:
 	The threads report a failure here instead of clearing GREEN_LIGHT, so only this job stops; the first failure of an
 	attempt is the one kept. committed is set once the attempt has committed a backup.
 	'''
-	def __init__(self, job_name:str):
+	def __init__(self, job_name:str, shown_name:str = None):
 		self.job_name = job_name
+		# what the job's marker lines call it: the raw name of a job whose cleaned name is empty
+		self.shown_name = job_name if shown_name is None else shown_name
 		self.running = threading.Event()
 		self.failure = None
 		self.committed = threading.Event()
@@ -721,6 +723,21 @@ def daemon_error_log(reason:str) -> str:
 	line = shown(f'reverberator EXITING with error: {reason}')
 	tl.teeerror(line)
 	return line
+
+class NamelessJobName(str):
+	'''The cleaned job name '' of a rule whose name has nothing left after cleanup; raw is the name as written.'''
+	def __new__(cls, raw:str):
+		self = super().__new__(cls, '')
+		self.raw = raw
+		return self
+
+def raw_job_name(rule) -> str:
+	'''The name a rule is called in messages: the job name, or the name as written when it cleaned up to nothing.'''
+	return getattr(rule.job_name, 'raw', rule.job_name)
+
+def nameless_reason(rule_path:str) -> str:
+	'''Why a job whose name cleaned up to nothing is stopped.'''
+	return f"its name has no letters, digits, '-' or '_' left after cleanup; rename it in {rule_path}"
 
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
@@ -983,7 +1000,7 @@ def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pendi
 			break
 		failure = job.failure
 		if failure.permanent:
-			job_log(job.job_name, f'STOPPED: {failure.reason}')
+			job_log(job.shown_name, f'STOPPED: {failure.reason}')
 			job.set_state('stopped', failure.reason, failures=failures)
 			return 'stopped'
 		failures = 1 if ran >= JOB_RETRY_RESET_SECONDS else failures + 1
@@ -1176,6 +1193,15 @@ def run_daemon():
 	colliding = colliding_job_names(rules)
 	for index, reverb_rule in enumerate(rules):
 		job_name = reverb_rule.job_name
+		if job_name == '':
+			# a name with nothing left would make the vault root the job's vault: stopped at once, before anything touches it
+			def start_nameless(job:JobControl, attempt:int) -> list:
+				job.fail(nameless_reason(args.rule_path), permanent=True)
+				return []
+			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name,raw_job_name(reverb_rule)),start_nameless,None),name=f'{raw_job_name(reverb_rule)} supervisor',daemon=True)
+			supervisor.start()
+			supervisors.append(supervisor)
+			continue
 		if job_name in colliding:
 			# rows sharing a job name would share one vault folder: each is stopped at once, nothing of it starts
 			def start_colliding(job:JobControl, attempt:int, job_name = job_name) -> list:
@@ -1529,7 +1555,11 @@ def parse_rules(rule_file:str, read_only:bool = False):
 			tl.teelog(log_text(f'Warning: Rule {ruleName} has empty Job Name. Ignoring rule...'),level='warning')
 			continue
 		cleanedJobName = slugify(inRule['job_name'])
-		if cleanedJobName != inRule['job_name']:
+		if not cleanedJobName:
+			# kept as written for the messages and the row in the file; the job is stopped, not renamed
+			tl.teelog(log_text(f'Warning: Rule {ruleName} has a Job Name with nothing left after cleanup. The job will be stopped.'),level='warning')
+			inRule['job_name'] = NamelessJobName(inRule['job_name'])
+		elif cleanedJobName != inRule['job_name']:
 			tl.teelog(log_text(f'Warning: Rule {ruleName} has dirty Job Name. Changing to {cleanedJobName}'),level='warning')
 			inRule['job_name'] = cleanedJobName
 			ruleUpdated = True
@@ -1631,9 +1661,9 @@ def parse_rules(rule_file:str, read_only:bool = False):
 			rulesToUpdate[ruleName] = list(inRule.values())
 		returnReverbRules.append(ReverbRule(**inRule))
 	# rewrite the updated rows in place once; a row whose cleaned name collides with another's is left as written,
-	# as renaming it would merge the two rows in the file
+	# as renaming it would merge the two rows in the file; a row whose name cleaned to nothing is left as written too
 	colliding = colliding_job_names(returnReverbRules)
-	rulesToUpdate = {name:row for name,row in rulesToUpdate.items() if row[0] not in colliding}
+	rulesToUpdate = {name:row for name,row in rulesToUpdate.items() if row[0] not in colliding and row[0] != ''}
 	if rulesToUpdate and not read_only:
 		try:
 			rewrite_rule_rows(rule_file,rulesToUpdate)
@@ -6596,12 +6626,12 @@ def find_job(rules:list, path:str, job_name:str = None) -> tuple:
 		/elsewhere is not under any job's monitored path (/m, /m/sub)
 	'''
 	if job_name is not None:
-		candidates = [rule for rule in rules if rule.job_name == job_name]
+		candidates = [rule for rule in rules if rule.job_name == job_name and job_name]
 		if not candidates:
-			raise CommandError(f'No job named {job_name}; the jobs are {", ".join(rule.job_name for rule in rules)}')
+			raise CommandError(f'No job named {job_name}; the jobs are {", ".join(rule.job_name for rule in rules if rule.job_name)}')
 		path = os.path.join(candidates[0].mon_path, path)
 	else:
-		candidates = rules
+		candidates = [rule for rule in rules if rule.job_name]
 	path = os.path.abspath(path)
 	best = None
 	for rule in candidates:
@@ -6609,7 +6639,7 @@ def find_job(rules:list, path:str, job_name:str = None) -> tuple:
 		if (path == mon_path or path.startswith(mon_path + '/')) and (best is None or len(mon_path) > len(best[1])):
 			best = (rule, mon_path)
 	if best is None:
-		where = f"job {job_name}'s monitored path ({candidates[0].mon_path})" if job_name is not None else f"any job's monitored path ({', '.join(rule.mon_path for rule in rules)})"
+		where = f"job {job_name}'s monitored path ({candidates[0].mon_path})" if job_name is not None else f"any job's monitored path ({', '.join(rule.mon_path for rule in rules if rule.job_name)})"
 		raise CommandError(f'{path} is not under {where}')
 	return best[0], path[len(best[1]) + 1:]
 
@@ -7034,9 +7064,13 @@ def format_status(status:DaemonStatus, rules:list, rule_path:str) -> str:
 		header = f'reverberator {record.get("version", "?")}, running since {show_time(record["started_at"])} (pid {record["pid"]}), rules {rule_path}'
 	else:
 		header = f'reverberator is not running (last started {show_time(record["started_at"])})'
-	width = max(len(rule.job_name) for rule in rules)
+	width = max(len(raw_job_name(rule)) for rule in rules)
 	lines = [header, '']
 	for rule in rules:
+		if not rule.job_name:
+			# stopped from the rule file alone, whether or not the daemon runs; it has no vault folder
+			lines.append(f'{raw_job_name(rule):<{width}}  stopped: {nameless_reason(rule_path)}')
+			continue
 		lines += format_job_status(rule, status.jobs.get(rule.job_name), status, width)
 	# details and paths can quote monitored names
 	return '\n'.join(shown(line) for line in lines)

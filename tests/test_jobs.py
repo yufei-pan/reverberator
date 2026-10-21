@@ -5,7 +5,8 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, wait_until, committed_versions
+import signal
+from tests.harness import seed_monitor, wait_until, committed_versions, create_job, rule_row, write_rule, wait_for_committed_count
 
 pytestmark = pytest.mark.unit
 
@@ -844,3 +845,53 @@ def test_unmount_of_an_already_removed_watch_logs_only_in_debug(monkeypatch, pol
 	rv.watchFolder('/monitor', rv.ChangeEventQueue('/monitor'), threading.Lock(), threading.Event(), rv.inotify_resource_manager())
 	rv.GREEN_LIGHT.set()
 	assert len([message for message in logged if 'unmount event' in message]) == (3 if debug else 0)
+
+
+@pytest.mark.process
+def test_a_job_whose_name_cleans_to_nothing_is_stopped(job, tmp_path, run_reverberator):
+	other = create_job(str(tmp_path / 'other'), 'other')
+	seed_monitor(job, {'a.txt': 'a'})
+	seed_monitor(other, {'b.txt': 'b'})
+	# the vault root holds a half made version of the nameless job's: it must be left alone
+	stray = os.path.join(job.vault, 'V1_stray.incomplete')
+	os.makedirs(stray)
+	nameless = rule_row(job)
+	nameless[0] = '!!!'
+	write_rule(other, extra_rows=[nameless])
+	before = set(os.listdir(job.vault))
+	proc = run_reverberator(other.rule_path)
+	wait_for_committed_count(other, 1, timeout=15)
+	assert proc.poll() is None
+	assert any("reverberator job !!! STOPPED: its name has no letters, digits, '-' or '_' left after cleanup; rename it in "
+		+ other.rule_path in line for line in ''.join(proc._out_buf + proc._err_buf).splitlines())
+	assert set(os.listdir(job.vault)) == before and os.path.isdir(stray)
+	assert any(line.startswith('!!!\t') for line in open(other.rule_path).read().splitlines())
+	proc.send_signal(signal.SIGTERM)
+
+
+@pytest.mark.process
+def test_the_only_job_having_no_name_exits_3(job, run_reverberator):
+	seed_monitor(job, {'a.txt': 'a'})
+	write_rule(job)
+	text = open(job.rule_path).read().replace('job\t', '!!!\t', 1)
+	open(job.rule_path, 'w').write(text)
+	proc = run_reverberator(job.rule_path)
+	assert proc.wait(timeout=15) == 3
+	assert os.listdir(job.vault) == []
+
+
+def test_find_job_ignores_nameless_rules():
+	blank = rv.NamelessJobName('!!!')
+	rules = [rv.ReverbRule(blank, '/m', *['']*10), rv.ReverbRule('sub', '/m/sub', *['']*10)]
+	assert rv.find_job(rules, '/m/sub/x')[0].job_name == 'sub'
+	with pytest.raises(rv.CommandError):
+		rv.find_job(rules, '/m/other')
+	with pytest.raises(rv.CommandError):
+		rv.find_job(rules, 'x', job_name='')
+
+
+def test_status_shows_a_nameless_job_as_stopped(tmp_path):
+	rules = [rv.ReverbRule(rv.NamelessJobName('!!!'), '/m', str(tmp_path), *['']*9)]
+	status = rv.DaemonStatus(None, False, {})
+	text = rv.format_status(status, rules, '/r/rules.tsv')
+	assert "!!!  stopped: its name has no letters, digits, '-' or '_' left after cleanup; rename it in /r/rules.tsv" in text
