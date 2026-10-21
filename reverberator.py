@@ -702,7 +702,7 @@ class StatusBoard:
 		except (OSError, ValueError, TypeError) as e:
 			if not self._failed:
 				self._failed = True
-				tl.teeerror(f'Cannot write status files in {self.state_dir}: {e}')
+				tl.teeerror(log_text(f'Cannot write status files in {self.state_dir}: {e}'))
 		finally:
 			if temp is not None:
 				with contextlib.suppress(OSError):
@@ -712,13 +712,13 @@ STATUS_BOARD = None
 
 def job_log(job_name:str, text:str) -> str:
 	'''Log a job's marker line at error level, where log alerts look for it, and return it.'''
-	line = f'reverberator job {job_name} {text}'
+	line = shown(f'reverberator job {job_name} {text}')
 	tl.teeerror(line)
 	return line
 
 def daemon_error_log(reason:str) -> str:
 	'''Log the marker line for the daemon exiting on an error at error level, and return it.'''
-	line = f'reverberator EXITING with error: {reason}'
+	line = shown(f'reverberator EXITING with error: {reason}')
 	tl.teeerror(line)
 	return line
 
@@ -1093,7 +1093,7 @@ def supervise_job(results:list, index:int, job:JobControl, start_attempt, persis
 		results[index] = run_job(job, start_attempt, persist_pending=persist_pending)
 	except Exception as e:
 		import traceback
-		tl.teeerror(traceback.format_exc())
+		tl.teeerror(log_text(traceback.format_exc()))
 		daemon_error_log(f'supervisor of job {job.job_name} crashed: {type(e).__name__}: {e}')
 		results[index] = 'crashed'
 		# the other jobs stop cleanly and save their pending transactions; main exits 1
@@ -1110,7 +1110,7 @@ def main(argv:list = None):
 		run_daemon()
 	except Exception as e:
 		import traceback
-		tl.teeerror(traceback.format_exc())
+		tl.teeerror(log_text(traceback.format_exc()))
 		daemon_error_log(f'{type(e).__name__}: {e}')
 		sys.exit(1)
 
@@ -1133,22 +1133,22 @@ def run_daemon():
 	signal.signal(signal.SIGTERM, signal_handler)
 	args, argString = get_args()
 	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=0, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log,callerStackDepth=4,in_place_compression='xz')
-	tl.teeprint(argString)
+	tl.teeprint(log_text(argString))
 	if args.verbose:
 		DEBUG = True
 	if args.drop_sample_reverb_rule_file:
 		rule_path = os.path.abspath(args.rule_path)
 		with open(rule_path, 'w', encoding='utf-8') as f:
 			f.write(SAMPLE_REVERB_RULE_FILE.strip() + '\n')
-		tl.teeok(f'Dropped sample rule file at {rule_path}')
+		tl.teeok(log_text(f'Dropped sample rule file at {rule_path}'))
 		return
 	try:
 		STATUS_BOARD = StatusBoard(state_dir_path(), os.path.abspath(args.rule_path))
 	except Exception as e:
-		tl.teeerror(f'Cannot publish status files: {e}')
+		tl.teeerror(log_text(f'Cannot publish status files: {e}'))
 	# warn the user if reverberator is not run as root
 	if os.geteuid() != 0:
-		tl.teeerror('Warning: reverberator is not run as root, dynamic nofile tuning will not work. And file permissions can cause errors.')
+		tl.teeerror(log_text('Warning: reverberator is not run as root, dynamic nofile tuning will not work. And file permissions can cause errors.'))
 	irm = inotify_resource_manager()
 	if args.threads == 0:
 		# set the max backup threads to 200k, which is usually about the max for a user set in ulimit. pratically unlimited.
@@ -1162,7 +1162,7 @@ def run_daemon():
 	# parse the rule file
 	rules = parse_rules(args.rule_path)
 	if not rules:
-		tl.teeerror(f'Error: Rule file {args.rule_path} appears empty after parsing.')
+		tl.teeerror(log_text(f'Error: Rule file {args.rule_path} appears empty after parsing.'))
 		daemon_error_log(f'rule file {args.rule_path} has no rules')
 		sys.exit(EXIT_ALL_STOPPED)
 	# one supervisor per job runs its watcher and backuper, and starts them again after a failure
@@ -1186,14 +1186,14 @@ def run_daemon():
 		try:
 			min_snapshot_delay_seconds = int(reverb_rule.min_shapshot_time)
 		except Exception as _:
-			tl.teeerror(f'Error: Rule {job_name} has invalid min_snapshot_delay_seconds value: {reverb_rule.min_shapshot_time}')
-			tl.teeprint(f"Reverting to default value: {DEFAULT_SNAPSHOT_DELAY}")
+			tl.teeerror(log_text(f'Error: Rule {job_name} has invalid min_snapshot_delay_seconds value: {reverb_rule.min_shapshot_time}'))
+			tl.teeprint(log_text(f"Reverting to default value: {DEFAULT_SNAPSHOT_DELAY}"))
 		max_shapshot_delay_seconds = DEFAULT_MAX_DELAY
 		try:
 			max_shapshot_delay_seconds = int(reverb_rule.max_shapshot_time)
 		except Exception as _:
-			tl.teeerror(f'Error: Rule {job_name} has invalid max_snapshot_delay_seconds value: {reverb_rule.max_shapshot_time}')
-			tl.teeprint(f"Reverting to default value: {DEFAULT_MAX_DELAY}")
+			tl.teeerror(log_text(f'Error: Rule {job_name} has invalid max_snapshot_delay_seconds value: {reverb_rule.max_shapshot_time}'))
+			tl.teeprint(log_text(f"Reverting to default value: {DEFAULT_MAX_DELAY}"))
 			max_shapshot_delay_seconds = DEFAULT_MAX_DELAY
 		vault_path = reverb_rule.vault_path
 		if reverb_rule.keep_one_complete_backup.lower() == 'none':
@@ -1208,8 +1208,8 @@ def run_daemon():
 		try:
 			keep_n_versions = int(reverb_rule.keep_n_versions)
 		except Exception as _:
-			tl.teeerror(f'Error: Rule {job_name} has invalid keep_n_versions value: {reverb_rule.keep_n_versions}')
-			tl.teeprint(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}")
+			tl.teeerror(log_text(f'Error: Rule {job_name} has invalid keep_n_versions value: {reverb_rule.keep_n_versions}'))
+			tl.teeprint(log_text(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}"))
 		backup_size_limit = reverb_rule.backup_size_limit
 		vault_path_signature = reverb_rule.vault_fs_signature
 		job_vault = os.path.join(vault_path, job_name)
@@ -1228,17 +1228,17 @@ def run_daemon():
 			gate = MonitorGate(monitor_path, monitor_fs_flag, monitor_path_signature)
 		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate, monitor_path_signature)
 		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
-		tl.info(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}')
+		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}'))
 		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
 		supervisor.start()
 		supervisors.append(supervisor)
-		tl.teeok(f'Started job {job_name} watching {monitor_path}:{monitor_path_signature} into vault {vault_path}:{vault_path_signature}')
+		tl.teeok(log_text(f'Started job {job_name} watching {monitor_path}:{monitor_path_signature} into vault {vault_path}:{vault_path_signature}'))
 	for supervisor in supervisors:
 		supervisor.join()
 	if 'crashed' in results:
 		raise RuntimeError(f'a job supervisor crashed: {results}')
 	if not GREEN_LIGHT.is_set():
-		tl.teeok('All jobs have exited. Exiting main thread.')
+		tl.teeok(log_text('All jobs have exited. Exiting main thread.'))
 		return
 	if all(result == 'stopped' for result in results):
 		daemon_error_log('every job is stopped')
@@ -1260,10 +1260,10 @@ def signal_handler(sig, frame):
 		None
 	'''
 	if GREEN_LIGHT.is_set():
-		tl.teeerror('Ctrl C caught, cleanning up and exiting... ( can take up to 5 seconds )')
+		tl.teeerror(log_text('Ctrl C caught, cleanning up and exiting... ( can take up to 5 seconds )'))
 		GREEN_LIGHT.clear()
 	else:
-		tl.teeerror('Ctrl C caught again, exiting immediately!')
+		tl.teeerror(log_text('Ctrl C caught again, exiting immediately!'))
 		# wait for 0.1 seconds to allow the threads to exit
 		time.sleep(0.1)
 		sys.exit(1)
@@ -1487,27 +1487,27 @@ def parse_rules(rule_file:str, read_only:bool = False):
 	if not os.path.exists(rule_file):
 		if read_only:
 			raise RuleFileError(f'Rule file {rule_file} does not exist.')
-		tl.teeerror(f'Error: Rule file {rule_file} does not exist.')
+		tl.teeerror(log_text(f'Error: Rule file {rule_file} does not exist.'))
 		daemon_error_log(f'rule file {rule_file} does not exist')
 		sys.exit(EXIT_ALL_STOPPED)
 	try:
 		if read_only:
 			pass
 		elif upgrade_rule_file_header(rule_file):
-			tl.info(f'Upgraded rule file {rule_file} header with the Skip List File column.')
+			tl.info(log_text(f'Upgraded rule file {rule_file} header with the Skip List File column.'))
 	except (OSError, ValueError) as e:
 		# ValueError: a compressed or non UTF-8 rule file, which TSVZ still reads
-		tl.teelog(f'Warning: Cannot upgrade rule file {rule_file} ({e}). The Skip List File column cannot be used until the header is upgraded.',level='warning')
+		tl.teelog(log_text(f'Warning: Cannot upgrade rule file {rule_file} ({e}). The Skip List File column cannot be used until the header is upgraded.'),level='warning')
 
 	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=DEBUG)
 	if DEBUG:
-		tl.teeprint(f'Parsed rules: \n{rules}')
+		tl.teeprint(log_text(f'Parsed rules: \n{rules}'))
 	else:
-		tl.info(f'Parsed rules: \n{rules}')
+		tl.info(log_text(f'Parsed rules: \n{rules}'))
 	if not rules:
 		if read_only:
 			raise RuleFileError(f'Rule file {rule_file} has no rules.')
-		tl.teeerror(f'Error: Rule file {rule_file} appears empty after parsing.')
+		tl.teeerror(log_text(f'Error: Rule file {rule_file} appears empty after parsing.'))
 		daemon_error_log(f'rule file {rule_file} has no rules')
 		sys.exit(EXIT_ALL_STOPPED)
 	# fill in empty / auto and append:
@@ -1516,36 +1516,36 @@ def parse_rules(rule_file:str, read_only:bool = False):
 	for ruleName in rules:
 		ruleList = list(rules[ruleName]) + [''] * (len(REVERB_RULE_HEADER) - len(rules[ruleName]))
 		if DEBUG:
-			tl.teeprint(f'Checking rule: {ruleList}')
+			tl.teeprint(log_text(f'Checking rule: {ruleList}'))
 		ruleUpdated = False
 		inRule = OrderedDict(zip(REVERB_RULE_HEADER, ruleList))
 		# job_name
 		if not inRule['job_name']:
-			tl.teelog(f'Warning: Rule {ruleName} has empty Job Name. Ignoring rule...',level='warning')
+			tl.teelog(log_text(f'Warning: Rule {ruleName} has empty Job Name. Ignoring rule...'),level='warning')
 			continue
 		cleanedJobName = slugify(inRule['job_name'])
 		if cleanedJobName != inRule['job_name']:
-			tl.teelog(f'Warning: Rule {ruleName} has dirty Job Name. Changing to {cleanedJobName}',level='warning')
+			tl.teelog(log_text(f'Warning: Rule {ruleName} has dirty Job Name. Changing to {cleanedJobName}'),level='warning')
 			inRule['job_name'] = cleanedJobName
 			ruleUpdated = True
 		# mon_path
 		if not inRule['mon_path']:
-			tl.teelog(f'Warning: Rule {ruleName} has empty Path Monitoring. Ignoring rule...',level='warning')
+			tl.teelog(log_text(f'Warning: Rule {ruleName} has empty Path Monitoring. Ignoring rule...'),level='warning')
 			continue
 		mon_path_exists = os.path.exists(inRule['mon_path'])
 		if not mon_path_exists:
-			tl.teelog(f'Warning: Rule {ruleName} has Path Monitoring: {inRule["mon_path"]} which does not exist, the job will wait for it',level='warning')
+			tl.teelog(log_text(f'Warning: Rule {ruleName} has Path Monitoring: {inRule["mon_path"]} which does not exist, the job will wait for it'),level='warning')
 		newSourcePath = os.path.realpath(inRule['mon_path']) if mon_path_exists else inRule['mon_path']
 		if newSourcePath != inRule['mon_path']:
-			tl.teelog(f'Warning: Rule {ruleName} has dirty Path Monitoring. Changing to {newSourcePath}',level='warning')
+			tl.teelog(log_text(f'Warning: Rule {ruleName} has dirty Path Monitoring. Changing to {newSourcePath}'),level='warning')
 			inRule['mon_path'] = newSourcePath
 			ruleUpdated = True
 		# vault_path
 		if not inRule['vault_path']:
-			tl.teelog(f'Warning: Rule {ruleName} has empty Vault Path. Ignoring rule...',level='warning')
+			tl.teelog(log_text(f'Warning: Rule {ruleName} has empty Vault Path. Ignoring rule...'),level='warning')
 			continue
 		if is_subpath(inRule['vault_path'],inRule['mon_path']):
-			tl.teelog(f'Warning: Rule {ruleName} has Vault Path: {inRule["vault_path"]} which is a subpath of the source path. Ignoring rule...',level='warning')
+			tl.teelog(log_text(f'Warning: Rule {ruleName} has Vault Path: {inRule["vault_path"]} which is a subpath of the source path. Ignoring rule...'),level='warning')
 			continue
 		# mon_fs_signature
 		if not mon_path_exists or read_only:
@@ -1554,52 +1554,52 @@ def parse_rules(rule_file:str, read_only:bool = False):
 			signatures = get_fs_signatures(inRule["mon_path"])
 			if signatures and signatures[0]:
 				inRule["mon_fs_signature"] = signatures[0]
-				tl.teelog(f'Auto filled Monitoring File System Signature for {ruleName}: {inRule["mon_fs_signature"]}',level='info')
+				tl.teelog(log_text(f'Auto filled Monitoring File System Signature for {ruleName}: {inRule["mon_fs_signature"]}'),level='info')
 				ruleUpdated = True
 			else:
-				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...',level='warning')
+				tl.teelog(log_text(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...'),level='warning')
 				inRule["mon_fs_signature"] = 'auto'
 		# min_shapshot_time
 		if not inRule["min_shapshot_time"] or inRule["min_shapshot_time"].lower() == 'none':
 			inRule["min_shapshot_time"] = '0'
-			tl.info(f'Zeroed Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}')
+			tl.info(log_text(f'Zeroed Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}'))
 			ruleUpdated = True
 		elif inRule["min_shapshot_time"].lower() == 'auto':
 			inRule["min_shapshot_time"] = str(DEFAULT_SNAPSHOT_DELAY)
-			tl.info(f'Auto filled Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}')
+			tl.info(log_text(f'Auto filled Minium snapshot time for {ruleName}: {inRule["min_shapshot_time"]}'))
 			ruleUpdated = True
 		# max_shapshot_time
 		if not inRule["max_shapshot_time"] or inRule["max_shapshot_time"].lower() == 'none':
 			inRule["max_shapshot_time"] = str(DEFAULT_MAX_DELAY)
-			tl.info(f'Auto filled Maximum snapshot time for {ruleName}: {inRule["max_shapshot_time"]}')
+			tl.info(log_text(f'Auto filled Maximum snapshot time for {ruleName}: {inRule["max_shapshot_time"]}'))
 			ruleUpdated = True
 		elif inRule["max_shapshot_time"].lower() == 'auto':
 			inRule["max_shapshot_time"] = str(DEFAULT_MAX_DELAY)
-			tl.info(f'Auto filled Maximum snapshot time for {ruleName}: {inRule["max_shapshot_time"]}')
+			tl.info(log_text(f'Auto filled Maximum snapshot time for {ruleName}: {inRule["max_shapshot_time"]}'))
 			ruleUpdated = True
 		# keep_one_complete_backup
 		if not inRule["keep_one_complete_backup"] or inRule["keep_one_complete_backup"].lower() == 'auto' or inRule["keep_one_complete_backup"].lower() == 'none':
 			inRule["keep_one_complete_backup"] = str(DEFAULT_KEEP_ONE_COMPLETE_BACKUP)
-			tl.info(f'Auto filled Keep 1 Compelete Backup for {ruleName}: {inRule["keep_one_complete_backup"]}')
+			tl.info(log_text(f'Auto filled Keep 1 Compelete Backup for {ruleName}: {inRule["keep_one_complete_backup"]}'))
 			ruleUpdated = True
 		# only_sync_attributes
 		if not inRule["only_sync_attributes"] or inRule["only_sync_attributes"].lower() == 'auto' or inRule["only_sync_attributes"].lower() == 'none':
 			inRule["only_sync_attributes"] = str(DEFAULT_ONLY_SYNC_ATTRIBUTES)
-			tl.info(f'Auto filled Only Sync Attributes for {ruleName}: {inRule["only_sync_attributes"]}')
+			tl.info(log_text(f'Auto filled Only Sync Attributes for {ruleName}: {inRule["only_sync_attributes"]}'))
 			ruleUpdated = True
 		# keep_n_versions
 		if not inRule["keep_n_versions"] or inRule["keep_n_versions"].lower() == 'none':
 			inRule["keep_n_versions"] = '0'
-			tl.info(f'Zeroed Keep N versions for {ruleName}: {inRule["keep_n_versions"]}')
+			tl.info(log_text(f'Zeroed Keep N versions for {ruleName}: {inRule["keep_n_versions"]}'))
 			ruleUpdated = True
 		elif inRule["keep_n_versions"].lower() == 'auto':
 			inRule["keep_n_versions"] = str(DEFAULT_KEEP_N_VERSIONS)
-			tl.info(f'Auto filled Keep N versions for {ruleName}: {inRule["keep_n_versions"]}')
+			tl.info(log_text(f'Auto filled Keep N versions for {ruleName}: {inRule["keep_n_versions"]}'))
 			ruleUpdated = True
 		# backup_size_limit
 		if not inRule["backup_size_limit"] or inRule["backup_size_limit"].lower() == 'auto' or inRule["backup_size_limit"].lower() == 'none':
 			inRule["backup_size_limit"] = DEFAULT_BACKUP_SIZE_LIMIT
-			tl.info(f'Auto filled Backup Size Limit for {ruleName}: {inRule["backup_size_limit"]}')
+			tl.info(log_text(f'Auto filled Backup Size Limit for {ruleName}: {inRule["backup_size_limit"]}'))
 			ruleUpdated = True
 		# vault_fs_signature
 		if read_only:
@@ -1610,19 +1610,19 @@ def parse_rules(rule_file:str, read_only:bool = False):
 				try:
 					os.makedirs(inRule["vault_path"],exist_ok=True)
 				except Exception as _:
-					tl.teelog(f'Warning: Rule {ruleName} with {inRule["vault_path"]} does not exist and failed to create it. Ignoring rule...',level='warning')
+					tl.teelog(log_text(f'Warning: Rule {ruleName} with {inRule["vault_path"]} does not exist and failed to create it. Ignoring rule...'),level='warning')
 					continue
 			signatures = get_fs_signatures(inRule["vault_path"])
 			if signatures and signatures[0]:
 				inRule["vault_fs_signature"] = signatures[0]
-				tl.teelog(f'Auto filled Vault File System Signature for {ruleName}: {inRule["vault_fs_signature"]}',level='info')
+				tl.teelog(log_text(f'Auto filled Vault File System Signature for {ruleName}: {inRule["vault_fs_signature"]}'),level='info')
 				ruleUpdated = True
 			else:
-				tl.teelog(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...',level='warning')
+				tl.teelog(log_text(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...'),level='warning')
 				inRule["vault_fs_signature"] = 'auto'
 		# check if the rule is explicit
 		if ruleUpdated:
-			tl.info(f'Updating rule {ruleName}: {inRule}')
+			tl.info(log_text(f'Updating rule {ruleName}: {inRule}'))
 			rulesToUpdate[ruleName] = list(inRule.values())
 		returnReverbRules.append(ReverbRule(**inRule))
 	# rewrite the updated rows in place once; a row whose cleaned name collides with another's is left as written,
@@ -1634,7 +1634,7 @@ def parse_rules(rule_file:str, read_only:bool = False):
 			rewrite_rule_rows(rule_file,rulesToUpdate)
 		except (OSError, ValueError) as e:
 			# ValueError: a compressed or non UTF-8 rule file; the rules in memory are still right
-			tl.teelog(f'Warning: Cannot write the filled in rows back to {rule_file} ({e}).',level='warning')
+			tl.teelog(log_text(f'Warning: Cannot write the filled in rows back to {rule_file} ({e}).'),level='warning')
 	return returnReverbRules
 
 def colliding_job_names(rules:list) -> dict:
@@ -1716,8 +1716,8 @@ class inotify_resource_manager:
 				return int(rtn[0].split('=')[-1].strip())
 		except Exception as _:
 			import traceback
-			tl.error(traceback.format_exc())
-			tl.error(f'Failed to get {field} value')
+			tl.error(log_text(traceback.format_exc()))
+			tl.error(log_text(f'Failed to get {field} value'))
 		return 0
 	
 	def setSysctlValues(self,field,value,value_name):
@@ -1730,32 +1730,32 @@ class inotify_resource_manager:
 			# check if the current value is less
 			rtn = self.getSysctlValues(field)
 			if rtn and rtn > value:
-				tl.info(f'Current {field} is already higher than {value}')
+				tl.info(log_text(f'Current {field} is already higher than {value}'))
 				setattr(self,value_name,rtn)
 				return False
 			rc = multiCMD.run_command(['sudo','sysctl',f'{field}={value}'],timeout=1,quiet=not self.debug,return_code_only=True)
 			if self.debug:
-				tl.teeprint(f'sudo sysctl {field}={value} return code = {rc}')
+				tl.teeprint(log_text(f'sudo sysctl {field}={value} return code = {rc}'))
 			else:
-				tl.info(f'sudo sysctl {field}={value} return code = {rc}')
+				tl.info(log_text(f'sudo sysctl {field}={value} return code = {rc}'))
 			if rc:
 				if self.debug:
-					tl.teeprint(f'Failed to set {field} to {value}')
+					tl.teeprint(log_text(f'Failed to set {field} to {value}'))
 				else:
-					tl.info(f'Failed to set {field} to {value}')
+					tl.info(log_text(f'Failed to set {field} to {value}'))
 				setattr(self,f'can_set_{value_name}',False)
 				if rtn:
 					setattr(self,value_name,rtn)
 				return False
 			else:
-				tl.teeok(f'Increased inotify {field} to {value}')
+				tl.teeok(log_text(f'Increased inotify {field} to {value}'))
 				setattr(self,value_name,value)
 				return True
 		except Exception as _:
 			try:
 				import traceback
-				tl.error(traceback.format_exc())
-				tl.teeerror(f'Failed to set {field} = {value} for {value_name}')
+				tl.error(log_text(traceback.format_exc()))
+				tl.teeerror(log_text(f'Failed to set {field} = {value} for {value_name}'))
 				setattr(self,f'can_set_{value_name}',False)
 				rtn = self.getSysctlValues(field)
 				if rtn:
@@ -1763,7 +1763,7 @@ class inotify_resource_manager:
 				else:
 					setattr(self,value_name,-1)
 			except Exception as _:
-				tl.teeerror(f'Failed to set {field} value')
+				tl.teeerror(log_text(f'Failed to set {field} value'))
 		return False
 
 	def increaseInotifyMaxQueueEvents(self,max_events:int = ...):
@@ -1794,20 +1794,20 @@ class inotify_resource_manager:
 			# check if the current value is less
 			if resource.getrlimit(resource.RLIMIT_NOFILE)[0] > nofile:
 				if self.debug:
-					tl.teeprint(f'Current open file limit is already higher than {nofile}')
+					tl.teeprint(log_text(f'Current open file limit is already higher than {nofile}'))
 				else:
-					tl.info(f'Current open file limit is already higher than {nofile}')
+					tl.info(log_text(f'Current open file limit is already higher than {nofile}'))
 				self.max_no_files = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
 				return False
 			rtn = self.__increaseSystemNoFiles(nofile)
 			resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
-			tl.teeok(f'Increased open file limit to {nofile}')
+			tl.teeok(log_text(f'Increased open file limit to {nofile}'))
 			self.max_no_files = nofile
 			return rtn
 		except Exception as _:
 			import traceback
-			tl.error(traceback.format_exc())
-			tl.teeerror(f'Failed to increase open file limit to {nofile}')
+			tl.error(log_text(traceback.format_exc()))
+			tl.teeerror(log_text(f'Failed to increase open file limit to {nofile}'))
 			self.can_set_max_no_files_user = False
 			return False
 
@@ -2187,7 +2187,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
 	global tl
 	global DEBUG
-	message = f'{WATCHER_LOG_PREFIX}| {monitor_path} | ' + message
+	message = f'{WATCHER_LOG_PREFIX}| {log_text(monitor_path)} | ' + log_text(message)
 	if error:
 		tl.teeerror(message,callerStackDepth=4)
 	elif ok:
@@ -3373,7 +3373,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 def backuperTeeLogToTl(path:str,message:str,error=False,ok=False,warning=False,debug=False):
 	global tl
 	global DEBUG
-	message = f'{BACKUPER_LOG_PREFIX}| {path} | ' + message
+	message = f'{BACKUPER_LOG_PREFIX}| {log_text(path)} | ' + log_text(message)
 	if error:
 		tl.teeerror(message,callerStackDepth=4)
 	elif ok:
@@ -6664,6 +6664,19 @@ def show_count(count:int, limit:int = None) -> str:
 def show_time(epoch:float, clock_only:bool = False) -> str:
 	'''A local time for people: date and minute, or only the minute of the day.'''
 	return time.strftime('%H:%M' if clock_only else '%Y-%m-%d %H:%M', time.localtime(epoch))
+
+def log_text(text) -> str:
+	'''
+	text as it is safe to put in a log line, as file names and exception messages are anyone's to choose and a name with
+	a line break could forge a marker line that log alerts act on: shown(), except that a line break stays one, with
+	four spaces after it so that no continuation line can start with a marker.
+	>>> print(log_text('a\\nreverberator job x FAILED: y\\x1b'))
+	a
+	    reverberator job x FAILED: y\\x1b
+	>>> log_text('caf\\u00e9 \\udcff')
+	'café \\\\xff'
+	'''
+	return '\n    '.join(shown(piece) for piece in str(text).split('\n'))
 
 def shown(text) -> str:
 	'''
