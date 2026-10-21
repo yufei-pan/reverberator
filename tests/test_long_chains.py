@@ -1,9 +1,13 @@
 import errno
+import itertools
 import os
+import sqlite3
+import stat
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup, event_entry, write_committed_version
+from tests.harness import seed_monitor, run_backup, event_entry, write_committed_version, latest_version
+from tests.test_names import write_schema_1, contents as database_contents
 
 pytestmark = pytest.mark.unit
 
@@ -124,3 +128,274 @@ def test_learn_copy_version_past_39_links(job):
 	assert raised.value.errno == errno.ELOOP
 	assert [rv.learn_copy_version(job.job_vault, versions[44], f'a/{name}') for name in ('x', 'u', 'r', 'new', 'gone', 'missing')] == [0, 0, 0, 44, None, None]
 	assert rv.learn_copy_version(job.job_vault, versions[20], 'a/x') == 0
+
+
+# --- copying a file again before its chain passes its threshold ---
+
+def backup(job, *changed, events=(), **kwargs):
+	'''
+	One committed version as the backuper makes it: events (event_entry() pairs) and a modify of each rel of changed, given
+	new contents first; with neither, a full comparison (the complete first version of a new vault). Returns the newest
+	KeptVersion, without measuring every version as run_backup() does.
+	'''
+	entries = OrderedDict(events)
+	for rel in changed:
+		seed_monitor(job, {rel: f'{rel} as of {len(rv.list_versions(job.job_vault))}'})
+		entries.update([event_entry(job, rel, 'modify')])
+	options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+	options.update(kwargs)
+	_, manifest, committed = rv.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, **options)
+	manifest.close()
+	assert committed is True
+	return rv.list_versions(job.job_vault)[-1]
+
+
+def name_with_threshold(threshold, stem='f'):
+	'''The first name stem<n>.txt that is copied again once its chain would pass threshold links.'''
+	return next(f'{stem}{n}.txt' for n in itertools.count() if rv.recopy_threshold(f'{stem}{n}.txt') == threshold)
+
+
+def chain_length(path):
+	'''How many links the kernel follows from path to the file it opens.'''
+	hops = 0
+	while os.path.islink(path):
+		path = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+		hops += 1
+	return hops
+
+
+def changes(job, version):
+	'''(rel, event) of each row of version's change list.'''
+	return [(os.path.relpath(row.path, job.monitor), row.event) for row in rv.iter_change_list(version.change_list)]
+
+
+def lookup(job, rel):
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return manifest.lookup(rel)
+	finally:
+		manifest.close()
+
+
+def forget_copy_versions(job):
+	'''The vault database as an upgrade from 0.39 leaves it: no row knows where its copy is.'''
+	conn = sqlite3.connect(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), isolation_level=None)
+	try:
+		conn.execute('UPDATE entries SET copy_version = NULL')
+	finally:
+		conn.close()
+
+
+def as_schema_1(job):
+	'''The vault database as 0.39 left it, keeping its rows and meta.'''
+	rows, meta = database_contents(job)
+	os.remove(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME))
+	write_schema_1(job, [row[:10] for row in rows], {key: value for key, value in meta if key != 'schema'})
+
+
+def test_no_chain_passes_38_hops(job):
+	# a name for each threshold, at the top and a folder down
+	names = [name_with_threshold(threshold, stem) for threshold in range(rv.RECOPY_MIN_HOPS, rv.RECOPY_MAX_HOPS + 1) for stem in ('f', 'd/f')]
+	seed_monitor(job, {**{name: name for name in names}, 'c.txt': 'c'})
+	backup(job)
+	for _ in range(45):
+		version = backup(job, 'c.txt')
+		for name in names:
+			assert chain_length(os.path.join(version.path, name)) <= rv.recopy_threshold(name), (version.number, name)
+	assert version.number == 45
+	for name in names:
+		with open(os.path.join(version.path, name)) as f:
+			assert f.read() == name
+	# each was copied again in the version its chain would have passed its threshold in, and only then
+	assert copy_versions(job) == {**{name: rv.recopy_threshold(name) + 1 for name in names}, 'c.txt': 45}
+
+
+def test_recopy_at_its_own_threshold(job):
+	name, later = name_with_threshold(34), name_with_threshold(35)
+	seed_monitor(job, {name: 'kept', later: 'kept too', 'c.txt': 'c'})
+	backup(job)
+	for _ in range(34):
+		version = backup(job, 'c.txt')
+	# V34 links to V0's copy through 34 links, as many as this name may have
+	assert version.number == 34 and chain_length(os.path.join(version.path, name)) == 34
+	version = backup(job, 'c.txt')
+	assert not os.path.islink(os.path.join(version.path, name)) and chain_length(os.path.join(version.path, later)) == 35
+	assert changes(job, version) == [(name, 'recopy'), ('c.txt', 'modify')]
+	assert copy_versions(job) == {name: 35, later: 0, 'c.txt': 35}
+	version = backup(job, 'c.txt')
+	assert chain_length(os.path.join(version.path, name)) == 1 and not os.path.islink(os.path.join(version.path, later))
+	assert changes(job, version) == [(later, 'recopy'), ('c.txt', 'modify')]
+	with open(os.path.join(version.path, name)) as f:
+		assert f.read() == 'kept'
+
+
+def test_recopy_comes_from_the_vault(job):
+	name = name_with_threshold(32)
+	seed_monitor(job, {name: 'backed up', 'c.txt': 'c'})
+	live = os.path.join(job.monitor, name)
+	os.chmod(live, 0o640)
+	os.utime(live, ns=(1_000_000_000, 1_000_000_000))
+	copy = os.lstat(os.path.join(backup(job).path, name))
+	# a full comparison finding nothing new checks the copies, so the record is the vault copy's, checked
+	backup(job)
+	record = lookup(job, name)
+	assert record.unchecked == 0 and record.mtime_ns == 1_000_000_000
+	for _ in range(32):
+		backup(job, 'c.txt')
+	# the monitored file changes, and no event for it has come yet
+	with open(live, 'w') as f:
+		f.write('changed since')
+	os.chmod(live, 0o600)
+	version = backup(job, 'c.txt')
+	assert version.number == 33 and changes(job, version) == [(name, 'recopy'), ('c.txt', 'modify')]
+	recopied = os.lstat(os.path.join(version.path, name))
+	assert stat.S_ISREG(recopied.st_mode) and recopied.st_ino != copy.st_ino
+	assert (recopied.st_mode, recopied.st_mtime_ns, recopied.st_size) == (copy.st_mode, copy.st_mtime_ns, copy.st_size)
+	with open(os.path.join(version.path, name)) as f:
+		assert f.read() == 'backed up'
+	# recorded as the copy it came from, so the next comparison reads only the monitored change
+	assert lookup(job, name) == record
+	found = OrderedDict()
+	rv.delta_generate_backup_entries(found, latest_version(job), job.monitor).close()
+	assert [(path, values.event) for path, values in found.items()] == [(live, 'modify')]
+
+
+def test_recopy_keeps_a_user_symlink_and_a_referenced_link(job):
+	referenced, user = name_with_threshold(32, 'r'), name_with_threshold(32, 'u')
+	seed_monitor(job, {referenced: 'r', 'c.txt': 'c'})
+	# a referenced first version links each file to the monitored one; V1 copies a user's symlink as one
+	backup(job, keep_one_complete_backup=False)
+	os.symlink(referenced, os.path.join(job.monitor, user))
+	backup(job, 'c.txt', events=[event_entry(job, user, 'create')], keep_one_complete_backup=False)
+	# a full comparison finding nothing new reads what V0 holds
+	backup(job, keep_one_complete_backup=False)
+	records = {name: lookup(job, name) for name in (referenced, user)}
+	assert (records[referenced].kind, records[user].kind) == ('r', 'l')
+	for _ in range(32):
+		version = backup(job, 'c.txt', keep_one_complete_backup=False)
+	assert version.number == 33 and changes(job, version) == [(referenced, 'recopy'), ('c.txt', 'modify')]
+	# the link V0 holds, as it is: not the monitored file it names
+	entry = os.path.join(version.path, referenced)
+	assert os.path.islink(entry) and os.readlink(entry) == os.path.join(job.monitor, referenced)
+	version = backup(job, 'c.txt', keep_one_complete_backup=False)
+	assert changes(job, version) == [(user, 'recopy'), ('c.txt', 'modify')]
+	entry = os.path.join(version.path, user)
+	assert os.path.islink(entry) and os.readlink(entry) == referenced
+	assert copy_versions(job) == {referenced: 33, user: 34, 'c.txt': 34}
+	assert {name: lookup(job, name) for name in (referenced, user)} == records
+
+
+def test_short_jobs_never_recopy(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'c.txt': 'c'})
+	backup(job)
+	# keeping 33 versions, no chain is longer than 32 links however many versions are made
+	learned = []
+	learn_copy_version = rv.learn_copy_version
+	monkeypatch.setattr(rv, 'learn_copy_version', lambda *args: learned.append(args) or learn_copy_version(*args))
+	for _ in range(40):
+		version = backup(job, 'c.txt', keep_n_versions=33)
+		assert 'recopy' not in [event for _, event in changes(job, version)]
+	assert version.number == 40 and chain_length(os.path.join(version.path, 'a.txt')) == 32 and learned == []
+	# an upgraded vault knows no copy version, and still nothing is read: the live vaults keep 3 to 5 versions
+	forget_copy_versions(job)
+	looked = []
+	lstat = os.lstat
+	monkeypatch.setattr(os, 'lstat', lambda *args, **kwargs: looked.append(args) or lstat(*args, **kwargs))
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		assert rv.recopy_rels(manifest, 213, 209, job.job_vault, version.path) == []
+		assert rv.recopy_rels(manifest, 41, 41 - rv.RECOPY_MIN_HOPS, job.job_vault, version.path) == []
+		assert learned == [] and looked == []
+		# a version further, the copies are looked for
+		rv.recopy_rels(manifest, 41, 40 - rv.RECOPY_MIN_HOPS, job.job_vault, version.path)
+	finally:
+		manifest.close()
+	assert sorted(args[2] for args in learned) == ['a.txt', 'c.txt'] and looked
+
+
+def test_upgraded_long_vault_recopies_only_past_threshold(job, monkeypatch):
+	# (threshold, the version that last copied it): 40 versions from it, the first three have passed their thresholds
+	files = {name_with_threshold(32, 'p'): 0, name_with_threshold(38, 'q'): 0, name_with_threshold(34, 's'): 5,
+		name_with_threshold(36, 't'): 5, name_with_threshold(38, 'u'): 3}
+	seed_monitor(job, {**{name: name for name in files}, 'c.txt': 'c'})
+	# 0.39 made these versions, linking every unchanged file
+	monkeypatch.setattr(rv, 'recopy_rels', lambda *args: [])
+	backup(job)
+	for number in range(1, 40):
+		version = backup(job, 'c.txt', *[name for name, copied in files.items() if copied == number])
+	assert version.number == 39 and chain_length(os.path.join(version.path, list(files)[0])) == 39
+	monkeypatch.undo()
+	as_schema_1(job)
+	version = backup(job, 'c.txt')
+	past = list(files)[:3]
+	assert sorted(changes(job, version)) == sorted([(name, 'recopy') for name in past] + [('c.txt', 'modify')])
+	assert {name: os.path.islink(os.path.join(version.path, name)) for name in files} == {name: name not in past for name in files}
+	# what was learned walking the chains is kept
+	assert copy_versions(job) == {**files, **dict.fromkeys(past, 40), 'c.txt': 40}
+	for name in files:
+		with open(os.path.join(version.path, name)) as f:
+			assert f.read().startswith(name)
+
+
+def test_size_estimate_counts_recopies(job, monkeypatch):
+	big = name_with_threshold(32, 'big')
+	seed_monitor(job, {big: 'x' * 256 * 1024, 'c.txt': 'c'})
+	# a vault 0.39 made, whose chains to big now pass its threshold
+	monkeypatch.setattr(rv, 'recopy_rels', lambda *args: [])
+	backup(job)
+	for _ in range(35):
+		backup(job, 'c.txt')
+	monkeypatch.undo()
+	# room for the change, not for copying big again
+	limit = rv.get_vault_info(job.job_vault).vault_size + 64 * 1024
+	version = backup(job, 'c.txt', backup_size_limit=str(limit))
+	# removing V0 to V3 moved big's copy up to V4, so its chain no longer passes its threshold: big is linked, and
+	# no more versions are removed than that took
+	assert version.number == 36 and rv.list_versions(job.job_vault)[0].number == 36 - rv.RECOPY_MIN_HOPS
+	assert rv.get_vault_info(job.job_vault).vault_size <= limit
+	assert chain_length(os.path.join(version.path, big)) == rv.RECOPY_MIN_HOPS and changes(job, version) == [('c.txt', 'modify')]
+
+
+def test_history_and_picker_skip_recopies(job):
+	name = name_with_threshold(32, 'd/f')
+	seed_monitor(job, {name: 'kept', 'c.txt': 'c'})
+	backup(job)
+	for _ in range(33):
+		backup(job, 'c.txt')
+	versions = rv.list_versions(job.job_vault)
+	assert changes(job, versions[33]) == [(name, 'recopy'), ('c.txt', 'modify')]
+	history = lambda rel, folder: [(row.version.number, row.event) for row in (rv.folder_history if folder else rv.file_history)(job.job_vault, versions, job.monitor, rel)]
+	picker = lambda rel, kind: [row.version.number for row in rv.restore_candidates(job.job_vault, versions, job.monitor, rel, kind)]
+	assert history(name, False) == history('d', True) == [(0, 'oldest')]
+	assert picker(name, 'file') == picker('d', 'folder') == [0]
+	root = rv.folder_history(job.job_vault, versions, job.monitor, '')[0]
+	assert (root.version.number, root.files) == (33, [('modify', 'c.txt')]) and sum(root.counts.values()) == 1
+	# a change after the re-copy is listed as ever
+	backup(job, name)
+	versions = rv.list_versions(job.job_vault)
+	assert history(name, False) == [(34, 'modify'), (0, 'oldest')] and picker(name, 'file') == [34, 0]
+
+
+def test_retention_in_the_same_backup_spares_a_recopy(job):
+	# keeping 34 versions, a version's chains are 33 links at most once the oldest is removed to make room for it
+	spared, due = name_with_threshold(33), name_with_threshold(32)
+	seed_monitor(job, {spared: 'spared', due: 'due', 'c.txt': 'c'})
+	backup(job)
+	for _ in range(40):
+		version = backup(job, 'c.txt', keep_n_versions=34)
+		assert chain_length(os.path.join(version.path, spared)) <= 33 and chain_length(os.path.join(version.path, due)) <= 32
+		assert (spared, 'recopy') not in changes(job, version)
+		assert ((due, 'recopy') in changes(job, version)) == (version.number == 33)
+	assert rv.list_versions(job.job_vault)[0].number == 7
+	# the copy V0 made has moved up to V7, the oldest kept, as removing each version moved it
+	assert copy_versions(job) == {spared: 0, due: 33, 'c.txt': 40}
+
+
+def test_a_chain_through_a_folder_symlink_is_not_followed(job):
+	seed_monitor(job, {'d/x': 'live'})
+	version = write_committed_version(job, 3, {'e/x': 'vault'}, timestamp=T)
+	# a version's folder that is a symlink leads out of the vault, here to the monitored folder
+	os.symlink(os.path.join(job.monitor, 'd'), os.path.join(version, 'd'))
+	assert rv.chain_end(job.job_vault, version, 'd/x') is None and rv.learn_copy_version(job.job_vault, version, 'd/x') is None
+	end = rv.chain_end(job.job_vault, version, 'e/x')
+	assert (end.number, end.path, stat.S_ISREG(end.st.st_mode)) == (3, os.path.join(version, 'e/x'), True)

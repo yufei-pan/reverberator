@@ -883,6 +883,11 @@ HASH_SIZE = 1<<16
 COMPARE_THREADS = 32
 # the kernel also gives up resolving a path after 40 links
 MAX_CHAINED_LINKS = 40
+# a new version copies a file again from the vault rather than link it through more links than its name's threshold,
+# from RECOPY_MIN_HOPS to RECOPY_MAX_HOPS (see recopy_threshold()): two below the kernel's 40, which counts every link on
+# a path, such as a user's symlink at the end of a chain or the current_version link at its start
+RECOPY_MIN_HOPS = 32
+RECOPY_MAX_HOPS = 38
 # vault folders known to be real, kept so the many links through one folder look at it once
 REAL_VAULT_FOLDERS_KEPT = 16384
 # manifest rows written or read per statement: enough to amortise sqlite calls, little to hold
@@ -3736,6 +3741,8 @@ def do_backup(backup_entries:dict,
 		vault_info_dict = vaultInfo.vault_info_dict
 		vault_size = vaultInfo.vault_size
 		vault_inodes = vaultInfo.vault_inodes
+		# the files the new version copied again from the vault
+		recopied = []
 		if not vault_info_dict:
 			backuperTeeLogToTl(job_name,f'Failed to get any version for {job_vault}, treating the vault as new.',error=True)
 			this_version_number = 0
@@ -3828,6 +3835,17 @@ def do_backup(backup_entries:dict,
 				return vaultInfo, manifest, True
 			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path,skip_list = skip_list)
 			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
+			this_version_number = latest_version_info.version_number + 1
+			# the files whose link chains would pass their threshold are copied again from the vault, so the size limit
+			# counts them too ( a copy in a link's place takes no inode more ). removing the oldest version moves its
+			# copies into the next one, which shortens their chains: they are counted again after each removal
+			def count_recopies():
+				oldest_kept = next(iter(vault_info_dict))
+				rels = recopy_rels(manifest,this_version_number,oldest_kept,job_vault,latest_version_info.path)
+				return oldest_kept, rels, recopy_size(manifest,rels,job_vault,latest_version_info.path)
+			recopies_oldest, recopies, recopies_size = count_recopies()
+			if recopies:
+				backuperTeeLogToTl(job_name,f'{len(recopies)} files to copy again from the vault, as their link chains would pass their limit: estimated size {recopies_size}')
 			estimated_backup_inode = latest_version_info.inode + estimated_backup_inode_change
 			backuperTeeLogToTl(job_name,f'Estimated backup inodes {estimated_backup_inode}')
 			vault_fs_size, vault_fs_inode = get_path_fs_info(vault_path)
@@ -3836,14 +3854,16 @@ def do_backup(backup_entries:dict,
 			backuperTeeLogToTl(job_name,f'Calculated backup size limit {backup_limit_size} and backup inode limit {backup_limit_inode}')
 			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
 			if backup_limit_size:
-				while vault_size + estimated_backup_size > backup_limit_size:
-					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size} exceeds backup size limit {backup_limit_size}')
+				while vault_size + estimated_backup_size + recopies_size > backup_limit_size:
+					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size + recopies_size} exceeds backup size limit {backup_limit_size}')
 					# we need to remove the oldest version
 					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name)
 					vault_size -= removed_size
 					vault_inodes -= removed_inodes
 					if not removed_size and not removed_inodes:
 						break
+					if recopies:
+						recopies_oldest, recopies, recopies_size = count_recopies()
 			if backup_limit_inode:
 				while vault_inodes + estimated_backup_inode > backup_limit_inode:
 					backuperTeeLogToTl(job_name,f'Vault inodes {vault_inodes} + estimated backup inodes {estimated_backup_inode} exceeds backup inode limit {backup_limit_inode}')
@@ -3861,12 +3881,14 @@ def do_backup(backup_entries:dict,
 				vault_inodes -= removed_inodes
 				if not removed_size and not removed_inodes:
 					break
-			this_version_number = latest_version_info.version_number + 1
+			if recopies and next(iter(vault_info_dict)) != recopies_oldest:
+				recopies_oldest, recopies, recopies_size = count_recopies()
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
 			os.makedirs(backup_folder,exist_ok=True)
 			backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
-			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported)
+			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported,
+				recopy=recopies,recopied=recopied)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -3881,7 +3903,10 @@ def do_backup(backup_entries:dict,
 		backup_size_str = format_bytes(this_size,use_1024_bytes=True,to_str=True).replace(' ','_')
 		backup_inode_str = format_bytes(this_inodes,use_1024_bytes=False,to_str=True).replace(' ','')
 		content_file_name = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
-		content_file_content = [entry_row(path,values) for path,values in backup_entries.items()]
+		# a copy made again is no change: its own event, which history and the restore picker pass over
+		recopy_time = datetime.datetime.now().isoformat()
+		content_file_content = [entry_row(os.path.join(monitor_path,rel),BackupEntryValues(recopy_time,'recopy',None)) for rel in recopied]
+		content_file_content += [entry_row(path,values) for path,values in backup_entries.items()]
 		# commit before the content file: without one the version is removed at startup, and a manifest
 		# describing a removed version is listed again from the vault
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
@@ -4405,7 +4430,7 @@ def copy_failure_side(source_path:str, temp_path:str, lines:list) -> str:
 		return 'vanished'
 	return 'vault' if source_readable(source_path) else 'source'
 
-def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_name:str, reported:set = None) -> None:
+def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_name:str, reported:set = None) -> list:
 	'''
 	Put the copies of pending in place once the executor has finished them, and empty pending.
 
@@ -4414,8 +4439,8 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 	failed leaves the destination as it was, keeping the last backed-up copy, when its source failed: silently when the
 	source is gone, with an UNREADABLE line (once per backup, with reported) when it could not be read. A destination holding nothing then stops being tracked in manifest, whose paths
 	are relative to version_path. Each copy put in place is recorded in manifest as held by version_path, in the
-	transaction committing that version. When writing into the vault is what failed, JobFailure is raised once every
-	copy is dealt with.
+	transaction committing that version, and returned (as its path relative to version_path). When writing into the
+	vault is what failed, JobFailure is raised once every copy is dealt with.
 	'''
 	failure = None
 	done = 0
@@ -4459,6 +4484,7 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 		discard_copies(rest)
 	if failure is not None:
 		raise failure
+	return copied
 
 def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, discard:bool = True):
 	'''
@@ -4893,6 +4919,10 @@ class VaultManifest:
 	def rollback(self):
 		if self.conn.in_transaction:
 			self.conn.execute('ROLLBACK')
+
+	@property
+	def in_transaction(self) -> bool:
+		return self.conn.in_transaction
 
 	def _set_version(self, version_path:str):
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (os.path.basename(os.path.normpath(version_path)),))
@@ -5372,32 +5402,126 @@ def effective_copy_version(recorded, oldest_kept:int):
 	'''
 	return None if recorded is None else max(recorded, oldest_kept)
 
-def learn_copy_version(job_vault:str, version_path:str, rel:str):
+ChainEnd = namedtuple('ChainEnd', ['number', 'path', 'st'])
+
+def chain_end(job_vault:str, version_path:str, rel:str):
 	'''
-	The number of the version whose folder holds the end of the chain starting at version_path's file rel: a copy, a
-	user's symlink backed up as one or a referenced backup's link. Each hop names an older version than the last, so the
-	walk ends within as many hops as there are versions below version_path, however many more links than the kernel
-	follows that is. None when the chain cannot be followed: an entry on it is missing or cannot be read, or a link on it
-	cannot be told for a chain link or not (strict_chain_hop()).
+	Where the chain starting at version_path's file rel ends, as a ChainEnd: the number of the version folder holding
+	it, its path and its lstat. The end is a copy, a user's symlink backed up as one or a referenced backup's link. Each
+	hop names an older version than the last, so the walk ends within as many hops as there are versions below
+	version_path, however many more links than the kernel follows that is. None when the chain cannot be followed: a
+	folder of rel in version_path is not a real folder (by is_real_folder_under()), an entry on the chain is missing or
+	cannot be read, or a link on it cannot be told for a chain link or not (strict_chain_hop()).
 	'''
 	vault = os.path.abspath(job_vault)
 	number = vault_version_number(os.path.basename(os.path.normpath(version_path)))
 	entry = os.path.abspath(os.path.join(version_path, rel))
+	try:
+		# a folder symlink would lead out of the version, to the monitored file say; each hop checks its own way down
+		if not is_real_folder_under(os.path.abspath(version_path), os.path.dirname(entry)):
+			return None
+	except UncheckedVaultLink:
+		return None
 	while number is not None:
 		try:
-			if not stat.S_ISLNK(os.lstat(entry).st_mode):
-				return number
+			st = os.lstat(entry)
+			if not stat.S_ISLNK(st.st_mode):
+				return ChainEnd(number, entry, st)
 			hop = strict_chain_hop(vault, entry, os.readlink(entry))
 		except (OSError, UncheckedVaultLink):
 			return None
 		if hop is None:
-			return number
+			return ChainEnd(number, entry, st)
 		hop_number = vault_version_number(hop[len(vault) + 1:].partition('/')[0])
 		if hop_number is None or hop_number >= number:
 			# never so for a chain link, which names an older version: the walk only goes down
 			return None
 		entry, number = hop, hop_number
 	return None
+
+def learn_copy_version(job_vault:str, version_path:str, rel:str):
+	'''
+	The number of the version whose folder holds the end of the chain starting at version_path's file rel (a copy, a
+	user's symlink backed up as one or a referenced backup's link), by chain_end(); None when the chain cannot be followed.
+	'''
+	end = chain_end(job_vault, version_path, rel)
+	return None if end is None else end.number
+
+def recopy_threshold(rel:str) -> int:
+	'''
+	The most links a new version may chain to the copy of the file rel before it copies it again, from RECOPY_MIN_HOPS to
+	RECOPY_MAX_HOPS by a hash of its name: files unchanged since the same version are not all copied again in one
+	version, and each keeps its threshold across runs and versions.
+
+	Examples:
+		>>> recopy_threshold('a.txt'), recopy_threshold('bad\\udcff.txt')
+		(38, 37)
+	'''
+	return RECOPY_MIN_HOPS + xxhash.xxh32(storable_name(rel).encode('utf-8')).intdigest() % (RECOPY_MAX_HOPS - RECOPY_MIN_HOPS + 1)
+
+def recopy_rels(manifest:VaultManifest, new_version:int, oldest_kept:int, job_vault:str, latest_version_path:str) -> list:
+	'''
+	The files new_version is to copy again from the vault, sorted: those whose link chain would pass their
+	recopy_threshold(), as new_version - effective_copy_version() says. While new_version is no more than RECOPY_MIN_HOPS
+	above oldest_kept no chain can, so nothing is read at all: a job keeping 32 versions or fewer never pays for it.
+	Otherwise a file whose copy version is not known (upgraded from schema '1') learns it from its chain in the latest
+	version, read on a compare pool, and the vault database records it, committed unless a transaction was open already,
+	as what is read from the vault holds whether or not a new version follows. One whose chain cannot be followed stays
+	unknown, and is linked as ever.
+	'''
+	if new_version - oldest_kept <= RECOPY_MIN_HOPS:
+		return []
+	own_transaction = not manifest.in_transaction
+	manifest.begin()
+	if not manifest.describes(latest_version_path):
+		backuperTeeLogToTl(path=job_vault,message=f'Manifest does not describe {latest_version_path}, listing it')
+		manifest.rebuild(latest_version_path)
+	due = []
+	unknown = []
+	# the rows are read in full before any is written, as changing a table while reading it is undefined in sqlite
+	for rel, recorded in manifest.iter_files_with_copy_version():
+		if recorded is None:
+			unknown.append(rel)
+		elif new_version - effective_copy_version(recorded, oldest_kept) > recopy_threshold(rel):
+			due.append(rel)
+	learned = 0
+	if unknown:
+		with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
+			for start in range(0, len(unknown), MANIFEST_BATCH_SIZE):
+				if not GREEN_LIGHT.is_set():
+					# stopping: no version follows, and what was learned is kept
+					break
+				batch = unknown[start:start + MANIFEST_BATCH_SIZE]
+				by_version = {}
+				for rel, version in zip(batch, pool.map(lambda rel: learn_copy_version(job_vault, latest_version_path, rel), batch)):
+					if version is None:
+						continue
+					by_version.setdefault(version, []).append(rel)
+					if new_version - effective_copy_version(version, oldest_kept) > recopy_threshold(rel):
+						due.append(rel)
+				for version, rels in by_version.items():
+					manifest.set_copy_version(rels, version)
+					learned += len(rels)
+		backuperTeeLogToTl(path=job_vault,message=f'Learned which version holds the copy of {learned} of {len(unknown)} files from their chains in {latest_version_path}')
+	if own_transaction:
+		manifest.commit()
+	return sorted(due)
+
+def recopy_size(manifest:VaultManifest, rels:list, job_vault:str, latest_version_path:str) -> int:
+	'''
+	The bytes copying rels again from the vault adds to a version: the size each one's record holds (none for a link),
+	else the size of what its chain in the latest version ends at.
+	'''
+	total = 0
+	for rel in rels:
+		record = manifest.lookup(rel)
+		if record is not None and record.kind is not None:
+			total += record.size or 0
+			continue
+		end = chain_end(job_vault, latest_version_path, rel)
+		if end is not None and stat.S_ISREG(end.st.st_mode):
+			total += end.st.st_size
+	return total
 
 def read_vault_record(version_path:str, rel:str, monitor_path:str):
 	'''
@@ -6162,10 +6286,15 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 	return removingSize, removingInodes
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
-					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None) -> VaultManifest:
+					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
+					 recopy:list = (),recopied:list = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
+	The files of recopy (rels, as recopy_rels() gives them) are copied again from the end of their chains in the latest
+	version, before the replay: the vault's copy, as it is there, never the monitored file, which may have changed
+	since. Each one copied is appended to recopied. One whose chain cannot be followed, or whose copy fails, keeps its
+	link. Their records stay as they are, as each copy matches the one it was made from.
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
@@ -6219,11 +6348,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			mcae.run_command(['rm','-f',vault_real_path])
 			manifest.discard(relative_path)
 	def wait_for_async_commands(mcae):
+		# returns the rels of the copies put in place
 		while GREEN_LIGHT.is_set() and mcae.runningThreads:
 			mcae.wait(timeout=POLL_WAIT_SECONDS)
-		if GREEN_LIGHT.is_set():
-			# what was copied takes its place before anything renames, removes or records it
-			finish_copies(pending,manifest,backup_folder,monitor_path if job_name is None else job_name,reported)
+		if not GREEN_LIGHT.is_set():
+			return []
+		# what was copied takes its place before anything renames, removes or records it
+		return finish_copies(pending,manifest,backup_folder,monitor_path if job_name is None else job_name,reported)
 	def recheck_moved_folder(folder_rel,mcae):
 		# a location-dependent pattern may judge the moved contents differently at the new place
 		under = list(manifest.iter_under(folder_rel))
@@ -6265,6 +6396,19 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	pending = []
 	need_delete_barrier = False
 	try:
+		if recopy:
+			# over the links the referenced copy just made: a copy that fails leaves the link
+			job_vault = os.path.dirname(os.path.abspath(backup_folder))
+			for rel in recopy:
+				if not GREEN_LIGHT.is_set():
+					break
+				end = chain_end(job_vault,latest_version_info.path,rel)
+				if end is not None and not stat.S_ISDIR(end.st.st_mode):
+					cp_af_copy_path(source_path=end.path,dest_path=os.path.join(backup_folder,rel),mcae=mcae,pending=pending)
+			copied = wait_for_async_commands(mcae)
+			if recopied is not None:
+				recopied.extend(copied)
+			backuperTeeLogToTl(path=monitor_path,message=f'Copied {len(copied)} of {len(recopy)} files again from the vault, as their link chains would pass their limit')
 		for event_source_real_path, event_values in backup_entries.items():
 			backuperTeeLogToTl(path=monitor_path,message=f'Processing {event_source_real_path} {event_values}')
 			event_relative_path = os.path.relpath(path=event_source_real_path,start=monitor_path)
@@ -6854,7 +6998,7 @@ HistoryRow = namedtuple('HistoryRow', ['version', 'event', 'size', 'source', 'co
 # what a change list row can record, as a folder's history counts them
 CHANGE_EVENTS = ('create', 'modify', 'attrib', 'move', 'delete')
 
-PathChanges = namedtuple('PathChanges', ['row', 'moved_from', 'moved_to', 'counts', 'files'])
+PathChanges = namedtuple('PathChanges', ['row', 'moved_from', 'moved_to', 'counts', 'files', 'recopied'])
 
 def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool = True) -> PathChanges:
 	'''
@@ -6863,7 +7007,8 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 	to (moved_to), else None; and for a folder, how many rows lie below it by event (counts) and each one's
 	(event, path below the folder) in the list's order, folders keeping their trailing '/' (files; None unless
 	list_files). The folder's own row is not counted below it; a move out of the folder counts as a delete, listed as
-	('moved_away', the path it left).
+	('moved_away', the path it left). A file the version copied again from the vault is no change: its recopy row is
+	neither the path's row nor counted, and only sets recopied.
 	'''
 	own = path.rstrip('/')
 	prefix = own + '/'
@@ -6872,8 +7017,12 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 	from_depth = to_depth = 0
 	counts = dict.fromkeys(CHANGE_EVENTS, 0) if folder else None
 	files = [] if folder and list_files else None
+	recopied = False
 	for row in iter_change_list(change_list):
 		its_own = row.path.rstrip('/') == own
+		if row.event == 'recopy':
+			recopied = recopied or its_own
+			continue
 		if its_own:
 			row_found = row
 		elif folder and row.path.startswith(prefix) and row.event in counts:
@@ -6896,7 +7045,7 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 			moved_to, to_depth = row.path.rstrip('/'), len(prefix)
 		elif source.endswith('/') and prefix.startswith(source) and len(source) > to_depth:
 			moved_to, to_depth = row.path.rstrip('/') + '/' + own[len(source):], len(source)
-	return PathChanges(row_found, moved_from, moved_to, counts, files)
+	return PathChanges(row_found, moved_from, moved_to, counts, files, recopied)
 
 def history_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str) -> tuple:
 	'''
@@ -6956,9 +7105,10 @@ def path_history(job_vault:str, versions:list, monitor_path:str, rel:str, folder
 		else:
 			changes = path_changes(version.change_list, path, folder, list_files)
 			if held:
-				# a version's folders are real folders; a file is unchanged when it links to the same path in an older version
+				# a version's folders are real folders; a file is unchanged when it links to the same path in an older version,
+				# or holds a copy of it made again from the vault
 				changed = (not held_before or changes.row is not None or (folder and any(changes.counts.values()))
-					or (not folder and hop_rel != rel))
+					or (not folder and hop_rel != rel and not changes.recopied))
 				if changed:
 					moved_from = os.path.join(monitor_path, hop_rel) if hop_rel not in (None, rel) else changes.moved_from
 					event, source = held_event(changes, resolved, moved_from, held_before)
