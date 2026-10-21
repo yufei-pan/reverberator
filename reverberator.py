@@ -5286,6 +5286,19 @@ def compare_monitor_entry(monitor_entry:str, monitor_stat:os.stat_result, record
 		return 'modify'
 	return 'attrib' if attrs_differ else None
 
+def kernel_cannot_follow(version_path:str, rel:str, record:ManifestRecord) -> bool:
+	'''
+	Whether version_path holds at rel a chain of links to the file record was read from that the kernel cannot follow.
+	Daemons before 0.39 kept a link's text when a move took it to another folder depth, so it no longer reaches the
+	copy: read_vault_record() still finds the copy by chain_link_target(), but browsing the vault does not, nor does
+	copy_file_meta() syncing attributes through the link.
+	'''
+	if record.kind not in ('f', 'o'):
+		# a folder is never a link, and a user's symlink or a referenced backup's link is not followed
+		return False
+	entry = os.path.join(version_path, rel)
+	return os.path.islink(entry) and not os.path.exists(entry)
+
 def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_path:str, monitor_path:str):
 	'''
 	Compare one tracked entry for delta generation, on the compare pool.
@@ -5304,6 +5317,10 @@ def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_pat
 		if found is None or (found.size, found.mtime_ns, found.hash) != (record.size, record.mtime_ns, record.hash):
 			backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Vault copy at {os.path.join(version_path, rel)} does not match its record, copying again')
 			return 'modify', None
+	if found is not None and kernel_cannot_follow(version_path, rel, found):
+		# copied again, the new version holds a real copy; the link stays in the older versions until pruning materialises it
+		backuperTeeLogToTl(path=monitor_entry,message=f'{os.path.join(version_path, rel)} links to its copy by a path the kernel cannot follow, as a move to another folder depth left it before 0.39, copying again')
+		return 'modify', None
 	try:
 		monitor_stat = os.lstat(monitor_entry)
 	except OSError:
