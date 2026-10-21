@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import sys
+import select
 import threading
 import time
 import pytest
@@ -49,7 +50,7 @@ def test_pruning_waits_while_a_restore_holds_the_lock(job):
 		run_backup(job, _change(job, 3), keep_n_versions=3)
 		assert _numbers(job) == [0, 1, 2, 3]
 	run_backup(job, _change(job, 4), keep_n_versions=3)
-	assert _numbers(job)[0] >= 2
+	assert _numbers(job) == [2, 3, 4]
 
 
 def test_pruning_resumes_after_the_restoring_process_is_killed(job, tmp_path):
@@ -58,6 +59,8 @@ def test_pruning_resumes_after_the_restoring_process_is_killed(job, tmp_path):
 	env = dict(os.environ, REVERB_STATE_DIR=str(tmp_path / 'state'), PYTHONPATH=os.path.dirname(rv.__file__))
 	proc = subprocess.Popen([sys.executable, '-c', code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
 	try:
+		# a child that never gets there must fail the test, not hang it
+		assert select.select([proc.stdout], [], [], 10)[0], 'the restoring process never took the lock'
 		assert proc.stdout.readline().strip() == b'held'
 		run_backup(job, _change(job, 3), keep_n_versions=3)
 		assert _numbers(job) == [0, 1, 2, 3]
@@ -67,7 +70,7 @@ def test_pruning_resumes_after_the_restoring_process_is_killed(job, tmp_path):
 		proc.stdin.close()
 		proc.stdout.close()
 	run_backup(job, _change(job, 4), keep_n_versions=3)
-	assert _numbers(job)[0] >= 2
+	assert _numbers(job) == [2, 3, 4]
 
 
 def test_restore_lock_waits_for_a_running_prune(tmp_path, capsys):
@@ -244,3 +247,30 @@ def test_restore_lock_default_stream_is_the_stderr_of_the_moment(tmp_path, capsy
 		os.close(fd)
 		thread.join(5)
 	assert entered.is_set()
+
+
+def test_pruning_holds_the_lock_while_the_oldest_version_is_removed(job, monkeypatch):
+	_three_versions(job)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	os.makedirs(os.path.dirname(rv.restore_lock_path('job')), exist_ok=True)
+	seen = []
+	real = rv.decrement_stepper
+	def stepping(vault_info_dict):
+		# what a restore starting now finds: the lock taken, so it waits for this removal
+		fd = os.open(rv.restore_lock_path('job'), os.O_RDWR)
+		try:
+			try:
+				fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+				seen.append('free')
+				fcntl.flock(fd, fcntl.LOCK_UN)
+			except BlockingIOError:
+				seen.append('held')
+		finally:
+			os.close(fd)
+		return real(vault_info_dict)
+	monkeypatch.setattr(rv, 'decrement_stepper', stepping)
+	assert rv.prune_oldest(info, 'job') != (0, 0)
+	assert seen == ['held'] and _numbers(job) == [1, 2]
+	# and released afterwards
+	with rv.RestoreLock('job'):
+		pass

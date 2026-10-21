@@ -80,6 +80,20 @@ def until_then(target):
 	return f'Until then {target} stays private (mode 0700) and its folders stay owned by {owner}, without their own modes and times'
 
 
+@pytest.fixture
+def frozen_disk(job, monkeypatch):
+	'''The free space of the monitored path as it is the first time it is asked, so a busy disk cannot move it between the command's reading and the test's.'''
+	statvfs = os.statvfs
+	held = []
+	def frozen(path):
+		if os.fspath(path) == job.monitor:
+			if not held:
+				held.append(statvfs(path))
+			return held[0]
+		return statvfs(path)
+	monkeypatch.setattr(os, 'statvfs', frozen)
+
+
 def disk_line(root, version):
 	'''The line a whole-job restore in place shows about the filesystem it writes to.'''
 	mount_point, source = rv.mount_holding(rv.current_mount_table(), root)
@@ -174,7 +188,7 @@ def test_in_place_folder_taken_right_after_the_move_aside(job, tmp_path, capsys,
 	assert tree(os.path.join(job.monitor, aside)) == {'a.txt': 'a2'} and tree(target) == {'new.txt': 'new'}
 
 
-def test_in_place_root_needs_an_empty_root(job, tmp_path, capsys):
+def test_in_place_root_needs_an_empty_root(job, frozen_disk, tmp_path, capsys):
 	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b', 'lost+found/': None})
 	os.chmod(f'{job.monitor}/lost+found', 0o700)
 	run_backup(job)
@@ -362,7 +376,7 @@ def test_in_place_rerun_does_not_move_aside_again(job, tmp_path, capsys, monkeyp
 	assert tree(os.path.join(job.monitor, aside))['f00.txt'] == 'edited'
 
 
-def test_in_place_root_asks_while_the_daemon_runs_the_job(job, tmp_path, capsys, monkeypatch):
+def test_in_place_root_asks_while_the_daemon_runs_the_job(job, frozen_disk, tmp_path, capsys, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
 	write_rule(job)
@@ -400,37 +414,56 @@ def test_in_place_root_asks_while_the_daemon_runs_the_job(job, tmp_path, capsys,
 	assert err == f'{shown_disk}\nContinue? [y/N] ' and stdout.startswith('Restored ')
 
 
+def refuses_an_untrusted_marker(job, tmp_path, capsys, name, prepare, *found):
+	'''A marker of this restore that prepare(target, marker) makes untrustworthy: the run is refused and touches nothing.'''
+	v0 = versions(job)[0]
+	out = destination(tmp_path, name)
+	target = os.path.join(out, 'proj')
+	marker = mark(target, job, 'proj', v0.name)
+	prepare(target, marker)
+	before = tree(target), metadata(target)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert (code, stdout) == (rv.EXIT_USAGE, ''), name
+	assert all(part in err for part in found), (name, err)
+	assert (tree(target), metadata(target)) == before, name
+
+
+def test_resume_refuses_a_marker_it_cannot_trust_without_root(job, tmp_path, capsys):
+	# the cases no other user is needed for
+	seed_monitor(job, {'proj/a.txt': 'a'})
+	run_backup(job)
+	write_rule(job)
+
+	def open_to_others(target, marker):
+		os.chmod(target, 0o777)
+	refuses_an_untrusted_marker(job, tmp_path, capsys, 'open', open_to_others, f'{target_of("open", tmp_path)} holds a restore marker', 'other users can write')
+
+	def linked(target, marker):
+		os.rename(marker, str(tmp_path / 'real_marker'))
+		os.symlink(str(tmp_path / 'real_marker'), marker)
+	refuses_an_untrusted_marker(job, tmp_path, capsys, 'linked', linked, rv.RESTORE_MARKER_NAME, 'not a regular file')
+
+	def garbled(target, marker):
+		with open(marker, 'w', encoding='utf-8') as f:
+			f.write('{not json')
+	refuses_an_untrusted_marker(job, tmp_path, capsys, 'garbled', garbled, rv.RESTORE_MARKER_NAME, 'cannot be read')
+
+	def not_json_object(target, marker):
+		with open(marker, 'w', encoding='utf-8') as f:
+			f.write('[1, 2]')
+	refuses_an_untrusted_marker(job, tmp_path, capsys, 'array', not_json_object, rv.RESTORE_MARKER_NAME, 'cannot be read')
+
+
 @pytest.mark.skipif(not ROOT, reason='needs root to hand folders to another user')
 def test_resume_refuses_a_marker_it_cannot_trust(job, tmp_path, capsys):
 	seed_monitor(job, {'proj/a.txt': 'a'})
 	run_backup(job)
 	write_rule(job)
 	v0 = versions(job)[0]
-
-	def refused(name, prepare, *found):
-		out = destination(tmp_path, name)
-		target = os.path.join(out, 'proj')
-		marker = mark(target, job, 'proj', v0.name)
-		prepare(target, marker)
-		before = tree(target), metadata(target)
-		code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-		assert (code, stdout) == (rv.EXIT_USAGE, ''), name
-		assert all(part in err for part in found), (name, err)
-		assert (tree(target), metadata(target)) == before, name
+	refused = lambda name, prepare, *found: refuses_an_untrusted_marker(job, tmp_path, capsys, name, prepare, *found)
 	# planted in a folder another user owns, or can write to: a restore must never write into a folder they control
 	refused('theirs', lambda target, marker: os.chown(target, OTHER, OTHER), f'{target_of("theirs", tmp_path)} holds a restore marker', f'uid {OTHER}')
-	refused('open', lambda target, marker: os.chmod(target, 0o777), f'{target_of("open", tmp_path)} holds a restore marker', 'other users can write')
 	refused('their_marker', lambda target, marker: os.chown(marker, OTHER, OTHER), rv.RESTORE_MARKER_NAME, f'uid {OTHER}')
-
-	def linked(target, marker):
-		os.rename(marker, str(tmp_path / 'real_marker'))
-		os.symlink(str(tmp_path / 'real_marker'), marker)
-	refused('linked', linked, rv.RESTORE_MARKER_NAME, 'not a regular file')
-
-	def garbled(target, marker):
-		with open(marker, 'w', encoding='utf-8') as f:
-			f.write('{not json')
-	refused('garbled', garbled, rv.RESTORE_MARKER_NAME, 'cannot be read')
 	# in place, another user's folder holding a marker is neither picked up nor moved aside
 	shutil.rmtree(f'{job.monitor}/proj')
 	mark(f'{job.monitor}/proj', job, 'proj', v0.name)
@@ -731,7 +764,7 @@ def test_accept_needs_an_unfinished_restore(job, tmp_path, capsys):
 	assert os.path.isfile(os.path.join(out, 'proj', rv.RESTORE_MARKER_NAME))
 
 
-def test_in_place_root_shows_the_disk_and_refuses_too_little_space(job, tmp_path, capsys, monkeypatch):
+def test_in_place_root_shows_the_disk_and_refuses_too_little_space(job, frozen_disk, tmp_path, capsys, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a' * 5000})
 	run_backup(job)
 	write_rule(job)
@@ -790,6 +823,30 @@ def test_in_place_root_weighs_free_space_against_the_whole_tree(job, tmp_path, c
 	assert code == 0 and err.startswith('Restoring the whole job into ')
 	assert err.startswith(shown_disk + '\n') and stdout.startswith('Restored ')
 	assert tree(job.monitor) == {'big.txt': 'a' * 200000, 'small.txt': 's2'}
+
+
+def test_a_picked_up_whole_job_restore_skips_the_free_space_checks(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a' * 20000, 'b.txt': 'b'})
+	run_backup(job)
+	write_rule(job)
+	version = versions(job)[0]
+	assert version.size > 1024
+	shutil.rmtree(job.monitor)
+	# less free space than the version took, as part of it is already in place
+	statvfs = os.statvfs
+	small = os.statvfs_result((4096, 1, 1, 1, 1, 100, 50, 50, 0, 255))
+	monkeypatch.setattr(os, 'statvfs', lambda path: small if os.fspath(path) == job.monitor else statvfs(path))
+	# nothing in place: refused
+	os.mkdir(job.monitor)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
+	assert (code, stdout) == (rv.EXIT_USAGE, '') and 'Not restoring the whole job' in err
+	# its own unfinished output there: picked up, with neither the refusal nor the warning that it may not fit
+	os.rmdir(job.monitor)
+	mark(job.monitor, job, '', version.name)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
+	assert code == 0, err
+	assert err.startswith('Restoring the whole job into ') and 'may not fit' not in err and 'Not restoring' not in err
+	assert tree(job.monitor) == {'a.txt': 'a' * 20000, 'b.txt': 'b'}
 
 
 def test_resume_never_replaces_a_folder_where_a_file_goes(job, tmp_path, capsys):

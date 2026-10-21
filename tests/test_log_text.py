@@ -70,3 +70,11 @@ def test_direct_log_calls_are_escaped(capsys):
 def test_log_text_keeps_line_structure():
 	assert rv.log_text('a\nb\n') == 'a\n    b\n    '
 	assert rv.log_text('café') == 'café'
+
+
+def test_a_carriage_return_in_a_name_cannot_start_a_line(capsys):
+	rv.backuperTeeLogToTl('/m/a\r' + FORGED, 'Not copying /m/a\r' + FORGED, error=True)
+	rv.job_log('j', f'UNREADABLE: /m/a\r{FORGED}: gone')
+	out = capsys.readouterr().out
+	assert '\r' not in out
+	assert len(alerting_lines(out)) == 1
