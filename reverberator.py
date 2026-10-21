@@ -4675,7 +4675,8 @@ STORED_NAME_ESCAPES = re.compile(f'{NAME_ESCAPE}([{NAME_ESCAPE}\U0010ff80-\U0010
 def storable_name(text:str) -> str:
 	'''
 	text, a name or path as os.fsdecode() gives it, as valid Unicode that stored_name() turns back into text exactly.
-	Each character is escaped on its own, so a folder's stored path starts every stored path under it.
+	Each character is escaped on its own, so a folder's stored path starts every stored path under it. The 128 bytes
+	that are not UTF-8 encode to UTF-8 (which never raises) as 128 different stored forms.
 
 	Examples:
 		>>> storable_name('café'), storable_name('a/b/')
@@ -4686,12 +4687,17 @@ def storable_name(text:str) -> str:
 		True
 		>>> storable_name('d\\udcff/' + 'x\\udc80') == storable_name('d\\udcff/') + storable_name('x\\udc80')
 		True
-		>>> all(storable_name(os.fsdecode(bytes([byte]))).encode('utf-8') for byte in range(0x80, 0x100))
-		True
+		>>> len({storable_name(os.fsdecode(bytes([byte]))).encode('utf-8') for byte in range(0x80, 0x100)})
+		128
 	'''
 	if text.isascii():
 		return text
-	return STORABLE_NAME_ESCAPES.sub(lambda match: NAME_ESCAPE + (NAME_ESCAPE if match.group(0) == NAME_ESCAPE else chr(ord(match.group(0)) - 0xdc00 + 0x10ff00)), text)
+	return STORABLE_NAME_ESCAPES.sub(storable_char, text)
+
+def storable_char(match) -> str:
+	'''What storable_name() stores for the one character STORABLE_NAME_ESCAPES matched.'''
+	c = match.group(0)
+	return NAME_ESCAPE + (NAME_ESCAPE if c == NAME_ESCAPE else chr(ord(c) - 0xdc00 + 0x10ff00))
 
 def stored_name(text:str) -> str:
 	'''
@@ -4710,7 +4716,12 @@ def stored_name(text:str) -> str:
 	'''
 	if NAME_ESCAPE not in text:
 		return text
-	return STORED_NAME_ESCAPES.sub(lambda match: NAME_ESCAPE if match.group(1) == NAME_ESCAPE else chr(ord(match.group(1)) - 0x10ff00 + 0xdc00), text)
+	return STORED_NAME_ESCAPES.sub(stored_char, text)
+
+def stored_char(match) -> str:
+	'''The character stored_name() reads back from the escape STORED_NAME_ESCAPES matched.'''
+	c = match.group(1)
+	return NAME_ESCAPE if c == NAME_ESCAPE else chr(ord(c) - 0x10ff00 + 0xdc00)
 
 def folder_range_end(folder:str) -> str:
 	'''
@@ -4759,6 +4770,9 @@ class VaultManifest:
 		True ['d/'] ['c.txt', 'd/x.txt', 'd/y.txt']
 	'''
 	SCHEMA = '2'
+	# the entries columns of schema '1', which schema '2' follows with copy_version
+	SCHEMA_1_COLUMNS = ('path TEXT PRIMARY KEY, kind TEXT, size INTEGER, mtime_ns INTEGER, mode INTEGER, uid INTEGER, gid INTEGER, '
+		'hash TEXT, link TEXT, unchecked INTEGER, dirty INTEGER NOT NULL DEFAULT 0')
 	UNVERIFIED = 'kind = NULL, size = NULL, mtime_ns = NULL, mode = NULL, uid = NULL, gid = NULL, hash = NULL, link = NULL, unchecked = NULL, dirty = 0'
 
 	def __init__(self, job_vault:str):
@@ -4788,9 +4802,7 @@ class VaultManifest:
 				self.conn.execute('DELETE FROM meta')
 				self.conn.execute("INSERT INTO meta VALUES ('schema', ?)", (self.SCHEMA,))
 			# copy_version comes last, where upgrading a schema '1' database adds it
-			self.conn.execute('CREATE TABLE IF NOT EXISTS entries(path TEXT PRIMARY KEY, kind TEXT, size INTEGER, mtime_ns INTEGER, '
-				'mode INTEGER, uid INTEGER, gid INTEGER, hash TEXT, link TEXT, unchecked INTEGER, dirty INTEGER NOT NULL DEFAULT 0, '
-				'copy_version INTEGER) WITHOUT ROWID')
+			self.conn.execute(f'CREATE TABLE IF NOT EXISTS entries({self.SCHEMA_1_COLUMNS}, copy_version INTEGER) WITHOUT ROWID')
 			self.conn.execute('CREATE INDEX IF NOT EXISTS dirty_entries ON entries(path) WHERE dirty')
 			self.conn.execute('CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY) WITHOUT ROWID')
 		except BaseException:
@@ -4813,6 +4825,9 @@ class VaultManifest:
 
 	def _upgrade_from_schema_1(self):
 		'''The statements upgrading a schema '1' database, in the transaction _upgrade() holds.'''
+		# 0.39 committed a new database's schema and its entries table one after the other: a crash between the two left
+		# no table, which holds no rows either
+		self.conn.execute(f'CREATE TABLE IF NOT EXISTS entries({self.SCHEMA_1_COLUMNS}) WITHOUT ROWID')
 		self.conn.execute('ALTER TABLE entries ADD COLUMN copy_version INTEGER')
 		# schema '1' stored names as they are: NAME_ESCAPE in one (rare, as it is a private use code point) is doubled to
 		# read back the same. the rows holding it move out and back in, as sqlite checks the key row by row, and a name
