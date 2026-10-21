@@ -85,11 +85,16 @@ def test_run_job_publishes_retrying_then_stopped(board, read_job, monkeypatch, p
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.3)
 	start_attempt, _ = _attempts([('fail', 'disk gone'), ('fail', 'bad pattern', True)])
 	seen = []
+
+	def retrying():
+		# the time first: the record read after it was still the one waiting for its retry
+		seen.append((time.time(), read_job('j')))
+		return (seen[-1][1] or {}).get('state') == 'retrying'
 	thread = threading.Thread(target=rv.run_job, args=(rv.JobControl('j'), start_attempt))
 	thread.start()
-	wait_until(lambda: seen.append(read_job('j')) or (seen[-1] or {}).get('state') == 'retrying')
-	retrying = read_job('j')
-	assert retrying['detail'] == 'disk gone' and retrying['failures'] == 1 and retrying['retry_at'] > time.time() - 0.01
+	wait_until(retrying)
+	read_at, record = seen[-1]
+	assert record['detail'] == 'disk gone' and record['failures'] == 1 and record['retry_at'] > read_at
 	thread.join(10)
 	stopped = read_job('j')
 	assert stopped['state'] == 'stopped' and stopped['detail'] == 'bad pattern'
