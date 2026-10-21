@@ -6771,11 +6771,21 @@ def find_job(rules:list, path:str, job_name:str = None) -> tuple:
 	else:
 		candidates = [rule for rule in rules if rule.job_name]
 	path = os.path.abspath(path)
-	best = None
-	for rule in candidates:
-		mon_path = rule.mon_path.rstrip('/')
-		if (path == mon_path or path.startswith(mon_path + '/')) and (best is None or len(mon_path) > len(best[1])):
-			best = (rule, mon_path)
+	def holder(path:str):
+		best = None
+		for rule in candidates:
+			mon_path = rule.mon_path.rstrip('/')
+			if (path == mon_path or path.startswith(mon_path + '/')) and (best is None or len(mon_path) > len(best[1])):
+				best = (rule, mon_path)
+		return best
+	best = holder(path)
+	if best is None and path != '/':
+		# typed through a symlink above a monitored path: the path with the longest folder of it that exists resolved
+		# (the name itself is kept, as a monitored symlink is backed up as one)
+		resolved = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+		best = holder(resolved)
+		if best is not None:
+			path = resolved
 	if best is None:
 		where = f"job {job_name}'s monitored path ({candidates[0].mon_path})" if job_name is not None else f"any job's monitored path ({', '.join(rule.mon_path for rule in rules if rule.job_name)})"
 		raise CommandError(f'{path} is not under {where}')
@@ -6891,7 +6901,13 @@ def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path
 	hops = 0
 	# every hop goes down a version, so the walk ends by itself; this only bounds it should a link ever not
 	own_number = vault_version_number(os.path.basename(os.path.abspath(version_path)))
-	max_hops = (own_number or 0) + 1
+	if own_number is None:
+		# a folder without a number (not one list_versions gives) can chain to any version in the vault
+		try:
+			own_number = len(os.listdir(vault))
+		except OSError as e:
+			return ResolvedEntry('unreadable', os.path.abspath(os.path.join(version_path, rel)), str(e))
+	max_hops = own_number + 1
 	# lstat follows the symlinks among rel's folders, so they must be real ones: a backed-up folder symlink holds no
 	# files of the version, and what lies behind it is the live file
 	version_top = os.path.abspath(version_path)
@@ -6956,6 +6972,8 @@ def unescape_change_list_field(text:str) -> str:
 		>>> unescape_change_list_field('</LF/>')
 		'<LF>'
 	'''
+	if '<' not in text:
+		return text
 	return CHANGE_LIST_ESCAPE_PATTERN.sub(lambda match: CHANGE_LIST_ESCAPES[match.group(0)], text)
 
 def iter_change_list(path:str):
@@ -7067,9 +7085,10 @@ def load_command_rules(rule_path:str) -> list:
 
 VaultNumbers = namedtuple('VaultNumbers', ['present', 'versions', 'size', 'inodes', 'size_limit', 'inode_limit', 'keep_n'])
 
-def vault_numbers(rule:ReverbRule) -> VaultNumbers:
-	'''What a job's vault holds and what limits it: sizes summed from its versions, limits as the backuper works them out.'''
-	versions = list_versions(job_vault_path(rule))
+def vault_numbers(rule:ReverbRule, versions:list = None) -> VaultNumbers:
+	'''What a job's vault holds and what limits it: sizes summed from its versions (list_versions() unless given), limits as the backuper works them out.'''
+	if versions is None:
+		versions = list_versions(job_vault_path(rule))
 	size_limit, inode_limit = get_backup_limits_from_str(rule.backup_size_limit, *get_path_fs_info(rule.vault_path))
 	try:
 		keep_n = int(rule.keep_n_versions)
@@ -7080,22 +7099,26 @@ def vault_numbers(rule:ReverbRule) -> VaultNumbers:
 
 def show_size(size:int, limit:int = None) -> str:
 	'''
-	A byte count for people, or 'no limit' when limit is 0.
-	>>> show_size(1536), show_size(0, 0)
-	('1.50 KiB', 'no limit')
+	A byte count for people, or 'no limit' when limit is 0; below 1 KiB as a whole number.
+	>>> show_size(1536), show_size(0, 0), show_size(0), show_size(512)
+	('1.50 KiB', 'no limit', '0 B', '512 B')
 	'''
 	if limit == 0:
 		return 'no limit'
+	if size < 1024:
+		return f'{size} B'
 	return format_bytes(size, use_1024_bytes=True, to_str=True).rstrip() + 'B'
 
 def show_count(count:int, limit:int = None) -> str:
 	'''
-	A count for people, or 'no limit' when limit is 0.
-	>>> show_count(126750), show_count(5, 0)
-	('126.75 K', 'no limit')
+	A count for people, or 'no limit' when limit is 0; below 1000 as a whole number.
+	>>> show_count(126750), show_count(5, 0), show_count(4)
+	('126.75 K', 'no limit', '4')
 	'''
 	if limit == 0:
 		return 'no limit'
+	if count < 1000:
+		return str(count)
 	return format_bytes(count, use_1024_bytes=False, to_str=True).strip()
 
 def show_time(epoch:float, clock_only:bool = False) -> str:
@@ -7169,19 +7192,20 @@ def format_job_status(rule:ReverbRule, record, status:DaemonStatus, width:int) -
 	indent = ' ' * (width + 2)
 	lines = [f'{rule.job_name:<{width}}  {job_state_phrase(record, status.alive, started)}']
 	try:
-		numbers = vault_numbers(rule)
 		versions = list_versions(job_vault_path(rule))
+		numbers = vault_numbers(rule, versions)
 		if versions:
 			newest, oldest = versions[-1], versions[0]
 			lines.append(f'{indent}last backup {show_time(newest.timestamp)} (V{newest.number})')
-			lines.append(f'{indent}{numbers.versions} versions (limit {numbers.keep_n or "no limit"}), oldest V{oldest.number} {show_time(oldest.timestamp)}')
+			lines.append(f'{indent}{numbers.versions} versions ({f"limit {numbers.keep_n}" if numbers.keep_n else "no limit"}), oldest V{oldest.number} {show_time(oldest.timestamp)}')
 		else:
 			lines.append(f'{indent}no versions yet')
 		if not os.path.isdir(rule.vault_path) or not os.listdir(rule.vault_path):
 			lines.append(f'{indent}vault not mounted: {rule.vault_path}')
 		elif numbers.present:
-			lines.append(f'{indent}vault {show_size(numbers.size)} / limit {show_size(numbers.size_limit, numbers.size_limit)}, '
-				f'{show_count(numbers.inodes)} inodes / limit {show_count(numbers.inode_limit, numbers.inode_limit)}')
+			size_limit = 'no limit' if numbers.size_limit == 0 else f'limit {show_size(numbers.size_limit)}'
+			inode_limit = 'no limit' if numbers.inode_limit == 0 else f'limit {show_count(numbers.inode_limit)}'
+			lines.append(f'{indent}vault {show_size(numbers.size)} / {size_limit}, {show_count(numbers.inodes)} inodes / {inode_limit}')
 	except OSError as e:
 		# a stale mount or a permission error on one vault must not stop the others showing
 		lines = lines[:1] + [f'{indent}vault not readable: {rule.vault_path}: {e}']
@@ -7298,47 +7322,60 @@ def held_event(changes:PathChanges, resolved:ResolvedEntry, moved_from:str, held
 	'''
 	(event, source) for a version that holds a path and changed it: its change list row's event when that fits a path
 	the version holds; else a move when the entry came from another path; else a creation when the version below
-	lacked it, or 'changed'. A link that leads nowhere or cannot be read is 'changed' unless its row says more.
+	lacked it, or 'changed'. A link that leads nowhere or cannot be read is 'changed' unless its row says more. A move
+	row that names no source takes moved_from, where the entry's chain link leads, as the source.
 	'''
 	row = changes.row
 	if row is not None and row.event in ('create', 'modify', 'attrib', 'move'):
-		return row.event, changes.moved_from if row.event == 'move' else None
+		if row.event != 'move':
+			return row.event, None
+		# a move row without a source leaves it to the chain
+		return 'move', moved_from if changes.moved_from is None else changes.moved_from
 	if resolved.kind in ('dangling', 'unreadable'):
 		return 'changed', None
 	if moved_from is not None:
 		return 'move', moved_from
 	return ('changed' if held_before else 'create'), None
 
-def path_history(job_vault:str, versions:list, monitor_path:str, rel:str, folder:bool, list_files:bool = True) -> list:
-	'''file_history() or folder_history(): the version folders tell when the path changed, the change lists what.'''
+def path_history(job_vault:str, versions:list, monitor_path:str, rel:str, folder:bool, list_files:bool = True):
+	'''
+	Yield the HistoryRows of file_history() or folder_history(), newest first, each as it is found: the version folders
+	tell when the path changed, the change lists what. Each version's entry is resolved once, and a version's change
+	list is read only when that version or the one below it holds the path.
+	'''
 	path = os.path.join(monitor_path, rel) if rel else monitor_path
-	rows = []
-	held_before = False
-	for index, version in enumerate(versions):
-		resolved, hop_rel = history_entry(job_vault, version, monitor_path, rel)
+	if not versions:
+		return
+	# walking down, the entry of the version below is the next one's own
+	below = history_entry(job_vault, versions[-1], monitor_path, rel)
+	for index in range(len(versions) - 1, -1, -1):
+		version = versions[index]
+		resolved, hop_rel = below
 		held = resolved.kind != 'missing'
 		size = None if folder else resolved_size(resolved)
 		if not index:
 			# not a change: what it changed from is no longer kept, so its change list is not read
 			if held:
-				rows.append(HistoryRow(version, 'oldest', size, None, dict.fromkeys(CHANGE_EVENTS, 0) if folder else None,
-					[] if folder and list_files else None))
+				yield HistoryRow(version, 'oldest', size, None, dict.fromkeys(CHANGE_EVENTS, 0) if folder else None,
+					[] if folder and list_files else None)
+			continue
+		below = history_entry(job_vault, versions[index - 1], monitor_path, rel)
+		held_before = below[0].kind != 'missing'
+		if not held and not held_before:
+			continue
+		changes = path_changes(version.change_list, path, folder, list_files)
+		if held:
+			# a version's folders are real folders; a file is unchanged when it links to the same path in an older version,
+			# or holds a copy of it made again from the vault
+			changed = (not held_before or changes.row is not None or (folder and any(changes.counts.values()))
+				or (not folder and hop_rel != rel and not changes.recopied))
+			if changed:
+				moved_from = os.path.join(monitor_path, hop_rel) if hop_rel not in (None, rel) else changes.moved_from
+				event, source = held_event(changes, resolved, moved_from, held_before)
+				yield HistoryRow(version, event, size, source, changes.counts, changes.files)
 		else:
-			changes = path_changes(version.change_list, path, folder, list_files)
-			if held:
-				# a version's folders are real folders; a file is unchanged when it links to the same path in an older version,
-				# or holds a copy of it made again from the vault
-				changed = (not held_before or changes.row is not None or (folder and any(changes.counts.values()))
-					or (not folder and hop_rel != rel and not changes.recopied))
-				if changed:
-					moved_from = os.path.join(monitor_path, hop_rel) if hop_rel not in (None, rel) else changes.moved_from
-					event, source = held_event(changes, resolved, moved_from, held_before)
-					rows.append(HistoryRow(version, event, size, source, changes.counts, changes.files))
-			elif held_before:
-				event = 'delete' if changes.moved_to is None else 'moved_away'
-				rows.append(HistoryRow(version, event, None, changes.moved_to, changes.counts, changes.files))
-		held_before = held
-	return rows[::-1]
+			event = 'delete' if changes.moved_to is None else 'moved_away'
+			yield HistoryRow(version, event, None, changes.moved_to, changes.counts, changes.files)
 
 def path_kind(job_vault:str, versions:list, monitor_path:str, rel:str) -> str:
 	'''
@@ -7366,9 +7403,9 @@ def file_history(job_vault:str, versions:list, monitor_path:str, rel:str) -> lis
 	link to another path is a move from it), when it lacks the entry the version below held (delete, or moved_away when
 	its change list moved the path, or a folder above it, elsewhere), or when its change list has a row for the path
 	(such as an attribute change, which the version's link does not show); the row gives the event when it has one.
-	The oldest kept version is listed as 'oldest' when it holds the entry. Each change list is read once, streamed.
+	The oldest kept version is listed as 'oldest' when it holds the entry. A change list is read once, streamed, and only when the version or the one below holds the entry.
 	'''
-	return path_history(job_vault, versions, monitor_path, rel, folder=False)
+	return list(path_history(job_vault, versions, monitor_path, rel, folder=False))
 
 def folder_history(job_vault:str, versions:list, monitor_path:str, rel:str, list_files:bool = True) -> list:
 	'''
@@ -7377,7 +7414,7 @@ def folder_history(job_vault:str, versions:list, monitor_path:str, rel:str, list
 	list_files is False), or a row for the folder itself, or when the folder appears or goes in it (as its own row or a
 	move of a folder above it says, else create or delete); the oldest kept version holding it is listed as 'oldest'.
 	'''
-	return path_history(job_vault, versions, monitor_path, rel, folder=True, list_files=list_files)
+	return list(path_history(job_vault, versions, monitor_path, rel, folder=True, list_files=list_files))
 
 HISTORY_LABELS = {'create': 'created', 'modify': 'modified', 'attrib': 'attributes changed', 'delete': 'deleted',
 	'changed': 'changed', 'oldest': 'oldest kept copy'}
@@ -7424,17 +7461,25 @@ def format_history_row(row:HistoryRow, kind:str) -> str:
 	# a moved-from or moved-to path is a monitored name
 	return shown(line)
 
-def format_history(rule:ReverbRule, job_vault:str, rows:list, kind:str, show_files:bool) -> str:
-	'''The history command's text: the job and its vault, then a line per row, a folder's changed paths under each when show_files.'''
-	lines = [shown(f'job {rule.job_name}, vault {job_vault}')]
+def history_lines(rule:ReverbRule, job_vault:str, rows, kind:str, show_files:bool):
+	'''Yield the history command's lines: the job and its vault, then a line per row (any iterable), a folder's changed paths under each when show_files.'''
+	yield shown(f'job {rule.job_name}, vault {job_vault}')
 	for row in rows:
-		lines.append(format_history_row(row, kind))
+		yield format_history_row(row, kind)
 		if show_files and row.files:
-			lines += [shown(f'    {event} {rel}') for event, rel in row.files]
-	return '\n'.join(lines)
+			for event, rel in row.files:
+				yield shown(f'    {event} {rel}')
 
-def never_backed_up(rule:ReverbRule, rule_path:str, rel:str) -> str:
-	'''Say the path at rel was never backed up, naming the pattern that skips it when the job's skip list reads and has one.'''
+def format_history(rule:ReverbRule, job_vault:str, rows:list, kind:str, show_files:bool) -> str:
+	'''The history command's text: history_lines() joined.'''
+	return '\n'.join(history_lines(rule, job_vault, rows, kind, show_files))
+
+def never_backed_up(rule:ReverbRule, rule_path:str, rel:str, typed_folder:bool = False) -> str:
+	'''
+	Say the path at rel was never backed up, naming the pattern that skips it when the job's skip list reads and has one.
+	A folder is what the live tree says, or what the path was typed as (typed_folder: it ended with a slash), as a
+	folder skipped and since removed has no live tree; no kept version holds the path, so none can tell.
+	'''
 	path = os.path.join(rule.mon_path, rel) if rel else rule.mon_path
 	skip_list_path = resolve_skip_list_path(rule.skip_list_file, rule_path)
 	pattern = None
@@ -7444,7 +7489,7 @@ def never_backed_up(rule:ReverbRule, rule_path:str, rel:str) -> str:
 		except (OSError, ValueError):
 			skip_list = None
 		if skip_list is not None:
-			pattern = skip_list.deciding_pattern(rel, os.path.isdir(path) and not os.path.islink(path))
+			pattern = skip_list.deciding_pattern(rel, typed_folder or (os.path.isdir(path) and not os.path.islink(path)))
 	message = f'{path} was never backed up'
 	return shown(message if pattern is None else f'{message}; it matches the skip pattern {pattern}')
 
@@ -7484,17 +7529,16 @@ def history_command(args) -> int:
 			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
 			kind = path_kind(job_vault, versions, rule.mon_path, rel) if versions else None
-			if kind == 'folder':
-				rows = folder_history(job_vault, versions, rule.mon_path, rel, list_files=args.files)
-			elif kind == 'file':
-				rows = file_history(job_vault, versions, rule.mon_path, rel)
+			if kind is not None:
+				# each row is printed as it is found, so a job's whole history is never held (nor its restore lock let go before)
+				rows = path_history(job_vault, versions, rule.mon_path, rel, folder=kind == 'folder', list_files=args.files and kind == 'folder')
+				for line in history_lines(rule, job_vault, rows, kind, args.files):
+					print(line)
 		except OSError as e:
 			raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
 	if kind is None:
 		# the header alone, then why there is nothing to show
-		print(format_history(rule, job_vault, [], 'file', False) + '\n' + never_backed_up(rule, rule_path, rel))
-	else:
-		print(format_history(rule, job_vault, rows, kind, args.files))
+		print(format_history(rule, job_vault, [], 'file', False) + '\n' + never_backed_up(rule, rule_path, rel, args.path.endswith('/')))
 	return 0
 
 # --- restore: a file, a folder or a whole job copied out of a kept version ---
@@ -8442,7 +8486,7 @@ def restore_command(args) -> int:
 			versions = list_versions(job_vault)
 			kind = path_kind(job_vault, versions, rule.mon_path, rel) if versions else None
 			if kind is None:
-				raise CommandError(never_backed_up(rule, rule_path, rel))
+				raise CommandError(never_backed_up(rule, rule_path, rel, args.path.endswith('/')))
 			# refused before a version is picked, and again once one is, as picking can take a while
 			target = restore_target(rules, dest, rel, rule.mon_path)
 			if args.accept and read_restore_marker(target) is None:

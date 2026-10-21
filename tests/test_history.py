@@ -287,12 +287,14 @@ def test_history_streams_change_lists(job, tmp_path, capsys, monkeypatch):
 	iter_change_list = rv.iter_change_list
 	monkeypatch.setattr(rv, 'iter_change_list', lambda path: read.append(path) or iter_change_list(path))
 	newer = sorted(version.change_list for version in versions(job)[1:])
-	for path, extra in ((f'{job.monitor}/a.txt', ()), (job.monitor, ('--files',))):
+	# a.txt is in V1 to V3 only (V4 and the oldest version lack it, and V4's list would say nothing of it)
+	of_a = sorted(version.change_list for version in versions(job)[1:4])
+	for path, extra, expected in ((f'{job.monitor}/a.txt', (), of_a), (job.monitor, ('--files',), newer)):
 		read.clear()
 		code, out, err = history(tmp_path, capsys, path, *extra)
 		assert (code, err) == (0, '')
 		# each change list once, and the oldest version's not at all: it is shown as the oldest copy, not as a change
-		assert sorted(read) == newer
+		assert sorted(read) == expected
 	assert f'V3  {at(job, 3)}  0 created, 0 modified, 0 deleted, 1 moved' in out
 
 
@@ -489,3 +491,78 @@ def test_history_prints_a_name_that_is_not_utf8(job, tmp_path, capsys):
 	assert out.split('\n')[1] == f'V1  {at(job, 1)}  created  {rv.show_size(1)}'
 	code, out, err = history(tmp_path, capsys, f'{job.monitor}/other{name}')
 	assert code == 0 and out.split('\n')[1] == f'{job.monitor}/otherbad\\xff.txt was never backed up'
+
+
+def test_history_reads_only_change_lists_next_to_the_path_and_resolves_each_version_once(job, monkeypatch):
+	seed_monitor(job, {'keep.txt': 'k'})
+	run_backup(job)
+	for number in range(1, 7):
+		write(job, 'keep.txt', f'k{number}')
+		entries = [('keep.txt', 'modify')]
+		if number == 2:
+			write(job, 'x.txt', 'x')
+			entries.append(('x.txt', 'create'))
+		if number == 5:
+			os.remove(f'{job.monitor}/x.txt')
+			entries.append(('x.txt', 'delete'))
+		backup(job, *entries)
+	read, resolved = [], []
+	real_changes, real_resolve = rv.path_changes, rv.resolve_version_entry
+	monkeypatch.setattr(rv, 'path_changes', lambda change_list, *args, **kwargs: read.append(change_list) or real_changes(change_list, *args, **kwargs))
+	monkeypatch.setattr(rv, 'resolve_version_entry', lambda job_vault, version_path, *args: resolved.append(version_path) or real_resolve(job_vault, version_path, *args))
+	rows = hist(job, 'x.txt')
+	assert events(rows) == [(5, 'delete'), (2, 'create')]
+	# V2 to V5 hold the file or lost it; V0, V1 and V6 never meet it
+	assert sorted(read) == sorted(v.change_list for v in versions(job) if 2 <= v.number <= 5)
+	assert sorted(resolved) == sorted(v.path for v in versions(job))
+
+
+def test_history_files_prints_each_row_as_it_is_produced(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	for number in range(1, 4):
+		write(job, 'a.txt', 'a' * (number + 1))
+		backup(job, ('a.txt', 'modify'))
+	write_rule(job)
+	seen = []
+	real = rv.path_changes
+	def watch(change_list, *args, **kwargs):
+		seen.append(capsys.readouterr().out)
+		return real(change_list, *args, **kwargs)
+	monkeypatch.setattr(rv, 'path_changes', watch)
+	code, out, err = history(tmp_path, capsys, job.monitor, '--files')
+	assert code == 0
+	# what each read finds already printed since the last: V3 is produced first, and is out (with its files) when V2's list is read
+	assert len(seen) == 3 and seen[0] == f'job {job.job_name}, vault {job.job_vault}\n'
+	assert seen[1].split('\n')[:2] == [f'V3  {at(job, 3)}  0 created, 1 modified, 0 deleted', '    modify a.txt']
+	assert seen[2].startswith(f'V2  {at(job, 2)}')
+	assert out.endswith(f'V0  {at(job, 0)}  oldest kept copy\n')
+
+
+def test_a_move_row_without_a_source_shows_the_chain_source(job):
+	a_txt_lifetime(job)
+	moved_list = versions(job)[3].change_list
+	with open(moved_list, encoding='utf-8', newline='\n') as f:
+		lines = f.read().split('\n')
+	rows = [line.split('\0') for line in lines]
+	for fields in rows[1:]:
+		if len(fields) == 4 and fields[2] == 'move':
+			fields[3] = ''
+	with open(moved_list, 'w', encoding='utf-8', newline='\n') as f:
+		f.write('\n'.join('\0'.join(fields) for fields in rows))
+	moved = hist(job, 'b/a.txt')[1]
+	assert (moved.version.number, moved.event, moved.source) == (3, 'move', f'{job.monitor}/a.txt')
+
+
+def test_never_backed_up_knows_a_folder_from_its_trailing_slash(job, tmp_path, capsys):
+	skip_file = tmp_path / 'skip.txt'
+	skip_file.write_text('cache/\n')
+	seed_monitor(job, {'keep': 'k'})
+	run_backup(job)
+	write_rule(job, skip_list_file=str(skip_file))
+	pattern = 'it matches the skip pattern cache/'
+	# a skipped folder that is gone, and no live tree to ask: only the slash says it is one
+	assert pattern not in history(tmp_path, capsys, f'{job.monitor}/cache')[1]
+	assert pattern in history(tmp_path, capsys, f'{job.monitor}/cache/')[1]
+	os.makedirs(f'{job.monitor}/cache')
+	assert pattern in history(tmp_path, capsys, f'{job.monitor}/cache')[1]

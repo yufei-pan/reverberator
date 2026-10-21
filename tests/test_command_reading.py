@@ -314,3 +314,45 @@ def test_resolve_a_version_root_and_a_top_level_entry(job):
 	assert got.kind == 'folder' and got.path == paths[2]
 	got = rv.resolve_version_entry(job.job_vault, paths[2], 'keep', job.monitor)
 	assert got.kind == 'file' and got.path == os.path.join(paths[2], 'keep')
+
+
+def test_find_job_resolves_a_symlinked_parent(two_jobs, tmp_path):
+	rules, top, sub = two_jobs
+	os.symlink(top.monitor, str(tmp_path / 'link'))
+	# typed through a symlink above the monitored path, the file need not exist
+	for typed in (str(tmp_path / 'link/sub/x'), str(tmp_path / 'link/sub/deep/new.txt')):
+		rule, rel = rv.find_job(rules, typed)
+		assert (rule.job_name, rel) == ('sub', typed.partition('/sub/')[2])
+	assert rv.find_job(rules, 'sub/x', job_name='top')[1] == 'sub/x'
+	with pytest.raises(rv.CommandError):
+		rv.find_job(rules, str(tmp_path / 'link/../elsewhere'))
+
+
+def test_unescape_change_list_field_without_an_escape_reads_nothing(monkeypatch):
+	class Boom:
+		def sub(self, *args):
+			raise AssertionError('the pattern was run')
+	monkeypatch.setattr(rv, 'CHANGE_LIST_ESCAPE_PATTERN', Boom())
+	assert rv.unescape_change_list_field('plain name.txt ') == 'plain name.txt '
+
+
+def test_an_unnumbered_version_follows_its_whole_chain(job, monkeypatch):
+	seed_monitor(job, {'a': 'x', 'k': 'k0'})
+	run_backup(job)
+	for number in (1, 2):
+		with open(f'{job.monitor}/k', 'w') as f:
+			f.write(f'k{number}')
+		run_backup(job, OrderedDict([event_entry(job, 'k', 'modify')]))
+	versions = rv.list_versions(job.job_vault)
+	assert os.path.islink(os.path.join(versions[2].path, 'a'))
+	# a version folder whose name carries no number, as the first look at it sees it (a chain link needs the number, so
+	# only the bound on the hops is in question): two hops back to the real copy
+	real, first = rv.vault_version_number, []
+	def number(name):
+		if name == versions[2].name and not first:
+			first.append(name)
+			return None
+		return real(name)
+	monkeypatch.setattr(rv, 'vault_version_number', number)
+	resolved = rv.resolve_version_entry(job.job_vault, versions[2].path, 'a', job.monitor)
+	assert first and (resolved.kind, resolved.path) == ('file', os.path.join(versions[0].path, 'a'))

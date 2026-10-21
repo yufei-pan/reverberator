@@ -244,3 +244,28 @@ def test_status_shows_an_unreadable_vault_and_the_other_jobs(job, tmp_path, caps
 	assert code == 0 and 'Traceback' not in err
 	assert f'vault not readable: {job.vault}: ' in out and 'not connected' in out
 	assert 'last backup' in out and out.index('second') > out.index('vault not readable')
+
+
+def test_show_size_and_count_below_a_thousand_are_plain():
+	assert [rv.show_size(n) for n in (0, 5, 1023)] == ['0 B', '5 B', '1023 B']
+	assert rv.show_size(1536) == '1.50 KiB' and rv.show_size(0, 0) == 'no limit'
+	assert [rv.show_count(n) for n in (0, 4, 999)] == ['0', '4', '999']
+	assert rv.show_count(1000) == '1.00 K' and rv.show_count(5, 0) == 'no limit'
+
+
+def test_status_vault_line_formats(job, tmp_path, capsys):
+	two_versions(job)
+	code, out, err = status(tmp_path, capsys, '--rule', job.rule_path)
+	line = next(line for line in out.split('\n') if 'inodes' in line)
+	versions = rv.list_versions(job.job_vault)
+	assert line.strip() == f'vault {rv.show_size(sum(v.size for v in versions))} / no limit, {sum(v.inodes for v in versions)} inodes / no limit'
+	assert 'limit no limit' not in out and ' 4.00 inodes' not in line
+
+
+def test_status_lists_each_vault_once(job, tmp_path, capsys, monkeypatch):
+	two_versions(job)
+	listed = []
+	real = rv.list_versions
+	monkeypatch.setattr(rv, 'list_versions', lambda path: listed.append(path) or real(path))
+	assert status(tmp_path, capsys, '--rule', job.rule_path)[0] == 0
+	assert listed == [job.job_vault]
