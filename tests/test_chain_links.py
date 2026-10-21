@@ -290,3 +290,42 @@ def test_an_absolute_link_into_a_later_version_is_not_a_chain_link(tmp_path):
 	target = f'{job_vault}/V2--{T}/a/x'
 	assert rv.chain_hop(job_vault, f'{job_vault}/V1--{T}/u', target) is None
 	assert rv.chain_hop(job_vault, f'{job_vault}/V3--{T}/u', target) == target
+
+
+
+@pytest.mark.parametrize('later_versions', [0, 1])
+def test_a_link_an_older_daemon_broke_in_the_newest_version_is_copied_again(job, later_versions):
+	seed_monitor(job, {'a/x.txt': 'x', 'deep/er/keep.txt': 'k'})
+	v0 = run_backup(job)[0]
+	os.rename(f'{job.monitor}/a/x.txt', f'{job.monitor}/deep/er/x.txt')
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'deep/er/x.txt', 'move', 'a/x.txt')]))[-1]
+	# as an older daemon left the move: the text the link had at a/x.txt, which the kernel cannot follow from deep/er/
+	os.remove(f'{v1}/deep/er/x.txt')
+	os.symlink(f'../../{os.path.basename(v0)}/a/x.txt', f'{v1}/deep/er/x.txt')
+	assert not os.path.exists(f'{v1}/deep/er/x.txt')
+	for _ in range(later_versions):
+		# a later version of that daemon, chaining onto the broken link
+		open(f'{job.monitor}/deep/er/keep.txt', 'w').write('k2')
+		run_backup(job, OrderedDict([event_entry(job, 'deep/er/keep.txt', 'modify')]))
+	# the next start's full comparison copies it again, so the newest version holds a copy the kernel can reach
+	versions = run_backup(job)
+	assert len(versions) == 3 + later_versions
+	newest = os.path.join(versions[-1], 'deep/er/x.txt')
+	assert not os.path.islink(newest) and open(newest).read() == 'x'
+	assert len(run_backup(job)) == 3 + later_versions
+
+
+def test_a_healthy_chain_moved_to_another_depth_is_not_copied_again(job):
+	seed_monitor(job, {'a/x.txt': 'x', 'deep/er/keep.txt': 'k'})
+	os.symlink('nowhere', f'{job.monitor}/dangling')
+	run_backup(job)
+	os.rename(f'{job.monitor}/a/x.txt', f'{job.monitor}/deep/er/x.txt')
+	run_backup(job, OrderedDict([event_entry(job, 'deep/er/x.txt', 'move', 'a/x.txt')]))
+	open(f'{job.monitor}/deep/er/keep.txt', 'w').write('k2')
+	run_backup(job, OrderedDict([event_entry(job, 'deep/er/keep.txt', 'modify')]))
+	# every row read back from the vault: a chain of two links the kernel follows, and a chain to a user's symlink that
+	# points nowhere, as the monitored one does
+	os.remove(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME))
+	versions = run_backup(job)
+	assert len(versions) == 3
+	assert os.path.islink(os.path.join(versions[-1], 'deep/er/x.txt'))
