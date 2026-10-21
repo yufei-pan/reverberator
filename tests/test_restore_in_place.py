@@ -523,10 +523,13 @@ def test_a_backed_up_marker_is_not_restored(job, tmp_path, capsys):
 	write_rule(job)
 	out = destination(tmp_path)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	assert (code, err) == (0, '')
+	assert code == 0
 	# at any depth: an in-place restore of a folder inside it may have been under way too
-	assert sorted(stdout.split('\n')[1:3]) == [f'WARNING proj/{rv.RESTORE_MARKER_NAME}: not restored: it is the marker of a restore under way when this version was taken',
+	warnings = [f'WARNING proj/{rv.RESTORE_MARKER_NAME}: not restored: it is the marker of a restore under way when this version was taken',
 		f'WARNING proj/sub/{rv.RESTORE_MARKER_NAME}: not restored: it is the marker of a restore under way when this version was taken']
+	assert sorted(stdout.split('\n')[1:3]) == warnings
+	# each said as it happened, too
+	assert sorted(err.rstrip('\n').split('\n')) == warnings
 	assert tree(os.path.join(out, 'proj')) == {'a.txt': 'a', 'sub/': None, 'sub/b.txt': 'b'}
 
 
@@ -640,7 +643,7 @@ def test_one_run_of_a_restore_at_a_time(job, tmp_path, capsys, monkeypatch):
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	_, (second_code, second_out, second_err), left = second
 	assert (second_code, second_out) == (rv.EXIT_USAGE, '')
-	assert f'{target}: another run of this restore is under way' in second_err
+	assert f'{target}: another run of this restore, or another program, holds a lock on it' in second_err
 	# it picked nothing up: the first run's marker and private target are as they were
 	assert left == (True, os.geteuid(), 0o700)
 	assert (code, err) == (0, '')
@@ -660,7 +663,7 @@ def test_one_run_of_a_restore_at_a_time(job, tmp_path, capsys, monkeypatch):
 	monkeypatch.setattr(rv, 'write_restore_marker', racing)
 	code, stdout, err = restore(tmp_path, capsys, live, '--in-place', '--version', '0')
 	_, (racing_code, racing_out, racing_err) = during
-	assert (racing_code, racing_out) == (rv.EXIT_USAGE, '') and 'another run of this restore is under way' in racing_err
+	assert (racing_code, racing_out) == (rv.EXIT_USAGE, '') and 'another run of this restore, or another program, holds a lock on it' in racing_err
 	assert (code, err) == (0, '')
 	[aside] = asides(job.monitor, 'proj')
 	assert tree(live) == files and tree(os.path.join(job.monitor, aside))['f00.txt'] == 'edited'
@@ -804,3 +807,139 @@ def test_resume_never_replaces_a_folder_where_a_file_goes(job, tmp_path, capsys)
 	assert 'FAILED proj/a.txt: a folder is in its place, which is left as it is' in stdout.split('\n')
 	assert tree(os.path.join(target, 'a.txt')) == {'inside/': None, 'inside/keep.txt': 'kept'}
 	assert tree(target)['b.txt'] == 'b' and os.path.isfile(marker)
+
+
+def xattr_support(tmp_path):
+	probe = tmp_path / 'xattr-probe'
+	probe.write_text('x')
+	try:
+		os.setxattr(probe, 'user.probe', b'1')
+	except OSError:
+		pytest.skip('no user xattrs here')
+
+
+def test_already_restored_compares_extended_attributes(tmp_path):
+	xattr_support(tmp_path)
+	source, dest = tmp_path / 'source', tmp_path / 'dest'
+	for path in (source, dest):
+		path.write_text('same')
+		os.chmod(path, 0o640)
+		os.utime(path, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
+	assert rv.already_restored(str(source), str(dest))
+	os.setxattr(source, 'user.note', b'one')
+	assert not rv.already_restored(str(source), str(dest))
+	os.setxattr(dest, 'user.note', b'two')
+	assert not rv.already_restored(str(source), str(dest))
+	os.setxattr(dest, 'user.note', b'one')
+	assert rv.already_restored(str(source), str(dest))
+
+
+def test_a_marker_records_entries_whose_metadata_could_not_be_set(tmp_path):
+	target = tmp_path / 'target'
+	target.mkdir()
+	os.chmod(target, 0o700)
+	class Version:
+		name = 'v0'
+	rels = [f'proj/f{number}' for number in range(1500)] + ['proj/\udce9']
+	rv.write_restore_marker(str(target), 'job', 'proj', Version, rels)
+	marker = rv.read_restore_marker(str(target))
+	assert marker['unset'] == rels[:rv.RESTORE_MARKER_UNSET_LIMIT] and len(marker['unset']) == 1000
+	rv.write_restore_marker(str(target), 'job', 'proj', Version, ['proj/\udce9'])
+	assert rv.read_restore_marker(str(target))['unset'] == ['proj/\udce9']
+	# none recorded: the marker is what it was
+	rv.write_restore_marker(str(target), 'job', 'proj', Version)
+	assert rv.read_restore_marker(str(target)) == {'job': 'job', 'path': 'proj', 'version': 'v0'}
+
+
+def test_a_resumed_run_reports_kept_entries_whose_metadata_the_earlier_run_could_not_set(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'proj/a.txt': 'a', 'proj/bad.txt': 'b', 'proj/meta.txt': 'm'})
+	run_backup(job)
+	write_rule(job)
+	copy_command = rv.copy_command
+
+	def failing(source_path, dest_path):
+		if source_path.endswith('bad.txt'):
+			return ['sh', '-c', f'echo "cp: error reading \'{source_path}\': Input/output error" >&2; exit 1']
+		if source_path.endswith('meta.txt'):
+			return ['sh', '-c', f'cp -a "{source_path}" "{dest_path}" && echo "cp: failed to preserve ownership for \'{dest_path}\': Operation not permitted" >&2; exit 1']
+		return copy_command(source_path, dest_path)
+	monkeypatch.setattr(rv, 'copy_command', failing)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert 'WARNING proj/meta.txt: copied without all of its metadata' in err
+	assert rv.read_restore_marker(target)['unset'] == ['proj/meta.txt']
+	# the second run copies what failed; meta.txt is kept, and its warning comes back
+	monkeypatch.setattr(rv, 'copy_command', copy_command)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == 0
+	assert 'keeping 2 already there' in stdout
+	warning = 'WARNING proj/meta.txt: kept as an earlier run restored it, which could not set all of its metadata'
+	assert warning in stdout and err == warning + '\n'
+
+
+def test_resume_recopies_a_kept_file_whose_xattrs_differ(job, tmp_path, capsys, monkeypatch):
+	xattr_support(tmp_path)
+	seed_monitor(job, {'proj/a.txt': 'a', 'proj/b.txt': 'b'})
+	os.setxattr(f'{job.monitor}/proj/a.txt', 'user.note', b'kept')
+	run_backup(job)
+	write_rule(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	copy_command = rv.copy_command
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['false'] if source.endswith('b.txt') else copy_command(source, dest))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	monkeypatch.setattr(rv, 'copy_command', copy_command)
+	os.removexattr(os.path.join(target, 'a.txt'), 'user.note')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert (code, err) == (0, '')
+	# a.txt was copied again, not kept
+	assert os.getxattr(os.path.join(target, 'a.txt'), 'user.note') == b'kept'
+	assert 'keeping' not in stdout
+
+
+def test_the_claim_looks_at_the_marker_again_under_the_lock(job, tmp_path, capsys, monkeypatch):
+	files = twenty_files(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	marker = mark(target, job, 'proj', versions(job)[0].name)
+	claim_restore_target = rv.claim_restore_target
+
+	def finishing(path):
+		fd = claim_restore_target(path)
+		# the run that held it finished, and removed its marker, before this one got the lock
+		os.unlink(marker)
+		return fd
+	monkeypatch.setattr(rv, 'claim_restore_target', finishing)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_USAGE and 'no longer holds an unfinished restore' in err
+	assert os.listdir(target) == []
+
+
+def test_accept_without_a_marker_is_nothing_to_accept_and_moves_nothing(job, tmp_path, capsys, monkeypatch):
+	twenty_files(job)
+	target = f'{job.monitor}/proj'
+	code, stdout, err = restore(tmp_path, capsys, target, '--in-place', '--version', '0', '--accept')
+	assert (code, stdout) == (rv.EXIT_USAGE, '') and 'holds no unfinished restore to keep' in err
+	assert asides(job.monitor, 'proj') == []
+	# the marker goes between two looks at it: nothing is moved aside, whichever look it is
+	version = versions(job)[0]
+	for vanishing_look in (1, 2, 3, 4):
+		shutil.rmtree(target)
+		marker = mark(target, job, 'proj', version.name)
+		looks = []
+		read_restore_marker = rv.read_restore_marker
+
+		def vanishing(path, read_restore_marker=read_restore_marker, marker=marker, looks=looks, vanishing_look=vanishing_look):
+			found = read_restore_marker(path)
+			looks.append(path)
+			if len(looks) == vanishing_look and found is not None:
+				os.unlink(marker)
+			return found
+		monkeypatch.setattr(rv, 'read_restore_marker', vanishing)
+		code, stdout, err = restore(tmp_path, capsys, target, '--in-place', '--version', '0', '--accept')
+		monkeypatch.setattr(rv, 'read_restore_marker', read_restore_marker)
+		assert asides(job.monitor, 'proj') == [], vanishing_look
+		assert os.path.isdir(target)

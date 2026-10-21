@@ -223,3 +223,24 @@ def test_a_lock_that_cannot_be_checked_raises_an_hourly_marker_after_the_grace(t
 	assert prune_at(5000) == []
 	failing[0] = True
 	assert prune_at(5001) == [] and prune_at(5900) == [] and len(prune_at(5901)) == 1
+
+
+def test_restore_lock_default_stream_is_the_stderr_of_the_moment(tmp_path, capsys):
+	path = rv.restore_lock_path('job')
+	os.makedirs(os.path.dirname(path))
+	fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+	fcntl.flock(fd, fcntl.LOCK_EX)
+	entered = threading.Event()
+	def restore():
+		with rv.RestoreLock('job'):
+			entered.set()
+	thread = threading.Thread(target=restore)
+	thread.start()
+	try:
+		assert not entered.wait(0.3)
+		assert 'Waiting for reverberator to finish removing an old version of job' in capsys.readouterr().err
+	finally:
+		fcntl.flock(fd, fcntl.LOCK_UN)
+		os.close(fd)
+		thread.join(5)
+	assert entered.is_set()

@@ -203,19 +203,19 @@ def test_restore_picker_reads_a_choice(job):
 	assert [row.version.number for row in candidates] == [2, 1, 0]
 	holds = lambda version: True
 	shown = io.StringIO()
-	assert rv.choose_version(candidates, kept, holds, stdin=Terminal('2\n'), stdout=shown) == kept[1]
+	assert rv.choose_version(candidates, kept, holds, stdin=Terminal('2\n'), stderr=shown) == kept[1]
 	lines = shown.getvalue().split('\n')
 	assert lines[1:4] == [f'  {number}  {rv.format_history_row(row, "file")}' for number, row in enumerate(candidates, 1)]
 	assert lines[4].startswith('Restore which version?')
 	# a wrong answer is asked again
-	assert rv.choose_version(candidates, kept, holds, stdin=Terminal('9\nx\n3\n'), stdout=io.StringIO()) == kept[0]
+	assert rv.choose_version(candidates, kept, holds, stdin=Terminal('9\nx\n3\n'), stderr=io.StringIO()) == kept[0]
 	for answer in ('q\n', ''):
 		with pytest.raises(rv.CommandError) as cancelled:
-			rv.choose_version(candidates, kept, holds, stdin=Terminal(answer), stdout=io.StringIO())
+			rv.choose_version(candidates, kept, holds, stdin=Terminal(answer), stderr=io.StringIO())
 		assert cancelled.value.code == rv.EXIT_COMMAND_FAILED
 	# one candidate is used, and named
 	shown = io.StringIO()
-	assert rv.choose_version(candidates[:1], kept, holds, stdin=Terminal(''), stdout=shown) == kept[2]
+	assert rv.choose_version(candidates[:1], kept, holds, stdin=Terminal(''), stderr=shown) == kept[2]
 	assert rv.format_history_row(candidates[0], 'file') in shown.getvalue()
 	# a version that does not hold the path names the ones that do
 	with pytest.raises(rv.CommandError) as refused:
@@ -688,7 +688,7 @@ def test_restore_folder_meta_hands_the_folder_over_last(tmp_path, monkeypatch):
 		return lambda target, *args, **kwargs: calls.append((name, target)) or real(target, *args, **kwargs)
 	for name in ('chmod', 'utime', 'chown', 'setxattr'):
 		monkeypatch.setattr(os, name, recording(name, getattr(os, name)))
-	assert rv.restore_folder_meta(str(source), str(dest)) is True
+	assert rv.restore_folder_meta(str(source), str(dest)) is None
 	monkeypatch.undo()
 	# all on the folder as opened, never by its path, and the owner handed over last
 	assert calls and all(isinstance(target, int) for _, target in calls)
@@ -703,6 +703,160 @@ def test_restore_folder_meta_hands_the_folder_over_last(tmp_path, monkeypatch):
 	elsewhere.mkdir()
 	before = os.lstat(elsewhere)
 	os.symlink(elsewhere, tmp_path / 'swapped')
-	assert rv.restore_folder_meta(str(source), str(tmp_path / 'swapped')) is False
+	assert 'Not a directory' in rv.restore_folder_meta(str(source), str(tmp_path / 'swapped'))
 	after = os.lstat(elsewhere)
 	assert (after.st_mode, after.st_uid, after.st_mtime_ns) == (before.st_mode, before.st_uid, before.st_mtime_ns)
+
+
+def test_failures_are_streamed_and_the_summary_repeats_the_first_twenty(capsys):
+	report = rv.RestoreReport()
+	report.target = '/out/proj'
+	for number in range(25):
+		report.fail(f'proj/f{number:02}', 'dangling vault link: x')
+	report.warn('proj/w', 'copied without all of its metadata')
+	assert (report.failed, len(report.failures), report.warned) == (25, rv.RESTORE_SUMMARY_LINES, 1)
+	err = capsys.readouterr().err.split('\n')
+	assert err[:25] == [f'FAILED proj/f{number:02}: dangling vault link: x' for number in range(25)]
+	assert err[25] == 'WARNING proj/w: copied without all of its metadata'
+	lines = report.summary().split('\n')
+	assert [line for line in lines if line.startswith('FAILED ')] == [f'FAILED proj/f{number:02}: dangling vault link: x' for number in range(20)]
+	assert '5 more failed: shown above as they happened' in lines
+	assert lines[-1].startswith('Left /out/proj private') or 'failed' in lines[-1]
+
+
+def test_a_streamed_failure_starts_a_line_of_its_own_on_a_terminal(monkeypatch):
+	terminal = Terminal()
+	monkeypatch.setattr(sys, 'stderr', terminal)
+	report = rv.RestoreReport()
+	report.progress_at -= rv.RESTORE_PROGRESS_TERMINAL_SECONDS
+	report.progress(terminal)
+	report.fail('a', 'gone')
+	text = terminal.getvalue()
+	# the progress line is wiped before the failure is written
+	assert text.endswith('\r' + ' ' * report.progress_width + '\rFAILED a: gone\n')
+
+
+def test_a_failed_progress_write_stops_the_progress(capsys):
+	class Broken(io.StringIO):
+		writes = 0
+		def write(self, text):
+			Broken.writes += 1
+			raise BrokenPipeError(32, 'Broken pipe')
+	report = rv.RestoreReport()
+	stream = Broken()
+	report.progress_at -= rv.RESTORE_PROGRESS_LINE_SECONDS
+	report.progress(stream)
+	report.progress_at -= rv.RESTORE_PROGRESS_LINE_SECONDS
+	report.progress(stream)
+	report.progress(stream, done=True)
+	assert Broken.writes == 1
+
+
+def test_a_stop_during_the_metadata_pass_is_noticed(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'proj/a.txt': 'a', 'proj/sub/b.txt': 'b', 'proj/sub/deeper/c.txt': 'c'})
+	run_backup(job)
+	write_rule(job)
+	restore_folder_meta = rv.restore_folder_meta
+	handed = []
+
+	def stopping(source, dest):
+		handed.append(dest)
+		# a signal arrives while the folders are being given their metadata
+		rv.RESTORE_STOP.set()
+		return restore_folder_meta(source, dest)
+	monkeypatch.setattr(rv, 'restore_folder_meta', stopping)
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED and 'Interrupted: run the same restore again' in err
+	# the deepest folder only: the rest waited for the next check, and the marker stayed
+	assert handed == [os.path.join(out, 'proj/sub/deeper')]
+	assert os.path.isfile(os.path.join(out, 'proj', rv.RESTORE_MARKER_NAME))
+
+
+def test_a_stop_check_waits_for_all_copies_no_longer_than_one_period(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {f'proj/f{i}.txt': str(i) for i in range(4)})
+	run_backup(job)
+	write_rule(job)
+	copy_command = rv.copy_command
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['sh', '-c', f'sleep 0.4; exec {" ".join(copy_command(source, dest))}'] if ' ' not in source + dest else copy_command(source, dest))
+	waits = []
+	wait = rv.multiCMD.AsyncExecutor.wait
+
+	def recording(self, timeout=None, *args, **kwargs):
+		waits.append((timeout, len(self.runningThreads)))
+		return wait(self, timeout, *args, **kwargs)
+	monkeypatch.setattr(rv.multiCMD.AsyncExecutor, 'wait', recording)
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0', '--threads', '4')
+	assert code == 0, err
+	assert any(running > 1 for _, running in waits)
+	# the executor may wait that long for each thread
+	assert all(timeout * max(1, running) <= rv.RESTORE_WAIT_SECONDS + 1e-9 for timeout, running in waits if timeout is not None and timeout > 0.001)
+
+
+def test_restore_picker_and_prompt_go_to_stderr(job, tmp_path, capsys, monkeypatch):
+	three_versions(job)
+	monkeypatch.setattr(sys, 'stdin', Terminal('2\n'))
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/a.txt', out)
+	assert code == 0
+	assert 'The versions that differ, newest first:' in err and 'Restore which version?' in err
+	assert 'versions that differ' not in stdout and 'Restore which version' not in stdout
+	assert stdout.startswith('Restored 1 entries')
+	assert tree(out) == {'a.txt': 'v1'}
+
+
+def test_a_folder_that_could_not_get_its_metadata_says_why(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'proj/a.txt': 'a'})
+	run_backup(job)
+	write_rule(job)
+	monkeypatch.setattr(rv, 'restore_folder_meta', lambda source, dest: '[Errno 1] Operation not permitted')
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == 0
+	assert 'WARNING proj: restored without all of its metadata: [Errno 1] Operation not permitted' in stdout
+
+
+def test_restore_folder_meta_names_what_failed(tmp_path):
+	source = tmp_path / 'source'
+	source.mkdir()
+	reason = rv.restore_folder_meta(str(source), str(tmp_path / 'absent'))
+	assert reason is not None and 'No such file' in reason
+	reason = rv.restore_folder_meta(str(tmp_path / 'absent'), str(tmp_path))
+	assert reason is not None and 'No such file' in reason
+
+
+def test_a_certain_failure_does_not_move_the_live_file_aside(job, tmp_path, capsys):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	write_rule(job)
+	held = os.path.join(version_path(job, 0), 'a.txt')
+	os.remove(held)
+	# a link to the live file: not held in the vault
+	os.symlink(f'{job.monitor}/a.txt', held)
+	write(job, 'a.txt', 'live')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/a.txt', '--in-place', '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert 'FAILED a.txt: not held in the vault' in stdout
+	assert tree(job.monitor) == {'a.txt': 'live'}
+
+
+def test_unsafe_folder_reasons(tmp_path):
+	open_folder = tmp_path / 'open'
+	open_folder.mkdir()
+	os.chmod(open_folder, 0o777)
+	assert rv.unsafe_folder_reason(str(open_folder)) == f'another user can change {open_folder}'
+	reason = rv.unsafe_folder_reason(str(tmp_path / 'absent'))
+	assert reason.startswith(f'{tmp_path / "absent"} cannot be looked at: ') and 'No such file' in reason
+
+
+def test_a_refused_destination_shows_the_path_as_typed_and_as_resolved(job, tmp_path, capsys):
+	three_versions(job)
+	real = tmp_path / 'open'
+	(real / 'out').mkdir(parents=True)
+	os.chmod(real, 0o777)
+	link = tmp_path / 'link'
+	os.symlink(real / 'out', link)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/a.txt', str(link), '--version', '1')
+	assert (code, stdout) == (rv.EXIT_USAGE, '')
+	assert f'{link} (resolved to {real / "out"})' in err and f'another user can change {real}' in err
