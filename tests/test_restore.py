@@ -80,6 +80,13 @@ def tree(top):
 	return found
 
 
+def marked_tree(top):
+	'''tree(top) of a folder restore that did not complete, which keeps its marker at the top: without it.'''
+	found = tree(top)
+	assert found.pop(rv.RESTORE_MARKER_NAME, None) is not None, f'no marker in {top}'
+	return found
+
+
 def snapshot(top):
 	found = {}
 	for folder, names, files in os.walk(top):
@@ -266,9 +273,10 @@ def test_restore_reports_dangling_and_continues(job, tmp_path, capsys):
 	assert lines[1].startswith('FAILED proj/b.txt: dangling vault link: proj/b.txt is missing from V0--')
 	target = os.path.join(out, 'proj')
 	# not everything is there: nobody else may look in, or put anything in for a later run to write through
-	assert lines[2:] == [f'Left {target} private (mode 0700), as not everything was restored']
+	assert lines[2:] == [f"Left {target} private (mode 0700), its folders' metadata not restored yet, as not everything was restored",
+		f'1 failed: run the same restore again to retry them, or remove {target}/{rv.RESTORE_MARKER_NAME} to accept the result as it is']
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o700
-	assert tree(target) == {'a.txt': 'a', 'c.txt': 'c1'}
+	assert marked_tree(target) == {'a.txt': 'a', 'c.txt': 'c1'}
 	assert partial_files(out) == []
 
 
@@ -285,7 +293,7 @@ def test_restore_reports_referenced_links(job, tmp_path, capsys):
 	assert code == rv.EXIT_COMMAND_FAILED
 	assert 'FAILED proj/r.txt: not held in the vault (referenced backup)' in stdout.split('\n')
 	# never the live file in its place
-	assert tree(os.path.join(out, 'proj')) == {'a.txt': 'a'}
+	assert marked_tree(os.path.join(out, 'proj')) == {'a.txt': 'a'}
 	out = destination(tmp_path, 'file')
 	code, stdout, _ = restore(tmp_path, capsys, f'{job.monitor}/proj/r.txt', out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
@@ -315,7 +323,7 @@ def test_restore_reports_a_failed_copy(job, tmp_path, capsys, monkeypatch):
 	assert lines[0].startswith('Restored 3 entries')
 	assert lines[1].startswith('WARNING proj/meta.txt: copied without all of its metadata: cp: failed to preserve ownership')
 	assert lines[2].startswith('FAILED proj/bad.txt: cp: error reading') and lines[2].endswith('Input/output error')
-	assert tree(os.path.join(out, 'proj')) == {'a.txt': 'a', 'meta.txt': 'm'}
+	assert marked_tree(os.path.join(out, 'proj')) == {'a.txt': 'a', 'meta.txt': 'm'}
 	assert partial_files(out) == []
 
 
@@ -366,10 +374,11 @@ def test_restore_reports_a_version_removed_mid_restore(job, tmp_path, monkeypatc
 	assert 'Traceback' not in err
 	lines = stdout.rstrip('\n').split('\n')
 	assert lines[0] == f'Restored 4 entries ({rv.show_size(2)}) from V1 to {out}/monitor'
-	assert sorted(line.partition(': ')[0] for line in lines[1:-1]) == ['FAILED proj/b.txt', 'FAILED proj/sub/c.txt']
-	assert all(': dangling vault link: ' in line for line in lines[1:-1])
-	assert lines[-1] == f'Left {out}/monitor private (mode 0700), as not everything was restored'
-	assert tree(os.path.join(out, 'monitor')) == {'proj/': None, 'proj/a.txt': 'a1', 'proj/sub/': None}
+	assert sorted(line.partition(': ')[0] for line in lines[1:-2]) == ['FAILED proj/b.txt', 'FAILED proj/sub/c.txt']
+	assert all(': dangling vault link: ' in line for line in lines[1:-2])
+	assert lines[-2] == f"Left {out}/monitor private (mode 0700), its folders' metadata not restored yet, as not everything was restored"
+	assert lines[-1].startswith('2 failed: run the same restore again')
+	assert marked_tree(os.path.join(out, 'monitor')) == {'proj/': None, 'proj/a.txt': 'a1', 'proj/sub/': None}
 	assert partial_files(out) == []
 
 
@@ -430,7 +439,7 @@ def test_restore_needs_one_destination(job, tmp_path, capsys):
 	three_versions(job)
 	path = f'{job.monitor}/a.txt'
 	out = destination(tmp_path)
-	for extra in ((), (out, '--in-place'), ('--in-place',), (out, '--threads', '0')):
+	for extra in ((), (out, '--in-place'), (out, '--threads', '0'), ('--in-place', '--threads', '0')):
 		code, stdout, err = restore(tmp_path, capsys, path, *extra, '--version', '1')
 		assert (code, stdout) == (rv.EXIT_USAGE, ''), extra
 		assert err, extra
@@ -463,10 +472,13 @@ def test_restore_stops_cleanly_on_a_signal(job, tmp_path, capsys, monkeypatch):
 	monkeypatch.setattr(rv.multiCMD.AsyncExecutor, 'wait', signalled_wait)
 	out = destination(tmp_path)
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, out, '--version', '0', '--threads', '4')
-	assert (code, stdout, err) == (rv.EXIT_COMMAND_FAILED, '', 'Interrupted\n')
+	target = os.path.join(out, 'monitor')
+	assert (code, stdout) == (rv.EXIT_COMMAND_FAILED, '')
+	# what it left is marked for a re-run to pick up
+	assert err == f'Interrupted: {target} is left private (mode 0700); run the same restore again to pick it up, or remove {target}/{rv.RESTORE_MARKER_NAME} to accept the result as it is\n'
 	assert signalled and raised_inside == []
 	# the batches put in place before it are whole, under their own names; nothing of the one under way is left
-	restored = {rel: text for rel, text in tree(os.path.join(out, 'monitor')).items() if text is not None}
+	restored = {rel: text for rel, text in marked_tree(target).items() if text is not None}
 	assert len(restored) == 20 * len(finished) and all(files[rel] == text for rel, text in restored.items())
 	assert partial_files(out) == []
 	assert {sig: signal.getsignal(sig) for sig in handlers} == handlers
