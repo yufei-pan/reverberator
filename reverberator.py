@@ -3838,11 +3838,18 @@ def do_backup(backup_entries:dict,
 			this_version_number = latest_version_info.version_number + 1
 			# the files whose link chains would pass their threshold are copied again from the vault, so the size limit
 			# counts them too ( a copy in a link's place takes no inode more ). removing the oldest version moves its
-			# copies into the next one, which shortens their chains: they are counted again after each removal
+			# copies into the next one, which shortens their chains: they are counted again after each removal.
+			# a file this batch deletes is not copied again; one it writes is, so a copy of it that fails leaves no chain
+			# past its threshold, but its bytes are counted once. the batch is read for that only when a file is due
+			batch_rels = []
 			def count_recopies():
 				oldest_kept = next(iter(vault_info_dict))
 				rels = recopy_rels(manifest,this_version_number,oldest_kept,job_vault,latest_version_info.path)
-				return oldest_kept, rels, recopy_size(manifest,rels,job_vault,latest_version_info.path)
+				if rels and not batch_rels:
+					batch_rels.extend(batch_rewrites(backup_entries,monitor_path))
+				rewritten, deleted = batch_rels or (set(), set())
+				rels = [rel for rel in rels if rel not in deleted]
+				return oldest_kept, rels, recopy_size(manifest,[rel for rel in rels if rel not in rewritten],job_vault,latest_version_info.path)
 			recopies_oldest, recopies, recopies_size = count_recopies()
 			if recopies:
 				backuperTeeLogToTl(job_name,f'{len(recopies)} files to copy again from the vault, as their link chains would pass their limit: estimated size {recopies_size}')
@@ -5045,6 +5052,10 @@ class VaultManifest:
 		self.conn.executemany('UPDATE entries SET kind = ?, size = ?, mtime_ns = ?, mode = ?, uid = ?, gid = ?, hash = ?, link = ?, '
 			'unchecked = ?, dirty = 0 WHERE path = ?', recorded)
 
+	def mark_unchecked(self, rels):
+		'''Mark the file records of rels unchecked, keeping the rest: each is a new copy of what it records, which delta generation reads back.'''
+		self.conn.executemany("UPDATE entries SET unchecked = 1 WHERE path = ? AND kind = 'f'", ((storable_name(rel),) for rel in rels))
+
 	def set_copy_version(self, rels, version:int):
 		'''Record that the version numbered version holds the copy of each file of rels; the caller holds the transaction.'''
 		self.conn.executemany('UPDATE entries SET copy_version = ? WHERE path = ?', ((version, storable_name(rel)) for rel in rels))
@@ -5506,6 +5517,28 @@ def recopy_rels(manifest:VaultManifest, new_version:int, oldest_kept:int, job_va
 	if own_transaction:
 		manifest.commit()
 	return sorted(due)
+
+def batch_rewrites(backup_entries:dict, monitor_path:str) -> tuple:
+	'''
+	(rewritten, deleted): the rels of the files backup_entries creates or modifies, and of those it deletes, by their own
+	entries. The replay deletes before it copies and copies before it moves, so a file's copy made again from the vault
+	is overwritten or removed before anything moves it.
+
+	Examples:
+		>>> entries = OrderedDict((path, BackupEntryValues('t', event, source)) for path, event, source in (('/m/a', 'modify', None),
+		...     ('/m/d/b', 'create', None), ('/m/c', 'delete', None), ('/m/e/', 'delete', None), ('/m/f', 'move', '/m/g'), ('/m/h', 'attrib', None)))
+		>>> [sorted(rels) for rels in batch_rewrites(entries, '/m')]
+		[['a', 'd/b'], ['c']]
+	'''
+	rewritten, deleted = set(), set()
+	for path, values in backup_entries.items():
+		if path.endswith('/'):
+			continue
+		if values.event in ('create', 'modify'):
+			rewritten.add(os.path.relpath(path, monitor_path))
+		elif values.event == 'delete':
+			deleted.add(os.path.relpath(path, monitor_path))
+	return rewritten, deleted
 
 def recopy_size(manifest:VaultManifest, rels:list, job_vault:str, latest_version_path:str) -> int:
 	'''
@@ -6293,8 +6326,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 
 	The files of recopy (rels, as recopy_rels() gives them) are copied again from the end of their chains in the latest
 	version, before the replay: the vault's copy, as it is there, never the monitored file, which may have changed
-	since. Each one copied is appended to recopied. One whose chain cannot be followed, or whose copy fails, keeps its
-	link. Their records stay as they are, as each copy matches the one it was made from.
+	since. Each one copied is appended to recopied. One whose chain cannot be followed (an error line names it), or
+	whose copy fails, keeps its link. Their records stay those of the copies they were made from, only unchecked, as a
+	crash can keep any new copy's bytes from the disk.
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
@@ -6403,9 +6437,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				if not GREEN_LIGHT.is_set():
 					break
 				end = chain_end(job_vault,latest_version_info.path,rel)
-				if end is not None and not stat.S_ISDIR(end.st.st_mode):
-					cp_af_copy_path(source_path=end.path,dest_path=os.path.join(backup_folder,rel),mcae=mcae,pending=pending)
+				if end is None or stat.S_ISDIR(end.st.st_mode):
+					what = 'cannot be followed' if end is None else f'ends at the folder {end.path}'
+					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not copying {rel} again from the vault: its link chain in {latest_version_info.path} {what}; linking it as it was, by more links than its limit')
+					continue
+				cp_af_copy_path(source_path=end.path,dest_path=os.path.join(backup_folder,rel),mcae=mcae,pending=pending)
 			copied = wait_for_async_commands(mcae)
+			manifest.mark_unchecked(copied)
 			if recopied is not None:
 				recopied.extend(copied)
 			backuperTeeLogToTl(path=monitor_path,message=f'Copied {len(copied)} of {len(recopy)} files again from the vault, as their link chains would pass their limit')
