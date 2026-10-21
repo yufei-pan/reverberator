@@ -201,6 +201,20 @@ def test_failed_upgrade_leaves_schema_1(job, monkeypatch):
 	assert schema(job) == '2'
 
 
+def test_schema_1_without_its_entries_table_upgrades(job):
+	# 0.39 created a new database's meta and its entries table in separate commits: a crash between them left this
+	os.makedirs(job.job_vault)
+	conn = database(job)
+	conn.execute('CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID')
+	conn.executemany('INSERT INTO meta VALUES (?, ?)', [('schema', '1'), ('version', VERSION), ('skip_fingerprint', 'abc'), ('inner_mounts', '["mnt/"]')])
+	conn.close()
+	manifest = rv.VaultManifest(job.job_vault)
+	assert (manifest.files, manifest.folders) == ([], [])
+	assert manifest.describes(os.path.join(job.job_vault, VERSION)) and manifest.skip_fingerprint == 'abc' and manifest.inner_mounts == ['mnt/']
+	manifest.close()
+	assert schema(job) == '2' and columns(job)[-1] == 'copy_version'
+
+
 def test_unknown_schema_is_started_over(job):
 	schema_1_job(job)
 	conn = database(job)
