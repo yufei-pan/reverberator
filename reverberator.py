@@ -585,7 +585,7 @@ class JobControl:
 	'''
 	def __init__(self, job_name:str, shown_name:str = None):
 		self.job_name = job_name
-		# what the job's marker lines call it: the raw name of a job whose cleaned name is empty
+		# what the job's marker lines call it: row-<n> for a job whose cleaned name is empty, which log alerts accept
 		self.shown_name = job_name if shown_name is None else shown_name
 		self.running = threading.Event()
 		self.failure = None
@@ -675,7 +675,8 @@ class JobControl:
 	def _write(self, published:tuple):
 		'''Write a record _publish() took to the status board, unless one taken after it is written already.'''
 		board = STATUS_BOARD
-		if board is None:
+		# the jobs whose name cleaned up to nothing would all write job-.json: status shows them from the rule file
+		if board is None or self.job_name == '':
 			return
 		number, record = published
 		with self._writing:
@@ -748,13 +749,13 @@ STATUS_BOARD = None
 
 def job_log(job_name:str, text:str) -> str:
 	'''Log a job's marker line at error level, where log alerts look for it, and return it.'''
-	line = shown(f'reverberator job {job_name} {text}')
+	line = cut_line(shown(f'reverberator job {job_name} {text}'))
 	tl.teeerror(line)
 	return line
 
 def daemon_error_log(reason:str) -> str:
 	'''Log the marker line for the daemon exiting on an error at error level, and return it.'''
-	line = shown(f'reverberator EXITING with error: {reason}')
+	line = cut_line(shown(f'reverberator EXITING with error: {reason}'))
 	tl.teeerror(line)
 	return line
 
@@ -769,9 +770,9 @@ def raw_job_name(rule) -> str:
 	'''The name a rule is called in messages: the job name, or the name as written when it cleaned up to nothing.'''
 	return getattr(rule.job_name, 'raw', rule.job_name)
 
-def nameless_reason(rule_path:str) -> str:
-	'''Why a job whose name cleaned up to nothing is stopped.'''
-	return f"its name has no letters, digits, '-' or '_' left after cleanup; rename it in {rule_path}"
+def nameless_reason(rule_path:str, raw:str = None) -> str:
+	'''Why a job whose name cleaned up to nothing is stopped; raw, when given, is the name as written.'''
+	return f"its name{'' if raw is None else f' {raw!r}'} has no letters, digits, '-' or '_' left after cleanup; rename it in {rule_path}"
 
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
@@ -1238,9 +1239,10 @@ def run_daemon():
 		if job_name == '':
 			# a name with nothing left would make the vault root the job's vault: stopped at once, before anything touches it
 			def start_nameless(job:JobControl, attempt:int) -> list:
-				job.fail(nameless_reason(args.rule_path), permanent=True)
+				job.fail(nameless_reason(args.rule_path,raw_job_name(reverb_rule)), permanent=True)
 				return []
-			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name,raw_job_name(reverb_rule)),start_nameless,None),name=f'{raw_job_name(reverb_rule)} supervisor',daemon=True)
+			# the marker calls it by its row, as the log alerts only accept a name of letters, digits, '-' and '_'
+			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name,f'row-{index + 1}'),start_nameless,None),name=f'row-{index + 1} supervisor',daemon=True)
 			supervisor.start()
 			supervisors.append(supervisor)
 			continue
@@ -7142,7 +7144,25 @@ def log_text(text) -> str:
 	>>> log_text('caf\\u00e9 \\udcff')
 	'café \\\\xff'
 	'''
-	return '\n    '.join(shown(piece) for piece in str(text).split('\n'))
+	return '\n    '.join(cut_line(shown(piece)) for piece in str(text).split('\n'))
+
+# journald splits a line longer than its LineMax (48K) into records of their own, and the second could start with a
+# marker: no line this program logs is longer than this
+LOG_LINE_LIMIT = 16384
+
+def cut_line(line:str) -> str:
+	'''
+	line, or its first LOG_LINE_LIMIT characters and how many more there were.
+	>>> cut_line('plain')
+	'plain'
+	>>> cut_line('x' * (LOG_LINE_LIMIT + 3))[-21:]
+	' \u2026(3 more characters)'
+	>>> len(cut_line('x' * LOG_LINE_LIMIT))
+	16384
+	'''
+	if len(line) <= LOG_LINE_LIMIT:
+		return line
+	return f'{line[:LOG_LINE_LIMIT]} \u2026({len(line) - LOG_LINE_LIMIT} more characters)'
 
 def shown(text) -> str:
 	'''

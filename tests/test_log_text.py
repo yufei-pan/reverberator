@@ -78,3 +78,15 @@ def test_a_carriage_return_in_a_name_cannot_start_a_line(capsys):
 	out = capsys.readouterr().out
 	assert '\r' not in out
 	assert len(alerting_lines(out)) == 1
+
+
+def test_a_very_long_line_is_cut_so_the_journal_cannot_split_it(capsys):
+	limit = rv.LOG_LINE_LIMIT
+	text = rv.log_text('a' * (limit + 5) + FORGED + '\nshort')
+	first, second = text.split('\n')
+	assert len(first) <= limit + 40 and first.endswith(f'...({len(FORGED) + 5} more characters)'.replace('...', '…'))
+	assert second == '    short'
+	rv.job_log('j', 'UNREADABLE: ' + 'b' * (3 * limit) + FORGED)
+	out = capsys.readouterr().out
+	assert all(len(line) <= limit + 200 for line in out.split('\n'))
+	assert len(alerting_lines(out)) == 1

@@ -7,6 +7,7 @@ import pytest
 import reverberator as rv
 import signal
 from tests.harness import seed_monitor, wait_until, committed_versions, create_job, rule_row, write_rule, wait_for_committed_count
+from tests.test_log_text import alerting_lines
 
 pytestmark = pytest.mark.unit
 
@@ -848,7 +849,8 @@ def test_unmount_of_an_already_removed_watch_logs_only_in_debug(monkeypatch, pol
 
 
 @pytest.mark.process
-def test_a_job_whose_name_cleans_to_nothing_is_stopped(job, tmp_path, run_reverberator):
+@pytest.mark.parametrize('raw', ['!!!', '\u65e5\u672c\u8a9e', '...', '???'])
+def test_a_job_whose_name_cleans_to_nothing_is_stopped(job, tmp_path, run_reverberator, raw):
 	other = create_job(str(tmp_path / 'other'), 'other')
 	seed_monitor(job, {'a.txt': 'a'})
 	seed_monitor(other, {'b.txt': 'b'})
@@ -856,16 +858,21 @@ def test_a_job_whose_name_cleans_to_nothing_is_stopped(job, tmp_path, run_reverb
 	stray = os.path.join(job.vault, 'V1_stray.incomplete')
 	os.makedirs(stray)
 	nameless = rule_row(job)
-	nameless[0] = '!!!'
+	nameless[0] = raw
 	write_rule(other, extra_rows=[nameless])
 	before = set(os.listdir(job.vault))
 	proc = run_reverberator(other.rule_path)
 	wait_for_committed_count(other, 1, timeout=15)
 	assert proc.poll() is None
-	assert any("reverberator job !!! STOPPED: its name has no letters, digits, '-' or '_' left after cleanup; rename it in "
-		+ other.rule_path in line for line in ''.join(proc._out_buf + proc._err_buf).splitlines())
+	output = ''.join(proc._out_buf + proc._err_buf)
+	# the marker calls the job by its row (the second), which the firewatcher patterns accept, and shows the name as written
+	assert any(f"reverberator job row-2 STOPPED: its name '{raw}' has no letters, digits, '-' or '_' left after cleanup; rename it in "
+		+ other.rule_path in line for line in output.splitlines())
+	assert len([line for line in alerting_lines(output) if 'STOPPED' in line]) == 1
+	# nameless jobs share the cleaned name '', so none of them has a status file
+	assert not os.path.exists(os.path.join(str(tmp_path / 'state'), 'job-.json'))
 	assert set(os.listdir(job.vault)) == before and os.path.isdir(stray)
-	assert any(line.startswith('!!!\t') for line in open(other.rule_path).read().splitlines())
+	assert any(line.startswith(raw + '\t') for line in open(other.rule_path).read().splitlines())
 	proc.send_signal(signal.SIGTERM)
 
 
