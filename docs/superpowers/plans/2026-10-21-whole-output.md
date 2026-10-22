@@ -13,6 +13,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-21-whole-output-design.md`
 
+**As built (differs from the tasks below):**
+- The streams wait at most 5 s for `LOG_LOCK`, then 0.1 s per write until the thread gets it again, and `flush()` takes no lock (see the spec's Anti-goals).
+- A held part is written on its own past `2 * LOG_LINE_LIMIT` characters.
+- Ended threads' parts come out with the next line.
+- `log_thread_exception` escapes first and writes the dying thread's held text first; it falls back to `tl.error` and then stderr.
+- sysctl uses `return_object=True`.
+- The tests in `tests/test_whole_output.py` hold the shipped behavior.
+
 ## Global Constraints
 
 - **Style.** Tab indentation. Match the surrounding code's naming, comment density and docstring style.
