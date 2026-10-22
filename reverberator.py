@@ -3739,12 +3739,14 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 		...     ChangeEvent(5.0, True, 'attrib', '/m', None), ChangeEvent(6.0, True, 'create', '/m/N', '/elsewhere'),
 		...     ChangeEvent(7.0, True, 'scan', '/m/S', None)], '/m')
 		TouchedScopes(subtrees=['D/', 'E/', 'N/'], paths=['A/', 'a', 'b'])
+		>>> touched_scopes([ChangeEvent(1.0, False, 'modify', '/etc/x', None), ChangeEvent(2.0, True, 'attrib', '/', None)], '/')
+		TouchedScopes(subtrees=[], paths=['etc/x'])
 	'''
 	root = os.path.abspath(monitor_path)
 	def rel_of(path):
-		path = os.path.abspath(path)
+		rel = os.path.relpath(os.path.abspath(path), root)
 		# the root itself, or a path outside it, is None
-		return path[len(root) + 1:] if path.startswith(root + '/') and len(path) > len(root) + 1 else None
+		return None if rel == '.' or rel == '..' or rel.startswith('../') else rel
 	subtrees = set()
 	paths = set()
 	for event in events:
@@ -4042,6 +4044,23 @@ def backup_entries_to_change_events(backup_entries:dict) -> list:
 		events.append(ChangeEvent(base + (i * 0.001), is_dir, values.event, path, moved_from))
 	return events
 
+def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str) -> set:
+	'''
+	After a walk of the monitored tree (named by walk in the log): a disk unmounted while it ran was walked as the empty
+	folder it left, so what the walk found under it is dropped from backup_entries, and its rows are linked forward as
+	for a disk paused before the walk. JobFailure is raised when the monitored root itself shows another filesystem than
+	root_mount. mount_table is the one read before the walk, remembered_mounts the inner mounts the manifest recorded.
+	Returns paused with the inner mounts that went away added.
+	'''
+	walked_table = current_mount_table()
+	check_monitored_mount(monitor_path,walked_table,root_mount)
+	seen_mounts = sorted(set(remembered_mounts) | inner_mount_rels(mount_table,monitor_path,skip))
+	unmounted = paused_inner_mounts(monitor_path,seen_mounts,walked_table,skip) - paused
+	if unmounted:
+		dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in unmounted])
+		backuperTeeLogToTl(job_name,f'Inner mounts unmounted during the {walk}, keeping their last backed-up contents: {", ".join(sorted(unmounted))}; dropped {dropped} backup entries')
+	return paused | unmounted
+
 def check_walk_errors(job_name:str, monitor_path:str, errors:list, manifest:'VaultManifest' = None, reported:set = None):
 	'''After a first-backup walk of monitor_path: fail the job when its root could not be read, else log each unreadable folder.'''
 	root_error = next((error for rel, error in errors if not rel), None)
@@ -4179,16 +4198,7 @@ def do_backup(backup_entries:dict,
 					backup_entries.clear()
 					backuperTeeLogToTl(job_name, 'Delta generation interrupted; not creating a new version', error=True)
 					return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
-				# a disk unmounted while the walk ran was walked as the empty folder it left: what the walk found under it is
-				# dropped, so its rows are linked forward as for a disk paused before the walk. the same goes for the root
-				walked_table = current_mount_table()
-				check_monitored_mount(monitor_path,walked_table,root_mount)
-				seen_mounts = sorted(set(remembered_mounts) | inner_mount_rels(mount_table,monitor_path,skip))
-				unmounted = paused_inner_mounts(monitor_path,seen_mounts,walked_table,skip) - paused
-				if unmounted:
-					dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in unmounted])
-					backuperTeeLogToTl(job_name,f'Inner mounts unmounted during the comparison, keeping their last backed-up contents: {", ".join(sorted(unmounted))}; dropped {dropped} backup entries')
-					paused = paused | unmounted
+				paused = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
 				if log_journal:
 					log_to_journal(journalPath,monitor_path,f'delta_generated_{len(backup_entries)}_differences',monitor_path)
 					log_events_to_journal(backup_entries,journalPath)
@@ -4271,8 +4281,12 @@ def do_backup(backup_entries:dict,
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
 			os.makedirs(backup_folder,exist_ok=True)
 			backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
+			def recheck_mounts(fixes):
+				# the verification walked the tree too
+				nonlocal paused
+				paused = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported,
-				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified)
+				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -4632,6 +4646,68 @@ def remove_entry(path:str):
 	except FileNotFoundError:
 		pass
 
+class NotARealFolder(OSError):
+	'''What a backup would write or remove in a version lies behind a link there (see real_folders_to()).'''
+
+def real_folders_to(version_path:str, rel:str, make:bool = False, missing_ok:bool = False) -> bool:
+	'''
+	Whether every folder between version_path and the entry of rel in it (a folder's rel ending with /) is a real folder
+	there: not a link, a file or nothing. Only then does what is written or removed at rel stay inside version_path, as
+	the path to it follows no link. With make, the missing ones are made, as real folders; with missing_ok, a missing
+	one is no obstacle (nothing below it exists to follow), and nothing is made.
+
+	Examples:
+		>>> import tempfile
+		>>> version = tempfile.mkdtemp()
+		>>> os.makedirs(os.path.join(version, 'd', 'e'))
+		>>> os.symlink('d', os.path.join(version, 'link'))
+		>>> [real_folders_to(version, rel) for rel in ('d/e/f', 'd/e/', 'link', 'link/f', 'link/e/f', 'gone/f')]
+		[True, True, True, False, False, False]
+		>>> real_folders_to(version, 'gone/f', missing_ok=True), real_folders_to(version, 'new/sub/f', make=True), os.path.isdir(os.path.join(version, 'new', 'sub'))
+		(True, True, True)
+		>>> import shutil; shutil.rmtree(version)
+	'''
+	path = version_path
+	for part in rel.strip('/').split('/')[:-1]:
+		path = os.path.join(path, part)
+		try:
+			if not stat.S_ISDIR(os.lstat(path).st_mode):
+				return False
+		except FileNotFoundError:
+			if missing_ok:
+				return True
+			if not make:
+				return False
+			try:
+				# its parent was found or made a real folder just before
+				os.mkdir(path)
+			except FileExistsError:
+				if not os.path.isdir(path) or os.path.islink(path):
+					return False
+			except OSError:
+				return False
+		except OSError:
+			return False
+	return True
+
+def make_real_folder(path:str) -> bool:
+	'''
+	Make path, in a real folder of a version being written (real_folders_to()), a real folder: an entry of another kind
+	there is removed first, a link as a link, never followed. False, with an error line, when that cannot be done.
+	'''
+	try:
+		try:
+			if stat.S_ISDIR(os.lstat(path).st_mode):
+				return True
+			os.remove(path)
+		except FileNotFoundError:
+			pass
+		os.mkdir(path)
+		return True
+	except OSError as e:
+		backuperTeeLogToTl(path=path,error=True,message=f'Cannot make the folder {path}: {e}')
+		return False
+
 def replace_entry(temp_path:str, dest_path:str):
 	'''Put temp_path in dest_path's place. A real folder there is removed first, as is anything a folder cannot be renamed over.'''
 	if os.path.isdir(dest_path) and not os.path.islink(dest_path):
@@ -4842,7 +4918,13 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 			if not succeeded and lines and all(copy_metadata_failure(line, temp_name) for line in lines) and os.path.lexists(copy.temp_path):
 				backuperTeeLogToTl(path=copy.source_path,warning=True,message=f'Copied {copy.source_path} to {copy.dest_path} without all of its metadata: {error}')
 				succeeded = True
-			if succeeded:
+			if succeeded and not real_folders_to(version_path, os.path.relpath(copy.dest_path, version_path), missing_ok=True):
+				# a folder above it is now a link or a file in the version: the copy is not put in place through it ( a missing
+				# one took the partial file along, and fails the copy as before )
+				remove_entry(copy.temp_path)
+				manifest.discard(os.path.relpath(copy.dest_path, version_path))
+				backuperTeeLogToTl(path=copy.source_path,error=True,message=f'Not putting the copy of {copy.source_path} in place at {copy.dest_path}: a folder above it in the version is not a real folder; not tracking it')
+			elif succeeded:
 				replace_entry(copy.temp_path, copy.dest_path)
 				copied.append(os.path.relpath(copy.dest_path, version_path))
 			else:
@@ -6139,21 +6221,37 @@ def kernel_cannot_follow(version_path:str, rel:str, record:ManifestRecord) -> bo
 	entry = os.path.join(version_path, rel)
 	return os.path.islink(entry) and not os.path.exists(entry)
 
-def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_path:str, monitor_path:str):
+def read_version_record(version_path:str, rel:str, monitor_path:str, fresh:bool = False):
 	'''
-	Compare one tracked entry for delta generation, on the compare pool.
+	read_vault_record(), for a fresh version_path: one a backup is still writing, where a regular file in the version
+	itself (reached by no link) is a copy this backup made, so its record stays unchecked, as read_copied_record() gives.
+	'''
+	record = read_vault_record(version_path, rel, monitor_path)
+	if fresh and record is not None and record.kind == 'f':
+		try:
+			copied = stat.S_ISREG(os.lstat(os.path.join(version_path, rel)).st_mode)
+		except OSError:
+			copied = False
+		if copied:
+			record = record._replace(unchecked=1)
+	return record
+
+def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_path:str, monitor_path:str, fresh:bool = False):
+	'''
+	Compare one tracked entry for delta generation, on the compare pool; with fresh, version_path is the version a
+	backup is writing (read_version_record()).
 	Returns (event or None, a record read from the vault to store or None).
 	'''
 	found = None
 	if record.kind is None:
-		found = read_vault_record(version_path, rel, monitor_path)
+		found = read_version_record(version_path, rel, monitor_path, fresh)
 		if found is None:
 			backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Cannot read {os.path.join(version_path, rel)} from the vault, treating as create')
 			return 'create', None
 		record = found
 	elif record.unchecked:
 		# a crash soon after a backup can leave its copies at the right size and mtime over bytes that never reached the disk
-		found = read_vault_record(version_path, rel, monitor_path)
+		found = read_version_record(version_path, rel, monitor_path, fresh)
 		if found is None or (found.size, found.mtime_ns, found.hash) != (record.size, record.mtime_ns, record.hash):
 			backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Vault copy at {os.path.join(version_path, rel)} does not match its record, copying again')
 			return 'modify', None
@@ -6237,7 +6335,7 @@ def scope_path_entry(monitor_path:str, rel:str, skip = None, errors:list = None)
 		return None
 	return (path + '/' if is_dir else path), entry_rel, is_dir
 
-def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str, monitor_path:str, scopes:TouchedScopes, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None, trusted = frozenset(), attributes:bool = True) -> int:
+def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str, monitor_path:str, scopes:TouchedScopes, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None, trusted = frozenset(), attributes:bool = True, fresh:bool = False) -> int:
 	'''
 	Add to backup_entries what differs between scopes of monitor_path and the manifest rows describing version_path,
 	in the caller's transaction: nothing is begun, committed or rolled back here, so the rows can be the ones a backup
@@ -6246,7 +6344,9 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	The vault is read, at version_path only, for unverified rows and unchecked copies, and what is read is recorded, as
 	delta_generate_backup_entries() describes. The trusted rels are rows this backup wrote from the monitored tree and
 	has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder from a file,
-	and never read back, so their copies stay unchecked. Without attributes, attribute-only differences are left out.
+	and never read back, so their copies stay unchecked. With fresh, version_path is that uncommitted version, and a
+	file read there as a real file of its own (a re-copy, or a copy a move carried) is recorded unchecked too.
+	Without attributes, attribute-only differences are left out.
 	Each subtree is walked, and the rows at or under it the walk did not find are deleted (every such row for the whole
 	tree); each path is looked up alone, a folder without its contents, and the root is never one. A scope nested in a
 	subtree is compared once, with the subtree, and so is an entry two paths name. The scopes are taken in the order of
@@ -6327,7 +6427,7 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 					# this backup just copied it from the tree, as the kind its rel tells
 					pending.append((monitor_entry, rel, (None, None)))
 				else:
-					pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path)))
+					pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path, fresh)))
 			settle(COMPARE_THREADS * 4)
 		# the entries the paths found, as X and X/ name the same one
 		path_entries = set()
@@ -6396,6 +6496,9 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 	- removed: each entry there that no row tracks, as a failed rename's copy fallback can leave one, is removed. A link
 	  is removed as a link, never followed, and a folder that holds tracked entries is looked into instead.
 	- missing: the tracked rels at or under each subtree that have no entry of their kind there.
+	A tracked rel whose place lies behind a link or a file of the version (a folder above it, or for a folder its own
+	entry, is not a real folder) cannot be held there: its row is dropped and it is counted as removed, never as missing,
+	as copying it would write through the link.
 	Only what lies in version_path through real folders is looked at or removed, and never version_path itself.
 	'''
 	removed = []
@@ -6453,7 +6556,14 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 		tracked = [rel for rel in (scope, scope[:-1]) if rel and manifest.lookup(rel) is not None]
 		tracked += list(manifest.iter_under(scope)) if scope else list(manifest.iter_folders()) + list(manifest.iter_files())
 		for rel in tracked:
-			if rel not in found and not any(rel.startswith(folder) or rel + '/' == folder for folder in unlisted):
+			if rel in found or any(rel.startswith(folder) or rel + '/' == folder for folder in unlisted):
+				continue
+			entry = os.path.join(version_path, rel.rstrip('/'))
+			if not real_folders_to(version_path, rel, missing_ok=True) or (rel.endswith('/') and os.path.lexists(entry) and (os.path.islink(entry) or not os.path.isdir(entry))):
+				backuperTeeLogToTl(path=version_path,message=f'Not tracking {rel}: its place in the version is behind a link or a file')
+				manifest.discard(rel)
+				removed.append(rel)
+			else:
 				missing.append(rel)
 	return removed, missing
 
@@ -7037,7 +7147,8 @@ def decrement_stepper(vault_info_dict:OrderedDict) -> tuple:
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
-					 recopy:list = (),recopied:list = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None) -> VaultManifest:
+					 recopy:list = (),recopied:list = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
+					 recheck_mounts = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
@@ -7051,7 +7162,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	entries), what differs is replayed the same way, then entries no row tracks are removed from backup_folder under
 	the touched subtrees and tracked ones missing there are copied (sweep_version_folder()). Each fix is appended to
 	verified as a (monitored path, BackupEntryValues) pair, a folder's path ending with /: the comparison's entries,
-	then a delete for each entry removed, then a create for each one missing.
+	then a delete for each entry removed, then a create for each one missing; one the replay could not apply is left
+	out. recheck_mounts(fixes), when given, runs once the comparison walked the tree: it drops the fixes under inner
+	mounts unmounted meanwhile, and raises JobFailure when the monitored root's filesystem changed.
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
@@ -7060,24 +7173,51 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		reported = set()
 	backup_entries = prepare_backup_entries_for_replay(backup_entries)
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
+	def not_through_link(rel,isDir,doing):
+		# a folder above rel in the new version is a link (or a file): what is done there would reach through it, out of
+		# the version. the version cannot hold rel there, so its rows go
+		backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not {doing} {os.path.join(backup_folder,rel)}: a folder above it in the version is not a real folder; not tracking it')
+		if isDir:
+			manifest.remove_tree(as_folder_entry(rel))
+		else:
+			manifest.discard(rel)
 	def copy_path(isDir,monitor_path,source_real_path,source_relative_path,file_vault_real_path,backup_folder,mcae):
+		# returns whether the entry is tracked and copied ( or queued ), as every write into the version goes through real
+		# folders of it only
 		if not os.path.lexists(source_real_path):
 			# recording a path we cannot copy makes the tracked list lie about this
 			# version, and the next referenced copy turns every such entry into a
 			# dangling link that all later versions inherit. skip it instead.
 			backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not tracking {source_relative_path}: source no longer exists')
-			return
+			return False
+		source_relative_path = source_relative_path.rstrip('/')
+		file_vault_real_path = file_vault_real_path.rstrip('/')
+		if not real_folders_to(backup_folder,source_relative_path,make=True):
+			not_through_link(source_relative_path,isDir,'copying to')
+			return False
 		if isDir:
+			if not make_real_folder(file_vault_real_path):
+				manifest.remove_tree(as_folder_entry(source_relative_path))
+				return False
+			# whatever stood at its place is gone
+			manifest.discard(source_relative_path)
 			manifest.add(as_folder_entry(source_relative_path),dirty=True)
-			os.makedirs(file_vault_real_path,exist_ok=True)
 			copy_file_meta(source_file=source_real_path,backup_file_path=file_vault_real_path)
 			walk_errors = []
 			rel_base = as_folder_entry(source_relative_path)
+			# a folder that could not be made: nothing is copied under it
+			unmade = None
 			for subRealPath, subRelativePath, subIsDir in iter_tree_entries(source_real_path,rel_base,skip=None if skip_list is None else skip_list.skips,errors=walk_errors):
+				if unmade is not None and subRelativePath.startswith(unmade):
+					continue
 				subVaultPath = os.path.join(backup_folder,subRelativePath)
 				if subIsDir:
+					# the walk lists each folder before its contents, so its parent was made a real folder just before
+					if not make_real_folder(subVaultPath.rstrip('/')):
+						unmade = subRelativePath
+						continue
+					manifest.discard(subRelativePath[:-1])
 					manifest.add(subRelativePath,dirty=True)
-					os.makedirs(subVaultPath,exist_ok=True)
 					copy_file_meta(source_file=subRealPath,backup_file_path=subVaultPath)
 					continue
 				if not os.path.lexists(subRealPath):
@@ -7090,13 +7230,25 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			manifest.add(source_relative_path,dirty=True)
 		# we just copy the entire folder / file ( for recursive create purposes )
 			cp_af_copy_path(source_path=source_real_path,dest_path=file_vault_real_path,mcae=mcae,pending=pending)
+		return True
 	def delete_path(isDir,vault_real_path,relative_path,mcae):
+		# never with a trailing /, which makes rm follow a link in the entry's place
+		vault_real_path = vault_real_path.rstrip('/')
+		relative_path = relative_path.rstrip('/')
+		if relative_path in ('', '.'):
+			backuperTeeLogToTl(path=vault_real_path,error=True,message='Attempting to remove the version itself, skipping')
+			return
+		if not real_folders_to(backup_folder,relative_path,missing_ok=True):
+			# nothing of it is in the version but through that link: only its rows go
+			not_through_link(relative_path,isDir,'removing')
+			return
 		if isDir:
 			# we just remove the folder
 			if os.path.abspath(vault_real_path) == '/':
 				# we cannot remove root
 				backuperTeeLogToTl(path=vault_real_path,error=True,message='Attempting to remove root, skipping')
-			else:
+			elif os.path.isdir(vault_real_path) and not os.path.islink(vault_real_path):
+				# an entry of another kind in its place is another row's ( a link that replaced the folder ), and stays
 				mcae.run_command(['rm','-rf',vault_real_path])
 			# also stops tracking all the files and subfolders in the folder
 			manifest.remove_tree(as_folder_entry(relative_path))
@@ -7138,9 +7290,12 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				copied = sub_rel if sub_is_dir else None
 		log_unreadable(monitor_path if job_name is None else job_name,monitor_path,walk_errors,reported)
 	def replay(entries):
-		# entries as prepare_backup_entries_for_replay() orders them
+		# entries as prepare_backup_entries_for_replay() orders them. returns {path: whether it was applied}: a create or
+		# modify whose source is gone, or whose place in the version lies behind a link, is not
+		applied = {}
 		need_delete_barrier = False
 		for event_source_real_path, event_values in entries.items():
+			applied[event_source_real_path] = True
 			backuperTeeLogToTl(path=monitor_path,message=f'Processing {event_source_real_path} {event_values}')
 			event_relative_path = os.path.relpath(path=event_source_real_path,start=monitor_path)
 			file_vault_target_path = os.path.join(backup_folder,event_relative_path)
@@ -7156,11 +7311,21 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				need_delete_barrier = False
 			if event_values.event in {'create','modify'}:
 				# we just over write the vault file with the source file
-				copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=event_source_real_path,
+				applied[event_source_real_path] = copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=event_source_real_path,
 				 source_relative_path=event_relative_path,
 				 file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
 			elif event_values.event == 'attrib':
+				# the parents a prior version lacked are made, as real folders
+				if not real_folders_to(backup_folder,event_relative_path,make=True):
+					not_through_link(event_relative_path,isDir,'syncing attributes onto')
+					applied[event_source_real_path] = False
+					continue
 				if isDir:
+					if os.path.lexists(file_vault_target_path) and (os.path.islink(file_vault_target_path) or not os.path.isdir(file_vault_target_path)):
+						# the folder's metadata would go through the link, or onto another row's entry
+						backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {event_source_real_path} onto {file_vault_target_path}, which is not a real folder in the version')
+						applied[event_source_real_path] = False
+						continue
 					# we just copy the folder metadata
 					os.makedirs(file_vault_target_path,exist_ok=True)
 					copy_file_meta(event_source_real_path,file_vault_target_path)
@@ -7168,10 +7333,6 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				else:
 					if only_sync_attributes:
 						# we just copy the file metadata
-						# ensure parent exists when prior version lacked this path
-						parent_dir = os.path.dirname(file_vault_target_path)
-						if parent_dir:
-							os.makedirs(parent_dir, exist_ok=True)
 						copy_file_meta(event_source_real_path,file_vault_target_path)
 					else:
 						# we copy the file
@@ -7196,6 +7357,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
 				link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
 				try:
+					if not real_folders_to(backup_folder,link_source_relative_path,missing_ok=True) or not real_folders_to(backup_folder,link_target_relative_path,missing_ok=True):
+						# renaming would reach through the link, out of the version
+						raise NotARealFolder(f'a folder above {link_source_backup_real_path} or {link_target_backup_real_path} in the version is not a real folder')
 					if os.path.lexists(link_target_backup_real_path):
 						os.remove(link_target_backup_real_path)
 					os.rename(link_source_backup_real_path,link_target_backup_real_path)
@@ -7214,9 +7378,18 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 							backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot re-target the links at {retarget_path}, moved to another folder depth: {retarget_error}; '
 								'they keep their text, which still names their versions, and the next comparison checks them')
 					# sync the current attrs from the source onto the moved vault entry,
-					# but never through a chained symlink: that would rewrite the previous version's metadata
-					if isDir or not os.path.islink(link_target_backup_real_path):
+					# but never through a symlink: a chained one would rewrite the previous version's metadata
+					if not os.path.islink(link_target_backup_real_path):
 						copy_file_meta(event_source_real_path,link_target_backup_real_path)
+				except NotARealFolder as e:
+					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: {e}; doing delete & copy instead')
+					copy_path(isDir=isDir,monitor_path=monitor_path,
+					  source_real_path=event_source_real_path,
+					  source_relative_path=event_relative_path,
+					  file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
+					delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
+					  relative_path=link_source_relative_path,mcae=mcae)
+					wait_for_async_commands(mcae)
 				except Exception as _:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
 					import traceback
@@ -7235,6 +7408,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
 		if need_delete_barrier:
 			wait_for_async_commands(mcae)
+		return applied
 	def verify():
 		# what the batch's events touched is compared with the monitored tree, and the version fixed where they differ:
 		# the collapse into one entry per path cannot replay every order of moves, re-creations and deletes. the rows this
@@ -7242,12 +7416,24 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# left to the attribute handling, which syncs them onto the latest copy, wherever it lives
 		fixes = OrderedDict()
 		compare_scopes(fixes, manifest, backup_folder, monitor_path, touched, None if skip_list is None else skip_list.skips, paused,
-			monitor_path if job_name is None else job_name, reported, trusted=manifest.dirty_rels(), attributes=False)
+			monitor_path if job_name is None else job_name, reported, trusted=manifest.dirty_rels(), attributes=False, fresh=True)
 		if not GREEN_LIGHT.is_set():
 			return
+		if recheck_mounts is not None:
+			# a disk unmounted while the comparison walked looks emptied
+			recheck_mounts(fixes)
+		def applied_fixes(entries, results):
+			# a fix is recorded once the version holds it: one the replay passed over ( its source gone, or its place behind
+			# a link ), or whose copy failed, is not. an entry the replay left to a folder create above it is in that folder
+			for path, values in entries.items():
+				rel = os.path.relpath(path, monitor_path) + ('/' if path.endswith('/') else '')
+				tracked = manifest.lookup(rel) is not None
+				if results.get(path, True) and tracked != (values.event == 'delete'):
+					yield path, values
+		applied = {}
 		if fixes:
 			backuperTeeLogToTl(path=monitor_path,message=f'Fixing {len(fixes)} differences between {backup_folder} and the touched places of the monitored tree')
-			replay(prepare_backup_entries_for_replay(fixes))
+			applied = replay(prepare_backup_entries_for_replay(fixes))
 			wait_for_async_commands(mcae)
 			if not GREEN_LIGHT.is_set():
 				return
@@ -7255,14 +7441,15 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		removed, missing = sweep_version_folder(manifest, backup_folder, touched)
 		fix_time = datetime.datetime.now().isoformat()
 		missing_entries = OrderedDict((os.path.join(monitor_path, rel), BackupEntryValues(fix_time, 'create', None)) for rel in missing)
+		copied = {}
 		if missing_entries:
 			backuperTeeLogToTl(path=monitor_path,message=f'Copying {len(missing_entries)} tracked entries missing from {backup_folder}')
-			replay(prepare_backup_entries_for_replay(missing_entries))
+			copied = replay(prepare_backup_entries_for_replay(missing_entries))
 			wait_for_async_commands(mcae)
 		if verified is not None:
-			verified.extend(fixes.items())
+			verified.extend(applied_fixes(fixes, applied))
 			verified.extend((os.path.join(monitor_path, rel), BackupEntryValues(fix_time, 'delete', None)) for rel in removed)
-			verified.extend(missing_entries.items())
+			verified.extend(applied_fixes(missing_entries, copied))
 	# this function does the actual backup using a referenced version and a change list to copy the source from
 	# reverb backup flow:
 	#   do referenced copy of the last version to the current backup folder 
@@ -7284,6 +7471,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			for rel in recopy:
 				if not GREEN_LIGHT.is_set():
 					break
+				if not real_folders_to(backup_folder,rel):
+					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not copying {rel} again from the vault: a folder above it in {backup_folder} is not a real folder')
+					continue
 				end = chain_end(job_vault,latest_version_info.path,rel)
 				if end is None or stat.S_ISDIR(end.st.st_mode):
 					what = 'cannot be followed' if end is None else f'ends at the folder {end.path}'
