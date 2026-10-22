@@ -352,3 +352,71 @@ def test_a_thread_that_gave_up_on_the_log_lock_gets_it_again_when_it_is_held_bri
 		logger.join(5)
 	assert gave_up is False
 	assert fake.writes == ['alone\n', 'again\n']
+
+
+def run_thread(target, name='worker'):
+	thread = threading.Thread(target=target, name=name)
+	thread.start()
+	thread.join()
+
+
+def test_a_thread_traceback_is_logged_escaped(capsys, monkeypatch):
+	monkeypatch.setattr(threading, 'excepthook', rv.log_thread_exception)
+	def fail():
+		raise ValueError('bad\nreverberator job x FAILED: forged\x1b[31m')
+	run_thread(fail)
+	captured = capsys.readouterr()
+	out = captured.out + captured.err
+	assert any('Uncaught exception in thread worker:' in line for line in out.split('\n'))
+	assert alerting_lines(out) == []
+	assert '\x1b[31m' not in out
+	# Tee_Logger's colour codes are the logger's own, and sit where its version puts them
+	forged = [line for line in COLOUR.sub('', out).split('\n') if line.endswith('reverberator job x FAILED: forged\\x1b[31m')]
+	assert len(forged) == 1 and forged[0].startswith('    ')
+
+
+def test_systemexit_in_a_thread_is_silent(capsys, monkeypatch):
+	monkeypatch.setattr(threading, 'excepthook', rv.log_thread_exception)
+	def leave():
+		raise SystemExit(3)
+	run_thread(leave)
+	captured = capsys.readouterr()
+	assert captured.out + captured.err == ''
+
+
+def test_a_failing_log_falls_back_to_pythons_hook(monkeypatch):
+	class BrokenLogger:
+		def teeerror(self, text):
+			raise OSError('journal gone')
+	seen = []
+	monkeypatch.setattr(rv, 'tl', BrokenLogger())
+	monkeypatch.setattr(threading, '__excepthook__', lambda args: seen.append(args))
+	monkeypatch.setattr(threading, 'excepthook', rv.log_thread_exception)
+	def fail():
+		raise ValueError('lost otherwise')
+	run_thread(fail)
+	assert len(seen) == 1
+	assert seen[0].exc_type is ValueError and str(seen[0].exc_value) == 'lost otherwise'
+
+
+def test_install_daemon_output_sets_the_thread_hook(monkeypatch):
+	monkeypatch.setattr(sys, 'stdout', io.StringIO())
+	monkeypatch.setattr(sys, 'stderr', io.StringIO())
+	monkeypatch.setattr(atexit, 'register', lambda *args, **kwargs: None)
+	monkeypatch.setattr(threading, 'excepthook', threading.excepthook)
+	rv.install_daemon_output()
+	assert threading.excepthook is rv.log_thread_exception
+
+
+def test_sysctl_runs_quiet_in_verbose_mode(monkeypatch):
+	quiet = []
+	def run_command(*args, **kwargs):
+		quiet.append(kwargs.get('quiet'))
+		return ['fs.inotify.max_user_watches = 5']
+	monkeypatch.setattr(rv.multiCMD, 'run_command', run_command)
+	monkeypatch.setattr(rv, 'DEBUG', True)
+	manager = rv.inotify_resource_manager()
+	assert manager.debug is True
+	assert manager.getSysctlValues('fs.inotify.max_user_watches') == 5
+	assert len(quiet) >= 5
+	assert all(q is True for q in quiet)
