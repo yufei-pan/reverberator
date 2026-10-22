@@ -66,14 +66,17 @@ def raw_events(job, events_spec):
 
 def replay_sequence(tmp_path, before:dict, after:dict, events_spec:list, between=None, **kwargs):
 	'''
-	V0 of before, then one batch of events_spec run as the backuper runs it, over the monitored tree made into after.
-	between(job), when given, runs once V0 is taken. Returns (job, the batch's version).
+	V0 of before, then one batch of events_spec run as the backuper runs it, over the monitored tree made into after
+	(or after(job), once between has run). between(job), when given, runs once V0 is taken. Returns (job, the batch's
+	version).
 	'''
 	job = create_job(str(tmp_path))
 	write_tree(job.monitor, before)
 	run_backup(job)
 	if between is not None:
 		between(job)
+	if callable(after):
+		after = after(job)
 	make_tree(job, before, after)
 	events = raw_events(job, events_spec)
 	entries = rv.change_events_to_backup_entries(deque(events), job.monitor)
@@ -374,26 +377,114 @@ def test_attribute_only_differences_are_not_replayed(tmp_path):
 	assert os.path.islink(os.path.join(version.path, 'D2/a.txt'))
 
 
-def older_versions(job):
-	'''(rel, kind, link target, mode, uid, gid, mtime_ns) of everything in every version but the newest.'''
+def older_versions(job, synced=()):
+	'''
+	(rel, kind, link target, mode, uid, gid, mtime_ns, ctime_ns, inode, size, hash of the bytes, extended attributes) of
+	everything in every version, by lstat: a link is never followed. The rels of synced (job vault rels) are the chain
+	ends an attribute sync may write: only their kind, link target, inode, size and bytes are listed.
+	'''
+	import hashlib
 	listing = []
 	for version in rv.list_versions(job.job_vault):
 		for folder, dirs, files in os.walk(version.path):
 			for name in sorted(dirs + files):
 				path = os.path.join(folder, name)
+				rel = os.path.relpath(path, job.job_vault)
 				st = os.lstat(path)
-				listing.append((os.path.relpath(path, job.job_vault), stat.S_IFMT(st.st_mode), os.readlink(path) if stat.S_ISLNK(st.st_mode) else None,
-					st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns))
-	return sorted(listing)
+				digest = None
+				if stat.S_ISREG(st.st_mode):
+					with open(path, 'rb') as f:
+						digest = hashlib.sha256(f.read()).hexdigest()
+				try:
+					xattrs = sorted((attr, os.getxattr(path, attr, follow_symlinks=False)) for attr in os.listxattr(path, follow_symlinks=False))
+				except OSError as e:
+					xattrs = type(e).__name__
+				meta = (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns, st.st_ctime_ns, xattrs)
+				if rel in synced:
+					meta = (None,) * len(meta)
+				listing.append((rel, stat.S_IFMT(st.st_mode), os.readlink(path) if stat.S_ISLNK(st.st_mode) else None,
+					*meta[:5], st.st_ino, st.st_size, digest, meta[5]))
+	return sorted(listing, key=lambda row: row[0])
 
 
-@pytest.mark.parametrize('name', sorted(SEQUENCES))
+def second_version(job):
+	'''
+	V1 of the tree with the times of keep.txt (or of its first file) changed, so that the version a batch then writes
+	chains through V1 to V0.
+	'''
+	keep = os.path.join(job.monitor, 'keep.txt')
+	if not os.path.lexists(keep):
+		keep = os.path.join(job.monitor, sorted(name for name in os.listdir(job.monitor) if os.path.isfile(os.path.join(job.monitor, name)))[0])
+	os.utime(keep, ns=(os.lstat(keep).st_atime_ns, os.lstat(keep).st_mtime_ns - 10 ** 9))
+	run_backup(job)
+	assert rv.list_versions(job.job_vault)[-1].number == 1
+
+
+def link_into_v0(job, rel):
+	'''The absolute path of rel in V0, for a user's link into the vault.'''
+	return os.path.join(rv.list_versions(job.job_vault)[0].path, rel)
+
+
+def with_users_link(job):
+	'''second_version(), with D/lnk made a user's link to sub/deep.txt first, so that V1 holds it.'''
+	os.symlink('sub/deep.txt', os.path.join(job.monitor, 'D/lnk'))
+	second_version(job)
+
+
+def attrib_after(job):
+	os.chmod(os.path.join(job.monitor, 'D/old.txt'), 0o600)
+	os.setxattr(os.path.join(job.monitor, 'D/old.txt'), 'user.guard', b'1')
+	os.chmod(os.path.join(job.monitor, 'D'), 0o700)
+	os.utime(os.path.join(job.monitor, 'D/lnk'), ns=(10 ** 18, 10 ** 18), follow_symlinks=False)
+
+
+# name: (before, between(job) making V1, after (or after(job)), raw events, after_tree(job) run on the made tree, the
+# job vault rels whose attributes the batch syncs onto chain ends)
+GUARD_SEQUENCES = {
+	# D, D/old.txt and D/lnk given other attributes: they are synced onto the end of each chain, V0's copy of D/old.txt
+	# and V1's user link D/lnk, never what the link leads to
+	'attrib': (BASE, with_users_link, {**BASE, 'D/lnk': ('link', 'sub/deep.txt')},
+		[('attrib', 'D/old.txt', None, False), ('attrib', 'D', None, True), ('attrib', 'D/lnk', None, False)], attrib_after,
+		lambda job: {os.path.relpath(link_into_v0(job, 'D/old.txt'), job.job_vault),
+			os.path.join(rv.list_versions(job.job_vault)[1].name, 'D/lnk')}),
+	# the folder D replaced by a user's link to V0's D, with an event of its old child after it: nothing of the version is
+	# written or removed through the link
+	'users_link_into_the_vault': (BASE, second_version, lambda job: {'keep.txt': 'keep', 'D': ('link', link_into_v0(job, 'D'))},
+		[('delete', 'D/sub/deep.txt', None, False), ('create', 'D', None, False), ('modify', 'D/old.txt', None, False)], None,
+		lambda job: set()),
+}
+
+
+@pytest.mark.parametrize('name', sorted(SEQUENCES) + sorted(GUARD_SEQUENCES))
 def test_older_versions_are_untouched(tmp_path, name):
-	before, after, events_spec, _ = SEQUENCES[name]
-	snapshots = []
-	job, version = replay_sequence(tmp_path, before, after, events_spec, between=lambda job: snapshots.append(older_versions(job)))
-	assert version.number == 1
-	assert snapshots[0] and [row for row in older_versions(job) if not row[0].startswith(version.name)] == snapshots[0]
+	if name in GUARD_SEQUENCES:
+		before, between, after, events_spec, after_tree, synced = GUARD_SEQUENCES[name]
+	else:
+		# V1 of the same tree first, so that the older versions hold chain links too
+		before, after, events_spec, _ = SEQUENCES[name]
+		between, after_tree, synced = second_version, None, lambda job: set()
+	job = create_job(str(tmp_path))
+	write_tree(job.monitor, before)
+	run_backup(job)
+	between(job)
+	synced = synced(job)
+	older = older_versions(job, synced)
+	make_tree(job, before, after(job) if callable(after) else after)
+	if after_tree is not None:
+		after_tree(job)
+	events = raw_events(job, events_spec)
+	run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
+	version = rv.list_versions(job.job_vault)[-1]
+	assert version.number == 2
+	assert [row for row in older_versions(job, synced) if not row[0].startswith(version.name + '/')] == older
+	if name == 'attrib':
+		# the syncs were made, onto the ends of the chains
+		assert stat.S_IMODE(os.lstat(link_into_v0(job, 'D/old.txt')).st_mode) == 0o600
+		assert os.getxattr(link_into_v0(job, 'D/old.txt'), 'user.guard') == b'1'
+		assert os.lstat(os.path.join(rv.list_versions(job.job_vault)[1].path, 'D/lnk')).st_mtime_ns == 10 ** 18
+	else:
+		# attrib's D/lnk is a chain link to V1's, which assert_version_matches_tree() would follow
+		assert_version_matches_tree(job, version)
 
 
 @pytest.mark.parametrize('name', ['a', 'c'])
@@ -439,10 +530,25 @@ def test_interrupted_verification_commits_nothing(tmp_path, monkeypatch, name):
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
 
 
-@pytest.mark.parametrize('pattern', ['recreated_folder', 'git'])
+@pytest.mark.parametrize('pattern', ['recreated_folder', 'git', 'git_alone'])
 def test_recopy_row_dropped_for_a_verified_delete(tmp_path, pattern):
 	job = create_job(str(tmp_path))
-	if pattern == 'recreated_folder':
+	if pattern == 'git_alone':
+		# a due file replaced and deleted, and nothing else: the batch collapses to no entry, and goes through the backuper
+		due = name_with_threshold(32, 'g')
+		fast_forward_to_32(job, {due: 'x' * 1024})
+		backuper = RunningBackuper(job)
+		try:
+			lock = os.path.join(job.monitor, due + '.lock')
+			with open(lock, 'w') as f:
+				f.write('new')
+			os.rename(lock, os.path.join(job.monitor, due))
+			os.remove(os.path.join(job.monitor, due))
+			assert backuper.back_up(raw_events(job, [('create', due + '.lock', None, False), ('move', due, due + '.lock', False),
+				('delete', due, None, False)]))[0::2] == (0, True)
+		finally:
+			backuper.stop()
+	elif pattern == 'recreated_folder':
 		# a stale child of a folder moved out of the tree and made again, due to be copied again from the vault
 		due = name_with_threshold(32, 'e/f')
 		fast_forward_to_32(job, {due: 'x' * 1024})
@@ -457,7 +563,8 @@ def test_recopy_row_dropped_for_a_verified_delete(tmp_path, pattern):
 		seed_monitor(job, {'c.txt': 'c changed'})
 		events = raw_events(job, [('create', due + '.lock', None, False), ('move', due, due + '.lock', False), ('delete', due, None, False),
 			('modify', 'c.txt', None, False)])
-	run_backup(job, rv.change_events_to_backup_entries(deque(events)), touched=rv.touched_scopes(events, job.monitor))
+	if pattern != 'git_alone':
+		run_backup(job, rv.change_events_to_backup_entries(deque(events)), touched=rv.touched_scopes(events, job.monitor))
 	version = rv.list_versions(job.job_vault)[-1]
 	assert version.number == 33
 	assert not os.path.lexists(os.path.join(version.path, due))
@@ -802,6 +909,160 @@ def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job, monkeypatch
 		time.sleep(0.5)
 		assert calls == [(1, rv.TouchedScopes(['a.txt/'], ['a.txt']))]
 		assert not queued_full_scan(queue, lock)
+	finally:
+		stop_backuper(thread)
+
+
+class RunningBackuper:
+	'''
+	The job's backuper as the daemon runs it, past its startup comparison: each batch is queued and signalled as the
+	watcher does, and waited for until the do_backup() it leads to returns. calls holds (entries, touched, committed) of
+	each do_backup() call, the startup comparison's first.
+	'''
+
+	def __init__(self, job):
+		from tests.harness import wait_until
+		self.calls = []
+		real = rv.do_backup
+
+		def recording(entries, *args, **kwargs):
+			count = len(entries)
+			result = real(entries, *args, **kwargs)
+			self.calls.append((count, kwargs.get('touched'), result[2]))
+			return result
+		self.patch = pytest.MonkeyPatch()
+		self.patch.setattr(rv, 'do_backup', recording)
+		self.queue = rv.ChangeEventQueue(job.monitor)
+		self.thread, self.lock, self.flag = start_backuper(job, self.queue)
+		wait_until(lambda: len(self.calls) == 1, message='no startup comparison')
+
+	def back_up(self, events, timeout=10.0):
+		'''Hand the backuper events as one batch. Returns its do_backup() call; it fails when there is none.'''
+		from tests.harness import wait_until
+		count = len(self.calls)
+		with self.lock:
+			for event in events:
+				self.queue.append(event)
+		self.flag.set()
+		wait_until(lambda: len(self.calls) > count, timeout=timeout, message='the backuper did not back up the batch')
+		return self.calls[count]
+
+	def stop(self):
+		try:
+			stop_backuper(self.thread)
+		finally:
+			self.patch.undo()
+
+
+def replace_then_delete(job):
+	'''git's ref written to X.lock, renamed over the existing X, then X deleted: the raw events, made in the tree.'''
+	ref = lambda name: os.path.join(job.monitor, 'refs', name)
+	with open(ref('X.lock'), 'w') as f:
+		f.write('new ref')
+	os.rename(ref('X.lock'), ref('X'))
+	os.remove(ref('X'))
+	return [rv.ChangeEvent(1.0, False, 'create', ref('X.lock'), None), rv.ChangeEvent(2.0, False, 'modify', ref('X.lock'), None),
+		rv.ChangeEvent(3.0, False, 'move', ref('X'), ref('X.lock')), rv.ChangeEvent(4.0, False, 'delete', ref('X'), None)]
+
+
+def test_a_lone_replace_then_delete_is_verified(job):
+	seed_monitor(job, {'refs/X': 'old ref', 'keep.txt': 'k'})
+	run_backup(job)
+	backuper = RunningBackuper(job)
+	try:
+		events = replace_then_delete(job)
+		assert rv.change_events_to_backup_entries(deque(events), job.monitor) == OrderedDict()
+		assert backuper.back_up(events) == (0, rv.touched_scopes(events, job.monitor), True)
+	finally:
+		backuper.stop()
+	versions = rv.list_versions(job.job_vault)
+	assert [version.number for version in versions] == [0, 1]
+	assert not os.path.lexists(os.path.join(versions[-1].path, 'refs/X'))
+	assert ('refs/X', 'delete') in changes(job, versions[-1])
+	assert_version_matches_tree(job, versions[-1])
+
+
+def test_a_swap_back_over_an_existing_file_is_verified(job):
+	seed_monitor(job, {'a': 'A', 'b': 'B'})
+	run_backup(job)
+	backuper = RunningBackuper(job)
+	try:
+		m = lambda name: os.path.join(job.monitor, name)
+		os.rename(m('a'), m('b'))
+		os.rename(m('b'), m('a'))
+		events = [rv.ChangeEvent(1.0, False, 'move', m('b'), m('a')), rv.ChangeEvent(2.0, False, 'move', m('a'), m('b'))]
+		assert backuper.back_up(events)[0::2] == (0, True)
+	finally:
+		backuper.stop()
+	versions = rv.list_versions(job.job_vault)
+	assert [version.number for version in versions] == [0, 1]
+	# the old b went with the first move
+	assert sorted(os.listdir(versions[-1].path)) == ['a']
+	with open(os.path.join(versions[-1].path, 'a')) as f:
+		assert f.read() == 'A'
+	assert_version_matches_tree(job, versions[-1])
+
+
+def test_an_empty_batch_whose_touched_places_match_the_vault_makes_no_version(job):
+	seed_monitor(job, {'X': 'x', 'keep.txt': 'k'})
+	run_backup(job)
+	rows = manifest_rows(job)
+	backuper = RunningBackuper(job)
+	try:
+		lock = os.path.join(job.monitor, 'X.lock')
+		with open(lock, 'w') as f:
+			f.write('tmp')
+		os.remove(lock)
+		events = [rv.ChangeEvent(1.0, False, 'create', lock, None), rv.ChangeEvent(2.0, False, 'modify', lock, None),
+			rv.ChangeEvent(3.0, False, 'delete', lock, None)]
+		assert backuper.back_up(events) == (0, rv.touched_scopes(events, job.monitor), True)
+	finally:
+		backuper.stop()
+	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
+	assert manifest_rows(job) == rows
+
+
+def test_scans_with_an_empty_collapse_compare_the_touched_places_too(job):
+	seed_monitor(job, {'refs/X': 'old ref', 'S/s.txt': 's'})
+	run_backup(job)
+	backuper = RunningBackuper(job)
+	try:
+		events = [rv.ChangeEvent(0.5, True, 'scan', os.path.join(job.monitor, 'S'), None)] + replace_then_delete(job)
+		assert backuper.back_up(events)[0::2] == (0, True)
+	finally:
+		backuper.stop()
+	versions = rv.list_versions(job.job_vault)
+	assert [version.number for version in versions] == [0, 1]
+	assert not os.path.lexists(os.path.join(versions[-1].path, 'refs/X'))
+	assert_version_matches_tree(job, versions[-1])
+
+
+def test_an_empty_collapse_that_does_not_commit_asks_for_a_full_comparison(job, monkeypatch):
+	from tests.harness import wait_until
+	seed_monitor(job, {'refs/X': 'old ref'})
+	run_backup(job)
+	real = rv.do_backup
+	calls = []
+
+	def failing(entries, *args, **kwargs):
+		calls.append(kwargs.get('touched'))
+		if len(calls) == 1:
+			return real(entries, *args, **kwargs)
+		# the batch's backup did not commit
+		return None, None, False
+	monkeypatch.setattr(rv, 'do_backup', failing)
+	queue = rv.ChangeEventQueue(job.monitor)
+	thread, lock, flag = start_backuper(job, queue)
+	try:
+		wait_until(lambda: len(calls) == 1, message='no startup comparison')
+		with lock:
+			for event in replace_then_delete(job):
+				queue.append(event)
+		flag.set()
+		# its events are gone from the queue, and nothing names what they touched but a full comparison
+		thread.join(timeout=10)
+		assert not thread.is_alive() and len(calls) == 2 and calls[1] is not None
+		assert queued_full_scan(queue, lock)
 	finally:
 		stop_backuper(thread)
 
@@ -1273,3 +1534,129 @@ def test_a_partial_file_behind_a_link_is_logged_and_left(job, monkeypatch):
 		manifest.close()
 	assert sorted(os.listdir(outside)) == ['.partial']
 	assert [message for message, _, _ in lines if 'Leaving the partial copy' in message]
+
+
+def test_the_monitored_roots_metadata_reaches_the_next_version(job, tmp_path, capsys):
+	from tests.harness import write_rule
+	from tests.test_restore import restore, destination
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
+		f.write('changed')
+	os.chmod(job.monitor, 0o750)
+	os.chown(job.monitor, 1234, 5678)
+	os.utime(job.monitor, ns=(10 ** 18, 10 ** 18))
+	# the root's own events give no entry
+	version = run_batch(job, [('attrib', '', None, True), ('modify', 'a.txt', None, False)])
+	assert version.number == 1
+	meta = lambda path: (lambda st: (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_mtime_ns))(os.lstat(path))
+	assert meta(version.path) == meta(job.monitor) == (0o750, 1234, 5678, 10 ** 18)
+	# and a whole-job restore gives it to the restored folder
+	write_rule(job)
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, out, '--version', '1')
+	assert (code, err) == (0, '')
+	assert meta(os.path.join(out, os.path.basename(job.monitor))) == meta(job.monitor)
+
+
+@pytest.mark.parametrize('kind', ['file', 'folder'])
+def test_copy_file_meta_never_takes_a_links_target_onto_an_entry_that_is_not_one(tmp_path, monkeypatch, kind):
+	# the monitored entry is a symlink now, while the version still holds a real copy of it
+	target = os.path.join(str(tmp_path), 'target')
+	dest = os.path.join(str(tmp_path), 'dest')
+	if kind == 'file':
+		write_plain_tree(str(tmp_path), {'target': 'elsewhere', 'dest': 'copy'})
+	else:
+		os.makedirs(target)
+		os.makedirs(dest)
+	os.chmod(target, 0o600)
+	os.chown(target, 1234, 5678)
+	os.setxattr(target, 'user.target', b'1')
+	link = os.path.join(str(tmp_path), 'link')
+	os.symlink(target, link)
+	before = os.lstat(dest)
+	lines = spy_on_log(monkeypatch)
+	assert rv.copy_file_meta(link + ('/' if kind == 'folder' else ''), dest) is False
+	after = os.lstat(dest)
+	assert (after.st_mode, after.st_uid, after.st_gid, after.st_mtime_ns, after.st_ctime_ns) == (before.st_mode, before.st_uid, before.st_gid, before.st_mtime_ns, before.st_ctime_ns)
+	assert os.listxattr(dest) == []
+	assert len([message for message, error, _ in lines if error]) == 1
+
+
+@pytest.mark.parametrize('how', ['returns', 'raises'])
+def test_a_version_being_written_is_forgotten_on_every_exit(job, monkeypatch, how):
+	seed_monitor(job, {'D/a.txt': 'a'})
+	run_backup(job)
+	latest = latest_version(job)
+	backup_folder = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
+	os.makedirs(backup_folder)
+	# what a walk of the version being written learned before the referenced copy stopped
+	key = (os.path.abspath(backup_folder), os.path.join(os.path.abspath(backup_folder), 'D'))
+	rv.REAL_VAULT_FOLDERS[key] = True
+
+	def stopped(*args, **kwargs):
+		if how == 'raises':
+			raise OSError('the disk went')
+		return False
+	monkeypatch.setattr(rv, 'do_referenced_copy', stopped)
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		if how == 'raises':
+			with pytest.raises(OSError):
+				rv.do_reverb_backup(OrderedDict(), backup_folder, latest, True, manifest, job.monitor)
+		else:
+			rv.do_reverb_backup(OrderedDict(), backup_folder, latest, True, manifest, job.monitor)
+	finally:
+		manifest.rollback()
+		manifest.close()
+	assert key not in rv.REAL_VAULT_FOLDERS
+
+
+@pytest.mark.parametrize('first', [True, False])
+@pytest.mark.parametrize('kind', ['link', 'folder'])
+def test_a_version_folder_already_there_fails_the_attempt(job, monkeypatch, first, kind):
+	'''A leftover of the new version's exact name, a link out of the vault or a folder holding one, is never written into.'''
+	outside = os.path.join(job.root, 'outside')
+	os.makedirs(outside)
+	seed_monitor(job, {'D/a.txt': 'a', 'keep.txt': 'k'})
+	if not first:
+		run_backup(job)
+	stamp = '2021-01-03_00-00-00_-0800'
+	real_format = rv.VAULT_TIMESTAMP_FORMAT
+	os.makedirs(job.job_vault, exist_ok=True)
+	leftover = os.path.join(job.job_vault, f'V{0 if first else 1}--{stamp}')
+	real_info = rv.get_vault_info
+
+	def info_then_leftover(*args, **kwargs):
+		# listing the vault removes the incomplete versions it finds: the leftover appears after that, and the new version
+		# is named as it is ( strftime() gives back a format without directives as it is )
+		info = real_info(*args, **kwargs)
+		monkeypatch.setattr(rv, 'VAULT_TIMESTAMP_FORMAT', stamp)
+		if kind == 'link':
+			os.symlink(outside, leftover)
+		else:
+			os.makedirs(leftover)
+			os.symlink(outside, os.path.join(leftover, 'D'))
+			os.symlink(os.path.join(outside, 'k'), os.path.join(leftover, 'keep.txt'))
+		return info
+	monkeypatch.setattr(rv, 'get_vault_info', info_then_leftover)
+	older = older_versions(job)
+	with open(os.path.join(job.monitor, 'D/a.txt'), 'w') as f:
+		f.write('changed')
+	lines = spy_on_log(monkeypatch)
+	entries = OrderedDict() if first else OrderedDict([event_entry_for(job, 'D/a.txt', 'modify')])
+	_, manifest, committed = rv.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
+		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+	manifest.close()
+	assert os.listdir(outside) == []
+	assert committed is False
+	monkeypatch.setattr(rv, 'get_vault_info', real_info)
+	monkeypatch.setattr(rv, 'VAULT_TIMESTAMP_FORMAT', real_format)
+	assert older_versions(job) == older
+	assert [message for message, error, _ in lines if error and leftover in message]
+	assert [version.number for version in rv.list_versions(job.job_vault)] == ([] if first else [0])
+
+
+def event_entry_for(job, rel, event):
+	from tests.harness import event_entry
+	return event_entry(job, rel, event)

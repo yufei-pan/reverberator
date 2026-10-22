@@ -4,8 +4,8 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import create_job, seed_monitor, run_backup, write_tree as write_plain_tree, wait_until
-from tests.test_verify_replay import BASE, assert_version_matches_tree
+from tests.harness import create_job, run_backup, write_tree as write_plain_tree, wait_until
+from tests.test_verify_replay import BASE, RunningBackuper, assert_version_matches_tree, write_tree
 
 pytestmark = pytest.mark.inotify
 
@@ -27,9 +27,12 @@ class Watch:
 		self.queue = rv.ChangeEventQueue(job.monitor)
 		self.lock = threading.Lock()
 		self.flag = threading.Event()
+		# stopped alone, as the job's backuper runs on
+		self.control = rv.JobControl(job.job_name)
+		self.control.start_attempt()
 		self.thread = threading.Thread(target=rv.watchFolder, kwargs=dict(monitor_path=job.monitor, to_process=self.queue,
 			to_process_lock=self.lock, to_process_flag=self.flag, irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=0,
-			max_shapshot_delay_seconds=60), daemon=True)
+			max_shapshot_delay_seconds=60, job=self.control), daemon=True)
 		self.thread.start()
 		probe = os.path.join(job.monitor, '.watch_ready')
 
@@ -60,9 +63,8 @@ class Watch:
 		return batch
 
 	def stop(self):
-		rv.GREEN_LIGHT.clear()
+		self.control.running.clear()
 		self.thread.join(timeout=3)
-		rv.GREEN_LIGHT.set()
 
 
 def has(kind, rel):
@@ -74,21 +76,31 @@ def all_of(*predicates):
 	return lambda events: all(predicate(events) for predicate in predicates)
 
 
-def backup_batch(job, batch):
-	'''One taken batch as the backuper backs it up: collapsed, its raw events' scopes to verify. Returns the new version.'''
-	entries = rv.change_events_to_backup_entries(batch, job.monitor)
-	run_backup(job, entries, touched=rv.touched_scopes(batch, job.monitor))
+def backup_batch(backuper, job, batch):
+	'''
+	One taken batch handed to the job's running backuper, which collapses it and verifies its raw events' scopes, as the
+	daemon does. Returns the latest version.
+	'''
+	backuper.back_up(list(batch))
 	return rv.list_versions(job.job_vault)[-1]
 
 
 def start(tmp_path, before):
-	'''V0 of before, and the real watcher on the monitored tree. Returns (job, the folder outside it, the watcher).'''
+	'''
+	V0 of before, the job's backuper and the real watcher on the monitored tree. Returns (job, the folder outside it,
+	the watcher, the backuper).
+	'''
 	job = create_job(str(tmp_path))
 	outside = os.path.join(job.root, 'outside')
 	os.makedirs(outside)
-	seed_monitor(job, before)
+	write_tree(job.monitor, before)
 	run_backup(job)
-	return job, outside, Watch(job)
+	backuper = RunningBackuper(job)
+	try:
+		return job, outside, Watch(job), backuper
+	except BaseException:
+		backuper.stop()
+		raise
 
 
 def mon(job, rel):
@@ -101,16 +113,19 @@ def put(job, rel, text):
 
 def run_sequence(tmp_path, before, ops, until, number=1):
 	'''
-	V0 of before, then ops(job, outside) in one batch, backed up. The latest version, number number, holds what the
-	monitored tree holds.
+	V0 of before, then ops(job, outside) in one batch, backed up by the backuper. The latest version, number number,
+	holds what the monitored tree holds.
 	'''
-	job, outside, watch = start(tmp_path, before)
+	job, outside, watch, backuper = start(tmp_path, before)
 	try:
-		ops(job, outside)
-		batch = watch.take(until=until)
+		try:
+			ops(job, outside)
+			batch = watch.take(until=until)
+		finally:
+			watch.stop()
+		version = backup_batch(backuper, job, batch)
 	finally:
-		watch.stop()
-	version = backup_batch(job, batch)
+		backuper.stop()
 	assert version.number == number
 	assert_version_matches_tree(job, version)
 	return job, version
@@ -202,13 +217,18 @@ def git_branch_delete(job, outside):
 	put(job, 'refs/X.lock', 'new ref')
 	os.rename(mon(job, 'refs/X.lock'), mon(job, 'refs/X'))
 	os.remove(mon(job, 'refs/X'))
-	put(job, 'keep.txt', 'changed')
 
 
 def swap_names(job, outside):
 	os.rename(mon(job, 'a'), mon(job, 'a.tmp'))
 	os.rename(mon(job, 'b'), mon(job, 'a'))
 	os.rename(mon(job, 'a.tmp'), mon(job, 'b'))
+
+
+def swap_back(job, outside):
+	# b existed before: the first move put a over it, so b is gone once a is back
+	os.rename(mon(job, 'a'), mon(job, 'b'))
+	os.rename(mon(job, 'b'), mon(job, 'a'))
 
 
 def chain_of_renames(job, outside):
@@ -224,7 +244,7 @@ def mv_dir_there_and_back(job, outside):
 
 
 SEQUENCES = {
-	'a': ({**BASE, 'D/lnk': 'old.txt'}, mv_dir_out_then_mkdir, has('create', 'D')),
+	'a': ({**BASE, 'D/lnk': ('link', 'old.txt')}, mv_dir_out_then_mkdir, has('create', 'D')),
 	'd4': (BASE, mv_dir_out_then_move_in, has('create', 'D')),
 	'd6': (BASE, mv_subdir_out_then_mkdir, has('create', 'D/sub')),
 	'd7': (BASE, mv_dir_out_then_mkdir_p, has('create', 'D')),
@@ -237,8 +257,11 @@ SEQUENCES = {
 	'd5': (BASE, mv_dir_then_mkdir, has('create', 'D')),
 	'f3': (BASE, create_in_dir_then_mv_dir, has('move', 'D2')),
 	'f5': (BASE, modify_in_dir_then_mv_dir, has('move', 'D2')),
-	'git': ({'keep.txt': 'keep', 'refs/X': 'old ref'}, git_branch_delete, all_of(has('delete', 'refs/X'), has('modify', 'keep.txt'))),
+	# its batch collapses to no entry at all
+	'git': ({'keep.txt': 'keep', 'refs/X': 'old ref'}, git_branch_delete, has('delete', 'refs/X')),
 	'swap': ({'a': 'A', 'b': 'B'}, swap_names, has('move', 'b')),
+	# so does this one's
+	'swap_back': ({'a': 'A', 'b': 'B'}, swap_back, has('move', 'a')),
 	'chain': ({'a': 'A'}, chain_of_renames, has('move', 'c')),
 	'loop': (BASE, mv_dir_there_and_back, all_of(has('move', 'D'), has('move', 'D2'))),
 }
@@ -264,25 +287,28 @@ def test_sequence_content_is_what_the_tree_holds(tmp_path):
 def test_sequence_git_pattern_removes_the_ref(tmp_path):
 	job, version = run_sequence(tmp_path, SEQUENCES['git'][0], git_branch_delete, SEQUENCES['git'][2])
 	assert not os.path.lexists(os.path.join(version.path, 'refs/X'))
-	assert read(os.path.join(version.path, 'keep.txt')) == 'changed'
+	assert read(os.path.join(version.path, 'keep.txt')) == 'keep'
 
 
 def test_sequence_late_delete(tmp_path):
 	# mv D/old.txt <outside>; mv D D2: the watcher holds the move out of the tree until it expires, so its delete reaches
 	# a later batch than D's rename
-	job, outside, watch = start(tmp_path, BASE)
+	job, outside, watch, backuper = start(tmp_path, BASE)
 	try:
-		os.rename(mon(job, 'D/old.txt'), os.path.join(outside, 'old.txt'))
-		os.rename(mon(job, 'D'), mon(job, 'D2'))
-		first = watch.take(until=has('move', 'D2'), settle=0.1)
-		assert not has('delete', 'D/old.txt')(list(first))
-		wait_until(lambda: has('delete', 'D/old.txt')(watch.events()), message='the move out did not expire')
-		second = watch.take()
+		try:
+			os.rename(mon(job, 'D/old.txt'), os.path.join(outside, 'old.txt'))
+			os.rename(mon(job, 'D'), mon(job, 'D2'))
+			first = watch.take(until=has('move', 'D2'), settle=0.1)
+			assert not has('delete', 'D/old.txt')(list(first))
+			wait_until(lambda: has('delete', 'D/old.txt')(watch.events()), message='the move out did not expire')
+			second = watch.take()
+		finally:
+			watch.stop()
+		version = backup_batch(backuper, job, first)
+		assert version.number == 1
+		assert_version_matches_tree(job, version)
+		version = backup_batch(backuper, job, second)
+		assert version.number == 2
+		assert_version_matches_tree(job, version)
 	finally:
-		watch.stop()
-	version = backup_batch(job, first)
-	assert version.number == 1
-	assert_version_matches_tree(job, version)
-	version = backup_batch(job, second)
-	assert version.number == 2
-	assert_version_matches_tree(job, version)
+		backuper.stop()

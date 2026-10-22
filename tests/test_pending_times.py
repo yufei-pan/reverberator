@@ -73,3 +73,37 @@ def test_scan_rows_alone_are_not_round_tripped(job):
 	queue = rv.ChangeEventQueue(job.monitor)
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue) is True
 	assert not queue.round_tripped
+
+
+def logged(monkeypatch):
+	lines = []
+	real = rv.backuperTeeLogToTl
+
+	def spy(path, message, *args, **kwargs):
+		lines.append(message)
+		return real(path, message, *args, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', spy)
+	return lines
+
+
+@pytest.mark.parametrize('case', ['earlier_boot', 'future'])
+def test_the_rebase_says_why_it_moved_the_times(job, monkeypatch, case):
+	seed_monitor(job, {'a.txt': 'a'})
+	start = time.monotonic() + 345600
+	pending = write_pending(job, [rv.ChangeEvent(start, False, 'modify', os.path.join(job.monitor, 'a.txt'), None)])
+	if case == 'earlier_boot':
+		real_monotonic = time.monotonic
+		shift = real_monotonic() - 30.0
+		monkeypatch.setattr(rv.time, 'monotonic', lambda: real_monotonic() - shift)
+		resumable(job, pending, time.time() - 60)
+	else:
+		resumable(job, pending, time.time() + 3600)
+	lines = logged(monkeypatch)
+	queue = rv.ChangeEventQueue(job.monitor)
+	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue) is True
+	rebased = [line for line in lines if 'moving their times' in line]
+	assert len(rebased) == 1
+	if case == 'earlier_boot':
+		assert 'before this boot' in rebased[0]
+	else:
+		assert 'dated in the future' in rebased[0] and 'before this boot' not in rebased[0]
