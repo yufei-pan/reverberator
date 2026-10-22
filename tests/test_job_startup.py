@@ -47,9 +47,14 @@ def _resumable_pending(job, path):
 
 
 def _count_deltas(monkeypatch):
+	'''The number of versions committed when each delta generation began.'''
 	calls = []
 	original = rv.delta_generate_backup_entries
-	monkeypatch.setattr(rv, 'delta_generate_backup_entries', lambda *args, **kwargs: calls.append(1) or original(*args, **kwargs))
+	def counting(*args, **kwargs):
+		latest = kwargs['latest_version_info'] if 'latest_version_info' in kwargs else args[1]
+		calls.append(len(rv.list_versions(os.path.dirname(os.path.abspath(latest.path)))))
+		return original(*args, **kwargs)
+	monkeypatch.setattr(rv, 'delta_generate_backup_entries', counting)
 	return calls
 
 
@@ -176,7 +181,8 @@ def test_unchanged_list_resumes_pending(job, poll_fast, monkeypatch):
 	thread = _run_backuper(job, startup)
 	try:
 		versions = wait_for_committed_count(job, 2)
-		assert not os.path.exists(pending) and deltas == []
+		# the resumed batch is backed up as it is; only the full comparison that follows it compares the tree
+		assert not os.path.exists(pending) and all(count >= 2 for count in deltas)
 		assert open(os.path.join(versions[1], 'a.txt')).read() == 'changed'
 	finally:
 		_stop(thread)
@@ -197,7 +203,8 @@ def test_upgrade_without_skip_list_resumes_pending(job, poll_fast, monkeypatch):
 	thread = _run_backuper(job, startup)
 	try:
 		wait_for_committed_count(job, 2)
-		assert not os.path.exists(pending) and deltas == []
+		# the resumed batch is backed up as it is; only the full comparison that follows it compares the tree
+		assert not os.path.exists(pending) and all(count >= 2 for count in deltas)
 	finally:
 		_stop(thread)
 
