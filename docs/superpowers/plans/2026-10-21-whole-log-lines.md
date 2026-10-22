@@ -10,6 +10,13 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-21-whole-log-lines-design.md`
 
+**As built (differs from the tasks below):**
+- The cut notice fits inside `LOG_LINE_LIMIT`, so Task 2's expected strings changed; the tests in `tests/test_log_lines.py` hold the values that shipped.
+- `log_text` cuts each line after its indent.
+- The watcher and backuper helpers escape and cut their joined line once.
+- `_call` finds `msg` by its parameter.
+- The README sentences differ from the drafts here: README.md lines 6 and 25 are the shipped text.
+
 ## Global Constraints
 
 - **Style.** The code is tab-indented and follows the surrounding code's naming, comment density and docstring-with-doctest style.

@@ -9,7 +9,7 @@ This round makes every line reverberator logs reach the output whole and within 
 ## Goals
 
 1. **Whole lines.** No other line from this process's logging lands inside a line being logged. One re-entrant lock, `LOG_LOCK`, is held across each call on `tl`, covering both the print and the log-file write. It is re-entrant because the SIGTERM handler logs from the main thread, which may already hold it.
-2. **A byte cap on every printed line.** No line reverberator logs is longer than `LOG_LINE_LIMIT = 16384` bytes of UTF-8 before its cut notice.
+2. **A byte cap on every printed line.** No line reverberator logs is longer than `LOG_LINE_LIMIT = 16384` bytes of UTF-8, its cut notice included, so a cut line is never cut again (decided during execution: a notice outside the limit made the logger cut lines `log_text` had already cut, and the second notice then miscounted).
    - The cap is checked on each line as it is printed, so the watcher and backuper lines (prefix, path and message joined) are covered too.
    - A cut never splits a character, and the line ends with ` …(<n> more bytes)`.
    - Why bytes: journald's LineMax (48K) counts bytes, and 16384 four-byte characters are 64K.
