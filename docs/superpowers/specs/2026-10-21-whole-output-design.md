@@ -40,7 +40,7 @@ This round closes those gaps for the daemon, without waiting for library release
 - **Losing output.**
   - A line part a thread has written without its newline is held, not dropped.
   - Held parts are written, each as its own line, when the daemon exits.
-  - A held part longer than `LOG_LINE_LIMIT` characters is written out at once as its own line, so a writer that never ends its line cannot grow memory without bound.
+  - A held part longer than `2 * LOG_LINE_LIMIT` characters is written out at once as its own line, so a writer that never ends its line cannot grow memory without bound. (Decided during execution: twice the limit, because `tl`'s own longest line, a cut line plus its level tag or colour codes, is longer than the limit.)
 - **Changing what the commands or the tests' in-process calls see.** The streams are replaced only on the daemon's console path in `main()`, not in `run_daemon()`, which tests call in-process.
 - **A deadlock.** The streams take the same re-entrant `LOG_LOCK`. `LockedLogger` already holds that lock when Tee_Logger prints through them, and the SIGTERM handler logs from the main thread.
   - Decided during execution: library code writes to stderr while holding its own locks (a logging handler's lock in `handleError`, Tee_Logger 6.42's `_rollover_lock`), while a `LockedLogger` caller holds `LOG_LOCK` and waits for those same locks.
