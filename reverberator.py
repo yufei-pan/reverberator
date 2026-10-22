@@ -2867,7 +2867,13 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 		offset = 0.0
 		if times and (pending_mtime < time.time() - time.monotonic() - 1.0 or max(times) > time.monotonic()):
 			offset = time.monotonic() - (time.time() - min(pending_mtime, time.time())) - max(times)
-			backuperTeeLogToTl(job_name, f'Pending transactions {pending_transactions_path} were written before this boot, moving their times by {offset:.0f}s')
+			if pending_mtime > time.time():
+				why = 'are dated in the future, so the clock was set back since they were written'
+			elif pending_mtime < time.time() - time.monotonic() - 1.0:
+				why = 'were written before this boot'
+			else:
+				why = "hold times this boot's clock has not reached"
+			backuperTeeLogToTl(job_name, f'Pending transactions {pending_transactions_path} {why}, moving their times by {offset:.0f}s')
 		for event_time, row in zip(times, pending_rows_raw.values()):
 			# the paths as pending_transaction_rows() wrote them
 			moved_from = row[4]
@@ -3649,15 +3655,16 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					break
 				if full_comparison:
 					backupEntries.clear()
-				elif not backupEntries:
+				elif not backupEntries and touched is None:
 					backuperTeeLogToTl(job_name,'Compared folders match the vault; no new version for this batch',ok=True)
 					# done, as a full comparison finding no differences is
 					if job is not None:
 						job.mark_committed()
 			else:
-				# do_backup compares the whole tree for an empty batch
-				full_comparison = full_comparison or not backupEntries
-			if backupEntries or full_comparison:
+				# do_backup compares the whole tree for an empty batch, and only what its events touched for a batch whose
+				# events collapsed to no entry
+				full_comparison = full_comparison or (not backupEntries and touched is None)
+			if backupEntries or full_comparison or touched is not None:
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
@@ -3687,7 +3694,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			# a stop before it runs saves it as a full scan request, as any full comparison
 			full_comparison = follow_up
 			round_tripped = False
-			while not backupEntries and not full_comparison and not scan_folders and running():
+			# a batch whose events collapsed to no entry is backed up too, as what they touched can differ from the vault
+			while not backupEntries and not full_comparison and not scan_folders and touched is None and running():
 				while running() and not to_process_flag.is_set():
 					to_process_flag.wait(POLL_WAIT_SECONDS)
 				if not running():
@@ -3724,11 +3732,12 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		else:
 			job.fail(f'{type(e).__name__}: {e}')
 	finally:
-		if full_comparison or backupEntries or scan_folders:
+		if full_comparison or backupEntries or scan_folders or touched is not None:
 			# for the job's next attempt, or the pending transactions when the daemon stops. the scans go back too, so
-			# their folders are compared again with what is there then
+			# their folders are compared again with what is there then. a batch whose events collapsed to no entry has
+			# none to hand back for what they touched: the whole tree is compared instead
 			with to_process_lock:
-				if full_comparison:
+				if full_comparison or (touched is not None and not backupEntries):
 					to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 				else:
 					to_process.prepend(backup_entries_to_change_events(backupEntries) + scan_events(scan_folders))
@@ -4148,7 +4157,8 @@ def do_backup(backup_entries:dict,
 	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
 	# reported: the unreadable paths already logged for this batch, so each is logged once
 	# touched: touched_scopes() of the batch's raw events, verified after the replay ( see do_reverb_backup ); a full
-	# comparison has none
+	# comparison has none. with no backup_entries, only the touched scopes are compared with the latest version: a new
+	# version, its replay verified with touched, is made only when they differ
 	# move events sync attrs from source where the vault entry is a real file/dir ( see do_reverb_backup )
 	global DEBUG
 	global BACKUP_SEMAPHORE
@@ -4209,7 +4219,8 @@ def do_backup(backup_entries:dict,
 			this_version_number = 0
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V0--{this_timestamp}')
-			os.makedirs(backup_folder,exist_ok=True)
+			if not make_version_folder(job_name,backup_folder):
+				return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 			manifest.begin()
 			if keep_one_complete_backup:
 				backuperTeeLogToTl(job_name,f'Creating a complete backup of {monitor_path} to {backup_folder}',ok=True)
@@ -4234,6 +4245,8 @@ def do_backup(backup_entries:dict,
 						mcae.wait(timeout=POLL_WAIT_SECONDS)
 					if GREEN_LIGHT.is_set():
 						finish_copies(pending,manifest,backup_folder,job_name,reported)
+						# the monitored root's own metadata, which no row holds
+						copy_file_meta(os.path.realpath(monitor_path),backup_folder)
 				finally:
 					# however the backup ends, no copy is left writing into this version. a copy finish_copies did not reach
 					# means this V0 is not committed: the whole folder is removed as an orphan ( on the next attempt, or at
@@ -4251,15 +4264,20 @@ def do_backup(backup_entries:dict,
 				# would at a copy ( a re-copy copies such a link as it is ), so they count as copied in V0
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors,copy_version=this_version_number)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
-				do_referenced_copy(monitor_path,backup_folder,manifest)
+				if do_referenced_copy(monitor_path,backup_folder,manifest) and GREEN_LIGHT.is_set():
+					copy_file_meta(os.path.realpath(monitor_path),backup_folder)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
 			if not backup_entries:
-				backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
-				# the whole tree is compared already
-				touched = None
-				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported,paused=paused)
+				if touched is None:
+					backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
+				else:
+					# events that cancel out in the collapse ( a file replaced, then deleted ) can still have changed the
+					# tree: what they touched is compared, and what differs is replayed and verified as a batch is
+					backuperTeeLogToTl(job_name,'The batch collapsed to no backup entries, comparing the places it touched with the vault')
+				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported,
+					scope_rel='' if touched is None else touched,paused=paused)
 				if not GREEN_LIGHT.is_set():
 					# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
 					backup_entries.clear()
@@ -4346,7 +4364,8 @@ def do_backup(backup_entries:dict,
 				recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
-			os.makedirs(backup_folder,exist_ok=True)
+			if not make_version_folder(job_name,backup_folder):
+				return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 			backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
 			def recheck_mounts(fixes):
 				# the verification walked the tree too
@@ -4400,6 +4419,22 @@ def do_backup(backup_entries:dict,
 		if opened_manifest:
 			manifest.close()
 		raise
+
+def make_version_folder(job_name:str, path:str) -> bool:
+	'''
+	Make path, the folder of the version a backup is about to write, which must not be there: the referenced copy and
+	the complete backup write into it as into an empty folder of their own, and a leftover of that name (an attempt
+	that did not commit, in the same second) could hold a link they would write through. When something is there,
+	an error line says so and nothing is made: the attempt fails, the next one gets a name of its own, and the leftover
+	goes at the next start, as any incomplete version does (remove_incomplete_vault_versions()). Other errors are
+	raised.
+	'''
+	try:
+		os.mkdir(path)
+	except FileExistsError:
+		backuperTeeLogToTl(job_name,f'Not backing up into {path}: something is there already, left by an attempt that did not commit; this attempt fails and writes nothing',error=True)
+		return False
+	return True
 
 def pending_transaction_rows(events) -> list:
 	'''
@@ -5172,19 +5207,25 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 	'''
 	Copy source_file's mode, times, owner and extended attributes onto backup_file_path. A symlink at backup_file_path
 	is never followed, even named with a trailing / as a folder's rel is: it gets only its own owner and times, from
-	source_file's own (by lstat), as a link has no mode or extended attributes of its own here. Returns whether it
-	worked; an error line says why not.
+	source_file's own (by lstat), as a link has no mode or extended attributes of its own here. A symlink source_file
+	onto anything else is refused, with an error line: what it leads to is another entry, whose metadata is not its own.
+	Returns whether it worked; an error line says why not.
 	'''
 	try:
 		# a trailing / makes the kernel follow a link to a folder
 		entry = backup_file_path.rstrip('/') or backup_file_path
+		source = source_file.rstrip('/') or source_file
 		if os.path.islink(entry):
 			# a user's symlink backed up as one can lead anywhere, out of the vault say
-			st = os.lstat(source_file.rstrip('/') or source_file)
+			st = os.lstat(source)
 			if os.name == 'posix':
 				os.lchown(entry, st.st_uid, st.st_gid)
 			os.utime(entry, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
 			return True
+		if os.path.islink(source):
+			# the monitored entry became a symlink while the version still holds a copy of what it was
+			backuperTeeLogToTl(path=source_file,error=True,message=f'Not copying the metadata of {source_file} onto {backup_file_path}: it is a symlink, and {backup_file_path} is not one')
+			return False
 		# copy the file metadata
 		copystat(source_file,backup_file_path)
 		st = os.stat(source_file)
@@ -6748,7 +6789,7 @@ def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_
 	removed.append(rel)
 	return []
 
-def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel:str = '',paused:set = None) -> VaultManifest:
+def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel = '',paused:set = None) -> VaultManifest:
 	'''
 	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest
 	(compare_scopes() over the whole tree, or scope_rel) in a transaction of its own, which it commits.
@@ -6759,7 +6800,8 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	A folder that cannot be read keeps its tracked entries and is logged as UNREADABLE; when the monitored root itself
 	cannot be read, JobFailure is raised before anything is recorded as deleted.
 	With scope_rel, a folder rel ending with /, only that folder is compared: it is looked up like any entry, and only
-	tracked rows at or under it can be found deleted.
+	tracked rows at or under it can be found deleted. scope_rel can also be a TouchedScopes, as touched_scopes() gives
+	for a batch: only its scopes are compared, as compare_scopes() compares them.
 	The paused inner mounts (paused_inner_mounts, from the remembered ones and the mount table now when not given) are
 	not walked and keep their tracked rows; a scope that is skipped or inside a paused folder compares nothing.
 	Returns the manifest, opened in the job vault when none is given.
@@ -6769,9 +6811,11 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	skips = None if skip_list is None else skip_list.skips
 	if paused is None:
 		paused = paused_inner_mounts(monitor_path, manifest.inner_mounts, current_mount_table(), skips)
+	scopes = scope_rel if isinstance(scope_rel, TouchedScopes) else TouchedScopes([scope_rel], [])
 	if scope_rel:
-		# checked before the transaction, as a scope compared nothing in leaves the manifest as it is
-		if skips_folder_or_parent(skip_paused(skips, paused), scope_rel):
+		# checked before the transaction, as a scope compared nothing in leaves the manifest as it is. compare_scopes()
+		# passes over each touched scope that is skipped
+		if not isinstance(scope_rel, TouchedScopes) and skips_folder_or_parent(skip_paused(skips, paused), scope_rel):
 			backuperTeeLogToTl(path=monitor_path,message=f'Not comparing {scope_rel}: it is skipped or in an unmounted inner mount')
 			return manifest
 		try:
@@ -6786,7 +6830,7 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 		backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {version_path}, listing it to read from the vault')
 		manifest.rebuild(version_path)
 	try:
-		compare_scopes(backupEntries, manifest, version_path, monitor_path, TouchedScopes([scope_rel], []), skip=skips, paused=paused, job_name=job_name, reported=reported)
+		compare_scopes(backupEntries, manifest, version_path, monitor_path, scopes, skip=skips, paused=paused, job_name=job_name, reported=reported)
 	except JobFailure:
 		manifest.rollback()
 		raise
@@ -7321,7 +7365,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	verified as a (monitored path, BackupEntryValues) pair, a folder's path ending with /: the comparison's entries,
 	then a delete for each entry removed, then a create for each one missing; one the replay could not apply is left
 	out. recheck_mounts(fixes), when given, runs once the comparison walked the tree: it drops the fixes under inner
-	mounts unmounted meanwhile, and raises JobFailure when the monitored root's filesystem changed.
+	mounts unmounted meanwhile, and raises JobFailure when the monitored root's filesystem changed. Then backup_folder
+	gets the monitored root's own mode, owner and times, which no row holds.
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
@@ -7677,17 +7722,18 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	# reverb backup flow:
 	#   do referenced copy of the last version to the current backup folder 
 	#   replay the changes chronologically ( to respect moves )
-	manifest.begin()
-	if not manifest.describes(latest_version_info.path):
-		backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {latest_version_info.path}, listing it')
-		manifest.rebuild(latest_version_info.path)
-	if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True):
-		return manifest
-	backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
-	mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
+	mcae = None
 	# copies queued on mcae, put in place by each wait for it
 	pending = []
 	try:
+		manifest.begin()
+		if not manifest.describes(latest_version_info.path):
+			backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {latest_version_info.path}, listing it')
+			manifest.rebuild(latest_version_info.path)
+		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True):
+			return manifest
+		backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
+		mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
 		if recopy:
 			# over the links the referenced copy just made: a copy that fails leaves the link
 			job_vault = os.path.dirname(os.path.abspath(backup_folder))
@@ -7712,10 +7758,15 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		wait_for_async_commands(mcae)
 		if touched is not None and GREEN_LIGHT.is_set():
 			verify()
+		if GREEN_LIGHT.is_set():
+			# the monitored root's own mode, owner and times, which no row holds and none of its events replays, go on the
+			# version folder, a real folder this backup made: a restore of the whole job gives them back from it
+			copy_file_meta(os.path.realpath(monitor_path),backup_folder)
 	finally:
 		try:
 			# however the backup ends, no copy is left writing into this version, nor a partial file in it
-			stop_copies(mcae,pending,backup_folder)
+			if mcae is not None:
+				stop_copies(mcae,pending,backup_folder)
 		finally:
 			# nothing about the folders of a version still being written may be taken as known later ( the replay can make
 			# one a link after it was looked at ): only committed versions keep their answers
