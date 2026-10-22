@@ -52,7 +52,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.41
+__version__ = 0.42
 
 ## WIP
 
@@ -929,6 +929,18 @@ def install_daemon_output():
 			wrapped = WholeLineStream(stream)
 			setattr(sys, name, wrapped)
 			atexit.register(wrapped.write_held)
+	threading.excepthook = log_thread_exception
+
+def log_thread_exception(args) -> None:
+	'''threading.excepthook: log a thread's uncaught exception through tl at error level, escaped and whole; Python's own hook when logging fails.'''
+	if args.exc_type is SystemExit:
+		return
+	try:
+		import traceback
+		name = args.thread.name if args.thread is not None else '?'
+		tl.teeerror(log_text(f'Uncaught exception in thread {name}:\n' + ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)).rstrip('\n')))
+	except Exception:
+		threading.__excepthook__(args)
 
 def job_log(job_name:str, text:str) -> str:
 	'''Log a job's marker line at error level, where log alerts look for it, and return it.'''
@@ -1980,7 +1992,9 @@ class inotify_resource_manager:
 	def getSysctlValues(self,field):
 		global tl
 		try:
-			rtn = multiCMD.run_command(['sysctl',field],timeout=1,quiet=not self.debug)
+			rtn = multiCMD.run_command(['sysctl',field],timeout=1,quiet=True)
+			if self.debug:
+				tl.teeprint(log_text(f'sysctl {field}: {rtn}'))
 			if rtn and rtn[0]:
 				return int(rtn[0].split('=')[-1].strip())
 		except Exception as _:
@@ -2002,7 +2016,7 @@ class inotify_resource_manager:
 				tl.info(log_text(f'Current {field} is already higher than {value}'))
 				setattr(self,value_name,rtn)
 				return False
-			rc = multiCMD.run_command(['sudo','sysctl',f'{field}={value}'],timeout=1,quiet=not self.debug,return_code_only=True)
+			rc = multiCMD.run_command(['sudo','sysctl',f'{field}={value}'],timeout=1,quiet=True,return_code_only=True)
 			if self.debug:
 				tl.teeprint(log_text(f'sudo sysctl {field}={value} return code = {rc}'))
 			else:
