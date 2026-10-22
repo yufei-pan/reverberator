@@ -16,7 +16,7 @@ This round closes those gaps for the daemon, without waiting for library release
 
 ## Goals
 
-1. **Whole-line streams.** In the daemon, `sys.stdout` and `sys.stderr` hold each thread's text until its line ends, then write the whole line with one write and a flush, holding `LOG_LOCK` (the same re-entrant lock `LockedLogger` holds).
+1. **Whole-line streams.** In the daemon, `sys.stdout` and `sys.stderr` hold each thread's text until its line ends, then write the whole line with one write and a flush, holding `LOG_LOCK` (up to the time limit under Anti-goals; the same re-entrant lock `LockedLogger` holds).
    - So no line from any in-process writer, library code included, can land inside another, and every marker starts its own line.
    - All the libraries look up `sys.stdout`/`sys.stderr` at call time, so replacing them covers them.
 2. **Thread tracebacks go through `tl`.** A thread's uncaught exception is logged through `tl` at error level, as text passed through `log_text`. It is escaped, continuation lines are indented, and it is cut to the byte limit.
@@ -43,6 +43,10 @@ This round closes those gaps for the daemon, without waiting for library release
   - A held part longer than `LOG_LINE_LIMIT` characters is written out at once as its own line, so a writer that never ends its line cannot grow memory without bound.
 - **Changing what the commands or the tests' in-process calls see.** The streams are replaced only on the daemon's console path in `main()`, not in `run_daemon()`, which tests call in-process.
 - **A deadlock.** The streams take the same re-entrant `LOG_LOCK`. `LockedLogger` already holds that lock when Tee_Logger prints through them, and the SIGTERM handler logs from the main thread.
+  - Decided during execution: library code writes to stderr while holding its own locks (a logging handler's lock in `handleError`, Tee_Logger 6.42's `_rollover_lock`), while a `LockedLogger` caller holds `LOG_LOCK` and waits for those same locks.
+  - So a stream waits at most `WHOLE_LINE_WAIT_SECONDS = 5` for `LOG_LOCK`, then writes without it. After that, the thread waits only `WHOLE_LINE_RETRY_SECONDS = 0.1` until it gets the lock again.
+  - Lines stay whole either way. What a write without the lock loses is only its order against other threads' writes.
+  - The SIGTERM handler starts shutdown before it logs.
 - **Breaking stream attributes.** `fileno()`, `isatty()`, `encoding`, `errors`, `buffer` and the rest come from the wrapped stream. Tee_Logger checks `isatty()`.
 
 ## Decisions (builder's calls, made here)
