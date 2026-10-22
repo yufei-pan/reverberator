@@ -4245,8 +4245,6 @@ def do_backup(backup_entries:dict,
 						mcae.wait(timeout=POLL_WAIT_SECONDS)
 					if GREEN_LIGHT.is_set():
 						finish_copies(pending,manifest,backup_folder,job_name,reported)
-						# the monitored root's own metadata, which no row holds
-						copy_file_meta(os.path.realpath(monitor_path),backup_folder)
 				finally:
 					# however the backup ends, no copy is left writing into this version. a copy finish_copies did not reach
 					# means this V0 is not committed: the whole folder is removed as an orphan ( on the next attempt, or at
@@ -4264,8 +4262,7 @@ def do_backup(backup_entries:dict,
 				# would at a copy ( a re-copy copies such a link as it is ), so they count as copied in V0
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors,copy_version=this_version_number)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
-				if do_referenced_copy(monitor_path,backup_folder,manifest) and GREEN_LIGHT.is_set():
-					copy_file_meta(os.path.realpath(monitor_path),backup_folder)
+				do_referenced_copy(monitor_path,backup_folder,manifest)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
@@ -7365,8 +7362,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	verified as a (monitored path, BackupEntryValues) pair, a folder's path ending with /: the comparison's entries,
 	then a delete for each entry removed, then a create for each one missing; one the replay could not apply is left
 	out. recheck_mounts(fixes), when given, runs once the comparison walked the tree: it drops the fixes under inner
-	mounts unmounted meanwhile, and raises JobFailure when the monitored root's filesystem changed. Then backup_folder
-	gets the monitored root's own mode, owner and times, which no row holds.
+	mounts unmounted meanwhile, and raises JobFailure when the monitored root's filesystem changed.
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
@@ -7758,10 +7754,6 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		wait_for_async_commands(mcae)
 		if touched is not None and GREEN_LIGHT.is_set():
 			verify()
-		if GREEN_LIGHT.is_set():
-			# the monitored root's own mode, owner and times, which no row holds and none of its events replays, go on the
-			# version folder, a real folder this backup made: a restore of the whole job gives them back from it
-			copy_file_meta(os.path.realpath(monitor_path),backup_folder)
 	finally:
 		try:
 			# however the backup ends, no copy is left writing into this version, nor a partial file in it

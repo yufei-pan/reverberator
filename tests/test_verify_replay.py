@@ -1536,27 +1536,22 @@ def test_a_partial_file_behind_a_link_is_logged_and_left(job, monkeypatch):
 	assert [message for message, _, _ in lines if 'Leaving the partial copy' in message]
 
 
-def test_the_monitored_roots_metadata_reaches_the_next_version(job, tmp_path, capsys):
-	from tests.harness import write_rule
-	from tests.test_restore import restore, destination
+def test_version_folders_stay_the_daemons_whatever_the_monitored_root(job):
+	# the user chose to keep each version folder the daemon's: the monitored root's owner (www-data for a Nextcloud
+	# folder) must not be able to change the top level of committed versions
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
 	with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
 		f.write('changed')
-	os.chmod(job.monitor, 0o750)
+	os.chmod(job.monitor, 0o777)
 	os.chown(job.monitor, 1234, 5678)
-	os.utime(job.monitor, ns=(10 ** 18, 10 ** 18))
 	# the root's own events give no entry
 	version = run_batch(job, [('attrib', '', None, True), ('modify', 'a.txt', None, False)])
 	assert version.number == 1
-	meta = lambda path: (lambda st: (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_mtime_ns))(os.lstat(path))
-	assert meta(version.path) == meta(job.monitor) == (0o750, 1234, 5678, 10 ** 18)
-	# and a whole-job restore gives it to the restored folder
-	write_rule(job)
-	out = destination(tmp_path)
-	code, stdout, err = restore(tmp_path, capsys, job.monitor, out, '--version', '1')
-	assert (code, err) == (0, '')
-	assert meta(os.path.join(out, os.path.basename(job.monitor))) == meta(job.monitor)
+	for path in (version.path, rv.list_versions(job.job_vault)[0].path):
+		st = os.lstat(path)
+		assert (st.st_uid, st.st_gid) == (os.geteuid(), os.getegid())
+		assert stat.S_IMODE(st.st_mode) != 0o777
 
 
 @pytest.mark.parametrize('kind', ['file', 'folder'])
