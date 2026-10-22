@@ -1,3 +1,4 @@
+import contextlib
 import lzma
 import os
 import re
@@ -53,7 +54,13 @@ def test_logging_while_holding_the_log_lock_does_not_deadlock(capsys):
 	inner = threading.Thread(target=log_holding_the_lock, daemon=True)
 	inner.start()
 	inner.join(timeout=5)
-	assert not inner.is_alive()
+	stuck = inner.is_alive()
+	if stuck:
+		# a plain Lock lets this thread release it, so that the tests after this one do not hang too
+		with contextlib.suppress(RuntimeError):
+			rv.LOG_LOCK.release()
+		inner.join(timeout=5)
+	assert not stuck
 	assert 'inner' in capsys.readouterr().out
 	other = threading.Thread(target=rv.tl.teeerror, args=('other',))
 	with rv.LOG_LOCK:
@@ -130,39 +137,79 @@ def test_an_explicit_caller_depth_is_kept_one_deeper():
 	assert fake.calls == [4, 5, 4, -1]
 
 
+def assert_cut(line, expected):
+	# the result, notice included, fits the limit, and cutting it again changes nothing
+	result = rv.cut_line(line)
+	assert result == expected
+	assert len(result.encode('utf-8', 'surrogatepass')) <= rv.LOG_LINE_LIMIT
+	assert rv.cut_line(result) == result
+
+
 def test_cut_line_never_splits_a_character():
-	assert rv.cut_line('\U0001f600' * 5000) == '\U0001f600' * 4096 + ' \u2026(3616 more bytes)'
-	assert rv.cut_line('ab' + '\u65e5' * 6000) == 'ab' + '\u65e5' * 5460 + ' \u2026(1620 more bytes)'
+	assert_cut('\U0001f600' * 5000, '\U0001f600' * 4090 + ' \u2026(3640 more bytes)')
+	assert_cut('ab' + '\u65e5' * 6000, 'ab' + '\u65e5' * 5453 + ' \u2026(1641 more bytes)')
+
+
+def test_cut_line_steps_back_over_up_to_three_bytes_of_a_character():
+	# the notice reserves 22 bytes, so the cut starts at byte 16362, and with 0, 1, 2 or 3 bytes of padding
+	# that byte is the third, second or first byte of an emoji, or its fourth (steps back 2, 1, 0 or 3)
+	for pad, kept, left in ((0, 4090, 3640), (1, 4090, 3640), (2, 4090, 3640), (3, 4089, 3644)):
+		assert_cut('x' * pad + '\U0001f600' * 5000, 'x' * pad + '\U0001f600' * kept + f' \u2026({left} more bytes)')
 
 
 def test_cut_line_keeps_a_line_exactly_at_the_limit():
-	assert rv.cut_line('x' * 16384) == 'x' * 16384
+	assert_cut('x' * 16384, 'x' * 16384)
 	line = 'a' + '\u65e5' * 5461
 	assert len(line.encode()) == 16384
-	assert rv.cut_line(line) == line
+	assert_cut(line, line)
+
+
+def test_cut_line_cuts_a_line_one_byte_over_the_limit():
+	assert_cut('x' * 16385, 'x' * 16362 + ' \u2026(23 more bytes)')
 
 
 def test_cut_line_counts_a_lone_surrogate_as_three_bytes():
-	assert rv.cut_line('\udcff' * 6000) == '\udcff' * 5461 + ' \u2026(1617 more bytes)'
+	assert_cut('\udcff' * 6000, '\udcff' * 5454 + ' \u2026(1638 more bytes)')
 
 
-def joined_line_lengths(capsys):
+def test_cutting_a_cut_line_again_keeps_its_count_of_bytes_left_out():
+	assert rv.cut_line(rv.cut_line('x' * 20000)) == 'x' * 16362 + ' \u2026(3638 more bytes)'
+
+
+def plain(out):
+	return re.sub(r'\x1b\[[0-9;]*m', '', out)
+
+
+def test_the_line_job_log_prints_is_the_line_it_returns(capsys):
+	line = rv.job_log('j', 'UNREADABLE: ' + 'b' * 50000)
+	assert line.endswith(' \u2026(33669 more bytes)')
+	assert line in plain(capsys.readouterr().out)
+
+
+def test_the_line_tl_prints_is_the_text_log_text_returns(capsys):
+	text = rv.log_text('a' * 30000)
+	assert text == 'a' * 16362 + ' \u2026(13638 more bytes)'
+	rv.tl.teeerror(text)
+	assert text in plain(capsys.readouterr().out)
+
+
+def assert_each_line_is_cut(capsys):
 	out = capsys.readouterr().out
-	lines = [re.sub(r'\x1b\[[0-9;]*m', '', line) for line in out.split('\n') if line]
+	lines = [line for line in plain(out).split('\n') if line]
 	assert lines
-	# the cap is on the message; Tee_Logger puts its own level tag before it
-	assert all(len(line.encode()) <= len('[ERROR] ') + 16384 + len(' \u2026(99999 more bytes)'.encode()) for line in lines)
+	# the joined line is cut once more, counting its own bytes; Tee_Logger puts its own level tag before it
+	assert all(len(line.encode()) <= len('[ERROR] ') + rv.LOG_LINE_LIMIT for line in lines)
 	assert lines[0].endswith('more bytes)')
 
 
 def test_a_joined_watcher_line_is_cut_in_bytes(capsys):
 	rv.watcherTeeLogToTl('/m/' + '\u65e5' * 10000, '\u65e5' * 10000, error=True)
-	joined_line_lengths(capsys)
+	assert_each_line_is_cut(capsys)
 
 
 def test_a_joined_backuper_line_is_cut_in_bytes(capsys):
 	rv.backuperTeeLogToTl('/m/' + '\u65e5' * 10000, '\u65e5' * 10000, error=True)
-	joined_line_lengths(capsys)
+	assert_each_line_is_cut(capsys)
 
 
 def test_the_proxy_cuts_each_line_of_a_message():
@@ -176,4 +223,16 @@ def test_the_proxy_cuts_each_line_of_a_message():
 	proxy.teeprint('x' * 16390 + '\nshort\n' + 'y' * 16385)
 	proxy.teeprint(msg='z' * 16386)
 	proxy.teeprint(b'x' * 20000)
-	assert fake.seen == ['x' * 16384 + ' \u2026(6 more bytes)\nshort\n' + 'y' * 16384 + ' \u2026(1 more bytes)', 'z' * 16384 + ' \u2026(2 more bytes)', b'x' * 20000]
+	# no msg parameter: nothing is cut, and the message is found by its position
+	class Table:
+		def __init__(self):
+			self.seen = []
+		def printTable(self, data, callerStackDepth=...):
+			self.seen.append(data)
+		def teelog(self, level, msg, callerStackDepth=...):
+			self.seen.append((level, msg))
+	table = Table()
+	rv.LockedLogger(table).printTable('x' * 20000)
+	rv.LockedLogger(table).teelog('q' * 20000, 'w' * 20000)
+	assert table.seen == ['x' * 20000, ('q' * 20000, 'w' * 16362 + ' \u2026(3638 more bytes)')]
+	assert fake.seen == ['x' * 16362 + ' \u2026(28 more bytes)\nshort\n' + 'y' * 16362 + ' \u2026(23 more bytes)', 'z' * 16362 + ' \u2026(24 more bytes)', b'x' * 20000]

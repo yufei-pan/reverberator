@@ -84,9 +84,10 @@ def test_a_very_long_line_is_cut_so_the_journal_cannot_split_it(capsys):
 	limit = rv.LOG_LINE_LIMIT
 	text = rv.log_text('a' * (limit + 5) + FORGED + '\nshort')
 	first, second = text.split('\n')
-	assert len(first.encode()) <= limit + 40 and first.endswith(f' …({len(FORGED) + 5} more bytes)')
+	# the notice is inside the limit: the line keeps limit - 22 bytes, leaving len(FORGED) + 5 + 22 out
+	assert len(first.encode()) <= limit and first.endswith(f' …({len(FORGED) + 5 + 22} more bytes)')
 	assert second == '    short'
 	rv.job_log('j', 'UNREADABLE: ' + 'b' * (3 * limit) + FORGED)
 	out = capsys.readouterr().out
-	assert all(len(line) <= limit + 200 for line in out.split('\n'))
+	assert all(len(line.encode()) <= limit + 200 for line in out.split('\n'))
 	assert len(alerting_lines(out)) == 1
