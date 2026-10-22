@@ -5047,7 +5047,12 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 				replace_entry(copy.temp_path, copy.dest_path)
 				copied.append(os.path.relpath(copy.dest_path, version_path))
 			else:
-				discard_copies([copy], version_path)
+				if real_folders_to(version_path, os.path.relpath(copy.temp_path, version_path), missing_ok=True):
+					# a partial file that cannot be removed would be committed with the version
+					remove_entry(copy.temp_path)
+				else:
+					# it went with the folder it was made in, which a link or a file has replaced: removing it would reach through
+					backuperTeeLogToTl(path=copy.source_path,message=f'Leaving the partial copy {copy.temp_path}: a folder above it in the version is not a real folder')
 				side = copy_failure_side(copy.source_path, copy.temp_path, lines)
 				if side == 'vault':
 					if failure is None:
@@ -7432,24 +7437,46 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# version or at the chain's end, gets only its own owner and times ( copy_file_meta() ), never what it points to.
 		# the chain is followed from its first hop, in a committed version: nothing is judged, nor remembered
 		# ( is_real_folder_under() ), about the folders of this one, which the replay can still change
+		# the end must be of the monitored entry's kind: the chain rule cannot tell a user's link whose text has a chain
+		# link's form ( ../<the version before>/D/f, at any depth ) from a chain link, and follows it on to another file's
+		# copy, while the link itself is what this version holds of the entry
 		entry = os.path.abspath(os.path.join(backup_folder,relative_path))
-		if os.path.islink(entry):
-			vault = os.path.dirname(os.path.abspath(backup_folder))
+		if not os.path.islink(entry):
+			return copy_file_meta(source_real_path,entry)
+		def refuse(why):
+			backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: {why}')
+			return False
+		vault = os.path.dirname(os.path.abspath(backup_folder))
+		try:
+			hop = strict_chain_hop(vault,entry,os.readlink(entry))
+		except (OSError,UncheckedVaultLink):
+			return refuse('its link chain cannot be followed')
+		if hop is None:
+			end_path, end_mode = entry, stat.S_IFLNK
+		else:
+			hop_version = hop[len(vault) + 1:].partition('/')[0]
+			end = chain_end(vault,os.path.join(vault,hop_version),hop[len(vault) + len(hop_version) + 2:])
+			if end is None:
+				return refuse('its link chain cannot be followed')
+			if stat.S_ISDIR(end.st.st_mode):
+				return refuse(f'its link chain ends at the folder {end.path}')
+			end_path, end_mode = end.path, end.st.st_mode
+		try:
+			source_is_link = stat.S_ISLNK(os.lstat(source_real_path).st_mode)
+		except OSError as e:
+			return refuse(f'it cannot be looked at: {e}')
+		if stat.S_ISLNK(end_mode) and not source_is_link:
 			try:
-				hop = strict_chain_hop(vault,entry,os.readlink(entry))
-			except (OSError,UncheckedVaultLink):
-				hop = False
-			if hop is not None:
-				hop_version = None if hop is False else hop[len(vault) + 1:].partition('/')[0]
-				end = None if hop is False else chain_end(vault,os.path.join(vault,hop_version),hop[len(vault) + len(hop_version) + 2:])
-				if end is None:
-					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: its link chain cannot be followed')
-					return False
-				if stat.S_ISDIR(end.st.st_mode):
-					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: its link chain ends at the folder {end.path}')
-					return False
-				entry = end.path
-		return copy_file_meta(source_real_path,entry)
+				text = os.readlink(end_path)
+			except OSError:
+				text = None
+			if text is not None and os.path.isabs(text) and os.path.normpath(text) == os.path.abspath(source_real_path):
+				# a referenced backup's link to the monitored file itself, whose contents it is: nothing of its own to sync
+				return True
+		if stat.S_ISLNK(end_mode) != source_is_link:
+			kinds = ('a symlink', 'not one') if source_is_link else ('not a symlink', 'a symlink')
+			return refuse(f'it is {kinds[0]}, and its link chain ends at {end_path}, which is {kinds[1]}')
+		return copy_file_meta(source_real_path,end_path)
 	def wait_for_async_commands(mcae):
 		# returns the rels of the copies put in place
 		while GREEN_LIGHT.is_set() and mcae.runningThreads:
@@ -7686,11 +7713,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		if touched is not None and GREEN_LIGHT.is_set():
 			verify()
 	finally:
-		# however the backup ends, no copy is left writing into this version, nor a partial file in it
-		stop_copies(mcae,pending,backup_folder)
-		# nothing about the folders of a version still being written may be taken as known later ( the replay can make
-		# one a link after it was looked at ): only committed versions keep their answers
-		forget_real_vault_folders(os.path.abspath(backup_folder))
+		try:
+			# however the backup ends, no copy is left writing into this version, nor a partial file in it
+			stop_copies(mcae,pending,backup_folder)
+		finally:
+			# nothing about the folders of a version still being written may be taken as known later ( the replay can make
+			# one a link after it was looked at ): only committed versions keep their answers
+			forget_real_vault_folders(os.path.abspath(backup_folder))
 	if mcae.runningThreads or not GREEN_LIGHT.is_set():
 		backuperTeeLogToTl(path=monitor_path,error=True,message='Reverb backup interrupted before copy threads finished')
 		return manifest

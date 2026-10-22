@@ -786,7 +786,7 @@ def test_a_requeued_batch_is_followed_by_a_full_comparison(job, monkeypatch):
 		stop_backuper(thread)
 
 
-def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job):
+def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job, monkeypatch):
 	from tests.harness import wait_for_committed_count
 	import time
 	seed_monitor(job, {'a.txt': 'a'})
@@ -795,10 +795,12 @@ def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job):
 		f.write('changed')
 	queue = rv.ChangeEventQueue(job.monitor)
 	queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+	calls = record_backups(monkeypatch)
 	thread, lock, flag = start_backuper(job, queue)
 	try:
 		wait_for_committed_count(job, 2)
-		time.sleep(0.3)
+		time.sleep(0.5)
+		assert calls == [(1, rv.TouchedScopes(['a.txt/'], ['a.txt']))]
 		assert not queued_full_scan(queue, lock)
 	finally:
 		stop_backuper(thread)
@@ -1144,3 +1146,130 @@ def test_the_other_kind_of_a_touched_name_is_compared(tmp_path, name):
 	latest = rv.list_versions(job.job_vault)[-1]
 	assert latest.number == 2
 	assert_version_matches_tree(job, latest)
+
+
+def versions_meta(job, xattrs, but=None):
+	"""older_versions() of every version (but the one named but), with each regular file's extended attributes."""
+	rows = []
+	for row in older_versions(job):
+		if but is not None and row[0].startswith(but + '/'):
+			continue
+		path = os.path.join(job.job_vault, row[0])
+		held = None
+		if xattrs and stat.S_ISREG(row[1]):
+			held = {name: os.getxattr(path, name) for name in os.listxattr(path)}
+		rows.append((*row, held))
+	return rows
+
+
+def run_batch(job, spec):
+	events = raw_events(job, spec)
+	run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
+	return rv.list_versions(job.job_vault)[-1]
+
+
+@pytest.mark.parametrize('depth', [1, 2])
+def test_a_users_link_of_chain_form_never_redirects_an_attribute_sync(tmp_path, monkeypatch, depth):
+	"""
+	A user's link whose text has a chain link's form, naming a file of the version before the one holding it, and a
+	decoy file it reaches in the monitored tree (depth 2), or beside it (depth 1). The chain rule takes the stored link
+	for a chain link to that file's copy: an attribute sync of the link, a symlink in the tree, must not land there.
+	"""
+	rv.REAL_VAULT_FOLDERS.clear()
+	job = create_job(str(tmp_path))
+	xattrs = xattrs_supported(job.root)
+	write_tree(job.monitor, {'D/secret': 'secret', 'keep': 'k'})
+	set_meta(os.path.join(job.monitor, 'D/secret'), 0o600, 0, 1_600_000_000_000_000_000, b'secret', xattrs)
+	run_backup(job)
+	v0 = rv.list_versions(job.job_vault)[-1]
+	if depth == 2:
+		os.makedirs(os.path.join(job.monitor, 'a'))
+		link = os.path.join(job.monitor, 'a', 'U')
+		decoy = os.path.join(job.monitor, v0.name, 'D', 'secret')
+		spec = [('create', 'a', None, True), ('create', v0.name, None, True)]
+	else:
+		link = os.path.join(job.monitor, 'U')
+		decoy = os.path.join(job.root, v0.name, 'D', 'secret')
+		spec = [('create', 'U', None, False)]
+	os.symlink(f'../{v0.name}/D/secret', link)
+	os.makedirs(os.path.dirname(decoy))
+	with open(decoy, 'w') as f:
+		f.write('decoy')
+	set_meta(decoy, 0o666, 4242, 1_500_000_000_000_000_000, b'decoy', xattrs)
+	run_batch(job, spec)
+	os.lchown(link, 4243, 4243)
+	held = versions_meta(job, xattrs)
+	lines = spy_on_log(monkeypatch)
+	version = run_batch(job, [('attrib', os.path.relpath(link, job.monitor), None, False)])
+	assert version.number == 2
+	assert versions_meta(job, xattrs, but=version.name) == held
+	assert [message for message, error, _ in lines if error and 'Not syncing the attributes' in message]
+
+
+def test_an_attribute_sync_whose_chain_ends_at_a_folder_is_refused(tmp_path, monkeypatch):
+	rv.REAL_VAULT_FOLDERS.clear()
+	job = create_job(str(tmp_path))
+	write_tree(job.monitor, {'D/g': 'g', 'keep': 'k'})
+	run_backup(job)
+	v0 = rv.list_versions(job.job_vault)[-1]
+	folder = os.path.join(v0.path, 'D')
+	os.chmod(folder, 0o750)
+	held = os.stat(folder)
+	# what the monitored link reaches: a decoy folder beside the monitored tree
+	decoy = os.path.join(job.root, v0.name, 'D')
+	os.makedirs(decoy)
+	os.chmod(decoy, 0o777)
+	os.chown(decoy, 4242, 4242)
+	os.symlink(f'../{v0.name}/D', os.path.join(job.monitor, 'U'))
+	run_batch(job, [('create', 'U', None, False)])
+	os.lchown(os.path.join(job.monitor, 'U'), 4243, 4243)
+	lines = spy_on_log(monkeypatch)
+	run_batch(job, [('attrib', 'U', None, False)])
+	st = os.stat(folder)
+	assert (st.st_mode, st.st_uid, st.st_mtime_ns) == (held.st_mode, held.st_uid, held.st_mtime_ns)
+	assert [message for message, error, _ in lines if error and 'ends at the folder' in message]
+
+
+def test_a_partial_file_that_cannot_be_removed_fails_the_copy(job, monkeypatch):
+	from tests.test_io_errors import FakeTask
+	version = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
+	os.makedirs(os.path.join(version, 'D'))
+	temp = os.path.join(version, 'D/.partial')
+	with open(temp, 'w') as f:
+		f.write('partial')
+
+	def stuck(path):
+		raise PermissionError(13, 'Permission denied', path)
+	monkeypatch.setattr(rv, 'remove_entry', stuck)
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	try:
+		# the copy's folder is a real folder of the version: a partial file left there would be committed with it
+		with pytest.raises(PermissionError):
+			rv.finish_copies([rv.PendingCopy(FakeTask(1, ['No such file or directory']), os.path.join(job.monitor, 'gone.txt'), temp,
+				os.path.join(version, 'D/a.txt'))], manifest, version, job.job_name)
+	finally:
+		manifest.rollback()
+		manifest.close()
+
+
+def test_a_partial_file_behind_a_link_is_logged_and_left(job, monkeypatch):
+	from tests.test_io_errors import FakeTask
+	outside = os.path.join(job.root, 'outside')
+	os.makedirs(outside)
+	with open(os.path.join(outside, '.partial'), 'w') as f:
+		f.write('not the copy')
+	version = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
+	os.makedirs(version)
+	os.symlink(outside, os.path.join(version, 'D'))
+	lines = spy_on_log(monkeypatch)
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	try:
+		rv.finish_copies([rv.PendingCopy(FakeTask(1, ['No such file or directory']), os.path.join(job.monitor, 'gone.txt'),
+			os.path.join(version, 'D/.partial'), os.path.join(version, 'D/a.txt'))], manifest, version, job.job_name)
+	finally:
+		manifest.rollback()
+		manifest.close()
+	assert sorted(os.listdir(outside)) == ['.partial']
+	assert [message for message, _, _ in lines if 'Leaving the partial copy' in message]
