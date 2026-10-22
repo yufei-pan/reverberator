@@ -823,6 +823,9 @@ class LockedLogger:
 		# a negative depth is Tee_Logger's "find the caller" default
 		return depth + 1 if isinstance(depth, int) and depth >= 0 else depth
 
+# how long a write to stdout or stderr waits for LOG_LOCK before it writes without it
+WHOLE_LINE_WAIT_SECONDS = 5
+
 class WholeLineStream:
 	'''
 	A text stream that holds each thread's text until its line ends, then writes the whole line at once, holding LOG_LOCK.
@@ -830,25 +833,46 @@ class WholeLineStream:
 	Other code in the daemon (multiCMD, TSVZ, Tee_Logger's own threads, a thread's traceback) writes a line to
 	stdout or stderr in pieces; a marker written between the pieces would sit mid-line, where the log alerts never
 	see it.
-	A held part is written as a line of its own when it outgrows LOG_LINE_LIMIT characters or by write_held() at
-	exit, so no text is dropped. flush() does not write held parts: that would put a part mid-line.
+	A held part is written as a line of its own when it outgrows LOG_LINE_LIMIT characters, when the next line is
+	written after its thread has ended, or by write_held() at exit, so no text is dropped. flush() does not write
+	held parts: that would put a part mid-line.
 	Every other attribute (fileno, isatty, encoding, buffer, ...) is the wrapped stream's.
 	'''
 	def __init__(self, stream):
 		self.stream = stream
 		# thread -> the part of a line it has written without its line break; an entry exists only while it holds one
 		self._held = {}
+		# gave_up: this thread's last wait for LOG_LOCK timed out
+		self._local = threading.local()
 
 	def __getattr__(self, name):
-		if name in ('stream', '_held'):
+		if name in ('stream', '_held', '_local'):
 			# not set yet, as on a copy: no loop through self.stream
 			raise AttributeError(name)
 		return getattr(self.stream, name)
 
+	@contextlib.contextmanager
+	def _log_lock(self):
+		# the caller may hold a library lock (a logging handler's, say) that a LOG_LOCK holder is waiting for: after a
+		# while the write goes ahead without LOG_LOCK, as a hang would silence every marker while this costs one line
+		# at most. A thread that holds LOG_LOCK already (LockedLogger printing, the SIGTERM handler) gets it at once.
+		# A thread whose wait timed out does not wait again until it gets the lock, so the many writes of a traceback
+		# it prints cost one wait, not one each.
+		if getattr(self._local, 'gave_up', False):
+			locked = LOG_LOCK.acquire(blocking=False)
+		else:
+			locked = LOG_LOCK.acquire(timeout=WHOLE_LINE_WAIT_SECONDS)
+		self._local.gave_up = not locked
+		try:
+			yield
+		finally:
+			if locked:
+				LOG_LOCK.release()
+
 	def write(self, text:str) -> int:
 		if not isinstance(text, str):
 			raise TypeError(f'write() argument must be str, not {type(text).__name__}')
-		with LOG_LOCK:
+		with self._log_lock():
 			thread = threading.current_thread()
 			# taken out first: a part being written is not held again if the stream raises
 			joined = self._held.pop(thread, '') + text
@@ -857,11 +881,18 @@ class WholeLineStream:
 			if len(rest) > LOG_LINE_LIMIT:
 				# a writer that never ends its line: memory stays bounded
 				out, rest = joined + '\n', ''
-			if rest:
-				self._held[thread] = rest
-			if out:
-				self.stream.write(out)
-				self.stream.flush()
+			try:
+				if out:
+					if self._held:
+						# parts of other threads: those that ended are written ahead, as lines of their own
+						self._write_parts([part for other in list(self._held) if not other.is_alive() and (part := self._held.pop(other, None))])
+					self.stream.write(out)
+					self.stream.flush()
+			finally:
+				if rest:
+					# after a write on this thread that came in while this one wrote (a signal handler's, say): this
+					# text was written before that one's
+					self._held[thread] = rest + self._held.pop(thread, '')
 		return len(text)
 
 	def writelines(self, lines):
@@ -869,16 +900,22 @@ class WholeLineStream:
 			self.write(line)
 
 	def flush(self):
-		with LOG_LOCK:
-			self.stream.flush()
+		# no LOG_LOCK: it writes no held text, so it has no line to keep whole
+		self.stream.flush()
 
 	def write_held(self):
 		'''Write every thread's held part as a line of its own, as at exit.'''
-		with LOG_LOCK:
-			parts, self._held = list(self._held.values()), {}
-			if parts:
-				self.stream.write(''.join(part + '\n' for part in parts))
-				self.stream.flush()
+		with self._log_lock():
+			self._write_parts([part for thread in list(self._held) if (part := self._held.pop(thread, None))])
+			self.stream.flush()
+
+	def _write_parts(self, parts):
+		for part in parts:
+			try:
+				self.stream.write(part + '\n')
+			except (OSError, ValueError):
+				# one the stream cannot take (a character it cannot encode, say) is skipped, not the rest
+				pass
 
 def install_daemon_output():
 	'''Make the daemon's stdout and stderr WholeLineStreams that write their held parts at exit; a repeated call changes nothing.'''
