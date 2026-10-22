@@ -24,6 +24,7 @@ import re
 import glob
 import select
 import contextlib
+import inspect
 import sqlite3
 import json
 import tempfile
@@ -747,6 +748,63 @@ class StatusBoard:
 
 STATUS_BOARD = None
 
+# re-entrant: the SIGTERM handler logs from the main thread, which may be mid-line
+LOG_LOCK = threading.RLock()
+
+class LockedLogger:
+	'''
+	A Tee_Logger whose every call runs holding LOG_LOCK, so each logged line reaches the output whole.
+
+	Tee_Logger prints a line's text and its line break as two writes; a marker another thread logs
+	between them lands mid-line, where the log alerts never see it.
+	A missing method raises AttributeError, so getattr(tl, name, fallback) still falls back.
+	This wrapper is one more stack frame, so a caller depth of 0 or more is passed on one deeper.
+	'''
+	def __init__(self, wrapped):
+		self.wrapped = wrapped
+		# method name -> (takes callerStackDepth, its position among the positional arguments or None)
+		self._depth_params = {}
+
+	def __getattr__(self, name):
+		if name in ('wrapped', '_depth_params'):
+			# not set yet, as on a copy: no loop through self.wrapped
+			raise AttributeError(name)
+		value = getattr(self.wrapped, name)
+		if not callable(value):
+			return value
+		# a partial adds no stack frame of its own: _call is the one frame between caller and logger
+		return functools.partial(self._call, name, value)
+
+	def _depth_param(self, name, method):
+		if name not in self._depth_params:
+			try:
+				params = list(inspect.signature(method).parameters.values())
+			except (TypeError, ValueError):
+				params = []
+			found = (False, None)
+			for position, param in enumerate(params):
+				if param.name == 'callerStackDepth':
+					found = (True, position if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD) else None)
+					break
+			self._depth_params[name] = found
+		return self._depth_params[name]
+
+	def _call(self, name, method, /, *args, **kwargs):
+		takes_depth, position = self._depth_param(name, method)
+		if takes_depth:
+			if position is not None and position < len(args):
+				args = args[:position] + (self._one_deeper(args[position]),) + args[position + 1:]
+			else:
+				kwargs['callerStackDepth'] = self._one_deeper(kwargs.get('callerStackDepth', ...))
+		with LOG_LOCK:
+			return method(*args, **kwargs)
+
+	def _one_deeper(self, depth):
+		if depth is ...:
+			depth = getattr(self.wrapped, 'callerStackDepth', -1)
+		# a negative depth is Tee_Logger's "find the caller" default
+		return depth + 1 if isinstance(depth, int) and depth >= 0 else depth
+
 def job_log(job_name:str, text:str) -> str:
 	'''Log a job's marker line at error level, where log alerts look for it, and return it.'''
 	line = cut_line(shown(f'reverberator job {job_name} {text}'))
@@ -986,7 +1044,7 @@ Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signatur
 #_defaults_#		/var/reverbs/	auto	60	86400	True	True	0	5%,i5%	auto	
 '''
 
-tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=False,noLog=True)
+tl = LockedLogger(Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=False,noLog=True))
 
 #%% ---- Main CLI Functions ----
 def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pending = None) -> str:
@@ -1197,7 +1255,7 @@ def run_daemon():
 	signal.signal(signal.SIGINT, signal_handler)
 	signal.signal(signal.SIGTERM, signal_handler)
 	args, argString = get_args()
-	tl = Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=0, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log,callerStackDepth=4,in_place_compression='xz')
+	tl = LockedLogger(Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=0, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log,callerStackDepth=4,in_place_compression='xz'))
 	tl.teeprint(log_text(argString))
 	if args.verbose:
 		DEBUG = True
@@ -8831,7 +8889,7 @@ def run_command(argv:list) -> int:
 	args = get_command_args(argv)
 	old_tl = tl
 	# library logging stays off the output
-	tl = Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=True, noLog=True)
+	tl = LockedLogger(Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=True, noLog=True))
 	try:
 		return COMMAND_FUNCTIONS[args.command](args)
 	except CommandError as e:
