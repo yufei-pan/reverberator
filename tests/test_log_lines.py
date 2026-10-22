@@ -2,6 +2,7 @@ import contextlib
 import lzma
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -221,6 +222,40 @@ def test_a_joined_backuper_line_is_cut_in_bytes(capsys):
 	assert_each_line_is_cut(capsys)
 
 
+JOINED_LOGS = [(rv.watcherTeeLogToTl, 'WATCHER_LOG_PREFIX'), (rv.backuperTeeLogToTl, 'BACKUPER_LOG_PREFIX')]
+
+
+@pytest.mark.parametrize('log, prefix', JOINED_LOGS)
+def test_a_joined_line_notice_counts_every_byte_left_out(capsys, log, prefix):
+	path = '/m/' + 'p' * 16370
+	message = 'a' * 30000
+	assert len(path.encode()) == 16373
+	log(path, message, error=True)
+	first = plain(capsys.readouterr().out).split('\n')[0]
+	expected = rv.cut_line(rv.shown(f'{getattr(rv, prefix)}| {path} | {message}'))
+	assert first.endswith(expected)
+	# the line's own bytes less what is kept: the path's tail and all of the message
+	left = int(re.search(r'\((\d+) more bytes\)$', expected).group(1))
+	assert left > 30000
+
+
+class Recorder:
+	def __init__(self):
+		self.seen = []
+	def teeerror(self, msg, callerStackDepth=...):
+		self.seen.append(msg)
+
+
+@pytest.mark.parametrize('log, prefix', JOINED_LOGS)
+def test_a_short_joined_line_is_what_it_was_when_its_pieces_were_cut_one_by_one(monkeypatch, log, prefix):
+	recorder = Recorder()
+	monkeypatch.setattr(rv, 'tl', recorder)
+	path = '/m/a\nb \x1b[31m\udcff c'
+	message = 'x \n y\x1b\udcff  z\n'
+	log(path, message, error=True)
+	assert recorder.seen == [f'{getattr(rv, prefix)}| {rv.log_text(path)} | ' + rv.log_text(message)]
+
+
 def test_the_proxy_cuts_each_line_of_a_message():
 	class Fake:
 		def __init__(self):
@@ -245,3 +280,32 @@ def test_the_proxy_cuts_each_line_of_a_message():
 	rv.LockedLogger(table).teelog('q' * 20000, 'w' * 20000)
 	assert table.seen == ['x' * 20000, ('q' * 20000, 'w' * 16362 + ' \u2026(3638 more bytes)')]
 	assert fake.seen == ['x' * 16362 + ' \u2026(28 more bytes)\nshort\n' + 'y' * 16362 + ' \u2026(23 more bytes)', 'z' * 16362 + ' \u2026(24 more bytes)', b'x' * 20000]
+
+
+def test_run_daemon_logs_through_the_locked_logger(tmp_path, monkeypatch):
+	rule_path = tmp_path / 'sample.tsv'
+	monkeypatch.setattr(sys, 'argv', ['reverberator.py', '--no_log', '--quiet', '-ld', str(tmp_path / 'logs'), '--drop_sample_reverb_rule_file', str(rule_path)])
+	# what run_daemon sets before it returns: the logger, the two signal handlers, the timings read from the environment
+	monkeypatch.setattr(rv, 'tl', rv.tl)
+	for name in ('POLL_WAIT_SECONDS', 'JOB_RETRY_FIRST_SECONDS', 'JOB_RETRY_MAX_SECONDS', 'DISK_WAIT_GRACE_SECONDS', 'DEBUG', 'STATUS_BOARD'):
+		monkeypatch.setattr(rv, name, getattr(rv, name))
+	handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+	try:
+		rv.run_daemon()
+	finally:
+		for sig, handler in handlers.items():
+			signal.signal(sig, handler)
+	assert rule_path.exists()
+	assert isinstance(rv.tl, rv.LockedLogger)
+
+
+def test_run_command_logs_through_the_locked_logger(monkeypatch):
+	seen = []
+	def command(args):
+		seen.append(isinstance(rv.tl, rv.LockedLogger))
+		return 0
+	monkeypatch.setattr(rv, 'COMMAND_FUNCTIONS', {'status': command})
+	before = rv.tl
+	assert rv.run_command(['status']) == 0
+	assert seen == [True]
+	assert rv.tl is before
