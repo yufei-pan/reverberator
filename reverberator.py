@@ -6189,10 +6189,11 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder from a file,
 	and never read back, so their copies stay unchecked. Without attributes, attribute-only differences are left out.
 	Each subtree is walked, and the rows at or under it the walk did not find are deleted (every such row for the whole
-	tree); each path is looked up alone, a folder without its contents. A scope nested in a subtree is compared once,
-	with the subtree.
+	tree); each path is looked up alone, a folder without its contents, and the root is never one. A scope nested in a
+	subtree is compared once, with the subtree, and so is an entry two paths name. The scopes are taken in the order of
+	their rels, so a folder comes before what lies under it.
 	A folder that cannot be read keeps its tracked entries and is logged as UNREADABLE; when the monitored root itself
-	cannot be read, JobFailure is raised before anything is found deleted. skip (a skip list's skips) and the paused
+	cannot be read, before the pass or at its end, JobFailure is raised before anything is found deleted. skip (a skip list's skips) and the paused
 	inner mounts leave entries out of the walks; the paused ones keep their tracked rows, and a scope that is skipped or
 	in a paused folder compares nothing.
 	'''
@@ -6212,6 +6213,9 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	subtrees.sort()
 	paths = []
 	for rel in sorted(set(scopes.paths)):
+		if not rel.strip('/'):
+			# the root is compared only as the whole tree
+			continue
 		if any(folder in covered for folder in scope_folders(rel)):
 			continue
 		parent = rel.rstrip('/').rpartition('/')[0]
@@ -6241,9 +6245,8 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 				recorded += 1
 			if event and (attributes or event != 'attrib'):
 				backup_entries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),event,None)
-	def walk():
-		for rel in subtrees:
-			yield from iter_scope_entries(monitor_path,rel,skip=skip,errors=walk_errors) if rel else iter_tree_entries(monitor_path,skip=skip,errors=walk_errors)
+	def walk(rel):
+		return iter_scope_entries(monitor_path,rel,skip=skip,errors=walk_errors) if rel else iter_tree_entries(monitor_path,skip=skip,errors=walk_errors)
 	# a subtree as a file, before it became a folder: no row under the subtree, so not found deleted there
 	stale_files = {rel[:-1] for rel in subtrees if rel and manifest.lookup(rel[:-1]) is not None}
 	# the tracked paths gone from the tree, or now of the other kind
@@ -6267,17 +6270,23 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 				else:
 					pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path)))
 			settle(COMPARE_THREADS * 4)
-		for monitor_entry, rel, _ in walk():
+		# the entries the paths found, as X and X/ name the same one
+		path_entries = set()
+		# subtrees and paths in the order of their rels: a folder named only as a path comes before a subtree under it
+		for rel, is_subtree in sorted([(rel, True) for rel in subtrees] + [(rel, False) for rel in paths]):
 			if not GREEN_LIGHT.is_set():
 				break
-			stale_files.discard(rel)
-			compare(monitor_entry, rel)
-		for rel in paths:
-			if not GREEN_LIGHT.is_set():
-				break
+			if is_subtree:
+				for monitor_entry, entry_rel, _ in walk(rel):
+					if not GREEN_LIGHT.is_set():
+						break
+					stale_files.discard(entry_rel)
+					compare(monitor_entry, entry_rel)
+				continue
 			errors = len(path_errors)
 			entry = scope_path_entry(monitor_path, rel, skip=skip, errors=path_errors)
-			if entry is not None:
+			if entry is not None and entry[1] not in path_entries:
+				path_entries.add(entry[1])
 				compare(entry[0], entry[1])
 			if (entry is None or entry[1] != rel) and len(path_errors) == errors and manifest.lookup(rel) is not None:
 				gone.append(rel)
@@ -6286,6 +6295,12 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	root_error = next((error for rel, error in walk_errors if not rel), None)
 	if root_error is not None:
 		raise JobFailure(f'cannot read {monitor_path}: {root_error}')
+	if GREEN_LIGHT.is_set() and (paths or subtrees):
+		try:
+			# a root gone during the pass would leave every scope after that point looking deleted
+			os.stat(monitor_path)
+		except OSError as e:
+			raise JobFailure(f'cannot read {monitor_path}: {e}')
 	# a folder that could not be read keeps its entries, and so does a subtree when it could not be looked at
 	manifest.mark_seen(rel for rel, _ in walk_errors)
 	for rel, _ in walk_errors:
