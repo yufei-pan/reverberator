@@ -5307,6 +5307,10 @@ class VaultManifest:
 		record = ManifestRecord(*row)
 		return record if record.link is None else record._replace(link=stored_name(record.link))
 
+	def dirty_rels(self) -> set:
+		'''The rels of the rows this backup wrote and has not recorded yet.'''
+		return {stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty')}
+
 	def add(self, rel:str, dirty:bool = False):
 		'''
 		Track rel without a record: dirty when this backup wrote it, so it is recorded before the backup commits. A
@@ -6133,9 +6137,188 @@ def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list
 	yield path + '/', scope_rel, True
 	yield from iter_tree_entries(path, scope_rel, skip=skip, errors=errors)
 
+# what a comparison covers: subtrees are folder rels ending with /, each compared with everything under it ('' for the
+# whole tree), and paths are file rels or folder rels ending with /, each compared alone
+TouchedScopes = namedtuple('TouchedScopes', ['subtrees', 'paths'])
+
+def scope_folders(rel:str) -> list:
+	'''
+	The subtree scopes that cover rel, outermost first: the whole tree, each folder above rel, and rel itself as a
+	folder, whose walk finds rel whatever it now is.
+
+	Examples:
+		>>> scope_folders('a/b.txt')
+		['', 'a/', 'a/b.txt/']
+		>>> scope_folders('D/')
+		['', 'D/']
+	'''
+	parts = rel.rstrip('/').split('/')
+	return [''] + ['/'.join(parts[:depth]) + '/' for depth in range(1, len(parts) + 1)]
+
+def scope_path_entry(monitor_path:str, rel:str, skip = None, errors:list = None):
+	'''
+	The entry at rel of monitor_path (a file rel, or a folder rel ending with /) as (entry path, rel, is_dir), the way
+	the walk of its parent would yield it: under the rel of what it now is, which can be the other kind. None when it
+	is gone or skip leaves it out; when it cannot be looked at, (rel, error) is appended to errors as for a folder that
+	cannot be read.
+	'''
+	name = rel.rstrip('/')
+	path = os.path.join(monitor_path, name)
+	try:
+		is_dir = stat.S_ISDIR(os.lstat(path).st_mode)
+	except (FileNotFoundError, NotADirectoryError):
+		return None
+	except OSError as e:
+		if errors is not None:
+			errors.append((rel, e))
+		backuperTeeLogToTl(path=path,error=True,message=f'Error scanning {path}: {e}')
+		return None
+	entry_rel = name + '/' if is_dir else name
+	if skip is not None and skip(entry_rel):
+		return None
+	return (path + '/' if is_dir else path), entry_rel, is_dir
+
+def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str, monitor_path:str, scopes:TouchedScopes, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None, trusted = frozenset(), attributes:bool = True) -> int:
+	'''
+	Add to backup_entries what differs between scopes of monitor_path and the manifest rows describing version_path,
+	in the caller's transaction: nothing is begun, committed or rolled back here, so the rows can be the ones a backup
+	is still writing, and version_path the version it is writing. Returns the number of tracked entries compared.
+
+	The vault is read, at version_path only, for unverified rows and unchecked copies, and what is read is recorded, as
+	delta_generate_backup_entries() describes. The trusted rels are rows this backup wrote from the monitored tree and
+	has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder from a file,
+	and never read back, so their copies stay unchecked. Without attributes, attribute-only differences are left out.
+	Each subtree is walked, and the rows at or under it the walk did not find are deleted (every such row for the whole
+	tree); each path is looked up alone, a folder without its contents. A scope nested in a subtree is compared once,
+	with the subtree.
+	A folder that cannot be read keeps its tracked entries and is logged as UNREADABLE; when the monitored root itself
+	cannot be read, JobFailure is raised before anything is found deleted. skip (a skip list's skips) and the paused
+	inner mounts leave entries out of the walks; the paused ones keep their tracked rows, and a scope that is skipped or
+	in a paused folder compares nothing.
+	'''
+	start_time = time.monotonic()
+	skip = skip_paused(skip, paused)
+	subtrees = []
+	covered = set()
+	# outermost first, as a folder's rel is shorter than any rel under it
+	for rel in sorted(set(scopes.subtrees), key=len):
+		if rel and any(folder in covered for folder in scope_folders(rel)):
+			continue
+		if rel and skips_folder_or_parent(skip, rel):
+			backuperTeeLogToTl(path=monitor_path,message=f'Not comparing {rel}: it is skipped or in an unmounted inner mount')
+			continue
+		covered.add(rel)
+		subtrees.append(rel)
+	subtrees.sort()
+	paths = []
+	for rel in sorted(set(scopes.paths)):
+		if any(folder in covered for folder in scope_folders(rel)):
+			continue
+		parent = rel.rstrip('/').rpartition('/')[0]
+		if (parent and skips_folder_or_parent(skip, parent + '/')) or (skip is not None and skip(rel)):
+			continue
+		paths.append(rel)
+	if paths or any(subtrees):
+		try:
+			# a scope missing along with the monitored root is not a deleted scope
+			os.stat(monitor_path)
+		except OSError as e:
+			raise JobFailure(f'cannot read {monitor_path}: {e}')
+	manifest.clear_seen()
+	pending = deque()
+	seen = []
+	compared = 0
+	recorded = 0
+	walk_errors = []
+	path_errors = []
+	def settle(limit):
+		nonlocal recorded
+		while len(pending) > limit:
+			monitor_entry, rel, outcome = pending.popleft()
+			event, found = outcome.result() if isinstance(outcome, Future) else outcome
+			if found is not None:
+				manifest.set_records(((rel, found),))
+				recorded += 1
+			if event and (attributes or event != 'attrib'):
+				backup_entries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),event,None)
+	def walk():
+		for rel in subtrees:
+			yield from iter_scope_entries(monitor_path,rel,skip=skip,errors=walk_errors) if rel else iter_tree_entries(monitor_path,skip=skip,errors=walk_errors)
+	# a subtree as a file, before it became a folder: no row under the subtree, so not found deleted there
+	stale_files = {rel[:-1] for rel in subtrees if rel and manifest.lookup(rel[:-1]) is not None}
+	# the tracked paths gone from the tree, or now of the other kind
+	gone = []
+	# results are taken in walk order, so a new tree still lists each folder before its contents
+	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
+		def compare(monitor_entry, rel):
+			nonlocal compared
+			record = manifest.lookup(rel)
+			if record is None:
+				pending.append((monitor_entry, rel, ('create', None)))
+			else:
+				compared += 1
+				seen.append(rel)
+				if len(seen) >= MANIFEST_BATCH_SIZE:
+					manifest.mark_seen(seen)
+					seen.clear()
+				if rel in trusted:
+					# this backup just copied it from the tree, as the kind its rel tells
+					pending.append((monitor_entry, rel, (None, None)))
+				else:
+					pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path)))
+			settle(COMPARE_THREADS * 4)
+		for monitor_entry, rel, _ in walk():
+			if not GREEN_LIGHT.is_set():
+				break
+			stale_files.discard(rel)
+			compare(monitor_entry, rel)
+		for rel in paths:
+			if not GREEN_LIGHT.is_set():
+				break
+			errors = len(path_errors)
+			entry = scope_path_entry(monitor_path, rel, skip=skip, errors=path_errors)
+			if entry is not None:
+				compare(entry[0], entry[1])
+			if (entry is None or entry[1] != rel) and len(path_errors) == errors and manifest.lookup(rel) is not None:
+				gone.append(rel)
+		settle(0)
+	manifest.mark_seen(seen)
+	root_error = next((error for rel, error in walk_errors if not rel), None)
+	if root_error is not None:
+		raise JobFailure(f'cannot read {monitor_path}: {root_error}')
+	# a folder that could not be read keeps its entries, and so does a subtree when it could not be looked at
+	manifest.mark_seen(rel for rel, _ in walk_errors)
+	for rel, _ in walk_errors:
+		manifest.mark_seen_under(rel)
+	# an unmounted inner disk keeps its last backed-up contents
+	paused_here = [rel for rel in paused if any(folder in covered for folder in scope_folders(rel))]
+	manifest.mark_seen(paused_here)
+	for rel in paused_here:
+		manifest.mark_seen_under(rel)
+	log_unreadable(job_name, monitor_path, walk_errors + path_errors, reported)
+	if GREEN_LIGHT.is_set():
+		# only a complete walk tells deleted entries from ones it did not reach
+		deleted = []
+		for rel in subtrees:
+			if rel[:-1] in stale_files and not any(error_rel == rel for error_rel, _ in walk_errors):
+				deleted.append(rel[:-1])
+			deleted.extend(manifest.unseen_under(rel) if rel else manifest.unseen())
+		deleted.extend(gone)
+		for rel in deleted:
+			backuperTeeLogToTl(path=monitor_path,message=f'Deleted file/folder {os.path.join(monitor_path,rel)}')
+			backup_entries[os.path.join(monitor_path,rel)] = BackupEntryValues(datetime.datetime.now().isoformat(),'delete',None)
+	if paths or len(subtrees) != 1:
+		count = len(subtrees) + len(paths)
+		compared_what = f' in {count} touched scope{"" if count == 1 else "s"}'
+	else:
+		compared_what = f' under {subtrees[0]}' if subtrees[0] else ''
+	backuperTeeLogToTl(path=monitor_path,message=f'Compared {compared} tracked entries{compared_what} in {time.monotonic() - start_time:.1f}s, {recorded} read from the vault, {len(backup_entries)} differences')
+	return compared
+
 def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel:str = '',paused:set = None) -> VaultManifest:
 	'''
-	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest.
+	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest
+	(compare_scopes() over the whole tree, or scope_rel) in a transaction of its own, which it commits.
 
 	Unchanged entries are recognised from the recorded size, mtime, mode, owner and tail hash, so only the monitored
 	side is read. The vault is read for unverified rows, which then get recorded, and for unchecked copies, which a
@@ -6150,11 +6333,12 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	'''
 	if manifest is None:
 		manifest = VaultManifest(os.path.dirname(os.path.abspath(latest_version_info.path)))
+	skips = None if skip_list is None else skip_list.skips
 	if paused is None:
-		paused = paused_inner_mounts(monitor_path, manifest.inner_mounts, current_mount_table(), None if skip_list is None else skip_list.skips)
-	skip = skip_paused(None if skip_list is None else skip_list.skips, paused)
+		paused = paused_inner_mounts(monitor_path, manifest.inner_mounts, current_mount_table(), skips)
 	if scope_rel:
-		if skips_folder_or_parent(skip, scope_rel):
+		# checked before the transaction, as a scope compared nothing in leaves the manifest as it is
+		if skips_folder_or_parent(skip_paused(skips, paused), scope_rel):
 			backuperTeeLogToTl(path=monitor_path,message=f'Not comparing {scope_rel}: it is skipped or in an unmounted inner mount')
 			return manifest
 		try:
@@ -6163,81 +6347,18 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 		except OSError as e:
 			raise JobFailure(f'cannot read {monitor_path}: {e}')
 	version_path = latest_version_info.path
-	start_time = time.monotonic()
 	manifest.prefetch()
 	manifest.begin()
 	if not manifest.describes(version_path):
 		backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {version_path}, listing it to read from the vault')
 		manifest.rebuild(version_path)
-	manifest.clear_seen()
-	pending = deque()
-	seen = []
-	compared = 0
-	recorded = 0
-	walk_errors = []
-	def settle(limit):
-		nonlocal recorded
-		while len(pending) > limit:
-			monitor_entry, rel, outcome = pending.popleft()
-			event, found = outcome.result() if isinstance(outcome, Future) else outcome
-			if found is not None:
-				manifest.set_records(((rel, found),))
-				recorded += 1
-			if event:
-				backupEntries[monitor_entry] = BackupEntryValues(datetime.datetime.now().isoformat(),event,None)
-	if scope_rel:
-		walk = iter_scope_entries(monitor_path,scope_rel,skip=skip,errors=walk_errors)
-		# the scope as a file, before it became a folder: no row under the scope, so not found deleted there
-		file_rel = scope_rel[:-1]
-		stale_file = manifest.lookup(file_rel) is not None
-	else:
-		walk = iter_tree_entries(monitor_path,skip=skip,errors=walk_errors)
-		stale_file = False
-	# results are taken in walk order, so a new tree still lists each folder before its contents
-	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
-		for monitor_entry, rel, _ in walk:
-			if not GREEN_LIGHT.is_set():
-				break
-			if stale_file and rel == file_rel:
-				stale_file = False
-			record = manifest.lookup(rel)
-			if record is None:
-				pending.append((monitor_entry, rel, ('create', None)))
-			else:
-				compared += 1
-				seen.append(rel)
-				if len(seen) >= MANIFEST_BATCH_SIZE:
-					manifest.mark_seen(seen)
-					seen.clear()
-				pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path)))
-			settle(COMPARE_THREADS * 4)
-		settle(0)
-	manifest.mark_seen(seen)
-	root_error = next((error for rel, error in walk_errors if not rel), None)
-	if root_error is not None:
+	try:
+		compare_scopes(backupEntries, manifest, version_path, monitor_path, TouchedScopes([scope_rel], []), skip=skips, paused=paused, job_name=job_name, reported=reported)
+	except JobFailure:
 		manifest.rollback()
-		raise JobFailure(f'cannot read {monitor_path}: {root_error}')
-	# a folder that could not be read keeps its entries, and so does the scope when it could not be looked at
-	manifest.mark_seen(rel for rel, _ in walk_errors)
-	for rel, _ in walk_errors:
-		manifest.mark_seen_under(rel)
-	# an unmounted inner disk keeps its last backed-up contents
-	manifest.mark_seen(paused)
-	for rel in paused:
-		manifest.mark_seen_under(rel)
-	log_unreadable(job_name, monitor_path, walk_errors, reported)
-	if GREEN_LIGHT.is_set():
-		# only a complete walk tells deleted entries from ones it did not reach
-		deleted = manifest.unseen_under(scope_rel) if scope_rel else manifest.unseen()
-		if stale_file and not any(rel == scope_rel for rel, _ in walk_errors):
-			deleted.insert(0, file_rel)
-		for rel in deleted:
-			backuperTeeLogToTl(path=monitor_path,message=f'Deleted file/folder {os.path.join(monitor_path,rel)}')
-			backupEntries[os.path.join(monitor_path,rel)] = BackupEntryValues(datetime.datetime.now().isoformat(),'delete',None)
+		raise
 	# what was read from the vault holds whether or not a new version follows
 	manifest.commit(version_path)
-	compared_what = f' under {scope_rel}' if scope_rel else ''
-	backuperTeeLogToTl(path=monitor_path,message=f'Compared {compared} tracked entries{compared_what} in {time.monotonic() - start_time:.1f}s, {recorded} read from the vault, {len(backupEntries)} differences')
 	return manifest
 
 def hash_file(path,size = ...,full_hash=False):
