@@ -725,7 +725,19 @@ def queued_full_scan(queue, lock):
 		return queue.full_scan_requested
 
 
-def test_a_resumed_batch_is_followed_by_a_full_comparison(job):
+def record_backups(monkeypatch):
+	'''(entries, touched) of each do_backup() call; a full comparison is (0, None).'''
+	calls = []
+	real = rv.do_backup
+
+	def recording(entries, *args, **kwargs):
+		calls.append((len(entries), kwargs.get('touched')))
+		return real(entries, *args, **kwargs)
+	monkeypatch.setattr(rv, 'do_backup', recording)
+	return calls
+
+
+def test_a_resumed_batch_is_followed_by_a_full_comparison(job, monkeypatch):
 	from tests.harness import write_pending, wait_until, wait_for_committed_count
 	import time
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
@@ -739,17 +751,20 @@ def test_a_resumed_batch_is_followed_by_a_full_comparison(job):
 	queue = rv.ChangeEventQueue(job.monitor)
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue) is True
 	assert queue.round_tripped
+	calls = record_backups(monkeypatch)
 	thread, lock, flag = start_backuper(job, queue)
 	try:
 		wait_for_committed_count(job, 2)
-		wait_until(lambda: queued_full_scan(queue, lock), message='no full comparison queued after the resumed batch')
-		# the queued comparison is the batch's own, not a flag left for later batches
+		# with no watcher to signal the backuper again
+		wait_until(lambda: (0, None) in calls, message='no full comparison after the resumed batch')
+		assert calls[0][0] == 1
+		# the comparison is the batch's own, not a flag left for later batches
 		assert not queue.round_tripped
 	finally:
 		stop_backuper(thread)
 
 
-def test_a_requeued_batch_is_followed_by_a_full_comparison(job):
+def test_a_requeued_batch_is_followed_by_a_full_comparison(job, monkeypatch):
 	from tests.harness import wait_until, wait_for_committed_count
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
 	run_backup(job)
@@ -762,10 +777,11 @@ def test_a_requeued_batch_is_followed_by_a_full_comparison(job):
 	# the batch a backup that did not commit hands back
 	queue.prepend(rv.backup_entries_to_change_events(OrderedDict([(a, rv.BackupEntryValues('t', 'modify', None))])))
 	assert queue.round_tripped
+	calls = record_backups(monkeypatch)
 	thread, lock, flag = start_backuper(job, queue)
 	try:
 		wait_for_committed_count(job, 2)
-		wait_until(lambda: queued_full_scan(queue, lock), message='no full comparison queued after the requeued batch')
+		wait_until(lambda: (0, None) in calls, message='no full comparison after the requeued batch')
 	finally:
 		stop_backuper(thread)
 
@@ -803,8 +819,7 @@ def test_git_pattern_round_tripped_ends_clean(tmp_path):
 	try:
 		wait_for_committed_count(job, 2)
 		assert os.path.lexists(os.path.join(rv.list_versions(job.job_vault)[1].path, 'refs/X'))
-		wait_until(lambda: queued_full_scan(queue, lock), message='no full comparison queued after the round-tripped batch')
-		flag.set()
+		# the full comparison follows by itself
 		wait_for_committed_count(job, 3)
 	finally:
 		stop_backuper(thread)
@@ -828,7 +843,7 @@ def test_an_event_on_the_root_gives_no_entry_and_no_row(tmp_path):
 	assert_version_matches_tree(job, version)
 
 
-def test_the_manifest_and_the_referenced_copy_reject_the_root(job):
+def test_the_manifest_and_the_referenced_copy_reject_the_root(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
 	v0 = latest_version(job).path
@@ -842,9 +857,13 @@ def test_the_manifest_and_the_referenced_copy_reject_the_root(job):
 		manifest.conn.execute("INSERT INTO entries(path) VALUES ('./'), ('')")
 		v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
 		os.makedirs(v1)
+		lines = spy_on_log(monkeypatch)
 		assert rv.do_referenced_copy(v0, v1, manifest, relative=True)
 		assert manifest_rows_of(manifest) == {'a.txt'}
 		assert sorted(os.listdir(v1)) == ['a.txt']
+		# the one-time cleanup of such rows is a warning
+		dropped = [(error, warning) for message, error, warning in lines if 'names no' in message]
+		assert dropped == [(False, True), (False, True)]
 	finally:
 		manifest.rollback()
 		manifest.close()
@@ -992,6 +1011,120 @@ def test_a_refused_copy_leaves_its_partial_file_alone(job, parent):
 		manifest.close()
 	if parent == 'link':
 		assert sorted(os.listdir(outside)) == ['.partial']
+
+
+@pytest.mark.parametrize('how', ['failed', 'discarded'])
+def test_partial_files_behind_a_link_are_never_removed(job, how):
+	from tests.test_io_errors import FakeTask
+	outside = os.path.join(job.root, 'outside')
+	os.makedirs(outside)
+	with open(os.path.join(outside, '.partial'), 'w') as f:
+		f.write('not the copy')
+	version = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
+	os.makedirs(version)
+	# the copy's folder D was replaced by a link after the copy was made in it
+	os.symlink(outside, os.path.join(version, 'D'))
+	copy = rv.PendingCopy(FakeTask(1, ['No such file or directory']), os.path.join(job.monitor, 'gone.txt'), os.path.join(version, 'D/.partial'),
+		os.path.join(version, 'D/a.txt'))
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	try:
+		if how == 'failed':
+			rv.finish_copies([copy], manifest, version, job.job_name)
+		else:
+			rv.stop_copies(rv.multiCMD.AsyncExecutor(semaphore=rv.BACKUP_SEMAPHORE, quiet=True), [copy], version)
+	finally:
+		manifest.rollback()
+		manifest.close()
+	assert sorted(os.listdir(outside)) == ['.partial']
+
+
+def test_a_version_being_written_is_never_trusted_for_its_folders(tmp_path):
+	'''
+	An attrib on D/f, then D replaced by a link out of the tree in the same batch. Then a link of chain form naming that
+	version's D/g, and a touch -h on it: nothing about the version written first may be taken as known, or the attribute
+	sync reaches through D to the outside file.
+	'''
+	rv.REAL_VAULT_FOLDERS.clear()
+	job = create_job(str(tmp_path))
+	xattrs = xattrs_supported(job.root)
+	outside = os.path.join(job.root, 'outside_dir')
+	os.makedirs(outside)
+	victim = os.path.join(outside, 'g')
+	with open(victim, 'w') as f:
+		f.write('root owned')
+	set_meta(victim, 0o600, 0, 1_600_000_000_000_000_000, b'victim', xattrs)
+	held = entry_meta(victim, xattrs)
+	before = {'D/f': 'x', 'keep': 'k'}
+	write_tree(job.monitor, before)
+	run_backup(job)
+	make_tree(job, before, {'D': ('link', outside), 'keep': 'k'})
+	events = raw_events(job, [('attrib', 'D/f', None, False), ('create', 'D', None, False)])
+	run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
+	v1 = rv.list_versions(job.job_vault)[-1]
+	assert os.path.islink(os.path.join(v1.path, 'D'))
+	cached = [key for key in rv.REAL_VAULT_FOLDERS if key[0] == os.path.abspath(v1.path)]
+	os.makedirs(os.path.join(job.monitor, 'a'))
+	os.symlink(f'../{v1.name}/D/g', os.path.join(job.monitor, 'a', 'U'))
+	decoy = os.path.join(job.monitor, v1.name, 'D', 'g')
+	os.makedirs(os.path.dirname(decoy))
+	with open(decoy, 'w') as f:
+		f.write('decoy')
+	set_meta(decoy, 0o666, 4242, 1_500_000_000_000_000_000, b'decoy', xattrs)
+	events = raw_events(job, [('create', 'a', None, True), ('create', v1.name, None, True)])
+	run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
+	os.lchown(os.path.join(job.monitor, 'a', 'U'), 4243, 4243)
+	events = raw_events(job, [('attrib', 'a/U', None, False)])
+	run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
+	assert rv.list_versions(job.job_vault)[-1].number == 3
+	assert entry_meta(victim, xattrs) == held
+	assert cached == []
+
+
+def test_copy_file_meta_never_follows_a_link_named_with_a_trailing_slash(tmp_path):
+	source, target, link = (os.path.join(str(tmp_path), name) for name in ('source', 'target', 'link'))
+	for path in (source, target):
+		os.makedirs(path)
+	os.chmod(target, 0o700)
+	os.utime(target, ns=(1_600_000_000_000_000_000, 1_600_000_000_000_000_000))
+	os.chmod(source, 0o755)
+	os.utime(source, ns=(1_500_000_000_000_000_000, 1_500_000_000_000_000_000))
+	held = os.stat(target)
+	os.symlink(target, link)
+	assert rv.copy_file_meta(source, link + '/')
+	st = os.stat(target)
+	assert (st.st_mode, st.st_uid, st.st_mtime_ns) == (held.st_mode, held.st_uid, held.st_mtime_ns)
+	assert os.lstat(link).st_mtime_ns == 1_500_000_000_000_000_000
+
+
+def spy_on_log(monkeypatch):
+	'''(message, error, warning) of each backuper log line.'''
+	lines = []
+	real = rv.backuperTeeLogToTl
+
+	def spy(path, message, error=False, ok=False, warning=False, debug=False):
+		lines.append((message, error, warning))
+		return real(path, message, error=error, ok=ok, warning=warning, debug=debug)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', spy)
+	return lines
+
+
+def test_a_folder_replaced_by_a_file_logs_one_line(tmp_path, monkeypatch):
+	lines = []
+	before = {'big/' + f'sub{i}/f{j}.txt': 'x' for i in range(3) for j in range(5)}
+	job, version = replay_sequence(tmp_path, {**before, 'keep.txt': 'k'}, {'big': 'now a file', 'keep.txt': 'k'},
+		[('create', 'big', None, False)], between=lambda job: lines.append(spy_on_log(monkeypatch)))
+	assert_version_matches_tree(job, version)
+	logged = [message for message, error, _ in lines[0] if 'big' in message and (error or 'in its place' in message)]
+	assert len(logged) == 1 and 'in its place' in logged[0], logged
+
+
+def test_scans_handed_back_alone_are_not_round_tripped(job):
+	queue = rv.ChangeEventQueue(job.monitor)
+	queue.prepend(rv.scan_events([os.path.join(job.monitor, 'disk')]))
+	assert not queue.round_tripped
+	queue.prepend(rv.backup_entries_to_change_events(OrderedDict([(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues('t', 'modify', None))])))
+	assert queue.round_tripped
 
 
 @pytest.mark.parametrize('name', ['file_over_folder', 'gone_folder_named_as_a_folder'])

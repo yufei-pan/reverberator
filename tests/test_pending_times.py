@@ -48,3 +48,28 @@ def test_times_from_this_boot_are_kept(job):
 	queue = rv.ChangeEventQueue(job.monitor)
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue) is True
 	assert [event.monotonic_time for event in queue] == stored
+
+
+def test_times_from_an_earlier_boot_in_a_file_dated_in_the_future_are_rebased(job):
+	seed_monitor(job, {'a.txt': 'a'})
+	start = time.monotonic() + 345600
+	pending = write_pending(job, [rv.ChangeEvent(start, False, 'modify', os.path.join(job.monitor, 'a.txt'), None),
+		rv.ChangeEvent(start + 1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None)])
+	# the clock was set back after the file was written
+	resumable(job, pending, time.time() + 3600)
+	queue = rv.ChangeEventQueue(job.monitor)
+	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue) is True
+	events = list(queue)
+	assert events[-1].monotonic_time <= time.monotonic()
+	assert round(events[1].monotonic_time - events[0].monotonic_time, 6) == 1.0
+	entries = rv.change_events_to_backup_entries(queue)
+	assert max(datetime.datetime.fromisoformat(values.iso_time) for values in entries.values()) <= datetime.datetime.now()
+
+
+def test_scan_rows_alone_are_not_round_tripped(job):
+	seed_monitor(job, {'disk/': None})
+	pending = write_pending(job, [rv.ChangeEvent(time.monotonic(), True, 'scan', os.path.join(job.monitor, 'disk'), None)])
+	resumable(job, pending, time.time() - 1)
+	queue = rv.ChangeEventQueue(job.monitor)
+	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue) is True
+	assert not queue.round_tripped

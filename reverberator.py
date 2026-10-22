@@ -218,7 +218,7 @@ class ChangeEventQueue:
 	A 'scan' event (compare that one folder with the vault) is kept like any other event.
 	round_tripped says that some of the events lost their raw form: a batch handed back after a backup that did not
 	commit, or loaded from the pending transactions, holds only its collapsed entries (backup_entries_to_change_events()).
-	prepend() and the pending load set it, and take() moves it to the batch it takes.
+	prepend() and the pending load set it for events other than scans, and take() moves it to the batch it takes.
 
 	Examples:
 		>>> queue = ChangeEventQueue('/m')
@@ -338,7 +338,8 @@ class ChangeEventQueue:
 		if self._full_scan is not None:
 			return
 		events = list(events)
-		if events:
+		if any(event.event != 'scan' for event in events):
+			# scans name folders compared whole, which lose nothing
 			self.round_tripped = True
 		for event in events:
 			if event.event == 'full_scan':
@@ -2860,11 +2861,12 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 			to_process.append(ChangeEvent(time.monotonic(), False, 'full_scan', monitor_path, None))
 			loaded_count += 1
 		times = [float(row[0]) for row in pending_rows_raw.values()]
-		# the times are of the monotonic clock, which starts again at each boot: rows written before this boot are moved
-		# by one offset, so the newest is when the file was written, on this boot's clock, and their order and spacing stay
+		# the times are of the monotonic clock, which starts again at each boot: rows written before this boot, or with a
+		# time this boot's clock has not reached, are moved by one offset, so the newest is when the file was written on
+		# this boot's clock ( now, for a file dated in the future ), and their order and spacing stay
 		offset = 0.0
-		if times and pending_mtime < time.time() - time.monotonic() - 1.0:
-			offset = time.monotonic() - (time.time() - pending_mtime) - max(times)
+		if times and (pending_mtime < time.time() - time.monotonic() - 1.0 or max(times) > time.monotonic()):
+			offset = time.monotonic() - (time.time() - min(pending_mtime, time.time())) - max(times)
 			backuperTeeLogToTl(job_name, f'Pending transactions {pending_transactions_path} were written before this boot, moving their times by {offset:.0f}s')
 		for event_time, row in zip(times, pending_rows_raw.values()):
 			# the paths as pending_transaction_rows() wrote them
@@ -2879,7 +2881,7 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 				None if moved_from is None else stored_name(moved_from)
 			))
 			loaded_count += 1
-		if pending_rows_raw and not to_process.full_scan_requested:
+		if any(row[2] != 'scan' for row in pending_rows_raw.values()) and not to_process.full_scan_requested:
 			# a batch handed back before the stop was saved as its collapsed entries only
 			to_process.round_tripped = True
 		try:
@@ -3638,6 +3640,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				break
 			# an unreadable path is reported once for the batch, by its comparison or its backup
 			reported = set()
+			# whether the whole tree is compared right after this batch
+			follow_up = False
 			if scan_folders and not full_comparison:
 				vaultInfo,manifest,full_comparison = compare_scanned_folders(backupEntries,scan_folders,job_name,monitor_path,vault_path,
 					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported)
@@ -3673,14 +3677,15 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				if round_tripped and not full_comparison:
 					# the collapse can drop a path its entries no longer name, as git's ref deleted after a rename over it:
 					# the verification compared only what they name, so the whole tree is compared next, as at a start
-					# with nothing to resume
+					# with nothing to resume. it runs now, without waiting for the watcher's signal, and the queue is left
+					# to the watcher: its new folders' events are recorded again only once it sees its batch taken
 					backuperTeeLogToTl(job_name,'The batch backed up was handed back or resumed, keeping only its collapsed entries: comparing the whole tree next')
-					with to_process_lock:
-						to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
+					follow_up = True
 			backupEntries.clear()
 			scan_folders = []
 			touched = None
-			full_comparison = False
+			# a stop before it runs saves it as a full scan request, as any full comparison
+			full_comparison = follow_up
 			round_tripped = False
 			while not backupEntries and not full_comparison and not scan_folders and running():
 				while running() and not to_process_flag.is_set():
@@ -4770,6 +4775,34 @@ def real_folders_to(version_path:str, rel:str, make:bool = False, missing_ok:boo
 			return False
 	return True
 
+def file_in_place_of_folder(version_path:str, rel:str):
+	'''
+	The rel (ending with /) of the first folder above rel in version_path that is a file or another entry that is no
+	folder and no link, as a file made where a folder was leaves it; None when the folders above are real, or the first
+	one that is not is a link, missing or cannot be looked at.
+
+	Examples:
+		>>> import tempfile
+		>>> version = tempfile.mkdtemp()
+		>>> os.makedirs(os.path.join(version, 'd'))
+		>>> open(os.path.join(version, 'd', 'f'), 'w').close()
+		>>> os.symlink('d', os.path.join(version, 'link'))
+		>>> [file_in_place_of_folder(version, rel) for rel in ('d/f/x', 'd/f/sub/', 'd/x', 'link/f/x', 'gone/x')]
+		['d/f/', 'd/f/', None, None, None]
+		>>> import shutil; shutil.rmtree(version)
+	'''
+	parts = rel.rstrip('/').split('/')[:-1]
+	for depth in range(1, len(parts) + 1):
+		try:
+			mode = os.lstat(os.path.join(version_path, *parts[:depth])).st_mode
+		except OSError:
+			return None
+		if stat.S_ISLNK(mode):
+			return None
+		if not stat.S_ISDIR(mode):
+			return '/'.join(parts[:depth]) + '/'
+	return None
+
 def make_real_folder(path:str) -> bool:
 	'''
 	Make path, in a real folder of a version being written (real_folders_to()), a real folder: an entry of another kind
@@ -4873,9 +4906,15 @@ def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = 
 		remove_entry(temp_path)
 	return returncode
 
-def discard_copies(pending:list):
-	'''Remove the partial files of the copies in pending, which will not be finished, and empty it.'''
+def discard_copies(pending:list, version_path:str = None):
+	'''
+	Remove the partial files of the copies in pending, which will not be finished, and empty it. With version_path, the
+	version they were made in, one whose folder there is no longer a real folder is left alone: it went with the folder
+	it was made in, and removing it would reach through a link (real_folders_to()).
+	'''
 	for copy in pending:
+		if version_path is not None and not real_folders_to(version_path, os.path.relpath(copy.temp_path, version_path), missing_ok=True):
+			continue
 		try:
 			remove_entry(copy.temp_path)
 		except OSError as e:
@@ -5008,7 +5047,7 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 				replace_entry(copy.temp_path, copy.dest_path)
 				copied.append(os.path.relpath(copy.dest_path, version_path))
 			else:
-				remove_entry(copy.temp_path)
+				discard_copies([copy], version_path)
 				side = copy_failure_side(copy.source_path, copy.temp_path, lines)
 				if side == 'vault':
 					if failure is None:
@@ -5031,7 +5070,7 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 		# an error above leaves no partial file of the copies it did not reach
 		rest = pending[done:]
 		pending.clear()
-		discard_copies(rest)
+		discard_copies(rest, version_path)
 	if failure is not None:
 		raise failure
 	return copied
@@ -5060,7 +5099,7 @@ def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, dis
 		shown = '; '.join(running[:10]) + (f'; and {len(running) - 10} more' if len(running) > 10 else '')
 		backuperTeeLogToTl(path=version_path,error=True,message=f'{len(running)} stopped commands still running after {COPY_STOP_WAIT_SECONDS}s, no longer waiting for them: {shown}')
 	if discard:
-		discard_copies(pending)
+		discard_copies(pending, version_path)
 	else:
 		pending.clear()
 
@@ -5080,7 +5119,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		backup_folder_path = os.path.join(backup_folder,folder)
 		if not is_entry_rel(folder):
 			# such as './', which daemons before 0.43 wrote for the attrib event of the monitored root
-			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping a tracked row that names no folder below the version: {folder!r}')
+			backuperTeeLogToTl(path=source_path,warning=True,message=f'Dropping a tracked row that names no folder below the version: {folder!r}')
 			missing.append(folder)
 			continue
 		if not os.path.lexists(source_folder):
@@ -5098,7 +5137,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		source_file_real = os.path.join(source_path,file)
 		backup_file_path = os.path.join(backup_folder,file)
 		if not is_entry_rel(file):
-			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping a tracked row that names no file below the version: {file!r}')
+			backuperTeeLogToTl(path=source_path,warning=True,message=f'Dropping a tracked row that names no file below the version: {file!r}')
 			missing.append(file)
 			continue
 		if not os.path.lexists(source_file_real):
@@ -5127,16 +5166,19 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 def copy_file_meta(source_file:str,backup_file_path:str):
 	'''
 	Copy source_file's mode, times, owner and extended attributes onto backup_file_path. A symlink at backup_file_path
-	is never followed: it gets only its own owner and times, from source_file's own (by lstat), as a link has no mode or
-	extended attributes of its own here. Returns whether it worked; an error line says why not.
+	is never followed, even named with a trailing / as a folder's rel is: it gets only its own owner and times, from
+	source_file's own (by lstat), as a link has no mode or extended attributes of its own here. Returns whether it
+	worked; an error line says why not.
 	'''
 	try:
-		if os.path.islink(backup_file_path):
+		# a trailing / makes the kernel follow a link to a folder
+		entry = backup_file_path.rstrip('/') or backup_file_path
+		if os.path.islink(entry):
 			# a user's symlink backed up as one can lead anywhere, out of the vault say
-			st = os.lstat(source_file)
+			st = os.lstat(source_file.rstrip('/') or source_file)
 			if os.name == 'posix':
-				os.lchown(backup_file_path, st.st_uid, st.st_gid)
-			os.utime(backup_file_path, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+				os.lchown(entry, st.st_uid, st.st_gid)
+			os.utime(entry, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
 			return True
 		# copy the file metadata
 		copystat(source_file,backup_file_path)
@@ -7283,6 +7325,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		reported = set()
 	backup_entries = prepare_backup_entries_for_replay(backup_entries)
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
+	# the folders a file now stands in place of, each logged once
+	replaced_folders = set()
 	def not_through_link(rel,isDir,doing):
 		# a folder above rel in the new version is a link (or a file): what is done there would reach through it, out of
 		# the version. the version cannot hold rel there, so its rows go
@@ -7341,6 +7385,11 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# we just copy the entire folder / file ( for recursive create purposes )
 			cp_af_copy_path(source_path=source_real_path,dest_path=file_vault_real_path,mcae=mcae,pending=pending)
 		return True
+	def replaced_folder(folder_rel):
+		# one line for each folder of the version a file now stands in place of, however many of its rows go
+		if folder_rel not in replaced_folders:
+			replaced_folders.add(folder_rel)
+			backuperTeeLogToTl(path=monitor_path,message=f'Dropping the rows under {os.path.join(backup_folder,folder_rel)}: a file is in its place in the version')
 	def delete_path(isDir,vault_real_path,relative_path,mcae):
 		# never with a trailing /, which makes rm follow a link in the entry's place
 		vault_real_path = vault_real_path.rstrip('/')
@@ -7349,6 +7398,15 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			backuperTeeLogToTl(path=vault_real_path,error=True,message='Attempting to remove the version itself, skipping')
 			return
 		if not real_folders_to(backup_folder,relative_path,missing_ok=True):
+			in_place = file_in_place_of_folder(backup_folder,relative_path)
+			if in_place is not None:
+				# a file made where a folder above it was ( rm -rf L; echo > L ): nothing of it is in the version, its rows go
+				replaced_folder(in_place)
+				if isDir:
+					manifest.remove_tree(as_folder_entry(relative_path))
+				else:
+					manifest.discard(relative_path)
+				return
 			# nothing of it is in the version but through that link: only its rows go
 			not_through_link(relative_path,isDir,'removing')
 			return
@@ -7360,6 +7418,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			elif os.path.isdir(vault_real_path) and not os.path.islink(vault_real_path):
 				# an entry of another kind in its place is another row's ( a link that replaced the folder ), and stays
 				mcae.run_command(['rm','-rf',vault_real_path])
+			elif os.path.lexists(vault_real_path) and not os.path.islink(vault_real_path):
+				replaced_folder(as_folder_entry(relative_path))
 			# also stops tracking all the files and subfolders in the folder
 			manifest.remove_tree(as_folder_entry(relative_path))
 		else:
@@ -7367,16 +7427,28 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			mcae.run_command(['rm','-f',vault_real_path])
 			manifest.discard(relative_path)
 	def sync_attributes(source_real_path,relative_path):
-		# onto the version's entry of a file, which a chain link leaves where the latest copy is, as only_sync_attributes
-		# has it: the end of the chain gets them. a user's symlink, in the version or at the chain's end, gets only its own
-		# owner and times ( copy_file_meta() ), never what it points to
-		entry = os.path.join(backup_folder,relative_path)
+		# onto the version's entry of a file ( its folders are real: real_folders_to() ), which a chain link leaves where
+		# the latest copy is, as only_sync_attributes has it: the end of the chain gets them. a user's symlink, in the
+		# version or at the chain's end, gets only its own owner and times ( copy_file_meta() ), never what it points to.
+		# the chain is followed from its first hop, in a committed version: nothing is judged, nor remembered
+		# ( is_real_folder_under() ), about the folders of this one, which the replay can still change
+		entry = os.path.abspath(os.path.join(backup_folder,relative_path))
 		if os.path.islink(entry):
-			end = chain_end(os.path.dirname(os.path.abspath(backup_folder)),backup_folder,relative_path)
-			if end is None:
-				backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: its link chain cannot be followed')
-				return False
-			entry = end.path
+			vault = os.path.dirname(os.path.abspath(backup_folder))
+			try:
+				hop = strict_chain_hop(vault,entry,os.readlink(entry))
+			except (OSError,UncheckedVaultLink):
+				hop = False
+			if hop is not None:
+				hop_version = None if hop is False else hop[len(vault) + 1:].partition('/')[0]
+				end = None if hop is False else chain_end(vault,os.path.join(vault,hop_version),hop[len(vault) + len(hop_version) + 2:])
+				if end is None:
+					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: its link chain cannot be followed')
+					return False
+				if stat.S_ISDIR(end.st.st_mode):
+					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: its link chain ends at the folder {end.path}')
+					return False
+				entry = end.path
 		return copy_file_meta(source_real_path,entry)
 	def wait_for_async_commands(mcae):
 		# returns the rels of the copies put in place
@@ -7616,6 +7688,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	finally:
 		# however the backup ends, no copy is left writing into this version, nor a partial file in it
 		stop_copies(mcae,pending,backup_folder)
+		# nothing about the folders of a version still being written may be taken as known later ( the replay can make
+		# one a link after it was looked at ): only committed versions keep their answers
+		forget_real_vault_folders(os.path.abspath(backup_folder))
 	if mcae.runningThreads or not GREEN_LIGHT.is_set():
 		backuperTeeLogToTl(path=monitor_path,error=True,message='Reverb backup interrupted before copy threads finished')
 		return manifest
