@@ -897,6 +897,18 @@ def test_find_job_ignores_nameless_rules():
 		rv.find_job(rules, 'x', job_name='')
 
 
+def test_each_nameless_row_quotes_its_own_name():
+	empty = rv.ReverbRule(*[''] * len(rv.REVERB_RULE_HEADER))
+	rules = [empty._replace(job_name=rv.NamelessJobName('!!!')), empty._replace(job_name=rv.NamelessJobName('???'))]
+	# both starters are made before either runs, as run_daemon does while the supervisor threads are still starting
+	starts = [rv.nameless_start('/rules.tsv', rule) for rule in rules]
+	jobs = [rv.JobControl('', 'row-1'), rv.JobControl('', 'row-2')]
+	assert [start(job, 1) for start, job in zip(starts, jobs)] == [[], []]
+	assert "'!!!'" in jobs[0].failure.reason and "'???'" not in jobs[0].failure.reason
+	assert "'???'" in jobs[1].failure.reason and "'!!!'" not in jobs[1].failure.reason
+	assert jobs[0].failure.permanent and jobs[1].failure.permanent
+
+
 def test_status_shows_a_nameless_job_as_stopped(tmp_path):
 	rules = [rv.ReverbRule(rv.NamelessJobName('!!!'), '/m', str(tmp_path), *['']*9)]
 	status = rv.DaemonStatus(None, False, {})

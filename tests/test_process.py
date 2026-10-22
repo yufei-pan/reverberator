@@ -216,4 +216,4 @@ def test_names_that_are_not_text_are_kept_exactly_and_never_alert(job, run_rever
 	proc.wait(timeout=15)
 	output = ''.join(proc._out_buf + proc._err_buf)
 	assert alerting_lines(output) == []
-	assert '\x1b[31mred' not in output and '\udcff' not in output
+	assert '\x1b[31mred' not in output and not any('\udc80' <= c <= '\udcff' for c in output)
