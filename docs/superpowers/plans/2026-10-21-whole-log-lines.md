@@ -118,7 +118,7 @@
 - [ ] **Step 1: Write the failing tests** in `tests/test_log_lines.py`.
   - `test_cut_line_never_splits_a_character`:
     - `rv.cut_line('\U0001f600' * 5000) == '\U0001f600' * 4096 + ' …(3616 more bytes)'`
-    - `rv.cut_line('ab' + '日' * 6000) == 'ab' + '日' * 5460 + ' …(5620 more bytes)'`
+    - `rv.cut_line('ab' + '日' * 6000) == 'ab' + '日' * 5460 + ' …(1620 more bytes)'`
   - `test_cut_line_keeps_a_line_exactly_at_the_limit`: `rv.cut_line('x' * 16384) == 'x' * 16384`, and `rv.cut_line('a' + '日' * 5461)` is unchanged (16384 bytes).
   - `test_cut_line_counts_a_lone_surrogate_as_three_bytes`: `rv.cut_line('\udcff' * 6000) == '\udcff' * 5461 + ' …(1617 more bytes)'`, with no exception.
   - `test_a_joined_watcher_line_is_cut_in_bytes`:
