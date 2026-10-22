@@ -4,6 +4,7 @@ import TSVZ
 import inotify_simple
 import Tee_Logger
 import argparse
+import atexit
 import xxhash
 import pathspec
 
@@ -822,6 +823,72 @@ class LockedLogger:
 		# a negative depth is Tee_Logger's "find the caller" default
 		return depth + 1 if isinstance(depth, int) and depth >= 0 else depth
 
+class WholeLineStream:
+	'''
+	A text stream that holds each thread's text until its line ends, then writes the whole line at once, holding LOG_LOCK.
+
+	Other code in the daemon (multiCMD, TSVZ, Tee_Logger's own threads, a thread's traceback) writes a line to
+	stdout or stderr in pieces; a marker written between the pieces would sit mid-line, where the log alerts never
+	see it.
+	A held part is written as a line of its own when it outgrows LOG_LINE_LIMIT characters or by write_held() at
+	exit, so no text is dropped. flush() does not write held parts: that would put a part mid-line.
+	Every other attribute (fileno, isatty, encoding, buffer, ...) is the wrapped stream's.
+	'''
+	def __init__(self, stream):
+		self.stream = stream
+		# thread -> the part of a line it has written without its line break; an entry exists only while it holds one
+		self._held = {}
+
+	def __getattr__(self, name):
+		if name in ('stream', '_held'):
+			# not set yet, as on a copy: no loop through self.stream
+			raise AttributeError(name)
+		return getattr(self.stream, name)
+
+	def write(self, text:str) -> int:
+		if not isinstance(text, str):
+			raise TypeError(f'write() argument must be str, not {type(text).__name__}')
+		with LOG_LOCK:
+			thread = threading.current_thread()
+			# taken out first: a part being written is not held again if the stream raises
+			joined = self._held.pop(thread, '') + text
+			end = joined.rfind('\n') + 1
+			out, rest = joined[:end], joined[end:]
+			if len(rest) > LOG_LINE_LIMIT:
+				# a writer that never ends its line: memory stays bounded
+				out, rest = joined + '\n', ''
+			if rest:
+				self._held[thread] = rest
+			if out:
+				self.stream.write(out)
+				self.stream.flush()
+		return len(text)
+
+	def writelines(self, lines):
+		for line in lines:
+			self.write(line)
+
+	def flush(self):
+		with LOG_LOCK:
+			self.stream.flush()
+
+	def write_held(self):
+		'''Write every thread's held part as a line of its own, as at exit.'''
+		with LOG_LOCK:
+			parts, self._held = list(self._held.values()), {}
+			if parts:
+				self.stream.write(''.join(part + '\n' for part in parts))
+				self.stream.flush()
+
+def install_daemon_output():
+	'''Make the daemon's stdout and stderr WholeLineStreams that write their held parts at exit; a repeated call changes nothing.'''
+	for name in ('stdout', 'stderr'):
+		stream = getattr(sys, name)
+		if stream is not None and not isinstance(stream, WholeLineStream):
+			wrapped = WholeLineStream(stream)
+			setattr(sys, name, wrapped)
+			atexit.register(wrapped.write_held)
+
 def job_log(job_name:str, text:str) -> str:
 	'''Log a job's marker line at error level, where log alerts look for it, and return it.'''
 	line = cut_line(shown(f'reverberator job {job_name} {text}'))
@@ -1255,6 +1322,8 @@ def main(argv:list = None):
 	if argv and argv[0] in COMMANDS:
 		sys.exit(run_command(argv))
 	try:
+		# the daemon only: the commands print prompts without a line break
+		install_daemon_output()
 		run_daemon()
 	except Exception as e:
 		import traceback
