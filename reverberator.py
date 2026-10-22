@@ -7226,7 +7226,8 @@ def log_text(text) -> str:
 	>>> log_text('caf\\u00e9 \\udcff')
 	'café \\\\xff'
 	'''
-	return '\n    '.join(cut_line(shown(piece)) for piece in str(text).split('\n'))
+	# each line is cut with its indent, so that a second cut of the text finds nothing to cut
+	return '\n'.join(cut_line(('    ' if number else '') + shown(piece)) for number, piece in enumerate(str(text).split('\n')))
 
 # journald splits a line longer than its LineMax (48K bytes) into records of their own, and the second could start
 # with a marker: no line this program logs holds more than this many bytes, its cut notice included (16384
@@ -7235,9 +7236,9 @@ LOG_LINE_LIMIT = 16384
 
 def cut_line(line:str) -> str:
 	'''
-	line, or its longest start of whole characters that leaves room for the notice of how many bytes were left out,
-	so that the result is at most LOG_LINE_LIMIT bytes of UTF-8 (a lone surrogate counts three) and cutting it again
-	changes nothing.
+	line, or a start of whole characters that leaves room for a notice of how many bytes were left out (room for as many
+	digits as the line's own byte count has), so that the result is at most LOG_LINE_LIMIT bytes of UTF-8 (a lone
+	surrogate counts three) and cutting it again changes nothing.
 	>>> cut_line('plain')
 	'plain'
 	>>> cut_line('x' * (LOG_LINE_LIMIT + 3))[-17:]

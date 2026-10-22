@@ -193,6 +193,15 @@ def test_the_line_tl_prints_is_the_text_log_text_returns(capsys):
 	assert text in plain(capsys.readouterr().out)
 
 
+def test_a_continuation_line_of_log_text_is_printed_as_log_text_returns_it(capsys):
+	text = rv.log_text('short\n' + 'a' * 30000)
+	second = text.split('\n')[1]
+	assert second == '    ' + 'a' * 16358 + ' \u2026(13642 more bytes)'
+	assert len(second.encode()) <= rv.LOG_LINE_LIMIT
+	rv.tl.teeerror(text)
+	assert second in plain(capsys.readouterr().out).split('\n')
+
+
 def assert_each_line_is_cut(capsys):
 	out = capsys.readouterr().out
 	lines = [line for line in plain(out).split('\n') if line]
