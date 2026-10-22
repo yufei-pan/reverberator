@@ -366,6 +366,8 @@ def test_main_exits_1_with_a_marker_when_the_daemon_fails(monkeypatch, capsys):
 	def broken():
 		raise OSError(5, 'Input/output error')
 	monkeypatch.setattr(rv, 'run_daemon', broken)
+	# the real one would wrap pytest's capture streams for the rest of the session
+	monkeypatch.setattr(rv, 'install_daemon_output', lambda: None)
 	with pytest.raises(SystemExit) as exc:
 		rv.main()
 	assert exc.value.code == 1

@@ -51,6 +51,8 @@ def test_main_dispatches_commands_and_keeps_the_daemon_argv(monkeypatch):
 	calls = []
 	monkeypatch.setattr(rv, 'run_command', lambda argv: calls.append(('cmd', argv)) or 0)
 	monkeypatch.setattr(rv, 'run_daemon', lambda: calls.append(('daemon',)))
+	# the real one would wrap pytest's capture streams for the rest of the session
+	monkeypatch.setattr(rv, 'install_daemon_output', lambda: None)
 	with pytest.raises(SystemExit):
 		rv.main(['status'])
 	rv.main(['-t', '6', 'rule.tsv'])
