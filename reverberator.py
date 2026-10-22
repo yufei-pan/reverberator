@@ -762,11 +762,12 @@ class LockedLogger:
 	'''
 	def __init__(self, wrapped):
 		self.wrapped = wrapped
-		# method name -> (takes callerStackDepth, its position among the positional arguments or None)
-		self._depth_params = {}
+		# method name -> {parameter name: its position among the positional arguments or None}, for the two
+		# parameters the wrapper acts on
+		self._params = {}
 
 	def __getattr__(self, name):
-		if name in ('wrapped', '_depth_params'):
+		if name in ('wrapped', '_params'):
 			# not set yet, as on a copy: no loop through self.wrapped
 			raise AttributeError(name)
 		value = getattr(self.wrapped, name)
@@ -775,31 +776,34 @@ class LockedLogger:
 		# a partial adds no stack frame of its own: _call is the one frame between caller and logger
 		return functools.partial(self._call, name, value)
 
-	def _depth_param(self, name, method):
-		if name not in self._depth_params:
+	def _positions(self, name, method):
+		if name not in self._params:
 			try:
 				params = list(inspect.signature(method).parameters.values())
 			except (TypeError, ValueError):
 				params = []
-			found = (False, None)
+			found = {}
 			for position, param in enumerate(params):
-				if param.name == 'callerStackDepth':
-					found = (True, position if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD) else None)
-					break
-			self._depth_params[name] = found
-		return self._depth_params[name]
+				if param.name in ('callerStackDepth', 'msg'):
+					found[param.name] = position if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD) else None
+			self._params[name] = found
+		return self._params[name]
 
 	def _call(self, name, method, /, *args, **kwargs):
-		takes_depth, position = self._depth_param(name, method)
-		if takes_depth:
+		positions = self._positions(name, method)
+		if 'callerStackDepth' in positions:
+			position = positions['callerStackDepth']
 			if position is not None and position < len(args):
 				args = args[:position] + (self._one_deeper(args[position]),) + args[position + 1:]
 			else:
 				kwargs['callerStackDepth'] = self._one_deeper(kwargs.get('callerStackDepth', ...))
-		if args and isinstance(args[0], str):
-			args = (self._cut_lines(args[0]),) + args[1:]
-		elif isinstance(kwargs.get('msg'), str):
-			kwargs['msg'] = self._cut_lines(kwargs['msg'])
+		if 'msg' in positions:
+			position = positions['msg']
+			if position is not None and position < len(args):
+				if isinstance(args[position], str):
+					args = args[:position] + (self._cut_lines(args[position]),) + args[position + 1:]
+			elif isinstance(kwargs.get('msg'), str):
+				kwargs['msg'] = self._cut_lines(kwargs['msg'])
 		with LOG_LOCK:
 			return method(*args, **kwargs)
 
@@ -7225,28 +7229,35 @@ def log_text(text) -> str:
 	return '\n    '.join(cut_line(shown(piece)) for piece in str(text).split('\n'))
 
 # journald splits a line longer than its LineMax (48K bytes) into records of their own, and the second could start
-# with a marker: no line this program logs holds more than this many bytes (16384 four-byte characters are 64K)
+# with a marker: no line this program logs holds more than this many bytes, its cut notice included (16384
+# four-byte characters are 64K)
 LOG_LINE_LIMIT = 16384
 
 def cut_line(line:str) -> str:
 	'''
-	line, or its longest start of whole characters that fits in LOG_LINE_LIMIT bytes of UTF-8 (a lone surrogate counts
-	three) and how many more bytes there were.
+	line, or its longest start of whole characters that leaves room for the notice of how many bytes were left out,
+	so that the result is at most LOG_LINE_LIMIT bytes of UTF-8 (a lone surrogate counts three) and cutting it again
+	changes nothing.
 	>>> cut_line('plain')
 	'plain'
-	>>> cut_line('x' * (LOG_LINE_LIMIT + 3))[-16:]
-	' \u2026(3 more bytes)'
+	>>> cut_line('x' * (LOG_LINE_LIMIT + 3))[-17:]
+	' \u2026(25 more bytes)'
 	>>> len(cut_line('x' * LOG_LINE_LIMIT))
 	16384
 	>>> cut_line('\u65e5' * 6000)[-20:]
-	'\u65e5 \u2026(1617 more bytes)'
+	'\u65e5 \u2026(1638 more bytes)'
+	>>> len(cut_line('\U0001f600' * 5000).encode())
+	16381
+	>>> cut_line(cut_line('x' * 20000)) == cut_line('x' * 20000)
+	True
 	'''
 	if len(line) * 4 <= LOG_LINE_LIMIT:
 		return line
 	data = line.encode('utf-8', 'surrogatepass')
 	if len(data) <= LOG_LINE_LIMIT:
 		return line
-	end = LOG_LINE_LIMIT
+	# the notice is at most as long as the one for all the bytes
+	end = LOG_LINE_LIMIT - len(f' \u2026({len(data)} more bytes)'.encode())
 	# a continuation byte at the cut belongs to a character that starts before it
 	while data[end] & 0xC0 == 0x80:
 		end -= 1
