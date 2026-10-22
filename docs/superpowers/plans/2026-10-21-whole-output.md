@@ -68,7 +68,7 @@
   - `write(self, text:str) -> int`, holding `LOG_LOCK`:
     - Join the calling thread's held part with `text`.
     - If the result holds a `'\n'`, write everything up to and including the last `'\n'` with one `self.stream.write(...)`, then `self.stream.flush()`.
-    - Hold what is left. If what is left is longer than `LOG_LINE_LIMIT` characters, write it with `'\n'` added, flush, and hold nothing.
+    - Hold what is left. If what is left is longer than `2 * LOG_LINE_LIMIT` characters (as built; first planned as `LOG_LINE_LIMIT`), write it with `'\n'` added, flush, and hold nothing.
     - Returns `len(text)`.
     - If the wrapped stream raises, the exception propagates. The part being written is not held again.
   - `writelines(self, lines)` writes each item through `write()`.
@@ -97,7 +97,7 @@
     - The main thread writes `'main\n'`, recorded as exactly `'main\n'` (not glued).
     - `w.write_held()` records `'left\n'`.
     - A second `write_held()` records nothing more.
-  - `test_a_part_longer_than_the_limit_is_written_as_its_own_line`: `w.write('x' * (rv.LOG_LINE_LIMIT + 5))` records exactly `['x' * (rv.LOG_LINE_LIMIT + 5) + '\n']` and holds nothing (a later `write_held()` records nothing).
+  - `test_a_part_longer_than_the_limit_is_written_as_its_own_line`: `w.write('x' * (2 * rv.LOG_LINE_LIMIT + 5))` records exactly `['x' * (2 * rv.LOG_LINE_LIMIT + 5) + '\n']` (as built) and holds nothing (a later `write_held()` records nothing).
   - `test_writelines_holds_parts_like_write`: `w.writelines(['a', 'b\n', 'c'])` records `['ab\n']`, and `write_held()` then records `'c\n'`.
   - `test_flush_does_not_write_a_held_part`: `w.write('part')`, then `w.flush()`. Nothing is recorded, and the fake's flush count went up.
   - `test_attributes_come_from_the_wrapped_stream`:
