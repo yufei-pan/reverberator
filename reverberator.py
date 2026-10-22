@@ -51,7 +51,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.40
+__version__ = 0.41
 
 ## WIP
 
@@ -846,6 +846,14 @@ def nameless_reason(rule_path:str, raw:str = None) -> str:
 	'''Why a job whose name cleaned up to nothing is stopped; raw, when given, is the name as written.'''
 	return f"its name{'' if raw is None else f' {raw!r}'} has no letters, digits, '-' or '_' left after cleanup; rename it in {rule_path}"
 
+def nameless_start(rule_path:str, rule):
+	'''The start function of a nameless row's supervisor: it fails the job at once, naming this rule's own name. The rule is bound here, so a later row cannot change what it quotes.'''
+	raw = raw_job_name(rule)
+	def start(job:JobControl, attempt:int) -> list:
+		job.fail(nameless_reason(rule_path, raw), permanent=True)
+		return []
+	return start
+
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
 VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER)
@@ -1310,11 +1318,8 @@ def run_daemon():
 		job_name = reverb_rule.job_name
 		if job_name == '':
 			# a name with nothing left would make the vault root the job's vault: stopped at once, before anything touches it
-			def start_nameless(job:JobControl, attempt:int) -> list:
-				job.fail(nameless_reason(args.rule_path,raw_job_name(reverb_rule)), permanent=True)
-				return []
 			# the marker calls it by its row, as the log alerts only accept a name of letters, digits, '-' and '_'
-			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name,f'row-{index + 1}'),start_nameless,None),name=f'row-{index + 1} supervisor',daemon=True)
+			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name,f'row-{index + 1}'),nameless_start(args.rule_path,reverb_rule),None),name=f'row-{index + 1} supervisor',daemon=True)
 			supervisor.start()
 			supervisors.append(supervisor)
 			continue
