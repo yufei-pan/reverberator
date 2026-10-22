@@ -827,6 +827,9 @@ class LockedLogger:
 WHOLE_LINE_WAIT_SECONDS = 5
 # how long it waits instead after its thread's last wait timed out
 WHOLE_LINE_RETRY_SECONDS = 0.1
+# gave_up: this thread's last wait for LOG_LOCK timed out, on either stream, so a thread that gave up on stdout does not
+# wait the full time again on stderr
+WHOLE_LINE_LOCAL = threading.local()
 
 class WholeLineStream:
 	'''
@@ -836,8 +839,9 @@ class WholeLineStream:
 	Other code in the daemon (multiCMD, TSVZ, Tee_Logger's own threads, a thread's traceback) writes a line to
 	stdout or stderr in pieces; a marker written between the pieces would sit mid-line, where the log alerts never
 	see it.
-	A held part is written as a line of its own when it outgrows LOG_LINE_LIMIT characters, when the next line is
-	written after its thread has ended, or by write_held() at exit, so no text is dropped. flush() does not write
+	A held part is written as a line of its own when it outgrows twice LOG_LINE_LIMIT characters (tl's own longest line,
+	a cut line plus its level tag or colour codes, is longer than the limit), when the next line is written after its
+	thread has ended, when its thread dies with an uncaught exception, or by write_held() at exit, so no text is dropped. flush() does not write
 	held parts: that would put a part mid-line.
 	Every other attribute (fileno, isatty, encoding, buffer, ...) is the wrapped stream's.
 	'''
@@ -845,11 +849,9 @@ class WholeLineStream:
 		self.stream = stream
 		# thread -> the part of a line it has written without its line break; an entry exists only while it holds one
 		self._held = {}
-		# gave_up: this thread's last wait for LOG_LOCK timed out
-		self._local = threading.local()
 
 	def __getattr__(self, name):
-		if name in ('stream', '_held', '_local'):
+		if name in ('stream', '_held'):
 			# not set yet, as on a copy: no loop through self.stream
 			raise AttributeError(name)
 		return getattr(self.stream, name)
@@ -865,8 +867,8 @@ class WholeLineStream:
 		# is still waited for.
 		# accepted: a signal handler that raises (the second signal's exit) right after the acquire, before the try,
 		# leaves LOG_LOCK owned; that window is microseconds and on the force-exit path
-		locked = LOG_LOCK.acquire(timeout=WHOLE_LINE_RETRY_SECONDS if getattr(self._local, 'gave_up', False) else WHOLE_LINE_WAIT_SECONDS)
-		self._local.gave_up = not locked
+		locked = LOG_LOCK.acquire(timeout=WHOLE_LINE_RETRY_SECONDS if getattr(WHOLE_LINE_LOCAL, 'gave_up', False) else WHOLE_LINE_WAIT_SECONDS)
+		WHOLE_LINE_LOCAL.gave_up = not locked
 		try:
 			yield
 		finally:
@@ -882,8 +884,10 @@ class WholeLineStream:
 			joined = self._held.pop(thread, '') + text
 			end = joined.rfind('\n') + 1
 			out, rest = joined[:end], joined[end:]
-			if len(rest) > LOG_LINE_LIMIT:
-				# a writer that never ends its line: memory stays bounded
+			if len(rest) > 2 * LOG_LINE_LIMIT:
+				# a writer that never ends its line: memory stays bounded. The cap is twice the limit because tl's own
+				# longest line (a cut line and its tag or colour codes) is over the limit, and print writes its line
+				# break as a separate write: a part cut earlier would leave that break as an empty record
 				out, rest = joined + '\n', ''
 			try:
 				if out:
@@ -913,6 +917,13 @@ class WholeLineStream:
 			self._write_parts([part for thread in list(self._held) if (part := self._held.pop(thread, None))])
 			self.stream.flush()
 
+	def write_held_of_this_thread(self):
+		'''Write the calling thread's held part, if any, as a line of its own.'''
+		with self._log_lock():
+			if part := self._held.pop(threading.current_thread(), None):
+				self._write_parts([part])
+				self.stream.flush()
+
 	def _write_parts(self, parts):
 		for part in parts:
 			try:
@@ -922,7 +933,7 @@ class WholeLineStream:
 				pass
 
 def install_daemon_output():
-	'''Make the daemon's stdout and stderr WholeLineStreams that write their held parts at exit; a repeated call changes nothing.'''
+	'''Make the daemon's stdout and stderr WholeLineStreams that write their held parts at exit, and set threading.excepthook to log_thread_exception; a repeated call changes nothing.'''
 	for name in ('stdout', 'stderr'):
 		stream = getattr(sys, name)
 		if stream is not None and not isinstance(stream, WholeLineStream):
@@ -932,15 +943,39 @@ def install_daemon_output():
 	threading.excepthook = log_thread_exception
 
 def log_thread_exception(args) -> None:
-	'''threading.excepthook: log a thread's uncaught exception through tl at error level, escaped and whole; Python's own hook when logging fails.'''
+	'''
+	threading.excepthook: log a thread's uncaught exception through tl at error level, escaped and whole.
+
+	The thread's unfinished stdout or stderr text is written as a line of its own first, so it is not glued to the
+	traceback. When logging fails the escaped text goes to the log file, then to stderr; Python's own hook runs only when
+	the text cannot be built, so no fallback writes unescaped text.
+	'''
 	if args.exc_type is SystemExit:
 		return
 	try:
 		import traceback
 		name = args.thread.name if args.thread is not None else '?'
-		tl.teeerror(log_text(f'Uncaught exception in thread {name}:\n' + ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)).rstrip('\n')))
+		text = log_text(f'Uncaught exception in thread {name}:\n' + ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)).rstrip('\n'))
 	except Exception:
 		threading.__excepthook__(args)
+		return
+	for stream in (sys.stdout, sys.stderr):
+		if isinstance(stream, WholeLineStream):
+			with contextlib.suppress(Exception):
+				stream.write_held_of_this_thread()
+	try:
+		tl.teeerror(text)
+		return
+	except Exception:
+		pass
+	try:
+		tl.error(text)
+	except Exception:
+		pass
+	try:
+		sys.stderr.write(text + '\n')
+	except Exception:
+		pass
 
 def job_log(job_name:str, text:str) -> str:
 	'''Log a job's marker line at error level, where log alerts look for it, and return it.'''
@@ -1537,8 +1572,10 @@ def signal_handler(sig, frame):
 		None
 	'''
 	if GREEN_LIGHT.is_set():
-		tl.teeerror(log_text('Ctrl C caught, cleanning up and exiting... ( can take up to 5 seconds )'))
+		# cleared first: the log call takes LOG_LOCK, which a thread blocked on a full journal may hold, and the shutdown
+		# must start (and a second signal take the other branch) without it
 		GREEN_LIGHT.clear()
+		tl.teeerror(log_text('Ctrl C caught, cleanning up and exiting... ( can take up to 5 seconds )'))
 	else:
 		tl.teeerror(log_text('Ctrl C caught again, exiting immediately!'))
 		# wait for 0.1 seconds to allow the threads to exit
@@ -1992,9 +2029,11 @@ class inotify_resource_manager:
 	def getSysctlValues(self,field):
 		global tl
 		try:
-			rtn = multiCMD.run_command(['sysctl',field],timeout=1,quiet=True)
+			task = multiCMD.run_command(['sysctl',field],timeout=1,quiet=True,return_object=True)
+			rtn = task.stdout
 			if self.debug:
-				tl.teeprint(log_text(f'sysctl {field}: {rtn}'))
+				# quiet, so multiCMD shows nothing: sysctl's error text is logged here
+				tl.teeprint(log_text(f'sysctl {field}: {rtn}' + (f' {task.stderr}' if task.stderr else '')))
 			if rtn and rtn[0]:
 				return int(rtn[0].split('=')[-1].strip())
 		except Exception as _:
@@ -2016,9 +2055,11 @@ class inotify_resource_manager:
 				tl.info(log_text(f'Current {field} is already higher than {value}'))
 				setattr(self,value_name,rtn)
 				return False
-			rc = multiCMD.run_command(['sudo','sysctl',f'{field}={value}'],timeout=1,quiet=True,return_code_only=True)
+			task = multiCMD.run_command(['sudo','sysctl',f'{field}={value}'],timeout=1,quiet=True,return_object=True)
+			rc = task.returncode
 			if self.debug:
-				tl.teeprint(log_text(f'sudo sysctl {field}={value} return code = {rc}'))
+				# quiet, so multiCMD shows nothing: sudo's and sysctl's error text is logged here
+				tl.teeprint(log_text(f'sudo sysctl {field}={value} return code = {rc}' + (f' {task.stderr}' if task.stderr else '')))
 			else:
 				tl.info(log_text(f'sudo sysctl {field}={value} return code = {rc}'))
 			if rc:

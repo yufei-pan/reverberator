@@ -2,6 +2,7 @@ import atexit
 import io
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -120,24 +121,40 @@ def test_write_held_skips_only_a_part_the_stream_cannot_write():
 	assert fake.flushes > flushes
 
 
-def test_a_part_longer_than_the_limit_is_written_as_its_own_line():
+def test_a_part_longer_than_twice_the_limit_is_written_as_its_own_line():
 	fake = Recorder()
 	w = rv.WholeLineStream(fake)
-	w.write('x' * (rv.LOG_LINE_LIMIT + 5))
-	assert fake.writes == ['x' * (rv.LOG_LINE_LIMIT + 5) + '\n']
+	long = 2 * rv.LOG_LINE_LIMIT
+	w.write('x' * long)
+	assert fake.writes == []
+	w.write('x' * 5)
+	assert fake.writes == ['x' * (long + 5) + '\n']
 	w.write_held()
-	assert fake.writes == ['x' * (rv.LOG_LINE_LIMIT + 5) + '\n']
+	assert fake.writes == ['x' * (long + 5) + '\n']
 
 
-def test_a_part_grown_past_the_limit_by_small_writes_is_written_as_its_own_line():
+def test_a_part_grown_past_twice_the_limit_by_small_writes_is_written_as_its_own_line():
 	fake = Recorder()
 	w = rv.WholeLineStream(fake)
-	for _ in range(rv.LOG_LINE_LIMIT + 5):
+	long = 2 * rv.LOG_LINE_LIMIT
+	for _ in range(long + 5):
 		w.write('y')
-	# cut once it is over the limit; the 4 written after the cut are a new part, held as any part is
-	assert fake.writes == ['y' * (rv.LOG_LINE_LIMIT + 1) + '\n']
+	# cut once it is over the cap; the 4 written after the cut are a new part, held as any part is
+	assert fake.writes == ['y' * (long + 1) + '\n']
 	w.write_held()
-	assert fake.writes == ['y' * (rv.LOG_LINE_LIMIT + 1) + '\n', 'y' * 4 + '\n']
+	assert fake.writes == ['y' * (long + 1) + '\n', 'y' * 4 + '\n']
+
+
+def test_the_longest_line_the_logger_prints_is_written_as_one_record(monkeypatch):
+	# a cut line plus the logger's level tag or colour codes is longer than LOG_LINE_LIMIT; print then writes the line
+	# break on its own
+	fake = Recorder()
+	monkeypatch.setattr(sys, 'stdout', rv.WholeLineStream(fake))
+	monkeypatch.setattr(sys, 'stderr', rv.WholeLineStream(fake))
+	rv.job_log('j', 'FAILED: ' + 'p' * 20000)
+	assert len(fake.writes) == 1
+	assert fake.writes[0].endswith('\n') and fake.writes[0].count('\n') == 1
+	assert fake.writes[0] != '\n'
 
 
 def test_writelines_holds_parts_like_write():
@@ -332,7 +349,7 @@ def test_a_thread_that_gave_up_on_the_log_lock_gets_it_again_when_it_is_held_bri
 	w.write('alone\n')
 	release.set()
 	holder.join()
-	assert w._local.gave_up is True
+	assert rv.WHOLE_LINE_LOCAL.gave_up is True
 	# another thread logging all the time, holding the lock 0.01 s at a time
 	stop, busy = threading.Event(), threading.Event()
 	def log_often():
@@ -340,13 +357,13 @@ def test_a_thread_that_gave_up_on_the_log_lock_gets_it_again_when_it_is_held_bri
 			with rv.LOG_LOCK:
 				busy.set()
 				time.sleep(0.01)
-			time.sleep(0.001)
+			time.sleep(0.005)
 	logger = threading.Thread(target=log_often, daemon=True)
 	logger.start()
 	busy.wait(5)
 	try:
 		w.write('again\n')
-		gave_up = w._local.gave_up
+		gave_up = rv.WHOLE_LINE_LOCAL.gave_up
 	finally:
 		stop.set()
 		logger.join(5)
@@ -354,10 +371,41 @@ def test_a_thread_that_gave_up_on_the_log_lock_gets_it_again_when_it_is_held_bri
 	assert fake.writes == ['alone\n', 'again\n']
 
 
+def test_a_thread_that_gave_up_on_one_stream_retries_briefly_on_the_other(monkeypatch):
+	monkeypatch.setattr(rv, 'WHOLE_LINE_WAIT_SECONDS', 0.5)
+	monkeypatch.setattr(rv, 'WHOLE_LINE_RETRY_SECONDS', 0.02)
+	out, err = Recorder(), Recorder()
+	stdout, stderr = rv.WholeLineStream(out), rv.WholeLineStream(err)
+	held, release = threading.Event(), threading.Event()
+	def hold():
+		with rv.LOG_LOCK:
+			held.set()
+			release.wait(5)
+	took = []
+	def write_both():
+		stdout.write('one\n')
+		start = time.monotonic()
+		stderr.write('two\n')
+		took.append(time.monotonic() - start)
+	holder = threading.Thread(target=hold)
+	holder.start()
+	held.wait(5)
+	writer = threading.Thread(target=write_both)
+	writer.start()
+	writer.join(timeout=10)
+	release.set()
+	holder.join(timeout=10)
+	assert not writer.is_alive()
+	assert out.writes == ['one\n'] and err.writes == ['two\n']
+	# the stderr write waited the retry time, not the full wait
+	assert took[0] < 0.3
+
+
 def run_thread(target, name='worker'):
 	thread = threading.Thread(target=target, name=name)
 	thread.start()
-	thread.join()
+	thread.join(timeout=10)
+	assert not thread.is_alive()
 
 
 def test_a_thread_traceback_is_logged_escaped(capsys, monkeypatch):
@@ -371,7 +419,9 @@ def test_a_thread_traceback_is_logged_escaped(capsys, monkeypatch):
 	assert alerting_lines(out) == []
 	assert '\x1b[31m' not in out
 	# Tee_Logger's colour codes are the logger's own, and sit where its version puts them
-	forged = [line for line in COLOUR.sub('', out).split('\n') if line.endswith('reverberator job x FAILED: forged\\x1b[31m')]
+	stripped = COLOUR.sub('', out)
+	assert '\x1b' not in stripped
+	forged = [line for line in stripped.split('\n') if line.endswith('reverberator job x FAILED: forged\\x1b[31m')]
 	assert len(forged) == 1 and forged[0].startswith('    ')
 
 
@@ -384,12 +434,61 @@ def test_systemexit_in_a_thread_is_silent(capsys, monkeypatch):
 	assert captured.out + captured.err == ''
 
 
-def test_a_failing_log_falls_back_to_pythons_hook(monkeypatch):
+def test_a_failing_log_falls_back_to_the_log_file_and_stderr_with_escaped_text(monkeypatch):
+	class BrokenLogger:
+		def __init__(self):
+			self.errors = []
+		def teeerror(self, text):
+			raise OSError('journal gone')
+		def error(self, text):
+			self.errors.append(text)
+	logger = BrokenLogger()
+	stderr = io.StringIO()
+	seen = []
+	monkeypatch.setattr(rv, 'tl', logger)
+	monkeypatch.setattr(sys, 'stderr', stderr)
+	monkeypatch.setattr(threading, '__excepthook__', lambda args: seen.append(args))
+	monkeypatch.setattr(threading, 'excepthook', rv.log_thread_exception)
+	def fail():
+		raise ValueError('bad\nreverberator job x FAILED: forged')
+	run_thread(fail)
+	assert seen == []
+	assert len(logger.errors) == 1
+	text = logger.errors[0]
+	assert 'Uncaught exception in thread worker:' in text
+	assert alerting_lines(text) == []
+	assert stderr.getvalue() == text + '\n'
+
+
+def test_a_failing_log_and_a_failing_log_file_still_write_to_stderr(monkeypatch):
 	class BrokenLogger:
 		def teeerror(self, text):
 			raise OSError('journal gone')
+		def error(self, text):
+			raise OSError('disk gone')
+	stderr = io.StringIO()
 	seen = []
 	monkeypatch.setattr(rv, 'tl', BrokenLogger())
+	monkeypatch.setattr(sys, 'stderr', stderr)
+	monkeypatch.setattr(threading, '__excepthook__', lambda args: seen.append(args))
+	monkeypatch.setattr(threading, 'excepthook', rv.log_thread_exception)
+	def fail():
+		raise ValueError('lost otherwise')
+	run_thread(fail)
+	assert seen == []
+	assert 'ValueError: lost otherwise' in stderr.getvalue()
+
+
+def test_pythons_hook_is_used_only_when_the_text_cannot_be_built(monkeypatch):
+	class Logger:
+		def teeerror(self, text):
+			raise AssertionError('nothing may be logged')
+		error = teeerror
+	def broken(text):
+		raise RuntimeError('cannot escape')
+	seen = []
+	monkeypatch.setattr(rv, 'tl', Logger())
+	monkeypatch.setattr(rv, 'log_text', broken)
 	monkeypatch.setattr(threading, '__excepthook__', lambda args: seen.append(args))
 	monkeypatch.setattr(threading, 'excepthook', rv.log_thread_exception)
 	def fail():
@@ -397,6 +496,21 @@ def test_a_failing_log_falls_back_to_pythons_hook(monkeypatch):
 	run_thread(fail)
 	assert len(seen) == 1
 	assert seen[0].exc_type is ValueError and str(seen[0].exc_value) == 'lost otherwise'
+
+
+def test_a_dying_threads_unfinished_text_is_written_as_its_own_line_before_the_traceback(monkeypatch):
+	fake = Recorder()
+	monkeypatch.setattr(sys, 'stdout', rv.WholeLineStream(fake))
+	monkeypatch.setattr(sys, 'stderr', rv.WholeLineStream(fake))
+	monkeypatch.setattr(threading, 'excepthook', rv.log_thread_exception)
+	def fail():
+		sys.stdout.write('copying a.txt ... ')
+		raise ValueError('boom')
+	run_thread(fail)
+	assert fake.writes[0] == 'copying a.txt ... \n'
+	assert len(fake.writes) > 1
+	assert not fake.writes[1].startswith('copying')
+	assert 'Uncaught exception in thread worker:' in COLOUR.sub('', fake.writes[1])
 
 
 def test_install_daemon_output_sets_the_thread_hook(monkeypatch):
@@ -408,11 +522,19 @@ def test_install_daemon_output_sets_the_thread_hook(monkeypatch):
 	assert threading.excepthook is rv.log_thread_exception
 
 
+class SysctlTask:
+	'''What multiCMD.run_command returns with return_object=True: lists of output lines and a return code.'''
+	def __init__(self, stdout=(), stderr=(), returncode=0):
+		self.stdout = list(stdout)
+		self.stderr = list(stderr)
+		self.returncode = returncode
+
+
 def test_sysctl_runs_quiet_in_verbose_mode(monkeypatch):
 	quiet = []
 	def run_command(*args, **kwargs):
 		quiet.append(kwargs.get('quiet'))
-		return ['fs.inotify.max_user_watches = 5']
+		return SysctlTask(['fs.inotify.max_user_watches = 5'])
 	monkeypatch.setattr(rv.multiCMD, 'run_command', run_command)
 	monkeypatch.setattr(rv, 'DEBUG', True)
 	manager = rv.inotify_resource_manager()
@@ -420,3 +542,80 @@ def test_sysctl_runs_quiet_in_verbose_mode(monkeypatch):
 	assert manager.getSysctlValues('fs.inotify.max_user_watches') == 5
 	assert len(quiet) >= 5
 	assert all(q is True for q in quiet)
+
+
+class RecordingLogger:
+	'''A tl that keeps what each level was given.'''
+	def __init__(self):
+		self.lines = []
+	def __getattr__(self, name):
+		return lambda text, *args, **kwargs: self.lines.append((name, text))
+
+
+def test_set_sysctl_values_runs_quiet_and_uses_the_return_code(monkeypatch):
+	calls = []
+	def run_command(command, **kwargs):
+		calls.append((command, kwargs))
+		if command[0] == 'sudo':
+			return SysctlTask(returncode=1 if command[-1].endswith('=7') else 0)
+		return SysctlTask(['fs.inotify.max_user_watches = 5'])
+	monkeypatch.setattr(rv.multiCMD, 'run_command', run_command)
+	monkeypatch.setattr(rv, 'tl', RecordingLogger())
+	manager = rv.inotify_resource_manager()
+	assert manager.setSysctlValues('fs.inotify.max_user_watches', 6, 'max_user_watches') is True
+	assert manager.max_user_watches == 6
+	assert manager.setSysctlValues('fs.inotify.max_user_instances', 7, 'max_user_instances') is False
+	assert manager.can_set_max_user_instances is False
+	sudo = [kwargs for command, kwargs in calls if command[0] == 'sudo']
+	assert len(sudo) == 2 and all(kwargs.get('quiet') is True for kwargs in sudo)
+
+
+def test_verbose_sysctl_logs_the_error_text_of_sysctl_and_sudo(monkeypatch):
+	def run_command(command, **kwargs):
+		if command[0] == 'sudo':
+			return SysctlTask(stderr=['sudo: a password is required'], returncode=1)
+		return SysctlTask(['fs.inotify.max_user_watches = 5'], ['sysctl: permission denied on key'])
+	monkeypatch.setattr(rv.multiCMD, 'run_command', run_command)
+	logger = RecordingLogger()
+	monkeypatch.setattr(rv, 'tl', logger)
+	monkeypatch.setattr(rv, 'DEBUG', True)
+	manager = rv.inotify_resource_manager()
+	assert manager.getSysctlValues('fs.inotify.max_user_watches') == 5
+	shown = [text for name, text in logger.lines if name == 'teeprint']
+	assert any('permission denied on key' in text and 'max_user_watches = 5' in text for text in shown)
+	assert manager.setSysctlValues('fs.inotify.max_user_watches', 6, 'max_user_watches') is False
+	shown = [text for name, text in logger.lines if name == 'teeprint']
+	assert any('a password is required' in text for text in shown)
+
+
+def test_non_verbose_sysctl_logs_no_error_text(monkeypatch):
+	def run_command(command, **kwargs):
+		return SysctlTask(['fs.inotify.max_user_watches = 5'], ['sysctl: noise'], 1 if command[0] == 'sudo' else 0)
+	monkeypatch.setattr(rv.multiCMD, 'run_command', run_command)
+	logger = RecordingLogger()
+	monkeypatch.setattr(rv, 'tl', logger)
+	monkeypatch.setattr(rv, 'DEBUG', False)
+	manager = rv.inotify_resource_manager()
+	manager.getSysctlValues('fs.inotify.max_user_watches')
+	manager.setSysctlValues('fs.inotify.max_user_watches', 6, 'max_user_watches')
+	assert not any('noise' in text for name, text in logger.lines)
+	assert not any(name == 'teeprint' for name, text in logger.lines)
+
+
+def test_the_first_signal_starts_the_shutdown_before_it_logs(monkeypatch):
+	seen = []
+	class Logger:
+		def teeerror(self, text):
+			seen.append(rv.GREEN_LIGHT.is_set())
+	monkeypatch.setattr(rv, 'tl', Logger())
+	was_set = rv.GREEN_LIGHT.is_set()
+	rv.GREEN_LIGHT.set()
+	try:
+		rv.signal_handler(signal.SIGTERM, None)
+		assert seen == [False]
+		assert not rv.GREEN_LIGHT.is_set()
+	finally:
+		if was_set:
+			rv.GREEN_LIGHT.set()
+		else:
+			rv.GREEN_LIGHT.clear()
