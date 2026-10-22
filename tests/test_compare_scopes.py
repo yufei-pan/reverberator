@@ -206,3 +206,119 @@ def test_delta_generation_is_unchanged(job):
 	assert events(job, whole) == expected
 	assert not manifest.conn.in_transaction and manifest.describes(v0)
 	manifest.close()
+
+
+def test_the_root_is_never_a_path(job):
+	_, manifest = backed_up(job, {'a.txt': 'a'})
+	os.chmod(job.monitor, 0o700)
+	entries = OrderedDict()
+	manifest.begin()
+	try:
+		assert rv.compare_scopes(entries, manifest, latest_version(job).path, job.monitor, rv.TouchedScopes([], ['', '/'])) == 0
+	finally:
+		manifest.rollback()
+	assert entries == {}
+
+
+def test_folders_come_before_their_contents_across_scopes(job):
+	_, manifest = backed_up(job, {'a.txt': 'a'})
+	seed_monitor(job, {'D/x/y.txt': 'y', 'D/z.txt': 'z'})
+	entries = OrderedDict()
+	manifest.begin()
+	try:
+		# the folder only as a path, and a subtree under it
+		rv.compare_scopes(entries, manifest, latest_version(job).path, job.monitor, rv.TouchedScopes(['D/x/'], ['D/']))
+	finally:
+		manifest.rollback()
+	assert list(events(job, entries).items()) == [('D/', 'create'), ('D/x/', 'create'), ('D/x/y.txt', 'create')]
+
+
+def test_a_path_named_both_ways_is_compared_once(job):
+	_, manifest = backed_up(job, {'X/a.txt': 'a', 'f': 'f'})
+	os.chmod(os.path.join(job.monitor, 'X'), 0o700)
+	entries = OrderedDict()
+	manifest.begin()
+	try:
+		assert rv.compare_scopes(entries, manifest, latest_version(job).path, job.monitor, rv.TouchedScopes([], ['X', 'X/', 'f', 'f/'])) == 2
+	finally:
+		manifest.rollback()
+	assert events(job, entries) == {'X/': 'attrib'}
+
+
+def test_a_path_that_cannot_be_looked_at_keeps_its_row(job, monkeypatch):
+	import errno
+	_, manifest = backed_up(job, {'a.txt': 'a', 'b.txt': 'b'})
+	os.remove(os.path.join(job.monitor, 'b.txt'))
+	failing = os.path.join(job.monitor, 'a.txt')
+	real_lstat = os.lstat
+
+	def lstat(path, *args, **kwargs):
+		if path == failing:
+			raise OSError(errno.EIO, 'Input/output error', path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	assert compare(job, manifest, rv.TouchedScopes([], ['a.txt', 'b.txt'])) == {'b.txt': 'delete'}
+
+
+def test_paths_in_paused_or_skipped_folders_give_nothing(job):
+	_, manifest = backed_up(job, {'P/x.txt': 'x', 'S/y.txt': 'y', 'S/z.txt': 'z', 'k.txt': 'k'})
+	for rel in ('P/x.txt', 'S/y.txt', 'k.txt'):
+		os.remove(os.path.join(job.monitor, rel))
+	open(os.path.join(job.monitor, 'S/z.txt'), 'w').write('changed')
+	skip = lambda rel: rel == 'S/'
+	scopes = rv.TouchedScopes([], ['P/x.txt', 'S/y.txt', 'S/z.txt', 'P/', 'k.txt'])
+	assert compare(job, manifest, scopes, skip=skip, paused={'P/'}) == {'k.txt': 'delete'}
+
+
+def test_paused_mounts_under_several_subtrees_keep_their_rows(job):
+	_, manifest = backed_up(job, {'A/m/x.txt': 'x', 'A/gone.txt': 'g', 'B/n/y.txt': 'y', 'B/gone.txt': 'g'})
+	for rel in ('A/m/x.txt', 'A/gone.txt', 'B/n/y.txt', 'B/gone.txt'):
+		os.remove(os.path.join(job.monitor, rel))
+	scopes = rv.TouchedScopes(['A/', 'B/'], [])
+	assert compare(job, manifest, scopes, paused={'A/m/', 'B/n/'}) == {'A/gone.txt': 'delete', 'B/gone.txt': 'delete'}
+
+
+def test_stopping_during_the_paths_reports_no_deletions(job, monkeypatch):
+	_, manifest = backed_up(job, {'D/gone.txt': 'g', 'a.txt': 'a', 'b.txt': 'b'})
+	for rel in ('D/gone.txt', 'a.txt', 'b.txt'):
+		os.remove(os.path.join(job.monitor, rel))
+	real = rv.scope_path_entry
+
+	def stopping(*args, **kwargs):
+		rv.GREEN_LIGHT.clear()
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'scope_path_entry', stopping)
+	try:
+		found = compare(job, manifest, rv.TouchedScopes(['D/'], ['a.txt', 'b.txt']))
+	finally:
+		rv.GREEN_LIGHT.set()
+	assert 'delete' not in found.values()
+
+
+def test_a_root_gone_during_the_pass_raises_before_any_deletion(job, monkeypatch):
+	v0, manifest = backed_up(job, {'A/x.txt': 'x', 'B/y.txt': 'y', 'c.txt': 'c'})
+	real = rv.iter_scope_entries
+
+	def vanishing(monitor_path, scope_rel, *args, **kwargs):
+		if scope_rel == 'B/':
+			# the root goes once A/ was walked
+			os.rename(job.monitor, job.monitor + '.away')
+		return real(monitor_path, scope_rel, *args, **kwargs)
+	monkeypatch.setattr(rv, 'iter_scope_entries', vanishing)
+	entries = OrderedDict()
+	manifest.begin()
+	try:
+		with pytest.raises(rv.JobFailure):
+			rv.compare_scopes(entries, manifest, v0, job.monitor, rv.TouchedScopes(['A/', 'B/'], ['c.txt']))
+		assert manifest.conn.in_transaction
+	finally:
+		manifest.rollback()
+	assert 'delete' not in events(job, entries).values()
+	# delta generation, which compares through compare_scopes(), rolls back and raises too
+	os.rename(job.monitor + '.away', job.monitor)
+	monkeypatch.setattr(rv, 'iter_scope_entries', vanishing)
+	before = rows(manifest)
+	with pytest.raises(rv.JobFailure):
+		rv.delta_generate_backup_entries(OrderedDict(), latest_version(job), job.monitor, manifest=manifest, scope_rel='B/')
+	assert not manifest.conn.in_transaction and rows(manifest) == before
+	manifest.close()
