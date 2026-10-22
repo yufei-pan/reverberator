@@ -796,10 +796,20 @@ class LockedLogger:
 				args = args[:position] + (self._one_deeper(args[position]),) + args[position + 1:]
 			else:
 				kwargs['callerStackDepth'] = self._one_deeper(kwargs.get('callerStackDepth', ...))
+		if args and isinstance(args[0], str):
+			args = (self._cut_lines(args[0]),) + args[1:]
+		elif isinstance(kwargs.get('msg'), str):
+			kwargs['msg'] = self._cut_lines(kwargs['msg'])
 		with LOG_LOCK:
 			return method(*args, **kwargs)
 
+	@staticmethod
+	def _cut_lines(text):
+		return '\n'.join(cut_line(line) for line in text.split('\n'))
+
 	def _one_deeper(self, depth):
+		# a negative depth would make Tee_Logger name this wrapper as the caller: every logger that writes a log file
+		# passes an explicit depth (run_daemon's uses 4)
 		if depth is ...:
 			depth = getattr(self.wrapped, 'callerStackDepth', -1)
 		# a negative depth is Tee_Logger's "find the caller" default
@@ -7214,23 +7224,33 @@ def log_text(text) -> str:
 	'''
 	return '\n    '.join(cut_line(shown(piece)) for piece in str(text).split('\n'))
 
-# journald splits a line longer than its LineMax (48K) into records of their own, and the second could start with a
-# marker: no line this program logs is longer than this
+# journald splits a line longer than its LineMax (48K bytes) into records of their own, and the second could start
+# with a marker: no line this program logs holds more than this many bytes (16384 four-byte characters are 64K)
 LOG_LINE_LIMIT = 16384
 
 def cut_line(line:str) -> str:
 	'''
-	line, or its first LOG_LINE_LIMIT characters and how many more there were.
+	line, or its longest start of whole characters that fits in LOG_LINE_LIMIT bytes of UTF-8 (a lone surrogate counts
+	three) and how many more bytes there were.
 	>>> cut_line('plain')
 	'plain'
-	>>> cut_line('x' * (LOG_LINE_LIMIT + 3))[-21:]
-	' \u2026(3 more characters)'
+	>>> cut_line('x' * (LOG_LINE_LIMIT + 3))[-16:]
+	' \u2026(3 more bytes)'
 	>>> len(cut_line('x' * LOG_LINE_LIMIT))
 	16384
+	>>> cut_line('\u65e5' * 6000)[-20:]
+	'\u65e5 \u2026(1617 more bytes)'
 	'''
-	if len(line) <= LOG_LINE_LIMIT:
+	if len(line) * 4 <= LOG_LINE_LIMIT:
 		return line
-	return f'{line[:LOG_LINE_LIMIT]} \u2026({len(line) - LOG_LINE_LIMIT} more characters)'
+	data = line.encode('utf-8', 'surrogatepass')
+	if len(data) <= LOG_LINE_LIMIT:
+		return line
+	end = LOG_LINE_LIMIT
+	# a continuation byte at the cut belongs to a character that starts before it
+	while data[end] & 0xC0 == 0x80:
+		end -= 1
+	return f"{data[:end].decode('utf-8', 'surrogatepass')} \u2026({len(data) - end} more bytes)"
 
 def shown(text) -> str:
 	'''

@@ -33,6 +33,7 @@ for thread in threads:
 '''
 
 
+@pytest.mark.process
 def test_markers_logged_at_once_from_many_threads_each_start_a_line():
 	child = subprocess.run([sys.executable, '-c', SCRIPT], env=dict(os.environ, PYTHONUNBUFFERED='1'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT, timeout=60)
 	out = child.stdout.decode('utf-8', 'replace')
@@ -45,8 +46,14 @@ def test_markers_logged_at_once_from_many_threads_each_start_a_line():
 
 
 def test_logging_while_holding_the_log_lock_does_not_deadlock(capsys):
-	with rv.LOG_LOCK:
-		rv.tl.teeerror('inner')
+	def log_holding_the_lock():
+		with rv.LOG_LOCK:
+			rv.tl.teeerror('inner')
+	# a lock that is not re-entrant would hang here: the thread is joined with a timeout so that the test fails instead
+	inner = threading.Thread(target=log_holding_the_lock, daemon=True)
+	inner.start()
+	inner.join(timeout=5)
+	assert not inner.is_alive()
 	assert 'inner' in capsys.readouterr().out
 	other = threading.Thread(target=rv.tl.teeerror, args=('other',))
 	with rv.LOG_LOCK:
@@ -81,7 +88,8 @@ def logged_caller(logger, log_dir):
 			path = os.path.join(folder, name)
 			if os.path.islink(path):
 				continue
-			data = open(path, 'rb').read()
+			with open(path, 'rb') as f:
+				data = f.read()
 			if data.startswith(b'\xfd7zXZ'):
 				data = lzma.decompress(data)
 			texts.append(data.decode('utf-8'))
@@ -116,6 +124,56 @@ def test_an_explicit_caller_depth_is_kept_one_deeper():
 	proxy = rv.LockedLogger(fake)
 	proxy.teelog('m', 'info', callerStackDepth=3)
 	proxy.teelog('m', 'info')
+	proxy.teelog('m', 'info', 3)
 	fake.callerStackDepth = -1
 	proxy.teelog('m', 'info')
-	assert fake.calls == [4, 5, -1]
+	assert fake.calls == [4, 5, 4, -1]
+
+
+def test_cut_line_never_splits_a_character():
+	assert rv.cut_line('\U0001f600' * 5000) == '\U0001f600' * 4096 + ' \u2026(3616 more bytes)'
+	assert rv.cut_line('ab' + '\u65e5' * 6000) == 'ab' + '\u65e5' * 5460 + ' \u2026(1620 more bytes)'
+
+
+def test_cut_line_keeps_a_line_exactly_at_the_limit():
+	assert rv.cut_line('x' * 16384) == 'x' * 16384
+	line = 'a' + '\u65e5' * 5461
+	assert len(line.encode()) == 16384
+	assert rv.cut_line(line) == line
+
+
+def test_cut_line_counts_a_lone_surrogate_as_three_bytes():
+	assert rv.cut_line('\udcff' * 6000) == '\udcff' * 5461 + ' \u2026(1617 more bytes)'
+
+
+def joined_line_lengths(capsys):
+	out = capsys.readouterr().out
+	lines = [re.sub(r'\x1b\[[0-9;]*m', '', line) for line in out.split('\n') if line]
+	assert lines
+	# the cap is on the message; Tee_Logger puts its own level tag before it
+	assert all(len(line.encode()) <= len('[ERROR] ') + 16384 + len(' \u2026(99999 more bytes)'.encode()) for line in lines)
+	assert lines[0].endswith('more bytes)')
+
+
+def test_a_joined_watcher_line_is_cut_in_bytes(capsys):
+	rv.watcherTeeLogToTl('/m/' + '\u65e5' * 10000, '\u65e5' * 10000, error=True)
+	joined_line_lengths(capsys)
+
+
+def test_a_joined_backuper_line_is_cut_in_bytes(capsys):
+	rv.backuperTeeLogToTl('/m/' + '\u65e5' * 10000, '\u65e5' * 10000, error=True)
+	joined_line_lengths(capsys)
+
+
+def test_the_proxy_cuts_each_line_of_a_message():
+	class Fake:
+		def __init__(self):
+			self.seen = []
+		def teeprint(self, msg, callerStackDepth=...):
+			self.seen.append(msg)
+	fake = Fake()
+	proxy = rv.LockedLogger(fake)
+	proxy.teeprint('x' * 16390 + '\nshort\n' + 'y' * 16385)
+	proxy.teeprint(msg='z' * 16386)
+	proxy.teeprint(b'x' * 20000)
+	assert fake.seen == ['x' * 16384 + ' \u2026(6 more bytes)\nshort\n' + 'y' * 16384 + ' \u2026(1 more bytes)', 'z' * 16384 + ' \u2026(2 more bytes)', b'x' * 20000]
