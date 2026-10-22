@@ -809,6 +809,9 @@ class LockedLogger:
 
 	@staticmethod
 	def _cut_lines(text):
+		# as cut_line's own check: no line of it can be over the limit
+		if len(text) * 4 <= LOG_LINE_LIMIT:
+			return text
 		return '\n'.join(cut_line(line) for line in text.split('\n'))
 
 	def _one_deeper(self, depth):
@@ -2343,7 +2346,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
 	global tl
 	global DEBUG
-	message = f'{WATCHER_LOG_PREFIX}| {log_text(monitor_path)} | ' + log_text(message)
+	# the whole line is cut once, so that its notice counts every byte left out
+	message = log_text(f'{WATCHER_LOG_PREFIX}| {monitor_path} | {message}')
 	if error:
 		tl.teeerror(message,callerStackDepth=4)
 	elif ok:
@@ -3529,7 +3533,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 def backuperTeeLogToTl(path:str,message:str,error=False,ok=False,warning=False,debug=False):
 	global tl
 	global DEBUG
-	message = f'{BACKUPER_LOG_PREFIX}| {log_text(path)} | ' + log_text(message)
+	# the whole line is cut once, so that its notice counts every byte left out
+	message = log_text(f'{BACKUPER_LOG_PREFIX}| {path} | {message}')
 	if error:
 		tl.teeerror(message,callerStackDepth=4)
 	elif ok:
