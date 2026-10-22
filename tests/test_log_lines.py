@@ -207,7 +207,7 @@ def assert_each_line_is_cut(capsys):
 	out = capsys.readouterr().out
 	lines = [line for line in plain(out).split('\n') if line]
 	assert lines
-	# the joined line is cut once more, counting its own bytes; Tee_Logger puts its own level tag before it
+	# log_text cuts the joined line once; Tee_Logger puts its own level tag before it
 	assert all(len(line.encode()) <= len('[ERROR] ') + rv.LOG_LINE_LIMIT for line in lines)
 	assert lines[0].endswith('more bytes)')
 
