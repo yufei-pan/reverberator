@@ -52,11 +52,12 @@ def test_main_dispatches_commands_and_keeps_the_daemon_argv(monkeypatch):
 	monkeypatch.setattr(rv, 'run_command', lambda argv: calls.append(('cmd', argv)) or 0)
 	monkeypatch.setattr(rv, 'run_daemon', lambda: calls.append(('daemon',)))
 	# the real one would wrap pytest's capture streams for the rest of the session
-	monkeypatch.setattr(rv, 'install_daemon_output', lambda: None)
+	monkeypatch.setattr(rv, 'install_daemon_output', lambda: calls.append(('install',)))
 	with pytest.raises(SystemExit):
 		rv.main(['status'])
 	rv.main(['-t', '6', 'rule.tsv'])
-	assert calls == [('cmd', ['status']), ('daemon',)]
+	# the daemon path installs its output between the command check and run_daemon; a command never does
+	assert calls == [('cmd', ['status']), ('install',), ('daemon',)]
 
 
 def test_command_args_define_all_three_commands():

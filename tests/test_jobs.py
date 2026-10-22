@@ -363,14 +363,17 @@ def test_do_backup_closes_a_manifest_it_opened_when_it_raises(job, monkeypatch):
 
 
 def test_main_exits_1_with_a_marker_when_the_daemon_fails(monkeypatch, capsys):
+	order = []
 	def broken():
+		order.append('daemon')
 		raise OSError(5, 'Input/output error')
 	monkeypatch.setattr(rv, 'run_daemon', broken)
 	# the real one would wrap pytest's capture streams for the rest of the session
-	monkeypatch.setattr(rv, 'install_daemon_output', lambda: None)
+	monkeypatch.setattr(rv, 'install_daemon_output', lambda: order.append('install'))
 	with pytest.raises(SystemExit) as exc:
 		rv.main()
 	assert exc.value.code == 1
+	assert order == ['install', 'daemon']
 	out = capsys.readouterr()
 	assert 'reverberator EXITING with error: OSError: [Errno 5] Input/output error' in out.out + out.err
 
