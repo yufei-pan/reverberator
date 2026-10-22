@@ -825,10 +825,13 @@ class LockedLogger:
 
 # how long a write to stdout or stderr waits for LOG_LOCK before it writes without it
 WHOLE_LINE_WAIT_SECONDS = 5
+# how long it waits instead after its thread's last wait timed out
+WHOLE_LINE_RETRY_SECONDS = 0.1
 
 class WholeLineStream:
 	'''
-	A text stream that holds each thread's text until its line ends, then writes the whole line at once, holding LOG_LOCK.
+	A text stream that holds each thread's text until its line ends, then writes the whole line at once, holding LOG_LOCK
+	(or, past WHOLE_LINE_WAIT_SECONDS, without it: see _log_lock).
 
 	Other code in the daemon (multiCMD, TSVZ, Tee_Logger's own threads, a thread's traceback) writes a line to
 	stdout or stderr in pieces; a marker written between the pieces would sit mid-line, where the log alerts never
@@ -854,14 +857,15 @@ class WholeLineStream:
 	@contextlib.contextmanager
 	def _log_lock(self):
 		# the caller may hold a library lock (a logging handler's, say) that a LOG_LOCK holder is waiting for: after a
-		# while the write goes ahead without LOG_LOCK, as a hang would silence every marker while this costs one line
-		# at most. A thread that holds LOG_LOCK already (LockedLogger printing, the SIGTERM handler) gets it at once.
-		# A thread whose wait timed out does not wait again until it gets the lock, so the many writes of a traceback
-		# it prints cost one wait, not one each.
-		if getattr(self._local, 'gave_up', False):
-			locked = LOG_LOCK.acquire(blocking=False)
-		else:
-			locked = LOG_LOCK.acquire(timeout=WHOLE_LINE_WAIT_SECONDS)
+		# while the write goes ahead without LOG_LOCK, as a hang would silence every marker. The cost: this thread's
+		# lines stay whole, but until it gets the lock again they are not ordered against other threads' writes.
+		# A thread that holds LOG_LOCK already (LockedLogger printing, the SIGTERM handler) gets it at once.
+		# A thread whose wait timed out waits only WHOLE_LINE_RETRY_SECONDS until it gets the lock again: the many
+		# writes of a traceback it prints cost one long wait, not one each, while a lock held by an ordinary log call
+		# is still waited for.
+		# accepted: a signal handler that raises (the second signal's exit) right after the acquire, before the try,
+		# leaves LOG_LOCK owned; that window is microseconds and on the force-exit path
+		locked = LOG_LOCK.acquire(timeout=WHOLE_LINE_RETRY_SECONDS if getattr(self._local, 'gave_up', False) else WHOLE_LINE_WAIT_SECONDS)
 		self._local.gave_up = not locked
 		try:
 			yield

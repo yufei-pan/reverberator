@@ -232,7 +232,8 @@ def test_the_rest_after_the_last_line_break_stays_held_when_the_stream_raises():
 def test_a_write_under_a_lock_that_a_log_lock_holder_waits_for_does_not_hang(monkeypatch):
 	# the order Tee_Logger can take them in: a log call holds LOG_LOCK and wants a handler lock, while a library
 	# thread holds that handler lock and writes to stderr
-	monkeypatch.setattr(rv, 'WHOLE_LINE_WAIT_SECONDS', 0.2)
+	monkeypatch.setattr(rv, 'WHOLE_LINE_WAIT_SECONDS', 0.5)
+	monkeypatch.setattr(rv, 'WHOLE_LINE_RETRY_SECONDS', 0.05)
 	fake = Recorder()
 	w = rv.WholeLineStream(fake)
 	other = threading.Lock()
@@ -243,8 +244,8 @@ def test_a_write_under_a_lock_that_a_log_lock_holder_waits_for_does_not_hang(mon
 		with rv.LOG_LOCK:
 			has_log_lock.set()
 			# bounded, so that without the timeout the test fails instead of hanging; the library's 10 writes waiting
-			# 0.2 s each would take longer than this too
-			if other.acquire(timeout=1.5):
+			# the full 0.5 s each would take longer than this too, while one wait and 9 retries take about 1 s
+			if other.acquire(timeout=2.5):
 				got.append(True)
 				other.release()
 	def library():
@@ -313,3 +314,41 @@ def test_split_prints_from_threads_never_put_a_marker_mid_line():
 		else:
 			pytest.fail(f'mixed line: {line!r}')
 	assert errors == plains == LIBRARY_THREADS * LINES
+
+
+def test_a_thread_that_gave_up_on_the_log_lock_gets_it_again_when_it_is_held_briefly(monkeypatch):
+	monkeypatch.setattr(rv, 'WHOLE_LINE_WAIT_SECONDS', 0.05)
+	monkeypatch.setattr(rv, 'WHOLE_LINE_RETRY_SECONDS', 0.1)
+	fake = Recorder()
+	w = rv.WholeLineStream(fake)
+	held, release = threading.Event(), threading.Event()
+	def hold():
+		with rv.LOG_LOCK:
+			held.set()
+			release.wait(5)
+	holder = threading.Thread(target=hold)
+	holder.start()
+	held.wait(5)
+	w.write('alone\n')
+	release.set()
+	holder.join()
+	assert w._local.gave_up is True
+	# another thread logging all the time, holding the lock 0.01 s at a time
+	stop, busy = threading.Event(), threading.Event()
+	def log_often():
+		while not stop.is_set():
+			with rv.LOG_LOCK:
+				busy.set()
+				time.sleep(0.01)
+			time.sleep(0.001)
+	logger = threading.Thread(target=log_often, daemon=True)
+	logger.start()
+	busy.wait(5)
+	try:
+		w.write('again\n')
+		gave_up = w._local.gave_up
+	finally:
+		stop.set()
+		logger.join(5)
+	assert gave_up is False
+	assert fake.writes == ['alone\n', 'again\n']
