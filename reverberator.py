@@ -216,6 +216,9 @@ class ChangeEventQueue:
 	events the backup conversion would skip anyway, and once longer than QUEUE_KEEP_EVENTS it becomes one full scan
 	when memory runs short. A queued full scan absorbs every later event, as the backuper compares the whole tree for it.
 	A 'scan' event (compare that one folder with the vault) is kept like any other event.
+	round_tripped says that some of the events lost their raw form: a batch handed back after a backup that did not
+	commit, or loaded from the pending transactions, holds only its collapsed entries (backup_entries_to_change_events()).
+	prepend() and the pending load set it, and take() moves it to the batch it takes.
 
 	Examples:
 		>>> queue = ChangeEventQueue('/m')
@@ -229,6 +232,9 @@ class ChangeEventQueue:
 		>>> taken = queue.take()
 		>>> (len(taken), len(queue))
 		(3, 0)
+		>>> queue.prepend([ChangeEvent(3.0, False, 'modify', '/m/new', None)])
+		>>> queue.round_tripped, queue.take().round_tripped, queue.round_tripped
+		(True, True, False)
 		>>> queue.append(ChangeEvent(4.0, False, 'full_scan', '/m', None))
 		>>> queue.append(ChangeEvent(5.0, False, 'modify', '/m/log', None))
 		>>> [event.event for event in queue]
@@ -239,6 +245,7 @@ class ChangeEventQueue:
 		self.clear()
 
 	def clear(self):
+		self.round_tripped = False
 		# (event count, zlib compressed marshal of the events' fields), oldest first
 		self._blocks = []
 		# the newest events, not packed yet
@@ -331,6 +338,8 @@ class ChangeEventQueue:
 		if self._full_scan is not None:
 			return
 		events = list(events)
+		if events:
+			self.round_tripped = True
 		for event in events:
 			if event.event == 'full_scan':
 				self.append(event)
@@ -345,6 +354,7 @@ class ChangeEventQueue:
 		taken = ChangeEventQueue(self.monitor_path)
 		taken._blocks, taken._recent, taken._count = self._blocks, self._recent, self._count
 		taken._packed_bytes, taken._full_scan = self._packed_bytes, self._full_scan
+		taken.round_tripped = self.round_tripped
 		self.clear()
 		return taken
 
@@ -2849,19 +2859,29 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 			pending_rows_raw = {}
 			to_process.append(ChangeEvent(time.monotonic(), False, 'full_scan', monitor_path, None))
 			loaded_count += 1
-		for row in pending_rows_raw.values():
+		times = [float(row[0]) for row in pending_rows_raw.values()]
+		# the times are of the monotonic clock, which starts again at each boot: rows written before this boot are moved
+		# by one offset, so the newest is when the file was written, on this boot's clock, and their order and spacing stay
+		offset = 0.0
+		if times and pending_mtime < time.time() - time.monotonic() - 1.0:
+			offset = time.monotonic() - (time.time() - pending_mtime) - max(times)
+			backuperTeeLogToTl(job_name, f'Pending transactions {pending_transactions_path} were written before this boot, moving their times by {offset:.0f}s')
+		for event_time, row in zip(times, pending_rows_raw.values()):
 			# the paths as pending_transaction_rows() wrote them
 			moved_from = row[4]
 			if moved_from == '':
 				moved_from = None
 			to_process.append(ChangeEvent(
-				float(row[0]),
+				event_time + offset,
 				row[1] in (True, 'True', 'true', '1', 1),
 				row[2],
 				stored_name(row[3]),
 				None if moved_from is None else stored_name(moved_from)
 			))
 			loaded_count += 1
+		if pending_rows_raw and not to_process.full_scan_requested:
+			# a batch handed back before the stop was saved as its collapsed entries only
+			to_process.round_tripped = True
 		try:
 			os.remove(pending_transactions_path)
 		except Exception as e:
@@ -3523,6 +3543,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	# what its raw events touched, verified after its replay; None for a full comparison or a batch of scans only
 	touched = None
 	full_comparison = False
+	# whether the batch is one handed back or resumed, whose events are only its collapsed entries
+	round_tripped = False
 	def batch_scopes(batch):
 		scopes = touched_scopes(batch, monitor_path)
 		return scopes if scopes.subtrees or scopes.paths else None
@@ -3603,9 +3625,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				backuperTeeLogToTl(job_name, 'Events queued at startup contain a full_scan request, forcing delta generation')
 				full_comparison = True
 			else:
-				backupEntries = change_events_to_backup_entries(to_process_temp)
+				backupEntries = change_events_to_backup_entries(to_process_temp,monitor_path)
 				scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
 				touched = batch_scopes(to_process_temp)
+				round_tripped = to_process_temp.round_tripped
 				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 		vaultInfo = None
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
@@ -3647,10 +3670,18 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					break
 				if job is not None:
 					job.mark_committed()
+				if round_tripped and not full_comparison:
+					# the collapse can drop a path its entries no longer name, as git's ref deleted after a rename over it:
+					# the verification compared only what they name, so the whole tree is compared next, as at a start
+					# with nothing to resume
+					backuperTeeLogToTl(job_name,'The batch backed up was handed back or resumed, keeping only its collapsed entries: comparing the whole tree next')
+					with to_process_lock:
+						to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 			backupEntries.clear()
 			scan_folders = []
 			touched = None
 			full_comparison = False
+			round_tripped = False
 			while not backupEntries and not full_comparison and not scan_folders and running():
 				while running() and not to_process_flag.is_set():
 					to_process_flag.wait(POLL_WAIT_SECONDS)
@@ -3666,9 +3697,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					backuperTeeLogToTl(job_name,'Full scan requested, forcing delta generation')
 					full_comparison = True
 				else:
-					backupEntries = change_events_to_backup_entries(to_process_temp)
+					backupEntries = change_events_to_backup_entries(to_process_temp,monitor_path)
 					scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
 					touched = batch_scopes(to_process_temp)
+					round_tripped = to_process_temp.round_tripped
 					backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 			if log_journal:
 				journalPath = os.path.join(vault_path,job_name,'journal.tsv')
@@ -3730,17 +3762,20 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 	What a batch's raw watcher events touched in monitor_path, for the comparison after its replay: each event's path
 	and each move's source, as the collapse into backup entries can lose some of them.
 	A folder created, deleted or moved is a subtree (its rel ending with /), compared with everything under it; a folder
-	whose attributes or contents changed is a path ending with /, compared alone; a file is a path. Scans, full scans,
-	self destructs, the root itself and paths outside monitor_path are left out, and so is a scope inside a subtree.
+	whose attributes or contents changed is a path ending with /, compared alone; a file is a path. Each name is also
+	compared as the other kind, as the batch may not say what it replaced: a file as a subtree, whose walk finds it and
+	any rows of a folder it replaced, and a folder as the file path. Scans, full scans, self destructs, the root itself
+	and paths outside monitor_path are left out, and so is a scope inside a subtree (a path inside one above it: its own
+	subtree can be skipped by a pattern for folders, which the file is not).
 
 	Examples:
 		>>> touched_scopes([ChangeEvent(1.0, True, 'move', '/m/E', '/m/D'), ChangeEvent(2.0, False, 'modify', '/m/E/f', None),
 		...     ChangeEvent(3.0, True, 'attrib', '/m/A', None), ChangeEvent(4.0, False, 'move', '/m/b', '/m/a'),
 		...     ChangeEvent(5.0, True, 'attrib', '/m', None), ChangeEvent(6.0, True, 'create', '/m/N', '/elsewhere'),
 		...     ChangeEvent(7.0, True, 'scan', '/m/S', None)], '/m')
-		TouchedScopes(subtrees=['D/', 'E/', 'N/'], paths=['A/', 'a', 'b'])
+		TouchedScopes(subtrees=['D/', 'E/', 'N/', 'a/', 'b/'], paths=['A', 'A/', 'D', 'E', 'N', 'a', 'b'])
 		>>> touched_scopes([ChangeEvent(1.0, False, 'modify', '/etc/x', None), ChangeEvent(2.0, True, 'attrib', '/', None)], '/')
-		TouchedScopes(subtrees=[], paths=['etc/x'])
+		TouchedScopes(subtrees=['etc/x/'], paths=['etc/x'])
 	'''
 	root = os.path.abspath(monitor_path)
 	def rel_of(path):
@@ -3763,13 +3798,26 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 			paths.update(rel + '/' for rel in rels)
 		else:
 			paths.update(rels)
+			# a file made where a folder was ( rm -rf L; echo > L ) leaves that folder's rows under L/
+			subtrees.update(rel + '/' for rel in rels)
+		if event.is_dir:
+			# a folder made where a file was leaves the file's row
+			paths.update(rels)
 	subtrees = sorted(rel for rel in subtrees if not inside_folders(rel, subtrees))
 	kept = set(subtrees)
-	return TouchedScopes(subtrees, sorted(rel for rel in paths if not any(folder in kept for folder in scope_folders(rel))))
+	def covered(rel):
+		# by a subtree above it, or for a folder by its own subtree
+		folders = scope_folders(rel)
+		return any(folder in kept for folder in (folders if rel.endswith('/') else folders[:-1]))
+	return TouchedScopes(subtrees, sorted(rel for rel in paths if not covered(rel)))
 
-def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
+def change_events_to_backup_entries(change_events:deque, monitor_path:str = None) -> OrderedDict:
 	'''
 	Collapse a chronological batch of watcher ChangeEvents into backup entries.
+
+	An event on monitor_path itself (by default the monitored path of a ChangeEventQueue given), such as the attrib the
+	watcher reports for the root folder, gives no entry: the version folder is no entry of itself. Nor does a move onto
+	itself, as a folder moved away and back in one batch collapses to; the comparison after the replay checks it.
 
 	Examples use fixed ``/tmp/reverb_doctest/...`` paths so results are stable across cwd.
 
@@ -3808,6 +3856,10 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 		OrderedDict()
 		>>> change_events_to_backup_entries(deque([ChangeEvent(1.0, True, 'scan', '/tmp/reverb_doctest/m', None)]))
 		OrderedDict()
+		>>> change_events_to_backup_entries(deque([ChangeEvent(1.0, True, 'attrib', '/tmp/reverb_doctest', None),
+		...     ChangeEvent(2.0, True, 'move', '/tmp/reverb_doctest/D2', '/tmp/reverb_doctest/D'),
+		...     ChangeEvent(3.0, True, 'move', '/tmp/reverb_doctest/D', '/tmp/reverb_doctest/D2')]), '/tmp/reverb_doctest/')
+		OrderedDict()
 	'''
 	# possibile events are create, delete, attrib, move, modify ( and scan, a folder the backuper compares itself )
 	# CHANGED_EVENT_HEADER = ['monotonic_time', 'is_dir', 'event', 'path','moved_from']
@@ -3825,6 +3877,9 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 	# will indicate if a path is a dir by making sure it ends with /
 	# self_destruct events ( monitor root deleted / moved / unmounted ) are logged and skipped: vault history is kept 
 	global DEBUG
+	if monitor_path is None:
+		monitor_path = getattr(change_events, 'monitor_path', '') or None
+	root = None if monitor_path is None else os.path.abspath(monitor_path)
 	backuperTeeLogToTl('convertor','Converting the following change events to backup entries')
 	if DEBUG:
 		backuperTeeLogToTl('convertor','\n'+multiCMD.pretty_format_table(list(change_events),header = CHANGED_EVENT_HEADER))
@@ -3854,6 +3909,9 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 			continue
 		if event == 'scan':
 			# a folder to compare with the vault (an inner mount came or went), not an entry of its own
+			continue
+		if os.path.abspath(changeEvent.path) == root:
+			# the monitored root itself ( an attrib on it ): its version is the version folder, no entry of it
 			continue
 		# pre handle move events
 		if event == 'move':
@@ -4002,6 +4060,10 @@ def change_events_to_backup_entries(change_events:deque) -> OrderedDict:
 			backuperTeeLogToTl(abs_path,f'Adding {event} on {abs_path} at {iso_time} with source {abs_moved_from}')
 			backup_entries[abs_path] = BackupEntryValues(iso_time,event,abs_moved_from)
 			backup_entries.move_to_end(abs_path,last=False)
+	for path in [path for path, values in backup_entries.items() if values.event == 'move' and values.source_path == path]:
+		# moved away and back ( mv D D2; mv D2 D ): nothing to rename
+		backuperTeeLogToTl(path,f'Dropping the move of {path} onto itself')
+		del backup_entries[path]
 	backuperTeeLogToTl('convertor','Converted backup entries')
 	if DEBUG:
 		backuperTeeLogToTl('convertor','\n'+multiCMD.pretty_format_table(backup_entries,header = ['path'] + BACKUP_ENTRY_VALUES_HEADER))
@@ -4649,12 +4711,26 @@ def remove_entry(path:str):
 class NotARealFolder(OSError):
 	'''What a backup would write or remove in a version lies behind a link there (see real_folders_to()).'''
 
+def is_entry_rel(rel:str) -> bool:
+	'''
+	Whether rel names an entry below a version folder, as manifest rows do (a folder's rel ending with /): relative, and
+	no part of it empty, . or .., so it is neither the version folder itself nor anything outside it.
+
+	Examples:
+		>>> [is_entry_rel(rel) for rel in ('a', 'a/b/', '.hidden', 'a..b', '', '.', './', '/', '/etc/x', 'a/../b', 'a/./b', 'a//b', '..', 'a//')]
+		[True, True, True, True, False, False, False, False, False, False, False, False, False, False]
+	'''
+	if not rel or rel.startswith('/'):
+		return False
+	return all(part not in ('', '.', '..') for part in (rel[:-1] if rel.endswith('/') else rel).split('/'))
+
 def real_folders_to(version_path:str, rel:str, make:bool = False, missing_ok:bool = False) -> bool:
 	'''
 	Whether every folder between version_path and the entry of rel in it (a folder's rel ending with /) is a real folder
 	there: not a link, a file or nothing. Only then does what is written or removed at rel stay inside version_path, as
 	the path to it follows no link. With make, the missing ones are made, as real folders; with missing_ok, a missing
-	one is no obstacle (nothing below it exists to follow), and nothing is made.
+	one is no obstacle (nothing below it exists to follow), and nothing is made. A rel that is no entry below the
+	version (is_entry_rel(): absolute, the version itself, or with a . or .. part) is never one.
 
 	Examples:
 		>>> import tempfile
@@ -4665,8 +4741,12 @@ def real_folders_to(version_path:str, rel:str, make:bool = False, missing_ok:boo
 		[True, True, True, False, False, False]
 		>>> real_folders_to(version, 'gone/f', missing_ok=True), real_folders_to(version, 'new/sub/f', make=True), os.path.isdir(os.path.join(version, 'new', 'sub'))
 		(True, True, True)
+		>>> [real_folders_to(version, rel, make=True, missing_ok=True) for rel in ('', '.', './', 'd/../link/f', 'd/./e/f', '..', '../x', '/etc/x', 'd//e')]
+		[False, False, False, False, False, False, False, False, False]
 		>>> import shutil; shutil.rmtree(version)
 	'''
+	if not is_entry_rel(rel):
+		return False
 	path = version_path
 	for part in rel.strip('/').split('/')[:-1]:
 		path = os.path.join(path, part)
@@ -4919,9 +4999,9 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 				backuperTeeLogToTl(path=copy.source_path,warning=True,message=f'Copied {copy.source_path} to {copy.dest_path} without all of its metadata: {error}')
 				succeeded = True
 			if succeeded and not real_folders_to(version_path, os.path.relpath(copy.dest_path, version_path), missing_ok=True):
-				# a folder above it is now a link or a file in the version: the copy is not put in place through it ( a missing
-				# one took the partial file along, and fails the copy as before )
-				remove_entry(copy.temp_path)
+				# a folder above it is now a link or a file in the version: the copy is not put in place through it, and its
+				# partial file is left alone, as removing it would reach through the link too. it went with the folder it was
+				# made in ( a missing one took it along, and fails the copy as before )
 				manifest.discard(os.path.relpath(copy.dest_path, version_path))
 				backuperTeeLogToTl(path=copy.source_path,error=True,message=f'Not putting the copy of {copy.source_path} in place at {copy.dest_path}: a folder above it in the version is not a real folder; not tracking it')
 			elif succeeded:
@@ -4998,6 +5078,11 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	for folder in manifest.iter_folders():
 		source_folder = os.path.join(source_path,folder)
 		backup_folder_path = os.path.join(backup_folder,folder)
+		if not is_entry_rel(folder):
+			# such as './', which daemons before 0.43 wrote for the attrib event of the monitored root
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping a tracked row that names no folder below the version: {folder!r}')
+			missing.append(folder)
+			continue
 		if not os.path.lexists(source_folder):
 			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked folder missing from {source_path}: {folder}')
 			missing.append(folder)
@@ -5012,6 +5097,10 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		# ln --symbolic --logical --force --no-target-directory
 		source_file_real = os.path.join(source_path,file)
 		backup_file_path = os.path.join(backup_folder,file)
+		if not is_entry_rel(file):
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping a tracked row that names no file below the version: {file!r}')
+			missing.append(file)
+			continue
 		if not os.path.lexists(source_file_real):
 			# the tracked list claims a file this version does not have. linking it
 			# anyway produces a dangling link that every later version inherits and
@@ -5036,7 +5125,19 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	return True
 
 def copy_file_meta(source_file:str,backup_file_path:str):
+	'''
+	Copy source_file's mode, times, owner and extended attributes onto backup_file_path. A symlink at backup_file_path
+	is never followed: it gets only its own owner and times, from source_file's own (by lstat), as a link has no mode or
+	extended attributes of its own here. Returns whether it worked; an error line says why not.
+	'''
 	try:
+		if os.path.islink(backup_file_path):
+			# a user's symlink backed up as one can lead anywhere, out of the vault say
+			st = os.lstat(source_file)
+			if os.name == 'posix':
+				os.lchown(backup_file_path, st.st_uid, st.st_gid)
+			os.utime(backup_file_path, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+			return True
 		# copy the file metadata
 		copystat(source_file,backup_file_path)
 		st = os.stat(source_file)
@@ -5456,8 +5557,12 @@ class VaultManifest:
 		'''
 		Track rel without a record: dirty when this backup wrote it, so it is recorded before the backup commits. A
 		tracked rel keeps its copy version, as its entry still leads to that copy until a new copy is recorded (one that
-		failed, or an attribute change synced onto a link, leaves the link there).
+		failed, or an attribute change synced onto a link, leaves the link there). A rel that names no entry below the
+		version (is_entry_rel(), such as './' for the version folder itself) is not tracked, with an error line.
 		'''
+		if not is_entry_rel(rel):
+			backuperTeeLogToTl(path=self.path,error=True,message=f'Not tracking {rel!r}: it names no entry below the version')
+			return
 		path = storable_name(rel)
 		self.conn.execute('INSERT OR REPLACE INTO entries(path, dirty, copy_version) VALUES (?, ?, (SELECT copy_version FROM entries WHERE path = ?))',
 			(path, int(dirty), path))
@@ -6581,6 +6686,11 @@ def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_
 	if rel.strip('/') in ('', '.') or not os.path.normpath(path).startswith(os.path.normpath(version_path) + '/'):
 		# never the version itself, nor anything outside it
 		return []
+	if not real_folders_to(version_path, rel):
+		# a folder above it is not a real folder of the version ( the walk only goes through real ones ): removing it
+		# would reach through a link
+		backuperTeeLogToTl(path=version_path,error=True,message=f'Not removing {path}: a folder above it in the version is not a real folder')
+		return []
 	try:
 		# a link is unlinked, never followed; a real folder goes with everything in it
 		remove_entry(path)
@@ -7256,6 +7366,18 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# we just remove the file
 			mcae.run_command(['rm','-f',vault_real_path])
 			manifest.discard(relative_path)
+	def sync_attributes(source_real_path,relative_path):
+		# onto the version's entry of a file, which a chain link leaves where the latest copy is, as only_sync_attributes
+		# has it: the end of the chain gets them. a user's symlink, in the version or at the chain's end, gets only its own
+		# owner and times ( copy_file_meta() ), never what it points to
+		entry = os.path.join(backup_folder,relative_path)
+		if os.path.islink(entry):
+			end = chain_end(os.path.dirname(os.path.abspath(backup_folder)),backup_folder,relative_path)
+			if end is None:
+				backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: its link chain cannot be followed')
+				return False
+			entry = end.path
+		return copy_file_meta(source_real_path,entry)
 	def wait_for_async_commands(mcae):
 		# returns the rels of the copies put in place
 		while GREEN_LIGHT.is_set() and mcae.runningThreads:
@@ -7333,7 +7455,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				else:
 					if only_sync_attributes:
 						# we just copy the file metadata
-						copy_file_meta(event_source_real_path,file_vault_target_path)
+						sync_attributes(event_source_real_path,event_relative_path)
 					else:
 						# we copy the file
 						cp_af_copy_path(source_path=event_source_real_path,dest_path=file_vault_target_path,mcae=mcae,pending=pending)
@@ -7377,9 +7499,11 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						for retarget_path,retarget_error in retarget_errors:
 							backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot re-target the links at {retarget_path}, moved to another folder depth: {retarget_error}; '
 								'they keep their text, which still names their versions, and the next comparison checks them')
-					# sync the current attrs from the source onto the moved vault entry,
-					# but never through a symlink: a chained one would rewrite the previous version's metadata
-					if not os.path.islink(link_target_backup_real_path):
+					# sync the current attrs from the source onto the moved vault entry, but never through a symlink: a chained
+					# one would rewrite the previous version's metadata, and gets none. a user's symlink gets its own owner and
+					# times only ( copy_file_meta() )
+					if not os.path.islink(link_target_backup_real_path) or chain_hop(os.path.dirname(os.path.abspath(backup_folder)),
+							link_target_backup_real_path,os.readlink(link_target_backup_real_path)) is None:
 						copy_file_meta(event_source_real_path,link_target_backup_real_path)
 				except NotARealFolder as e:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: {e}; doing delete & copy instead')
