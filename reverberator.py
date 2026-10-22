@@ -52,7 +52,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.42
+__version__ = 0.43
 
 ## WIP
 
