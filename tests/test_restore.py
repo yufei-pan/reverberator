@@ -256,21 +256,23 @@ def test_restore_refuses_destination_inside_vault(job, tmp_path, capsys):
 	assert code == rv.EXIT_USAGE and 'not a folder' in err
 
 
-def test_restore_reports_an_old_absolute_link_to_a_removed_version(job, tmp_path, capsys):
+def test_restore_keeps_an_old_absolute_link_to_a_removed_version_as_a_link(job, tmp_path, capsys):
 	seed_monitor(job, {'proj/a.txt': 'a', 'proj/b.txt': 'b'})
 	run_backup(job)
 	write(job, 'proj/a.txt', 'a1')
 	backup(job, ('proj/a.txt', 'modify'))
 	write_rule(job)
 	v0, v1 = version_path(job, 0), version_path(job, 1)
-	# as an older daemon linked b.txt, to a version since removed by hand
+	# shaped as an older daemon linked b.txt, to a version since removed by hand; since 0.44 an absolute link is a
+	# user's symlink (no kept version holds one of the daemon's), so it is restored as the link it is, never dangling
 	os.remove(os.path.join(v1, 'proj/b.txt'))
-	os.symlink(os.path.join(job.job_vault, f'V0--2021-01-01_00-00-00_-0800/proj/b.txt'), os.path.join(v1, 'proj/b.txt'))
+	text = os.path.join(job.job_vault, f'V0--2021-01-01_00-00-00_-0800/proj/b.txt')
+	os.symlink(text, os.path.join(v1, 'proj/b.txt'))
 	out = destination(tmp_path)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '1')
-	assert code == rv.EXIT_COMMAND_FAILED and 'Traceback' not in err
-	assert 'FAILED proj/b.txt: dangling vault link: V0--2021-01-01_00-00-00_-0800 is missing' in stdout.split('\n')
-	assert not os.path.lexists(os.path.join(out, 'proj/b.txt'))
+	assert (code, err) == (0, '')
+	assert os.readlink(os.path.join(out, 'proj/b.txt')) == text
+	assert open(os.path.join(out, 'proj/a.txt')).read() == 'a1'
 	assert os.path.isdir(v0)
 
 

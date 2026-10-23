@@ -5921,18 +5921,19 @@ def is_real_folder_under(top:str, folder:str) -> bool:
 def parse_chain_text(job_vault:str, link_text:str, link_path:str):
 	'''
 	The version folder name and the parts of the path in it that the relative link at link_path with link_text names,
-	as (version_name, rel_parts), when the text has the form of a chain link; else None. The form is (../)+<name>/<rel>:
-	<name> the whole name of the version folder numbered one below the one in job_vault holding link_path, and <rel> one
-	or more parts, none of them '', '.' or '..', which could lead out of that version. How many ../ there are is not
-	looked at, as daemons before 0.39 kept the text when a move took the link to another folder depth. Nothing on disk
-	is looked at either: chain_link_target() checks the folders on the way, chain_form_missing_version() the version.
+	and how many ../ the text starts with, as (version_name, rel_parts, ups), when the text has the form of a chain
+	link; else None. The form is (../)+<name>/<rel>: <name> the whole name of the version folder numbered one below the
+	one in job_vault holding link_path, and <rel> one or more parts, none of them '', '.' or '..', which could lead out
+	of that version. Any count of ../ has the form, as daemons before 0.39 kept the text when a move took the link to
+	another folder depth: vault_chain_hop() judges the count by the version's moves. Nothing on disk is looked at
+	either: chain_link_target() checks the folders on the way, chain_form_missing_version() the version.
 
 	Examples:
 		>>> link_path = '/v/job/V4--2021-01-02_00-00-00_-0800/deep/x'
 		>>> parse_chain_text('/v/job', '../../V3--2021-01-01_00-00-00_-0800/a/x', link_path)
-		('V3--2021-01-01_00-00-00_-0800', ['a', 'x'])
+		('V3--2021-01-01_00-00-00_-0800', ['a', 'x'], 2)
 		>>> parse_chain_text('/v/job/', '../V3--2021-01-01_00-00-00_-0800/x', link_path)
-		('V3--2021-01-01_00-00-00_-0800', ['x'])
+		('V3--2021-01-01_00-00-00_-0800', ['x'], 1)
 		>>> [parse_chain_text('/v/job', text, link_path) for text in ('/v/job/V3--2021-01-01_00-00-00_-0800/x',
 		...     'V3--2021-01-01_00-00-00_-0800/x', '../V3--2021-01-01_00-00-00_-0800', '../V3--2021-01-01_00-00-00_-0800/',
 		...     '../V3--2021-01-01_00-00-00_-0800/a/../x', '../V3--2021-01-01_00-00-00_-0800/./x', '../V3--2021-01-01_00-00-00_-0800//x',
@@ -5959,19 +5960,19 @@ def parse_chain_text(job_vault:str, link_text:str, link_path:str):
 	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
 	if own_number is None or number != own_number - 1 or not is_version_folder_name(name):
 		return None
-	return name, rel
+	return name, rel, ups
 
 def chain_link_target(job_vault:str, link_text:str, link_path:str):
 	'''
 	Where the relative link at link_path with link_text points, if it is a chain link by the rule; None for any other
 	link, such as a user's symlink backed up as one.
 	The daemon links an unchanged entry of a version to the version just before it: ../ up to the job vault, that
-	version's folder and the entry's path in it. A link counts when its text has that form (parse_chain_text(), which
-	does not count the ../), the version folder it names is there, and the folders from it down to the target's parent
+	version's folder and the entry's path in it. A link counts when its text has that form (parse_chain_text(), its
+	../ not counted here), the version folder it names is there, and the folders from it down to the target's parent
 	are real folders or missing ones (by is_real_folder_under()), so a backed-up folder symlink never leads out of it.
-	The rule cannot tell a user's symlink of that very form, naming the previous version's folder by its whole name,
-	from a chain link, and takes it for one. A chain link whose target is gone is still one. Raises UncheckedVaultLink
-	as is_real_folder_under() does.
+	By the text alone, a user's symlink of that very form, naming the previous version's folder by its whole name, is
+	taken for a chain link: vault_chain_hop() tells them apart by the version's moves. A chain link whose target is
+	gone is still one. Raises UncheckedVaultLink as is_real_folder_under() does.
 
 	Examples:
 		>>> import tempfile
@@ -5997,17 +5998,17 @@ def chain_link_target(job_vault:str, link_text:str, link_path:str):
 	parsed = parse_chain_text(job_vault, link_text, link_path)
 	if parsed is None:
 		return None
-	name, rel = parsed
+	name, rel, _ = parsed
 	vault = os.path.abspath(job_vault)
 	target = os.path.join(vault, name, *rel)
 	return target if is_real_folder_under(os.path.join(vault, name), os.path.dirname(target)) else None
 
 def strict_chain_hop(job_vault:str, link_path:str, link_text:str):
 	'''
-	Where the link at link_path with link_text leads if it is a chain link, else None. A relative link is one by
-	chain_link_target(); an absolute one, as older daemons wrote them, when its text names an older version of
-	job_vault and no symlink in that version lies on the way to the target (by is_real_folder_under()). Raises
-	UncheckedVaultLink, and nothing else, when that cannot be told.
+	Where the link at link_path with link_text leads if it is a chain link by its text alone (chain_link_target()),
+	else None. An absolute link is never one: daemons before 0.38 wrote them, but no kept version holds one now, while a
+	user's symlink to a backed-up copy has just that form. Raises UncheckedVaultLink, and nothing else, when that cannot
+	be told. vault_chain_hop() adds the version's moves, which tell a user's symlink in the relative form apart.
 
 	Examples:
 		>>> import tempfile
@@ -6015,26 +6016,16 @@ def strict_chain_hop(job_vault:str, link_path:str, link_text:str):
 		>>> os.makedirs(os.path.join(job_vault, 'V3--2021-01-01_00-00-00_-0800', 'a'))
 		>>> os.symlink(job_vault, os.path.join(job_vault, 'V3--2021-01-01_00-00-00_-0800', 'l'))
 		>>> link_path = os.path.join(job_vault, 'V4--2021-01-02_00-00-00_-0800', 'a', 'u')
-		>>> strict_chain_hop(job_vault, link_path, job_vault + '/V3--2021-01-01_00-00-00_-0800/a/../a/u')[len(job_vault):]
+		>>> strict_chain_hop(job_vault, link_path, '../../V3--2021-01-01_00-00-00_-0800/a/u')[len(job_vault):]
 		'/V3--2021-01-01_00-00-00_-0800/a/u'
-		>>> [strict_chain_hop(job_vault, link_path, text) for text in ('/elsewhere/u', '../lib/x', job_vault + '/V3--2021-01-01_00-00-00_-0800/l/u',
-		...     job_vault + '/V5--2021-01-03_00-00-00_-0800/a/u')]
-		[None, None, None, None]
+		>>> [strict_chain_hop(job_vault, link_path, text) for text in ('/elsewhere/u', '../lib/x', '../../V3--2021-01-01_00-00-00_-0800/l/u',
+		...     job_vault + '/V3--2021-01-01_00-00-00_-0800/a/u', job_vault + '/V3--2021-01-01_00-00-00_-0800/a/../a/u')]
+		[None, None, None, None, None]
 		>>> import shutil; shutil.rmtree(job_vault)
 	'''
-	if not os.path.isabs(link_text):
-		return chain_link_target(job_vault, link_text, link_path)
-	resolved = os.path.normpath(link_text)
-	vault = os.path.abspath(job_vault)
-	link_path = os.path.abspath(link_path)
-	if not is_chained_link(resolved, vault, link_path):
+	if os.path.isabs(link_text):
 		return None
-	version = resolved[len(vault) + 1:].partition('/')[0]
-	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
-	# the daemon only ever linked a version to an older one
-	if own_number is None or vault_version_number(version) >= own_number:
-		return None
-	return resolved if is_real_folder_under(os.path.join(vault, version), os.path.dirname(resolved)) else None
+	return chain_link_target(job_vault, link_text, link_path)
 
 def chain_hop(job_vault:str, link_path:str, link_text:str):
 	'''strict_chain_hop(), but None (not a chain link) also when that cannot be told. Never raises.'''
@@ -6042,6 +6033,227 @@ def chain_hop(job_vault:str, link_path:str, link_text:str):
 		return strict_chain_hop(job_vault, link_path, link_text)
 	except UncheckedVaultLink:
 		return None
+
+# the moves of committed versions, each read from its change list once: (version folder, monitored path), both
+# absolute, -> VersionMoves. rows once written never change (pruning renames a change list, rows and all), so an
+# answer from a list that was read is kept; one that found no list, or could not read it, is not, as it may be there
+# later. VERSION_MOVES_WARNED holds the versions a warning was logged for, as their rows cannot be used
+VERSION_MOVES = OrderedDict()
+VERSION_MOVES_WARNED = OrderedDict()
+VERSION_MOVES_KEPT = 1024
+VERSION_MOVES_LOCK = threading.Lock()
+
+def remember_version_moves(table:OrderedDict, key:tuple, value) -> None:
+	'''Keep value for key in table, one of VERSION_MOVES and VERSION_MOVES_WARNED, dropping the oldest past VERSION_MOVES_KEPT.'''
+	with VERSION_MOVES_LOCK:
+		table[key] = value
+		table.move_to_end(key)
+		while len(table) > VERSION_MOVES_KEPT:
+			table.popitem(last=False)
+
+class VersionMoves:
+	'''
+	A version's move rows, applied in their order, which tell its chain links from users' symlinks of the same form
+	(vault_chain_hop()). moves holds them as (source_rel, dest_rel, is_folder): rels of the monitored path with no
+	leading /, a folder's ending with /, and source_rel None for a move row without a source. Rows whose event is
+	move are the moves; an escalated create or modify carrying a source renamed nothing in the vault. usable is False
+	when the rows cannot tell: the change list is missing, unreadable or holds no rows (every version after the first
+	has one), or a row lies outside the monitored path (it was changed since); why says which.
+	of_committed() reads a committed version's change list, once, when first asked; applied() takes the moves the
+	replay of the version being written has made, before its change list exists.
+
+	Examples:
+		>>> moves = VersionMoves.applied([('d/x', 'e/x', False), ('d/', 'f/', True), ('f/y', 'y', False), (None, 'n/', True)])
+		>>> moves.usable, moves.takes('d/x', 'e/x'), moves.takes('d/z/w', 'f/z/w'), moves.takes('d/y', 'y'), moves.takes('d/x', 'f/x')
+		(True, True, True, True, False)
+		>>> moves.takes('a', 'a'), moves.takes('a', 'n/a'), moves.takes('a', 'n/b/c')
+		(True, None, None)
+		>>> moves.touches('d/x'), moves.touches('d/q'), moves.touches('e/x'), moves.touches('a')
+		(True, True, False, False)
+	'''
+	def __init__(self, moves:list = None, usable:bool = True, why:str = '', key:tuple = None, change_list_folder:str = None):
+		self._moves = moves
+		self._usable = usable
+		self.why = why
+		# (version folder, monitored path) of a committed version; None for the version being written
+		self.key = key
+		# the job vault to find a committed version's change list in, until it is read
+		self._job_vault = change_list_folder
+		self._lock = threading.Lock()
+
+	@classmethod
+	def of_committed(cls, job_vault:str, version_path:str, monitor_path:str) -> 'VersionMoves':
+		'''
+		The moves of the committed version at version_path, as its change list records them under monitor_path. The
+		list is found by listing job_vault for the version folder's name, not by the sizes its name records, and is read
+		when an answer first needs it: a version whose links all sit where the text says needs no rows.
+		'''
+		key = (os.path.abspath(version_path), os.path.abspath(monitor_path))
+		with VERSION_MOVES_LOCK:
+			known = VERSION_MOVES.get(key)
+			if known is not None:
+				VERSION_MOVES.move_to_end(key)
+				return known
+		return cls(moves=None, usable=False, key=key, change_list_folder=os.path.abspath(job_vault))
+
+	@classmethod
+	def applied(cls, moves:list) -> 'VersionMoves':
+		'''The moves the replay of the version being written has applied, as (source_rel, dest_rel, is_folder) in its order.'''
+		return cls(moves=list(moves), usable=True)
+
+	def _read(self) -> None:
+		'''Read a committed version's moves, the first time they are asked for.'''
+		with self._lock:
+			if self._job_vault is None:
+				return
+			version_path, monitor_path = self.key
+			moves, why, lasting = read_version_moves(self._job_vault, version_path, monitor_path)
+			self._moves, self._usable, self.why = moves or [], moves is not None, why
+			self._job_vault = None
+		if lasting:
+			remember_version_moves(VERSION_MOVES, self.key, self)
+
+	@property
+	def moves(self) -> list:
+		self._read()
+		return self._moves
+
+	@property
+	def usable(self) -> bool:
+		self._read()
+		return self._usable
+
+	def takes(self, source_rel:str, dest_rel:str) -> 'bool | None':
+		'''
+		Whether the moves, applied in order to a file or to a folder and what is under it, take source_rel to dest_rel;
+		None when that cannot be told, as a move row without a source lands on dest_rel or a folder above it.
+		'''
+		path = source_rel
+		for source, dest, is_folder in self.moves:
+			if source is None:
+				continue
+			if is_folder:
+				if path.startswith(source):
+					path = dest + path[len(source):]
+			elif path == source:
+				path = dest
+		if path == dest_rel:
+			return True
+		for source, dest, _ in self.moves:
+			if source is None and (dest == dest_rel or dest_rel.startswith(dest.rstrip('/') + '/')):
+				return None
+		return False
+
+	def touches(self, rel:str) -> bool:
+		'''Whether any move applies to rel, itself or a folder above it: the first one to do so meets rel unmoved.'''
+		return any(source is not None and (rel.startswith(source) if is_folder else rel == source)
+			for source, _, is_folder in self.moves)
+
+def read_version_moves(job_vault:str, version_path:str, monitor_path:str) -> tuple:
+	'''
+	(moves, why, lasting) for VersionMoves.of_committed(): the move rows of the change list of the version at
+	version_path, which job_vault is listed for, as (source_rel, dest_rel, is_folder) under monitor_path; moves is None,
+	and why says why, when the rows cannot be used. lasting says whether the list was read in full, so the answer is
+	the same every time.
+	'''
+	name = os.path.basename(version_path)
+	try:
+		change_lists = sorted(entry for entry in os.listdir(job_vault) if (parse_change_list_name(entry) or (None, None))[1] == name)
+	except (OSError, ValueError) as e:
+		return None, f'the job vault cannot be listed: {e}', False
+	if not change_lists:
+		return None, 'it has no change list', False
+	monitor = os.path.abspath(monitor_path)
+	prefix = monitor if monitor.endswith('/') else monitor + '/'
+	def rel_of(path:str):
+		return path[len(prefix):] if path.startswith(prefix) else '' if path == monitor else None
+	moves = []
+	rows = 0
+	try:
+		for row in iter_change_list(os.path.join(job_vault, change_lists[0])):
+			rows += 1
+			dest = rel_of(row.path)
+			source = None if row.source_path is None else rel_of(row.source_path)
+			if dest is None or (row.source_path is not None and source is None):
+				return None, f'a row outside {monitor} ({row.path if dest is None else row.source_path}), which it was backed up from', True
+			if row.event == 'move':
+				moves.append((source, dest, dest.endswith('/')))
+	except (OSError, ValueError) as e:
+		return None, f'its change list cannot be read: {e}', False
+	if not rows:
+		return None, 'its change list has no rows', True
+	return moves, '', True
+
+def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMoves) -> 'str | None':
+	'''
+	Where the link at link_path with link_text leads if it is a chain link of its version, whose moves are moves; else
+	None, as for a user's symlink backed up as one. Raises UncheckedVaultLink, and nothing else, when that cannot be
+	told. With R the link's path in its version, R' the path its text names in the version below and u its count of
+	../, a link the text rule takes (strict_chain_hop(): relative, the previous version's whole name, real folders on
+	the way) is a chain link when:
+	- R' is R and u is R's own depth + 1, the text the referenced copy writes: no rows are read;
+	- else, when the moves take R' to R. Any u is then fine, as a retarget that failed, or a daemon before 0.39, keeps
+	  the old text; R' being R takes a move too, such as away and back. A move row without a source landing on R or a
+	  folder above it cannot tell;
+	and its target is not a real folder, as the daemon links files only. A version whose rows cannot be used (usable
+	is False) goes by the text alone, u not counted, as refusing a moved chain link would lose its copy; one warning
+	is logged for each such version.
+
+	Examples:
+		>>> import tempfile
+		>>> job_vault = tempfile.mkdtemp()
+		>>> os.makedirs(os.path.join(job_vault, 'V3--2021-01-01_00-00-00_-0800', 'a', 'f'))
+		>>> link_path = os.path.join(job_vault, 'V4--2021-01-02_00-00-00_-0800', 'a', 'u')
+		>>> none, moved = VersionMoves.applied([]), VersionMoves.applied([('b/u', 'a/u', False)])
+		>>> vault_chain_hop(job_vault, link_path, '../../V3--2021-01-01_00-00-00_-0800/a/u', none)[len(job_vault):]
+		'/V3--2021-01-01_00-00-00_-0800/a/u'
+		>>> [vault_chain_hop(job_vault, link_path, text, none) for text in ('../V3--2021-01-01_00-00-00_-0800/a/u',
+		...     '../../V3--2021-01-01_00-00-00_-0800/b/u', '../../V3--2021-01-01_00-00-00_-0800/a/f',
+		...     job_vault + '/V3--2021-01-01_00-00-00_-0800/a/u')]
+		[None, None, None, None]
+		>>> [vault_chain_hop(job_vault, link_path, text, moved)[len(job_vault):] for text in ('../../V3--2021-01-01_00-00-00_-0800/b/u',
+		...     '../V3--2021-01-01_00-00-00_-0800/b/u')]
+		['/V3--2021-01-01_00-00-00_-0800/b/u', '/V3--2021-01-01_00-00-00_-0800/b/u']
+		>>> import shutil; shutil.rmtree(job_vault)
+	'''
+	# strict_chain_hop() and chain_link_target(), keeping the parse
+	parsed = None if os.path.isabs(link_text) else parse_chain_text(job_vault, link_text, link_path)
+	if parsed is None:
+		return None
+	name, named_parts, ups = parsed
+	vault = os.path.abspath(job_vault)
+	target = os.path.join(vault, name, *named_parts)
+	if not is_real_folder_under(os.path.join(vault, name), os.path.dirname(target)):
+		return None
+	version_name, _, rel = os.path.abspath(link_path)[len(vault) + 1:].partition('/')
+	named = '/'.join(named_parts)
+	if named != rel or ups != rel.count('/') + 1:
+		if not moves.usable:
+			if moves.key is not None and moves.key not in VERSION_MOVES_WARNED:
+				remember_version_moves(VERSION_MOVES_WARNED, moves.key, None)
+				backuperTeeLogToTl(path=moves.key[0],warning=True,message=f'Telling the moved links of {version_name} by their text alone, as its moves cannot be used: {moves.why}')
+		else:
+			taken = moves.takes(named, rel)
+			if taken is None:
+				raise UncheckedVaultLink(f'a move without a source in {version_name} lands on {rel}')
+			# a link at its own path with another depth's text is one only when a move took it away and back
+			if not taken or (named == rel and not moves.touches(named)):
+				return None
+	try:
+		if stat.S_ISDIR(os.lstat(target).st_mode):
+			# the daemon links files only, and makes every folder a real one
+			return None
+	except (FileNotFoundError, NotADirectoryError):
+		# a chain link whose copy is gone is still one
+		pass
+	except OSError as e:
+		if e.errno == errno.ENAMETOOLONG:
+			# a name too long to use: the daemon reaches its copies by path, so none is behind it
+			return None
+		raise UncheckedVaultLink(e) from e
+	except ValueError as e:
+		raise UncheckedVaultLink(e) from e
+	return target
 
 def retarget_chain_link(job_vault:str, link_path:str) -> bool:
 	'''
@@ -6099,29 +6311,6 @@ def retarget_moved_links(job_vault:str, moved_path:str, errors:list = None) -> i
 	if walk_errors:
 		errors.extend((unreadable_path(moved_path, rel), error) for rel, error in walk_errors)
 	return rewritten
-
-def is_chained_link(resolved:str, job_vault:str, link_path:str) -> bool:
-	'''
-	Whether the link at link_path, resolving to resolved, points into another version of job_vault: that is how a
-	version links an unchanged entry (under its old name if it moved since). A symlink backed up as one resolves
-	within its own version, if into the vault at all. strict_chain_hop() judges absolute links, as older daemons wrote
-	them, by it; relative ones go by chain_link_target().
-
-	Examples:
-		>>> is_chained_link('/v/job/V3--2021/a/b.txt', '/v/job', '/v/job/V4--2021/a/b.txt')
-		True
-		>>> is_chained_link('/v/job/V3--2021/old/b.txt', '/v/job', '/v/job/V4--2021/new/b.txt')
-		True
-		>>> is_chained_link('/v/job/V4--2021/b.txt', '/v/job', '/v/job/V4--2021/a/link')
-		False
-		>>> is_chained_link('/elsewhere/b.txt', '/v/job', '/v/job/V4--2021/a/link')
-		False
-	'''
-	prefix = job_vault.rstrip('/') + '/'
-	if not resolved.startswith(prefix) or not link_path.startswith(prefix):
-		return False
-	target_version = resolved[len(prefix):].partition('/')[0]
-	return vault_version_number(target_version) is not None and target_version != link_path[len(prefix):].partition('/')[0]
 
 def effective_copy_version(recorded, oldest_kept:int):
 	'''
@@ -7886,43 +8075,28 @@ ResolvedEntry = namedtuple('ResolvedEntry', ['kind', 'path', 'detail'])
 
 def chain_form_missing_version(job_vault:str, link_path:str, link_text:str):
 	'''
-	The name of the version folder a link names when the link has the form of a chain link but that folder does not
-	exist; else None. A relative link has that form by parse_chain_text(); an absolute one, as older daemons wrote them,
-	when it names an older version of job_vault by is_chained_link().
+	The name of the version folder a link names when the link has the form of a chain link (parse_chain_text()) but
+	that folder does not exist; else None. An absolute link never has that form, as for strict_chain_hop(): a user's
+	symlink into a version since pruned is a symlink, not a dangling chain link.
 
 	Examples:
 		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '../../V3--2021-01-01_00-00-00_-0800/a/x')
 		'V3--2021-01-01_00-00-00_-0800'
 		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '../../V2--2021-01-01_00-00-00_-0800/a/x') is None
 		True
-		>>> chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', '/v/job/V2--2021-01-01_00-00-00_-0800/a/x')
-		'V2--2021-01-01_00-00-00_-0800'
 		>>> [chain_form_missing_version('/v/job', '/v/job/V4--2021-01-02_00-00-00_-0800/a/x', text) for text in (
+		...     '/v/job/V3--2021-01-01_00-00-00_-0800/a/x', '/v/job/V2--2021-01-01_00-00-00_-0800/a/x',
 		...     '/abs/V3--2021-01-01_00-00-00_-0800/a/x', '/v/job/V5--2021-01-03_00-00-00_-0800/a/x', '/v/job/lib/x')]
-		[None, None, None]
+		[None, None, None, None, None]
+		>>> chain_form_missing_version('/v/job', '/v/job/current_version/a/x', '../../V3--2021-01-01_00-00-00_-0800/a/x') is None
+		True
 	'''
-	vault = os.path.abspath(job_vault)
-	link_path = os.path.abspath(link_path)
-	if not link_path.startswith(vault + '/'):
+	parsed = parse_chain_text(job_vault, link_text, link_path)
+	if parsed is None:
 		return None
-	own_number = vault_version_number(link_path[len(vault) + 1:].partition('/')[0])
-	if own_number is None:
-		return None
-	if os.path.isabs(link_text):
-		resolved = os.path.normpath(link_text)
-		if not is_chained_link(resolved, vault, link_path):
-			return None
-		name = resolved[len(vault) + 1:].partition('/')[0]
-		# the daemon only ever linked a version to an older one
-		if vault_version_number(name) >= own_number:
-			return None
-	else:
-		parsed = parse_chain_text(vault, link_text, link_path)
-		if parsed is None:
-			return None
-		name = parsed[0]
+	name = parsed[0]
 	try:
-		os.lstat(os.path.join(vault, name))
+		os.lstat(os.path.join(os.path.abspath(job_vault), name))
 	except (FileNotFoundError, NotADirectoryError):
 		return name
 	except (OSError, ValueError):

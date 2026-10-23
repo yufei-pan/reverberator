@@ -171,7 +171,8 @@ def test_link_through_a_backed_up_folder_symlink_is_not_followed_or_pruned_onto(
 	# a user's symlink to a folder, backed up as one
 	os.symlink(outside, f'{v0}/a')
 	v1 = write_committed_version(job, 1, {'deep/': None}, timestamp=T)
-	# shaped like a chain link an older daemon moved deeper, or like an older daemon's absolute one
+	# shaped like a chain link an older daemon moved deeper, or like an older daemon's absolute one (no chain link
+	# since 0.44, wherever it leads)
 	text = f'{v0}/a/x' if absolute else f'../V0--{T}/a/x'
 	os.symlink(text, f'{v1}/deep/u')
 	record = rv.read_vault_record(v1, 'deep/u', job.monitor)
@@ -250,6 +251,11 @@ def test_a_chain_link_whose_folders_cannot_be_looked_at_keeps_the_version_being_
 	# as the daemon writes it, or as an older daemon did
 	text = f'{v0}/a/b/x' if absolute else f'../../../V0--{T}/a/b/x'
 	os.symlink(text, f'{v1}/a/b/x')
+	if absolute:
+		# since 0.44 an absolute link is a user's symlink, told without looking at a folder: pruning goes on and leaves it
+		rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+		assert not os.path.exists(v0) and os.readlink(f'{v1}/a/b/x') == text
+		return
 	lstat = os.lstat
 	def lstat_failing_on_a(path, *args, **kwargs):
 		if path == f'{v0}/a':
@@ -274,22 +280,24 @@ def test_a_refused_or_missing_folder_is_looked_at_again(tmp_path):
 	job_vault = str(tmp_path / 'job')
 	v0 = f'{job_vault}/V0--{T}'
 	link_path = f'{job_vault}/V1--{T}/u'
-	texts = (f'{v0}/a/x', f'../V0--{T}/a/x')
+	# relative only: since 0.44 an absolute link is never a chain link, so no folder of it is looked at
+	text = f'../V0--{T}/a/x'
 	# V0 is not there yet
-	assert [rv.chain_hop(job_vault, link_path, text) for text in texts] == [None, None]
+	assert rv.chain_hop(job_vault, link_path, text) is None
 	os.makedirs(v0)
 	# V0/a is not there yet, so nothing goes through it
-	assert [rv.chain_hop(job_vault, link_path, text) for text in texts] == [f'{v0}/a/x'] * 2
+	assert rv.chain_hop(job_vault, link_path, text) == f'{v0}/a/x'
 	os.symlink(str(tmp_path), f'{v0}/a')
-	assert [rv.chain_hop(job_vault, link_path, text) for text in texts] == [None, None]
+	assert rv.chain_hop(job_vault, link_path, text) is None
 
 
-def test_an_absolute_link_into_a_later_version_is_not_a_chain_link(tmp_path):
+def test_an_absolute_link_into_any_version_is_not_a_chain_link(tmp_path):
 	job_vault = str(tmp_path / 'job')
 	write_tree(f'{job_vault}/V2--{T}', {'a/x': 'x'})
 	target = f'{job_vault}/V2--{T}/a/x'
 	assert rv.chain_hop(job_vault, f'{job_vault}/V1--{T}/u', target) is None
-	assert rv.chain_hop(job_vault, f'{job_vault}/V3--{T}/u', target) == target
+	# an older one too, which daemons before 0.38 wrote: since 0.44 that form is a user's symlink to a backed-up copy
+	assert rv.chain_hop(job_vault, f'{job_vault}/V3--{T}/u', target) is None
 
 
 
