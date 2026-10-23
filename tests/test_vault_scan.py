@@ -196,6 +196,7 @@ def renamed(job, number, change):
 	return folder, change_list
 
 
+@pytest.mark.chain_ground_truth_allows('refused_chain', reason='V1 is renamed by hand, so the links of V2 name no version')
 def test_a_version_number_that_is_not_ascii_digits_fails_the_scan(tmp_path, monkeypatch):
 	# haiku9 p1: isdigit() takes V², int() then raised outside the inner try: the scan returned V0 and V2, and a backup
 	# keeping 2 removed V0, whose copy V²'s and V2's D/secret named
@@ -218,6 +219,7 @@ def test_a_folder_whose_number_is_not_ascii_digits_and_has_no_change_list_is_lef
 	assert rv.remove_incomplete_vault_versions(job.job_vault) == [] and os.path.isdir(odd)
 
 
+@pytest.mark.chain_ground_truth_allows('refused_chain', reason='V1 is renamed by hand, so the links of V2 name no version')
 @pytest.mark.parametrize('first', ['change_list', 'folder'])
 @pytest.mark.parametrize('bad', ['non_utf8', 'unparsable'])
 def test_a_timestamp_that_does_not_parse_fails_the_scan_in_either_order(tmp_path, monkeypatch, first, bad):
@@ -659,6 +661,7 @@ def test_a_new_vault_still_starts_at_v0(tmp_path):
 
 # --- Task 2b fix round 1b ---
 
+@pytest.mark.chain_ground_truth_allows('refused_chain', reason='V2 is removed by hand, so the links of V3 name no version')
 def test_a_gap_in_the_committed_versions_fails_the_scan(tmp_path):
 	# a version deleted by hand, or a listing that left one out without an error: pruning past the gap would take the
 	# version after it for the next one, and the missing version's links into the oldest would be broken when it is back

@@ -120,6 +120,7 @@ def test_resolve_missing_entry(job):
 	assert rv.resolve_version_entry(job.job_vault, paths[2], 'nothing', job.monitor).kind == 'missing'
 
 
+@pytest.mark.chain_ground_truth_allows('refused_chain', reason='V1 is renamed by hand, so the links of V2 name no version')
 def test_resolve_dangling_chain(job):
 	paths = three_versions(job)
 	os.rename(paths[1], paths[1] + '.gone')

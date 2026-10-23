@@ -20,6 +20,7 @@ import xxhash
 import reverberator as rv
 from tests.harness import create_job, seed_monitor, run_backup, event_entry, write_rule, write_committed_version
 from tests.test_log_text import alerting_lines
+from tests import chain_ground_truth
 
 pytestmark = pytest.mark.unit
 
@@ -188,6 +189,29 @@ def test_pruning_keeps_a_user_link_naming_a_missing_file(tmp_path, pruning_keeps
 	pruning_keeps(job, {'a/U': text})
 	bump(job, 3, keep_n_versions=2)
 	assert all(holds_user_link(job, version, 'a/U', text) for version in rv.list_versions(job.job_vault))
+
+
+@pytest.mark.chain_ground_truth_allows('blind_spot', reason="a/U's text is exactly its own path's chain text: the documented blind spot")
+def test_a_user_link_with_its_own_paths_chain_text_is_the_documented_blind_spot(tmp_path):
+	# the one form no rows can tell: a link at a/U whose text is what the referenced copy writes for a/U itself. Its damage
+	# stays on that path: pruning gives a/U its own older copy, and every other copy is kept
+	job = fresh_job(tmp_path, {'a/U': 'old', 'D/secret': 'secret', 'keep': 'k'})
+	v0 = latest(job)
+	text = chain_text(v0.name, 'a/U')
+	os.remove(os.path.join(job.monitor, 'a/U'))
+	os.symlink(text, os.path.join(job.monitor, 'a/U'))
+	run_backup(job, OrderedDict([event_entry(job, 'a/U', 'create')]))
+	v1 = latest(job)
+	held = os.path.join(v1.path, 'a/U')
+	assert os.readlink(held) == text
+	bump(job, 1, keep_n_versions=2)
+	assert [version.number for version in rv.list_versions(job.job_vault)] == [1, 2]
+	assert not os.path.islink(held) and open(held).read() == 'old'
+	assert open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
+	assert os.readlink(os.path.join(job.monitor, 'a/U')) == text
+	if chain_ground_truth.ENABLED:
+		# the ground truth found it at the prune, and lets it pass by this test's marker alone
+		assert ('prune', 'blind_spot', held, text) in chain_ground_truth.FOUND
 
 
 def test_a_user_link_naming_a_folder_never_wedges_pruning(tmp_path, pruning_keeps, monkeypatch):
@@ -943,6 +967,7 @@ def test_a_command_reads_the_record_once_and_only_when_rows_are_needed(tmp_path,
 	assert code == 0 and len(reads) == 1 and 'moved' not in out and err == ''
 
 
+@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the record of monitored paths is broken on purpose, so a/U goes by its text')
 def test_a_command_says_once_when_the_record_cannot_be_read(tmp_path, capsys):
 	job = fresh_job(tmp_path)
 	add_user_link(job, 'a/U', chain_text(latest(job).name, 'D/secret'))
@@ -1040,6 +1065,7 @@ def order_walk(monkeypatch, inside, v1, first):
 	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
 
 
+@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('how', ['link', 'move'])
 @pytest.mark.parametrize('first', ['D/', 'a/'])
 def test_two_links_naming_one_copy_both_keep_its_bytes(tmp_path, monkeypatch, capsys, first, how):
@@ -1147,6 +1173,7 @@ def holds_secret_everywhere(job, v1):
 	assert open(os.path.join(v1.path, 'a/U')).read() == 'secret'
 
 
+@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('fault', ['enospc', 'kill'])
 @pytest.mark.parametrize('first', ['D/', 'a/'])
 def test_a_failed_link_or_a_kill_between_two_links_loses_nothing(tmp_path, monkeypatch, first, fault):
@@ -1906,6 +1933,7 @@ def big_two_links_job(tmp_path):
 	return job, v0, v1
 
 
+@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_two_links_naming_one_copy_book_it_once(tmp_path):
 	# review8 NB2, haiku8 p1: both links took the copy into V1's record, so the prune returned less than nothing
 	job, v0, v1 = big_two_links_job(tmp_path)
@@ -1918,6 +1946,7 @@ def test_two_links_naming_one_copy_book_it_once(tmp_path):
 	assert_books(job, info.vault_info_dict, caller)
 
 
+@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_two_links_naming_one_copy_remove_no_version_the_limit_keeps(tmp_path):
 	# haiku8 p1: the prune's return took vault_size up by the copy, and the loop removed V1 too although the vault fit
 	job, v0, v1 = big_two_links_job(tmp_path)
@@ -1938,6 +1967,7 @@ def test_two_links_naming_one_copy_remove_no_version_the_limit_keeps(tmp_path):
 	assert (info.vault_size, info.vault_inodes) == du_versions(job) == recorded(job)
 
 
+@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_a_prune_never_gives_back_less_than_nothing(tmp_path, monkeypatch):
 	# across runs a copy two links name can still be booked twice (an abort, then the rerun's link): what the prune
 	# returns stays at nothing or more, so vault_size never rises from a prune
@@ -2146,6 +2176,7 @@ def books_after_prune(job, info):
 	return freed, (before[0] - freed[0], before[1] - freed[1]), before
 
 
+@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('first', ['D/', 'a/'])
 @pytest.mark.parametrize('how', ['move', 'link_then_emlink'])
 def test_two_links_naming_one_copy_keep_the_books_on_the_move_path_and_the_mixed_one(tmp_path, monkeypatch, how, first):
@@ -2388,6 +2419,7 @@ def copy_version_of(job, rel):
 		manifest.close()
 
 
+@pytest.mark.chain_ground_truth_allows('refused_chain', reason='the rows of V1 are forged to refuse E/secret, which copy_version overrules')
 @pytest.mark.parametrize('reader', ['comparison', 'sync', 'recopy', 'learned'])
 def test_copy_version_is_authoritative_for_the_latest_version(tmp_path, monkeypatch, reader):
 	# a row whose copy_version names an older version is followed down to it, by the links' text, whatever the rows of

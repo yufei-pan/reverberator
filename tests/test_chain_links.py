@@ -69,7 +69,8 @@ def test_retarget_moved_links_keeps_user_symlinks(tmp_path):
 	os.symlink('x', f'{moved}/u')
 	# a user's symlink shaped like a chain link, naming a version folder the job vault does not have
 	os.symlink(INNER_LINK_TEXT, f'{moved}/v')
-	assert rv.retarget_moved_links(job_vault, moved) == 1
+	# moved with its folder: a/ to deep/er/sub/
+	assert rv.retarget_moved_links(job_vault, moved, rv.VersionMoves.applied([('a/', 'deep/er/sub/', True)])) == 1
 	assert os.readlink(f'{moved}/u') == 'x'
 	assert os.readlink(f'{moved}/v') == INNER_LINK_TEXT
 	assert open(f'{moved}/x').read() == 'x'
@@ -80,7 +81,7 @@ def test_retarget_moved_links_leaves_a_moved_copy_alone(tmp_path, capsys):
 	# a file this backup copied, then moved
 	job_vault = str(tmp_path / 'job')
 	write_tree(f'{job_vault}/V1--{T}', {'deep/er/x': 'x'})
-	assert rv.retarget_moved_links(job_vault, f'{job_vault}/V1--{T}/deep/er/x') == 0
+	assert rv.retarget_moved_links(job_vault, f'{job_vault}/V1--{T}/deep/er/x', rv.VersionMoves.applied([('x', 'deep/er/x', False)])) == 0
 	assert 'ERROR' not in capsys.readouterr().out
 
 
@@ -90,9 +91,9 @@ def test_same_depth_move_leaves_the_link_text_alone(job, monkeypatch):
 	retargeted = []
 	retarget = rv.retarget_moved_links
 
-	def recording(job_vault, moved_path):
+	def recording(job_vault, moved_path, *args):
 		retargeted.append(moved_path)
-		return retarget(job_vault, moved_path)
+		return retarget(job_vault, moved_path, *args)
 	monkeypatch.setattr(rv, 'retarget_moved_links', recording)
 	os.rename(f'{job.monitor}/a/x.txt', f'{job.monitor}/b/x.txt')
 	v1 = run_backup(job, OrderedDict([event_entry(job, 'b/x.txt', 'move', 'a/x.txt')]))[-1]
@@ -161,10 +162,11 @@ def test_link_naming_another_folder_for_the_previous_version_is_not_a_chain_link
 	write_tree(f'{job_vault}/V0--{T}', {'a/x': 'x'})
 	write_tree(f'{job_vault}/V0--notatime', {'a/x': 'x'})
 	link_path = f'{job_vault}/V1--{T}/y'
-	assert rv.chain_link_target(job_vault, f'../V0--{T}/a/x', link_path) == f'{job_vault}/V0--{T}/a/x'
+	# by the text alone, as chain_link_target() told it before it went with its last caller
+	assert rv.vault_chain_hop(job_vault, link_path, f'../V0--{T}/a/x', rv.BY_THE_TEXT) == f'{job_vault}/V0--{T}/a/x'
 	# another timestamp than the previous version's folder has, and a folder whose name holds no timestamp
-	assert rv.chain_link_target(job_vault, f'../V0--{INNER_T}/a/x', link_path) is None
-	assert rv.chain_link_target(job_vault, '../V0--notatime/a/x', link_path) is None
+	assert rv.vault_chain_hop(job_vault, link_path, f'../V0--{INNER_T}/a/x', rv.BY_THE_TEXT) is None
+	assert rv.vault_chain_hop(job_vault, link_path, '../V0--notatime/a/x', rv.BY_THE_TEXT) is None
 
 
 @pytest.mark.parametrize('absolute', [False, True])
@@ -181,7 +183,8 @@ def test_link_through_a_backed_up_folder_symlink_is_not_followed_or_pruned_onto(
 	os.symlink(text, f'{v1}/deep/u')
 	record = rv.read_vault_record(v1, 'deep/u', job.monitor)
 	assert (record.kind, record.link) == ('l', text)
-	assert rv.retarget_moved_links(job.job_vault, f'{v1}/deep') == 0
+	# not even by the text alone
+	assert rv.retarget_moved_links(job.job_vault, f'{v1}/deep', rv.BY_THE_TEXT) == 0
 	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert open(os.path.join(outside, 'x')).read() == 'not the vault\'s'
@@ -290,23 +293,24 @@ def test_a_refused_or_missing_folder_is_looked_at_again(tmp_path):
 	link_path = f'{job_vault}/V1--{T}/u'
 	# relative only: since 0.44 an absolute link is never a chain link, so no folder of it is looked at
 	text = f'../V0--{T}/a/x'
-	# V0 is not there yet
-	assert rv.chain_hop(job_vault, link_path, text) is None
+	# V0 is not there yet (by the text alone, as chain_hop() told it before it went with its last caller)
+	assert rv.vault_chain_hop(job_vault, link_path, text, rv.BY_THE_TEXT) is None
 	os.makedirs(v0)
 	# V0/a is not there yet, so nothing goes through it
-	assert rv.chain_hop(job_vault, link_path, text) == f'{v0}/a/x'
+	assert rv.vault_chain_hop(job_vault, link_path, text, rv.BY_THE_TEXT) == f'{v0}/a/x'
 	os.symlink(str(tmp_path), f'{v0}/a')
-	assert rv.chain_hop(job_vault, link_path, text) is None
+	assert rv.vault_chain_hop(job_vault, link_path, text, rv.BY_THE_TEXT) is None
 
 
 def test_an_absolute_link_into_any_version_is_not_a_chain_link(tmp_path):
 	job_vault = str(tmp_path / 'job')
 	write_tree(f'{job_vault}/V2--{T}', {'a/x': 'x'})
 	target = f'{job_vault}/V2--{T}/a/x'
-	assert rv.chain_hop(job_vault, f'{job_vault}/V1--{T}/u', target) is None
+	# not even by the text alone
+	assert rv.vault_chain_hop(job_vault, f'{job_vault}/V1--{T}/u', target, rv.BY_THE_TEXT) is None
 	# an older one too: no released daemon wrote absolute chain links, and since 0.44 that form is a user's symlink to a
 	# backed-up copy
-	assert rv.chain_hop(job_vault, f'{job_vault}/V3--{T}/u', target) is None
+	assert rv.vault_chain_hop(job_vault, f'{job_vault}/V3--{T}/u', target, rv.BY_THE_TEXT) is None
 
 
 
@@ -419,7 +423,7 @@ def test_pruning_forgets_the_real_folders_of_the_version_it_removes(job):
 	# a user's symlink naming the version just removed is not a chain link: it is no version of the vault now
 	text = f'../V0--{T}/a/x'
 	os.symlink(text, f'{v1}/u')
-	assert rv.chain_hop(job.job_vault, f'{v1}/u', text) is None
+	assert rv.vault_chain_hop(job.job_vault, f'{v1}/u', text, rv.BY_THE_TEXT) is None
 	record = rv.read_vault_record(v1, 'u', job.monitor)
 	assert (record.kind, record.link) == ('l', text)
 

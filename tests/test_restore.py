@@ -372,6 +372,7 @@ def test_restore_names_with_spaces_and_unicode(job, tmp_path, capsys):
 	assert tree(out) == {'café.txt': 'crème'}
 
 
+@pytest.mark.chain_ground_truth_allows('refused_chain', reason='V0 is removed by hand, so the links of V1 name no version')
 def test_restore_reports_a_version_removed_mid_restore(job, tmp_path, monkeypatch, capsys):
 	seed_monitor(job, {'proj/a.txt': 'a', 'proj/b.txt': 'b', 'proj/sub/c.txt': 'c'})
 	run_backup(job)
