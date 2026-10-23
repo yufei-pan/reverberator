@@ -75,11 +75,7 @@ def chain_text(version_name, rel):
 
 def vault_salt(job):
 	'''The vault's secret for the names pruning links copies under, made now when it has none, as the daemon's first prune makes it.'''
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		return manifest.prune_salt()
-	finally:
-		manifest.close()
+	return rv.vault_prune_salt(job.job_vault, job.job_name)
 
 
 def holds_user_link(job, version, rel, text):
@@ -1460,24 +1456,159 @@ def test_the_temp_name_is_the_copys_own(tmp_path):
 	assert os.path.basename(path) not in {names_from_the_copy(kind, first) for kind in ('unsalted', 'device_and_inode', 'inode_only')}
 
 
+def salt_file(job):
+	return os.path.join(job.job_vault, rv.PRUNE_SALT_FILE_NAME)
+
+
+def stored_row(job):
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return manifest.conn.execute("SELECT value FROM meta WHERE key = 'prune_salt'").fetchone()
+	finally:
+		manifest.close()
+
+
 def test_the_vaults_secret_is_made_once_and_kept(tmp_path):
-	# review8: the secret lives in the manifest, so a restart, or a remount, names a cut off run's temp the same
+	# review8: kept so a restart, or a remount, names a cut off run's temp the same; Task 2b: in a file of its own that
+	# only root can read, as the manifest is 0644 and every user who can see a copy's inode could read the secret there
 	job = fresh_job(tmp_path)
 	bump(job, 1)
+	assert not os.path.lexists(salt_file(job))
+	bump(job, 1, keep_n_versions=2)
+	st = os.lstat(salt_file(job))
+	assert stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o600 and st.st_uid == os.geteuid() and st.st_size == 16
+	secret = open(salt_file(job), 'rb').read()
+	assert stored_row(job) is None
+	bump(job, 1, keep_n_versions=2)
+	assert vault_salt(job) == secret and open(salt_file(job), 'rb').read() == secret
+
+
+def test_the_secret_file_is_0600_whatever_the_umask_and_synced_with_the_vault(tmp_path, monkeypatch):
+	job = fresh_job(tmp_path)
+	synced = []
+	real_fsync_path = rv.fsync_path
+	monkeypatch.setattr(rv, 'fsync_path', lambda path, folder=False: synced.append((path, folder)) or real_fsync_path(path, folder))
+	old = os.umask(0o077 ^ 0o777)
+	try:
+		secret = vault_salt(job)
+	finally:
+		os.umask(old)
+	assert len(secret) == 16 and stat.S_IMODE(os.lstat(salt_file(job)).st_mode) == 0o600
+	assert (job.job_vault, True) in synced
+
+
+def test_a_secret_an_older_daemon_kept_in_the_manifest_moves_to_the_file(tmp_path):
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	old = bytes(range(16))
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
-		assert manifest.conn.execute("SELECT value FROM meta WHERE key = 'prune_salt'").fetchone() is None
+		manifest.conn.execute("INSERT OR REPLACE INTO meta VALUES ('prune_salt', ?)", (old.hex(),))
 	finally:
 		manifest.close()
+	# the temp a run cut off under that secret had made keeps its name
+	v0, v1 = rv.list_versions(job.job_vault)
+	copy_st = os.lstat(os.path.join(v0.path, 'D/secret'))
+	temp = rv.prune_link_path(os.path.join(v1.path, 'D/secret'), copy_st, old)
+	os.link(os.path.join(v0.path, 'D/secret'), temp)
 	bump(job, 1, keep_n_versions=2)
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		stored = manifest.conn.execute("SELECT value FROM meta WHERE key = 'prune_salt'").fetchone()[0]
-		assert len(bytes.fromhex(stored)) == 16 and manifest.prune_salt() == bytes.fromhex(stored)
-	finally:
-		manifest.close()
+	assert open(salt_file(job), 'rb').read() == old and stored_row(job) is None
+	# zeroed where it was, not left on a freed page of the manifest, which every user can read
+	assert old.hex().encode() not in open(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), 'rb').read()
+	assert numbers(job) == [1, 2] and not os.path.lexists(temp)
+	assert open(os.path.join(v1.path, 'D/secret')).read() == 'secret' and not os.path.islink(os.path.join(v1.path, 'D/secret'))
+
+
+def bad_secret_files():
+	def symlink(path):
+		other = path + '.elsewhere'
+		with open(other, 'wb') as f:
+			f.write(bytes(16))
+		os.chmod(other, 0o600)
+		os.symlink(other, path)
+	def mode(path):
+		with open(path, 'wb') as f:
+			f.write(bytes(16))
+		os.chmod(path, 0o644)
+	def short(path):
+		with open(path, 'wb') as f:
+			f.write(bytes(15))
+		os.chmod(path, 0o600)
+	def long(path):
+		with open(path, 'wb') as f:
+			f.write(bytes(17))
+		os.chmod(path, 0o600)
+	def owner(path):
+		with open(path, 'wb') as f:
+			f.write(bytes(16))
+		os.chmod(path, 0o600)
+		os.chown(path, 65534, 65534)
+	def folder(path):
+		os.mkdir(path, 0o600)
+	def fifo(path):
+		os.mkfifo(path, 0o600)
+	return {'symlink': symlink, 'mode_0644': mode, 'short': short, 'long': long, 'owner': owner, 'folder': folder, 'fifo': fifo}
+
+
+def held_as(path):
+	st = os.lstat(path)
+	content = open(path, 'rb').read() if stat.S_ISREG(st.st_mode) else os.readlink(path) if stat.S_ISLNK(st.st_mode) else None
+	return st.st_ino, st.st_mode, st.st_uid, content
+
+
+@pytest.mark.parametrize('kind', list(bad_secret_files()))
+def test_a_secret_file_that_fails_the_checks_is_left_and_pruning_names_by_the_inode(tmp_path, monkeypatch, kind):
+	if kind == 'owner' and os.geteuid() != 0:
+		pytest.skip('needs root to give the file another owner')
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	bad_secret_files()[kind](salt_file(job))
+	before = held_as(salt_file(job))
+	warnings = warnings_logged(monkeypatch)
+	v0, v1 = rv.list_versions(job.job_vault)
+	copy_st = os.lstat(os.path.join(v0.path, 'D/secret'))
+	linked = []
+	real_link = os.link
+	def link(source, dest, *args, **kwargs):
+		linked.append(os.fspath(dest))
+		return real_link(source, dest, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'link', link)
 	bump(job, 1, keep_n_versions=2)
-	assert vault_salt(job) == bytes.fromhex(stored)
+	monkeypatch.undo()
+	assert held_as(salt_file(job)) == before
+	assert [warning for warning in warnings if rv.PRUNE_SALT_FILE_NAME in warning]
+	assert rv.prune_link_path(os.path.join(v1.path, 'D/secret'), copy_st, None) in linked
+	assert numbers(job) == [1, 2] and open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
+
+
+def test_a_secret_file_another_made_first_is_the_one_read(tmp_path, monkeypatch):
+	job = fresh_job(tmp_path)
+	theirs = bytes(range(100, 116))
+	real_open = os.open
+	def racing_open(path, flags, *args, **kwargs):
+		if os.fspath(path) == salt_file(job) and flags & os.O_EXCL:
+			fd = real_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+			os.write(fd, theirs)
+			os.close(fd)
+		return real_open(path, flags, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'open', racing_open)
+	assert vault_salt(job) == theirs
+	monkeypatch.undo()
+	assert open(salt_file(job), 'rb').read() == theirs
+
+
+def test_a_secret_file_that_cannot_be_written_is_not_left_half_made(tmp_path, monkeypatch, capsys):
+	job = fresh_job(tmp_path)
+	real_write = os.write
+	def write(fd, data):
+		if os.path.realpath(f'/proc/self/fd/{fd}') == salt_file(job):
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		return real_write(fd, data)
+	monkeypatch.setattr(rv.os, 'write', write)
+	assert vault_salt(job) is None
+	monkeypatch.undo()
+	assert not os.path.lexists(salt_file(job))
+	assert len(vault_salt(job)) == 16
 
 
 def test_pruning_without_the_vaults_secret_names_by_the_inode_and_says_so_once(tmp_path, monkeypatch):
@@ -1878,9 +2009,10 @@ def test_a_version_folder_that_cannot_be_looked_at_is_kept_by_the_scan(tmp_path,
 	capsys.readouterr()
 	info = rv.get_vault_info(job.job_vault)
 	monkeypatch.undo()
+	# Task 2b: a folder listed with its change list is the list's, and is not looked at again; an error looking at an
+	# entry of the listing fails the scan (tests/test_vault_scan.py)
 	assert os.path.isdir(v0.path) and os.path.isfile(v0.change_list)
 	assert list(info.vault_info_dict) == [0, 1] and info.vault_info_dict[0].size == v0.size
-	assert os.strerror(errno.EIO) in capsys.readouterr().out
 	assert open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
 
 
@@ -1938,3 +2070,100 @@ def test_a_change_list_pruning_makes_is_written_whole(tmp_path, monkeypatch):
 	assert rv.decrement_stepper(info, job.job_name, job.monitor) != (0, 0)
 	assert len(written) == 1 and written[0][1] == [] and os.path.basename(written[0][0]).startswith(v1.name + '--')
 	assert v1_change_lists(job) == [os.path.basename(written[0][0])]
+
+
+# --- Task 2b ---
+
+def rows_out_of_step(tmp_path, rows):
+	'''V0 holding a file a and c, its rows tracking rows (a/b under a, which V0 holds as a file), and an empty V1.'''
+	vault = os.path.join(str(tmp_path), 'job')
+	v0 = os.path.join(vault, f'V0--{T0}')
+	v1 = os.path.join(vault, f'V1--{T1}')
+	os.makedirs(v0)
+	os.makedirs(v1)
+	for name, text in (('a', 'a file where the rows say a folder'), ('c', 'c')):
+		with open(os.path.join(v0, name), 'w') as f:
+			f.write(text)
+	manifest = rv.VaultManifest(vault)
+	manifest.begin()
+	for rel in rows:
+		manifest.add(rel)
+	manifest.commit(v0)
+	return vault, v0, v1, manifest
+
+
+@pytest.mark.parametrize('rows', [('a/b', 'c'), ('a/', 'a/b', 'c')], ids=['file_row', 'folder_and_file_rows'])
+def test_a_row_below_a_file_is_missing_from_the_source(tmp_path, rows):
+	# review9 p5, p6: lstat of a/b, below V0's file a, gives ENOTDIR, which counted as "cannot be looked at": the row was
+	# kept, and the referenced copy either raised FileNotFoundError making its link (every backup failed), or left V1 a
+	# dangling a/b
+	vault, v0, v1, manifest = rows_out_of_step(tmp_path, rows)
+	try:
+		assert rv.do_referenced_copy(v0, v1, manifest, relative=True)
+		assert 'a/b' not in manifest.files and 'c' in manifest.files
+	finally:
+		manifest.close()
+	assert not os.path.lexists(os.path.join(v1, 'a', 'b'))
+	assert open(os.path.join(v1, 'c')).read() == 'c'
+
+
+def test_a_link_whose_target_lies_below_a_file_is_dropped_as_dangling(tmp_path, capsys):
+	# review9 p6: V1's a/b links to V0's a/b, below V0's file a: the walk's lstat gave ENOTDIR and every prune of V0 aborted
+	vault, v0, v1, manifest = rows_out_of_step(tmp_path, ('a/', 'a/b', 'c'))
+	manifest.close()
+	os.makedirs(os.path.join(v1, 'a'))
+	os.symlink(chain_text(os.path.basename(v0), 'a/b'), os.path.join(v1, 'a', 'b'))
+	os.symlink(chain_text(os.path.basename(v0), 'c'), os.path.join(v1, 'c'))
+	for version in (v0, v1):
+		rv.write_change_list(rv.change_list_path(version, 4096, 3), [])
+	info = rv.get_vault_info(vault).vault_info_dict
+	capsys.readouterr()
+	rv.decrement_stepper(info, 'job', os.path.join(str(tmp_path), 'm'))
+	assert alerting_lines(capsys.readouterr().out) == []
+	assert list(info) == [1] and not os.path.exists(v0)
+	assert not os.path.lexists(os.path.join(v1, 'a', 'b'))
+	assert not os.path.islink(os.path.join(v1, 'c')) and open(os.path.join(v1, 'c')).read() == 'c'
+
+
+def books_after_prune(job, info):
+	'''decrement_stepper() of info as a backup's loop runs it: (what it freed, the caller's sums after it, and before).'''
+	before = (info.vault_size, info.vault_inodes)
+	freed = rv.decrement_stepper(info.vault_info_dict, job.job_name, job.monitor)
+	return freed, (before[0] - freed[0], before[1] - freed[1]), before
+
+
+@pytest.mark.parametrize('first', ['D/', 'a/'])
+@pytest.mark.parametrize('how', ['move', 'link_then_emlink'])
+def test_two_links_naming_one_copy_keep_the_books_on_the_move_path_and_the_mixed_one(tmp_path, monkeypatch, how, first):
+	# review9 p3: the records, the dict and du of the version folders agree, and the caller's sums do within the clamp,
+	# which keeps a prune from raising them: on the move path the second link's own copy is new space, so the prune frees
+	# nothing of the bytes there, and the caller's sum stays below what the vault takes by that copy until a restart
+	job, v0, v1 = big_two_links_job(tmp_path)
+	inside = during_prune(monkeypatch)
+	order_walk(monkeypatch, inside, v1, first)
+	target = os.path.join(v0.path, 'D/secret')
+	if how == 'move':
+		no_hard_links(monkeypatch, inside)
+	else:
+		real_link = os.link
+		calls = []
+		def link(source, dest, *args, **kwargs):
+			if inside[0] and os.fspath(source) == target:
+				calls.append(dest)
+				if len(calls) == 2:
+					raise OSError(errno.EMLINK, os.strerror(errno.EMLINK), dest)
+			return real_link(source, dest, *args, **kwargs)
+		monkeypatch.setattr(rv.os, 'link', link)
+	info = rv.get_vault_info(job.job_vault)
+	freed, caller, before = books_after_prune(job, info)
+	monkeypatch.undo()
+	assert list(info.vault_info_dict) == [1, 2]
+	real = du_versions(job)
+	assert recorded(job) == real and held(info.vault_info_dict) == real
+	assert freed == (max(0, before[0] - real[0]), max(0, before[1] - real[1]))
+	assert caller == (min(before[0], real[0]), min(before[1], real[1]))
+	if how == 'link_then_emlink':
+		assert caller == real
+	for rel in ('D/secret', 'a/U'):
+		assert open(os.path.join(v1.path, rel)).read() == 'S' * 20000
+		assert not os.path.islink(os.path.join(v1.path, rel))
