@@ -10,11 +10,13 @@ import shutil
 import sqlite3
 import signal
 import stat
+import sys
 import threading
 import time
 from collections import deque, OrderedDict
 import pytest
 import TSVZ
+import xxhash
 import reverberator as rv
 from tests.harness import create_job, seed_monitor, run_backup, event_entry, write_rule, write_committed_version
 from tests.test_log_text import alerting_lines
@@ -994,7 +996,7 @@ def test_a_move_that_lands_then_reports_an_error_keeps_the_copy(tmp_path, monkey
 	if how == 'move':
 		no_hard_links(monkeypatch, inside)
 	# the rename of the hard link over the chain link, or of the copy itself
-	source_of = {'link': rv.prune_link_path(os.path.join(v1.path, 'D/secret')), 'move': target}[how]
+	source_of = {'link': rv.prune_link_path(os.path.join(v1.path, 'D/secret'), os.lstat(target)), 'move': target}[how]
 	real_rename = os.rename
 	fired = []
 	def rename(source, dest, *args, **kwargs):
@@ -1050,7 +1052,8 @@ def test_two_links_naming_one_copy_both_keep_its_bytes(tmp_path, monkeypatch, ca
 		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
 	# the user's link gets the copy's bytes too: the ruled damage of the fallback, with no file lost
 	assert open(os.path.join(v1.path, 'a/U')).read() == 'secret'
-	assert "a user's link that cannot be told from a chain link" in capsys.readouterr().out
+	# the move path knows it moved the copy for the other link; the link path cannot tell, as st_nlink can be stale
+	assert ("a user's link that cannot be told from a chain link" in capsys.readouterr().out) == (how == 'move')
 
 
 def test_a_link_that_cannot_be_read_aborts_the_prune_and_the_backup_goes_on(tmp_path, monkeypatch, capsys):
@@ -1092,7 +1095,8 @@ def test_a_removal_that_does_not_happen_is_not_reported_done(tmp_path, monkeypat
 		monkeypatch.setattr(rv.multiCMD, 'run_command', lambda command, *args, **kwargs: 1 if command[0] == 'rm' else real_run(command, *args, **kwargs))
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
 	capsys.readouterr()
-	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	# V0 stays, but V1's link was replaced by V0's copy: the records went down by that link, as the vault did
+	assert prune_dropping(info, job)[1] == 1
 	assert len([line for line in alerting_lines(capsys.readouterr().out) if f'cannot remove {v0.path}' in line]) == 1
 	assert list(info) == [0, 1] and os.path.isdir(v0.path) and job.job_name in rv.PRUNE_ABORTED
 	monkeypatch.undo()
@@ -1174,7 +1178,7 @@ def test_a_stored_symlink_whose_rename_lands_then_fails_is_kept(tmp_path, monkey
 	inside = during_prune(monkeypatch)
 	if how == 'move':
 		no_hard_links(monkeypatch, inside)
-	sources = {rv.prune_link_path(os.path.join(v2.path, 'D/secret')), os.path.join(v1.path, 'D/secret')}
+	sources = {rv.prune_link_path(os.path.join(v2.path, 'D/secret'), os.lstat(os.path.join(v1.path, 'D/secret'))), os.path.join(v1.path, 'D/secret')}
 	real_rename = os.rename
 	fired = []
 	def rename(source, dest, *args, **kwargs):
@@ -1193,12 +1197,14 @@ def test_a_stored_symlink_whose_rename_lands_then_fails_is_kept(tmp_path, monkey
 	assert holds_user_link(job, versions[1], 'D/secret', 'elsewhere-target')
 
 
-def test_a_temp_link_a_cut_off_run_left_is_reused(tmp_path, monkeypatch):
+@pytest.mark.parametrize('first', ['D/secret', 'D/.'], ids=['link_first', 'temp_first'])
+def test_a_temp_link_a_cut_off_run_left_is_reused(tmp_path, monkeypatch, first):
+	# listed with the link first, the temp, once renamed over the link, was looked at as a link of its own, and gone
 	job = fresh_job(tmp_path)
 	bump(job, 1)
 	v0, v1 = rv.list_versions(job.job_vault)
 	link = os.path.join(v1.path, 'D/secret')
-	temp = rv.prune_link_path(link)
+	temp = rv.prune_link_path(link, os.lstat(os.path.join(v0.path, 'D/secret')))
 	inside = during_prune(monkeypatch)
 	real_rename = os.rename
 	def rename(source, dest, *args, **kwargs):
@@ -1211,9 +1217,14 @@ def test_a_temp_link_a_cut_off_run_left_is_reused(tmp_path, monkeypatch):
 	monkeypatch.undo()
 	# killed between the link and the rename: the temp is the copy's, V0 whole
 	assert os.lstat(temp).st_ino == os.lstat(os.path.join(v0.path, 'D/secret')).st_ino and os.path.islink(link)
+	# the links made: the one tried at the temp's name finds it there (review7 M6: tried first, looked at only then)
 	linked = []
 	real_link = os.link
-	monkeypatch.setattr(rv.os, 'link', lambda source, dest, *args, **kwargs: linked.append(dest) or real_link(source, dest, *args, **kwargs))
+	def linking(source, dest, *args, **kwargs):
+		real_link(source, dest, *args, **kwargs)
+		linked.append(dest)
+	monkeypatch.setattr(rv.os, 'link', linking)
+	order_walk(monkeypatch, during_prune(monkeypatch), v1, first)
 	bump(job, 1, keep_n_versions=2)
 	monkeypatch.undo()
 	assert temp not in linked and not os.path.lexists(temp) and not os.path.exists(v0.path)
@@ -1227,7 +1238,7 @@ def test_something_else_at_the_temp_name_keeps_the_oldest_and_is_left(tmp_path, 
 	bump(job, 1)
 	v0, v1 = rv.list_versions(job.job_vault)
 	link = os.path.join(v1.path, 'D/secret')
-	temp = rv.prune_link_path(link)
+	temp = rv.prune_link_path(link, os.lstat(os.path.join(v0.path, 'D/secret')))
 	with open(temp, 'w') as f:
 		f.write('not the copy')
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
@@ -1236,35 +1247,6 @@ def test_something_else_at_the_temp_name_keeps_the_oldest_and_is_left(tmp_path, 
 	assert len([line for line in alerting_lines(capsys.readouterr().out) if 'cannot remove' in line]) == 1
 	assert open(temp).read() == 'not the copy' and os.path.islink(link) and open(os.path.join(v0.path, 'D/secret')).read() == 'secret'
 	assert list(info) == [0, 1]
-
-
-def du(path, inodes=False):
-	out = rv.multiCMD.run_command(['du', '--inodes' if inodes else '--block-size=1', '-sP', path], quiet=True)
-	return int(out[-1].partition('\t')[0])
-
-
-def test_the_freed_counts_are_what_the_removal_frees(tmp_path, monkeypatch):
-	job = fresh_job(tmp_path, {'D/secret': 'secret' * 3000, 'b/x': 'x' * 20000, 'b/y': 'y', 'keep': 'k' * 9000})
-	with open(os.path.join(job.monitor, 'b/y'), 'w') as f:
-		f.write('y' * 50000)
-	run_backup(job, OrderedDict([event_entry(job, 'b/y', 'modify')]))
-	v0, v1 = rv.list_versions(job.job_vault)
-	all_of_v0 = du(v0.path)
-	real_run = rv.multiCMD.run_command
-	measured = []
-	def run(command, *args, **kwargs):
-		if command[0] == 'rm':
-			before = (du(job.job_vault), du(job.job_vault, inodes=True))
-			code = real_run(command, *args, **kwargs)
-			measured.append((before[0] - du(job.job_vault), before[1] - du(job.job_vault, inodes=True)))
-			return code
-		return real_run(command, *args, **kwargs)
-	monkeypatch.setattr(rv.multiCMD, 'run_command', run)
-	freed = rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
-	monkeypatch.undo()
-	# V0's own b/y, its folders and its change list: its other copies live on in V1, linked
-	assert measured and freed == measured[0] and 0 < freed[0] < all_of_v0 - 30000
-	assert open(os.path.join(v1.path, 'b/x')).read() == 'x' * 20000
 
 
 def v1_change_lists(job):
@@ -1279,7 +1261,7 @@ def test_an_abort_at_the_removal_makes_no_second_change_list(tmp_path, monkeypat
 	real_run = rv.multiCMD.run_command
 	monkeypatch.setattr(rv.multiCMD, 'run_command', lambda command, *args, **kwargs: 1 if command[0] == 'rm' else real_run(command, *args, **kwargs))
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
-	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	prune_dropping(info, job)
 	monkeypatch.undo()
 	assert len(v1_change_lists(job)) == 1
 	capsys.readouterr()
@@ -1301,12 +1283,363 @@ def test_a_removal_cut_short_is_finished_by_the_next_prune(tmp_path, monkeypatch
 		return real_run(command, *args, **kwargs)
 	monkeypatch.setattr(rv.multiCMD, 'run_command', run)
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
-	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	prune_dropping(info, job)
 	monkeypatch.undo()
 	left = [os.path.join(job.job_vault, name) for name in os.listdir(job.job_vault) if name.startswith(v0.name)]
 	assert list(info) == [0, 1] and not os.path.exists(v0.path) and len(left) == 1
-	freed = os.lstat(left[0]).st_blocks * 512
-	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (freed, 1)
+	# the folder went, and with it all V0's record counted, which the records went down by at once
+	assert (info[0].size, info[0].inode) == (0, 0)
+	# the next prune removes what is left, freeing what V0's record still holds: nothing
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
 	assert not [name for name in os.listdir(job.job_vault) if name.startswith(v0.name)]
 	assert list(info) == [1] and job.job_name not in rv.PRUNE_ABORTED
 	assert open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
+
+
+# --- fix round 4: an error never takes the oldest version for gone, and the books say what the versions take ---
+
+def eio(path):
+	return OSError(errno.EIO, os.strerror(errno.EIO), path)
+
+
+def markers(capsys, v0):
+	return [line for line in alerting_lines(capsys.readouterr().out) if f'cannot remove {v0.path}' in line]
+
+
+def test_an_oldest_version_that_cannot_be_looked_at_is_kept(tmp_path, monkeypatch, capsys):
+	# review7 P1: os.path.lexists() is False on any error, so one EIO looking at V0 took it for a removal cut short, and
+	# all of it went with no link of V1 materialised
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	inside = during_prune(monkeypatch)
+	real_lstat = os.lstat
+	def lstat(path, *args, **kwargs):
+		if inside[0] and os.path.abspath(os.fspath(path)) == v0.path:
+			raise eio(path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	capsys.readouterr()
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	monkeypatch.undo()
+	assert len(markers(capsys, v0)) == 1
+	assert list(info) == [0, 1] and os.path.isdir(v0.path)
+	assert os.path.islink(os.path.join(v1.path, 'D/secret')) and open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
+
+
+def test_an_error_from_statvfs_never_escapes_the_prune(tmp_path, monkeypatch):
+	# review7: the statvfs() of V0 for its block size raised out of decrement_stepper, with V0 popped from the dict; the
+	# books now go by st_blocks alone, so nothing asks for the block size
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	inside = during_prune(monkeypatch)
+	real_statvfs = os.statvfs
+	def statvfs(path, *args, **kwargs):
+		if inside[0]:
+			raise eio(path)
+		return real_statvfs(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'statvfs', statvfs)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	rv.decrement_stepper(info, job.job_name, job.monitor)
+	monkeypatch.undo()
+	assert list(info) == [1] and not os.path.exists(v0.path)
+	held = os.path.join(v1.path, 'D/secret')
+	assert not os.path.islink(held) and open(held).read() == 'secret'
+
+
+def test_a_link_that_cannot_be_looked_at_before_its_copy_is_moved_keeps_the_oldest(tmp_path, monkeypatch, capsys):
+	# review7 M3: the move's own look at the link, on a filesystem that cannot hard link, raised out of
+	# decrement_stepper with no marker and V0 popped from the dict
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	link = os.path.join(v1.path, 'D/secret')
+	inside = during_prune(monkeypatch)
+	no_hard_links(monkeypatch, inside)
+	real_lstat = os.lstat
+	looks = []
+	def lstat(path, *args, **kwargs):
+		# the walk's look passes, the move's own fails
+		if inside[0] and os.fspath(path) == link and sys._getframe(1).f_code.co_name == 'move_copy':
+			looks.append(path)
+			raise eio(path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	capsys.readouterr()
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	monkeypatch.undo()
+	assert looks and len(markers(capsys, v0)) == 1
+	assert list(info) == [0, 1] and open(os.path.join(v0.path, 'D/secret')).read() == 'secret'
+	assert os.readlink(link) == chain_text(v0.name, 'D/secret')
+
+
+def test_a_change_list_that_cannot_be_looked_at_keeps_the_oldest(tmp_path, monkeypatch, capsys):
+	# the next version's change list was looked for with os.path.lexists(): an error took it for missing, and a second
+	# list was made beside it, which a restart counts too
+	job = fresh_job(tmp_path, {'D/secret': 'secret' * 3000, 'keep': 'k'})
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	inside = during_prune(monkeypatch)
+	real_lstat = os.lstat
+	def lstat(path, *args, **kwargs):
+		if inside[0] and os.path.basename(os.fspath(path)) == os.path.basename(v1.change_list):
+			raise eio(path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	capsys.readouterr()
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	monkeypatch.undo()
+	assert len(markers(capsys, v0)) == 1 and list(info) == [0, 1] and os.path.isdir(v0.path)
+	assert v1_change_lists(job) == [os.path.basename(v1.change_list)]
+	assert os.path.islink(os.path.join(v1.path, 'D/secret'))
+
+
+def unsalted_prune_link_name(name):
+	'''The name 1aa5f7b hard linked a copy under beside the link name, worked out from the name alone.'''
+	return '.' + xxhash.xxh128(os.fsencode(name)).hexdigest() + rv.PARTIAL_COPY_SUFFIX
+
+
+def test_a_monitored_file_at_the_unsalted_temp_name_never_stops_pruning(tmp_path, monkeypatch, capsys):
+	# review7 P3: any monitored user could stop pruning for good with a file of that name beside one of theirs
+	user_file = 'D/' + unsalted_prune_link_name('secret')
+	job = fresh_job(tmp_path, {'D/secret': 'secret', user_file: 'a user file', 'keep': 'k'})
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	assert os.path.islink(os.path.join(v1.path, 'D/secret')) and os.path.lexists(os.path.join(v1.path, user_file))
+	capsys.readouterr()
+	bump(job, 1, keep_n_versions=2)
+	assert not markers(capsys, v0)
+	versions = rv.list_versions(job.job_vault)
+	assert [version.number for version in versions] == [1, 2]
+	held = os.path.join(v1.path, 'D/secret')
+	assert not os.path.islink(held) and open(held).read() == 'secret'
+	for version in versions:
+		assert open(os.path.join(version.path, user_file)).read() == 'a user file'
+		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
+
+
+def test_the_temp_name_is_the_copys_own(tmp_path):
+	link = os.path.join(str(tmp_path), 'V1--x', 'D', 'secret')
+	first, second = (os.stat_result((stat.S_IFREG | 0o600, ino, 7, 1, 0, 0, 6, 0, 0, 0)) for ino in (11, 12))
+	path = rv.prune_link_path(link, first)
+	assert os.path.dirname(path) == os.path.dirname(link) and rv.PARTIAL_COPY_NAME.fullmatch(os.path.basename(path))
+	assert path == rv.prune_link_path(link, first) and path != rv.prune_link_path(link, second)
+	assert os.path.basename(path) != unsalted_prune_link_name('secret')
+
+
+def test_a_filesystem_that_gives_enosys_for_a_hard_link_moves_the_copy(tmp_path, monkeypatch):
+	# sshfs without its hard link extension, and rclone, answer link() with ENOSYS
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	inside = during_prune(monkeypatch)
+	real_link, real_rename = os.link, os.rename
+	moved = []
+	def link(source, dest, *args, **kwargs):
+		if inside[0]:
+			raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), source)
+		return real_link(source, dest, *args, **kwargs)
+	def rename(source, dest, *args, **kwargs):
+		if inside[0] and os.fspath(source) == os.path.join(v0.path, 'D/secret'):
+			moved.append(dest)
+		return real_rename(source, dest, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'link', link)
+	monkeypatch.setattr(rv.os, 'rename', rename)
+	bump(job, 1, keep_n_versions=2)
+	monkeypatch.undo()
+	assert moved == [os.path.join(v1.path, 'D/secret')] and not os.path.exists(v0.path)
+	for version in rv.list_versions(job.job_vault):
+		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
+
+
+# a rel whose chain link is too long to sit in its inode, so the link takes a block of its own
+LONG = 'a_folder_with_a_long_enough_name/and_a_file_name_long_enough_too.txt'
+
+
+def books_job(tmp_path, tree=None):
+	'''
+	V0, V1 and V2 of a job whose V1 links keep, D/secret (a link short enough to sit in its inode), LONG and b/x to
+	V0's copies, and copies b/y, which it modified.
+	'''
+	job = fresh_job(tmp_path, {'D/secret': 'secret' * 3000, 'b/x': 'x' * 20000, 'b/y': 'y', LONG: 'z' * 5000, 'keep': 'k'} if tree is None else tree)
+	with open(os.path.join(job.monitor, 'b/y'), 'w') as f:
+		f.write('y' * 50000)
+	run_backup(job, OrderedDict([event_entry(job, 'b/y', 'modify')]))
+	bump(job, 1)
+	return job
+
+
+def du_versions(job):
+	'''What the job's version folders take, (bytes, inodes), each inode once: du of them all in one call.'''
+	paths = [version.path for version in rv.list_versions(job.job_vault)]
+	return rv.get_path_size(*paths), rv.get_path_inodes(*paths)
+
+
+def recorded(job):
+	'''What the change lists' names record, (bytes, inodes), as a restart sums them.'''
+	versions = rv.list_versions(job.job_vault)
+	return sum(version.size for version in versions), sum(version.inodes for version in versions)
+
+
+def held(info):
+	return sum(entry.size for entry in info.values()), sum(entry.inode for entry in info.values())
+
+
+def prune_dropping(info, job):
+	'''decrement_stepper() of info, which returns how far the sums of info's records went down, whatever came of it.'''
+	before = held(info)
+	removed = rv.decrement_stepper(info, job.job_name, job.monitor)
+	after = held(info)
+	assert removed == (before[0] - after[0], before[1] - after[1])
+	return removed
+
+
+def assert_books(job, info, caller):
+	'''
+	The change lists' names, the dict of the versions and the caller's sums each say what the version folders take, and
+	each version folder has one change list: none went missing, none was made twice.
+	'''
+	names = os.listdir(job.job_vault)
+	for folder in names:
+		if rv.is_version_folder_name(folder) and os.path.isdir(os.path.join(job.job_vault, folder)):
+			assert len([name for name in names if (rv.parse_change_list_name(name) or (None, None))[1] == folder]) == 1, folder
+	real = du_versions(job)
+	assert recorded(job) == real
+	assert held(info) == real
+	assert tuple(caller) == real
+
+
+def reads_right(job):
+	for version in rv.list_versions(job.job_vault):
+		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret' * 3000, version.name
+		assert open(os.path.join(version.path, 'b/x')).read() == 'x' * 20000, version.name
+		assert open(os.path.join(version.path, LONG)).read() == 'z' * 5000, version.name
+		# modified in V1
+		assert open(os.path.join(version.path, 'b/y')).read() == ('y' if version.number == 0 else 'y' * 50000), version.name
+
+
+class StaleLinkCount:
+	'''An lstat() result with st_nlink 1, as mergerfs's attribute cache (cache.attr=1) shows for a second after a link.'''
+	st_nlink = 1
+
+	def __init__(self, st):
+		self._st = st
+
+	def __getattr__(self, name):
+		return getattr(self._st, name)
+
+
+@pytest.mark.parametrize('case', ['clean', 'stale_link_count', 'abort', 'kill', 'cut_short'])
+def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
+	# review7 P2, P4, P7, M4, M5, haiku7 p6: the sizes the change lists record, which a restart sums, and the caller's
+	# vault_size went by st_nlink, counted the removed version's change list, booked a link as a whole block, were
+	# measured again by du after an abort, each version counting the copies they then share, and were never written
+	# when a removal was cut short
+	job = books_job(tmp_path)
+	v0, v1, v2 = rv.list_versions(job.job_vault)
+	assert os.lstat(os.path.join(v1.path, LONG)).st_blocks and not os.lstat(os.path.join(v1.path, 'D/secret')).st_blocks
+	info = rv.get_vault_info(job.job_vault)
+	caller = [info.vault_size, info.vault_inodes]
+	assert_books(job, info.vault_info_dict, caller)
+	def prune():
+		freed = rv.decrement_stepper(info.vault_info_dict, job.job_name, job.monitor)
+		caller[0] -= freed[0]
+		caller[1] -= freed[1]
+	inside = during_prune(monkeypatch)
+	if case in ('clean', 'stale_link_count'):
+		if case == 'stale_link_count':
+			real_lstat = os.lstat
+			monkeypatch.setattr(rv.os, 'lstat', lambda path, *args, **kwargs: StaleLinkCount(real_lstat(path, *args, **kwargs)) if inside[0] else real_lstat(path, *args, **kwargs))
+		prune()
+		monkeypatch.undo()
+	elif case == 'abort':
+		# every other link is materialised, then V0 kept
+		real_link = os.link
+		def link(source, dest, *args, **kwargs):
+			if inside[0] and os.fspath(source) == os.path.join(v0.path, 'b/x'):
+				raise eio(source)
+			return real_link(source, dest, *args, **kwargs)
+		monkeypatch.setattr(rv.os, 'link', link)
+		prune()
+		monkeypatch.undo()
+		assert list(info.vault_info_dict) == [0, 1, 2] and os.path.isdir(v0.path)
+		assert os.lstat(os.path.join(v1.path, LONG)).st_ino == os.lstat(os.path.join(v0.path, LONG)).st_ino
+		assert_books(job, info.vault_info_dict, caller)
+		reads_right(job)
+		prune()
+	elif case == 'kill':
+		real_run = rv.multiCMD.run_command
+		def run(command, *args, **kwargs):
+			if command[0] == 'rm':
+				raise Killed()
+			return real_run(command, *args, **kwargs)
+		monkeypatch.setattr(rv.multiCMD, 'run_command', run)
+		with pytest.raises(Killed):
+			prune()
+		monkeypatch.undo()
+		# a restart reads the names the books were written to before the removal
+		info = rv.get_vault_info(job.job_vault)
+		caller = [info.vault_size, info.vault_inodes]
+		assert list(info.vault_info_dict) == [0, 1, 2]
+		assert_books(job, info.vault_info_dict, caller)
+		reads_right(job)
+		prune()
+	else:
+		real_run = rv.multiCMD.run_command
+		def run(command, *args, **kwargs):
+			if command[0] == 'rm':
+				# the folder went, its change list did not
+				shutil.rmtree(v0.path)
+				return 1
+			return real_run(command, *args, **kwargs)
+		monkeypatch.setattr(rv.multiCMD, 'run_command', run)
+		prune()
+		monkeypatch.undo()
+		assert list(info.vault_info_dict) == [0, 1, 2] and not os.path.exists(v0.path)
+		assert_books(job, info.vault_info_dict, caller)
+		prune()
+		assert not [name for name in os.listdir(job.job_vault) if name.startswith(v0.name)]
+	assert list(info.vault_info_dict) == [1, 2] and not os.path.exists(v0.path)
+	assert_books(job, info.vault_info_dict, caller)
+	reads_right(job)
+
+
+@pytest.mark.parametrize('restart', [True, False], ids=['restart', 'carried'])
+def test_after_an_aborted_prune_the_next_backup_removes_no_version_the_limit_keeps(tmp_path, monkeypatch, restart):
+	# review7 P2: the abort measured V0 and V1 again by du, each counting the copies they then shared, so a restart
+	# summed those twice, and removed versions 0 to 2 although the vault fit its limit
+	job = fresh_job(tmp_path, {'big': 'B' * 900_000, LONG: 'z', 'keep': 'k'})
+	bump(job, 3)
+	v0, v1 = rv.list_versions(job.job_vault)[:2]
+	inside = during_prune(monkeypatch)
+	real_link = os.link
+	def link(source, dest, *args, **kwargs):
+		if inside[0] and os.fspath(source) == os.path.join(v0.path, LONG):
+			raise eio(source)
+		return real_link(source, dest, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'link', link)
+	def backup(text, **kwargs):
+		with open(os.path.join(job.monitor, 'keep'), 'w') as f:
+			f.write(text)
+		options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+		options.update(kwargs)
+		info, manifest, committed = rv.do_backup(OrderedDict([event_entry(job, 'keep', 'modify')]), job_name=job.job_name,
+			monitor_path=job.monitor, vault_path=job.vault, **options)
+		manifest.close()
+		assert committed
+		return info
+	# the prune aborts inside a backup, as the daemon runs it, and the backup goes on
+	carried = backup('aborted', keep_n_versions=4)
+	monkeypatch.undo()
+	assert [version.number for version in rv.list_versions(job.job_vault)] == [0, 1, 2, 3, 4]
+	assert os.lstat(os.path.join(v1.path, 'big')).st_ino == os.lstat(os.path.join(v0.path, 'big')).st_ino
+	real, books = du_versions(job), (recorded(job), (carried.vault_size, carried.vault_inodes))
+	# the next backup, under a limit the vault fits with room to spare
+	after = backup('next', backup_size_limit=str(real[0] + 300_000), **({} if restart else {'vaultInfo': carried}))
+	assert [version.number for version in rv.list_versions(job.job_vault)] == [0, 1, 2, 3, 4, 5]
+	assert books == (real, real)
+	assert (after.vault_size, after.vault_inodes) == du_versions(job) == recorded(job)
