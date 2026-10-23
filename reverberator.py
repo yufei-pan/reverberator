@@ -22,7 +22,6 @@ import resource
 import datetime
 import unicodedata
 import re
-import glob
 import hashlib
 import select
 import contextlib
@@ -4588,28 +4587,37 @@ def change_list_record(rest:str):
 	return format_bytes(size_number + size_unit, to_int=True), format_bytes(inodes_number + inodes_unit, use_1024_bytes=False, to_int=True)
 
 # what read_job_vault() found in a job vault: versions, {number: VaultEntry} with the size and inodes its change list
-# records; change_lists, {number: that list's path}; orphans, the paths of the version folders without a change list;
-# stale, the paths of the change lists whose version folder is not there; unread, the names of the change lists that
-# name no folder there and cannot be read, kept; unfinished, the private folders of change lists a crash cut off before
+# records; change_lists, {number: that list's path}; orphans, the paths of the version folders without a change list that
+# may go; stale, the paths of the change lists whose version folder is not there and whose number no folder there
+# carries; kept, the names of the entries kept as they are, though they name no folder there (whose name cannot be read,
+# or of a number a folder there carries); unfinished, the private folders of change lists a crash cut off before
 # write_change_list() renamed them into place
-VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans', 'stale', 'unread', 'unfinished'])
+VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans', 'stale', 'kept', 'unfinished'])
 
 def read_job_vault(job_vault_path:str) -> VaultListing:
 	'''
 	What job_vault_path holds, read whole before anything in it is deleted; None when there is no job vault (it is not
 	there: FileNotFoundError alone says so).
 
-	A version folder is a folder named V<n>--<timestamp>, n in ASCII digits and the timestamp VAULT_TIMESTAMP_FORMAT's
-	(is_version_folder_name()); any other folder is no version, and is left alone. A change list belongs to each folder
-	whose name, then --, begins its own name, matched by name before anything is parsed, so a list whose name cannot be
-	read still keeps its folder from being taken for an orphan. A version is a version folder with one change list
-	whose name is the folder's, --, and the record change_list_record() reads.
+	A version folder is a folder (not a link to one) named V<n>--<timestamp>, n in ASCII digits and the timestamp
+	VAULT_TIMESTAMP_FORMAT's (is_version_folder_name()); any other folder is no version, and is left alone. An entry of
+	any type but a version folder belongs, as a change list, to each folder whose name, then --, begins its own name,
+	matched by name before anything is parsed, so a list whose name cannot be read, or that is no file, still keeps its
+	folder from being taken for an orphan. A version is a version folder with one change list, a regular file whose name
+	is the folder's, --, and the record change_list_record() reads.
+
+	A version folder without a change list, an orphan, may go only when no committed version is there, or when its
+	number is above the newest (a backup that did not commit) or below the oldest (a removal cut short, which
+	materialised every link into it first); one between them is a committed version whose list the listing did not
+	show. A change list that names no folder there is stale, to be deleted, only when it is a regular file, its folder's
+	name is well formed, that folder is not there, and no folder there carries its number. Any other entry that names no
+	folder there is kept, and holds back the orphans of its number (every orphan when its number cannot be read).
 
 	Raises VaultScanError, with nothing to be deleted, when the job vault cannot be looked at or listed, or an entry in
-	it cannot; when a list named after a folder there cannot be read as its change list (a committed version would be
-	left out silently); when two version folders have one number, or one has two change lists; when a list that names no
-	folder there names a version folder that cannot be told gone; and when a version folder has no change list while a
-	list naming no folder cannot be read, as it may be that folder's.
+	it cannot; when an entry with a version folder's name is a link; when an entry named after a folder there cannot be
+	read as its change list (a committed version would be left out silently); when two version folders have one number,
+	or one has two change lists; when an entry with a change list's name for no folder there is no regular file, or
+	names a version folder that cannot be told gone; and when an orphan may not go.
 	'''
 	try:
 		os.lstat(job_vault_path)
@@ -4617,9 +4625,10 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 		return None
 	except OSError as e:
 		raise VaultScanError(f'cannot look at the vault {job_vault_path}: {e}')
-	# every folder named V...--, by name: its path; and every other entry so named, as (name, path, regular file)
+	# every folder named V...--, by name: its path; and every entry so named but a version folder, as (name, path,
+	# regular file), each looked at as itself, never through a link
 	folders = {}
-	files = []
+	entries = []
 	unfinished = []
 	try:
 		for entry in os.scandir(job_vault_path):
@@ -4630,10 +4639,16 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 				continue
 			if not (name.startswith('V') and '--' in name):
 				continue
-			if entry.is_dir():
+			version_form = is_version_folder_name(name)
+			if version_form and entry.is_symlink():
+				raise VaultScanError(f'{name} in {job_vault_path} has a version folder\'s name but is a link')
+			is_dir = entry.is_dir(follow_symlinks=False)
+			if is_dir:
 				folders[name] = entry.path
-			else:
-				files.append((name, entry.path, entry.is_file()))
+			if not (is_dir and version_form):
+				entries.append((name, entry.path, entry.is_file(follow_symlinks=False)))
+	except VaultScanError:
+		raise
 	except Exception as e:
 		raise VaultScanError(f'cannot list the vault {job_vault_path}: {e}')
 	try:
@@ -4645,12 +4660,17 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 					raise VaultScanError(f'two version folders in {job_vault_path} are numbered {number}: {numbered[number]} and {name}')
 				numbered[number] = name
 		version_folders = set(numbered.values())
-		# each version folder's change lists, and every folder some list is named after
+		# the numbers the folders there carry, version folders or not
+		carried = {vault_version_number(name) for name in folders} - {None}
+		# each version folder's change lists, and every folder some entry is named after
 		own = {name: [] for name in version_folders}
 		claimed = set()
-		unread = []
+		kept = []
+		# the numbers of the orphans the kept entries may be the lists of, and whether one's number cannot be read
+		held_back = set()
+		hold_all = False
 		gone = []
-		for name, path, is_file in files:
+		for name, path, is_file in entries:
 			owners = []
 			at = name.find('--')
 			while at != -1:
@@ -4661,7 +4681,7 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 				claimed.update(owners)
 				usable = [owner for owner in owners if is_file and owner in version_folders and change_list_record(name[len(owner) + 2:]) is not None]
 				if not usable:
-					raise VaultScanError(f'{name} in {job_vault_path} is named after the folder {owners[-1]}, but cannot be read as its change list')
+					raise VaultScanError(f'{name} in {job_vault_path} is named after the folder {owners[-1]}, but cannot be read as its change list (a regular file named after it and its record)')
 				for owner in usable:
 					own[owner].append(name)
 				continue
@@ -4669,10 +4689,18 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 			first, _, rest = name.partition('--')
 			stamp, _, record = rest.partition('--')
 			folder = f'{first}--{stamp}'
-			if is_file and is_version_folder_name(folder) and change_list_record(record) is not None:
-				gone.append((folder, path))
+			number = vault_version_number(name)
+			if is_version_folder_name(folder) and change_list_record(record) is not None:
+				if not is_file:
+					raise VaultScanError(f'{name} in {job_vault_path} has a change list\'s name but is no regular file')
+				if number not in carried:
+					gone.append((folder, path))
+					continue
+			kept.append(name)
+			if number is None:
+				hold_all = True
 			else:
-				unread.append(name)
+				held_back.add(number)
 		versions = {}
 		change_lists = {}
 		orphans = []
@@ -4681,16 +4709,18 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 				raise VaultScanError(f'the version folder {name} in {job_vault_path} has {len(own[name])} change lists: {", ".join(sorted(own[name]))}')
 			if not own[name]:
 				if name not in claimed:
-					orphans.append(folders[name])
+					orphans.append((number, name))
 				continue
 			change_list = own[name][0]
 			size, inodes = change_list_record(change_list[len(name) + 2:])
 			timestamp = datetime.datetime.strptime(name.partition('--')[2], VAULT_TIMESTAMP_FORMAT).timestamp()
 			versions[number] = VaultEntry(number, folders[name], timestamp, size, inodes)
 			change_lists[number] = os.path.join(job_vault_path, change_list)
-		if orphans and unread:
-			raise VaultScanError(f'{", ".join(sorted(os.path.basename(path) for path in orphans))} in {job_vault_path} have no change list, and '
-				f'{", ".join(sorted(unread))}, whose names cannot be read, may be theirs')
+		for number, name in orphans:
+			if hold_all or number in held_back:
+				raise VaultScanError(f'{name} in {job_vault_path} has no change list, and {", ".join(sorted(kept))}, which name no folder there, may be its')
+			if versions and min(versions) < number < max(versions):
+				raise VaultScanError(f'{name} in {job_vault_path} has no change list, though versions {min(versions)} and {max(versions)} around it are committed: its list may not have been listed')
 		stale = []
 		for folder, path in gone:
 			# not listed: only a folder that is not there is gone
@@ -4706,7 +4736,7 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 		raise
 	except Exception as e:
 		raise VaultScanError(f'cannot read the vault {job_vault_path}: {type(e).__name__}: {e}')
-	return VaultListing(versions, change_lists, orphans, stale, sorted(unread), unfinished)
+	return VaultListing(versions, change_lists, [folders[name] for _, name in orphans], stale, sorted(kept), unfinished)
 
 def remove_orphan(job_vault_path:str, path:str) -> bool:
 	'''rm -rf of path, a version folder without a change list in job_vault_path: whether it is gone.'''
@@ -4754,16 +4784,23 @@ def remove_incomplete_vault_versions(job_vault_path: str) -> list:
 			deleted.append(path)
 	return deleted
 
+# the job vaults (absolute paths) a scan of this daemon found committed versions in: one that is not there afterwards
+# went away under the daemon (as a mergerfs branch dropping out shows it), and is no new vault to start at V0 in
+VAULTS_WITH_VERSIONS = set()
+
 def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	'''
 	The versions job_vault_path holds, oldest first, each with the size and inodes its change list records, or with
-	recalculate, what du measures (the list renamed to record it). A job vault that is not there is an empty one.
+	recalculate, what du measures (the list renamed to record it). A job vault that is not there is an empty one, unless
+	a scan of this daemon found committed versions in it (VAULTS_WITH_VERSIONS): it fails then, as a backup would start
+	a whole V0 beside them once it came back.
 
 	The scan deletes only what it is certain of, once the whole vault was read (read_job_vault()): the change lists of
-	version folders that are not there, and the version folders without a change list, the orphans of backups that did
-	not commit. Raises VaultScanError, having deleted nothing, when the vault cannot be read whole or for certain, and
-	(after the deletions) when an orphan cannot be removed, as the next backup would make a version of its number beside
-	it. The caller's job then fails its attempt, with its FAILED marker: no backup prunes or writes on a partial view.
+	version folders that are not there, and the version folders without a change list that may go, the orphans of
+	backups that did not commit and of removals cut short. Raises VaultScanError, having deleted nothing, when the vault
+	cannot be read whole or for certain, and (after the deletions) when an orphan cannot be removed, as the next backup
+	would make a version of its number beside it. The caller's job then fails its attempt, with its FAILED marker: no
+	backup prunes or writes on a partial view.
 	'''
 	# job vault subfolder should follow: V{version}--{ISO8601ish time}
 	# ex. V0--2021-01-01_00-00-00_-0800
@@ -4773,10 +4810,16 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 		backuperTeeLogToTl(job_vault_path, f'Cannot read the vault, nothing in it is removed: {e.reason}', error=True)
 		raise
 	if listing is None:
+		if os.path.abspath(job_vault_path) in VAULTS_WITH_VERSIONS:
+			reason = f'the vault {job_vault_path} is not there, though this daemon found versions in it: not starting it again'
+			backuperTeeLogToTl(job_vault_path, f'Cannot read the vault: {reason}', error=True)
+			raise VaultScanError(reason)
 		backuperTeeLogToTl(job_vault_path, f'Job vault path {job_vault_path} does not exist', error=True)
 		return VaultInfo({},0,0)
-	for name in listing.unread:
-		backuperTeeLogToTl(job_vault_path, f'Keeping {name}: its name does not say which version it is the change list of', error=True)
+	if listing.versions:
+		VAULTS_WITH_VERSIONS.add(os.path.abspath(job_vault_path))
+	for name in listing.kept:
+		backuperTeeLogToTl(job_vault_path, f'Keeping {name}: it names no folder there, and its name does not say it is the change list of a version gone', error=True)
 	for path in listing.stale:
 		backuperTeeLogToTl(job_vault_path, f'Vault path {path.rpartition("--")[0]} for content {os.path.basename(path)} does not exist, deleting content file...', error=True)
 		try:
@@ -8038,7 +8081,12 @@ def vault_prune_salt(job_vault:str, job_name:str, manifest:'VaultManifest' = Non
 			os.close(fd)
 			raise
 		os.close(fd)
-		fsync_path(job_vault, folder=True)
+		try:
+			fsync_path(job_vault, folder=True)
+		except OSError as e:
+			# the file holds the whole secret, synced: only its name may not outlast a crash, and one made again then names
+			# a temp a cut off run left otherwise, which stays a stray
+			backuperTeeLogToTl(job_name, f"The vault's secret for pruning's temp names was made in {path}, but {job_vault} cannot be synced: {e}", warning=True)
 		return True
 	stored = None
 	if manifest is not None:
@@ -8321,8 +8369,13 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		forget_version_moves(referenceVaultPath)
 		PRUNE_ABORTED.pop(job_name, None)
 		return True
-	# the path as a pattern of its own, so a vault path holding *, ? or [ matches nothing beside it
-	own_paths = lambda: glob.glob(glob.escape(referenceVaultPath)+'*',recursive=False)
+	def own_paths() -> list:
+		# the reference vault's folder and its change lists (its name, --, and a record change_list_record() reads), and
+		# nothing else named like them, such as a user's V0--<timestamp>.stray beside it. raises OSError when the job
+		# vault cannot be listed
+		folder = os.path.basename(referenceVaultPath)
+		return sorted(os.path.join(job_vault, name) for name in os.listdir(job_vault)
+			if name == folder or (name.startswith(folder + '--') and change_list_record(name[len(folder) + 2:]) is not None))
 	# only a folder that is not there is gone: one that cannot be looked at may hold every copy the next version links
 	try:
 		os.lstat(referenceVaultPath)
@@ -8330,7 +8383,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		# a removal cut short took the folder, once its links were all materialised and the records written: what is left
 		# goes, and its record with it
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{referenceVaultPath} is already gone: removing what is left of it')
-		if not remove_paths(own_paths()):
+		try:
+			left = own_paths()
+		except OSError as e:
+			return keep_oldest(f'the job vault cannot be listed for what is left of it: {e}')
+		if not remove_paths(left):
 			return keep_oldest('rm -rf of what was left of it failed')
 		return went_down(False)
 	except OSError as e:
@@ -8552,9 +8609,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	if not write_records():
 		return keep_oldest(f'the change list of {applyingVaultEntry.path} cannot be renamed for what it now holds')
 	backuperTeeLogToTl(path=referenceVaultPath,message=f'Removing {referenceVaultPath}')
-	paths_to_remove = own_paths()
-	if referenceVaultPath not in paths_to_remove:
-		# glob() passes over an error listing the job vault: nothing would be removed
+	try:
+		paths_to_remove = own_paths()
+	except OSError as e:
+		return keep_oldest(f'the job vault cannot be listed: {e}')
+	if os.path.join(job_vault, os.path.basename(referenceVaultPath)) not in paths_to_remove:
 		return keep_oldest('its folder was not found listing the job vault')
 	if not remove_paths(paths_to_remove):
 		if there(referenceVaultPath) is False:
