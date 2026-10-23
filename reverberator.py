@@ -4467,18 +4467,35 @@ def do_backup(backup_entries:dict,
 		# the change list's rows are absolute paths: which monitored path they are read under
 		manifest.note_monitor_path(this_version_number,monitor_path)
 		manifest.commit(backup_folder)
-		write_change_list(content_file_name,content_file_content)
+		# current_version next, and the change list, the commit point, last: neither record ever names a version before
+		# this one while this one's list is there, so the scan can take the version after the link for a leftover
+		# (read_job_vault()), and one the link names without a list is never removed
+		link_path = os.path.join(job_vault,'current_version')
+		try:
+			previous_link = os.readlink(link_path)
+		except OSError:
+			previous_link = None
+		swap_current_version(job_vault,os.path.basename(backup_folder))
+		try:
+			write_change_list(content_file_name,content_file_content)
+		except BaseException as e:
+			if isinstance(e, Exception) and not os.path.lexists(content_file_name):
+				# the version is not committed: the link goes back to the one that is, so the scan of the next attempt
+				# removes this one as the version after the link
+				try:
+					if previous_link is None:
+						# a first backup: no link, and a manifest that records no version, as before it began
+						os.remove(link_path)
+						manifest.forget_version()
+					else:
+						swap_current_version(job_vault,previous_link)
+				except (OSError, sqlite3.Error) as undo_error:
+					backuperTeeLogToTl(job_name,f'Cannot put {link_path} back to {previous_link} after the change list failed: {undo_error}',error=True)
+			raise
 		# a vault this daemon committed to has versions: one that later shows none went away under it
 		VAULTS_WITH_VERSIONS.add(os.path.abspath(job_vault))
 		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
-		# create the current version symlink
 		vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder,this_timestamp,this_size,this_inodes)
-		# swapped in under a temporary name, so the link is never missing
-		temp_link = os.path.join(job_vault,'.current_version.tmp')
-		if os.path.lexists(temp_link):
-			os.unlink(temp_link)
-		os.symlink(os.path.basename(backup_folder),temp_link,target_is_directory=True)
-		os.replace(temp_link,os.path.join(job_vault,'current_version'))
 		if log_journal:
 			tracked_files, tracked_folders = manifest.counts()
 			log_to_journal(journalPath,monitor_path,f'end_reverb_backup_{tracked_files}files_{tracked_folders}folders_tracked',job_vault)
@@ -4487,6 +4504,14 @@ def do_backup(backup_entries:dict,
 		if opened_manifest:
 			manifest.close()
 		raise
+
+def swap_current_version(job_vault:str, text:str) -> None:
+	'''Point job_vault's current_version link at text, swapped in under a temporary name, so the link is never missing.'''
+	temp_link = os.path.join(job_vault,'.current_version.tmp')
+	if os.path.lexists(temp_link):
+		os.unlink(temp_link)
+	os.symlink(text,temp_link,target_is_directory=True)
+	os.replace(temp_link,os.path.join(job_vault,'current_version'))
 
 def make_version_folder(job_name:str, path:str) -> bool:
 	'''
@@ -4596,22 +4621,26 @@ def change_list_record(rest:str):
 # write_change_list() renamed them into place
 VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans', 'stale', 'kept', 'unfinished'])
 
-# what a job vault records of its latest commit (recorded_latest_version()): number, the latest committed version's, by
-# the current_version link, or failing that by the manifest; link, whether a current_version entry is there; manifest,
-# the version folder name the manifest records (None when it records none, or there is no manifest)
-LatestRecord = namedtuple('LatestRecord', ['number', 'link', 'manifest'])
+# what a job vault records of its latest commit (recorded_latest_version()): number, the latest version a commit got
+# under way for, by the current_version link, or failing that by the manifest; link, whether a current_version entry is
+# there; manifest, whether a manifest file is there, and recorded, the version folder name it records (None when it
+# records none, or was not read as the link gave the number)
+LatestRecord = namedtuple('LatestRecord', ['number', 'link', 'manifest', 'recorded'])
 
 def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 	'''
-	The latest committed version as job_vault_path records it: by the text of its current_version link (even
-	dangling), which a commit swaps in after the change list, or failing that by the version the manifest's meta
-	records, read only, which a commit sets before the change list. Raises VaultScanError when either cannot be read.
+	The latest version a commit got under way for, as job_vault_path records it: by the text of its current_version
+	link (even dangling), or failing that by the version the manifest's meta records, read only and only then. A commit
+	sets both before it writes its change list, the commit point (do_backup()), so neither names a version before one
+	whose list is there. Raises VaultScanError when either cannot be read.
 	'''
 	link = os.path.join(job_vault_path, 'current_version')
 	number = None
 	try:
 		text = os.readlink(link)
 		number = vault_version_number(os.path.basename(os.fsdecode(text).rstrip('/')))
+		if number is not None:
+			return LatestRecord(number, True, None, None)
 		has_link = True
 	except FileNotFoundError:
 		has_link = False
@@ -4624,7 +4653,7 @@ def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 	try:
 		os.lstat(path)
 	except FileNotFoundError:
-		return LatestRecord(number, has_link, None)
+		return LatestRecord(None, has_link, False, None)
 	except OSError as e:
 		raise VaultScanError(f'cannot look at {path}: {e}')
 	try:
@@ -4639,10 +4668,8 @@ def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 			row = None
 		else:
 			raise VaultScanError(f'cannot read the version {path} records: {e}')
-	manifest = None if row is None else str(row[0])
-	if number is None and manifest is not None:
-		number = vault_version_number(manifest)
-	return LatestRecord(number, has_link, manifest)
+	recorded = None if row is None else str(row[0])
+	return LatestRecord(None if recorded is None else vault_version_number(recorded), has_link, True, recorded)
 
 def read_job_vault(job_vault_path:str) -> VaultListing:
 	'''
@@ -4657,10 +4684,10 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 	is the folder's, --, and the record change_list_record() reads.
 
 	A version folder without a change list, an orphan, may go only on positive evidence, as a listing can leave a list
-	out with no error: when its number is the one after the latest committed version the vault records
-	(recorded_latest_version(), or the newest listed when that is newer), which is a backup that did not commit; or,
-	for a first backup that did not commit, when it is the only orphan and a V0, there is no current_version entry and
-	no entry with a change list's name, and the manifest records no version or a V0 (cut off after its commit). A
+	out with no error: when its number is the one after the latest version the vault records (recorded_latest_version()),
+	which is a backup cut off before its commit got under way; or, for a first backup cut off so, when it is the only
+	orphan and a V0, there is no current_version entry and no entry with a change list's name, and a manifest is there
+	that records no version. A
 	change list that names no folder there is stale, to be deleted, only when it is a regular file, its folder's name
 	is well formed, that folder is not there, no folder there carries its number, and its number is below the oldest
 	committed version (what a removal cut short leaves, as the prune removes the folder first). Any other entry that
@@ -4789,17 +4816,16 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 			for number, name in orphans:
 				if hold_all or number in held_back:
 					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and {", ".join(sorted(kept))}, which name no folder there, may be its')
-				if not record.link and not list_named and len(orphans) == 1 and number == 0 and (record.manifest is None or vault_version_number(record.manifest) == 0):
-					# a first backup that did not commit: cut off before its manifest commit, or between that and its
-					# change list, the manifest then naming a V0 (this one, or one an attempt before it left), while no
-					# link or list was ever made
+				if not record.link and record.manifest and record.recorded is None and not list_named and len(orphans) == 1 and number == 0:
+					# a first backup cut off before its manifest commit: the manifest it opened first records no version,
+					# and no link or list was ever made
 					continue
 				if record.number is not None:
-					# a run cut off between a change list and current_version leaves the link a version behind
-					latest = max(record.number, max(versions)) if versions else record.number
-					if number == latest + 1:
+					# the version after the one the link (or the manifest) names is an attempt cut off before its commit
+					# got under way; the one it names may be committed with its list out of the listing
+					if number == record.number + 1:
 						continue
-					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and is not the one after the latest committed version, {latest}: its list may not have been listed')
+					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and is not the one after the latest recorded version, {record.number}: its list may not have been listed')
 				raise VaultScanError(f'{name} in {job_vault_path} has no change list, and the latest committed version cannot be told')
 		stale = []
 		for number, folder, path in gone:
@@ -5894,6 +5920,10 @@ class VaultManifest:
 	@property
 	def in_transaction(self) -> bool:
 		return self.conn.in_transaction
+
+	def forget_version(self):
+		'''Record no version: a first backup's commit undone before its change list was written (do_backup()).'''
+		self.conn.execute("DELETE FROM meta WHERE key = 'version'")
 
 	def _set_version(self, version_path:str):
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (os.path.basename(os.path.normpath(version_path)),))
@@ -8378,23 +8408,15 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		name = os.path.basename(os.path.abspath(entry.path))
 		found = sorted(listed for listed in os.listdir(job_vault) if (parse_change_list_name(listed) or (None, None))[1] == name)
 		return os.path.join(job_vault, found[0]) if found else None
-	def record(change_list:str, entry:VaultEntry, size:int, inodes:int, make:bool = False):
+	def record(change_list:str, entry:VaultEntry, size:int, inodes:int):
 		# change_list renamed for entry to record size and inodes: entry as it now records, None when that failed. a
-		# version without a list has no other record, or, with make, gets one, as one without is removed at startup
+		# version without a list (only the reference vault can be one: the prune stops for a next version without its
+		# list) has no other record
 		written = entry._replace(size=size, inode=inodes)
 		new_path = change_list_path(entry.path, size, inodes)
 		if change_list == new_path:
 			return written
 		if change_list is None:
-			if not make:
-				return written
-			backuperTeeLogToTl(path=referenceVaultPath,message=f'Creating content file {new_path}')
-			try:
-				# whole or not at all, as every change list is
-				write_change_list(new_path,[])
-			except Exception as e:
-				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error creating content file {new_path}: {e}')
-				return None
 			return written
 		backuperTeeLogToTl(path=referenceVaultPath,message=f'Renaming {change_list} to {new_path}')
 		try:
@@ -8420,7 +8442,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			if transferred[1] or unlinked[1] or copied[1]:
 				written = record(applying_list, applyingVaultEntry,
 					max(0, applyingVaultEntry.size - unlinked[0] + transferred[0] + copied[0]),
-					max(0, applyingVaultEntry.inode - unlinked[1] + transferred[1] + copied[1]), make=True)
+					max(0, applyingVaultEntry.inode - unlinked[1] + transferred[1] + copied[1]))
 				if written is None:
 					records_written = False
 				else:
@@ -8503,7 +8525,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	except OSError as e:
 		return keep_oldest(f'its change list, or that of {applyingVaultEntry.path}, cannot be looked at: {e}')
 	if applying_list is None:
-		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Content file {change_list_path(applyingVaultEntry.path, applyingVaultEntry.size, applyingVaultEntry.inode)} does not exist, creating a new one...')
+		# its list may be only out of the listing (a mergerfs branch out): one made now would be a second when it is back
+		return keep_oldest(f'the change list of {applyingVaultEntry.path} is not there')
 	backuperTeeLogToTl(path=referenceVaultPath,message=f"Dealing with {applyingVersionNumber}: {applyingVaultEntry.path}")
 	materialize_failed = False
 	def failed(message:str) -> None:

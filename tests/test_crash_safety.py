@@ -39,6 +39,8 @@ class TestGetVaultInfoOrphans(unittest.TestCase):
 	def test_orphan_dir_is_removed_not_indexed(self):
 		# a first backup that did not commit: a V0 alone, with no record and no change list (Task 2b fix round 2)
 		with tempfile.TemporaryDirectory() as job_vault:
+			# the manifest the backup opened before making V0, recording no version
+			rv.VaultManifest(job_vault).close()
 			orphan = os.path.join(job_vault, 'V0--2021-01-03_00-00-00_-0800')
 			os.makedirs(orphan)
 			with open(os.path.join(orphan, 'x'), 'w') as f:
