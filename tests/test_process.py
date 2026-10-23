@@ -67,9 +67,11 @@ def test_restart_deletes_incomplete_keeps_committed(job, run_reverberator):
 	wait_for_committed_count(job, 1, timeout=10)
 	proc.send_signal(signal.SIGTERM)
 	proc.wait(timeout=5)
-	orphan = write_incomplete_version(job, 99, {'junk': 'x'}, timestamp='2021-12-31_00-00-00_-0800')
+	# the attempt after the latest commit, which a crash leaves; any other orphan stops the job (Task 2b)
+	latest = max(int(name[1:].partition('--')[0]) for name in os.listdir(job.job_vault) if rv.is_version_folder_name(name))
+	orphan = write_incomplete_version(job, latest + 1, {'junk': 'x'}, timestamp='2021-12-31_00-00-00_-0800')
 	run_reverberator(job.rule_path)
-	wait_until(lambda: not os.path.isdir(orphan), timeout=10, message='incomplete V99 not removed')
+	wait_until(lambda: not os.path.isdir(orphan), timeout=10, message='incomplete version not removed')
 	assert len(committed_versions(job)) >= 1
 
 
