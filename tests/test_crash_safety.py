@@ -26,6 +26,8 @@ class TestRemoveIncompleteVaultVersions(unittest.TestCase):
 			)
 			with open(content, 'w') as f:
 				f.write('path\tiso_time\tevent\tsource_path\n')
+			# the commit's current_version: what says V2 is the attempt after the latest commit (Task 2b)
+			os.symlink(os.path.basename(committed), os.path.join(job_vault, 'current_version'))
 			deleted = rv.remove_incomplete_vault_versions(job_vault)
 			self.assertTrue(os.path.isdir(committed))
 			self.assertTrue(os.path.isfile(content))
@@ -35,14 +37,25 @@ class TestRemoveIncompleteVaultVersions(unittest.TestCase):
 
 class TestGetVaultInfoOrphans(unittest.TestCase):
 	def test_orphan_dir_is_removed_not_indexed(self):
+		# a first backup that did not commit: a V0 alone, with no record and no change list (Task 2b fix round 2)
 		with tempfile.TemporaryDirectory() as job_vault:
-			orphan = os.path.join(job_vault, 'V3--2021-01-03_00-00-00_-0800')
+			orphan = os.path.join(job_vault, 'V0--2021-01-03_00-00-00_-0800')
 			os.makedirs(orphan)
 			with open(os.path.join(orphan, 'x'), 'w') as f:
 				f.write('y')
 			info = rv.get_vault_info(job_vault)
 			self.assertFalse(os.path.isdir(orphan))
-			self.assertNotIn(3, info.vault_info_dict)
+			self.assertNotIn(0, info.vault_info_dict)
+
+	def test_a_lone_orphan_that_is_no_v0_is_kept(self):
+		# no first backup leaves a V3: its list, current_version and manifest may all be out of the listing
+		with tempfile.TemporaryDirectory() as job_vault:
+			orphan = os.path.join(job_vault, 'V3--2021-01-03_00-00-00_-0800')
+			os.makedirs(orphan)
+			with self.assertRaises(rv.VaultScanError):
+				rv.get_vault_info(job_vault)
+			self.assertEqual(rv.remove_incomplete_vault_versions(job_vault), [])
+			self.assertTrue(os.path.isdir(orphan))
 
 
 class TestBackupEntriesToChangeEvents(unittest.TestCase):

@@ -5,6 +5,7 @@ matched to their folders by name before any parse, and duplicate version numbers
 '''
 import errno
 import shutil
+import sys
 import os
 import threading
 import time
@@ -316,43 +317,42 @@ def test_two_change_lists_for_one_folder_fail_the_scan(tmp_path):
 
 
 def test_a_change_list_whose_folder_is_gone_is_deleted(tmp_path):
+	# Task 2b fix round 2: only below the oldest committed version, as a removal cut short leaves it
 	job = three_versions(tmp_path)
-	gone = rv.change_list_path(os.path.join(job.job_vault, 'V9--2021-01-09_00-00-00_-0800'), 4096, 1)
-	open(gone, 'w').close()
-	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2]
+	gone = prune_keeping_v0_stale_list(job)
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [1, 2]
 	assert not os.path.exists(gone)
 
 
 @pytest.mark.parametrize('code', [errno.EIO, errno.EACCES], ids=['EIO', 'EACCES'])
 def test_a_change_list_whose_folder_cannot_be_looked_at_fails_the_scan(tmp_path, monkeypatch, code):
 	job = three_versions(tmp_path)
-	folder = os.path.join(job.job_vault, 'V9--2021-01-09_00-00-00_-0800')
-	gone = rv.change_list_path(folder, 4096, 1)
-	open(gone, 'w').close()
+	gone = prune_keeping_v0_stale_list(job)
+	folder = gone.rpartition('--')[0]
 	real_lstat = os.lstat
 	def lstat(path, *args, **kwargs):
 		if os.path.abspath(os.fspath(path)) == folder:
 			raise OSError(code, os.strerror(code), path)
 		return real_lstat(path, *args, **kwargs)
 	monkeypatch.setattr(rv.os, 'lstat', lstat)
-	with pytest.raises(rv.JobFailure):
+	with pytest.raises(rv.JobFailure) as failure:
 		rv.get_vault_info(job.job_vault)
+	assert os.strerror(code) in failure.value.reason
 	assert os.path.isfile(gone)
 
 
 def test_the_orphan_and_the_leftover_list_go_only_on_a_clean_listing(tmp_path, monkeypatch):
 	# an orphan, a list whose folder is gone, and an entry that cannot be looked at: nothing goes until the listing is whole
 	job = three_versions(tmp_path)
-	orphan = write_incomplete_version(job, 5, {'x': 'y'})
-	gone = rv.change_list_path(os.path.join(job.job_vault, 'V9--2021-01-09_00-00-00_-0800'), 4096, 1)
-	open(gone, 'w').close()
+	gone = prune_keeping_v0_stale_list(job)
+	orphan = write_incomplete_version(job, 3, {'x': 'y'})
 	listing(monkeypatch, job, fail={change_list_name(job, 2): errno.EIO}, first=lambda listed: not listed.startswith('V2--'))
 	with pytest.raises(rv.JobFailure):
 		rv.get_vault_info(job.job_vault)
 	assert rv.remove_incomplete_vault_versions(job.job_vault) == []
 	assert os.path.isdir(orphan) and os.path.isfile(gone)
 	monkeypatch.undo()
-	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2]
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [1, 2]
 	assert not os.path.exists(orphan) and not os.path.exists(gone)
 
 
@@ -478,24 +478,26 @@ def test_a_crash_leftover_above_the_newest_version_is_removed(tmp_path):
 	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2] and not os.path.exists(leftover)
 
 
-def test_a_cut_short_removal_below_the_oldest_version_is_removed(tmp_path, monkeypatch):
-	# the prune materialised V1's links, then rm took V0's change list and not its folder
+class Killed(BaseException):
+	pass
+
+
+def test_a_removal_cut_short_between_folder_and_list_leaves_a_list_the_scan_deletes(tmp_path, monkeypatch):
+	# the prune removes the folder first: killed before its change list goes, it leaves a stale list below the oldest
 	job = three_versions(tmp_path)
 	v0 = version(job, 0)
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
-	real_run = rv.multiCMD.run_command
-	def run(command, *args, **kwargs):
-		if command[0] == 'rm':
-			for path in command[1:]:
-				if path.endswith(rv.CONTENT_FILE_EXTENSION_NAME):
-					os.remove(path)
-			return 1
-		return real_run(command, *args, **kwargs)
-	monkeypatch.setattr(rv.multiCMD, 'run_command', run)
-	rv.decrement_stepper(info, job.job_name, job.monitor)
+	real_remove = os.remove
+	def remove(path, *args, **kwargs):
+		if os.fspath(path).endswith(rv.CONTENT_FILE_EXTENSION_NAME) and os.path.basename(os.fspath(path)).startswith(v0.name + '--'):
+			raise Killed()
+		return real_remove(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'remove', remove)
+	with pytest.raises(Killed):
+		rv.decrement_stepper(info, job.job_name, job.monitor)
 	monkeypatch.undo()
-	assert os.path.isdir(v0.path) and lists_of(job, v0) == []
-	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [1, 2] and not os.path.exists(v0.path)
+	assert not os.path.exists(v0.path) and len(lists_of(job, v0)) == 1
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [1, 2] and lists_of(job, v0) == []
 	every_folder_reads_right(job)
 
 
@@ -670,7 +672,7 @@ def test_a_gap_in_the_committed_versions_fails_the_scan(tmp_path):
 	before = vault_names(job)
 	with pytest.raises(rv.JobFailure) as failure:
 		rv.get_vault_info(job.job_vault)
-	assert '2' in failure.value.reason
+	assert 'missing' in failure.value.reason
 	assert rv.remove_incomplete_vault_versions(job.job_vault) == []
 	assert_nothing_done(job, before, backup_keeping_two(job))
 	assert os.path.isdir(v0.path) and os.path.isfile(v0.change_list)
@@ -723,3 +725,238 @@ def test_a_fresh_daemon_starts_an_empty_vault_at_v0(tmp_path):
 	assert dict(rv.get_vault_info(job.job_vault).vault_info_dict) == {}
 	run_backup(job)
 	assert [kept.number for kept in rv.list_versions(job.job_vault)] == [0]
+
+
+# --- Task 2b fix round 2: an orphan goes only on positive evidence ---
+
+def hide(monkeypatch, job, hidden):
+	'''os.scandir() of the job vault leaving out, with no error, the entries for which hidden(name) is true: as a mergerfs
+	branch dropping out shows it, each change list on one branch while each version folder spans several.'''
+	real_scandir = os.scandir
+	def scandir(path='.'):
+		if os.path.abspath(os.fspath(path)) != job.job_vault:
+			return real_scandir(path)
+		return iter([entry for entry in real_scandir(path) if not hidden(entry.name)])
+	monkeypatch.setattr(rv.os, 'scandir', scandir)
+
+
+def assert_refused_everywhere(job, before):
+	with pytest.raises(rv.JobFailure):
+		rv.get_vault_info(job.job_vault)
+	assert rv.remove_incomplete_vault_versions(job.job_vault) == []
+	assert_nothing_done(job, before, backup_keeping_two(job))
+
+
+@pytest.mark.parametrize('memory', ['at_a_start', 'in_process'])
+def test_every_list_hidden_removes_nothing(tmp_path, monkeypatch, memory):
+	# review11: with no committed version showing, every folder was an orphan, rm -rf'd by the startup cleanup and by
+	# the scan of a daemon that had not seen the vault
+	job = three_versions(tmp_path)
+	if memory == 'in_process':
+		rv.get_vault_info(job.job_vault)
+	else:
+		rv.VAULTS_WITH_VERSIONS.clear()
+	before = vault_names(job)
+	hide(monkeypatch, job, lambda name: name.endswith(rv.CONTENT_FILE_EXTENSION_NAME))
+	assert_refused_everywhere(job, before)
+
+
+@pytest.mark.parametrize('number', [0, 2], ids=['oldest', 'newest'])
+def test_the_oldest_or_newest_list_hidden_removes_nothing(tmp_path, monkeypatch, number):
+	# review11: the version whose list was hidden was rm -rf'd as an orphan below the oldest or above the newest
+	job = three_versions(tmp_path)
+	rv.VAULTS_WITH_VERSIONS.clear()
+	hidden = os.path.basename(version(job, number).change_list)
+	before = vault_names(job)
+	hide(monkeypatch, job, lambda name: name == hidden)
+	assert_refused_everywhere(job, before)
+
+
+@pytest.mark.parametrize('record', ['current_version', 'manifest'])
+def test_a_crash_leftover_numbered_after_the_recorded_latest_is_removed(tmp_path, record):
+	job = three_versions(tmp_path)
+	if record == 'manifest':
+		os.remove(os.path.join(job.job_vault, 'current_version'))
+	leftover = write_incomplete_version(job, 3, {'x': 'y'})
+	assert rv.remove_incomplete_vault_versions(job.job_vault) == [leftover]
+	leftover = write_incomplete_version(job, 3, {'x': 'y'})
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2] and not os.path.exists(leftover)
+
+
+def test_a_crash_leftover_after_a_record_left_behind_is_removed(tmp_path):
+	# a run cut off between V2's change list and current_version leaves the link on V1; the next attempt's crash leaves V3
+	job = three_versions(tmp_path)
+	link = os.path.join(job.job_vault, 'current_version')
+	os.remove(link)
+	os.symlink(version(job, 1).name, link)
+	leftover = write_incomplete_version(job, 3, {'x': 'y'})
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2] and not os.path.exists(leftover)
+
+
+@pytest.mark.parametrize('number', [4, 5])
+def test_a_leftover_past_the_recorded_latest_plus_one_fails_the_scan(tmp_path, number):
+	job = three_versions(tmp_path)
+	write_incomplete_version(job, number, {'x': 'y'})
+	before = vault_names(job)
+	assert_refused_everywhere(job, before)
+
+
+@pytest.mark.parametrize('manifest', ['no_manifest', 'manifest_without_a_version', 'manifest_naming_it', 'manifest_naming_an_earlier_v0'])
+def test_a_first_backups_crash_is_removed(tmp_path, manifest):
+	# no current_version, no change list, and a manifest (the backup opens it before making V0) that records no version,
+	# or a V0: this one, cut off between the manifest's commit and its change list, or an earlier attempt's (haiku11
+	# chain A: two first backups cut off in a row)
+	job = create_job(str(tmp_path))
+	timestamp = '2021-01-02_00-00-00_-0800'
+	if manifest != 'no_manifest':
+		os.makedirs(job.job_vault)
+		recorded = rv.VaultManifest(job.job_vault)
+		if manifest != 'manifest_without_a_version':
+			recorded.begin()
+			recorded.commit(os.path.join(job.job_vault, f'V0--{timestamp}' if manifest == 'manifest_naming_it' else 'V0--2021-01-01_00-00-00_-0800'))
+		recorded.close()
+	leftover = write_incomplete_version(job, 0, {'x': 'y'}, timestamp=timestamp)
+	assert rv.remove_incomplete_vault_versions(job.job_vault) == [leftover]
+	leftover = write_incomplete_version(job, 0, {'x': 'y'}, timestamp=timestamp)
+	assert dict(rv.get_vault_info(job.job_vault).vault_info_dict) == {} and not os.path.exists(leftover)
+
+
+
+def test_an_orphan_below_the_oldest_fails_the_scan(tmp_path):
+	# a list hidden or moved, or a removal cut short by an older daemon (which removed the list first): no evidence
+	job = three_versions(tmp_path)
+	os.remove(version(job, 0).change_list)
+	before = vault_names(job)
+	assert_refused_everywhere(job, before)
+
+
+@pytest.mark.parametrize('rename', ['renumbered', 'renamed_away'])
+def test_a_version_folder_renamed_by_hand_keeps_its_list(tmp_path, rename):
+	# haiku11: V2--ts renamed V5--ts or old-V2--ts: V2's list was deleted as stale, and V5 removed as an orphan
+	job = three_versions(tmp_path)
+	v2 = version(job, 2)
+	new = os.path.join(job.job_vault, v2.name.replace('V2--', 'V5--', 1) if rename == 'renumbered' else 'old-' + v2.name)
+	os.rename(v2.path, new)
+	before = vault_names(job)
+	assert_refused_everywhere(job, before)
+	assert os.path.isdir(new) and os.path.isfile(v2.change_list)
+
+
+def test_the_newest_list_renamed_by_hand_keeps_its_version(tmp_path):
+	# haiku11: the newest list renamed x-V2--…: V2 was removed as an orphan above the newest
+	job = three_versions(tmp_path)
+	v2 = version(job, 2)
+	os.rename(v2.change_list, os.path.join(job.job_vault, 'x-' + os.path.basename(v2.change_list)))
+	before = vault_names(job)
+	assert_refused_everywhere(job, before)
+	assert os.path.isdir(v2.path)
+
+
+def prune_keeping_v0_stale_list(job):
+	'''V0 removed by a prune, then a change list named for it put back: a stale list below the oldest.'''
+	v0 = version(job, 0)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
+	assert not os.path.exists(v0.path)
+	stale = rv.change_list_path(v0.path, 4096, 1)
+	open(stale, 'w').close()
+	return stale
+
+
+def test_a_stale_list_below_the_oldest_is_deleted(tmp_path):
+	job = three_versions(tmp_path)
+	stale = prune_keeping_v0_stale_list(job)
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [1, 2] and not os.path.exists(stale)
+
+
+@pytest.mark.parametrize('number', [3, 9])
+def test_a_stale_list_not_below_the_oldest_fails_the_scan(tmp_path, number):
+	job = three_versions(tmp_path)
+	stale = rv.change_list_path(os.path.join(job.job_vault, f'V{number}--2021-01-09_00-00-00_-0800'), 4096, 1)
+	open(stale, 'w').close()
+	before = vault_names(job)
+	assert_refused_everywhere(job, before)
+	assert os.path.isfile(stale)
+
+
+def test_an_rm_failure_inside_the_oldest_keeps_its_lists_and_the_next_prune_finishes(tmp_path, monkeypatch):
+	# the folder goes first, its lists only once it is gone: a removal cut short leaves the version committed
+	job = three_versions(tmp_path)
+	v0 = version(job, 0)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	real_run = rv.multiCMD.run_command
+	def run(command, *args, **kwargs):
+		if command[0] == 'rm':
+			# rm got through the change lists it was given, and part of the folder
+			for path in command[2:]:
+				if path.endswith(rv.CONTENT_FILE_EXTENSION_NAME):
+					os.remove(path)
+				elif os.path.isdir(path):
+					os.remove(os.path.join(path, 'keep'))
+			return 1
+		return real_run(command, *args, **kwargs)
+	monkeypatch.setattr(rv.multiCMD, 'run_command', run)
+	rv.decrement_stepper(info, job.job_name, job.monitor)
+	monkeypatch.undo()
+	assert list(info) == [0, 1, 2] and os.path.isdir(v0.path) and len(lists_of(job, v0)) == 1
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2]
+	rv.decrement_stepper(info, job.job_name, job.monitor)
+	assert list(info) == [1, 2] and not os.path.exists(v0.path) and lists_of(job, v0) == []
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [1, 2]
+	for kept in rv.list_versions(job.job_vault):
+		assert open(os.path.join(kept.path, 'D/secret')).read() == 'secret', kept.name
+
+
+def test_one_enoent_on_the_oldest_while_it_is_listed_keeps_it(tmp_path, monkeypatch, capsys):
+	# review11 p4: the cut-short branch trusted one ENOENT and rm -rf'd what the listing showed of V0, unmaterialised
+	job = three_versions(tmp_path)
+	v0, v1 = version(job, 0), version(job, 1)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	real_lstat = os.lstat
+	once = []
+	def lstat(path, *args, **kwargs):
+		# the prune's own look at V0, once
+		if not once and os.path.abspath(os.fspath(path)) == v0.path and sys._getframe(1).f_code.co_name == 'decrement_stepper':
+			once.append(path)
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	capsys.readouterr()
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	monkeypatch.undo()
+	assert once and list(info) == [0, 1, 2] and os.path.isdir(v0.path) and os.path.isfile(v0.change_list)
+	assert len(alerting_lines(capsys.readouterr().out)) == 1
+	assert os.readlink(os.path.join(v1.path, 'D/secret')).endswith(f'{v0.name}/D/secret')
+
+
+@pytest.mark.parametrize('folder', ['Vacation--2020', 'V--notes', 'V7--old'])
+def test_a_users_folder_that_claims_nothing_holds_nothing_back(tmp_path, folder):
+	# review11 p5: a user's folder named V…--… held back every orphan, so any crash stopped the job
+	job = three_versions(tmp_path)
+	os.makedirs(os.path.join(job.job_vault, folder, 'inside'))
+	leftover = write_incomplete_version(job, 3, {'x': 'y'})
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2]
+	assert not os.path.exists(leftover) and os.path.isdir(os.path.join(job.job_vault, folder, 'inside'))
+
+
+def test_the_daemons_own_commits_remember_the_vault(tmp_path, monkeypatch):
+	# review11 p1: a vault this process started was never remembered, so a listing that showed it empty got a second V0
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	run_backup(job)
+	assert os.path.abspath(job.job_vault) in rv.VAULTS_WITH_VERSIONS
+	before = vault_names(job)
+	hide(monkeypatch, job, lambda name: name.startswith('V'))
+	assert isinstance(backup_keeping_two(job), rv.JobFailure)
+	monkeypatch.undo()
+	assert vault_names(job) == before
+
+
+def test_the_prune_keeps_an_entry_named_like_a_list_that_is_no_file(tmp_path):
+	# review11 p3: a folder named V0--<ts>--<record>.nsv went with V0
+	job = three_versions(tmp_path)
+	v0 = version(job, 0)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	odd = os.path.join(job.job_vault, v0.name + '--1_B-1_ino' + rv.CONTENT_FILE_EXTENSION_NAME)
+	os.makedirs(os.path.join(odd, 'inside'))
+	rv.decrement_stepper(info, job.job_name, job.monitor)
+	assert list(info) == [1, 2] and not os.path.exists(v0.path) and os.path.isdir(os.path.join(odd, 'inside'))
