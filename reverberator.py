@@ -1768,11 +1768,18 @@ CHANGE_LIST_FOLDER_PREFIX = '.reverberator-change-list-'
 
 def write_change_list(content_file_name:str, rows:list) -> None:
 	'''
-	Write a new version's change list, its commit marker, whole or not at all: into a private folder of its own in the
-	job vault (mkdtemp(), CHANGE_LIST_FOLDER_PREFIX), fsynced, renamed into place, the job vault fsynced, then the
-	private folder removed. No reader ever sees part of its rows, a crash before the rename leaves the version uncommitted,
-	removed at the next start, and no name planted or raced in the job vault can take the rows elsewhere. A failed sync
-	of the folder after the rename is only logged, as the version is committed by then.
+	Write a new version's change list, its commit marker, whole or not at all (prepare_change_list(), then
+	place_change_list()): no reader ever sees part of its rows, a crash before the rename leaves the version
+	uncommitted, and no name planted or raced in the job vault can take the rows elsewhere.
+	'''
+	place_change_list(content_file_name, prepare_change_list(content_file_name, rows))
+
+def prepare_change_list(content_file_name:str, rows:list) -> str:
+	'''
+	The slow part of writing a change list: its rows written whole into a private folder of its own in the job vault
+	(mkdtemp(), CHANGE_LIST_FOLDER_PREFIX), under its own name, and fsynced. Returns that file's path, for
+	place_change_list() (or discard_change_list()). A crash leaves the private folder, which the startup cleanup removes;
+	an error removes it, and raises.
 	'''
 	job_vault = os.path.dirname(os.path.abspath(content_file_name))
 	private = tempfile.mkdtemp(prefix=CHANGE_LIST_FOLDER_PREFIX,dir=job_vault)
@@ -1780,17 +1787,34 @@ def write_change_list(content_file_name:str, rows:list) -> None:
 	try:
 		TSVZ.appendLinesTabularFile(temp_path,rows,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=False)
 		fsync_path(temp_path)
+	except BaseException:
+		discard_change_list(temp_path)
+		raise
+	return temp_path
+
+def place_change_list(content_file_name:str, temp_path:str) -> None:
+	'''
+	A change list prepare_change_list() wrote at temp_path renamed into place, the commit point of its version, then the
+	job vault fsynced and the private folder removed. A failed sync of the folder after the rename is only logged, as
+	the version is committed by then.
+	'''
+	job_vault = os.path.dirname(os.path.abspath(content_file_name))
+	try:
 		os.replace(temp_path,content_file_name)
 		try:
 			fsync_path(job_vault,folder=True)
 		except OSError as e:
 			backuperTeeLogToTl(content_file_name,f'Could not sync the folder of {content_file_name} to disk: {e}',warning=True)
 	finally:
-		# empty once the list is in place; one a crash leaves, or one not emptied here, is removed at the next start
-		with contextlib.suppress(OSError):
-			os.remove(temp_path)
-		with contextlib.suppress(OSError):
-			os.rmdir(private)
+		discard_change_list(temp_path)
+
+def discard_change_list(temp_path:str) -> None:
+	'''The private folder of a change list prepare_change_list() wrote at temp_path removed, with what is left in it.'''
+	# empty once the list is in place; one a crash leaves, or one not emptied here, is removed at the next start
+	with contextlib.suppress(OSError):
+		os.remove(temp_path)
+	with contextlib.suppress(OSError):
+		os.rmdir(os.path.dirname(temp_path))
 
 def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 	'''
@@ -4466,18 +4490,32 @@ def do_backup(backup_entries:dict,
 		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
 		# the change list's rows are absolute paths: which monitored path they are read under
 		manifest.note_monitor_path(this_version_number,monitor_path)
-		manifest.commit(backup_folder)
-		# current_version next, and the change list, the commit point, last: neither record ever names a version before
-		# this one while this one's list is there, so the scan can take the version after the link for a leftover
-		# (read_job_vault()), and one the link names without a list is never removed
+		# the change list's rows first, written whole and synced in its private folder: the slow part, before either record
+		# names this version, so a crash there leaves an orphan at the link + 1, which the next scan removes. then the
+		# manifest, current_version, and the list's rename into place, the commit point, last: neither record ever
+		# names a version before this one while this one's list is there, so the scan can take the version after the
+		# link for a leftover (read_job_vault()), and one the link names without a list is never removed
+		prepared_list = prepare_change_list(content_file_name,content_file_content)
 		link_path = os.path.join(job_vault,'current_version')
 		try:
 			previous_link = os.readlink(link_path)
 		except OSError:
 			previous_link = None
-		swap_current_version(job_vault,os.path.basename(backup_folder))
 		try:
-			write_change_list(content_file_name,content_file_content)
+			manifest.commit(backup_folder)
+			swap_current_version(job_vault,os.path.basename(backup_folder))
+		except BaseException as e:
+			discard_change_list(prepared_list)
+			if isinstance(e, Exception) and previous_link is None and not os.path.lexists(link_path):
+				# a first backup whose link could not be made: a manifest naming V0 with no link would be refused for
+				# good, so it records no version again, as before the backup began
+				try:
+					manifest.forget_version()
+				except sqlite3.Error as undo_error:
+					backuperTeeLogToTl(job_name,f'Cannot drop the version the manifest records after {link_path} could not be made: {undo_error}',error=True)
+			raise
+		try:
+			place_change_list(content_file_name,prepared_list)
 		except BaseException as e:
 			if isinstance(e, Exception) and not os.path.lexists(content_file_name):
 				# the version is not committed: the link goes back to the one that is, so the scan of the next attempt

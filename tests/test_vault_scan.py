@@ -1063,39 +1063,81 @@ def restart_and_scan(job):
 		return removed, e
 
 
-@pytest.mark.parametrize('step', ['copy', 'manifest', 'swap', 'list'])
+def commit_hooks(monkeypatch, kill_at=None, fail_place=False):
+	'''
+	The commit's steps, as the syscalls and calls that make them, recorded in order in the list returned, with a kill
+	(Killed) at kill_at: 'writing' (half way through the change list's rows, in its private folder), 'manifest' (just
+	after the manifest's commit), 'swap' (just after current_version is swapped in), 'placed' (just after the list's
+	rename into place); with fail_place, that rename fails with ENOSPC instead.
+	'''
+	steps = []
+	real_append, real_commit, real_replace = rv.TSVZ.appendLinesTabularFile, rv.VaultManifest.commit, os.replace
+	def append(path, rows, *args, **kwargs):
+		if rv.CHANGE_LIST_FOLDER_PREFIX not in os.fspath(path):
+			return real_append(path, rows, *args, **kwargs)
+		if kill_at == 'writing':
+			real_append(path, list(rows)[:1], *args, **kwargs)
+			raise Killed()
+		result = real_append(path, rows, *args, **kwargs)
+		steps.append('list written')
+		return result
+	def commit(self, version_path=None):
+		real_commit(self, version_path)
+		if version_path is not None:
+			steps.append('manifest')
+			if kill_at == 'manifest':
+				raise Killed()
+	def replace(source, dest, *args, **kwargs):
+		name = os.path.basename(os.fspath(dest))
+		if name.endswith(rv.CONTENT_FILE_EXTENSION_NAME) and fail_place:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), dest)
+		result = real_replace(source, dest, *args, **kwargs)
+		if name == 'current_version':
+			steps.append('link')
+			if kill_at == 'swap':
+				raise Killed()
+		elif name.endswith(rv.CONTENT_FILE_EXTENSION_NAME):
+			steps.append('list placed')
+			if kill_at == 'placed':
+				raise Killed()
+		return result
+	monkeypatch.setattr(rv.TSVZ, 'appendLinesTabularFile', append)
+	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
+	monkeypatch.setattr(rv.os, 'replace', replace)
+	return steps
+
+
+def test_the_commit_writes_the_list_first_and_places_it_last(tmp_path, monkeypatch):
+	# Task 2b fix round 4: the slow part, the list's rows written and synced in its private folder, comes before either
+	# record names the version; the rename into place, the commit point, comes last
+	job = three_versions(tmp_path)
+	steps = commit_hooks(monkeypatch)
+	run_backup(job, keep_modified(job, 'ordered'))
+	monkeypatch.undo()
+	assert steps == ['list written', 'manifest', 'link', 'list placed']
+
+
+def private_folders(job):
+	return [name for name in os.listdir(job.job_vault) if name.startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
+
+
+@pytest.mark.parametrize('step', ['writing', 'manifest', 'swap', 'placed'])
 def test_a_crash_at_each_step_of_the_commit(tmp_path, monkeypatch, step):
-	# the commit's order: the manifest, current_version, then the change list, the commit point. A crash before the swap
-	# leaves an orphan at the link + 1, cleaned up; one after the swap leaves the link on an orphan, refused (accepted);
-	# one after the list leaves the version committed
+	# a kill while the list is written (however long a big one takes) or before the link names the version leaves an
+	# orphan at the link + 1, cleaned up; one between the swap and the rename leaves the link on an orphan, refused
+	# (accepted, a few syscalls wide); one after the rename leaves the version committed
 	job = three_versions(tmp_path)
 	committed = committed_folders(job)
-	real_commit, real_symlink, real_write = rv.VaultManifest.commit, os.symlink, rv.write_change_list
-	def commit(self, version_path=None):
-		if version_path is not None and step == 'copy':
-			raise Killed()
-		real_commit(self, version_path)
-	def symlink(source, dest, *args, **kwargs):
-		if step == 'manifest' and os.path.basename(os.fspath(dest)) == '.current_version.tmp':
-			raise Killed()
-		return real_symlink(source, dest, *args, **kwargs)
-	def write(name, rows):
-		if step == 'swap':
-			raise Killed()
-		real_write(name, rows)
-		if step == 'list':
-			raise Killed()
-	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
-	monkeypatch.setattr(rv.os, 'symlink', symlink)
-	monkeypatch.setattr(rv, 'write_change_list', write)
+	commit_hooks(monkeypatch, kill_at=step)
 	with pytest.raises(Killed):
 		run_backup(job, keep_modified(job, 'cut'))
 	monkeypatch.undo()
 	attempt = [name for name in os.listdir(job.job_vault) if name.startswith('V3--') and os.path.isdir(os.path.join(job.job_vault, name))]
 	assert len(attempt) == 1
 	removed, scanned = restart_and_scan(job)
-	if step in ('copy', 'manifest'):
+	if step in ('writing', 'manifest'):
 		assert link_number(job) == 2 and removed == [os.path.join(job.job_vault, attempt[0])] and scanned == [0, 1, 2]
+		assert private_folders(job) == []
 		run_backup(job, keep_modified(job, 'next'))
 		assert sorted(committed_folders(job)) == [0, 1, 2, 3] and link_number(job) == 3
 	elif step == 'swap':
@@ -1106,33 +1148,49 @@ def test_a_crash_at_each_step_of_the_commit(tmp_path, monkeypatch, step):
 	assert all(os.path.isdir(path) for path in committed.values())
 
 
-def test_a_first_backups_change_list_that_cannot_be_written_leaves_a_leftover_the_next_attempt_removes(tmp_path, monkeypatch):
+@pytest.mark.parametrize('step', ['writing', 'manifest', 'swap'])
+def test_a_crash_at_each_step_of_a_first_backups_commit(tmp_path, monkeypatch, step):
+	# a first backup's manifest names V0 from its commit on, with no link before the swap: refused from there
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	commit_hooks(monkeypatch, kill_at=step)
+	with pytest.raises(Killed):
+		run_backup(job)
+	monkeypatch.undo()
+	attempt = [name for name in os.listdir(job.job_vault) if name.startswith('V0--')]
+	assert len(attempt) == 1
+	removed, scanned = restart_and_scan(job)
+	if step == 'writing':
+		assert removed == [os.path.join(job.job_vault, attempt[0])] and scanned == [] and private_folders(job) == []
+		run_backup(job)
+		assert sorted(committed_folders(job)) == [0]
+	else:
+		assert removed == [] and isinstance(scanned, rv.VaultScanError)
+
+
+def test_a_first_backups_change_list_that_cannot_be_placed_leaves_a_leftover_the_next_attempt_removes(tmp_path, monkeypatch):
 	# haiku12 chain D: the link was removed, but the manifest still named V0, so the leftover was refused for good
 	job = create_job(str(tmp_path))
 	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
-	def write(name, rows):
-		raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), name)
-	monkeypatch.setattr(rv, 'write_change_list', write)
+	commit_hooks(monkeypatch, fail_place=True)
 	with pytest.raises(OSError):
 		run_backup(job)
 	monkeypatch.undo()
 	assert not os.path.lexists(os.path.join(job.job_vault, 'current_version'))
 	assert rv.recorded_latest_version(job.job_vault).recorded is None
 	removed, scanned = restart_and_scan(job)
-	assert len(removed) == 1 and scanned == []
+	assert len(removed) == 1 and scanned == [] and private_folders(job) == []
 	run_backup(job)
 	assert sorted(committed_folders(job)) == [0] and link_number(job) == 0
 
 
-def test_a_change_list_that_cannot_be_written_puts_the_link_back(tmp_path, monkeypatch):
+def test_a_change_list_that_cannot_be_placed_puts_the_link_back(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
-	def write(name, rows):
-		raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), name)
-	monkeypatch.setattr(rv, 'write_change_list', write)
+	commit_hooks(monkeypatch, fail_place=True)
 	with pytest.raises(OSError):
 		run_backup(job, keep_modified(job, 'full'))
 	monkeypatch.undo()
-	assert link_number(job) == 2
+	assert link_number(job) == 2 and private_folders(job) == []
 	assert restart_and_scan(job)[1] == [0, 1, 2]
 
 
@@ -1151,3 +1209,22 @@ def test_a_prune_that_finds_no_list_for_the_next_version_makes_none(tmp_path, mo
 	os.rename(aside, v1.change_list)
 	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2]
 	every_folder_reads_right(job)
+
+
+def test_a_first_backups_link_that_cannot_be_made_leaves_a_leftover_the_next_attempt_removes(tmp_path, monkeypatch):
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	real_symlink = os.symlink
+	def symlink(source, dest, *args, **kwargs):
+		if os.path.basename(os.fspath(dest)) == '.current_version.tmp':
+			raise OSError(errno.EIO, os.strerror(errno.EIO), dest)
+		return real_symlink(source, dest, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'symlink', symlink)
+	with pytest.raises(OSError):
+		run_backup(job)
+	monkeypatch.undo()
+	assert rv.recorded_latest_version(job.job_vault).recorded is None and private_folders(job) == []
+	removed, scanned = restart_and_scan(job)
+	assert len(removed) == 1 and scanned == []
+	run_backup(job)
+	assert sorted(committed_folders(job)) == [0] and link_number(job) == 0
