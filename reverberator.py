@@ -30,6 +30,7 @@ import sqlite3
 import json
 import tempfile
 import stat
+import array
 import errno
 import fcntl
 import marshal
@@ -6187,22 +6188,22 @@ def recorded_monitor_paths(job_vault:str):
 	'''
 	return read_recorded_monitor_paths(job_vault)[0]
 
-# how long each try of a command waits for the daemon's write to let go of the manifest, as it tells its links by
-# the record: it tries again until it can read it, as it waits for the restore lock
-COMMAND_RECORD_WAIT_SECONDS = 5
-
 def command_monitor_paths(job_vault:str, stream = None):
 	'''
 	recorded_monitor_paths() for the history and restore commands: while a write of the daemon holds the manifest, it
-	waits, saying so once on stream (sys.stderr as it is now when None). None, said once too, when the record cannot be
-	read for any other reason: the links of versions whose rows it would place are then judged by their text alone.
+	waits, as for the restore lock, saying so once on stream (sys.stderr as it is now when None). None, said once too,
+	when the record cannot be read for any other reason: the links of versions whose rows it would place are then
+	judged by their text alone. Each try waits RESTORE_WAIT_SECONDS at most, so a stop signal a restore turned into
+	RESTORE_STOP ends the wait soon after, as a KeyboardInterrupt.
 	'''
 	stream = sys.stderr if stream is None else stream
 	recorded, locked = read_recorded_monitor_paths(job_vault, timeout=0)
 	if locked:
 		print(f'Waiting for reverberator to finish writing the vault database of {job_vault}', file=stream, flush=True)
 	while locked:
-		recorded, locked = read_recorded_monitor_paths(job_vault, timeout=COMMAND_RECORD_WAIT_SECONDS)
+		if RESTORE_STOP.is_set():
+			raise KeyboardInterrupt
+		recorded, locked = read_recorded_monitor_paths(job_vault, timeout=RESTORE_WAIT_SECONDS)
 	if recorded is None:
 		print("Note: the vault's record of monitored paths cannot be read; links are judged by their text", file=stream, flush=True)
 	return recorded
@@ -7866,6 +7867,57 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	block_size = os.statvfs(referenceVaultPath).f_frsize
 	materialize_failed = False
 	job_vault = os.path.dirname(referenceVaultPath)
+	def keep_oldest(why:str) -> tuple:
+		# the reference vault stays, back at the front of vault_info_dict, and the job's FAILED marker says so
+		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Aborting removal of {referenceVaultPath} because {why}')
+		now = clock()
+		if now >= PRUNE_ABORTED.get(job_name, now):
+			job_log(job_name, f'FAILED: cannot remove {referenceVaultPath}, as {why}; it is kept, and the vault keeps growing')
+			PRUNE_ABORTED[job_name] = now + DISK_WAIT_REPEAT_SECONDS
+		new_dict = OrderedDict()
+		new_dict[referenceVersionNumber] = referenceVaultEntry
+		new_dict.update(vault_info_dict)
+		vault_info_dict.clear()
+		vault_info_dict.update(new_dict)
+		vault_info_dict[referenceVersionNumber] = refresh_vault_entry_size_metadata(vault_info_dict[referenceVersionNumber])
+		vault_info_dict[applyingVersionNumber] = refresh_vault_entry_size_metadata(vault_info_dict[applyingVersionNumber])
+		return 0, 0
+	def share_moved_copy(copy:str, link:str) -> bool:
+		# a copy of copy, with its metadata, put in place of link by a rename, while link is still a symlink
+		temp_path = partial_copy_path(link)
+		try:
+			shutil.copyfile(copy,temp_path,follow_symlinks=False)
+			if not copy_file_meta(copy,temp_path):
+				return False
+			if not stat.S_ISLNK(os.lstat(link).st_mode):
+				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Not copying {copy} to {link}: it is no longer a symlink')
+				return False
+			os.replace(temp_path,link)
+			return True
+		except OSError as e:
+			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error copying {copy} to {link}: {e}')
+			return False
+		finally:
+			with contextlib.suppress(OSError):
+				os.remove(temp_path)
+	# the copies this walk moved out of the reference vault, so a second link naming one gets its bytes too, as one of
+	# the two is a user's link the rows could not tell from a chain link: a copy moved to the link at its own path by
+	# the hash of its path alone (8 bytes each, as every unchanged file of a big job is one), any other by target ->
+	# the link it now stands in place of
+	moved_home = array.array('q')
+	moved = {}
+	def moved_to(target:str):
+		# where this walk moved target, None when it did not
+		if target in moved:
+			return moved[target]
+		if hash(target) in moved_home:
+			return os.path.join(applyingVaultEntry.path, target[len(referenceVaultPath) + 1:])
+		return None
+	def note_moved(target:str, link:str):
+		if link[len(applyingVaultEntry.path):] == target[len(referenceVaultPath):]:
+			moved_home.append(hash(target))
+		else:
+			moved[target] = link
 	# the next version's rows, read once for the whole walk
 	moves = VaultMoves(job_vault,monitor_path,monitor_paths).of(applyingVaultEntry.path)
 	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs).
@@ -7891,7 +7943,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			except UnexplainedChainLink as e:
 				# the rows cannot tell: it may be this version's only way to its copy, which is kept as for a chain link
 				linkTarget = e.target
-			except UncheckedVaultLink as e:
+			except (UncheckedVaultLink, OSError) as e:
 				# it may be this version's only way to a file in the reference vault, so keep that, as for a failed move
 				materialize_failed = True
 				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error checking whether {file} links into {referenceVaultPath}: {e}')
@@ -7924,6 +7976,32 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 						materialize_failed = True
 						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error moving {linkTarget} to {file}: {e}')
 						continue
+					try:
+						landed = not stat.S_ISLNK(os.lstat(file).st_mode)
+					except FileNotFoundError:
+						# neither the link nor the target is there: nothing is left to move or to drop
+						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error moving {linkTarget} to {file}: {e}; both are gone')
+						continue
+					except OSError as lstatError:
+						materialize_failed = True
+						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error moving {linkTarget} to {file}: {e}; {file} cannot be looked at: {lstatError}')
+						continue
+					if landed:
+						# the rename moved the copy and then reported an error: the copy is in place
+						backuperTeeLogToTl(path=referenceVaultPath,message=f'Moving {linkTarget} to {file} reported {e}, but the copy is in place')
+						note_moved(linkTarget, file)
+						continue
+					taken = moved_to(linkTarget)
+					if taken is not None:
+						# two links name one copy, which no move of the daemon's makes: one is a user's link whose text
+						# the rows could not tell from a chain link's. which one cannot be told, so both get its bytes
+						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{file} and {taken} both link to {linkTarget}: one is a user\'s link that cannot be told from a chain link, so both get its copy')
+						if not share_moved_copy(taken, file):
+							materialize_failed = True
+							continue
+						with contextlib.suppress(OSError):
+							new_size += max(os.lstat(file).st_size,block_size) - block_size
+						continue
 					# the target is already gone, so this link was dangling before we touched it.
 					# removing the reference vault loses nothing that is not already lost, and
 					# keeping the link would carry the broken reference forward into every later
@@ -7934,31 +8012,23 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 						if DEBUG:
 							backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error getting size of {file}: {sizeError}')
 					try:
+						# only while it is still the link: whatever stands there now is not removed
+						if not stat.S_ISLNK(os.lstat(file).st_mode):
+							raise OSError(errno.EEXIST, 'it is no longer a symlink', file)
 						os.remove(file)
 					except Exception as removeError:
 						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error removing dangling link {file} -> {linkTarget}: {removeError}')
 					else:
 						backuperTeeLogToTl(path=referenceVaultPath,message=f'Removed dangling link {file} -> {linkTarget} as the target is already missing')
 					continue
+				note_moved(linkTarget, file)
 			elif DEBUG:
 				backuperTeeLogToTl(path=referenceVaultPath,message=f'Not moving {linkTarget} to {file}: not a chain link into {referenceVaultPath}')
 	for rel, error in walk_errors:
 		materialize_failed = True
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error listing {unreadable_path(applyingVaultEntry.path, rel)}: {error}')
 	if materialize_failed:
-		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Aborting removal of {referenceVaultPath} because materializing linked files failed')
-		now = clock()
-		if now >= PRUNE_ABORTED.get(job_name, now):
-			job_log(job_name, f'FAILED: cannot remove {referenceVaultPath}, as materializing the links of {applyingVaultEntry.path} into it failed; it is kept, and the vault keeps growing')
-			PRUNE_ABORTED[job_name] = now + DISK_WAIT_REPEAT_SECONDS
-		new_dict = OrderedDict()
-		new_dict[referenceVersionNumber] = referenceVaultEntry
-		new_dict.update(vault_info_dict)
-		vault_info_dict.clear()
-		vault_info_dict.update(new_dict)
-		vault_info_dict[referenceVersionNumber] = refresh_vault_entry_size_metadata(vault_info_dict[referenceVersionNumber])
-		vault_info_dict[applyingVersionNumber] = refresh_vault_entry_size_metadata(vault_info_dict[applyingVersionNumber])
-		return 0, 0
+		return keep_oldest(f'materializing the links of {applyingVaultEntry.path} into it failed')
 	#V0--2021-01-01_00-00-00_-0800
 	if new_size != applyingVaultEntry.size:
 		backup_size_str = format_bytes(new_size,use_1024_bytes=True,to_str=True).replace(' ','_')
@@ -7987,7 +8057,12 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	#os.remove(path=reference_content_file_path)
 	# the path as a pattern of its own, so a vault path holding *, ? or [ matches nothing beside it
 	paths_to_remove = glob.glob(glob.escape(referenceVaultPath)+'*',recursive=False)
-	multiCMD.run_command(['rm','-rf',*paths_to_remove],quiet=True,return_code_only=True)
+	if referenceVaultPath not in paths_to_remove:
+		# glob() passes over an error listing the job vault: nothing would be removed
+		return keep_oldest('its folder was not found listing the job vault')
+	returncode = multiCMD.run_command(['rm','-rf',*paths_to_remove],quiet=True,return_code_only=True)
+	if returncode:
+		return keep_oldest(f'rm -rf of its paths returned {returncode}')
 	forget_real_vault_folders(referenceVaultPath)
 	forget_version_moves(referenceVaultPath)
 	PRUNE_ABORTED.pop(job_name, None)

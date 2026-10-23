@@ -17,6 +17,7 @@ def restore_runtime_globals(tmp_path, monkeypatch):
 	rv.VERSION_MOVES_WARNED.clear()
 	# a test's aborted prunes must not hold back another's FAILED marker
 	rv.PRUNE_ABORTED.clear()
+	rv.RESTORE_STOP.clear()
 	# the daemon publishes status files: keep them out of /run/reverberator
 	monkeypatch.setenv('REVERB_STATE_DIR', str(tmp_path / 'state'))
 	yield
