@@ -6155,30 +6155,57 @@ def forget_version_moves(version_path:str) -> None:
 			for key in [key for key in table if key[0] == version_path]:
 				del table[key]
 
-def recorded_monitor_paths(job_vault:str):
+def read_recorded_monitor_paths(job_vault:str, timeout:float = 1) -> tuple:
 	'''
-	The monitored paths the versions of job_vault were written under, as VaultManifest.monitor_paths records them,
-	read without changing the manifest: [] when it records none (no manifest, versions written before 0.44, or one
-	started over), None when it cannot be read now (locked, say).
+	(record, locked) for recorded_monitor_paths(), waiting up to timeout seconds for a lock on the manifest: locked
+	says that record is None because a write holds the manifest, as a big backup's does, so a read later can succeed.
 	'''
 	path = os.path.join(job_vault, MANIFEST_FILE_NAME)
 	if not os.path.exists(path):
-		return []
+		return [], False
 	try:
 		# quoted as bytes, so a vault path that is not UTF-8 is opened as it is
-		conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=ro', uri=True, timeout=1)
+		conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=ro', uri=True, timeout=timeout)
 		try:
 			row = conn.execute("SELECT value FROM meta WHERE key = 'monitor_paths'").fetchone()
 		finally:
 			conn.close()
-		return [] if row is None else [(int(number), stored_name(monitor)) for number, monitor in json.loads(row[0])]
+		return ([] if row is None else [(int(number), stored_name(monitor)) for number, monitor in json.loads(row[0])]), False
 	except sqlite3.DatabaseError as e:
 		if 'not a database' in str(e) or 'malformed' in str(e) or 'no such table' in str(e):
 			# started over when next opened, with no record
-			return []
-		return None
+			return [], False
+		return None, isinstance(e, sqlite3.OperationalError) and ('locked' in str(e) or 'busy' in str(e))
 	except (OSError, ValueError, TypeError):
-		return None
+		return None, False
+
+def recorded_monitor_paths(job_vault:str):
+	'''
+	The monitored paths the versions of job_vault were written under, as VaultManifest.monitor_paths records them,
+	read without changing the manifest: [] when it records none (no manifest, versions written before 0.44, or one
+	started over), None when it cannot be read now (locked for over a second, say).
+	'''
+	return read_recorded_monitor_paths(job_vault)[0]
+
+# how long each try of a command waits for the daemon's write to let go of the manifest, as it tells its links by
+# the record: it tries again until it can read it, as it waits for the restore lock
+COMMAND_RECORD_WAIT_SECONDS = 5
+
+def command_monitor_paths(job_vault:str, stream = None):
+	'''
+	recorded_monitor_paths() for the history and restore commands: while a write of the daemon holds the manifest, it
+	waits, saying so once on stream (sys.stderr as it is now when None). None, said once too, when the record cannot be
+	read for any other reason: the links of versions whose rows it would place are then judged by their text alone.
+	'''
+	stream = sys.stderr if stream is None else stream
+	recorded, locked = read_recorded_monitor_paths(job_vault, timeout=0)
+	if locked:
+		print(f'Waiting for reverberator to finish writing the vault database of {job_vault}', file=stream, flush=True)
+	while locked:
+		recorded, locked = read_recorded_monitor_paths(job_vault, timeout=COMMAND_RECORD_WAIT_SECONDS)
+	if recorded is None:
+		print("Note: the vault's record of monitored paths cannot be read; links are judged by their text", file=stream, flush=True)
+	return recorded
 
 def written_under(monitor_paths:list, number:int, monitor_path:str) -> str:
 	'''
@@ -6254,7 +6281,7 @@ class VersionMoves:
 		version_path = os.path.abspath(version_path)
 		recorded = recorded_monitor_paths(job_vault) if monitor_paths is None else monitor_paths
 		if recorded is None:
-			return cls(moves=[], usable=False, why='the record of the monitored paths its versions were written under cannot be read', key=(version_path, ''))
+			return cls.unreadable_record(version_path)
 		number = vault_version_number(os.path.basename(version_path))
 		monitor = written_under(recorded, -1 if number is None else number, monitor_path)
 		if monitor is None:
@@ -6266,6 +6293,11 @@ class VersionMoves:
 				VERSION_MOVES.move_to_end(key)
 				return known
 		return cls(moves=None, usable=False, key=key, change_list_folder=os.path.abspath(job_vault), landed=())
+
+	@classmethod
+	def unreadable_record(cls, version_path:str) -> 'VersionMoves':
+		'''The moves of the committed version at version_path when the record of monitored paths cannot be read.'''
+		return cls(moves=[], usable=False, why='the record of the monitored paths its versions were written under cannot be read', key=(os.path.abspath(version_path), ''))
 
 	@classmethod
 	def applied(cls, moves:list) -> 'VersionMoves':
@@ -6521,23 +6553,59 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 		raise UnexplainedChainLink(why, target)
 	return target if verdict else None
 
+class CommittedMoves:
+	'''
+	VersionMoves.of_committed() of a version of vault (a VaultMoves), made when an answer first needs it, so a link
+	sitting where its text says, which needs no rows, never has the record of monitored paths read either.
+	'''
+	def __init__(self, vault:'VaultMoves', version_path:str):
+		self._vault = vault
+		self._version_path = version_path
+		self._moves = None
+		self._lock = threading.Lock()
+
+	def _get(self) -> VersionMoves:
+		with self._lock:
+			if self._moves is None:
+				recorded = self._vault.record()
+				if recorded is None:
+					self._moves = VersionMoves.unreadable_record(self._version_path)
+				else:
+					self._moves = VersionMoves.of_committed(self._vault.job_vault, self._version_path, self._vault.monitor_path, recorded)
+			return self._moves
+
+	def __getattr__(self, name):
+		return getattr(self._get(), name)
+
 class VaultMoves:
 	'''
 	The VersionMoves of the versions of job_vault, each asked for once and held for a whole pass (a removal of the
 	oldest version, a history, a restore, a backup's reads of the vault), so a pass reads each change list once,
-	however few VERSION_MOVES keeps meanwhile. monitor_paths is the record of the monitored paths the versions were
-	written under (VaultManifest.monitor_paths: the daemon's own connection gives it, as a read of its own could find
-	the manifest locked by the daemon's own write), read from the manifest when None; monitor_path is the job's path
-	now, None when not known. writing is the folder of the version a backup is writing, which has no change list yet:
-	its links go by their text alone, with no warning, as before 0.44.
+	however few VERSION_MOVES keeps meanwhile; release() lets a pass that is done with a version drop it. monitor_paths
+	is the record of the monitored paths the versions were written under (VaultManifest.monitor_paths: the daemon's
+	own connection gives it, as a read of its own could find the manifest locked by the daemon's own write); when None
+	it is read_record(job_vault) (recorded_monitor_paths() when None), once, the first time a link needs rows.
+	monitor_path is the job's path now, None when not known. writing is the folder of the version a backup is writing,
+	which has no change list yet: its links go by their text alone, with no warning, as before 0.44.
 	'''
-	def __init__(self, job_vault:str, monitor_path:str = None, monitor_paths:list = None, writing:str = None):
+	def __init__(self, job_vault:str, monitor_path:str = None, monitor_paths:list = None, writing:str = None, read_record = None):
 		self.job_vault = os.path.abspath(job_vault)
 		self.monitor_path = monitor_path
 		self.monitor_paths = monitor_paths
 		self.writing = None if writing is None else os.path.abspath(writing)
+		self._read_record = recorded_monitor_paths if read_record is None else read_record
+		self._record_read = monitor_paths is not None
 		self._held = {}
 		self._lock = threading.Lock()
+		self._record_lock = threading.Lock()
+
+	def record(self):
+		'''The record of monitored paths, read the first time it is asked for; None when it cannot be read.'''
+		with self._record_lock:
+			if not self._record_read:
+				self.monitor_paths = self._read_record(self.job_vault)
+				self._record_read = True
+			return self.monitor_paths
 
 	def of(self, version) -> VersionMoves:
 		'''The moves of version: a version folder's path, or anything with one as its path, such as a KeptVersion.'''
@@ -6549,9 +6617,14 @@ class VaultMoves:
 		if path == self.writing:
 			moves = VersionMoves(moves=[], usable=False, why='it is being written')
 		else:
-			moves = VersionMoves.of_committed(self.job_vault, path, self.monitor_path, self.monitor_paths)
+			moves = CommittedMoves(self, path)
 		with self._lock:
 			return self._held.setdefault(path, moves)
+
+	def release(self, version) -> None:
+		'''Drop what is held for version (as of() takes it), once the pass will not ask for it again.'''
+		with self._lock:
+			self._held.pop(os.path.abspath(getattr(version, 'path', version)), None)
 
 	def holding(self, path:str) -> 'VersionMoves | None':
 		'''The moves of the version folder of job_vault that holds path, None when no folder of job_vault does.'''
@@ -6662,10 +6735,11 @@ def chain_end(job_vault:str, version_path:str, rel:str, moves:'VaultMoves' = Non
 	Where the chain starting at version_path's file rel ends, as a ChainEnd: the number of the version folder holding
 	it, its path and its lstat. The end is a copy, a user's symlink backed up as one or a referenced backup's link,
 	each link told by the moves of its version (moves, a VaultMoves for the pass; one reading the manifest's record
-	when None, which knows no monitored path for a version the record does not name). Each hop names an older version than the last, so the walk ends within as many hops as
-	there are versions below version_path, however many more links than the kernel follows that is. None when the
-	chain cannot be followed: a folder of rel in version_path is not a real folder (by is_real_folder_under()), an
-	entry on the chain is missing or cannot be read, or a link on it cannot be looked at (UncheckedVaultLink).
+	when None, which knows no monitored path for a version the record does not name). Each hop names an older version
+	than the last, so the walk ends within as many hops as there are versions below version_path, however many more
+	links than the kernel follows that is. None when the chain cannot be followed: a folder of rel in version_path is
+	not a real folder (by is_real_folder_under()), an entry on the chain is missing or cannot be read, or a link on it
+	cannot be looked at (UncheckedVaultLink).
 	'''
 	vault = os.path.abspath(job_vault)
 	if moves is None:
@@ -7795,11 +7869,20 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	# the next version's rows, read once for the whole walk
 	moves = VaultMoves(job_vault,monitor_path,monitor_paths).of(applyingVaultEntry.path)
 	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs).
-	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another
-	for file, _, is_dir in iter_tree_entries(applyingVaultEntry.path, list_folders_first=True):
+	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another.
+	# a folder that cannot be listed, or an entry that cannot be looked at, may hold this version's only way to a copy
+	# in the reference vault, so the reference vault is kept, as for a failed move
+	walk_errors = []
+	for file, _, is_dir in iter_tree_entries(applyingVaultEntry.path, list_folders_first=True, errors=walk_errors):
 		if is_dir:
 			continue
-		if os.path.islink(file):
+		try:
+			is_link = stat.S_ISLNK(os.lstat(file).st_mode)
+		except OSError as e:
+			materialize_failed = True
+			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error looking at {file}: {e}')
+			continue
+		if is_link:
 			# a link an older daemon moved to another folder depth still names its version, though its text no longer reaches it.
 			# a user's symlink is left as it is, however it is shaped, and so is a link naming a folder: the daemon links
 			# files only, so no folder is ever renamed onto a link
@@ -7827,8 +7910,16 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				try:
 					os.rename(linkTarget,file)
 				except Exception as e:
-					if os.path.lexists(linkTarget):
-						# the target is still there but we could not move it, so removing the
+					try:
+						os.lstat(linkTarget)
+						gone = False
+					except FileNotFoundError:
+						gone = True
+					except OSError:
+						# it may still be there: only a target known to be gone is one
+						gone = False
+					if not gone:
+						# the target is still there (or may be) but we could not move it, so removing the
 						# reference vault would destroy the only copy. keep it and retry later.
 						materialize_failed = True
 						backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error moving {linkTarget} to {file}: {e}')
@@ -7851,6 +7942,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 					continue
 			elif DEBUG:
 				backuperTeeLogToTl(path=referenceVaultPath,message=f'Not moving {linkTarget} to {file}: not a chain link into {referenceVaultPath}')
+	for rel, error in walk_errors:
+		materialize_failed = True
+		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error listing {unreadable_path(applyingVaultEntry.path, rel)}: {error}')
 	if materialize_failed:
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Aborting removal of {referenceVaultPath} because materializing linked files failed')
 		now = clock()
@@ -7891,7 +7985,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	removingSize = get_path_size(referenceVaultPath)
 	removingInodes = get_path_inodes(referenceVaultPath)
 	#os.remove(path=reference_content_file_path)
-	paths_to_remove = glob.glob(referenceVaultPath+'*',recursive=False)
+	# the path as a pattern of its own, so a vault path holding *, ? or [ matches nothing beside it
+	paths_to_remove = glob.glob(glob.escape(referenceVaultPath)+'*',recursive=False)
 	multiCMD.run_command(['rm','-rf',*paths_to_remove],quiet=True,return_code_only=True)
 	forget_real_vault_folders(referenceVaultPath)
 	forget_version_moves(referenceVaultPath)
@@ -8036,9 +8131,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# version or at the chain's end, gets only its own owner and times ( copy_file_meta() ), never what it points to.
 		# the chain is followed from its first hop, in a committed version: nothing is judged, nor remembered
 		# ( is_real_folder_under() ), about the folders of this one, which the replay can still change
-		# the end must be of the monitored entry's kind: the chain rule cannot tell a user's link whose text has a chain
-		# link's form ( ../<the version before>/D/f, at any depth ) from a chain link, and follows it on to another file's
-		# copy, while the link itself is what this version holds of the entry
+		# the end must be of the monitored entry's kind. the first hop, in this version, still goes by the text alone (the
+		# version's moves are not known yet), and chain_end() tells the links of the committed versions by their moves,
+		# so a user's link whose text has a chain link's form ( ../<the version before>/D/f ) is the chain's end there;
+		# the check still guards a chain that ends anywhere else, such as a folder
 		entry = os.path.abspath(os.path.join(backup_folder,relative_path))
 		if not os.path.islink(entry):
 			return copy_file_meta(source_real_path,entry)
@@ -9101,6 +9197,8 @@ def path_history(job_vault:str, versions:list, monitor_path:str, rel:str, folder
 					[] if folder and list_files else None)
 			continue
 		below = history_entry(job_vault, versions[index - 1], monitor_path, rel, moves)
+		# every chain from here on starts below version, so its rows are no longer needed
+		moves.release(version)
 		held_before = below[0].kind != 'missing'
 		if not held and not held_before:
 			continue
@@ -9271,8 +9369,9 @@ def history_command(args) -> int:
 		try:
 			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
-			# the moves of each version, read once for the whole command
-			moves = VaultMoves(job_vault, rule.mon_path)
+			# the moves of each version, read once for the whole command, and the record of monitored paths once, when a
+			# link first needs rows, waiting while the daemon writes the manifest
+			moves = VaultMoves(job_vault, rule.mon_path, read_record=command_monitor_paths)
 			kind = path_kind(job_vault, versions, rule.mon_path, rel, moves) if versions else None
 			if kind is not None:
 				# each row is printed as it is found, so a job's whole history is never held; the lock is held all the while,
@@ -10404,8 +10503,9 @@ def restore_command(args) -> int:
 		try:
 			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
-			# the moves of each version, read once for the whole command
-			moves = VaultMoves(job_vault, rule.mon_path)
+			# the moves of each version, read once for the whole command, and the record of monitored paths once, when a
+			# link first needs rows, waiting while the daemon writes the manifest
+			moves = VaultMoves(job_vault, rule.mon_path, read_record=command_monitor_paths)
 			kind = path_kind(job_vault, versions, rule.mon_path, rel, moves) if versions else None
 			if kind is None:
 				raise CommandError(never_backed_up(rule, rule_path, rel, args.path.endswith('/')))

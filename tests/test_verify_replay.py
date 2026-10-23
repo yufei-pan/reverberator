@@ -1462,13 +1462,17 @@ def test_a_users_link_of_chain_form_never_redirects_an_attribute_sync(tmp_path, 
 	run_batch(job, spec)
 	os.lchown(link, 4243, 4243)
 	held = versions_meta(job, xattrs)
+	own = f'{rv.list_versions(job.job_vault)[1].name}/{os.path.relpath(link, job.monitor)}'
+	own_link = os.path.join(job.job_vault, own)
+	own_text, own_inode = os.readlink(own_link), os.lstat(own_link).st_ino
 	lines = spy_on_log(monkeypatch)
 	version = run_batch(job, [('attrib', os.path.relpath(link, job.monitor), None, False)])
 	assert version.number == 2
-	own = f'{rv.list_versions(job.job_vault)[1].name}/{os.path.relpath(link, job.monitor)}'
 	after = versions_meta(job, xattrs, but=version.name)
 	assert [row for row in after if row[0] != own] == [row for row in held if row[0] != own]
 	assert [row[4:6] for row in after if row[0] == own] == [(4243, 4243)]
+	# the link itself, its text and inode, as it was: only its owner and times are set
+	assert (os.readlink(own_link), os.lstat(own_link).st_ino) == (own_text, own_inode) == (f'../{rv.list_versions(job.job_vault)[0].name}/D/secret', own_inode)
 	assert not [message for message, error, _ in lines if error and 'Not syncing the attributes' in message]
 
 

@@ -15,6 +15,8 @@ def restore_runtime_globals(tmp_path, monkeypatch):
 	# a test may write a version's change list again after its moves were read
 	rv.VERSION_MOVES.clear()
 	rv.VERSION_MOVES_WARNED.clear()
+	# a test's aborted prunes must not hold back another's FAILED marker
+	rv.PRUNE_ABORTED.clear()
 	# the daemon publishes status files: keep them out of /run/reverberator
 	monkeypatch.setenv('REVERB_STATE_DIR', str(tmp_path / 'state'))
 	yield
