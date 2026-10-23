@@ -66,9 +66,9 @@ def test_trusted_rels_are_not_read_from_the_vault(job, monkeypatch):
 	assert trusted == {'D/new.txt', 'D/gone.txt', 'p.txt', 'q.txt'}
 	read = rv.read_vault_record
 
-	def guarded(version_path, rel, monitor_path):
+	def guarded(version_path, rel, monitor_path, *args):
 		assert rel not in trusted, f'{rel} was read from the vault'
-		return read(version_path, rel, monitor_path)
+		return read(version_path, rel, monitor_path, *args)
 	monkeypatch.setattr(rv, 'read_vault_record', guarded)
 	entries = OrderedDict()
 	rv.compare_scopes(entries, manifest, v0, job.monitor, rv.TouchedScopes(['D/'], ['p.txt', 'q.txt']), trusted=trusted)

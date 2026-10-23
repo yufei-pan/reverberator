@@ -1433,8 +1433,10 @@ def run_batch(job, spec):
 def test_a_users_link_of_chain_form_never_redirects_an_attribute_sync(tmp_path, monkeypatch, depth):
 	"""
 	A user's link whose text has a chain link's form, naming a file of the version before the one holding it, and a
-	decoy file it reaches in the monitored tree (depth 2), or beside it (depth 1). The chain rule takes the stored link
+	decoy file it reaches in the monitored tree (depth 2), or beside it (depth 1). The text rule took the stored link
 	for a chain link to that file's copy: an attribute sync of the link, a symlink in the tree, must not land there.
+	Since 0.44 its version's rows tell it for the user's link, which is the end of its chain: it gets the link's
+	owner, as a file's copy gets its file's attributes, and nothing else changes.
 	"""
 	rv.REAL_VAULT_FOLDERS.clear()
 	job = create_job(str(tmp_path))
@@ -1463,11 +1465,14 @@ def test_a_users_link_of_chain_form_never_redirects_an_attribute_sync(tmp_path, 
 	lines = spy_on_log(monkeypatch)
 	version = run_batch(job, [('attrib', os.path.relpath(link, job.monitor), None, False)])
 	assert version.number == 2
-	assert versions_meta(job, xattrs, but=version.name) == held
-	assert [message for message, error, _ in lines if error and 'Not syncing the attributes' in message]
+	own = f'{rv.list_versions(job.job_vault)[1].name}/{os.path.relpath(link, job.monitor)}'
+	after = versions_meta(job, xattrs, but=version.name)
+	assert [row for row in after if row[0] != own] == [row for row in held if row[0] != own]
+	assert [row[4:6] for row in after if row[0] == own] == [(4243, 4243)]
+	assert not [message for message, error, _ in lines if error and 'Not syncing the attributes' in message]
 
 
-def test_an_attribute_sync_whose_chain_ends_at_a_folder_is_refused(tmp_path, monkeypatch):
+def test_an_attribute_sync_of_a_link_naming_a_folder_lands_on_the_link_alone(tmp_path, monkeypatch):
 	rv.REAL_VAULT_FOLDERS.clear()
 	job = create_job(str(tmp_path))
 	write_tree(job.monitor, {'D/g': 'g', 'keep': 'k'})
@@ -1488,7 +1493,10 @@ def test_an_attribute_sync_whose_chain_ends_at_a_folder_is_refused(tmp_path, mon
 	run_batch(job, [('attrib', 'U', None, False)])
 	st = os.stat(folder)
 	assert (st.st_mode, st.st_uid, st.st_mtime_ns) == (held.st_mode, held.st_uid, held.st_mtime_ns)
-	assert [message for message, error, _ in lines if error and 'ends at the folder' in message]
+	# since 0.44 a link naming a folder is the user's (the daemon links files only): the end of its chain, which gets
+	# the link's owner
+	assert os.lstat(os.path.join(rv.list_versions(job.job_vault)[1].path, 'U')).st_uid == 4243
+	assert not [message for message, error, _ in lines if error and 'ends at the folder' in message]
 
 
 def test_a_partial_file_that_cannot_be_removed_fails_the_copy(job, monkeypatch):

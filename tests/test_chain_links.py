@@ -114,7 +114,7 @@ def test_pruning_materialises_a_link_broken_by_an_old_move(job):
 	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp=T, current=False)
 	v1 = write_committed_version(job, 1, {'deep/er/': None}, timestamp=T)
 	os.symlink(f'../../V0--{T}/a/x', f'{v1}/deep/er/x')
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert not os.path.islink(f'{v1}/deep/er/x') and open(f'{v1}/deep/er/x').read() == 'x'
 
@@ -147,7 +147,7 @@ def test_link_naming_an_older_version_is_not_followed_or_pruned_onto(job):
 	os.symlink(f'../V0--{T}/a/x', f'{v2}/u')
 	record = rv.read_vault_record(v2, 'u', job.monitor)
 	assert (record.kind, record.link) == ('l', f'../V0--{T}/a/x')
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert os.readlink(f'{v2}/u') == f'../V0--{T}/a/x'
 
@@ -178,7 +178,7 @@ def test_link_through_a_backed_up_folder_symlink_is_not_followed_or_pruned_onto(
 	record = rv.read_vault_record(v1, 'deep/u', job.monitor)
 	assert (record.kind, record.link) == ('l', text)
 	assert rv.retarget_moved_links(job.job_vault, f'{v1}/deep') == 0
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert open(os.path.join(outside, 'x')).read() == 'not the vault\'s'
 	assert os.readlink(f'{v1}/deep/u') == text
@@ -189,7 +189,7 @@ def test_pruning_drops_a_chain_link_whose_folder_is_gone(job):
 	v0 = write_committed_version(job, 0, {'keep': 'k'}, timestamp=T, current=False)
 	v1 = write_committed_version(job, 1, {'sub/': None}, timestamp=T)
 	os.symlink(f'../../V0--{T}/sub/x', f'{v1}/sub/x')
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert not os.path.lexists(f'{v1}/sub/x')
 
@@ -227,7 +227,7 @@ def test_a_chain_a_thousand_folders_deep_resolves_and_prunes(job):
 	# as an older daemon left it after moving the file to the top
 	os.symlink(f'../V0--{T}/{DEEP}x', f'{v1}/x')
 	assert rv.read_vault_record(v1, 'x', job.monitor).kind == 'f'
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert not os.path.islink(f'{v1}/x') and open(f'{v1}/x').read() == 'x'
 
@@ -239,7 +239,7 @@ def test_a_link_naming_too_long_a_folder_does_not_stop_a_prune(job):
 	text = f'../V0--{T}/' + 'a' * 300 + '/x'
 	os.symlink(text, f'{v1}/u')
 	assert rv.read_vault_record(v1, 'u', job.monitor).kind == 'l'
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert os.readlink(f'{v1}/u') == text
 
@@ -261,21 +261,21 @@ def test_a_chain_link_whose_folders_cannot_be_looked_at_keeps_the_version_being_
 		info = rv.get_vault_info(job.job_vault).vault_info_dict
 		with monkeypatch.context() as patch:
 			patch.setattr(rv.os, 'lstat', lstat_failing_on_a)
-			assert rv.decrement_stepper(info) != (0, 0)
+			assert rv.decrement_stepper(info, job.job_name, job.monitor) != (0, 0)
 			assert os.strerror(errno.EIO) not in capsys.readouterr().out
 		assert not os.path.exists(v0) and os.readlink(f'{v1}/a/b/x') == text
 		return
 	with monkeypatch.context() as patch:
 		patch.setattr(rv.os, 'lstat', lstat_failing_on_a)
 		# the link may be V1's only way to x, so V0 stays
-		assert rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict) == (0, 0)
+		assert rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor) == (0, 0)
 		assert open(f'{v0}/a/b/x').read() == 'x'
 		assert os.readlink(f'{v1}/a/b/x') == text
 		out = capsys.readouterr().out
 		assert f'{v1}/a/b/x' in out and os.strerror(errno.EIO) in out
 		# unreadable, never a user's symlink
 		assert rv.read_vault_record(v1, 'a/b/x', job.monitor) is None
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert not os.path.islink(f'{v1}/a/b/x') and open(f'{v1}/a/b/x').read() == 'x'
 
@@ -409,7 +409,7 @@ def test_pruning_forgets_the_real_folders_of_the_version_it_removes(job):
 	os.symlink(f'../../V0--{T}/a/x', f'{v1}/a/x')
 	# read through V0's folders, which are found real
 	assert rv.read_vault_record(v1, 'a/x', job.monitor).kind == 'f'
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	# a user's symlink naming the version just removed is not a chain link: it is no version of the vault now
 	text = f'../V0--{T}/a/x'
@@ -439,7 +439,7 @@ def test_pruning_the_oldest_version_after_a_retargeted_move_leaves_a_real_copy(j
 	os.rename(f'{job.monitor}/a/x.txt', f'{job.monitor}/deep/er/x.txt')
 	v1 = run_backup(job, OrderedDict([event_entry(job, 'deep/er/x.txt', 'move', 'a/x.txt')]))[-1]
 	assert_links_to(os.path.join(v1, 'deep/er/x.txt'), os.path.join(v0, 'a/x.txt'), 'x')
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert not os.path.islink(os.path.join(v1, 'deep/er/x.txt')) and open(os.path.join(v1, 'deep/er/x.txt')).read() == 'x'
 

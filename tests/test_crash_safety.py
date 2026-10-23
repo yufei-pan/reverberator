@@ -329,7 +329,7 @@ class TestDecrementStepperAbort(unittest.TestCase):
 	def test_successful_step_removes_oldest(self):
 		with tempfile.TemporaryDirectory() as root:
 			d, v0, v1 = self._make_pair(root)
-			removed_size, removed_inodes = rv.decrement_stepper(d)
+			removed_size, removed_inodes = rv.decrement_stepper(d, 'job', os.path.join(root, 'monitor'))
 			self.assertFalse(os.path.isdir(v0))
 			self.assertTrue(os.path.isfile(os.path.join(v1, 'a.txt')))
 			self.assertFalse(os.path.islink(os.path.join(v1, 'a.txt')))
@@ -348,7 +348,7 @@ class TestDecrementStepperAbort(unittest.TestCase):
 
 			os.rename = boom
 			try:
-				removed_size, removed_inodes = rv.decrement_stepper(d)
+				removed_size, removed_inodes = rv.decrement_stepper(d, 'job', os.path.join(root, 'monitor'))
 			finally:
 				os.rename = real_rename
 			self.assertEqual((removed_size, removed_inodes), (0, 0))
@@ -364,7 +364,7 @@ class TestDecrementStepperAbort(unittest.TestCase):
 			os.remove(os.path.join(v0, 'a.txt'))
 			self.assertTrue(os.path.islink(os.path.join(v1, 'a.txt')))
 
-			removed_size, removed_inodes = rv.decrement_stepper(d)
+			removed_size, removed_inodes = rv.decrement_stepper(d, 'job', os.path.join(root, 'monitor'))
 
 			self.assertFalse(os.path.isdir(v0))
 			self.assertNotIn(0, d)
@@ -389,11 +389,11 @@ class TestDecrementStepperAbort(unittest.TestCase):
 			d[2] = rv.VaultEntry(2, v2, 2, sz, ino)
 			os.remove(os.path.join(v0, 'a.txt'))
 
-			rv.decrement_stepper(d)
+			rv.decrement_stepper(d, 'job', os.path.join(root, 'monitor'))
 			self.assertFalse(os.path.isdir(v0))
 			self.assertEqual(list(d), [1, 2])
 
-			rv.decrement_stepper(d)
+			rv.decrement_stepper(d, 'job', os.path.join(root, 'monitor'))
 			self.assertFalse(os.path.isdir(v1))
 			self.assertEqual(list(d), [2])
 			self.assertFalse(os.path.lexists(os.path.join(v2, 'a.txt')))
