@@ -1,3 +1,4 @@
+import errno
 import os
 import sys
 import tracemalloc
@@ -93,8 +94,15 @@ def test_inode_limit_i1_attempts_stepper(job, monkeypatch):
 	assert called
 
 
-def test_stepper_memory_does_not_grow_with_the_version(job, monkeypatch):
-	# a big job's next version links 500k+ files: listing them all before moving any cost hundreds of MB per backup
+@pytest.mark.parametrize('how', ['link', 'move'])
+def test_stepper_memory_does_not_grow_with_the_version(job, monkeypatch, how):
+	# a big job's next version links 500k+ files: listing them all before moving any cost hundreds of MB per backup.
+	# on a filesystem that cannot hard link, each copy is moved, and the walk notes every one (review7 P5: a set of
+	# their hashes went past the bound)
+	if how == 'move':
+		def link(source, dest, *args, **kwargs):
+			raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), source)
+		monkeypatch.setattr(rv.os, 'link', link)
 	def peak_for(files):
 		root = os.path.join(job.root, f'tree{files}')
 		v0 = os.path.join(root, 'V0--2021-01-01_00-00-00_-0800')

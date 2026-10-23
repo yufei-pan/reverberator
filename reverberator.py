@@ -4381,14 +4381,20 @@ def do_backup(backup_entries:dict,
 			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
 			# why the loops below postponed removing a version: each loop tries again, but only the first says so
 			postponed = []
+			def remove_oldest() -> bool:
+				# prune_oldest(), vault_size and vault_inodes kept the sums of the versions' records: whether the oldest version
+				# went, freeing something. one kept can change the records too, by the links its removal replaced first
+				nonlocal vault_size, vault_inodes
+				oldest = next(iter(vault_info_dict))
+				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths)
+				vault_size -= removed_size
+				vault_inodes -= removed_inodes
+				return next(iter(vault_info_dict), None) != oldest and bool(removed_size or removed_inodes)
 			if backup_limit_size:
 				while vault_size + estimated_backup_size + recopies_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size + recopies_size} exceeds backup size limit {backup_limit_size}')
 					# we need to remove the oldest version
-					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths)
-					vault_size -= removed_size
-					vault_inodes -= removed_inodes
-					if not removed_size and not removed_inodes:
+					if not remove_oldest():
 						break
 					if recopies:
 						recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
@@ -4396,18 +4402,12 @@ def do_backup(backup_entries:dict,
 				while vault_inodes + estimated_backup_inode > backup_limit_inode:
 					backuperTeeLogToTl(job_name,f'Vault inodes {vault_inodes} + estimated backup inodes {estimated_backup_inode} exceeds backup inode limit {backup_limit_inode}')
 					# we need to remove the oldest version
-					removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths)
-					vault_size -= removed_size
-					vault_inodes -= removed_inodes
-					if not removed_size and not removed_inodes:
+					if not remove_oldest():
 						break
 			while keep_n_versions and len(vault_info_dict) >= keep_n_versions:
 				backuperTeeLogToTl(job_name,f'Vault has {len(vault_info_dict)} versions, exceeding keep n versions {keep_n_versions}')
 				# we need to remove the oldest version
-				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths)
-				vault_size -= removed_size
-				vault_inodes -= removed_inodes
-				if not removed_size and not removed_inodes:
+				if not remove_oldest():
 					break
 			if recopies and next(iter(vault_info_dict)) != recopies_oldest:
 				recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
@@ -7703,24 +7703,18 @@ def get_backup_limits_from_str(backup_size_limit:str,vault_fs_size:int,vault_fs_
 				rtn_size_limit = size_limit
 	return rtn_size_limit, rtn_inode_limit
 
-def refresh_vault_entry_size_metadata(entry:VaultEntry) -> VaultEntry:
-	'''Recalculate size/inode from disk and rename content file to match.'''
-	new_size = get_path_size(entry.path)
-	new_inode = get_path_inodes(entry.path)
-	old_size_str = format_bytes(entry.size,use_1024_bytes=True,to_str=True).replace(' ','_')
-	old_inode_str = format_bytes(entry.inode,use_1024_bytes=False,to_str=True).replace(' ','')
-	old_content = f'{entry.path}--{old_size_str}B-{old_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
-	new_size_str = format_bytes(new_size,use_1024_bytes=True,to_str=True).replace(' ','_')
-	new_inode_str = format_bytes(new_inode,use_1024_bytes=False,to_str=True).replace(' ','')
-	new_content = f'{entry.path}--{new_size_str}B-{new_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
-	if os.path.lexists(old_content) and old_content != new_content:
-		try:
-			os.rename(old_content,new_content)
-		except Exception as e:
-			backuperTeeLogToTl(path=entry.path,error=True,message=f'Error renaming content file {old_content} -> {new_content}: {e}')
-	elif not os.path.lexists(new_content) and not os.path.lexists(old_content):
-		pass
-	return VaultEntry(entry.version_number,entry.path,entry.timestamp,new_size,new_inode)
+def change_list_path(version_path:str, size:int, inodes:int) -> str:
+	'''
+	The change list of the version at version_path whose name records size bytes and inodes, rounded as format_bytes()
+	writes them (parse_change_list_name() reads them back).
+
+	Examples:
+		>>> change_list_path('/v/job/V1--2021-01-01_00-00-00_-0800', 12288, 4)
+		'/v/job/V1--2021-01-01_00-00-00_-0800--12.00_KiB-4.00_ino.modified_contents.nsv'
+	'''
+	size_str = format_bytes(size,use_1024_bytes=True,to_str=True).replace(' ','_')
+	inode_str = format_bytes(inodes,use_1024_bytes=False,to_str=True).replace(' ','')
+	return f'{version_path}--{size_str}B-{inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
 
 def restore_lock_path(job_name:str, state_dir:str = None) -> str:
 	'''
@@ -7817,52 +7811,81 @@ def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, po
 		os.close(fd)
 
 # the errors of os.link() that say the filesystem (or this pair of folders on it) cannot hard link: pruning then moves
-# that copy instead
-NO_HARD_LINK_ERRNOS = frozenset({errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK})
+# that copy instead. ENOSYS is sshfs's without its hard link extension, and rclone's
+NO_HARD_LINK_ERRNOS = frozenset({errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS})
 
-def prune_link_path(link_path:str) -> str:
+def prune_link_path(link_path:str, copy_st:os.stat_result) -> str:
 	'''
-	The name beside the chain link at link_path that pruning hard links the copy under before renaming it over the
-	link: the same every time for one link, so a run cut off between the two finds what it made, and of the partial
-	copy form (PARTIAL_COPY_NAME), which no entry of a version backed up by the daemon has.
+	The name beside the chain link at link_path that pruning hard links the copy copy_st was read from under, before
+	renaming it over the link: of the partial copy form (PARTIAL_COPY_NAME), and the same every time for one link and
+	one copy, so a run cut off between the two finds what it made. The monitored tree can hold a file of that form
+	beside the link's, which is backed up as any other and which pruning never removes, as it cannot tell what it is:
+	the name holds the copy's device and inode, which only the vault's owner can see, so no monitored file can be
+	given it to stop every prune.
 
 	Examples:
-		>>> path = prune_link_path('/vault/job/V1--x/d/a.txt')
-		>>> os.path.dirname(path), PARTIAL_COPY_NAME.fullmatch(os.path.basename(path)) is not None, path == prune_link_path('/vault/job/V1--x/d/a.txt')
-		('/vault/job/V1--x/d', True, True)
+		>>> copy, other = (os.stat_result((stat.S_IFREG | 0o600, ino, 7, 1, 0, 0, 6, 0, 0, 0)) for ino in (11, 12))
+		>>> path = prune_link_path('/vault/job/V1--x/d/a.txt', copy)
+		>>> os.path.dirname(path), PARTIAL_COPY_NAME.fullmatch(os.path.basename(path)) is not None
+		('/vault/job/V1--x/d', True)
+		>>> path == prune_link_path('/vault/job/V1--x/d/a.txt', copy), path == prune_link_path('/vault/job/V1--x/d/a.txt', other)
+		(True, False)
 	'''
 	folder, name = os.path.split(link_path)
-	return os.path.join(folder, '.' + xxhash.xxh128(os.fsencode(name)).hexdigest() + PARTIAL_COPY_SUFFIX)
+	salt = f'\0{copy_st.st_dev}:{copy_st.st_ino}'.encode()
+	return os.path.join(folder, '.' + xxhash.xxh128(os.fsencode(name) + salt).hexdigest() + PARTIAL_COPY_SUFFIX)
 
 def same_inode(first:os.stat_result, second:os.stat_result) -> bool:
 	return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
-def freed_by_removal(paths:list) -> tuple:
+class PathHashes:
 	'''
-	(bytes, inodes) removing paths (and all under them) frees, as du counts them: each folder, and each other entry no
-	name outside them shares (st_nlink 1). The daemon makes no hard links but pruning's, so a copy with more links is
-	one the next version holds too.
+	A set of paths kept by their 64-bit hash() alone, in one array with open addressing: 12 to 24 bytes a path, a
+	fraction of what a set of ints takes, as pruning's walk notes every copy it moves on a filesystem that cannot hard
+	link, and a big job's next version links 500k+ of them. Two paths of one hash count as one, which at worst gives a
+	dangling link a copy of the other's bytes in decrement_stepper(), never loses one.
+
+	Examples:
+		>>> held = PathHashes()
+		>>> for i in range(1000):
+		...     held.add(f'/v/V0/{i}')
+		>>> '/v/V0/7' in held, '/v/V0/999' in held, '/v/V0/1000' in held, len(held)
+		(True, True, False, 1000)
 	'''
-	size = inodes = 0
-	def count(path:str, is_dir:bool):
-		nonlocal size, inodes
-		try:
-			st = os.lstat(path)
-		except OSError:
+	def __init__(self):
+		# 0 marks a free slot, so a hash of 0 is kept as 1
+		self._slots = array.array('q', bytes(8 * 16))
+		self._count = 0
+
+	@staticmethod
+	def _slot(slots:array.array, key:int) -> int:
+		# where key is, or the free slot it would go in: probed in turn from its own
+		mask = len(slots) - 1
+		at = key & mask
+		while slots[at] and slots[at] != key:
+			at = (at + 1) & mask
+		return at
+
+	def add(self, path:str) -> None:
+		key = hash(path) or 1
+		at = self._slot(self._slots, key)
+		if self._slots[at]:
 			return
-		if is_dir or st.st_nlink == 1:
-			size += st.st_blocks * 512
-			inodes += 1
-	for path in paths:
-		try:
-			top_is_dir = stat.S_ISDIR(os.lstat(path).st_mode)
-		except OSError:
-			continue
-		count(path, top_is_dir)
-		if top_is_dir:
-			for entry, _, is_dir in iter_tree_entries(path):
-				count(entry.rstrip('/'), is_dir)
-	return size, inodes
+		self._slots[at] = key
+		self._count += 1
+		if self._count * 3 > len(self._slots) * 2:
+			# two thirds full: twice the slots, each key put in again
+			old, self._slots = self._slots, array.array('q', bytes(16 * len(self._slots)))
+			for key in old:
+				if key:
+					self._slots[self._slot(self._slots, key)] = key
+
+	def __contains__(self, path:str) -> bool:
+		key = hash(path) or 1
+		return self._slots[self._slot(self._slots, key)] == key
+
+	def __len__(self) -> int:
+		return self._count
 
 def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, monitor_paths:list = None, clock = time.monotonic) -> tuple:
 	'''
@@ -7874,12 +7897,21 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	(VersionMoves.of_committed(), under monitor_path and monitor_paths, the record of the monitored paths the versions
 	were written under, read from the manifest when None): a user's symlink is left as it is, whatever its text, and a
 	link whose rows cannot tell (UnexplainedChainLink) is taken for a chain link, as refusing one would lose its copy.
-	Two links naming one copy (one of them a user's link the rows could not tell) each get it. A link or copy that
-	cannot be looked at, linked or moved, or a removal that fails, keeps the oldest version: the removal is aborted,
-	and job_name's FAILED marker logged, then again every DISK_WAIT_REPEAT_SECONDS by clock while it lasts, as no
-	version is removed meanwhile and the vault keeps growing. A kept oldest version whose folder is gone, as a removal
-	cut short leaves it, is finished by removing what is left of its paths. Returns the bytes and inodes the removal
-	freed (freed_by_removal()), (0, 0) when nothing was removed.
+	Two links naming one copy (one of them a user's link the rows could not tell) each get it. A version, change list,
+	link or copy that cannot be looked at, linked or moved, or a removal that fails, keeps the oldest version: the
+	removal is aborted, and job_name's FAILED marker logged, then again every DISK_WAIT_REPEAT_SECONDS by clock while it
+	lasts, as no version is removed meanwhile and the vault keeps growing. Only a folder that is not there is gone: a
+	kept oldest version whose folder is gone, as a removal cut short leaves it, is finished by removing what is left of
+	its paths.
+	Each version's record of what it holds, which its change list's name keeps and a restart sums, is kept in du's
+	measure (st_blocks * 512, and an inode an entry), never by st_nlink, which mergerfs can show stale for a second
+	after a link: a copy materialised moves from the oldest version's record to the next one's, and the link it
+	replaces, or a dangling link dropped, leaves the next one's. Both records are written, by renaming the change
+	lists, before the removal, so a run cut off then, or a removal cut short, leaves them true, and when it is
+	aborted. Returns how far the two records went down in all, (bytes, inodes), so the caller's sums of every
+	version's record (vault_size, vault_inodes) stay theirs whether or not the oldest version went: the oldest
+	version's record and what the next one lost, when it went. Two links naming one copy both book it, so the next
+	version's record then holds one copy more than the version does.
 
 	Examples:
 		>>> decrement_stepper(OrderedDict([(0, VaultEntry(0, '/tmp/x', 0, 0, 0))]), 'job', '/m')
@@ -7905,47 +7937,133 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	applyingVersionNumber = next(vaultInfoIter)
 	applyingVaultEntry = vault_info_dict[applyingVersionNumber]
 	job_vault = os.path.dirname(referenceVaultPath)
+	# the books, each [bytes, inodes]: the copies the next version took from the reference vault, the entries it no
+	# longer holds (the links replaced, the dangling links dropped), and the copies made for it besides (for a second
+	# link naming a copy the walk moved)
+	transferred, unlinked, copied = [0, 0], [0, 0], [0, 0]
+	def book(books:list, st:os.stat_result) -> None:
+		books[0] += st.st_blocks * 512
+		books[1] += 1
+	# the records as the change lists' names hold them, and those lists (None for a version without one)
+	reference_record, applying_record = referenceVaultEntry, applyingVaultEntry
+	reference_list = applying_list = None
+	# whether the records were written, once a call: None until they are
+	records_written = None
+	def there(path:str):
+		# True when path is there, False when it is not, None when that cannot be told
+		try:
+			os.lstat(path)
+		except FileNotFoundError:
+			return False
+		except OSError:
+			return None
+		return True
+	def change_list_of(entry:VaultEntry):
+		# the change list holding entry's record: by the name the record makes, else the version's own found by listing
+		# the job vault (as a rename that reported an error can leave it); None when it has none. raises OSError when
+		# that cannot be told
+		expected = change_list_path(entry.path, entry.size, entry.inode)
+		try:
+			os.lstat(expected)
+			return expected
+		except FileNotFoundError:
+			pass
+		name = os.path.basename(os.path.abspath(entry.path))
+		found = sorted(listed for listed in os.listdir(job_vault) if (parse_change_list_name(listed) or (None, None))[1] == name)
+		return os.path.join(job_vault, found[0]) if found else None
+	def record(change_list:str, entry:VaultEntry, size:int, inodes:int, make:bool = False):
+		# change_list renamed for entry to record size and inodes: entry as it now records, None when that failed. a
+		# version without a list has no other record, or, with make, gets one, as one without is removed at startup
+		written = entry._replace(size=size, inode=inodes)
+		new_path = change_list_path(entry.path, size, inodes)
+		if change_list == new_path:
+			return written
+		if change_list is None:
+			if not make:
+				return written
+			backuperTeeLogToTl(path=referenceVaultPath,message=f'Creating content file {new_path}')
+			try:
+				TSVZ.appendTabularFile(new_path,[],header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=False)
+			except Exception as e:
+				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error creating content file {new_path}: {e}')
+				return None
+			return written
+		backuperTeeLogToTl(path=referenceVaultPath,message=f'Renaming {change_list} to {new_path}')
+		try:
+			os.rename(change_list,new_path)
+		except OSError as e:
+			# a rename that moved the list and then reported an error is done
+			if not (there(change_list) is False and there(new_path)):
+				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error renaming {change_list} to {new_path}: {e}')
+				return None
+		return written
+	def write_records() -> bool:
+		# both records written, the next version's first: whether its was. one of the reference vault's that cannot be
+		# written stays as it was, which a removal then takes with it, and which overstates the vault meanwhile
+		nonlocal reference_record, applying_record, records_written
+		if records_written is None:
+			records_written = True
+			if transferred[1] or unlinked[1] or copied[1]:
+				written = record(applying_list, applyingVaultEntry,
+					max(0, applyingVaultEntry.size - unlinked[0] + transferred[0] + copied[0]),
+					max(0, applyingVaultEntry.inode - unlinked[1] + transferred[1] + copied[1]), make=True)
+				if written is None:
+					records_written = False
+				else:
+					applying_record = vault_info_dict[applyingVersionNumber] = written
+					reference_record = record(reference_list, referenceVaultEntry, max(0, referenceVaultEntry.size - transferred[0]),
+						max(0, referenceVaultEntry.inode - transferred[1])) or reference_record
+		return records_written
+	def went_down(kept:bool) -> tuple:
+		# how far the two records went down in all: the reference vault's with it, when it went
+		size = applying_record.size + (reference_record.size if kept else 0)
+		inodes = applying_record.inode + (reference_record.inode if kept else 0)
+		return referenceVaultEntry.size + applyingVaultEntry.size - size, referenceVaultEntry.inode + applyingVaultEntry.inode - inodes
 	def keep_oldest(why:str) -> tuple:
-		# the reference vault stays, back at the front of vault_info_dict, and the job's FAILED marker says so
+		# the reference vault stays, back at the front of vault_info_dict, with the records written, and the job's FAILED
+		# marker says so
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Aborting removal of {referenceVaultPath} because {why}')
 		now = clock()
 		if now >= PRUNE_ABORTED.get(job_name, now):
 			job_log(job_name, f'FAILED: cannot remove {referenceVaultPath}, as {why}; it is kept, and the vault keeps growing')
 			PRUNE_ABORTED[job_name] = now + DISK_WAIT_REPEAT_SECONDS
+		write_records()
 		new_dict = OrderedDict()
-		new_dict[referenceVersionNumber] = referenceVaultEntry
+		new_dict[referenceVersionNumber] = reference_record
 		new_dict.update(vault_info_dict)
 		vault_info_dict.clear()
 		vault_info_dict.update(new_dict)
-		vault_info_dict[referenceVersionNumber] = refresh_vault_entry_size_metadata(vault_info_dict[referenceVersionNumber])
-		vault_info_dict[applyingVersionNumber] = refresh_vault_entry_size_metadata(vault_info_dict[applyingVersionNumber])
-		return 0, 0
-	def remove_paths(paths:list) -> tuple:
-		# rm -rf of paths, the reference vault's own: (freed bytes, inodes), or None when rm failed
-		freed = freed_by_removal(paths)
-		returncode = multiCMD.run_command(['rm','-rf',*paths],quiet=True,return_code_only=True) if paths else 0
-		if returncode:
-			return None
+		return went_down(True)
+	def remove_paths(paths:list) -> bool:
+		# rm -rf of paths, the reference vault's own: whether they went
+		if paths and multiCMD.run_command(['rm','-rf',*paths],quiet=True,return_code_only=True):
+			return False
 		forget_real_vault_folders(referenceVaultPath)
 		forget_version_moves(referenceVaultPath)
 		PRUNE_ABORTED.pop(job_name, None)
-		return freed
+		return True
 	# the path as a pattern of its own, so a vault path holding *, ? or [ matches nothing beside it
 	own_paths = lambda: glob.glob(glob.escape(referenceVaultPath)+'*',recursive=False)
-	if not os.path.lexists(referenceVaultPath):
-		# a removal cut short took the folder: its links were all materialised before, so what is left goes
+	# only a folder that is not there is gone: one that cannot be looked at may hold every copy the next version links
+	try:
+		os.lstat(referenceVaultPath)
+	except FileNotFoundError:
+		# a removal cut short took the folder, once its links were all materialised and the records written: what is left
+		# goes, and its record with it
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{referenceVaultPath} is already gone: removing what is left of it')
-		freed = remove_paths(own_paths())
-		return keep_oldest('rm -rf of what was left of it failed') if freed is None else freed
-	backup_size_str = format_bytes(applyingVaultEntry.size,use_1024_bytes=True,to_str=True).replace(' ','_')
-	backup_inode_str = format_bytes(applyingVaultEntry.inode,use_1024_bytes=False,to_str=True).replace(' ','')
-	content_file_path = f'{applyingVaultEntry.path}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
-	if not os.path.lexists(content_file_path):
-		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Content file {content_file_path} does not exist, creating a new one...')
-		content_file_path = ''
+		if not remove_paths(own_paths()):
+			return keep_oldest('rm -rf of what was left of it failed')
+		return went_down(False)
+	except OSError as e:
+		return keep_oldest(f'it cannot be looked at: {e}')
+	try:
+		reference_list = change_list_of(referenceVaultEntry)
+		applying_list = change_list_of(applyingVaultEntry)
+	except OSError as e:
+		return keep_oldest(f'its change list, or that of {applyingVaultEntry.path}, cannot be looked at: {e}')
+	if applying_list is None:
+		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Content file {change_list_path(applyingVaultEntry.path, applyingVaultEntry.size, applyingVaultEntry.inode)} does not exist, creating a new one...')
 	backuperTeeLogToTl(path=referenceVaultPath,message=f"Dealing with {applyingVersionNumber}: {applyingVaultEntry.path}")
-	new_size = applyingVaultEntry.size
-	block_size = os.statvfs(referenceVaultPath).f_frsize
 	materialize_failed = False
 	def failed(message:str) -> None:
 		nonlocal materialize_failed
@@ -7956,55 +8074,57 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		with contextlib.suppress(OSError):
 			if same_inode(os.lstat(path), target_st):
 				os.remove(path)
-	def share_moved_copy(copy:str, link:str, link_st:os.stat_result) -> bool:
-		# a copy of copy, with its metadata, put in place of link by a rename, while link is still the walk's symlink
+	def share_moved_copy(copy:str, link:str, link_st:os.stat_result):
+		# a copy of copy, with its metadata, put in place of link by a rename, while link is still the walk's symlink: its
+		# lstat(), None when it failed
 		temp_path = partial_copy_path(link)
 		try:
 			shutil.copyfile(copy,temp_path,follow_symlinks=False)
 			if not copy_file_meta(copy,temp_path):
-				return False
+				return None
+			made = os.lstat(temp_path)
 			if not same_inode(os.lstat(link), link_st):
 				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Not copying {copy} to {link}: it is no longer the link')
-				return False
+				return None
 			os.replace(temp_path,link)
-			return True
+			return made
 		except OSError as e:
 			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error copying {copy} to {link}: {e}')
-			return False
+			return None
 		finally:
 			with contextlib.suppress(OSError):
 				os.remove(temp_path)
 	# the copies a filesystem without hard links made this walk move out of the reference vault, so a second link
-	# naming one gets its bytes too: one moved to the link at its own path by the hash of its path alone, as every
-	# unchanged file of a big job is one, any other by target -> the link it now stands in place of
-	moved_home = set()
-	moved = {}
+	# naming one gets its bytes too: one moved to the link at its own path by the hash of its path alone (PathHashes),
+	# as every unchanged file of a big job is one, any other by target -> the link it now stands in place of
+	moved_home = PathHashes()
+	moved_away = {}
 	def moved_to(target:str):
 		# where this walk moved target, None when it did not
-		if target in moved:
-			return moved[target]
-		if hash(target) in moved_home:
+		if target in moved_away:
+			return moved_away[target]
+		if target in moved_home:
 			return os.path.join(applyingVaultEntry.path, target[len(referenceVaultPath) + 1:])
 		return None
 	def note_moved(target:str, link:str):
 		if link[len(applyingVaultEntry.path):] == target[len(referenceVaultPath):]:
-			moved_home.add(hash(target))
+			moved_home.add(target)
 		else:
-			moved[target] = link
+			moved_away[target] = link
 	def drop_dangling(file:str, file_st:os.stat_result, linkTarget:str) -> None:
 		# the target is gone: moved into this version by this walk for another link (one of the two a user's link the rows
 		# could not tell), whose copy this one gets too; else the link was dangling before. removing the reference vault
 		# loses nothing that is not already lost, and keeping the link would carry the broken reference forward into every
 		# later version. drop it and keep stepping, as aborting here wedges retention forever
-		nonlocal new_size
 		taken = moved_to(linkTarget)
 		if taken is not None:
 			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{file} and {taken} both link to {linkTarget}: one is a user\'s link that cannot be told from a chain link, so both get its copy')
-			if not share_moved_copy(taken, file, file_st):
+			made = share_moved_copy(taken, file, file_st)
+			if made is None:
 				failed(f'Error giving {file} the copy of {linkTarget} that {taken} took')
 				return
-			with contextlib.suppress(OSError):
-				new_size += max(os.lstat(file).st_size,block_size) - max(file_st.st_size,block_size)
+			book(unlinked, file_st)
+			book(copied, made)
 			return
 		try:
 			# only while it is still the link the walk saw: whatever stands there now is not removed
@@ -8014,11 +8134,16 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		except Exception as removeError:
 			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error removing dangling link {file} -> {linkTarget}: {removeError}')
 		else:
-			new_size -= max(file_st.st_size,block_size)
+			book(unlinked, file_st)
 			backuperTeeLogToTl(path=referenceVaultPath,message=f'Removed dangling link {file} -> {linkTarget} as the target is already missing')
 	def move_copy(file:str, file_st:os.stat_result, linkTarget:str, target_st:os.stat_result) -> bool:
 		# the copy moved in place of the link, for a filesystem that cannot hard link it: whether it is there now
-		if not same_inode(os.lstat(file), file_st):
+		try:
+			still_the_link = same_inode(os.lstat(file), file_st)
+		except OSError as e:
+			failed(f'Error looking at {file}: {e}')
+			return False
+		if not still_the_link:
 			failed(f'Not moving {linkTarget} to {file}: it is no longer the link')
 			return False
 		try:
@@ -8037,39 +8162,33 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		note_moved(linkTarget, file)
 		return True
 	def link_copy(file:str, file_st:os.stat_result, linkTarget:str, target_st:os.stat_result):
-		# the copy hard linked in place of the link: (True when it is there, False when it failed and the walk aborts, None
-		# when the filesystem cannot hard link it; how many links the copy had before this one)
-		temp_path = prune_link_path(file)
-		before = target_st.st_nlink
+		# the copy hard linked in place of the link: True when it is there, False when it failed and the walk aborts, None
+		# when the filesystem cannot hard link it
+		temp_path = prune_link_path(file, target_st)
 		try:
-			temp_st = os.lstat(temp_path)
-		except FileNotFoundError:
-			temp_st = None
-		except OSError as e:
-			failed(f'Error looking at {temp_path}: {e}')
-			return False, before
-		if temp_st is not None and not same_inode(temp_st, target_st):
-			# never removed: what it is cannot be told
-			failed(f'Not linking {linkTarget} to {file}: {temp_path} is there already, and is not its copy')
-			return False, before
-		if temp_st is None:
+			# the link itself when the copy is a user's symlink stored in the version
+			os.link(linkTarget,temp_path,follow_symlinks=False)
+		except FileExistsError:
+			# its own link, from a run cut off before the rename; anything else is never removed: what it is cannot be told
 			try:
-				# the link itself when the copy is a user's symlink stored in the version
-				os.link(linkTarget,temp_path,follow_symlinks=False)
+				left_by_a_run = same_inode(os.lstat(temp_path), target_st)
 			except OSError as e:
-				if e.errno in NO_HARD_LINK_ERRNOS:
-					return None, before
-				failed(f'Error linking {linkTarget} to {temp_path}: {e}')
-				return False, before
-		else:
-			# its own link, from a run cut off before the rename
-			before -= 1
+				failed(f'Error looking at {temp_path}: {e}')
+				return False
+			if not left_by_a_run:
+				failed(f'Not linking {linkTarget} to {file}: {temp_path} is there already, and is not its copy')
+				return False
 			backuperTeeLogToTl(path=referenceVaultPath,message=f'Linking {linkTarget} to {file} again from {temp_path}, which an earlier run left')
+		except OSError as e:
+			if e.errno in NO_HARD_LINK_ERRNOS:
+				return None
+			failed(f'Error linking {linkTarget} to {temp_path}: {e}')
+			return False
 		try:
 			if not same_inode(os.lstat(file), file_st):
 				remove_if_target(temp_path, target_st)
 				failed(f'Not linking {linkTarget} to {file}: it is no longer the link')
-				return False, before
+				return False
 			os.rename(temp_path,file)
 		except Exception as e:
 			try:
@@ -8079,9 +8198,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			if not landed:
 				remove_if_target(temp_path, target_st)
 				failed(f'Error linking {linkTarget} to {file}: {e}')
-				return False, before
+				return False
 			backuperTeeLogToTl(path=referenceVaultPath,message=f'Linking {linkTarget} to {file} reported {e}, but the copy is in place')
-		return True, before
+		return True
 	# the next version's rows, read once for the whole walk
 	moves = VaultMoves(job_vault,monitor_path,monitor_paths).of(applyingVaultEntry.path)
 	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs).
@@ -8094,6 +8213,12 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			continue
 		try:
 			file_st = os.lstat(file)
+		except FileNotFoundError as e:
+			if PARTIAL_COPY_NAME.fullmatch(os.path.basename(file)):
+				# a name a cut off run linked a copy under, listed with its folder before this walk renamed it over its link
+				continue
+			failed(f'Error looking at {file}: {e}')
+			continue
 		except OSError as e:
 			failed(f'Error looking at {file}: {e}')
 			continue
@@ -8128,48 +8253,32 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			continue
 		if DEBUG:
 			backuperTeeLogToTl(path=referenceVaultPath,message=f'Materialising {linkTarget} at {file}')
-		linked, before = link_copy(file, file_st, linkTarget, target_st)
+		linked = link_copy(file, file_st, linkTarget, target_st)
 		if linked is None:
 			linked = move_copy(file, file_st, linkTarget, target_st)
 		if linked:
-			if before > 1:
-				# no move of the daemon's makes two links to one copy: one is a user's link whose text the rows could not tell
-				# from a chain link's, and which cannot be told, so each keeps the copy
-				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{file} links to {linkTarget} too, which another entry already holds: one of them is a user\'s link that cannot be told from a chain link, so each gets the copy')
-			# what the version holds: the copy once, for its first link here, less the link
-			if before == 1:
-				new_size += max(target_st.st_size,block_size)
-			new_size -= max(file_st.st_size,block_size)
+			# the copy is the next version's now, in place of the link
+			book(transferred, target_st)
+			book(unlinked, file_st)
 	for rel, error in walk_errors:
 		failed(f'Error listing {unreadable_path(applyingVaultEntry.path, rel)}: {error}')
 	if materialize_failed:
 		return keep_oldest(f'materializing the links of {applyingVaultEntry.path} into it failed')
+	# before the removal, so a run cut off from here on leaves records a restart reads true
+	if not write_records():
+		return keep_oldest(f'the change list of {applyingVaultEntry.path} cannot be renamed for what it now holds')
 	backuperTeeLogToTl(path=referenceVaultPath,message=f'Removing {referenceVaultPath}')
 	paths_to_remove = own_paths()
 	if referenceVaultPath not in paths_to_remove:
 		# glob() passes over an error listing the job vault: nothing would be removed
 		return keep_oldest('its folder was not found listing the job vault')
-	freed = remove_paths(paths_to_remove)
-	if freed is None:
+	if not remove_paths(paths_to_remove):
+		if there(referenceVaultPath) is False:
+			# the folder went, and all it held with it: what is left of the version holds nothing, and the next prune
+			# finishes it
+			reference_record = reference_record._replace(size=0, inode=0)
 		return keep_oldest('rm -rf of its paths failed')
-	# the next version's change list is renamed for its new size only now, as an aborted removal refreshes its size
-	# from the name it has, and its retry would find no list of the old name
-	if new_size != applyingVaultEntry.size:
-		backup_size_str = format_bytes(new_size,use_1024_bytes=True,to_str=True).replace(' ','_')
-		new_content_file_path = f'{applyingVaultEntry.path}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
-		if content_file_path:
-			backuperTeeLogToTl(path=referenceVaultPath,message=f'Renaming {content_file_path} to {new_content_file_path}')
-			try:
-				os.rename(content_file_path,new_content_file_path)
-			except Exception as e:
-				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error renaming {content_file_path} to {new_content_file_path}: {e}')
-		else:
-			backuperTeeLogToTl(path=referenceVaultPath,message=f'Creating content file {new_content_file_path}')
-			try:
-				TSVZ.appendTabularFile(new_content_file_path,[],header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=False)
-			except Exception as e:
-				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error creating content file {new_content_file_path}: {e}')
-	return freed
+	return went_down(False)
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
