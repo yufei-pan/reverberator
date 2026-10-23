@@ -171,8 +171,8 @@ def test_link_through_a_backed_up_folder_symlink_is_not_followed_or_pruned_onto(
 	# a user's symlink to a folder, backed up as one
 	os.symlink(outside, f'{v0}/a')
 	v1 = write_committed_version(job, 1, {'deep/': None}, timestamp=T)
-	# shaped like a chain link an older daemon moved deeper, or like an older daemon's absolute one (no chain link
-	# since 0.44, wherever it leads)
+	# shaped like a chain link an older daemon moved deeper, or an absolute link of that shape (no chain link since
+	# 0.44, wherever it leads)
 	text = f'{v0}/a/x' if absolute else f'../V0--{T}/a/x'
 	os.symlink(text, f'{v1}/deep/u')
 	record = rv.read_vault_record(v1, 'deep/u', job.monitor)
@@ -248,19 +248,23 @@ def test_a_link_naming_too_long_a_folder_does_not_stop_a_prune(job):
 def test_a_chain_link_whose_folders_cannot_be_looked_at_keeps_the_version_being_pruned(job, monkeypatch, capsys, absolute):
 	v0 = write_committed_version(job, 0, {'a/b/x': 'x'}, timestamp=T, current=False)
 	v1 = write_committed_version(job, 1, {'a/b/': None}, timestamp=T)
-	# as the daemon writes it, or as an older daemon did
+	# as the daemon writes it, or an absolute link of that shape
 	text = f'{v0}/a/b/x' if absolute else f'../../../V0--{T}/a/b/x'
 	os.symlink(text, f'{v1}/a/b/x')
-	if absolute:
-		# since 0.44 an absolute link is a user's symlink, told without looking at a folder: pruning goes on and leaves it
-		rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict)
-		assert not os.path.exists(v0) and os.readlink(f'{v1}/a/b/x') == text
-		return
 	lstat = os.lstat
 	def lstat_failing_on_a(path, *args, **kwargs):
 		if path == f'{v0}/a':
 			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
 		return lstat(path, *args, **kwargs)
+	if absolute:
+		# since 0.44 an absolute link is a user's symlink, told without looking at a folder: pruning goes on and leaves it
+		info = rv.get_vault_info(job.job_vault).vault_info_dict
+		with monkeypatch.context() as patch:
+			patch.setattr(rv.os, 'lstat', lstat_failing_on_a)
+			assert rv.decrement_stepper(info) != (0, 0)
+			assert os.strerror(errno.EIO) not in capsys.readouterr().out
+		assert not os.path.exists(v0) and os.readlink(f'{v1}/a/b/x') == text
+		return
 	with monkeypatch.context() as patch:
 		patch.setattr(rv.os, 'lstat', lstat_failing_on_a)
 		# the link may be V1's only way to x, so V0 stays
@@ -296,7 +300,8 @@ def test_an_absolute_link_into_any_version_is_not_a_chain_link(tmp_path):
 	write_tree(f'{job_vault}/V2--{T}', {'a/x': 'x'})
 	target = f'{job_vault}/V2--{T}/a/x'
 	assert rv.chain_hop(job_vault, f'{job_vault}/V1--{T}/u', target) is None
-	# an older one too, which daemons before 0.38 wrote: since 0.44 that form is a user's symlink to a backed-up copy
+	# an older one too: no released daemon wrote absolute chain links, and since 0.44 that form is a user's symlink to a
+	# backed-up copy
 	assert rv.chain_hop(job_vault, f'{job_vault}/V3--{T}/u', target) is None
 
 
