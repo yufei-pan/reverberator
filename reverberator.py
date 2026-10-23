@@ -4401,7 +4401,8 @@ def do_backup(backup_entries:dict,
 				rels = recopy_rels(manifest,this_version_number,oldest_kept,job_vault,latest_version_info.path,moves)
 				rewritten, deleted = batch_rewrites(backup_entries,monitor_path,only_sync_attributes,rels) if rels else (set(), set())
 				rels = [rel for rel in rels if rel not in deleted]
-				return oldest_kept, rels, rewritten, recopy_size([rel for rel in rels if rel not in rewritten],job_vault,latest_version_info.path,moves)
+				counted = [rel for rel in rels if rel not in rewritten]
+				return oldest_kept, rels, rewritten, recopy_size(counted,job_vault,latest_version_info.path,moves,{rel: manifest.copy_version(rel) for rel in counted})
 			recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
 			if recopies:
 				backuperTeeLogToTl(job_name,f'{len(recopies)} files to copy again from the vault, as their link chains would pass their limit: estimated size {recopies_size}')
@@ -5602,11 +5603,12 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 			# the monitored entry became a symlink while the version still holds a copy of what it was
 			backuperTeeLogToTl(path=source_file,error=True,message=f'Not copying the metadata of {source_file} onto {backup_file_path}: it is a symlink, and {backup_file_path} is not one')
 			return False
-		# copy the file metadata
-		copystat(source_file,backup_file_path)
+		# copy the file metadata, the owner first: a chown clears S_ISUID and S_ISGID of a file, even for root (and its
+		# security.capability), so copystat's mode and extended attributes come after it
 		st = os.stat(source_file)
 		if os.name == 'posix':
 			os.chown(backup_file_path, st.st_uid, st.st_gid)
+		copystat(source_file,backup_file_path)
 		# to the nanosecond, as copystat set them: times passed as floats come back up to a few hundred ns off
 		os.utime(backup_file_path, ns=(st.st_atime_ns, st.st_mtime_ns))
 		return True
@@ -6063,11 +6065,15 @@ class VaultManifest:
 
 	def lookup(self, rel:str):
 		'''The record for rel (all None when unverified), or None when rel is not tracked.'''
-		row = self.conn.execute('SELECT kind, size, mtime_ns, mode, uid, gid, hash, link, unchecked FROM entries WHERE path = ?', (storable_name(rel),)).fetchone()
+		return self.lookup_with_copy_version(rel)[0]
+
+	def lookup_with_copy_version(self, rel:str) -> tuple:
+		'''(lookup(rel), copy_version(rel)), read at once.'''
+		row = self.conn.execute('SELECT kind, size, mtime_ns, mode, uid, gid, hash, link, unchecked, copy_version FROM entries WHERE path = ?', (storable_name(rel),)).fetchone()
 		if row is None:
-			return None
-		record = ManifestRecord(*row)
-		return record if record.link is None else record._replace(link=stored_name(record.link))
+			return None, None
+		record = ManifestRecord(*row[:-1])
+		return (record if record.link is None else record._replace(link=stored_name(record.link))), row[-1]
 
 	def dirty_rels(self) -> set:
 		'''The rels of the rows this backup wrote and has not recorded yet.'''
@@ -6154,6 +6160,15 @@ class VaultManifest:
 
 	def take_dirty(self, limit:int) -> list:
 		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty LIMIT ?', (limit,))]
+
+	def take_dirty_copy_versions(self, limit:int) -> list:
+		'''take_dirty(), each rel with its copy version, as (rel, copy version or None).'''
+		return [(stored_name(rel), copy_version) for rel, copy_version in self.conn.execute('SELECT path, copy_version FROM entries WHERE dirty LIMIT ?', (limit,))]
+
+	def copy_version(self, rel:str):
+		'''The number of the version that holds the copy of the file rel (set_copy_version()), None when not known or not tracked.'''
+		row = self.conn.execute('SELECT copy_version FROM entries WHERE path = ?', (storable_name(rel),)).fetchone()
+		return None if row is None else row[0]
 
 	def iter_folders(self):
 		# sorted, so every folder comes before the folders inside it
@@ -6656,8 +6671,10 @@ class VersionMoves:
 		'''
 		The moves the replay of the version being written has applied, as (source_rel, dest_rel, is_folder) in its
 		order. The replay made every entry of the version, so a link they do not explain is not one of its chain links.
+		moves is the replay's own list, not a copy: a move it applies later is seen too, as the replay appends each one
+		before anything reads the links it renamed.
 		'''
-		return cls(moves=list(moves), usable=True)
+		return cls(moves=moves if isinstance(moves, list) else list(moves), usable=True)
 
 	def _read(self) -> None:
 		'''Read a committed version's moves, the first time they are asked for.'''
@@ -6905,6 +6922,18 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 		raise UnexplainedChainLink(why, target)
 	return target if verdict else None
 
+# the moves of a version none are read for: its links go by the text alone, with no warning
+BY_THE_TEXT = VersionMoves(moves=[], usable=False, why='its links are followed by their text')
+
+def copied_hop(job_vault:str, link_path:str, link_text:str) -> 'str | None':
+	'''
+	vault_chain_hop() of a link above the version the manifest says holds its file's copy (its copy_version), in a
+	chain from the latest version: the daemon's own chain link, so it is followed by the text rule (and the rest of
+	vault_chain_hop()'s checks: no absolute text, no folder target), whatever its version's moves say. Raises
+	UncheckedVaultLink when that cannot be told.
+	'''
+	return vault_chain_hop(job_vault, link_path, link_text, BY_THE_TEXT)
+
 class CommittedMoves:
 	'''
 	VersionMoves.of_committed() of a version of vault (a VaultMoves), made when an answer first needs it, so a link
@@ -6938,13 +6967,16 @@ class VaultMoves:
 	own connection gives it, as a read of its own could find the manifest locked by the daemon's own write); when None
 	it is read_record(job_vault) (recorded_monitor_paths() when None), once, the first time a link needs rows.
 	monitor_path is the job's path now, None when not known. writing is the folder of the version a backup is writing,
-	which has no change list yet: its links go by their text alone, with no warning, as before 0.44.
+	which has no change list yet: its links are told by applied, the moves its replay has applied
+	(VersionMoves.applied()), or when None by their text alone, with no warning, as before 0.44.
 	'''
-	def __init__(self, job_vault:str, monitor_path:str = None, monitor_paths:list = None, writing:str = None, read_record = None):
+	def __init__(self, job_vault:str, monitor_path:str = None, monitor_paths:list = None, writing:str = None, read_record = None,
+			applied:VersionMoves = None):
 		self.job_vault = os.path.abspath(job_vault)
 		self.monitor_path = monitor_path
 		self.monitor_paths = monitor_paths
 		self.writing = None if writing is None else os.path.abspath(writing)
+		self.applied = applied
 		self._read_record = recorded_monitor_paths if read_record is None else read_record
 		self._record_read = monitor_paths is not None
 		self._held = {}
@@ -6967,7 +6999,7 @@ class VaultMoves:
 		if held is not None:
 			return held
 		if path == self.writing:
-			moves = VersionMoves(moves=[], usable=False, why='it is being written')
+			moves = VersionMoves(moves=[], usable=False, why='it is being written') if self.applied is None else self.applied
 		else:
 			moves = CommittedMoves(self, path)
 		with self._lock:
@@ -7011,14 +7043,17 @@ def manifest_monitor_paths(manifest:VaultManifest):
 	except (sqlite3.Error, ValueError, TypeError):
 		return None
 
-def retarget_chain_link(job_vault:str, link_path:str) -> bool:
+def retarget_chain_link(job_vault:str, link_path:str, moves:VersionMoves = None) -> bool:
 	'''
-	Rewrite the relative chain link at link_path (by chain_link_target()) to the text that reaches its target from where
-	it now sits. True if it was rewritten; a link already reaching it, or any other link, keeps its text.
+	Rewrite the relative chain link at link_path to the text that reaches its target from where it now sits. True if it
+	was rewritten; a link already reaching it, or any other link, keeps its text. moves are those of the link's version,
+	the one a backup is writing (VersionMoves.applied(), the move that took the link there among them), by which
+	vault_chain_hop() tells a chain link from a user's symlink of its form, such as the copy of one the replay made and
+	a move then carried; by the text alone (chain_link_target()) when None.
 	'''
 	link_text = os.readlink(link_path)
 	try:
-		target = chain_link_target(job_vault, link_text, link_path)
+		target = chain_link_target(job_vault, link_text, link_path) if moves is None else vault_chain_hop(job_vault, link_path, link_text, moves)
 	except UncheckedVaultLink:
 		# reading and pruning still find its version, whatever folder depth its text is for
 		return False
@@ -7037,19 +7072,20 @@ def retarget_chain_link(job_vault:str, link_path:str) -> bool:
 		raise
 	return True
 
-def retarget_moved_links(job_vault:str, moved_path:str, errors:list = None) -> int:
+def retarget_moved_links(job_vault:str, moved_path:str, errors:list = None, moves:VersionMoves = None) -> int:
 	'''
-	retarget_chain_link() for the vault entry a move put at moved_path: the link itself, or every link under a folder.
-	Returns how many links were rewritten. With errors, a link that cannot be rewritten and a folder that cannot be read
-	are appended to it as (path, error) and the others are rewritten all the same: the links left keep their text,
-	which still names their versions, so reading and pruning find their copies (chain_link_target() does not count the
-	../). Without, the first link that cannot be rewritten raises.
+	retarget_chain_link() for the vault entry a move put at moved_path: the link itself, or every link under a folder,
+	each told by moves (the version's applied moves, that move among them; the text alone when None). Returns how many
+	links were rewritten. With errors, a link that cannot be rewritten and a folder that cannot be read are appended to
+	it as (path, error) and the others are rewritten all the same: the links left keep their text, which still names
+	their versions, so reading and pruning find their copies (the moves take them there, whatever their ../ count).
+	Without, the first link that cannot be rewritten raises.
 	'''
 	def retarget(path:str) -> bool:
 		if errors is None:
-			return retarget_chain_link(job_vault, path)
+			return retarget_chain_link(job_vault, path, moves)
 		try:
-			return retarget_chain_link(job_vault, path)
+			return retarget_chain_link(job_vault, path, moves)
 		except OSError as e:
 			errors.append((path, e))
 			return False
@@ -7082,16 +7118,21 @@ def effective_copy_version(recorded, oldest_kept:int):
 
 ChainEnd = namedtuple('ChainEnd', ['number', 'path', 'st'])
 
-def chain_end(job_vault:str, version_path:str, rel:str, moves:'VaultMoves' = None):
+def chain_end(job_vault:str, version_path:str, rel:str, moves:'VaultMoves' = None, copy_version:int = None):
 	'''
 	Where the chain starting at version_path's file rel ends, as a ChainEnd: the number of the version folder holding
 	it, its path and its lstat. The end is a copy, a user's symlink backed up as one or a referenced backup's link,
 	each link told by the moves of its version (moves, a VaultMoves for the pass; one reading the manifest's record
-	when None, which knows no monitored path for a version the record does not name). Each hop names an older version
-	than the last, so the walk ends within as many hops as there are versions below version_path, however many more
-	links than the kernel follows that is. None when the chain cannot be followed: a folder of rel in version_path is
-	not a real folder (by is_real_folder_under()), an entry on the chain is missing or cannot be read, or a link on it
-	cannot be looked at (UncheckedVaultLink).
+	when None, which knows no monitored path for a version the record does not name). copy_version, for a chain from
+	the latest version, is the number of the version the manifest says holds the copy (VaultManifest.copy_version()),
+	which overrules the moves: the links above it are the daemon's own, followed by their text (copied_hop()), and the
+	chain ends at the entry of that version, whatever it is, as a refusal by the rows could otherwise end it at a chain
+	link that no rule follows once it is copied elsewhere. A copy pruning moved into the oldest version kept ends the
+	chain there too, its own link naming the version gone. Each hop names an older version than the last, so the walk
+	ends within as many hops as there are versions below version_path, however many more links than the kernel follows
+	that is. None when the chain cannot be followed: a folder of rel in version_path is not a real folder (by
+	is_real_folder_under()), an entry on the chain is missing or cannot be read, or a link on it cannot be looked at
+	(UncheckedVaultLink).
 	'''
 	vault = os.path.abspath(job_vault)
 	if moves is None:
@@ -7107,9 +7148,10 @@ def chain_end(job_vault:str, version_path:str, rel:str, moves:'VaultMoves' = Non
 	while number is not None:
 		try:
 			st = os.lstat(entry)
-			if not stat.S_ISLNK(st.st_mode):
+			if not stat.S_ISLNK(st.st_mode) or (copy_version is not None and number <= copy_version):
 				return ChainEnd(number, entry, st)
-			hop = moves.follow(entry, os.readlink(entry))
+			text = os.readlink(entry)
+			hop = moves.follow(entry, text) if copy_version is None else copied_hop(vault, entry, text)
 		except (OSError, UncheckedVaultLink):
 			return None
 		if hop is None:
@@ -7124,10 +7166,21 @@ def chain_end(job_vault:str, version_path:str, rel:str, moves:'VaultMoves' = Non
 def learn_copy_version(job_vault:str, version_path:str, rel:str, moves:'VaultMoves' = None):
 	'''
 	The number of the version whose folder holds the end of the chain starting at version_path's file rel (a copy, a
-	user's symlink backed up as one or a referenced backup's link), by chain_end(); None when the chain cannot be followed.
+	user's symlink backed up as one or a referenced backup's link), by chain_end(); None when the chain cannot be followed,
+	or when it ends at a link the text rule follows that the moves of its version refuse. That one may be a chain link
+	the rows cannot account for: learned, its version would be the manifest's word (chain_end()'s copy_version), and a
+	re-copy would copy the link itself where no rule follows it. Left unknown, the file is linked as ever.
 	'''
 	end = chain_end(job_vault, version_path, rel, moves)
-	return None if end is None else end.number
+	if end is None:
+		return None
+	if stat.S_ISLNK(end.st.st_mode):
+		try:
+			if copied_hop(job_vault, end.path, os.readlink(end.path)) is not None:
+				return None
+		except (OSError, UncheckedVaultLink):
+			return None
+	return end.number
 
 def recopy_threshold(rel:str) -> int:
 	'''
@@ -7233,24 +7286,29 @@ def batch_rewrites(backup_entries:dict, monitor_path:str, only_sync_attributes:b
 			rewritten.add(rel)
 	return rewritten, deleted
 
-def recopy_size(rels:list, job_vault:str, latest_version_path:str, moves:'VaultMoves' = None) -> int:
+def recopy_size(rels:list, job_vault:str, latest_version_path:str, moves:'VaultMoves' = None, copy_versions:dict = None) -> int:
 	'''
 	The bytes copying rels again from the vault adds to a version: the size of the file each one's chain in the latest
-	version ends at (chain_end(), by moves), nothing for a link, nor for a chain that cannot be followed, which keeps
+	version ends at (chain_end(), by moves, and by its copy version in copy_versions, rel -> the manifest's
+	copy_version, as the re-copy follows it), nothing for a link, nor for a chain that cannot be followed, which keeps
 	its link.
 	'''
 	total = 0
 	for rel in rels:
-		end = chain_end(job_vault, latest_version_path, rel, moves)
+		end = chain_end(job_vault, latest_version_path, rel, moves, None if copy_versions is None else copy_versions.get(rel))
 		if end is not None and stat.S_ISREG(end.st.st_mode):
 			total += end.st.st_size
 	return total
 
-def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None):
+def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None):
 	'''
 	Record what version_path holds at rel, following the links that chain an unchanged entry back to its copy, each
 	told by the moves of its version (moves, a VaultMoves for the pass; one reading the manifest's record when None).
-	Returns None when there is nothing readable there, or a link there cannot be looked at (UncheckedVaultLink).
+	copy_version, for the version the manifest describes, is the number its row gives for the version holding the copy
+	(VaultManifest.copy_version()): the links above that version are followed by their text, whatever the moves say,
+	and the entry there is the end, as chain_end() has it; so an entry this version copied (copy_version its own
+	number) is read as it is, a user's link as the link. Returns None when there is nothing readable there, or a link
+	there cannot be looked at (UncheckedVaultLink).
 	'''
 	entry = os.path.abspath(os.path.join(version_path, rel))
 	try:
@@ -7263,12 +7321,24 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 		if moves is None:
 			moves = VaultMoves(job_vault, monitor_path)
 		monitor_entry = os.path.abspath(os.path.join(monitor_path, rel))
+		number = vault_version_number(os.path.basename(os.path.normpath(version_path)))
+		if number is None:
+			copy_version = None
 		for _ in range(MAX_CHAINED_LINKS):
 			st = os.lstat(entry)
 			if not stat.S_ISLNK(st.st_mode):
 				break
 			target = os.readlink(entry)
-			resolved = moves.follow(entry, target)
+			if copy_version is None:
+				resolved = moves.follow(entry, target)
+			elif number <= copy_version:
+				# the version the manifest says holds the copy: what is here is it
+				resolved = None
+			else:
+				resolved = copied_hop(job_vault, entry, target)
+				if resolved is not None:
+					# a chain link names the version below by its whole name
+					number = vault_version_number(resolved[len(job_vault) + 1:].partition('/')[0])
 			if resolved is None:
 				if os.path.isabs(target) and os.path.normpath(target) == monitor_entry:
 					# a referenced backup links to the monitored file itself
@@ -7284,23 +7354,29 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 	except (OSError, UncheckedVaultLink):
 		return None
 
-def read_copied_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None):
-	'''read_vault_record() for an entry a backup just wrote: its file is still unchecked, as it was read from memory.'''
-	record = read_vault_record(version_path, rel, monitor_path, moves)
+def read_copied_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None):
+	'''
+	read_vault_record() for an entry a backup just wrote: its file is still unchecked, as it was read from memory. One
+	whose copy_version is this version's own number, a copy this backup made, is read as it is, never followed: a
+	user's link copied is recorded as the link, with its text.
+	'''
+	record = read_vault_record(version_path, rel, monitor_path, moves, copy_version)
 	return record._replace(unchecked=1) if record is not None and record.kind == 'f' else record
 
-def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:str):
+def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:str, applied:VersionMoves = None):
 	'''
 	Record what version_path, the version this backup is writing, holds for the rows it wrote, reading them on a
-	compare pool: its own links by their text alone, those of the committed versions below by their moves.
+	compare pool, each by its copy version (read_copied_record()): the links of the version by applied, the moves its
+	replay applied (by their text alone when None), those of the committed versions below by their moves.
 	'''
-	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path)
+	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path,
+		applied=applied)
 	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
 		while GREEN_LIGHT.is_set():
-			rels = manifest.take_dirty(MANIFEST_BATCH_SIZE)
-			if not rels:
+			rows = manifest.take_dirty_copy_versions(MANIFEST_BATCH_SIZE)
+			if not rows:
 				return
-			manifest.set_records(zip(rels, pool.map(lambda rel: read_copied_record(version_path, rel, monitor_path, moves), rels)))
+			manifest.set_records(zip((rel for rel, _ in rows), pool.map(lambda row: read_copied_record(version_path, row[0], monitor_path, moves, row[1]), rows)))
 
 def count_batch(pool, batch:list, allocated, total_bytes:int, inodes:int) -> tuple:
 	for blocks in pool.map(allocated, batch):
@@ -7368,12 +7444,12 @@ def kernel_cannot_follow(version_path:str, rel:str, record:ManifestRecord) -> bo
 	entry = os.path.join(version_path, rel)
 	return os.path.islink(entry) and not os.path.exists(entry)
 
-def read_version_record(version_path:str, rel:str, monitor_path:str, fresh:bool = False, moves:'VaultMoves' = None):
+def read_version_record(version_path:str, rel:str, monitor_path:str, fresh:bool = False, moves:'VaultMoves' = None, copy_version:int = None):
 	'''
 	read_vault_record(), for a fresh version_path: one a backup is still writing, where a regular file in the version
 	itself (reached by no link) is a copy this backup made, so its record stays unchecked, as read_copied_record() gives.
 	'''
-	record = read_vault_record(version_path, rel, monitor_path, moves)
+	record = read_vault_record(version_path, rel, monitor_path, moves, copy_version)
 	if fresh and record is not None and record.kind == 'f':
 		try:
 			copied = stat.S_ISREG(os.lstat(os.path.join(version_path, rel)).st_mode)
@@ -7383,22 +7459,23 @@ def read_version_record(version_path:str, rel:str, monitor_path:str, fresh:bool 
 			record = record._replace(unchecked=1)
 	return record
 
-def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_path:str, monitor_path:str, fresh:bool = False, moves:'VaultMoves' = None):
+def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_path:str, monitor_path:str, fresh:bool = False, moves:'VaultMoves' = None,
+		copy_version:int = None):
 	'''
 	Compare one tracked entry for delta generation, on the compare pool; with fresh, version_path is the version a
-	backup is writing (read_version_record()). moves tells the vault's links, as read_vault_record() says.
-	Returns (event or None, a record read from the vault to store or None).
+	backup is writing (read_version_record()). moves tells the vault's links, and copy_version, the row's, where its
+	copy is, as read_vault_record() says. Returns (event or None, a record read from the vault to store or None).
 	'''
 	found = None
 	if record.kind is None:
-		found = read_version_record(version_path, rel, monitor_path, fresh, moves)
+		found = read_version_record(version_path, rel, monitor_path, fresh, moves, copy_version)
 		if found is None:
 			backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Cannot read {os.path.join(version_path, rel)} from the vault, treating as create')
 			return 'create', None
 		record = found
 	elif record.unchecked:
 		# a crash soon after a backup can leave its copies at the right size and mtime over bytes that never reached the disk
-		found = read_version_record(version_path, rel, monitor_path, fresh, moves)
+		found = read_version_record(version_path, rel, monitor_path, fresh, moves, copy_version)
 		if found is None or (found.size, found.mtime_ns, found.hash) != (record.size, record.mtime_ns, record.hash):
 			backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Vault copy at {os.path.join(version_path, rel)} does not match its record, copying again')
 			return 'modify', None
@@ -7482,7 +7559,8 @@ def scope_path_entry(monitor_path:str, rel:str, skip = None, errors:list = None)
 		return None
 	return (path + '/' if is_dir else path), entry_rel, is_dir
 
-def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str, monitor_path:str, scopes:TouchedScopes, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None, trusted = frozenset(), attributes:bool = True, fresh:bool = False) -> int:
+def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str, monitor_path:str, scopes:TouchedScopes, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None, trusted = frozenset(), attributes:bool = True, fresh:bool = False,
+		applied:VersionMoves = None) -> int:
 	'''
 	Add to backup_entries what differs between scopes of monitor_path and the manifest rows describing version_path,
 	in the caller's transaction: nothing is begun, committed or rolled back here, so the rows can be the ones a backup
@@ -7502,11 +7580,14 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	cannot be read, before the pass or at its end, JobFailure is raised before anything is found deleted. skip (a skip list's skips) and the paused
 	inner mounts leave entries out of the walks; the paused ones keep their tracked rows, and a scope that is skipped or
 	in a paused folder compares nothing. The vault's links are told by the moves of their versions (VaultMoves), by
-	the record of monitored paths on the manifest's own connection.
+	the record of monitored paths on the manifest's own connection, those of a fresh version_path by applied, the moves
+	its replay applied (VersionMoves.applied(); by their text alone when None), and a row's copy version overrules them
+	(read_vault_record()).
 	'''
 	start_time = time.monotonic()
 	skip = skip_paused(skip, paused)
-	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path if fresh else None)
+	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path if fresh else None,
+		applied=applied if fresh else None)
 	subtrees = []
 	covered = set()
 	# outermost first, as a folder's rel is shorter than any rel under it
@@ -7563,7 +7644,8 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
 		def compare(monitor_entry, rel):
 			nonlocal compared
-			record = manifest.lookup(rel)
+			# with where its copy is, for a row compare_entry() reads from the vault
+			record, copy_version = manifest.lookup_with_copy_version(rel)
 			if record is None:
 				pending.append((monitor_entry, rel, ('create', None)))
 			else:
@@ -7576,7 +7658,7 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 					# this backup just copied it from the tree, as the kind its rel tells
 					pending.append((monitor_entry, rel, (None, None)))
 				else:
-					pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path, fresh, moves)))
+					pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path, fresh, moves, copy_version)))
 			settle(COMPARE_THREADS * 4)
 		# the entries the paths found, as X and X/ name the same one
 		path_entries = set()
@@ -8807,7 +8889,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 
 	The files of recopy (rels, as recopy_rels() gives them) are copied again from the end of their chains in the latest
 	version, before the replay: the vault's copy, as it is there, never the monitored file, which may have changed
-	since. Each one copied is appended to recopied. One whose chain cannot be followed (an error line names it), or
+	since. The end is in the version each one's row says holds its copy (chain_end()'s copy_version), whatever the
+	rows of the versions on the way say, so a link the re-copy copies is a user's own, which no rule takes for a chain
+	link where it lands. Each one copied is appended to recopied. One whose chain cannot be followed (an error line names it), or
 	whose copy fails, keeps its link. Their records stay those of the copies they were made from, only unchecked, as a
 	crash can keep any new copy's bytes from the disk.
 	With touched (touched_scopes() of the batch's raw events), the replay is verified once its copies are in place: the
@@ -8829,6 +8913,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	# the links of the committed versions, on the chains the re-copy and the attribute sync follow, are told by their
 	# versions' moves, held for this backup
 	committed_moves = VaultMoves(os.path.dirname(os.path.abspath(backup_folder)),monitor_path,manifest_monitor_paths(manifest))
+	# the moves this replay applied, in its order, as (source_rel, dest_rel, is_folder), a folder's rels ending with /:
+	# each is added once its rename is made, before anything reads the links it renamed ( the retarget, the move's
+	# metadata check, the attribute sync, the verification and the records ), and one that fell back to delete & copy,
+	# which renamed no link, is not. by them every reader tells this version's links ( VersionMoves.applied() )
+	applied_moves = []
+	writing_moves = VersionMoves.applied(applied_moves)
+	this_version_number = vault_version_number(os.path.basename(os.path.normpath(backup_folder)))
 	# the folders a file now stands in place of, each logged once
 	replaced_folders = set()
 	def not_through_link(rel,isDir,doing):
@@ -8935,11 +9026,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# the latest copy is, as only_sync_attributes has it: the end of the chain gets them. a user's symlink, in the
 		# version or at the chain's end, gets only its own owner and times ( copy_file_meta() ), never what it points to.
 		# the chain is followed from its first hop, in a committed version: nothing is judged, nor remembered
-		# ( is_real_folder_under() ), about the folders of this one, which the replay can still change
-		# the end must be of the monitored entry's kind. the first hop, in this version, still goes by the text alone (the
-		# version's moves are not known yet), and chain_end() tells the links of the committed versions by their moves,
-		# so a user's link whose text has a chain link's form ( ../<the version before>/D/f ) is the chain's end there;
-		# the check still guards a chain that ends anywhere else, such as a folder
+		# ( is_real_folder_under() ), about the folders of this one, which the replay can still change.
+		# the file's copy version says where its copy is, and so where the chain ends: the links above that version are
+		# the daemon's own, followed by their text ( copied_hop() ), and one this backup copied is the end itself. when
+		# it is not known, the first hop goes by the moves this replay applied, and chain_end() tells the links of the
+		# committed versions by their moves, so a user's link whose text has a chain link's form
+		# ( ../<the version before>/D/f ) is the chain's end. the end must be of the monitored entry's kind, which still
+		# guards a chain that ends anywhere else, such as a folder
 		entry = os.path.abspath(os.path.join(backup_folder,relative_path))
 		if not os.path.islink(entry):
 			return copy_file_meta(source_real_path,entry)
@@ -8947,15 +9040,21 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: {why}')
 			return False
 		vault = os.path.dirname(os.path.abspath(backup_folder))
+		copy_version = manifest.copy_version(relative_path)
 		try:
-			hop = strict_chain_hop(vault,entry,os.readlink(entry))
+			if copy_version is not None and this_version_number is not None and this_version_number <= copy_version:
+				# a copy this backup made, as a re-copy of a user's link: the link itself
+				hop = None
+			else:
+				text = os.readlink(entry)
+				hop = vault_chain_hop(vault,entry,text,writing_moves) if copy_version is None else copied_hop(vault,entry,text)
 		except (OSError,UncheckedVaultLink):
 			return refuse('its link chain cannot be followed')
 		if hop is None:
 			end_path, end_mode = entry, stat.S_IFLNK
 		else:
 			hop_version = hop[len(vault) + 1:].partition('/')[0]
-			end = chain_end(vault,os.path.join(vault,hop_version),hop[len(vault) + len(hop_version) + 2:],committed_moves)
+			end = chain_end(vault,os.path.join(vault,hop_version),hop[len(vault) + len(hop_version) + 2:],committed_moves,copy_version)
 			if end is None:
 				return refuse('its link chain cannot be followed')
 			if stat.S_ISDIR(end.st.st_mode):
@@ -8977,6 +9076,12 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			kinds = ('a symlink', 'not one') if source_is_link else ('not a symlink', 'a symlink')
 			return refuse(f'it is {kinds[0]}, and its link chain ends at {end_path}, which is {kinds[1]}')
 		return copy_file_meta(source_real_path,end_path)
+	def own_chain_hop(path):
+		# vault_chain_hop() of a link of this version, by the moves this replay applied; None when that cannot be told
+		try:
+			return vault_chain_hop(os.path.dirname(os.path.abspath(backup_folder)),path,os.readlink(path),writing_moves)
+		except UncheckedVaultLink:
+			return None
 	def wait_for_async_commands(mcae):
 		# returns the rels of the copies put in place
 		while GREEN_LIGHT.is_set() and mcae.runningThreads:
@@ -9084,6 +9189,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					if os.path.lexists(link_target_backup_real_path):
 						os.remove(link_target_backup_real_path)
 					os.rename(link_source_backup_real_path,link_target_backup_real_path)
+					# the links it renamed are told by it from here on, its own retarget first
+					applied_moves.append((as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path),True) if isDir else
+						(link_source_relative_path,link_target_relative_path,False))
 					backuperTeeLogToTl(path=monitor_path,message=f'Moved {link_source_backup_real_path} to {link_target_backup_real_path}')
 					if link_source_relative_path.rstrip('/').count('/') != link_target_relative_path.rstrip('/').count('/'):
 						# the relative links moved to another folder depth no longer reach the versions holding the copies.
@@ -9092,17 +9200,16 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						# again a file whose link the kernel cannot follow )
 						retarget_errors = []
 						try:
-							retarget_moved_links(os.path.dirname(backup_folder),link_target_backup_real_path,retarget_errors)
+							retarget_moved_links(os.path.dirname(backup_folder),link_target_backup_real_path,retarget_errors,writing_moves)
 						except Exception as e:
 							retarget_errors.append((link_target_backup_real_path,e))
 						for retarget_path,retarget_error in retarget_errors:
 							backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot re-target the links at {retarget_path}, moved to another folder depth: {retarget_error}; '
 								'they keep their text, which still names their versions, and the next comparison checks them')
 					# sync the current attrs from the source onto the moved vault entry, but never through a symlink: a chained
-					# one would rewrite the previous version's metadata, and gets none. a user's symlink gets its own owner and
-					# times only ( copy_file_meta() )
-					if not os.path.islink(link_target_backup_real_path) or chain_hop(os.path.dirname(os.path.abspath(backup_folder)),
-							link_target_backup_real_path,os.readlink(link_target_backup_real_path)) is None:
+					# one, told by the moves this replay applied, would rewrite the previous version's metadata, and gets none.
+					# a user's symlink, or a link that cannot be told, gets its own owner and times only ( copy_file_meta() )
+					if not os.path.islink(link_target_backup_real_path) or own_chain_hop(link_target_backup_real_path) is None:
 						copy_file_meta(event_source_real_path,link_target_backup_real_path)
 				except NotARealFolder as e:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: {e}; doing delete & copy instead')
@@ -9139,7 +9246,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# left to the attribute handling, which syncs them onto the latest copy, wherever it lives
 		fixes = OrderedDict()
 		compare_scopes(fixes, manifest, backup_folder, monitor_path, touched, None if skip_list is None else skip_list.skips, paused,
-			monitor_path if job_name is None else job_name, reported, trusted=manifest.dirty_rels(), attributes=False, fresh=True)
+			monitor_path if job_name is None else job_name, reported, trusted=manifest.dirty_rels(), attributes=False, fresh=True,
+			applied=writing_moves)
 		if not GREEN_LIGHT.is_set():
 			return
 		if recheck_mounts is not None:
@@ -9198,7 +9306,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				if not real_folders_to(backup_folder,rel):
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not copying {rel} again from the vault: a folder above it in {backup_folder} is not a real folder')
 					continue
-				end = chain_end(job_vault,latest_version_info.path,rel,committed_moves)
+				# down to the version its row says holds the copy, as the size limit counted it ( recopy_size() )
+				end = chain_end(job_vault,latest_version_info.path,rel,committed_moves,manifest.copy_version(rel))
 				if end is None or stat.S_ISDIR(end.st.st_mode):
 					what = 'cannot be followed' if end is None else f'ends at the folder {end.path}'
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not copying {rel} again from the vault: its link chain in {latest_version_info.path} {what}; linking it as it was, by more links than its limit')
@@ -9225,7 +9334,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	if mcae.runningThreads or not GREEN_LIGHT.is_set():
 		backuperTeeLogToTl(path=monitor_path,error=True,message='Reverb backup interrupted before copy threads finished')
 		return manifest
-	record_dirty_entries(manifest,backup_folder,monitor_path)
+	record_dirty_entries(manifest,backup_folder,monitor_path,writing_moves)
 	return manifest
 
 # --- the status, history and restore commands read the vault through these, and write nothing ---

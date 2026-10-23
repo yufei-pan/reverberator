@@ -363,7 +363,8 @@ def test_a_link_that_cannot_be_retargeted_keeps_the_move(job, monkeypatch):
 	seed_monitor(job, {'a/x.txt': 'x', 'deep/er/keep.txt': 'k'})
 	v0 = run_backup(job)[0]
 	lines = logged_lines(monkeypatch)
-	def refuse(job_vault, link_path):
+	# retarget_chain_link() also takes the moves of the version being written
+	def refuse(job_vault, link_path, *args):
 		raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), link_path)
 	monkeypatch.setattr(rv, 'retarget_chain_link', refuse)
 	os.rename(f'{job.monitor}/a/x.txt', f'{job.monitor}/deep/er/x.txt')
