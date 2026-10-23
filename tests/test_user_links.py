@@ -317,11 +317,15 @@ def test_pruning_keeps_moved_copies_when_rows_cannot_be_used(tmp_path, pruning_k
 		monkeypatch.setattr(rv, 'change_list_rows_ended', failing)
 	warnings = warnings_logged(monkeypatch)
 	if why == 'missing':
-		# gone between the listing of the versions and the removal, which then writes one with the header alone
+		# gone between the listing of the versions and the removal: Task 2b, it may be only out of the listing (a
+		# mergerfs branch out), so the prune stops, keeping V0 whole, and makes none (a second once the first is back)
 		info = rv.get_vault_info(job.job_vault).vault_info_dict
 		os.remove(v1.change_list)
-		assert rv.decrement_stepper(info, job.job_name, job.monitor) != (0, 0)
-		assert not os.path.exists(v0.path)
+		assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+		assert os.path.isdir(v0.path) and list(info)[0] == 0
+		assert not [name for name in os.listdir(job.job_vault) if name.startswith(v1.name + '--')]
+		assert open(os.path.join(v1.path, 'deep/er/x')).read() == 'x'
+		return
 	else:
 		pruning_keeps(job, {})
 		bump(job, 1, keep_n_versions=2)
@@ -2065,8 +2069,9 @@ def test_a_tracked_entry_that_cannot_be_looked_at_stays_tracked(tmp_path, monkey
 		manifest.close()
 
 
-def test_a_change_list_pruning_makes_is_written_whole(tmp_path, monkeypatch):
-	# review8: the list made for a next version without one was appended in place, not written whole and renamed
+def test_a_prune_makes_no_change_list_for_the_next_version(tmp_path, monkeypatch):
+	# review8 had the list made for a next version without one written whole; Task 2b: none is made, as the next
+	# version's list may be only out of the listing, and the prune stops
 	job = fresh_job(tmp_path)
 	bump(job, 1)
 	v0, v1 = rv.list_versions(job.job_vault)
@@ -2075,9 +2080,8 @@ def test_a_change_list_pruning_makes_is_written_whole(tmp_path, monkeypatch):
 	written = []
 	real_write = rv.write_change_list
 	monkeypatch.setattr(rv, 'write_change_list', lambda name, rows: written.append((name, list(rows))) or real_write(name, rows))
-	assert rv.decrement_stepper(info, job.job_name, job.monitor) != (0, 0)
-	assert len(written) == 1 and written[0][1] == [] and os.path.basename(written[0][0]).startswith(v1.name + '--')
-	assert v1_change_lists(job) == [os.path.basename(written[0][0])]
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	assert written == [] and v1_change_lists(job) == [] and os.path.isdir(v0.path)
 
 
 # --- Task 2b ---

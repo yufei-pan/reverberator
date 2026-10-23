@@ -783,14 +783,16 @@ def test_a_crash_leftover_numbered_after_the_recorded_latest_is_removed(tmp_path
 	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2] and not os.path.exists(leftover)
 
 
-def test_a_crash_leftover_after_a_record_left_behind_is_removed(tmp_path):
-	# a run cut off between V2's change list and current_version leaves the link on V1; the next attempt's crash leaves V3
+def test_an_orphan_past_a_link_left_behind_fails_the_scan(tmp_path):
+	# Task 2b fix round 3: a link one behind (left by a daemon before 0.44, which wrote the change list first) makes V3 two
+	# after it: the newest listed is no evidence, as a listing can leave V2's list out as well
 	job = three_versions(tmp_path)
 	link = os.path.join(job.job_vault, 'current_version')
 	os.remove(link)
 	os.symlink(version(job, 1).name, link)
-	leftover = write_incomplete_version(job, 3, {'x': 'y'})
-	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2] and not os.path.exists(leftover)
+	write_incomplete_version(job, 3, {'x': 'y'})
+	before = vault_names(job)
+	assert_refused_everywhere(job, before)
 
 
 @pytest.mark.parametrize('number', [4, 5])
@@ -801,11 +803,7 @@ def test_a_leftover_past_the_recorded_latest_plus_one_fails_the_scan(tmp_path, n
 	assert_refused_everywhere(job, before)
 
 
-@pytest.mark.parametrize('manifest', ['no_manifest', 'manifest_without_a_version', 'manifest_naming_it', 'manifest_naming_an_earlier_v0'])
-def test_a_first_backups_crash_is_removed(tmp_path, manifest):
-	# no current_version, no change list, and a manifest (the backup opens it before making V0) that records no version,
-	# or a V0: this one, cut off between the manifest's commit and its change list, or an earlier attempt's (haiku11
-	# chain A: two first backups cut off in a row)
+def first_backup_leftover(tmp_path, manifest):
 	job = create_job(str(tmp_path))
 	timestamp = '2021-01-02_00-00-00_-0800'
 	if manifest != 'no_manifest':
@@ -815,11 +813,27 @@ def test_a_first_backups_crash_is_removed(tmp_path, manifest):
 			recorded.begin()
 			recorded.commit(os.path.join(job.job_vault, f'V0--{timestamp}' if manifest == 'manifest_naming_it' else 'V0--2021-01-01_00-00-00_-0800'))
 		recorded.close()
+	return job, timestamp
+
+
+def test_a_first_backups_crash_is_removed(tmp_path):
+	# no current_version, no change list, and the manifest the backup opened before making V0, recording no version
+	job, timestamp = first_backup_leftover(tmp_path, 'manifest_without_a_version')
 	leftover = write_incomplete_version(job, 0, {'x': 'y'}, timestamp=timestamp)
 	assert rv.remove_incomplete_vault_versions(job.job_vault) == [leftover]
 	leftover = write_incomplete_version(job, 0, {'x': 'y'}, timestamp=timestamp)
 	assert dict(rv.get_vault_info(job.job_vault).vault_info_dict) == {} and not os.path.exists(leftover)
 
+
+@pytest.mark.parametrize('manifest', ['no_manifest', 'manifest_naming_it', 'manifest_naming_an_earlier_v0'])
+def test_a_lone_v0_without_a_manifest_that_records_nothing_is_kept(tmp_path, manifest):
+	# review12: a lone committed V0 whose list and link are out of the listing looks like this, the manifest shown
+	# (naming V0) or not; a first backup whose manifest names V0 had its commit under way
+	job, timestamp = first_backup_leftover(tmp_path, manifest)
+	leftover = write_incomplete_version(job, 0, {'x': 'y'}, timestamp=timestamp)
+	with pytest.raises(rv.JobFailure):
+		rv.get_vault_info(job.job_vault)
+	assert rv.remove_incomplete_vault_versions(job.job_vault) == [] and os.path.isdir(leftover)
 
 
 def test_an_orphan_below_the_oldest_fails_the_scan(tmp_path):
@@ -960,3 +974,180 @@ def test_the_prune_keeps_an_entry_named_like_a_list_that_is_no_file(tmp_path):
 	os.makedirs(os.path.join(odd, 'inside'))
 	rv.decrement_stepper(info, job.job_name, job.monitor)
 	assert list(info) == [1, 2] and not os.path.exists(v0.path) and os.path.isdir(os.path.join(odd, 'inside'))
+
+
+# --- Task 2b fix round 3: the records never lag a committed change list ---
+
+def keep_modified(job, text):
+	with open(os.path.join(job.monitor, 'keep'), 'w') as f:
+		f.write(text)
+	return OrderedDict([event_entry(job, 'keep', 'modify')])
+
+
+def link_number(job):
+	return rv.vault_version_number(os.readlink(os.path.join(job.job_vault, 'current_version')))
+
+
+def committed_folders(job):
+	return {kept.number: kept.path for kept in rv.list_versions(job.job_vault)}
+
+
+@pytest.mark.parametrize('lag', [1, 2])
+def test_a_swap_that_fails_leaves_no_committed_version_behind_the_link(tmp_path, monkeypatch, lag):
+	# review12: the change list was written before current_version was swapped in, so a swap that failed left the link
+	# behind a committed version, which a branch out hiding its list then made an orphan at link + 1, rm -rf'd
+	job = three_versions(tmp_path)
+	real_replace = os.replace
+	def replace(source, dest, *args, **kwargs):
+		if os.path.basename(os.fspath(dest)) == 'current_version':
+			raise OSError(errno.EIO, os.strerror(errno.EIO), dest)
+		return real_replace(source, dest, *args, **kwargs)
+	for i in range(lag):
+		monkeypatch.setattr(rv.os, 'replace', replace)
+		with pytest.raises(OSError):
+			run_backup(job, keep_modified(job, f'w{i}'))
+		monkeypatch.undo()
+	committed = committed_folders(job)
+	assert link_number(job) == max(committed)
+	# a restart with the newest list's branch out
+	rv.VAULTS_WITH_VERSIONS.clear()
+	newest = version(job, max(committed))
+	hidden = os.path.basename(newest.change_list)
+	hide(monkeypatch, job, lambda name: name == hidden)
+	with pytest.raises(rv.JobFailure):
+		rv.get_vault_info(job.job_vault)
+	assert rv.remove_incomplete_vault_versions(job.job_vault) == []
+	monkeypatch.undo()
+	assert committed_folders(job) == committed and all(os.path.isdir(path) for path in committed.values())
+
+
+@pytest.mark.parametrize('manifest', ['shown', 'hidden'])
+def test_a_lone_committed_v0_whose_list_and_link_are_hidden_is_kept(tmp_path, monkeypatch, manifest):
+	# review12, haiku12 lone_v0: a lone committed V0 was taken for a first backup's leftover
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	run_backup(job)
+	v0 = version(job, 0)
+	rv.VAULTS_WITH_VERSIONS.clear()
+	hidden = {os.path.basename(v0.change_list), 'current_version'} | ({rv.MANIFEST_FILE_NAME} if manifest == 'hidden' else set())
+	hide(monkeypatch, job, lambda name: name in hidden)
+	real_lstat, real_readlink = os.lstat, os.readlink
+	def gone(path):
+		path = os.path.abspath(os.fspath(path))
+		return os.path.dirname(path) == job.job_vault and os.path.basename(path) in hidden
+	def lstat(path, *args, **kwargs):
+		if gone(path):
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		return real_lstat(path, *args, **kwargs)
+	def readlink(path, *args, **kwargs):
+		if gone(path):
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		return real_readlink(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	monkeypatch.setattr(rv.os, 'readlink', readlink)
+	with pytest.raises(rv.JobFailure):
+		rv.get_vault_info(job.job_vault)
+	assert rv.remove_incomplete_vault_versions(job.job_vault) == []
+	monkeypatch.undo()
+	assert os.path.isdir(v0.path) and os.path.isfile(v0.change_list)
+
+
+def restart_and_scan(job):
+	'''A restart: nothing in memory, the startup cleanup, then the scan: (what the cleanup removed, the versions or the refusal).'''
+	rv.VAULTS_WITH_VERSIONS.clear()
+	rv.REAL_VAULT_FOLDERS.clear()
+	removed = rv.remove_incomplete_vault_versions(job.job_vault)
+	try:
+		return removed, list(rv.get_vault_info(job.job_vault).vault_info_dict)
+	except rv.VaultScanError as e:
+		return removed, e
+
+
+@pytest.mark.parametrize('step', ['copy', 'manifest', 'swap', 'list'])
+def test_a_crash_at_each_step_of_the_commit(tmp_path, monkeypatch, step):
+	# the commit's order: the manifest, current_version, then the change list, the commit point. A crash before the swap
+	# leaves an orphan at the link + 1, cleaned up; one after the swap leaves the link on an orphan, refused (accepted);
+	# one after the list leaves the version committed
+	job = three_versions(tmp_path)
+	committed = committed_folders(job)
+	real_commit, real_symlink, real_write = rv.VaultManifest.commit, os.symlink, rv.write_change_list
+	def commit(self, version_path=None):
+		if version_path is not None and step == 'copy':
+			raise Killed()
+		real_commit(self, version_path)
+	def symlink(source, dest, *args, **kwargs):
+		if step == 'manifest' and os.path.basename(os.fspath(dest)) == '.current_version.tmp':
+			raise Killed()
+		return real_symlink(source, dest, *args, **kwargs)
+	def write(name, rows):
+		if step == 'swap':
+			raise Killed()
+		real_write(name, rows)
+		if step == 'list':
+			raise Killed()
+	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
+	monkeypatch.setattr(rv.os, 'symlink', symlink)
+	monkeypatch.setattr(rv, 'write_change_list', write)
+	with pytest.raises(Killed):
+		run_backup(job, keep_modified(job, 'cut'))
+	monkeypatch.undo()
+	attempt = [name for name in os.listdir(job.job_vault) if name.startswith('V3--') and os.path.isdir(os.path.join(job.job_vault, name))]
+	assert len(attempt) == 1
+	removed, scanned = restart_and_scan(job)
+	if step in ('copy', 'manifest'):
+		assert link_number(job) == 2 and removed == [os.path.join(job.job_vault, attempt[0])] and scanned == [0, 1, 2]
+		run_backup(job, keep_modified(job, 'next'))
+		assert sorted(committed_folders(job)) == [0, 1, 2, 3] and link_number(job) == 3
+	elif step == 'swap':
+		assert link_number(job) == 3 and removed == [] and isinstance(scanned, rv.VaultScanError)
+		assert os.path.isdir(os.path.join(job.job_vault, attempt[0]))
+	else:
+		assert link_number(job) == 3 and removed == [] and scanned == [0, 1, 2, 3]
+	assert all(os.path.isdir(path) for path in committed.values())
+
+
+def test_a_first_backups_change_list_that_cannot_be_written_leaves_a_leftover_the_next_attempt_removes(tmp_path, monkeypatch):
+	# haiku12 chain D: the link was removed, but the manifest still named V0, so the leftover was refused for good
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	def write(name, rows):
+		raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), name)
+	monkeypatch.setattr(rv, 'write_change_list', write)
+	with pytest.raises(OSError):
+		run_backup(job)
+	monkeypatch.undo()
+	assert not os.path.lexists(os.path.join(job.job_vault, 'current_version'))
+	assert rv.recorded_latest_version(job.job_vault).recorded is None
+	removed, scanned = restart_and_scan(job)
+	assert len(removed) == 1 and scanned == []
+	run_backup(job)
+	assert sorted(committed_folders(job)) == [0] and link_number(job) == 0
+
+
+def test_a_change_list_that_cannot_be_written_puts_the_link_back(tmp_path, monkeypatch):
+	job = three_versions(tmp_path)
+	def write(name, rows):
+		raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), name)
+	monkeypatch.setattr(rv, 'write_change_list', write)
+	with pytest.raises(OSError):
+		run_backup(job, keep_modified(job, 'full'))
+	monkeypatch.undo()
+	assert link_number(job) == 2
+	assert restart_and_scan(job)[1] == [0, 1, 2]
+
+
+def test_a_prune_that_finds_no_list_for_the_next_version_makes_none(tmp_path, monkeypatch, capsys):
+	# haiku12 F5: with V1's list out of the listing, the prune wrote an empty one, and the two wedged the job when the
+	# branch came back
+	job = three_versions(tmp_path)
+	v0, v1 = version(job, 0), version(job, 1)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	aside = os.path.join(job.job_vault, 'x-' + os.path.basename(v1.change_list))
+	os.rename(v1.change_list, aside)
+	capsys.readouterr()
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	assert len(alerting_lines(capsys.readouterr().out)) == 1
+	assert list(info) == [0, 1, 2] and os.path.isdir(v0.path) and lists_of(job, v1) == []
+	os.rename(aside, v1.change_list)
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2]
+	every_folder_reads_right(job)
