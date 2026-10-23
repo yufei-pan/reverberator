@@ -23,6 +23,7 @@ import datetime
 import unicodedata
 import re
 import glob
+import hashlib
 import select
 import contextlib
 import inspect
@@ -1197,6 +1198,8 @@ REAL_VAULT_FOLDERS_KEPT = 16384
 MANIFEST_BATCH_SIZE = 10000
 # a copy is written under a name of its own with this suffix, in its destination's folder, until it succeeded
 PARTIAL_COPY_SUFFIX = '.reverberator-partial'
+# the length of the vault's secret for the names pruning links copies under (VaultManifest.prune_salt())
+PRUNE_SALT_BYTES = 16
 # how long a failed backup waits for its stopped copies before it gives up on them
 COPY_STOP_WAIT_SECONDS = 60
 # a stopping daemon waits less: a stopped command is killed within about a second ( multiCMD sends SIGKILL a second after SIGTERM )
@@ -4381,15 +4384,21 @@ def do_backup(backup_entries:dict,
 			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
 			# why the loops below postponed removing a version: each loop tries again, but only the first says so
 			postponed = []
+			# the vault's secret for the names pruning links copies under, read (made, the first time) on this backup's own
+			# connection when a removal is first tried
+			prune_salt = []
 			def remove_oldest() -> bool:
 				# prune_oldest(), vault_size and vault_inodes kept the sums of the versions' records: whether the oldest version
-				# went, freeing something. one kept can change the records too, by the links its removal replaced first
+				# went, the only sign of progress, as finishing a removal cut short frees nothing more, and a removal kept
+				# can change the records too, by the links it replaced first
 				nonlocal vault_size, vault_inodes
+				if not prune_salt:
+					prune_salt.append(manifest_prune_salt(manifest))
 				oldest = next(iter(vault_info_dict))
-				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths)
+				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths,prune_salt=prune_salt[0])
 				vault_size -= removed_size
 				vault_inodes -= removed_inodes
-				return next(iter(vault_info_dict), None) != oldest and bool(removed_size or removed_inodes)
+				return next(iter(vault_info_dict), None) != oldest
 			if backup_limit_size:
 				while vault_size + estimated_backup_size + recopies_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size + recopies_size} exceeds backup size limit {backup_limit_size}')
@@ -4633,10 +4642,16 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 					elif entry.is_file():
 						try:
 							vault_path = entry.path.rpartition('--')[0]
-							if not os.path.exists(vault_path):
+							# only a folder that is not there is gone: one that cannot be looked at may hold every copy a later
+							# version's links name, and deleting its change list would remove it as an orphan
+							try:
+								os.lstat(vault_path)
+							except FileNotFoundError:
 								backuperTeeLogToTl(job_vault_path,f'Vault path {vault_path} for content {entry.name} does not exist, deleting content file...',error=True)
 								content_file_to_delete.add(entry.path)
 								continue
+							except OSError as e:
+								backuperTeeLogToTl(job_vault_path,f'Cannot look at {vault_path}, keeping it as {entry.name} records it: {e}',error=True)
 							orphan_entries.discard(vault_path)
 							if not recalculate:
 								entry_name = strip_suffix(entry.name, CONTENT_FILE_EXTENSION_NAME)
@@ -5206,8 +5221,19 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	'''
 	Recreate the folders tracked in manifest under backup_folder and link each tracked file to its copy under source_path.
 
-	Entries missing from source_path are dropped from the manifest. Returns False when the backup was interrupted.
+	Entries missing from source_path are dropped from the manifest; one that cannot be looked at stays tracked, and is
+	made or linked as ever, with an error line, as dropping it would leave it out of the new version. Returns False when
+	the backup was interrupted.
 	'''
+	def missing_from_source(path:str, kind:str, rel:str) -> bool:
+		# only an entry that is not there is missing
+		try:
+			os.lstat(path)
+		except FileNotFoundError:
+			return True
+		except OSError as e:
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Cannot look at tracked {kind} {rel} in {source_path}, keeping it: {e}')
+		return False
 	global BACKUP_SEMAPHORE
 	global GREEN_LIGHT
 	backuperTeeLogToTl(path=source_path,message=f'Creating a referenced copy of {source_path} to {backup_folder}')
@@ -5221,7 +5247,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			backuperTeeLogToTl(path=source_path,warning=True,message=f'Dropping a tracked row that names no folder below the version: {folder!r}')
 			missing.append(folder)
 			continue
-		if not os.path.lexists(source_folder):
+		if missing_from_source(source_folder, 'folder', folder):
 			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked folder missing from {source_path}: {folder}')
 			missing.append(folder)
 			continue
@@ -5239,7 +5265,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			backuperTeeLogToTl(path=source_path,warning=True,message=f'Dropping a tracked row that names no file below the version: {file!r}')
 			missing.append(file)
 			continue
-		if not os.path.lexists(source_file_real):
+		if missing_from_source(source_file_real, 'file', file):
 			# the tracked list claims a file this version does not have. linking it
 			# anyway produces a dangling link that every later version inherits and
 			# chains onto, so drop the entry here and let the list self heal.
@@ -5689,6 +5715,27 @@ class VaultManifest:
 		if not pairs or pairs[-1][1] != monitor_path:
 			pairs.append((version_number, monitor_path))
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('monitor_paths', ?)", (json.dumps([[number, storable_name(path)] for number, path in pairs]),))
+
+	def prune_salt(self):
+		'''
+		The vault's secret for the names pruning hard links copies under (prune_link_path()): PRUNE_SALT_BYTES random
+		bytes, kept in meta as hex, made the first time they are asked for and committed at once, so a restart or a
+		remount names a temp the same as the run that made it, and no user can work a name out. None when there are none
+		and a transaction is open, as one made in it would go with a rollback, and its names with it.
+		'''
+		row = self.conn.execute("SELECT value FROM meta WHERE key = 'prune_salt'").fetchone()
+		if row is not None:
+			try:
+				salt = bytes.fromhex(row[0])
+			except (TypeError, ValueError):
+				salt = b''
+			if len(salt) == PRUNE_SALT_BYTES:
+				return salt
+		if self.conn.in_transaction:
+			return None
+		salt = os.urandom(PRUNE_SALT_BYTES)
+		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('prune_salt', ?)", (salt.hex(),))
+		return salt
 
 	def describes(self, version_path:str) -> bool:
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
@@ -6658,6 +6705,13 @@ def manifest_monitor_paths(manifest:VaultManifest):
 	try:
 		return manifest.monitor_paths
 	except (sqlite3.Error, ValueError, TypeError):
+		return None
+
+def manifest_prune_salt(manifest:VaultManifest):
+	'''VaultManifest.prune_salt() on the daemon's own connection; None when that cannot be read or written.'''
+	try:
+		return manifest.prune_salt()
+	except sqlite3.Error:
 		return None
 
 def retarget_chain_link(job_vault:str, link_path:str) -> bool:
@@ -7764,15 +7818,18 @@ RESTORE_LOCK_UNCHECKED = {}
 # job name -> when the FAILED marker saying decrement_stepper() cannot remove its oldest version is next due, by the
 # clock it is given, while it cannot. each job's backuper alone sets its own key
 PRUNE_ABORTED = {}
+# the jobs decrement_stepper() has warned that it names its temps without the vault's secret
+PRUNE_SALT_MISSING = set()
 
-def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, postponed:list = None, clock = time.monotonic, monitor_paths:list = None) -> tuple:
+def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, postponed:list = None, clock = time.monotonic, monitor_paths:list = None,
+		prune_salt:bytes = None) -> tuple:
 	'''
 	decrement_stepper while no restore holds the job's lock; when one does, postpone and return (0, 0) so the retention
 	loops stop. Without a state folder nothing can hold the lock, so it prunes; any other failure to lock postpones too.
 	A lock that cannot be checked (opened, or tried) for DISK_WAIT_GRACE_SECONDS gets a FAILED marker, repeated every
 	DISK_WAIT_REPEAT_SECONDS while it lasts, as no version is removed meanwhile and the vault keeps growing.
 	postponed is a list a backup hands each of its calls: a call that postpones appends why, and only the first of them
-	logs it, so a backup says it once. monitor_path, monitor_paths and clock go to decrement_stepper.
+	logs it, so a backup says it once. monitor_path, monitor_paths, clock and prune_salt go to decrement_stepper.
 	'''
 	lock_path = restore_lock_path(job_name)
 	def postpone(reason:str, cannot_check:OSError = None) -> tuple:
@@ -7794,7 +7851,7 @@ def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, po
 	except (FileNotFoundError, NotADirectoryError):
 		# no state folder, so no restore can be holding a lock
 		RESTORE_LOCK_UNCHECKED.pop(job_name, None)
-		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock)
+		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt)
 	except OSError as e:
 		# the lock may be held right now: a check that failed is never taken as permission to remove
 		return postpone(f'cannot open the restore lock: {e}', e)
@@ -7806,7 +7863,7 @@ def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, po
 		except OSError as e:
 			return postpone(f'cannot take the restore lock: {e}', e)
 		RESTORE_LOCK_UNCHECKED.pop(job_name, None)
-		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock)
+		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt)
 	finally:
 		os.close(fd)
 
@@ -7814,36 +7871,40 @@ def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, po
 # that copy instead. ENOSYS is sshfs's without its hard link extension, and rclone's
 NO_HARD_LINK_ERRNOS = frozenset({errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK, errno.ENOSYS})
 
-def prune_link_path(link_path:str, copy_st:os.stat_result) -> str:
+def prune_link_path(link_path:str, copy_st:os.stat_result, salt:bytes) -> str:
 	'''
 	The name beside the chain link at link_path that pruning hard links the copy copy_st was read from under, before
 	renaming it over the link: of the partial copy form (PARTIAL_COPY_NAME), and the same every time for one link and
 	one copy, so a run cut off between the two finds what it made. The monitored tree can hold a file of that form
 	beside the link's, which is backed up as any other and which pruning never removes, as it cannot tell what it is:
-	the name holds the copy's device and inode, which only the vault's owner can see, so no monitored file can be
-	given it to stop every prune.
+	the name is a keyed hash (BLAKE2b) of the link's name and the copy's inode under salt, the vault's secret
+	(VaultManifest.prune_salt()), so no monitored file can be given it to stop every prune; of those alone when salt is
+	None. The device is left out: a FUSE mount gets its number when it is mounted, and a remount would rename a temp.
 
 	Examples:
 		>>> copy, other = (os.stat_result((stat.S_IFREG | 0o600, ino, 7, 1, 0, 0, 6, 0, 0, 0)) for ino in (11, 12))
-		>>> path = prune_link_path('/vault/job/V1--x/d/a.txt', copy)
+		>>> path = prune_link_path('/vault/job/V1--x/d/a.txt', copy, bytes(16))
 		>>> os.path.dirname(path), PARTIAL_COPY_NAME.fullmatch(os.path.basename(path)) is not None
 		('/vault/job/V1--x/d', True)
-		>>> path == prune_link_path('/vault/job/V1--x/d/a.txt', copy), path == prune_link_path('/vault/job/V1--x/d/a.txt', other)
+		>>> path == prune_link_path('/vault/job/V1--x/d/a.txt', copy, bytes(16)), path == prune_link_path('/vault/job/V1--x/d/a.txt', other, bytes(16))
 		(True, False)
+		>>> path == prune_link_path('/vault/job/V1--x/d/a.txt', copy, bytes(15) + b'1'), path == prune_link_path('/vault/job/V1--x/d/a.txt', copy, None)
+		(False, False)
 	'''
 	folder, name = os.path.split(link_path)
-	salt = f'\0{copy_st.st_dev}:{copy_st.st_ino}'.encode()
-	return os.path.join(folder, '.' + xxhash.xxh128(os.fsencode(name) + salt).hexdigest() + PARTIAL_COPY_SUFFIX)
+	digest = hashlib.blake2b(os.fsencode(name) + b'\0' + str(copy_st.st_ino).encode(), digest_size=16, key=salt or b'')
+	return os.path.join(folder, '.' + digest.hexdigest() + PARTIAL_COPY_SUFFIX)
 
 def same_inode(first:os.stat_result, second:os.stat_result) -> bool:
 	return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 class PathHashes:
 	'''
-	A set of paths kept by their 64-bit hash() alone, in one array with open addressing: 12 to 24 bytes a path, a
-	fraction of what a set of ints takes, as pruning's walk notes every copy it moves on a filesystem that cannot hard
-	link, and a big job's next version links 500k+ of them. Two paths of one hash count as one, which at worst gives a
-	dangling link a copy of the other's bytes in decrement_stepper(), never loses one.
+	A set of keys (paths, or (st_dev, st_ino) pairs) kept by their 64-bit hash() alone, in one array with open
+	addressing: 12 to 24 bytes a key, a fraction of what a set of ints takes, as pruning's walk notes every copy it
+	books, and on a filesystem that cannot hard link every copy it moves, and a big job's next version links 500k+ of
+	them. Two keys of one hash count as one, which at worst gives a dangling link a copy of the other's bytes, or leaves
+	a copy out of the next version's record, in decrement_stepper(); it never loses a file.
 
 	Examples:
 		>>> held = PathHashes()
@@ -7866,8 +7927,8 @@ class PathHashes:
 			at = (at + 1) & mask
 		return at
 
-	def add(self, path:str) -> None:
-		key = hash(path) or 1
+	def add(self, key) -> None:
+		key = hash(key) or 1
 		at = self._slot(self._slots, key)
 		if self._slots[at]:
 			return
@@ -7880,19 +7941,21 @@ class PathHashes:
 				if key:
 					self._slots[self._slot(self._slots, key)] = key
 
-	def __contains__(self, path:str) -> bool:
-		key = hash(path) or 1
+	def __contains__(self, key) -> bool:
+		key = hash(key) or 1
 		return self._slots[self._slot(self._slots, key)] == key
 
 	def __len__(self) -> int:
 		return self._count
 
-def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, monitor_paths:list = None, clock = time.monotonic) -> tuple:
+def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, monitor_paths:list = None, clock = time.monotonic,
+		prune_salt:bytes = None) -> tuple:
 	'''
 	Remove the oldest vault version and materialize the next version's symlinks: each of the next version's chain
-	links into the oldest one is replaced by a hard link to the copy it names (prune_link_path(), then a rename over
-	the link), so the oldest version stays whole until it is removed, and a run cut off anywhere loses nothing: the
-	next run finds the links left. Where the filesystem cannot hard link (NO_HARD_LINK_ERRNOS), the copy is moved in
+	links into the oldest one is replaced by a hard link to the copy it names (prune_link_path() with prune_salt, the
+	vault's secret, or the copy's inode alone, with one warning a job, when it is None; then a rename over the link),
+	so the oldest version stays whole until it is removed, and a run cut off anywhere loses nothing: the next run finds
+	the links left. Where the filesystem cannot hard link (NO_HARD_LINK_ERRNOS), the copy is moved in
 	the link's place, as before 0.44. The links are told by vault_chain_hop() with the next version's moves
 	(VersionMoves.of_committed(), under monitor_path and monitor_paths, the record of the monitored paths the versions
 	were written under, read from the manifest when None): a user's symlink is left as it is, whatever its text, and a
@@ -7905,13 +7968,14 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	its paths.
 	Each version's record of what it holds, which its change list's name keeps and a restart sums, is kept in du's
 	measure (st_blocks * 512, and an inode an entry), never by st_nlink, which mergerfs can show stale for a second
-	after a link: a copy materialised moves from the oldest version's record to the next one's, and the link it
-	replaces, or a dangling link dropped, leaves the next one's. Both records are written, by renaming the change
-	lists, before the removal, so a run cut off then, or a removal cut short, leaves them true, and when it is
-	aborted. Returns how far the two records went down in all, (bytes, inodes), so the caller's sums of every
-	version's record (vault_size, vault_inodes) stay theirs whether or not the oldest version went: the oldest
-	version's record and what the next one lost, when it went. Two links naming one copy both book it, so the next
-	version's record then holds one copy more than the version does.
+	after a link: a copy materialised moves from the oldest version's record to the next one's, once a run however many
+	links name it (by its inode, in a PathHashes), and the link it replaces, or a dangling link dropped, leaves the
+	next one's. Both records are written, by renaming the change lists, before the removal, so a run cut off then, or a
+	removal cut short, leaves them true, and when it is aborted. Returns how far the two records went down in all,
+	(bytes, inodes), so the caller's sums of every version's record (vault_size, vault_inodes) stay theirs whether or
+	not the oldest version went: the oldest version's record and what the next one lost, when it went; never less than
+	nothing, so no prune raises the caller's sums, though a copy two links name that an aborted run booked for one and
+	its rerun for the other is booked twice, and the next version's record then holds one copy more than it does.
 
 	Examples:
 		>>> decrement_stepper(OrderedDict([(0, VaultEntry(0, '/tmp/x', 0, 0, 0))]), 'job', '/m')
@@ -7931,6 +7995,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	if referenceVaultPath == '/':
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message='Attempting to remove root, skipping')
 		backuperTeeLogToTl(path=referenceVaultPath,message=referenceVaultEntry)
+		# still the oldest, so the caller sees nothing removed
+		vault_info_dict[referenceVersionNumber] = referenceVaultEntry
+		vault_info_dict.move_to_end(referenceVersionNumber, last=False)
 		return 0 , 0
 	backuperTeeLogToTl(path=referenceVaultPath,message=f'Recursively removing V{referenceVersionNumber}: {referenceVaultPath}')
 	vaultInfoIter = iter(vault_info_dict)
@@ -7944,6 +8011,13 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	def book(books:list, st:os.stat_result) -> None:
 		books[0] += st.st_blocks * 512
 		books[1] += 1
+	# the copies hard linked into the next version this run, by inode, so two links naming one copy (one of them a user's
+	# link the rows could not tell) book it once. one moved needs no note: another link naming it finds it gone, and
+	# gets a copy of its own (copied), so the move path, which notes every copy it moves already, holds no more
+	booked = PathHashes()
+	if prune_salt is None and job_name not in PRUNE_SALT_MISSING:
+		PRUNE_SALT_MISSING.add(job_name)
+		backuperTeeLogToTl(path=referenceVaultPath,warning=True,message="The vault's secret for the names pruning links copies under cannot be had: they go by the copy's inode alone")
 	# the records as the change lists' names hold them, and those lists (None for a version without one)
 	reference_record, applying_record = referenceVaultEntry, applyingVaultEntry
 	reference_list = applying_list = None
@@ -7983,7 +8057,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				return written
 			backuperTeeLogToTl(path=referenceVaultPath,message=f'Creating content file {new_path}')
 			try:
-				TSVZ.appendTabularFile(new_path,[],header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=False)
+				# whole or not at all, as every change list is
+				write_change_list(new_path,[])
 			except Exception as e:
 				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error creating content file {new_path}: {e}')
 				return None
@@ -7998,8 +8073,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				return None
 		return written
 	def write_records() -> bool:
-		# both records written, the next version's first: whether its was. one of the reference vault's that cannot be
-		# written stays as it was, which a removal then takes with it, and which overstates the vault meanwhile
+		# both records written, the next version's first on purpose: whether its was. a run cut off between the two
+		# leaves only the reference vault's record high, by the copies it gave, and that is the version this prune is
+		# removing; one of its that cannot be written stays high the same way until the removal takes it. when the next
+		# version's cannot be written, neither is, and the removal aborts: both stay as they were, high by the links
+		# replaced, an overstatement, which over-prunes by those links' blocks
 		nonlocal reference_record, applying_record, records_written
 		if records_written is None:
 			records_written = True
@@ -8015,10 +8093,12 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 						max(0, referenceVaultEntry.inode - transferred[1])) or reference_record
 		return records_written
 	def went_down(kept:bool) -> tuple:
-		# how far the two records went down in all: the reference vault's with it, when it went
+		# how far the two records went down in all, the reference vault's with it when it went, but never less than
+		# nothing: a prune raising the caller's sums would remove more versions than the limit asks for
 		size = applying_record.size + (reference_record.size if kept else 0)
 		inodes = applying_record.inode + (reference_record.inode if kept else 0)
-		return referenceVaultEntry.size + applyingVaultEntry.size - size, referenceVaultEntry.inode + applyingVaultEntry.inode - inodes
+		return (max(0, referenceVaultEntry.size + applyingVaultEntry.size - size),
+			max(0, referenceVaultEntry.inode + applyingVaultEntry.inode - inodes))
 	def keep_oldest(why:str) -> tuple:
 		# the reference vault stays, back at the front of vault_info_dict, with the records written, and the job's FAILED
 		# marker says so
@@ -8164,7 +8244,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	def link_copy(file:str, file_st:os.stat_result, linkTarget:str, target_st:os.stat_result):
 		# the copy hard linked in place of the link: True when it is there, False when it failed and the walk aborts, None
 		# when the filesystem cannot hard link it
-		temp_path = prune_link_path(file, target_st)
+		temp_path = prune_link_path(file, target_st, prune_salt)
 		try:
 			# the link itself when the copy is a user's symlink stored in the version
 			os.link(linkTarget,temp_path,follow_symlinks=False)
@@ -8254,11 +8334,15 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		if DEBUG:
 			backuperTeeLogToTl(path=referenceVaultPath,message=f'Materialising {linkTarget} at {file}')
 		linked = link_copy(file, file_st, linkTarget, target_st)
-		if linked is None:
+		moved = linked is None
+		if moved:
 			linked = move_copy(file, file_st, linkTarget, target_st)
 		if linked:
 			# the copy is the next version's now, in place of the link
-			book(transferred, target_st)
+			if (target_st.st_dev, target_st.st_ino) not in booked:
+				if not moved:
+					booked.add((target_st.st_dev, target_st.st_ino))
+				book(transferred, target_st)
 			book(unlinked, file_st)
 	for rel, error in walk_errors:
 		failed(f'Error listing {unreadable_path(applyingVaultEntry.path, rel)}: {error}')
