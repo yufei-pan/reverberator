@@ -1736,6 +1736,21 @@ def replace_file_text(path:str, text:str):
 			os.remove(temp_path)
 		raise
 
+def sync_file_and_folder(path:str) -> None:
+	'''
+	fsync the file at path, then the folder holding it, so a crash leaves both its bytes and its name on disk. A
+	filesystem that cannot sync (EINVAL, ENOTSUP) is passed over; any other error raises.
+	'''
+	for target, flags in ((path, os.O_RDONLY | os.O_NOFOLLOW), (os.path.dirname(os.path.abspath(path)), os.O_RDONLY | os.O_DIRECTORY)):
+		fd = os.open(target, flags)
+		try:
+			os.fsync(fd)
+		except OSError as e:
+			if e.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+				raise
+		finally:
+			os.close(fd)
+
 def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 	'''
 	Replace rule rows in place. rows maps the job name cell as written in the file to its new full row.
@@ -4399,6 +4414,12 @@ def do_backup(backup_entries:dict,
 		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
 		manifest.commit(backup_folder)
 		TSVZ.appendLinesTabularFile(content_file_name,content_file_content,header = ['path']+ BACKUP_ENTRY_VALUES_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl,verbose=False)
+		# the change list is the commit marker, and its rows tell the version's chain links: a crash must not leave
+		# it missing or cut short
+		try:
+			sync_file_and_folder(content_file_name)
+		except OSError as e:
+			backuperTeeLogToTl(job_name,f'Could not sync {content_file_name} to disk: {e}',warning=True)
 		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
 		# create the current version symlink
 		vault_info_dict[this_version_number] = VaultEntry(this_version_number,backup_folder,this_timestamp,this_size,this_inodes)
@@ -6006,9 +6027,9 @@ def chain_link_target(job_vault:str, link_text:str, link_path:str):
 def strict_chain_hop(job_vault:str, link_path:str, link_text:str):
 	'''
 	Where the link at link_path with link_text leads if it is a chain link by its text alone (chain_link_target()),
-	else None. An absolute link is never one: daemons before 0.38 wrote them, but no kept version holds one now, while a
-	user's symlink to a backed-up copy has just that form. Raises UncheckedVaultLink, and nothing else, when that cannot
-	be told. vault_chain_hop() adds the version's moves, which tell a user's symlink in the relative form apart.
+	else None. An absolute link is never one: no released daemon wrote absolute chain links, and a scan of the live
+	vaults found none, while a user's symlink to a backed-up copy has just that form. Raises UncheckedVaultLink, and
+	nothing else, when that cannot be told. vault_chain_hop() adds the version's moves, which tell a user's symlink in the relative form apart.
 
 	Examples:
 		>>> import tempfile
@@ -6053,12 +6074,15 @@ def remember_version_moves(table:OrderedDict, key:tuple, value) -> None:
 
 class VersionMoves:
 	'''
-	A version's move rows, applied in their order, which tell its chain links from users' symlinks of the same form
-	(vault_chain_hop()). moves holds them as (source_rel, dest_rel, is_folder): rels of the monitored path with no
-	leading /, a folder's ending with /, and source_rel None for a move row without a source. Rows whose event is
-	move are the moves; an escalated create or modify carrying a source renamed nothing in the vault. usable is False
-	when the rows cannot tell: the change list is missing, unreadable or holds no rows (every version after the first
-	has one), or a row lies outside the monitored path (it was changed since); why says which.
+	A version's move rows, applied in their order, and the rels its rows land on, which tell its chain links from
+	users' symlinks of the same form (vault_chain_hop()). moves holds them as (source_rel, dest_rel, is_folder): rels
+	of the monitored path with no leading /, a folder's ending with /, and source_rel None for a move row without a
+	source. Rows whose event is move are the moves; an escalated create or modify carrying a source renamed nothing in
+	the vault. landed holds the rel of every row of any event (the monitored root's own left out), or None when every
+	entry of the version is known to be explained by its moves, as for the version being written. usable is False
+	when the rows cannot tell: the change list is missing, unreadable, cut short (its last line unended, as by a crash
+	in the middle of the append) or holds no rows (every version after the first has one), or a row lies outside the
+	monitored path (it was changed since); why says which.
 	of_committed() reads a committed version's change list, once, when first asked; applied() takes the moves the
 	replay of the version being written has made, before its change list exists.
 
@@ -6070,9 +6094,13 @@ class VersionMoves:
 		(True, None, None)
 		>>> moves.touches('d/x'), moves.touches('d/q'), moves.touches('e/x'), moves.touches('a')
 		(True, True, False, False)
+		>>> rows = VersionMoves(moves=[], landed={'a/', 'b/x'})
+		>>> rows.explains('a/u/v'), rows.explains('b/x'), rows.explains('b/y'), moves.explains('anything')
+		(True, True, False, True)
 	'''
-	def __init__(self, moves:list = None, usable:bool = True, why:str = '', key:tuple = None, change_list_folder:str = None):
+	def __init__(self, moves:list = None, usable:bool = True, why:str = '', key:tuple = None, change_list_folder:str = None, landed = None):
 		self._moves = moves
+		self._landed = None if landed is None else frozenset(landed)
 		self._usable = usable
 		self.why = why
 		# (version folder, monitored path) of a committed version; None for the version being written
@@ -6094,11 +6122,14 @@ class VersionMoves:
 			if known is not None:
 				VERSION_MOVES.move_to_end(key)
 				return known
-		return cls(moves=None, usable=False, key=key, change_list_folder=os.path.abspath(job_vault))
+		return cls(moves=None, usable=False, key=key, change_list_folder=os.path.abspath(job_vault), landed=())
 
 	@classmethod
 	def applied(cls, moves:list) -> 'VersionMoves':
-		'''The moves the replay of the version being written has applied, as (source_rel, dest_rel, is_folder) in its order.'''
+		'''
+		The moves the replay of the version being written has applied, as (source_rel, dest_rel, is_folder) in its
+		order. The replay made every entry of the version, so a link they do not explain is not one of its chain links.
+		'''
 		return cls(moves=list(moves), usable=True)
 
 	def _read(self) -> None:
@@ -6107,8 +6138,9 @@ class VersionMoves:
 			if self._job_vault is None:
 				return
 			version_path, monitor_path = self.key
-			moves, why, lasting = read_version_moves(self._job_vault, version_path, monitor_path)
+			moves, landed, why, lasting = read_version_moves(self._job_vault, version_path, monitor_path)
 			self._moves, self._usable, self.why = moves or [], moves is not None, why
+			self._landed = frozenset(landed)
 			self._job_vault = None
 		if lasting:
 			remember_version_moves(VERSION_MOVES, self.key, self)
@@ -6123,11 +6155,18 @@ class VersionMoves:
 		self._read()
 		return self._usable
 
+	def lands_without_source(self, rel:str) -> bool:
+		'''Whether a move row without a source lands on rel or on a folder above it.'''
+		return any(source is None and (dest.rstrip('/') == rel or rel.startswith(dest.rstrip('/') + '/'))
+			for source, dest, _ in self.moves)
+
 	def takes(self, source_rel:str, dest_rel:str) -> 'bool | None':
 		'''
 		Whether the moves, applied in order to a file or to a folder and what is under it, take source_rel to dest_rel;
 		None when that cannot be told, as a move row without a source lands on dest_rel or a folder above it.
 		'''
+		if self.lands_without_source(dest_rel):
+			return None
 		path = source_rel
 		for source, dest, is_folder in self.moves:
 			if source is None:
@@ -6137,52 +6176,90 @@ class VersionMoves:
 					path = dest + path[len(source):]
 			elif path == source:
 				path = dest
-		if path == dest_rel:
-			return True
-		for source, dest, _ in self.moves:
-			if source is None and (dest == dest_rel or dest_rel.startswith(dest.rstrip('/') + '/')):
-				return None
-		return False
+		return path == dest_rel
 
 	def touches(self, rel:str) -> bool:
 		'''Whether any move applies to rel, itself or a folder above it: the first one to do so meets rel unmoved.'''
 		return any(source is not None and (rel.startswith(source) if is_folder else rel == source)
 			for source, _, is_folder in self.moves)
 
+	def explains(self, rel:str) -> bool:
+		'''
+		Whether a row of the version, of any event, lands on rel or on a folder above it, so the rows account for what
+		the version holds there. A user's symlink always has one: the create that copied it or a folder above it, a
+		fix of the verification or a full comparison's create. A chain link under rows shifted by a change of the
+		monitored path has none.
+		'''
+		self._read()
+		if self._landed is None:
+			return True
+		if rel in self._landed or rel + '/' in self._landed:
+			return True
+		parts = rel.split('/')
+		return any('/'.join(parts[:depth]) + '/' in self._landed for depth in range(1, len(parts)))
+
+def read_change_list_moves(change_list:str, monitor:str) -> tuple:
+	'''
+	(moves, landed, why, lasting, had_rows) for read_version_moves(), from the one change list at change_list, under
+	the monitored path monitor (absolute and normalised).
+	'''
+	prefix = monitor if monitor.endswith('/') else monitor + '/'
+	def rel_of(path:str):
+		# the rule's monitored path as typed made the row, so './' or '//' in it are read as the path they name
+		folder = path.endswith('/')
+		path = os.path.normpath(path)
+		if path == monitor:
+			return ''
+		return path[len(prefix):] + ('/' if folder else '') if path.startswith(prefix) else None
+	moves = []
+	landed = set()
+	rows = 0
+	try:
+		with open(change_list, 'rb') as f:
+			f.seek(0, os.SEEK_END)
+			if f.tell():
+				f.seek(-1, os.SEEK_END)
+				ended = f.read(1) == b'\n'
+			else:
+				ended = True
+		for row in iter_change_list(change_list):
+			rows += 1
+			dest = rel_of(row.path)
+			source = None if row.source_path is None else rel_of(row.source_path)
+			if dest is None or (row.source_path is not None and source is None):
+				return None, (), f'a row outside {monitor} ({row.path if dest is None else row.source_path}), which it was backed up from', True, True
+			if dest:
+				landed.add(dest)
+			if row.event == 'move':
+				moves.append((source, dest, dest.endswith('/')))
+	except (OSError, ValueError) as e:
+		return None, (), f'its change list cannot be read: {e}', False, False
+	if not ended:
+		# its last row may have lost its source, or more
+		return None, (), 'its change list was cut short in its last row', True, True
+	if not rows:
+		return None, (), 'its change list has no rows', True, False
+	return moves, landed, '', True, True
+
 def read_version_moves(job_vault:str, version_path:str, monitor_path:str) -> tuple:
 	'''
-	(moves, why, lasting) for VersionMoves.of_committed(): the move rows of the change list of the version at
-	version_path, which job_vault is listed for, as (source_rel, dest_rel, is_folder) under monitor_path; moves is None,
-	and why says why, when the rows cannot be used. lasting says whether the list was read in full, so the answer is
-	the same every time.
+	(moves, landed, why, lasting) for VersionMoves.of_committed(): the move rows of the change list of the version at
+	version_path, which job_vault is listed for, as (source_rel, dest_rel, is_folder) under monitor_path, and the rels
+	all its rows land on; moves is None, and why says why, when the rows cannot be used. lasting says whether every
+	list was read in full, so the answer is the same every time. Of two lists for one version (pruning makes a
+	header-only one when the name it works out from the recorded sizes is not there), the one with rows counts.
 	'''
 	name = os.path.basename(version_path)
 	try:
 		change_lists = sorted(entry for entry in os.listdir(job_vault) if (parse_change_list_name(entry) or (None, None))[1] == name)
 	except (OSError, ValueError) as e:
-		return None, f'the job vault cannot be listed: {e}', False
+		return None, (), f'the job vault cannot be listed: {e}', False
 	if not change_lists:
-		return None, 'it has no change list', False
+		return None, (), 'it has no change list', False
 	monitor = os.path.abspath(monitor_path)
-	prefix = monitor if monitor.endswith('/') else monitor + '/'
-	def rel_of(path:str):
-		return path[len(prefix):] if path.startswith(prefix) else '' if path == monitor else None
-	moves = []
-	rows = 0
-	try:
-		for row in iter_change_list(os.path.join(job_vault, change_lists[0])):
-			rows += 1
-			dest = rel_of(row.path)
-			source = None if row.source_path is None else rel_of(row.source_path)
-			if dest is None or (row.source_path is not None and source is None):
-				return None, f'a row outside {monitor} ({row.path if dest is None else row.source_path}), which it was backed up from', True
-			if row.event == 'move':
-				moves.append((source, dest, dest.endswith('/')))
-	except (OSError, ValueError) as e:
-		return None, f'its change list cannot be read: {e}', False
-	if not rows:
-		return None, 'its change list has no rows', True
-	return moves, '', True
+	read = [read_change_list_moves(os.path.join(job_vault, entry), monitor) for entry in change_lists]
+	moves, landed, why, _, _ = next((found for found in read if found[4]), read[0])
+	return moves, landed, why, all(found[3] for found in read)
 
 def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMoves) -> 'str | None':
 	'''
@@ -6190,14 +6267,15 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 	None, as for a user's symlink backed up as one. Raises UncheckedVaultLink, and nothing else, when that cannot be
 	told. With R the link's path in its version, R' the path its text names in the version below and u its count of
 	../, a link the text rule takes (strict_chain_hop(): relative, the previous version's whole name, real folders on
-	the way) is a chain link when:
+	the way), whose target is not a real folder (the daemon links files only), is a chain link when:
 	- R' is R and u is R's own depth + 1, the text the referenced copy writes: no rows are read;
 	- else, when the moves take R' to R. Any u is then fine, as a retarget that failed, or a daemon before 0.39, keeps
-	  the old text; R' being R takes a move too, such as away and back. A move row without a source landing on R or a
-	  folder above it cannot tell;
-	and its target is not a real folder, as the daemon links files only. A version whose rows cannot be used (usable
-	is False) goes by the text alone, u not counted, as refusing a moved chain link would lose its copy; one warning
-	is logged for each such version.
+	  the old text; R' being R takes a move too, such as away and back.
+	It is not one when the moves do not take it there and a row of the version lands on R or a folder above it, as
+	every user's symlink has one (VersionMoves.explains()). With no such row, or with a move row without a source
+	landing there, that cannot be told: rows of a monitored path since moved to a parent or a child look usable but
+	are shifted. A version whose rows cannot be used (usable is False) goes by the text alone, u not counted, as
+	refusing a moved chain link would lose its copy; one warning is logged for each such version.
 
 	Examples:
 		>>> import tempfile
@@ -6214,6 +6292,11 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 		>>> [vault_chain_hop(job_vault, link_path, text, moved)[len(job_vault):] for text in ('../../V3--2021-01-01_00-00-00_-0800/b/u',
 		...     '../V3--2021-01-01_00-00-00_-0800/b/u')]
 		['/V3--2021-01-01_00-00-00_-0800/b/u', '/V3--2021-01-01_00-00-00_-0800/b/u']
+		>>> try:
+		...     vault_chain_hop(job_vault, link_path, '../../V3--2021-01-01_00-00-00_-0800/b/u', VersionMoves(moves=[], landed={'c/'}))
+		... except UncheckedVaultLink:
+		...     print('cannot tell')
+		cannot tell
 		>>> import shutil; shutil.rmtree(job_vault)
 	'''
 	# strict_chain_hop() and chain_link_target(), keeping the parse
@@ -6225,20 +6308,7 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 	target = os.path.join(vault, name, *named_parts)
 	if not is_real_folder_under(os.path.join(vault, name), os.path.dirname(target)):
 		return None
-	version_name, _, rel = os.path.abspath(link_path)[len(vault) + 1:].partition('/')
-	named = '/'.join(named_parts)
-	if named != rel or ups != rel.count('/') + 1:
-		if not moves.usable:
-			if moves.key is not None and moves.key not in VERSION_MOVES_WARNED:
-				remember_version_moves(VERSION_MOVES_WARNED, moves.key, None)
-				backuperTeeLogToTl(path=moves.key[0],warning=True,message=f'Telling the moved links of {version_name} by their text alone, as its moves cannot be used: {moves.why}')
-		else:
-			taken = moves.takes(named, rel)
-			if taken is None:
-				raise UncheckedVaultLink(f'a move without a source in {version_name} lands on {rel}')
-			# a link at its own path with another depth's text is one only when a move took it away and back
-			if not taken or (named == rel and not moves.touches(named)):
-				return None
+	# told before any row, so no row can make pruning rename a folder onto a link
 	try:
 		if stat.S_ISDIR(os.lstat(target).st_mode):
 			# the daemon links files only, and makes every folder a real one
@@ -6253,7 +6323,24 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 		raise UncheckedVaultLink(e) from e
 	except ValueError as e:
 		raise UncheckedVaultLink(e) from e
-	return target
+	version_name, _, rel = os.path.abspath(link_path)[len(vault) + 1:].partition('/')
+	named = '/'.join(named_parts)
+	if named == rel and ups == rel.count('/') + 1:
+		return target
+	if not moves.usable:
+		if moves.key is not None and moves.key not in VERSION_MOVES_WARNED:
+			remember_version_moves(VERSION_MOVES_WARNED, moves.key, None)
+			backuperTeeLogToTl(path=moves.key[0],warning=True,message=f'Telling the moved links of {version_name} by their text alone, as its moves cannot be used: {moves.why}')
+		return target
+	taken = moves.takes(named, rel)
+	if taken is None:
+		raise UncheckedVaultLink(f'a move without a source in {version_name} lands on {rel}')
+	# a link at its own path with another depth's text is one only when a move took it away and back
+	if taken and (named != rel or moves.touches(named)):
+		return target
+	if moves.explains(rel):
+		return None
+	raise UncheckedVaultLink(f'no row of {version_name} lands on {rel}, so its rows may be of another monitored path')
 
 def retarget_chain_link(job_vault:str, link_path:str) -> bool:
 	'''

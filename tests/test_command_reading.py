@@ -135,8 +135,8 @@ def test_resolve_chain_to_a_pruned_entry_is_dangling(job):
 
 
 def test_resolve_old_absolute_link_to_a_removed_version_is_a_symlink(job):
-	# shaped as daemons before 0.38 linked an unchanged entry; since 0.44 no absolute link is a chain link, as no kept
-	# version holds one while a user's symlink to a backed-up copy has that form
+	# an absolute link of a chain link's shape: since 0.44 no absolute link is a chain link, as no released daemon wrote
+	# one (the live vaults hold none) while a user's symlink to a backed-up copy has that form
 	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp=T, current=False)
 	write_committed_version(job, 1, {'a/': None}, timestamp=T, current=False)
 	v2 = write_committed_version(job, 2, {'a/': None}, timestamp=T)

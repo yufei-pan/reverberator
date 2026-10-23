@@ -1,7 +1,7 @@
 import os
 import pytest
 import reverberator as rv
-from tests.harness import write_committed_version
+from tests.harness import write_committed_version, write_change_list, run_backup, seed_monitor
 
 pytestmark = pytest.mark.unit
 
@@ -34,6 +34,13 @@ def hop(job, v1, rel, moves=None):
 	if moves is None:
 		moves = rv.VersionMoves.of_committed(job.job_vault, v1, job.monitor)
 	return rv.vault_chain_hop(job.job_vault, path, os.readlink(path), moves)
+
+
+def hop_or_cannot_tell(job, v1, rel, monitor):
+	try:
+		return hop(job, v1, rel, rv.VersionMoves.of_committed(job.job_vault, v1, monitor))
+	except rv.UncheckedVaultLink:
+		return 'cannot tell'
 
 
 def no_rows_read(monkeypatch):
@@ -82,8 +89,15 @@ def test_a_moved_link_is_a_chain_link_when_the_moves_take_it_there(job, case, mo
 	moves = rv.VersionMoves.of_committed(job.job_vault, v1, job.monitor)
 	assert moves.usable
 	assert hop(job, v1, rel) == f'{v0}/{named}'
-	# the old-depth link sits beside rel, where no move took named: not a chain link
-	assert hop(job, v1, os.path.join(os.path.dirname(rel), old_depth)) is None
+	# the old-depth link sits beside rel, where no move took named. A row of V1 landing on a folder above it (a moved
+	# or created folder) accounts for it, so it is no chain link; with none, rows of a monitored path changed since
+	# could be shifted, so that cannot be told (a user's link always has a row)
+	old_rel = os.path.join(os.path.dirname(rel), old_depth)
+	if case in ('folder', 'mkdir_and_mv'):
+		assert moves.explains(old_rel) and hop(job, v1, old_rel) is None
+	else:
+		with pytest.raises(rv.UncheckedVaultLink):
+			hop(job, v1, old_rel)
 	os.remove(f'{v1}/{rel}')
 	link(v1, rel, '../' * (named.count('/') + 1) + f'{V0}/{named}')
 	assert hop(job, v1, rel) == f'{v0}/{named}'
@@ -106,11 +120,16 @@ def test_away_and_back_with_a_failed_retarget_is_a_chain_link(job):
 
 
 def test_a_depth_off_without_a_move_is_not_a_chain_link(job):
-	v0, v1 = two_versions(job, {'x': 'x', 'y': 'y'}, {'other': 'o'}, [('other', 'modify', None), ('z', 'move', 'y')])
+	# x has a row of its own, as the version that copied a user's link has
+	v0, v1 = two_versions(job, {'x': 'x', 'y': 'y'}, {'other': 'o'}, [('x', 'create', None), ('z', 'move', 'y')])
 	link(v1, 'x', f'../../{V0}/x')
 	assert hop(job, v1, 'x') is None
 	moves = rv.VersionMoves.of_committed(job.job_vault, v1, job.monitor)
 	assert moves.takes('x', 'x') is True and not moves.touches('x')
+	# with no row landing on x, shifted rows of a changed monitored path cannot be ruled out
+	v2 = write_committed_version(job, 2, {'other': 'o'}, timestamp='2021-01-03_00-00-00_-0800', rows=[('other', 'modify', None)])
+	os.symlink(f'../../V1--{T1}/x', f'{v2}/x')
+	assert hop_or_cannot_tell(job, v2, 'x', job.monitor) == 'cannot tell'
 
 
 def test_absolute_links_are_never_chain_links(job, tmp_path):
@@ -131,12 +150,15 @@ def test_absolute_links_are_never_chain_links(job, tmp_path):
 
 @pytest.mark.parametrize('usable', [True, False])
 def test_a_link_naming_a_folder_is_not_a_chain_link(job, usable):
-	v0, v1 = two_versions(job, {'D/f': 'f', 'E/f': 'f'}, {'other': 'o'}, [('other', 'modify', None), ('M', 'move', 'E')] if usable else [])
-	# D's own chain text, and a "move" from E: the daemon links files only
+	rows = [('other', 'modify', None), ('M', 'move', 'E'), ('N', 'move', None)]
+	v0, v1 = two_versions(job, {'D/f': 'f', 'E/f': 'f'}, {'other': 'o'}, rows if usable else [])
+	# D's own chain text, a "move" from E, and a move without a source onto N: the daemon links files only, which is
+	# told before any row, so a forged row cannot make pruning rename a folder onto a link
 	link(v1, 'D', f'../{V0}/D')
 	link(v1, 'M', f'../{V0}/E')
-	assert hop(job, v1, 'D') is None
-	assert hop(job, v1, 'M') is None
+	link(v1, 'N', f'../{V0}/E')
+	for rel in ('D', 'M', 'N'):
+		assert hop(job, v1, rel) is None
 
 
 def test_escalated_rows_with_a_source_are_not_moves(job):
@@ -187,14 +209,101 @@ def test_rows_that_cannot_be_used_fall_back_to_the_text(job, how, monkeypatch):
 		os.chmod(change_list, 0o644)
 
 
-@pytest.mark.parametrize('dest', ['deep/x', 'deep/'])
-def test_a_move_row_without_a_source_cannot_be_told(job, dest):
-	v0, v1 = two_versions(job, {'a/x': 'x'}, {'deep/': None}, [(dest, 'move', None)])
-	link(v1, 'deep/x', f'../../{V0}/a/x')
+@pytest.mark.parametrize('rows,text', [
+	([('deep/x', 'move', None)], f'../../{V0}/a/x'),
+	([('deep/', 'move', None)], f'../../{V0}/a/x'),
+	# told before the moves that do take a/x there
+	([('deep/x', 'move', 'a/x'), ('deep/x', 'move', None)], f'../../{V0}/a/x'),
+	# and before the rule for a link at its own path at another depth
+	([('deep/x', 'move', None)], f'../../../{V0}/deep/x'),
+], ids=['onto_it', 'onto_a_folder_above', 'after_a_move_there', 'own_path_depth_off'])
+def test_a_move_row_without_a_source_cannot_be_told(job, rows, text):
+	v0, v1 = two_versions(job, {'a/x': 'x', 'deep/x': 'x'}, {'deep/': None}, rows)
+	link(v1, 'deep/x', text)
 	with pytest.raises(rv.UncheckedVaultLink):
 		hop(job, v1, 'deep/x')
-	# one landing elsewhere tells
-	v2 = write_committed_version(job, 2, {'deep/': None}, timestamp='2021-01-03_00-00-00_-0800', rows=[('other', 'move', None)])
+	# one landing elsewhere tells, by the create row of deep/
+	v2 = write_committed_version(job, 2, {'deep/': None}, timestamp='2021-01-03_00-00-00_-0800', rows=[('deep/', 'create', None), ('other', 'move', None)])
 	os.symlink(f'../../V1--{T1}/a/x', f'{v2}/deep/x')
 	assert rv.vault_chain_hop(job.job_vault, f'{v2}/deep/x', os.readlink(f'{v2}/deep/x'),
 		rv.VersionMoves.of_committed(job.job_vault, v2, job.monitor)) is None
+
+
+SHIFTED = {
+	# the job's monitored path widened to a parent, and narrowed to a child, since V1 was written
+	'widened': ('a', '', [('deep/x', 'move', 'x')], 'deep/x', 'x'),
+	'narrowed': ('', 'sub', [('sub/deep/x', 'move', 'sub/x'), ('sub/', 'attrib', None)], 'sub/deep/x', 'sub/x'),
+}
+
+
+@pytest.mark.parametrize('case', sorted(SHIFTED))
+def test_rows_of_a_changed_monitored_path_never_refuse_a_moved_chain_link(job, case):
+	old, new, rows, rel, named = SHIFTED[case]
+	old_monitor, new_monitor = (os.path.join(job.monitor, sub) if sub else job.monitor for sub in (old, new))
+	v0, v1 = two_versions(job, {named: 'x'}, {os.path.dirname(rel) + '/': None}, rows, monitor=old_monitor)
+	link(v1, rel, '../' * (rel.count('/') + 1) + f'{V0}/{named}')
+	# every row starts with the new path, so the rows look usable, but each rel is shifted
+	assert rv.VersionMoves.of_committed(job.job_vault, v1, new_monitor).usable
+	assert hop_or_cannot_tell(job, v1, rel, new_monitor) in (f'{v0}/{named}', 'cannot tell')
+	assert hop_or_cannot_tell(job, v1, rel, old_monitor) == f'{v0}/{named}'
+
+
+CUT_ROW_AT = ['inside_the_path', 'after_the_path', 'inside_the_event', 'after_the_event', 'inside_the_source']
+
+
+@pytest.mark.parametrize('cut', CUT_ROW_AT)
+def test_a_change_list_cut_short_falls_back_to_the_text(job, cut):
+	v0, v1 = two_versions(job, {'a/x': 'x'}, {'deep/er/': None}, [('deep/', 'create', None), ('deep/er/x', 'move', 'a/x')])
+	link(v1, 'deep/er/x', f'../../../{V0}/a/x')
+	change_list = rv.list_versions(job.job_vault)[1].change_list
+	data = open(change_list, 'rb').read()
+	start = data.rindex(b'\n', 0, len(data) - 1) + 1
+	fields = data[start:-1].split(b'\0')
+	ends = [start + len(b'\0'.join(fields[:i + 1])) for i in range(len(fields))]
+	at = {'inside_the_path': ends[0] - 3, 'after_the_path': ends[0], 'inside_the_event': ends[2] - 2,
+		'after_the_event': ends[2], 'inside_the_source': ends[3] - 3}[cut]
+	# a crash in the middle of the append
+	with open(change_list, 'wb') as f:
+		f.write(data[:at])
+	moves = rv.VersionMoves.of_committed(job.job_vault, v1, job.monitor)
+	assert not moves.usable
+	assert hop(job, v1, 'deep/er/x') == f'{v0}/a/x'
+	# read in full, so kept
+	assert rv.VersionMoves.of_committed(job.job_vault, v1, job.monitor) is moves
+
+
+def test_a_version_with_two_change_lists_reads_the_one_with_rows(job):
+	v0, v1 = two_versions(job, {'a/x': 'x'}, {'deep/': None}, [('deep/x', 'move', 'a/x')])
+	# as pruning makes one when the name it works out from the recorded sizes is not there; it sorts first
+	empty = f'{v1}--1.00_B-1_ino{rv.CONTENT_FILE_EXTENSION_NAME}'
+	write_change_list(empty, job.monitor, [])
+	assert sorted(name for name in os.listdir(job.job_vault) if name.startswith(os.path.basename(v1) + '--'))[0] == os.path.basename(empty)
+	link(v1, 'deep/x', f'../../{V0}/a/x')
+	moves = rv.VersionMoves.of_committed(job.job_vault, v1, job.monitor)
+	assert moves.usable and moves.moves == [('a/x', 'deep/x', False)]
+	assert hop(job, v1, 'deep/x') == f'{v0}/a/x'
+
+
+def test_rows_under_a_monitored_path_spelled_with_dots_are_usable(job):
+	# the rule's monitored path as typed, with ./ and a doubled /
+	v0, v1 = two_versions(job, {'a/x': 'x'}, {'deep/': None}, [('deep/x', 'move', 'a/x')], monitor=job.monitor + '/./')
+	link(v1, 'deep/x', f'../../{V0}/a/x')
+	for monitor in (job.monitor, job.monitor + '/.'):
+		moves = rv.VersionMoves.of_committed(job.job_vault, v1, monitor)
+		assert moves.usable and moves.moves == [('a/x', 'deep/x', False)]
+		assert hop(job, v1, 'deep/x', moves) == f'{v0}/a/x'
+
+
+def test_a_new_change_list_is_synced_with_its_folder(job, monkeypatch):
+	seed_monitor(job, {'a': 'a'})
+	synced = []
+	real_fsync = os.fsync
+	def recording_fsync(fd):
+		synced.append(os.path.realpath(f'/proc/self/fd/{fd}'))
+		return real_fsync(fd)
+	monkeypatch.setattr(rv.os, 'fsync', recording_fsync)
+	run_backup(job)
+	change_list = rv.list_versions(job.job_vault)[-1].change_list
+	# the commit marker: the version is there once its change list is
+	assert os.path.realpath(change_list) in synced
+	assert synced.index(os.path.realpath(job.job_vault)) > synced.index(os.path.realpath(change_list))

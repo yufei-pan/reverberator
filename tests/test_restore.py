@@ -263,8 +263,8 @@ def test_restore_keeps_an_old_absolute_link_to_a_removed_version_as_a_link(job, 
 	backup(job, ('proj/a.txt', 'modify'))
 	write_rule(job)
 	v0, v1 = version_path(job, 0), version_path(job, 1)
-	# shaped as an older daemon linked b.txt, to a version since removed by hand; since 0.44 an absolute link is a
-	# user's symlink (no kept version holds one of the daemon's), so it is restored as the link it is, never dangling
+	# an absolute link of a chain link's shape for b.txt, to a version since removed by hand; since 0.44 an absolute
+	# link is a user's symlink (no released daemon wrote absolute chain links), so it is restored as it is, never dangling
 	os.remove(os.path.join(v1, 'proj/b.txt'))
 	text = os.path.join(job.job_vault, f'V0--2021-01-01_00-00-00_-0800/proj/b.txt')
 	os.symlink(text, os.path.join(v1, 'proj/b.txt'))
