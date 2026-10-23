@@ -8,6 +8,7 @@ import errno
 import os
 import shutil
 import sqlite3
+import signal
 import stat
 import threading
 import time
@@ -938,3 +939,138 @@ def test_a_history_pass_lets_go_of_the_versions_it_has_passed(tmp_path):
 	assert [(row.version.number, row.event) for row in rows][-1:] == [(1, 'move')]
 	# the walk is done with every version above the last two it resolved
 	assert set(moves._held) <= {v0.path, v1.path}
+
+
+@pytest.mark.parametrize('sig', [signal.SIGINT, signal.SIGTERM], ids=['SIGINT', 'SIGTERM'])
+def test_a_folder_restore_waiting_for_the_manifest_stops_on_a_signal(tmp_path, capsys, monkeypatch, sig):
+	# review5 probe_sigint_wait: the restore's handlers only set RESTORE_STOP, which the wait never looked at
+	job, v0, v1 = moved_job(tmp_path)
+	write_rule(job)
+	handlers = {each: signal.getsignal(each) for each in rv.RESTORE_STOP_SIGNALS}
+	real = rv.read_recorded_monitor_paths
+	tries, signalled = [], []
+	def read(job_vault, timeout=1):
+		tries.append(timeout)
+		if len(tries) == 3:
+			signalled.append(time.monotonic())
+			os.kill(os.getpid(), sig)
+		assert len(tries) < 40, 'still waiting long after the signal'
+		return real(job_vault, timeout=min(timeout, 0.2))
+	monkeypatch.setattr(rv, 'read_recorded_monitor_paths', read)
+	dest = tmp_path / 'out'
+	dest.mkdir()
+	locker = lock_manifest(job)
+	try:
+		code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'deep'), str(dest), '--version', '1')
+	finally:
+		locker.close()
+	assert code == rv.EXIT_COMMAND_FAILED and 'Interrupted' in err, err
+	assert signalled and time.monotonic() - signalled[0] < 2
+	# each try waits a short while, so a stop is met soon
+	assert all(timeout <= rv.RESTORE_WAIT_SECONDS for timeout in tries)
+	assert {each: signal.getsignal(each) for each in handlers} == handlers
+
+
+def test_a_move_that_lands_then_reports_an_error_keeps_the_copy(tmp_path, monkeypatch):
+	# haiku5 h1: the rename moved the copy, then raised; the copy, now where the link was, was removed as a dangling link
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	target = os.path.join(v0.path, 'D/secret')
+	inside = during_prune(monkeypatch)
+	real_rename = os.rename
+	fired = []
+	def rename(source, dest, *args, **kwargs):
+		if inside[0] and os.fspath(source) == target and not fired:
+			real_rename(source, dest, *args, **kwargs)
+			fired.append(dest)
+			raise OSError(errno.EIO, os.strerror(errno.EIO), source)
+		return real_rename(source, dest, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'rename', rename)
+	bump(job, 1, keep_n_versions=2)
+	monkeypatch.undo()
+	assert fired and not os.path.exists(v0.path)
+	held = os.path.join(v1.path, 'D/secret')
+	assert not os.path.islink(held) and open(held).read() == 'secret'
+	for version in rv.list_versions(job.job_vault):
+		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
+
+
+@pytest.mark.parametrize('first', ['D/', 'a/'])
+def test_two_links_naming_one_copy_both_keep_its_bytes(tmp_path, monkeypatch, capsys, first):
+	# haiku5 h7: by the text alone, a user's link and the chain link both name V0's D/secret; the first walked took the
+	# copy, and the second, its target gone, was removed as dangling: V1 lost D/secret when the user's link came first
+	job = fresh_job(tmp_path)
+	v0 = latest(job)
+	v1 = add_user_link(job, 'a/U', chain_text(v0.name, 'D/secret'))
+	# rows that cannot be used: the user's link goes by its text
+	rewrite_text(v1, lambda text: text.partition('\n')[0] + '\n')
+	inside = during_prune(monkeypatch)
+	real_walk = rv.iter_tree_entries
+	def walk(path, *args, **kwargs):
+		entries = list(real_walk(path, *args, **kwargs))
+		if inside[0] and os.path.abspath(path) == os.path.abspath(v1.path):
+			entries.sort(key=lambda entry: not entry[1].startswith(first))
+		yield from entries
+	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
+	capsys.readouterr()
+	bump(job, 1, keep_n_versions=2)
+	monkeypatch.undo()
+	assert not os.path.exists(v0.path)
+	held = os.path.join(v1.path, 'D/secret')
+	assert not os.path.islink(held) and open(held).read() == 'secret'
+	assert stat.S_IMODE(os.lstat(held).st_mode) == 0o600
+	for version in rv.list_versions(job.job_vault):
+		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
+	# the user's link gets the copy's bytes too: the ruled damage of the fallback, with no file lost
+	assert open(os.path.join(v1.path, 'a/U')).read() == 'secret'
+	assert 'both link to' in capsys.readouterr().out
+
+
+def test_a_link_that_cannot_be_read_aborts_the_prune_and_the_backup_goes_on(tmp_path, monkeypatch, capsys):
+	# haiku5 h3: an OSError from readlink escaped decrement_stepper, after earlier renames, with no marker
+	job = fresh_job(tmp_path, {'D/secret': 'secret', 'b/x': 'x', 'keep': 'k'})
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	inside = during_prune(monkeypatch)
+	real_readlink = os.readlink
+	def readlink(path, *args, **kwargs):
+		if inside[0] and os.fspath(path) == os.path.join(v1.path, 'D/secret'):
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return real_readlink(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'readlink', readlink)
+	capsys.readouterr()
+	bump(job, 1, keep_n_versions=2)
+	assert len([line for line in alerting_lines(capsys.readouterr().out) if 'cannot remove' in line]) == 1
+	monkeypatch.undo()
+	assert [version.number for version in rv.list_versions(job.job_vault)] == [0, 1, 2]
+	assert os.readlink(os.path.join(v1.path, 'D/secret')) == chain_text(v0.name, 'D/secret')
+	# a clean run prunes as ever
+	bump(job, 1, keep_n_versions=2)
+	versions = rv.list_versions(job.job_vault)
+	assert [version.number for version in versions] == [2, 3]
+	for version in versions:
+		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret' and open(os.path.join(version.path, 'b/x')).read() == 'x'
+
+
+@pytest.mark.parametrize('fails', ['listing', 'rm'])
+def test_a_removal_that_does_not_happen_is_not_reported_done(tmp_path, monkeypatch, capsys, fails):
+	# haiku5 h8: glob() passes over a listing error and rm's code was ignored, so the version was reported removed
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	if fails == 'listing':
+		monkeypatch.setattr(rv.glob, 'glob', lambda pattern, **kwargs: [])
+	else:
+		real_run = rv.multiCMD.run_command
+		monkeypatch.setattr(rv.multiCMD, 'run_command', lambda command, *args, **kwargs: 1 if command[0] == 'rm' else real_run(command, *args, **kwargs))
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	capsys.readouterr()
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
+	assert len([line for line in alerting_lines(capsys.readouterr().out) if f'cannot remove {v0.path}' in line]) == 1
+	assert list(info) == [0, 1] and os.path.isdir(v0.path) and job.job_name in rv.PRUNE_ABORTED
+	monkeypatch.undo()
+	# V1's links were made copies: nothing depends on V0 now, and the next removal goes through
+	assert rv.decrement_stepper(info, job.job_name, job.monitor) != (0, 0)
+	assert not os.path.exists(v0.path) and job.job_name not in rv.PRUNE_ABORTED
+	assert open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
