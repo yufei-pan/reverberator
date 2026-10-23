@@ -43,8 +43,8 @@ def hop_or_cannot_tell(job, v1, rel, monitor):
 	try:
 		return hop(job, v1, rel, rv.VersionMoves.of_committed(job.job_vault, v1, monitor))
 	except rv.UnexplainedChainLink as e:
-		# the hop the text names, for pruning and reading to follow
-		assert e.target == rv.strict_chain_hop(job.job_vault, os.path.join(v1, rel), os.readlink(os.path.join(v1, rel)))
+		# the hop the text names (by the text alone), for pruning and reading to follow
+		assert e.target == rv.vault_chain_hop(job.job_vault, os.path.join(v1, rel), os.readlink(os.path.join(v1, rel)), rv.BY_THE_TEXT)
 		return 'cannot tell'
 
 
@@ -144,7 +144,7 @@ def test_absolute_links_are_never_chain_links(job, tmp_path):
 	for rel in ('a/x', 'b/x'):
 		assert hop(job, v1, rel) is None
 		assert hop(job, v1, rel, rv.VersionMoves.applied([('a/x', 'b/x', False)])) is None
-		assert rv.strict_chain_hop(job.job_vault, f'{v1}/{rel}', f'{v0}/a/x') is None
+		assert rv.vault_chain_hop(job.job_vault, f'{v1}/{rel}', f'{v0}/a/x', rv.BY_THE_TEXT) is None
 	# rows that cannot be used fall back to the text, which never takes an absolute link either
 	os.remove(rv.list_versions(job.job_vault)[1].change_list)
 	rv.VERSION_MOVES.clear()
@@ -227,7 +227,7 @@ def test_a_move_row_without_a_source_cannot_be_told(job, rows, text):
 	link(v1, 'deep/x', text)
 	with pytest.raises(rv.UnexplainedChainLink) as raised:
 		hop(job, v1, 'deep/x')
-	assert raised.value.target == rv.strict_chain_hop(job.job_vault, f'{v1}/deep/x', text)
+	assert raised.value.target == rv.vault_chain_hop(job.job_vault, f'{v1}/deep/x', text, rv.BY_THE_TEXT)
 	# one landing elsewhere tells, by the create row of deep/
 	v2 = write_committed_version(job, 2, {'deep/': None}, timestamp='2021-01-03_00-00-00_-0800', rows=[('deep/', 'create', None), ('other', 'move', None)])
 	os.symlink(f'../../V1--{T1}/a/x', f'{v2}/deep/x')

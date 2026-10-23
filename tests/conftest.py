@@ -7,6 +7,9 @@ import pytest
 import reverberator as rv
 from tests.harness import create_job, reverberator_script
 
+# the chain-link ground truth over the whole suite (REVERB_CHAIN_GROUND_TRUTH=0 turns it off)
+pytest_plugins = ['tests.chain_ground_truth']
+
 
 @pytest.fixture(autouse=True)
 def restore_runtime_globals(tmp_path, monkeypatch):
