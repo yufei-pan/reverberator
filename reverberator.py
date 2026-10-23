@@ -4617,7 +4617,8 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 	it cannot; when an entry with a version folder's name is a link; when an entry named after a folder there cannot be
 	read as its change list (a committed version would be left out silently); when two version folders have one number,
 	or one has two change lists; when an entry with a change list's name for no folder there is no regular file, or
-	names a version folder that cannot be told gone; and when an orphan may not go.
+	names a version folder that cannot be told gone; when the committed versions' numbers have a gap; and when an orphan
+	may not go.
 	'''
 	try:
 		os.lstat(job_vault_path)
@@ -4716,6 +4717,11 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 			timestamp = datetime.datetime.strptime(name.partition('--')[2], VAULT_TIMESTAMP_FORMAT).timestamp()
 			versions[number] = VaultEntry(number, folders[name], timestamp, size, inodes)
 			change_lists[number] = os.path.join(job_vault_path, change_list)
+		missing = sorted(set(range(min(versions), max(versions) + 1)) - set(versions)) if versions else []
+		if missing:
+			# versions are made newest + 1 and pruned oldest first: a gap is a version deleted by hand or one the listing
+			# left out, and pruning past it would take the version after it for the next one
+			raise VaultScanError(f'versions {", ".join(map(str, missing))} in {job_vault_path} are missing between the committed versions {min(versions)} and {max(versions)}')
 		for number, name in orphans:
 			if hold_all or number in held_back:
 				raise VaultScanError(f'{name} in {job_vault_path} has no change list, and {", ".join(sorted(kept))}, which name no folder there, may be its')
@@ -4784,16 +4790,17 @@ def remove_incomplete_vault_versions(job_vault_path: str) -> list:
 			deleted.append(path)
 	return deleted
 
-# the job vaults (absolute paths) a scan of this daemon found committed versions in: one that is not there afterwards
-# went away under the daemon (as a mergerfs branch dropping out shows it), and is no new vault to start at V0 in
+# the job vaults (absolute paths) a scan of this daemon found committed versions in: one that is not there afterwards,
+# or shows no committed version, went away under the daemon (as a mergerfs branch dropping out shows it), and is no new
+# vault to start at V0 in
 VAULTS_WITH_VERSIONS = set()
 
 def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	'''
 	The versions job_vault_path holds, oldest first, each with the size and inodes its change list records, or with
-	recalculate, what du measures (the list renamed to record it). A job vault that is not there is an empty one, unless
-	a scan of this daemon found committed versions in it (VAULTS_WITH_VERSIONS): it fails then, as a backup would start
-	a whole V0 beside them once it came back.
+	recalculate, what du measures (the list renamed to record it). A job vault that is not there, or holds no committed
+	version, is an empty one, unless a scan of this daemon found committed versions in it (VAULTS_WITH_VERSIONS): it
+	fails then, before anything is deleted, as a backup would start a whole V0 beside them once they showed again.
 
 	The scan deletes only what it is certain of, once the whole vault was read (read_job_vault()): the change lists of
 	version folders that are not there, and the version folders without a change list that may go, the orphans of
@@ -4818,6 +4825,11 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 		return VaultInfo({},0,0)
 	if listing.versions:
 		VAULTS_WITH_VERSIONS.add(os.path.abspath(job_vault_path))
+	elif os.path.abspath(job_vault_path) in VAULTS_WITH_VERSIONS:
+		# a vault shown empty (as a mergerfs branch dropping out can show it) is no new vault either
+		reason = f'the vault {job_vault_path} shows no committed version, though this daemon found versions in it: not starting it again'
+		backuperTeeLogToTl(job_vault_path, f'Cannot read the vault, nothing in it is removed: {reason}', error=True)
+		raise VaultScanError(reason)
 	for name in listing.kept:
 		backuperTeeLogToTl(job_vault_path, f'Keeping {name}: it names no folder there, and its name does not say it is the change list of a version gone', error=True)
 	for path in listing.stale:

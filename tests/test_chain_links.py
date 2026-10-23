@@ -147,7 +147,11 @@ def test_link_naming_an_older_version_is_not_followed_or_pruned_onto(job):
 	os.symlink(f'../V0--{T}/a/x', f'{v2}/u')
 	record = rv.read_vault_record(v2, 'u', job.monitor)
 	assert (record.kind, record.link) == ('l', f'../V0--{T}/a/x')
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
+	# Task 2b: the scan fails on the gap, so no backup prunes past it; pruning given V0 and V2 still follows no such link
+	with pytest.raises(rv.VaultScanError):
+		rv.get_vault_info(job.job_vault)
+	info = OrderedDict((kept.number, rv.VaultEntry(kept.number, kept.path, kept.timestamp, kept.size, kept.inodes)) for kept in rv.list_versions(job.job_vault))
+	rv.decrement_stepper(info, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert os.readlink(f'{v2}/u') == f'../V0--{T}/a/x'
 

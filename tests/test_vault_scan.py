@@ -653,3 +653,73 @@ def test_a_new_vault_still_starts_at_v0(tmp_path):
 	assert dict(rv.get_vault_info(job.job_vault).vault_info_dict) == {}
 	run_backup(job)
 	assert [kept.number for kept in rv.list_versions(job.job_vault)] == [0]
+
+
+# --- Task 2b fix round 1b ---
+
+def test_a_gap_in_the_committed_versions_fails_the_scan(tmp_path):
+	# a version deleted by hand, or a listing that left one out without an error: pruning past the gap would take the
+	# version after it for the next one, and the missing version's links into the oldest would be broken when it is back
+	job = three_versions(tmp_path)
+	with open(os.path.join(job.monitor, 'keep'), 'w') as f:
+		f.write('v3')
+	run_backup(job, OrderedDict([event_entry(job, 'keep', 'modify')]))
+	v0, v2 = version(job, 0), version(job, 2)
+	shutil.rmtree(v2.path)
+	os.remove(v2.change_list)
+	before = vault_names(job)
+	with pytest.raises(rv.JobFailure) as failure:
+		rv.get_vault_info(job.job_vault)
+	assert '2' in failure.value.reason
+	assert rv.remove_incomplete_vault_versions(job.job_vault) == []
+	assert_nothing_done(job, before, backup_keeping_two(job))
+	assert os.path.isdir(v0.path) and os.path.isfile(v0.change_list)
+
+
+def test_versions_made_and_pruned_stay_contiguous(tmp_path, monkeypatch):
+	# a failed attempt's number is taken again once its folder goes, and a prune takes only the oldest
+	job = three_versions(tmp_path)
+	leftover = write_incomplete_version(job, 3, {'x': 'y'})
+	with open(os.path.join(job.monitor, 'keep'), 'w') as f:
+		f.write('v3')
+	run_backup(job, OrderedDict([event_entry(job, 'keep', 'modify')]), keep_n_versions=3)
+	assert not os.path.exists(leftover)
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [1, 2, 3]
+
+
+@pytest.mark.parametrize('how', ['emptied', 'listed_empty'])
+def test_a_vault_that_shows_no_version_after_its_versions_were_seen_fails_the_scan(tmp_path, monkeypatch, how):
+	# a mergerfs branch dropping out can show the job vault there but empty: a backup would start a whole V0
+	job = three_versions(tmp_path)
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2]
+	if how == 'emptied':
+		aside = os.path.join(str(tmp_path), 'aside')
+		os.makedirs(aside)
+		for name in os.listdir(job.job_vault):
+			if name.startswith('V'):
+				os.rename(os.path.join(job.job_vault, name), os.path.join(aside, name))
+	else:
+		real_scandir = os.scandir
+		def scandir(path='.'):
+			if os.path.abspath(os.fspath(path)) != job.job_vault:
+				return real_scandir(path)
+			return iter([entry for entry in real_scandir(path) if not entry.name.startswith('V')])
+		monkeypatch.setattr(rv.os, 'scandir', scandir)
+	before = vault_names(job)
+	with pytest.raises(rv.JobFailure):
+		rv.get_vault_info(job.job_vault)
+	assert_nothing_done(job, before, backup_keeping_two(job))
+
+
+def test_a_fresh_daemon_starts_an_empty_vault_at_v0(tmp_path):
+	job = three_versions(tmp_path)
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2]
+	for name in os.listdir(job.job_vault):
+		path = os.path.join(job.job_vault, name)
+		if name.startswith('V'):
+			shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+	# a restart: nothing kept in memory
+	rv.VAULTS_WITH_VERSIONS.clear()
+	assert dict(rv.get_vault_info(job.job_vault).vault_info_dict) == {}
+	run_backup(job)
+	assert [kept.number for kept in rv.list_versions(job.job_vault)] == [0]

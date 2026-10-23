@@ -633,6 +633,8 @@ def test_a_vault_started_over_drops_the_pairs_of_its_old_versions(tmp_path):
 		if name.startswith('V'):
 			path = os.path.join(base.job_vault, name)
 			shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+	# started over while the daemon was stopped: one that saw the versions would refuse an emptied vault (Task 2b)
+	rv.VAULTS_WITH_VERSIONS.clear()
 	run_backup(b)
 	assert rv.recorded_monitor_paths(base.job_vault) == [(0, b.monitor)]
 	manifest = rv.VaultManifest(base.job_vault)
