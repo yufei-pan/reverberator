@@ -9,6 +9,8 @@ import os
 import shutil
 import sqlite3
 import stat
+import threading
+import time
 from collections import deque, OrderedDict
 import pytest
 import TSVZ
@@ -288,20 +290,34 @@ def forget_record(job):
 	manifest.close()
 
 
-@pytest.mark.parametrize('why', ['empty', 'old_monitored_path'])
+@pytest.mark.parametrize('why', ['empty', 'old_monitored_path', 'unreadable', 'missing'])
 def test_pruning_keeps_moved_copies_when_rows_cannot_be_used(tmp_path, pruning_keeps, monkeypatch, why):
 	job, v0, v1 = moved_job(tmp_path)
 	if why == 'empty':
 		# a crash right after the commit, before 0.44 wrote change lists whole
 		rewrite_text(v1, lambda text: text.partition('\n')[0] + '\n')
-	else:
+	elif why == 'old_monitored_path':
 		# the monitored path changed since, with no record of the old one, as before 0.44
 		rewrite_text(v1, lambda text: text.replace(job.monitor, '/old/monitor'))
 		forget_record(job)
+	elif why == 'unreadable':
+		real_ended = rv.change_list_rows_ended
+		def failing(change_list):
+			if os.path.basename(change_list).startswith(v1.name):
+				raise OSError(errno.EIO, os.strerror(errno.EIO), change_list)
+			return real_ended(change_list)
+		monkeypatch.setattr(rv, 'change_list_rows_ended', failing)
 	warnings = warnings_logged(monkeypatch)
-	pruning_keeps(job, {})
-	bump(job, 1, keep_n_versions=2)
-	assert [version.number for version in rv.list_versions(job.job_vault)] == [1, 2]
+	if why == 'missing':
+		# gone between the listing of the versions and the removal, which then writes one with the header alone
+		info = rv.get_vault_info(job.job_vault).vault_info_dict
+		os.remove(v1.change_list)
+		assert rv.decrement_stepper(info, job.job_name, job.monitor) != (0, 0)
+		assert not os.path.exists(v0.path)
+	else:
+		pruning_keeps(job, {})
+		bump(job, 1, keep_n_versions=2)
+		assert [version.number for version in rv.list_versions(job.job_vault)] == [1, 2]
 	held = os.path.join(v1.path, 'deep/er/x')
 	assert not os.path.islink(held) and open(held).read() == 'x'
 	assert len([warning for warning in warnings if v1.name in warning and 'text alone' in warning]) == 1
@@ -367,8 +383,13 @@ def test_the_recopy_keeps_a_user_link_a_link(tmp_path, monkeypatch):
 	v3 = latest(job)
 	held = os.path.join(v3.path, 'a/U')
 	assert os.path.islink(held) and os.readlink(held) == text
-	assert rv.resolve_version_entry(job.job_vault, v3.path, 'a/U', job.monitor).kind == 'symlink'
-	assert open(os.path.join(v3.path, 'D/secret')).read() == 'secret'
+	# every kept version holds the link, and D/secret as it was
+	for version in rv.list_versions(job.job_vault):
+		if version.number:
+			assert holds_user_link(job, version, 'a/U', text)
+			assert rv.resolve_version_entry(job.job_vault, version.path, 'a/U', job.monitor).kind == 'symlink'
+		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
+		assert stat.S_IMODE(os.stat(os.path.join(version.path, 'D/secret')).st_mode) == 0o600
 	assert os.path.islink(os.path.join(job.monitor, 'a/U'))
 
 
@@ -741,3 +762,179 @@ def test_the_history_and_restore_commands_read_each_change_list_once(tmp_path, c
 		assert open(dest / 'x').read() == 'x'
 	assert code == 0, err
 	assert sorted(reads) == ['V1', 'V2']
+
+
+# --- pruning keeps the oldest version when the next one cannot be looked at in full ---
+
+def during_prune(monkeypatch):
+	'''A list whose first item is True while decrement_stepper() runs.'''
+	inside = [False]
+	real = rv.decrement_stepper
+	def stepping(*args, **kwargs):
+		inside[0] = True
+		try:
+			return real(*args, **kwargs)
+		finally:
+			inside[0] = False
+	monkeypatch.setattr(rv, 'decrement_stepper', stepping)
+	return inside
+
+
+@pytest.mark.parametrize('fails', ['listing', 'lstat'])
+def test_a_next_version_that_cannot_be_looked_at_keeps_the_oldest(tmp_path, monkeypatch, capsys, fails):
+	# probe haiku4/probe_a2: a folder of V1 that cannot be listed while V0 was pruned lost the copies V1 linked under it
+	monkeypatch.setattr(rv, 'PRUNE_ABORTED', {})
+	job = fresh_job(tmp_path, {'D/secret': 'secret', 'sub/f1': 'payload', 'keep': 'k'})
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	assert os.path.islink(os.path.join(v1.path, 'sub/f1'))
+	inside = during_prune(monkeypatch)
+	real_scandir, real_lstat = os.scandir, os.lstat
+	failing = os.path.join(v1.path, 'sub')
+	def scandir(path, *args, **kwargs):
+		if inside[0] and fails == 'listing' and os.fspath(path) == failing:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return real_scandir(path, *args, **kwargs)
+	def lstat(path, *args, **kwargs):
+		if inside[0] and fails == 'lstat' and os.fspath(path) == os.path.join(failing, 'f1'):
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'scandir', scandir)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	before = snapshot(job, [v1], {})
+	capsys.readouterr()
+	bump(job, 1, keep_n_versions=2)
+	assert len([line for line in alerting_lines(capsys.readouterr().out) if 'cannot remove' in line]) == 1
+	monkeypatch.undo()
+	versions = rv.list_versions(job.job_vault)
+	assert [version.number for version in versions] == [0, 1, 2] and os.path.isdir(v0.path)
+	assert snapshot(job, [v1], {}) == before
+	assert open(os.path.join(versions[2].path, 'sub/f1')).read() == 'payload'
+
+
+def test_a_copy_that_cannot_be_looked_at_after_a_failed_move_keeps_the_oldest(tmp_path, monkeypatch):
+	# probe haiku4/probe_f_lexists: a failed rename whose lstat failed too was taken for a copy already gone, and the
+	# chain link removed, the copy going with V0
+	monkeypatch.setattr(rv, 'PRUNE_ABORTED', {})
+	job = fresh_job(tmp_path)
+	bump(job, 1)
+	v0, v1 = rv.list_versions(job.job_vault)
+	target = os.path.join(v0.path, 'D/secret')
+	inside = during_prune(monkeypatch)
+	failed = [False]
+	real_rename, real_lstat = os.rename, os.lstat
+	def rename(source, dest, *args, **kwargs):
+		if inside[0] and os.fspath(source) == target and not failed[0]:
+			failed[0] = True
+			raise OSError(errno.EIO, os.strerror(errno.EIO), source)
+		return real_rename(source, dest, *args, **kwargs)
+	def lstat(path, *args, **kwargs):
+		if inside[0] and failed[0] and os.fspath(path) == target:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'rename', rename)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	bump(job, 1, keep_n_versions=2)
+	monkeypatch.undo()
+	assert failed[0] and os.path.isfile(target)
+	for version in rv.list_versions(job.job_vault):
+		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
+	assert os.readlink(os.path.join(v1.path, 'D/secret')) == chain_text(v0.name, 'D/secret')
+
+
+def test_a_vault_path_with_glob_characters_removes_only_its_own_version(tmp_path):
+	# probe haiku4/probe_g_glob: the removal globbed the version's path as typed, matching a sibling's folder
+	root = tmp_path / 'r[x]*'
+	job = fresh_job(root)
+	bump(job, 1)
+	v0 = rv.list_versions(job.job_vault)[0]
+	# a sibling the pattern matches: [x] for x, then * for anything
+	decoy_vault = os.path.join(tmp_path, 'rx-decoy', 'vault', 'job')
+	decoy = os.path.join(decoy_vault, v0.name)
+	shutil.copytree(v0.path, decoy, symlinks=True)
+	shutil.copy(v0.change_list, decoy_vault)
+	held = sorted(os.listdir(decoy_vault))
+	bump(job, 1, keep_n_versions=2)
+	assert not os.path.exists(v0.path)
+	assert sorted(os.listdir(decoy_vault)) == held and open(os.path.join(decoy, 'D/secret')).read() == 'secret'
+
+
+# --- the commands read the record of monitored paths once, waiting while the daemon writes the manifest ---
+
+def lock_manifest(job):
+	'''An exclusive lock on the job's manifest, as a big backup's spilled write holds it; close() releases it.'''
+	locker = sqlite3.connect(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), isolation_level=None, check_same_thread=False)
+	locker.execute('PRAGMA locking_mode = EXCLUSIVE')
+	locker.execute('BEGIN EXCLUSIVE')
+	locker.execute("UPDATE meta SET value = value WHERE key = 'schema'")
+	return locker
+
+
+@pytest.mark.parametrize('which', ['history', 'restore'])
+def test_a_command_waits_for_the_manifest_and_then_judges_by_the_rows(tmp_path, capsys, which):
+	# review4 probe_locked_commands: each version waited 1 s, then the link was judged by its text, silently
+	job = fresh_job(tmp_path)
+	text = chain_text(latest(job).name, 'D/secret')
+	add_user_link(job, 'a/U', text)
+	bump(job, 4)
+	write_rule(job)
+	locker = lock_manifest(job)
+	releaser = threading.Timer(1.0, locker.close)
+	releaser.start()
+	try:
+		start = time.monotonic()
+		if which == 'history':
+			code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'a/U'))
+			assert 'moved' not in out and 'D/secret' not in out
+		else:
+			dest = tmp_path / 'out'
+			dest.mkdir()
+			code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'a/U'), str(dest), '--version', str(latest(job).number))
+			assert os.readlink(dest / 'U') == text
+		elapsed = time.monotonic() - start
+	finally:
+		releaser.join()
+	assert code == 0, err
+	assert err.count('Waiting for reverberator to finish writing') == 1 and 'cannot be read' not in err
+	assert 1.0 <= elapsed < 3.0
+
+
+def test_a_command_reads_the_record_once_and_only_when_rows_are_needed(tmp_path, capsys, monkeypatch):
+	job = fresh_job(tmp_path)
+	text = chain_text(latest(job).name, 'D/secret')
+	add_user_link(job, 'a/U', text)
+	bump(job, 4)
+	write_rule(job)
+	reads = []
+	real = rv.read_recorded_monitor_paths
+	monkeypatch.setattr(rv, 'read_recorded_monitor_paths', lambda *args, **kwargs: reads.append(args) or real(*args, **kwargs))
+	# keep is copied in each version, D/secret linked at its own path: no rows needed
+	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'D/secret'))
+	assert code == 0 and reads == []
+	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'a/U'))
+	assert code == 0 and len(reads) == 1 and 'moved' not in out and err == ''
+
+
+def test_a_command_says_once_when_the_record_cannot_be_read(tmp_path, capsys):
+	job = fresh_job(tmp_path)
+	add_user_link(job, 'a/U', chain_text(latest(job).name, 'D/secret'))
+	bump(job, 2)
+	write_rule(job)
+	manifest = sqlite3.connect(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), isolation_level=None)
+	manifest.execute("UPDATE meta SET value = 'not a record' WHERE key = 'monitor_paths'")
+	manifest.close()
+	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'a/U'))
+	assert code == 0
+	assert err.count("the vault's record of monitored paths cannot be read; links are judged by their text") == 1
+	assert 'Waiting' not in err
+
+
+def test_a_history_pass_lets_go_of_the_versions_it_has_passed(tmp_path):
+	job, v0, v1 = moved_job(tmp_path)
+	bump(job, 3)
+	versions = rv.list_versions(job.job_vault)
+	moves = rv.VaultMoves(job.job_vault, job.monitor)
+	rows = list(rv.path_history(job.job_vault, versions, job.monitor, 'deep/er/x', folder=False, moves=moves))
+	assert [(row.version.number, row.event) for row in rows][-1:] == [(1, 'move')]
+	# the walk is done with every version above the last two it resolved
+	assert set(moves._held) <= {v0.path, v1.path}
