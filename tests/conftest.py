@@ -12,6 +12,9 @@ from tests.harness import create_job, reverberator_script
 def restore_runtime_globals(tmp_path, monkeypatch):
 	old_poll = rv.POLL_WAIT_SECONDS
 	rv.GREEN_LIGHT.set()
+	# a test may write a version's change list again after its moves were read
+	rv.VERSION_MOVES.clear()
+	rv.VERSION_MOVES_WARNED.clear()
 	# the daemon publishes status files: keep them out of /run/reverberator
 	monkeypatch.setenv('REVERB_STATE_DIR', str(tmp_path / 'state'))
 	yield

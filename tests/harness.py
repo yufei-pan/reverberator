@@ -80,14 +80,33 @@ def content_file_path(version_dir: str) -> str:
 	return f'{version_dir}--{size_s}B-{ino_s}_ino{rv.CONTENT_FILE_EXTENSION_NAME}'
 
 
+def write_change_list(path: str, monitor: str, rows) -> str:
+	'''
+	A change list at path as do_backup() writes one: each row (rel, event, source rel or None), a folder's rels ending
+	with /, made absolute under monitor.
+	'''
+	lines = [rv.entry_row(os.path.join(monitor, rel), rv.BackupEntryValues(
+		datetime.now().isoformat(), event, None if source is None else os.path.join(monitor, source))) for rel, event, source in rows]
+	TSVZ.appendLinesTabularFile(path, lines, header=['path'] + rv.BACKUP_ENTRY_VALUES_HEADER, createIfNotExist=True,
+		verifyHeader=True, strict=False, teeLogger=rv.tl, verbose=False)
+	return path
+
+
 def write_committed_version(job: JobPaths, version: int, tree: dict,
-		timestamp: str = '2021-01-01_00-00-00_-0800', current: bool = True) -> str:
+		timestamp: str = '2021-01-01_00-00-00_-0800', current: bool = True, rows=None, monitor: str = None) -> str:
+	'''
+	A committed version of tree. Its change list holds the header only, or with rows the rows as write_change_list()
+	writes them, under monitor (the job's monitored path by default).
+	'''
 	os.makedirs(job.job_vault, exist_ok=True)
 	version_dir = os.path.join(job.job_vault, f'V{version}--{timestamp}')
 	write_tree(version_dir, tree)
 	content = content_file_path(version_dir)
-	with open(content, 'w', encoding='utf-8') as f:
-		f.write('path\tiso_time\tevent\tsource_path\n')
+	if rows is not None:
+		write_change_list(content, job.monitor if monitor is None else monitor, rows)
+	else:
+		with open(content, 'w', encoding='utf-8') as f:
+			f.write('path\tiso_time\tevent\tsource_path\n')
 	if current:
 		link = os.path.join(job.job_vault, 'current_version')
 		if os.path.lexists(link):

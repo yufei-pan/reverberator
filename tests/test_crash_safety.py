@@ -310,7 +310,8 @@ class TestDecrementStepperAbort(unittest.TestCase):
 		os.makedirs(v1)
 		with open(os.path.join(v0, 'a.txt'), 'w') as f:
 			f.write('data')
-		os.symlink(os.path.join(v0, 'a.txt'), os.path.join(v1, 'a.txt'))
+		# relative, as the daemon links: an absolute link is a user's symlink since 0.44
+		os.symlink(os.path.join('..', os.path.basename(v0), 'a.txt'), os.path.join(v1, 'a.txt'))
 		# content files with parseable names (use get_path_size after)
 		for path, ver in ((v0, 0), (v1, 1)):
 			sz = rv.get_path_size(path)
@@ -377,7 +378,8 @@ class TestDecrementStepperAbort(unittest.TestCase):
 			d, v0, v1 = self._make_pair(root)
 			v2 = os.path.join(root, 'V2--2021-01-03_00-00-00_-0800')
 			os.makedirs(v2)
-			os.symlink(os.path.join(v1, 'a.txt'), os.path.join(v2, 'a.txt'))
+			# relative, as the daemon links: an absolute link is a user's symlink since 0.44
+			os.symlink(os.path.join('..', os.path.basename(v1), 'a.txt'), os.path.join(v2, 'a.txt'))
 			sz = rv.get_path_size(v2)
 			ino = rv.get_path_inodes(v2)
 			sz_s = rv.format_bytes(sz, use_1024_bytes=True, to_str=True).replace(' ', '_')

@@ -20,7 +20,8 @@ def _two_versions_symlink_pair(job):
 	v0 = write_committed_version(job, 0, {'a.txt': 'data'}, timestamp='2021-01-01_00-00-00_-0800', current=False)
 	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
 	os.makedirs(v1)
-	os.symlink(os.path.join(v0, 'a.txt'), os.path.join(v1, 'a.txt'))
+	# relative, as the daemon links: an absolute link is a user's symlink since 0.44, which pruning leaves dangling
+	os.symlink(os.path.join('..', os.path.basename(v0), 'a.txt'), os.path.join(v1, 'a.txt'))
 	with open(content_file_path(v1), 'w', encoding='utf-8') as f:
 		f.write('path\tiso_time\tevent\tsource_path\n')
 	link = os.path.join(job.job_vault, 'current_version')
@@ -44,6 +45,8 @@ def test_keep_n_versions_2_steps_before_v2(job):
 		vaultInfo=info,
 	)
 	assert not os.path.isdir(v0)
+	# V0's copy moved into V1 in place of the link
+	assert not os.path.islink(os.path.join(v1, 'a.txt')) and open(os.path.join(v1, 'a.txt')).read() == 'data'
 	names = [os.path.basename(p) for p in committed_versions(job)]
 	assert any(n.startswith('V1') or n.startswith('V2') for n in names)
 

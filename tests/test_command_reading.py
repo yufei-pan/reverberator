@@ -134,19 +134,21 @@ def test_resolve_chain_to_a_pruned_entry_is_dangling(job):
 	assert got.kind == 'dangling' and 'a/x' in got.detail
 
 
-def test_resolve_old_absolute_chain_link_to_a_removed_version_is_dangling(job):
-	# as daemons before 0.38 linked an unchanged entry, possibly to a version older than the one just below
+def test_resolve_old_absolute_link_to_a_removed_version_is_a_symlink(job):
+	# shaped as daemons before 0.38 linked an unchanged entry; since 0.44 no absolute link is a chain link, as no kept
+	# version holds one while a user's symlink to a backed-up copy has that form
 	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp=T, current=False)
 	write_committed_version(job, 1, {'a/': None}, timestamp=T, current=False)
 	v2 = write_committed_version(job, 2, {'a/': None}, timestamp=T)
-	os.symlink(os.path.join(v0, 'a/x'), os.path.join(v2, 'a/x'))
+	text = os.path.join(v0, 'a/x')
+	os.symlink(text, os.path.join(v2, 'a/x'))
 	got = rv.resolve_version_entry(job.job_vault, v2, 'a/x', job.monitor)
-	assert got.kind == 'file' and got.path == os.path.join(v0, 'a/x')
+	assert got == ('symlink', os.path.join(v2, 'a/x'), text)
 	os.rename(v0, v0 + '.gone')
 	# a command runs in a process of its own, which has not seen V0's folders
 	rv.REAL_VAULT_FOLDERS.clear()
 	got = rv.resolve_version_entry(job.job_vault, v2, 'a/x', job.monitor)
-	assert got.kind == 'dangling' and got.path == os.path.join(v2, 'a/x') and got.detail == f'V0--{T} is missing'
+	assert got == ('symlink', os.path.join(v2, 'a/x'), text)
 
 
 def test_resolve_user_symlink(job):
