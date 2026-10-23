@@ -54,7 +54,7 @@ def test_keep_n_versions_2_steps_before_v2(job):
 def test_tiny_size_limit_still_creates_version_if_stepper_cannot_free(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
 	write_committed_version(job, 0, {'a.txt': 'hello'})
-	monkeypatch.setattr(rv, 'decrement_stepper', lambda d: (0, 0))
+	monkeypatch.setattr(rv, 'decrement_stepper', lambda d, *args, **kwargs: (0, 0))
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('hello2')
 	entries = OrderedDict([
 		(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues('t', 'modify', None)),
@@ -75,9 +75,9 @@ def test_inode_limit_i1_attempts_stepper(job, monkeypatch):
 	write_committed_version(job, 0, {'a.txt': 'hello'})
 	real = rv.decrement_stepper
 
-	def wrap(d):
+	def wrap(d, *args, **kwargs):
 		called.append(True)
-		return real(d)
+		return real(d, *args, **kwargs)
 
 	monkeypatch.setattr(rv, 'decrement_stepper', wrap)
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('hello2')
@@ -109,7 +109,7 @@ def test_stepper_memory_does_not_grow_with_the_version(job, monkeypatch):
 		tracemalloc.start()
 		try:
 			before = tracemalloc.get_traced_memory()[0]
-			rv.decrement_stepper(versions)
+			rv.decrement_stepper(versions, 'job', os.path.join(root, 'monitor'))
 			peak = tracemalloc.get_traced_memory()[1] - before
 		finally:
 			tracemalloc.stop()

@@ -16,9 +16,9 @@ def count_vault_reads(monkeypatch):
 	reads = []
 	read = rv.read_vault_record
 
-	def counting(version_path, rel, monitor_path):
+	def counting(version_path, rel, monitor_path, *args):
 		reads.append(rel)
-		return read(version_path, rel, monitor_path)
+		return read(version_path, rel, monitor_path, *args)
 	monkeypatch.setattr(rv, 'read_vault_record', counting)
 	return reads
 

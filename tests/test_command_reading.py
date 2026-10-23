@@ -224,7 +224,7 @@ def test_resolve_unreadable_link(job, monkeypatch):
 	paths = three_versions(job)
 	def refuse(*args):
 		raise rv.UncheckedVaultLink(OSError(errno.EIO, 'Input/output error'))
-	monkeypatch.setattr(rv, 'strict_chain_hop', refuse)
+	monkeypatch.setattr(rv, 'vault_chain_hop', refuse)
 	got = rv.resolve_version_entry(job.job_vault, paths[2], 'a/x', job.monitor)
 	assert got.kind == 'unreadable' and 'Input/output error' in got.detail
 

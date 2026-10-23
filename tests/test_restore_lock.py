@@ -209,7 +209,7 @@ def test_a_lock_that_cannot_be_checked_raises_an_hourly_marker_after_the_grace(t
 	make_failing(monkeypatch, failing)
 	def prune_at(now, job_name='job'):
 		capsys.readouterr()
-		assert rv.prune_oldest(OrderedDict(), job_name, clock=lambda: now) == (0, 0)
+		assert rv.prune_oldest(OrderedDict(), job_name, '/monitor', clock=lambda: now) == (0, 0)
 		return alerting_lines(capsys.readouterr().out)
 	assert prune_at(0) == [] and prune_at(899) == []
 	markers = prune_at(900)
@@ -255,7 +255,7 @@ def test_pruning_holds_the_lock_while_the_oldest_version_is_removed(job, monkeyp
 	os.makedirs(os.path.dirname(rv.restore_lock_path('job')), exist_ok=True)
 	seen = []
 	real = rv.decrement_stepper
-	def stepping(vault_info_dict):
+	def stepping(vault_info_dict, *args, **kwargs):
 		# what a restore starting now finds: the lock taken, so it waits for this removal
 		fd = os.open(rv.restore_lock_path('job'), os.O_RDWR)
 		try:
@@ -267,9 +267,9 @@ def test_pruning_holds_the_lock_while_the_oldest_version_is_removed(job, monkeyp
 				seen.append('held')
 		finally:
 			os.close(fd)
-		return real(vault_info_dict)
+		return real(vault_info_dict, *args, **kwargs)
 	monkeypatch.setattr(rv, 'decrement_stepper', stepping)
-	assert rv.prune_oldest(info, 'job') != (0, 0)
+	assert rv.prune_oldest(info, 'job', job.monitor) != (0, 0)
 	assert seen == ['held'] and _numbers(job) == [1, 2]
 	# and released afterwards
 	with rv.RestoreLock('job'):
