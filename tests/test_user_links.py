@@ -1089,12 +1089,18 @@ def test_a_link_that_cannot_be_read_aborts_the_prune_and_the_backup_goes_on(tmp_
 
 @pytest.mark.parametrize('fails', ['listing', 'rm'])
 def test_a_removal_that_does_not_happen_is_not_reported_done(tmp_path, monkeypatch, capsys, fails):
-	# haiku5 h8: glob() passes over a listing error and rm's code was ignored, so the version was reported removed
+	# haiku5 h8: glob() passes over a listing error and rm's code was ignored, so the version was reported removed. Task
+	# 2b: the job vault is listed for the version's own paths, and a listing error keeps it
 	job = fresh_job(tmp_path)
 	bump(job, 1)
 	v0, v1 = rv.list_versions(job.job_vault)
 	if fails == 'listing':
-		monkeypatch.setattr(rv.glob, 'glob', lambda pattern, **kwargs: [])
+		real_listdir = os.listdir
+		def listdir(path='.'):
+			if os.path.abspath(os.fspath(path)) == job.job_vault:
+				raise eio(path)
+			return real_listdir(path)
+		monkeypatch.setattr(rv.os, 'listdir', listdir)
 	else:
 		real_run = rv.multiCMD.run_command
 		monkeypatch.setattr(rv.multiCMD, 'run_command', lambda command, *args, **kwargs: 1 if command[0] == 'rm' else real_run(command, *args, **kwargs))
@@ -2167,3 +2173,20 @@ def test_two_links_naming_one_copy_keep_the_books_on_the_move_path_and_the_mixed
 	for rel in ('D/secret', 'a/U'):
 		assert open(os.path.join(v1.path, rel)).read() == 'S' * 20000
 		assert not os.path.islink(os.path.join(v1.path, rel))
+
+
+def test_a_secret_made_whole_is_used_when_only_the_vaults_sync_fails(tmp_path, monkeypatch):
+	# review10: the file was made and synced, but a failed fsync of the job vault was reported as "cannot be made"
+	job = fresh_job(tmp_path)
+	real_fsync_path = rv.fsync_path
+	def fsync_path(path, folder=False):
+		if folder and os.path.abspath(path) == job.job_vault:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return real_fsync_path(path, folder)
+	monkeypatch.setattr(rv, 'fsync_path', fsync_path)
+	warnings = warnings_logged(monkeypatch)
+	secret = vault_salt(job)
+	monkeypatch.undo()
+	assert secret is not None and len(secret) == 16 and open(salt_file(job), 'rb').read() == secret
+	assert [warning for warning in warnings if os.strerror(errno.EIO) in warning]
+	assert vault_salt(job) == secret

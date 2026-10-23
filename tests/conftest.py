@@ -19,6 +19,8 @@ def restore_runtime_globals(tmp_path, monkeypatch):
 	rv.PRUNE_ABORTED.clear()
 	# and a test's warning that pruning has no secret must not hold back another's
 	rv.PRUNE_SALT_MISSING.clear()
+	# and a test's vault seen with versions must not make a later scan of a new vault at that path fail
+	rv.VAULTS_WITH_VERSIONS.clear()
 	rv.RESTORE_STOP.clear()
 	# the daemon publishes status files: keep them out of /run/reverberator
 	monkeypatch.setenv('REVERB_STATE_DIR', str(tmp_path / 'state'))
