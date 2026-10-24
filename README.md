@@ -13,6 +13,10 @@ Design decision:
 	Pruning hard-links the oldest version's copies into the next version and removes the oldest version only at the end, so a prune cut off anywhere loses nothing. On a filesystem without hard links it moves them, as before.
 	Each job vault gets .reverberator_prune_salt at the job's first prune, a root-only 0600 file whose secret names pruning's temporary files. Leave it in place. A temp of it (.reverberator_prune_salt.tmp-*) that a kill left is removed by the job's next vault scan.
 
+Known limits (each in docs/limitations.md):
+	A mergerfs disk of the vault pool that is out can stop a job with a FAILED marker until it is back, and a prune while one is out could remove oldest-version copies whose links sit on it; a check that every disk is there comes in round 9.
+	A file moved and then chmod'ed, chown'ed or given new xattrs in one batch keeps its old mode, owner and xattrs in new versions until the next full comparison (at a restart, a failed attempt or an inotify overflow); round 9 fixes the order.
+
 Failure handling and log markers:
 	A job that fails (an unreadable disk, a vault that is not ready, an error in a thread) is restarted by itself, while the other jobs keep running. The retry delay starts at 60 s, doubles on each failure, and stops at 1 h. It starts again from 60 s once an attempt has run for an hour before failing. While a disk the job needs is missing, the job waits for it, and logs a failure once the wait reaches 15 min, then once an hour while it lasts.
 	A failed read is never taken as a deletion, and a failed copy into the vault never commits a version. A path that cannot be read keeps its last backed-up copy.
