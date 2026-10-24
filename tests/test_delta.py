@@ -129,6 +129,8 @@ def test_delta_memory_does_not_grow_with_the_tree(job, monkeypatch):
 			assert entries == OrderedDict()
 		return peak, sum(sys.getsizeof(name) + 8 for name in names)
 
+	# a first pass, so what any first call sets up once is not counted
+	peak_for(200)
 	small, small_paths = peak_for(1000)
 	large, large_paths = peak_for(4000)
 	assert large - small < (large_paths - small_paths) / 4

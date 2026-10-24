@@ -162,7 +162,7 @@ def test_link_naming_another_folder_for_the_previous_version_is_not_a_chain_link
 	write_tree(f'{job_vault}/V0--{T}', {'a/x': 'x'})
 	write_tree(f'{job_vault}/V0--notatime', {'a/x': 'x'})
 	link_path = f'{job_vault}/V1--{T}/y'
-	# by the text alone, as chain_link_target() told it before it went with its last caller
+	# judged by the text alone (BY_THE_TEXT): the folder name is what this tells, not the rows
 	assert rv.vault_chain_hop(job_vault, link_path, f'../V0--{T}/a/x', rv.BY_THE_TEXT) == f'{job_vault}/V0--{T}/a/x'
 	# another timestamp than the previous version's folder has, and a folder whose name holds no timestamp
 	assert rv.vault_chain_hop(job_vault, link_path, f'../V0--{INNER_T}/a/x', rv.BY_THE_TEXT) is None
@@ -293,7 +293,7 @@ def test_a_refused_or_missing_folder_is_looked_at_again(tmp_path):
 	link_path = f'{job_vault}/V1--{T}/u'
 	# relative only: since 0.44 an absolute link is never a chain link, so no folder of it is looked at
 	text = f'../V0--{T}/a/x'
-	# V0 is not there yet (by the text alone, as chain_hop() told it before it went with its last caller)
+	# V0 is not there yet (judged by the text alone, BY_THE_TEXT: the folders are what this tells, not the rows)
 	assert rv.vault_chain_hop(job_vault, link_path, text, rv.BY_THE_TEXT) is None
 	os.makedirs(v0)
 	# V0/a is not there yet, so nothing goes through it

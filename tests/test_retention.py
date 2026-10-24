@@ -128,6 +128,8 @@ def test_stepper_memory_does_not_grow_with_the_version(job, monkeypatch, how):
 		assert all(os.path.isfile(os.path.join(v1, name)) and not os.path.islink(os.path.join(v1, name)) for name in names)
 		return peak, sum(sys.getsizeof(os.path.join(v1, name)) + 8 for name in names)
 
+	# a first pass, so what any first call sets up once is not counted
+	peak_for(200)
 	small, small_paths = peak_for(1000)
 	large, large_paths = peak_for(4000)
 	assert large - small < (large_paths - small_paths) / 4
