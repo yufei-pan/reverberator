@@ -133,6 +133,34 @@ def test_a_killed_prune_then_the_next_prune_consumes_its_temp(tmp_path, monkeypa
 	assert open(os.path.join(v1.path, 'd/a')).read() == 'alpha' and not os.path.islink(os.path.join(v1.path, 'd/a'))
 
 
+def test_a_referenced_first_versions_prune_temp_is_skipped(tmp_path, monkeypatch, capsys):
+	# Keep 1 Complete Backup False: V0's files are links into the monitored path, and a killed prune's temp beside V1's
+	# link is one of them ( kind 'referenced' ), which a folder restore leaves out too
+	job = create_job(str(tmp_path))
+	write_rule(job, keep_one_complete_backup='False')
+	seed_monitor(job, {'d/a': 'alpha', 'keep': 'k0'})
+	run_backup(job, keep_one_complete_backup=False)
+	write(job, 'keep', 'k1')
+	run_backup(job, OrderedDict([event_entry(job, 'keep', 'modify')]), keep_one_complete_backup=False)
+	v0, v1 = rv.list_versions(job.job_vault)
+	salt = rv.vault_prune_salt(job.job_vault, job.job_name)
+	real_rename = os.rename
+	def rename(source, dest, *args, **kwargs):
+		if rv.PARTIAL_COPY_NAME.fullmatch(os.path.basename(os.fspath(source))):
+			raise Killed()
+		return real_rename(source, dest, *args, **kwargs)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv.os, 'rename', rename)
+		with pytest.raises(Killed):
+			rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor, prune_salt=salt)
+	assert len([n for n in os.listdir(os.path.join(v1.path, 'd')) if rv.PARTIAL_COPY_NAME.fullmatch(n)]) == 1
+	dest = tmp_path / 'out'
+	dest.mkdir()
+	command(tmp_path, capsys, 'restore', '--version', '1', os.path.join(job.monitor, 'd'), str(dest))
+	# d/a itself is a link into the monitored path, which the restore reports
+	assert not [name for name in restored_names(str(dest)) if rv.PARTIAL_COPY_NAME.fullmatch(os.path.basename(name))]
+
+
 def pooled_job(tmp_path, fake_pool):
 	job = create_job(str(tmp_path))
 	write_rule(job)
@@ -146,7 +174,7 @@ def test_history_warns_and_exits_1_when_a_vault_disk_is_missing(tmp_path, fake_p
 	fake_pool.drop(a)
 	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'keep'))
 	assert 'V1' in out and 'modified' in out
-	assert err == f'Warning: disk {a} of pool {job.vault} is not mounted: what it holds of {job.job_vault} is not shown\n'
+	assert err == f'Warning: disk {a} of pool {job.vault} is not mounted: {job.job_vault} may be incomplete\n'
 	assert code == 1
 
 
@@ -157,7 +185,7 @@ def test_restore_runs_warns_and_exits_1_when_a_vault_disk_is_missing(tmp_path, f
 	dest.mkdir()
 	code, out, err = command(tmp_path, capsys, 'restore', '--version', '1', os.path.join(job.monitor, 'keep'), str(dest))
 	assert open(dest / 'keep').read() == 'k1'
-	warning = f'Warning: disk {a} of pool {job.vault} is not mounted: what it holds of {job.job_vault} is not shown'
+	warning = f'Warning: disk {a} of pool {job.vault} is not mounted: {job.job_vault} may be incomplete'
 	assert err.count(warning) == 1
 	assert code == 1
 

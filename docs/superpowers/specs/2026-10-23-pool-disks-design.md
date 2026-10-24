@@ -166,13 +166,14 @@ When the job vault's pool has a missing disk (the same test as Goal 1), `restore
   files as deletions, or a prune removing copies while a disk is out, is a failure even if every test passes.
 - **Never write vault files onto the root disk** because a vault disk dropped.
 - **Never block a job for a pool it doesn't use.**
-- **Don't slow the normal backup.** The checks read one xattr, the mount table and a handful of `statvfs` calls, at the
-  points above, never per file.
+- **Don't slow the normal backup.** The checks read one xattr, the mount table, a statx of each branch and the pool,
+  and an f2fs branch's `cp_status`, at the points above, never per file.
 - **Don't keep a copy of the pool layout.** Branches come from mergerfs at check time, never from the rule file.
 
 ## Calls (the builder's, made here; to confirm with the user)
 
-- "Missing" means not a mount point or `statvfs` fails, after resolving symlinks. There is no per-job switch.
+- "Missing" means not a mount point (statx's `STATX_ATTR_MOUNT_ROOT`), a statx that fails, or an f2fs branch whose
+  `cp_status` has the checkpoint-error bit 0x8, after resolving symlinks. There is no per-job switch.
 - The pause also covers the commit step, so a disk lost mid-backup never commits a version made from a partial view.
 - Mount ids are compared across each guarded step, to catch a disk that drops and comes back within it.
 - The checks are live reads, not the cached flag.

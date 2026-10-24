@@ -605,6 +605,11 @@ def test_recopy_row_dropped_for_a_verified_delete(tmp_path, pattern):
 	assert_version_matches_tree(job, version)
 
 
+def without_wall(scopes):
+	'''scopes without the wall clock time a ChangeEventQueue stamps on its batch, which a test cannot know.'''
+	return None if scopes is None else scopes._replace(changed_since_wall=None)
+
+
 def test_backuper_passes_what_each_batch_touched(job, monkeypatch):
 	import threading
 	from tests.harness import wait_for_committed_count
@@ -645,8 +650,10 @@ def test_backuper_passes_what_each_batch_touched(job, monkeypatch):
 		rv.GREEN_LIGHT.clear()
 		thread.join(timeout=5)
 		rv.GREEN_LIGHT.set()
-	# with the time of each batch's first event, from which the verification reads the extended attributes of what changed
-	assert passed == [rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0), rv.TouchedScopes(['N/'], ['N'], 2.0), None]
+	# with the time of each batch's first event, from which the verification reads the extended attributes of what changed,
+	# on both clocks: the queue's wall clock stamp, and the event's monotonic time
+	assert all(isinstance(scopes.changed_since_wall, int) for scopes in passed[:2])
+	assert [without_wall(scopes) for scopes in passed] == [rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0), rv.TouchedScopes(['N/'], ['N'], 2.0), None]
 
 
 def test_the_sweep_never_follows_links(job):
@@ -940,7 +947,7 @@ def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job, monkeypatch
 	try:
 		wait_for_committed_count(job, 2)
 		time.sleep(0.5)
-		assert calls == [(1, rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0))]
+		assert [(count, without_wall(scopes)) for count, scopes in calls] == [(1, rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0))]
 		assert not queued_full_scan(queue, lock)
 	finally:
 		stop_backuper(thread)
@@ -1005,7 +1012,8 @@ def test_a_lone_replace_then_delete_is_verified(job):
 	try:
 		events = replace_then_delete(job)
 		assert rv.change_events_to_backup_entries(deque(events), job.monitor) == OrderedDict()
-		assert backuper.back_up(events) == (0, rv.touched_scopes(events, job.monitor), True)
+		count, scopes, committed = backuper.back_up(events)
+		assert (count, without_wall(scopes), committed) == (0, rv.touched_scopes(events, job.monitor), True)
 	finally:
 		backuper.stop()
 	versions = rv.list_versions(job.job_vault)
@@ -1048,7 +1056,8 @@ def test_an_empty_batch_whose_touched_places_match_the_vault_makes_no_version(jo
 		os.remove(lock)
 		events = [rv.ChangeEvent(1.0, False, 'create', lock, None), rv.ChangeEvent(2.0, False, 'modify', lock, None),
 			rv.ChangeEvent(3.0, False, 'delete', lock, None)]
-		assert backuper.back_up(events) == (0, rv.touched_scopes(events, job.monitor), True)
+		count, scopes, committed = backuper.back_up(events)
+		assert (count, without_wall(scopes), committed) == (0, rv.touched_scopes(events, job.monitor), True)
 	finally:
 		backuper.stop()
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
