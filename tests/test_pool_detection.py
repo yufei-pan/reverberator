@@ -61,28 +61,49 @@ def test_a_missing_disk_is_named(fake_pool, pool):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize('probe', ['statx', 'readdir'])
-def test_a_failed_disk_still_mounted_is_named(fake_pool, pool, probe):
-	# a shut-down XFS or f2fs stays mounted, and its statfs still answers: its statx or its root's readdir fail
-	vault, a, _ = pool
-	fake_pool.fail_disk(a, probes=(probe,))
-	assert rv.pool_problem(vault) == f'disk {a} of pool {vault} cannot be read: [Errno {errno.EIO}] {os.strerror(errno.EIO)}'
-	assert dict(rv.pool_state(vault).ids)[a] is None
-
-
-@pytest.mark.unit
-def test_a_dead_disk_answers_statvfs_but_is_still_caught(fake_pool, pool, monkeypatch):
+def test_a_failed_disk_still_mounted_is_named(fake_pool, pool, monkeypatch):
+	# a shut-down XFS stays mounted, and its statfs still answers: its statx fails
 	vault, a, _ = pool
 	monkeypatch.setattr(os, 'statvfs', lambda path: (_ for _ in ()).throw(AssertionError('statvfs is no probe')))
 	fake_pool.fail_disk(a)
-	assert rv.pool_problem(vault).startswith(f'disk {a} of pool {vault} cannot be read: ')
+	assert rv.pool_problem(vault) == f'disk {a} of pool {vault} cannot be read: {os.strerror(errno.EIO)}'
+	assert dict(rv.pool_state(vault).ids)[a] is None
+
+
+@pytest.fixture
+def f2fs_pool(tmp_path, fake_pool):
+	'''A pool at tmp_path/klein over the f2fs disks c and d: (pool, c, d).'''
+	klein = str(tmp_path / 'klein')
+	c, d = fake_pool.add(klein, ['c', 'd'], fstype='f2fs')
+	return klein, c, d
+
+
+@pytest.mark.unit
+def test_a_failed_f2fs_disk_is_told_by_its_checkpoint(fake_pool, f2fs_pool):
+	# f2fs keeps a dead disk mounted and answers statx and readdir from cache; only its checkpoint flags say so
+	klein, c, d = f2fs_pool
+	assert rv.pool_problem(klein) is None
+	# the source is a /dev/mapper link: the sysfs folder is named after the device it resolves to
+	assert os.path.basename(os.path.dirname(os.path.dirname(fake_pool.f2fs_status(c)))).startswith('dm-')
+	fake_pool.fail_disk(c)
+	assert rv.pool_problem(klein) == f'disk {c} of pool {klein} has failed: its f2fs checkpoint reports an error'
+	assert dict(rv.pool_state(klein).ids)[c] is None
+	fake_pool.recover(c)
+	assert rv.pool_problem(klein) is None
+
+
+@pytest.mark.unit
+def test_an_f2fs_disk_without_its_checkpoint_status_cannot_be_read(fake_pool, f2fs_pool):
+	klein, c, _ = f2fs_pool
+	os.remove(fake_pool.f2fs_status(c))
+	assert rv.pool_problem(klein) == f'disk {c} of pool {klein} cannot be read: {os.strerror(errno.ENOENT)}'
 
 
 @pytest.mark.unit
 def test_an_unreadable_branch_list_names_the_pool(fake_pool, pool):
 	vault, _, _ = pool
 	fake_pool.unreadable(vault)
-	assert rv.pool_problem(vault).startswith(f'the disks of pool {vault} cannot be listed: ')
+	assert rv.pool_problem(vault) == f'the disks of pool {vault} cannot be listed: {os.strerror(errno.ENOTSUP)}'
 
 
 @pytest.mark.unit
@@ -136,13 +157,48 @@ def test_an_unreadable_mount_table_is_a_problem(tmp_path, fake_pool, pool, monke
 	vault, _, _ = pool
 	guard = rv.PoolGuard([vault])
 	monkeypatch.setattr(rv, 'MOUNTINFO_PATH', str(tmp_path / 'no_mountinfo'))
-	problem = f'the mount table cannot be read: [Errno {errno.ENOENT}] {os.strerror(errno.ENOENT)}: {str(tmp_path / "no_mountinfo")!r}'
+	problem = f'the mount table cannot be read: {os.strerror(errno.ENOENT)}'
 	assert guard.problem() == problem
 	assert rv.pool_problem(vault) == problem
 	# a guard taken while it cannot be read fails too, as which paths are on a pool is not known
 	assert rv.PoolGuard([vault]).problem() == problem
 	# what reads the table for other uses still gets an empty one
 	assert rv.current_mount_table() == []
+
+
+@pytest.mark.unit
+def test_a_guard_taken_while_the_mount_table_cannot_be_read_fails_its_step(tmp_path, fake_pool, pool, monkeypatch):
+	# with no baseline, a disk dropped and mounted again later in the step could not be seen
+	vault, a, _ = pool
+	monkeypatch.setattr(rv, 'MOUNTINFO_PATH', str(tmp_path / 'no_mountinfo'))
+	guard = rv.PoolGuard([vault])
+	monkeypatch.setattr(rv, 'MOUNTINFO_PATH', fake_pool.mountinfo_path)
+	assert guard.problem() == f'the mount table cannot be read: {os.strerror(errno.ENOENT)}'
+	fake_pool.drop(a)
+	fake_pool.mount(a)
+	assert guard.problem() == f'the mount table cannot be read: {os.strerror(errno.ENOENT)}'
+	# the next attempt's guard has its baseline
+	assert rv.PoolGuard([vault]).problem() is None
+
+
+@pytest.mark.unit
+def test_a_guard_taken_with_a_failed_disk_fails_its_step(fake_pool, pool):
+	vault, a, _ = pool
+	fake_pool.fail_disk(a)
+	guard = rv.PoolGuard([vault])
+	fake_pool.recover(a)
+	assert guard.problem() == f'disk {a} of pool {vault} cannot be read: {os.strerror(errno.EIO)}'
+	assert rv.PoolGuard([vault]).problem() is None
+
+
+@pytest.mark.unit
+def test_a_pool_id_unknown_at_the_start_is_no_remount(fake_pool, pool):
+	# a statx error on the pool's own mount point leaves its id unknown; known later, it is not a new mount
+	vault, _, _ = pool
+	fake_pool.fail_disk(vault)
+	guard = rv.PoolGuard([vault])
+	fake_pool.recover(vault)
+	assert guard.problem() is None
 
 
 @pytest.mark.unit
@@ -270,6 +326,31 @@ def test_the_monitor_clears_and_sets_a_flag_on_a_branch_change(monkeypatch, fake
 	monitor.check_changed()
 	assert flag.is_set() and signed.is_set()
 	assert len(counted_signatures) == 2
+
+
+@pytest.mark.unit
+def test_the_monitor_leaves_pool_flags_alone_on_an_unreadable_table(tmp_path, monkeypatch, fake_pool, pool, counted_signatures):
+	vault, a, _ = pool
+	monitor = fake_pool.monitor
+	monkeypatch.setattr(monitor, 'start', lambda: None)
+	flag = monitor.register(vault, 'sig')
+	monitor.check_changed()
+	assert flag.is_set()
+	fake_pool.drop(a)
+	monitor.check_changed()
+	assert not flag.is_set()
+	# the signature alone would set it while the disk is out
+	monkeypatch.setattr(monitor, 'mountinfo_path', str(tmp_path / 'no_mountinfo'))
+	monitor.check_changed(recheck_failed=True)
+	assert not flag.is_set()
+	monkeypatch.setattr(monitor, 'mountinfo_path', fake_pool.mountinfo_path)
+	fake_pool.mount(a)
+	monitor.check_changed()
+	assert flag.is_set()
+	# nor is a set flag cleared for that pass
+	monkeypatch.setattr(monitor, 'mountinfo_path', str(tmp_path / 'no_mountinfo'))
+	monitor.check_changed(recheck_failed=True)
+	assert flag.is_set()
 
 
 @pytest.mark.unit

@@ -58,7 +58,7 @@ def job(tmp_path):
 def fake_pool(tmp_path, monkeypatch):
 	'''
 	mergerfs pools in a fake mount table that current_mount_table and a fresh shared monitor read, with a patched branch
-	reader and statx. Every pool check runs, as POOL_CHECK_SECONDS is 0.
+	reader, statx and f2fs sysfs. Every pool check runs, as POOL_CHECK_SECONDS is 0.
 	'''
 	monitor = rv.fs_signature_monitor(mountinfo_path=str(tmp_path / 'fake_mountinfo'))
 	pool = FakePool(tmp_path, monkeypatch, monitor)
@@ -66,6 +66,7 @@ def fake_pool(tmp_path, monkeypatch):
 	monkeypatch.setattr(rv, 'FS_SIGNATURE_MONITOR', monitor)
 	monkeypatch.setattr(rv, 'read_pool_branches', pool.read)
 	monkeypatch.setattr(rv, 'statx_mount', pool.statx_mount)
+	monkeypatch.setattr(rv, 'F2FS_SYSFS_PATH', pool.f2fs_sysfs)
 	monkeypatch.setattr(rv, 'POOL_CHECK_SECONDS', 0)
 	return pool
 

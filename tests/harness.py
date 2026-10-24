@@ -206,17 +206,21 @@ def wait_for_committed_count(job: JobPaths, count: int, timeout: float = 10.0) -
 
 class FakePool:
 	'''
-	mergerfs pools in a fake mount table file: a fuse.mergerfs line per pool and an xfs line per branch, mount ids
-	counted up from 100. read() stands in for rv.read_pool_branches and statx_mount() for rv.statx_mount, whose unique
-	mount ids count up from 1000 on every mount. Every change rewrites the file and wakes the monitor.
+	mergerfs pools in a fake mount table file: a fuse.mergerfs line per pool and an xfs or f2fs line per branch, mount
+	ids counted up from 100. read() stands in for rv.read_pool_branches and statx_mount() for rv.statx_mount, whose
+	unique mount ids count up from 1000 on every mount. An f2fs branch's source is a /dev/mapper-like link to a dm-<n>
+	device in tmp_path/dev, with its cp_status in f2fs_sysfs. Every change rewrites the file and wakes the monitor.
 	'''
 	ROOT_LINE = '22 1 8:1 / / rw - ext4 /dev/sda1 rw\n'
+	# ckpt_flags as the live f2fs disks show them: CP_NOCRC_RECOVERY_FLAG | CP_COMPACT_SUM_FLAG
+	F2FS_WHOLE = 0x44
 
 	def __init__(self, tmp_path, monkeypatch, monitor):
 		self.tmp_path = str(tmp_path)
 		self.monkeypatch = monkeypatch
 		self.monitor = monitor
 		self.mountinfo_path = os.path.join(self.tmp_path, 'fake_mountinfo')
+		self.f2fs_sysfs = os.path.join(self.tmp_path, 'sys_fs_f2fs')
 		self.next_id = 100
 		self.next_unique_id = 1000
 		# (real mount point, line, mountinfo id, unique id), in kernel order
@@ -226,7 +230,7 @@ class FakePool:
 		# real mount point of a pool -> its branch list as mergerfs gives it
 		self.pools = {}
 		self.unreadable_pools = {}
-		# real path -> {probe: errno} for fail_disk()
+		# real path -> errno its statx raises (fail_disk())
 		self.failing = {}
 		self.reads = 0
 		self.write()
@@ -251,8 +255,30 @@ class FakePool:
 		self.mounted_as[mount_point] = (fstype, source, mount_id)
 		return mount_point, f'{mount_id} 22 0:{mount_id} / {mount_point} rw - {fstype} {source} rw\n', mount_id, self.next_unique_id
 
-	def add(self, mount_point:str, branches:list) -> list:
-		'''A pool at mount_point over branches (paths, or bare names made in tmp_path/disks); the branches' real paths.'''
+	def f2fs_source(self, branch:str) -> str:
+		'''A /dev/mapper-like link to a dm-<n> device for a new f2fs branch, whose cp_status says it is whole.'''
+		device = f'dm-{self.next_id}'
+		os.makedirs(os.path.join(self.tmp_path, 'dev', 'mapper'), exist_ok=True)
+		source = os.path.join(self.tmp_path, 'dev', 'mapper', os.path.basename(branch))
+		os.symlink(os.path.join('..', device), source)
+		os.makedirs(os.path.join(self.f2fs_sysfs, device, 'stat'))
+		self.set_f2fs_flags(source, self.F2FS_WHOLE)
+		return source
+
+	def f2fs_status(self, branch:str) -> str:
+		'''The cp_status file of an f2fs branch.'''
+		source = self.mounted_as[self.branch_path(branch)][1]
+		return os.path.join(self.f2fs_sysfs, os.path.basename(os.path.realpath(source)), 'stat', 'cp_status')
+
+	def set_f2fs_flags(self, source:str, flags:int):
+		with open(os.path.join(self.f2fs_sysfs, os.path.basename(os.path.realpath(source)), 'stat', 'cp_status'), 'w') as f:
+			f.write(f'{flags:x}\n')
+
+	def add(self, mount_point:str, branches:list, fstype:str = 'xfs') -> list:
+		'''
+		A pool at mount_point over branches (paths, or bare names made in tmp_path/disks) of fstype xfs or f2fs; the
+		branches' real paths.
+		'''
 		os.makedirs(mount_point, exist_ok=True)
 		pool = os.path.realpath(mount_point)
 		listed = [self.named(b) for b in branches]
@@ -261,7 +287,7 @@ class FakePool:
 		real = [os.path.realpath(b) for b in listed]
 		self.pools[pool] = listed
 		self.lines.append(self.line(pool, 'fuse.mergerfs', 'pool'))
-		self.lines.extend(self.line(b, 'xfs', '/dev/fake') for b in real)
+		self.lines.extend(self.line(b, fstype, self.f2fs_source(b) if fstype == 'f2fs' else '/dev/fake') for b in real)
 		self.write()
 		return real
 
@@ -281,43 +307,50 @@ class FakePool:
 		self.lines.append(self.line(real, fstype, source, mount_id if same_id else None))
 		self.write()
 
-	def fail_disk(self, branch:str, err:int = errno.EIO, probes=('statx', 'readdir')):
-		'''The branch's statx, its readdir or both raise OSError(err), as on a filesystem shut down but still mounted.'''
-		if not any('readdir' in failing for failing in self.failing.values()) and 'readdir' in probes:
-			real_scandir = os.scandir
-
-			def scandir(path='.'):
-				if isinstance(path, (str, bytes, os.PathLike)):
-					code = self.failing.get(os.path.realpath(os.fsdecode(path)), {}).get('readdir')
-					if code is not None:
-						raise OSError(code, os.strerror(code))
-				return real_scandir(path)
-			self.monkeypatch.setattr(os, 'scandir', scandir)
-		self.failing.setdefault(self.branch_path(branch), {}).update((probe, err) for probe in probes)
+	def fail_disk(self, branch:str, err:int = errno.EIO):
+		'''
+		The branch's filesystem shuts down and stays mounted, as a dying disk's does: an f2fs one sets CP_ERROR_FLAG
+		in its checkpoint and still answers statx, any other one (or a pool) fails statx with err, as XFS does.
+		'''
+		real = self.branch_path(branch)
+		fstype, source, _ = self.mounted_as[real]
+		if fstype == 'f2fs':
+			self.set_f2fs_flags(source, self.F2FS_WHOLE | 0x8)
+		else:
+			self.failing[real] = err
 		self.write()
 
-	def statx_mount(self, path:str) -> tuple:
-		'''(unique mount id, whether path is a mount root) as rv.statx_mount gives them.'''
-		real = os.path.realpath(path)
-		code = self.failing.get(real, {}).get('statx')
-		if code is not None:
-			raise OSError(code, os.strerror(code))
-		if not os.path.lexists(real):
-			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
-		on_top = [unique_id for point, _, _, unique_id in self.lines if point == real]
-		# a path that is no mount root is on the root filesystem
-		return (on_top[-1], True) if on_top else (1, False)
+	def recover(self, branch:str):
+		'''The failure fail_disk() gave the branch ends.'''
+		real = self.branch_path(branch)
+		fstype, source, _ = self.mounted_as[real]
+		if fstype == 'f2fs':
+			self.set_f2fs_flags(source, self.F2FS_WHOLE)
+		self.failing.pop(real, None)
+		self.write()
 
 	def unreadable(self, mount_point:str, err:int = errno.ENOTSUP):
 		self.unreadable_pools[os.path.realpath(mount_point)] = err
 		self.write()
+
+	def statx_mount(self, path:str) -> tuple:
+		'''(unique mount id, whether path is a mount root) as rv.statx_mount gives them, and its errors.'''
+		real = os.path.realpath(path)
+		code = self.failing.get(real)
+		if code is None and not os.path.lexists(real):
+			code = errno.ENOENT
+		if code is not None:
+			raise OSError(code, os.strerror(code), path)
+		on_top = [unique_id for point, _, _, unique_id in self.lines if point == real]
+		# a path that is no mount root is on the root filesystem
+		return (on_top[-1], True) if on_top else (1, False)
 
 	def read(self, mount_point:str) -> list:
 		self.reads += 1
 		pool = os.path.realpath(mount_point)
 		err = self.unreadable_pools.get(pool, None if pool in self.pools else errno.ENODATA)
 		if err is not None:
-			raise OSError(err, os.strerror(err))
+			raise OSError(err, os.strerror(err), os.path.join(mount_point, '.mergerfs'))
 		return list(self.pools[pool])
 
 
