@@ -1,3 +1,4 @@
+import errno
 import os
 import time
 from collections import namedtuple, OrderedDict
@@ -201,6 +202,96 @@ def wait_for_committed_count(job: JobPaths, count: int, timeout: float = 10.0) -
 		message=f'expected >= {count} committed versions, got {committed_versions(job)} in {job.job_vault}',
 	)
 	return committed_versions(job)
+
+
+class FakePool:
+	'''
+	mergerfs pools in a fake mount table file: a fuse.mergerfs line per pool and an xfs line per branch, mount ids
+	counted up from 100. read() stands in for rv.read_pool_branches. Every change rewrites the file and wakes the monitor.
+	'''
+	ROOT_LINE = '22 1 8:1 / / rw - ext4 /dev/sda1 rw\n'
+
+	def __init__(self, tmp_path, monkeypatch, monitor):
+		self.tmp_path = str(tmp_path)
+		self.monkeypatch = monkeypatch
+		self.monitor = monitor
+		self.mountinfo_path = os.path.join(self.tmp_path, 'fake_mountinfo')
+		self.next_id = 100
+		# (real mount point, line), in kernel order
+		self.lines = []
+		# real mount point of a pool -> its branch list as mergerfs gives it
+		self.pools = {}
+		self.unreadable_pools = {}
+		self.failing = {}
+		self.reads = 0
+		self.write()
+
+	def write(self):
+		with open(self.mountinfo_path, 'w', encoding='utf-8') as f:
+			f.write(self.ROOT_LINE + ''.join(line for _, line in self.lines))
+		self.monitor.wake()
+
+	def named(self, branch:str) -> str:
+		'''A bare name is a folder in tmp_path/disks.'''
+		return os.path.join(self.tmp_path, 'disks', branch) if '/' not in branch else branch
+
+	def branch_path(self, branch:str) -> str:
+		return os.path.realpath(self.named(branch))
+
+	def line(self, mount_point:str, fstype:str, source:str) -> tuple:
+		mount_id = self.next_id
+		self.next_id += 1
+		return mount_point, f'{mount_id} 22 0:{mount_id} / {mount_point} rw - {fstype} {source} rw\n'
+
+	def add(self, mount_point:str, branches:list) -> list:
+		'''A pool at mount_point over branches (paths, or bare names made in tmp_path/disks); the branches' real paths.'''
+		os.makedirs(mount_point, exist_ok=True)
+		pool = os.path.realpath(mount_point)
+		listed = [self.named(b) for b in branches]
+		for branch in listed:
+			os.makedirs(branch, exist_ok=True)
+		real = [os.path.realpath(b) for b in listed]
+		self.pools[pool] = listed
+		self.lines.append(self.line(pool, 'fuse.mergerfs', 'pool'))
+		self.lines.extend(self.line(b, 'xfs', '/dev/fake') for b in real)
+		self.write()
+		return real
+
+	def drop(self, branch:str):
+		'''The branch's line goes; its folder stays, as a disk's mount point does.'''
+		real = self.branch_path(branch)
+		self.lines = [(point, line) for point, line in self.lines if point != real]
+		self.write()
+
+	def mount(self, branch:str):
+		'''The branch is mounted again, with a new mount id.'''
+		self.lines.append(self.line(self.branch_path(branch), 'xfs', '/dev/fake'))
+		self.write()
+
+	def fail_statvfs(self, branch:str, err:int = errno.EIO):
+		if not self.failing:
+			real_statvfs = os.statvfs
+
+			def statvfs(path):
+				code = self.failing.get(os.path.realpath(os.fspath(path)))
+				if code is not None:
+					raise OSError(code, os.strerror(code))
+				return real_statvfs(path)
+			self.monkeypatch.setattr(os, 'statvfs', statvfs)
+		self.failing[self.branch_path(branch)] = err
+		self.write()
+
+	def unreadable(self, mount_point:str, err:int = errno.ENOTSUP):
+		self.unreadable_pools[os.path.realpath(mount_point)] = err
+		self.write()
+
+	def read(self, mount_point:str) -> list:
+		self.reads += 1
+		pool = os.path.realpath(mount_point)
+		err = self.unreadable_pools.get(pool, None if pool in self.pools else errno.ENODATA)
+		if err is not None:
+			raise OSError(err, os.strerror(err))
+		return list(self.pools[pool])
 
 
 def reverberator_script() -> str:

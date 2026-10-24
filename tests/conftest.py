@@ -5,7 +5,7 @@ import sys
 import threading
 import pytest
 import reverberator as rv
-from tests.harness import create_job, reverberator_script
+from tests.harness import FakePool, create_job, reverberator_script
 
 # the chain-link ground truth over the whole suite (REVERB_CHAIN_GROUND_TRUTH=0 turns it off)
 pytest_plugins = ['tests.chain_ground_truth']
@@ -52,6 +52,21 @@ def stop_fs_signature_monitor():
 @pytest.fixture
 def job(tmp_path):
 	return create_job(str(tmp_path))
+
+
+@pytest.fixture
+def fake_pool(tmp_path, monkeypatch):
+	'''
+	mergerfs pools in a fake mount table that current_mount_table and a fresh shared monitor read, with a patched branch
+	reader. Every pool check runs, as POOL_CHECK_SECONDS is 0.
+	'''
+	monitor = rv.fs_signature_monitor(mountinfo_path=str(tmp_path / 'fake_mountinfo'))
+	pool = FakePool(tmp_path, monkeypatch, monitor)
+	monkeypatch.setattr(rv, 'MOUNTINFO_PATH', pool.mountinfo_path)
+	monkeypatch.setattr(rv, 'FS_SIGNATURE_MONITOR', monitor)
+	monkeypatch.setattr(rv, 'read_pool_branches', pool.read)
+	monkeypatch.setattr(rv, 'POOL_CHECK_SECONDS', 0)
+	return pool
 
 
 @pytest.fixture
