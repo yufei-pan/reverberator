@@ -212,7 +212,7 @@ class FakePool:
 	device in tmp_path/dev, with its cp_status in f2fs_sysfs. Every change rewrites the file and wakes the monitor.
 	'''
 	ROOT_LINE = '22 1 8:1 / / rw - ext4 /dev/sda1 rw\n'
-	# ckpt_flags as the live f2fs disks show them: CP_NOCRC_RECOVERY_FLAG | CP_COMPACT_SUM_FLAG
+	# ckpt_flags as the live f2fs disks show them: CP_CRC_RECOVERY_FLAG (0x40) | CP_COMPACT_SUM_FLAG (0x4)
 	F2FS_WHOLE = 0x44
 
 	def __init__(self, tmp_path, monkeypatch, monitor):

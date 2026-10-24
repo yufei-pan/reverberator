@@ -121,3 +121,11 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** neither restore nor the job's scan recognises pruning's own temporaries yet.
 - **Revisit when:** round 9: make restore and the job's scan recognise and drop them.
 - **Approved:** 2026-10-23, the user's choice "Defer to round 9 (Recommended)".
+
+### A SnapRAID fix while reverberator runs
+
+- **Kind:** known limitation.
+- **What the operator sees:** a replaced disk is mounted, so jobs resume while `snapraid fix` restores its files.
+- **Why:** nothing tells a disk being rebuilt from one that is whole.
+- **Revisit when:** it bites.
+- **Approved:** 2026-10-23, the user's choice "Known limitation, README says stop it (Recommended)".

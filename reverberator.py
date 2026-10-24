@@ -629,7 +629,7 @@ class JobControl:
 		self._since = time.time()
 		self._retry_at = None
 		self._failures = 0
-		# the waits for a disk now going on, oldest first, as [token, path, what, started]
+		# the waits for a disk now going on, oldest first, as [token, path, what, started, alert]
 		self._waits = []
 		# the status records, taken in order under _lock and written outside it, one at a time ( _write() )
 		self._writing = threading.Lock()
@@ -666,14 +666,26 @@ class JobControl:
 			record = self._publish()
 		self._write(record)
 
-	def begin_wait(self, path:str, what:str) -> object:
-		'''Note the job waiting for path, and return the token update_wait and end_wait take.'''
+	def begin_wait(self, path:str, what:str, alert:bool = True) -> object:
+		'''Note the job waiting for path, and return the token update_wait, alerts and end_wait take.'''
 		token = object()
 		with self._lock:
-			self._waits.append([token, path, what, time.time()])
+			self._waits.append([token, path, what, time.time(), alert])
 			record = self._publish()
 		self._write(record)
 		return token
+
+	def alerts(self, token) -> bool:
+		'''
+		Whether the wait of token is the one to alert for its path: its alert is set, and no older wait of the job for
+		that path has it set, so two threads waiting for one path log one marker.
+		'''
+		with self._lock:
+			index = next((i for i, wait in enumerate(self._waits) if wait[0] is token), None)
+			if index is None:
+				return False
+			_, path, _, _, alert = self._waits[index]
+			return alert and not any(wait[4] and wait[1] == path for wait in self._waits[:index])
 
 	def update_wait(self, token, what:str):
 		'''Say what the wait of token waits for now, publishing it when that changed; the wait keeps its start.'''
@@ -1168,29 +1180,43 @@ GREEN_LIGHT.set()
 
 def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic, alert:bool = True) -> bool:
 	'''
-	Wait until flag is set and path is a directory. Returns False when the job (with job None, GREEN_LIGHT) says stop.
-	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS; with alert False,
-	never, for a wait another thread of the job alerts for.
+	Wait until no disk of a mergerfs pool holding path is missing, flag is set and path is a directory. Returns False
+	when the job (with job None, GREEN_LIGHT) says stop. The pool is checked live on every poll, as the flag can lag
+	behind it, and the wait's reason is the pool's problem while there is one, else what.
+	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS, and once the wait
+	it alerted for ends, one line saying the job goes on. With alert False never, for a wait another thread of the job
+	alerts for; of the job's waits for one path, only the oldest that may alert does (JobControl.alerts).
 	'''
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	started = clock()
 	next_alert = started + DISK_WAIT_GRACE_SECONDS
 	token = None
+	alerted = False
 	try:
 		while running():
-			if flag.is_set() and os.path.isdir(path):
-				return True
-			if token is None and job is not None:
-				token = job.begin_wait(path, what)
+			reason = pool_problem(path)
+			if reason is None:
+				if flag.is_set() and os.path.isdir(path):
+					if alerted:
+						tl.teeok(cut_line(shown(f'reverberator job {job.job_name} goes on: {path} is ready again after {int((clock() - started) // 60)} min')))
+					return True
+				reason = what
+			if job is not None:
+				if token is None:
+					token = job.begin_wait(path, reason, alert)
+				else:
+					job.update_wait(token, reason)
 			if flag.is_set():
-				# the filesystem is ready but the path is not there yet, so the flag cannot end the wait
+				# the filesystem is ready but the path is not there yet, or a disk of its pool is out, so the flag cannot
+				# end the wait
 				time.sleep(POLL_WAIT_SECONDS)
 			else:
 				flag.wait(POLL_WAIT_SECONDS)
 			now = clock()
-			if now >= next_alert and job is not None and alert:
+			if now >= next_alert and job is not None and alert and job.alerts(token):
 				waited = now - started
-				job_log(job.job_name, f'FAILED: waiting {int(waited // 60)} min for {path}: {what}')
+				job_log(job.job_name, f'FAILED: waiting {int(waited // 60)} min for {path}: {reason}')
+				alerted = True
 				next_alert = now + DISK_WAIT_REPEAT_SECONDS
 		return False
 	finally:
@@ -3963,6 +3989,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while running():
 			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+			if not running():
+				break
+			# a disk of the monitored pool out would show its files as deleted: the batch waits for it too
+			wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 			if not running():
 				break
 			# an unreadable path is reported once for the batch, by its comparison or its backup
