@@ -4818,8 +4818,13 @@ def do_backup(backup_entries:dict,
 						backuperTeeLogToTl(job_name,f'Cannot drop the version the manifest records after {link_path} could not be made: {undo_error}',error=True)
 			raise
 		try:
+			# a disk dropped since the check above: the list could be made in its empty folder on the root disk, and be hidden
+			# once it is back
+			pool_guard.require()
 			place_change_list(content_file_name,prepared_list)
 		except BaseException as e:
+			# placed or not, its private folder goes (place_change_list() removes it too)
+			discard_change_list(prepared_list)
 			list_there = entry_there(content_file_name) if isinstance(e, Exception) else True
 			if list_there is None:
 				# the rename may have been made: the version may be committed, so the records stay on it
@@ -5318,6 +5323,11 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	try:
 		listing = read_job_vault(job_vault_path)
 	except VaultScanError as e:
+		# what the read found wrong, as a change list missing, can be a disk's that dropped meanwhile
+		problem = guard.problem()
+		if problem:
+			backuperTeeLogToTl(job_vault_path, f'Cannot scan the vault, nothing in it is removed: {problem}', error=True)
+			raise PoolNotReady(problem) from e
 		backuperTeeLogToTl(job_vault_path, f'Cannot read the vault, nothing in it is removed: {e.reason}', error=True)
 		raise
 	try:
@@ -8808,8 +8818,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	link or copy that cannot be looked at, linked or moved, or a removal that fails, keeps the oldest version: the
 	removal is aborted, and job_name's FAILED marker logged, then again every DISK_WAIT_REPEAT_SECONDS by clock while it
 	lasts, as no version is removed meanwhile and the vault keeps growing. A disk of the job vault's or monitor_path's
-	mergerfs pool missing at the removal, or mounted again since the walk began, keeps it the same way, then raises
-	PoolNotReady to fail the attempt. Only a folder that is not there is gone: a
+	mergerfs pool missing, or mounted again since the call began, keeps it the same way before it is taken for gone or
+	removed, and again after rm -rf, then raises PoolNotReady to fail the attempt. Only a folder that is not there is gone: a
 	kept oldest version whose folder is gone, as a removal cut short leaves it, is finished by removing what is left of
 	its paths.
 	Each version's record of what it holds, which its change list's name keeps and a restart sums, is kept in du's
@@ -8973,6 +8983,16 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				return False
 		PRUNE_ABORTED.pop(job_name, None)
 		return True
+	# a disk of either pool missing, or mounted again since here, can hide the reference vault, a link of the next
+	# version into it (during the walk), or what is left of it (during its removal): nothing is taken for gone then
+	guard = PoolGuard([job_vault, monitor_path])
+	def require_pools() -> None:
+		# the reference vault kept, and the attempt failed: its retry scans the vault again, so the caller's sums need not
+		# be right
+		problem = guard.problem()
+		if problem:
+			keep_oldest(problem)
+			raise PoolNotReady(problem)
 	folder_name = os.path.basename(referenceVaultPath)
 	own_folder = os.path.join(job_vault, folder_name)
 	def own_paths() -> tuple:
@@ -8996,6 +9016,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		if listed:
 			# one ENOENT is no proof while the job vault still lists it: its links may not be materialised
 			return keep_oldest('it was not there when looked at, though the job vault lists it')
+		# nor while a disk is out, whose folder of it may be all of it
+		require_pools()
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{referenceVaultPath} is already gone: removing what is left of it')
 		folder_gone()
 		if not remove_lists(lists):
@@ -9143,9 +9165,6 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		return True
 	# the next version's rows, read once for the whole walk
 	moves = VaultMoves(job_vault,monitor_path,monitor_paths).of(applyingVaultEntry.path)
-	# a disk of either pool that drops during the walk, even one back by its end, can hide a link into the reference
-	# vault: checked against the pools as they are now, right before the removal
-	guard = PoolGuard([job_vault, monitor_path])
 	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs).
 	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another.
 	# a folder that cannot be listed, or an entry that cannot be looked at, may hold this version's only way to a copy
@@ -9225,12 +9244,10 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	# the folder first, its change lists only once it is gone: a removal cut short leaves a list whose folder went (a
 	# stale list below the oldest, which the scan deletes) or the version committed, never a folder without a list,
 	# which the scan could not tell from a version whose list a listing left out
-	problem = guard.problem()
-	if problem:
-		# the attempt fails, and its retry scans the vault again, so the caller's sums need not be right
-		keep_oldest(problem)
-		raise PoolNotReady(problem)
+	require_pools()
 	removed = not multiCMD.run_command(['rm','-rf',own_folder],quiet=True,return_code_only=True)
+	# a disk that dropped while it ran hides what is left of the folder on it, which a list must still name when it is back
+	require_pools()
 	gone = there(referenceVaultPath) is False
 	if gone:
 		folder_gone()
