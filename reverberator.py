@@ -5283,8 +5283,7 @@ def forget_recorded_version(job_vault_path:str) -> None:
 		return
 	conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=rw', uri=True, timeout=1)
 	try:
-		for pragma in MANIFEST_JOURNAL_PRAGMAS:
-			conn.execute(pragma)
+		conn.execute(MANIFEST_JOURNAL_MODE)
 		with conn:
 			conn.execute("DELETE FROM meta WHERE key = 'version'")
 	except sqlite3.OperationalError as e:
@@ -6266,9 +6265,10 @@ def folder_range_end(folder:str) -> str:
 	'''
 	return folder[:-1] + chr(ord(folder[-1]) + 1)
 
-# every connection that writes the manifest runs these: the rollback journal is kept between transactions, its name
-# flushed once at open (VaultManifest._open()), and truncated to nothing after each commit, not left as big as the biggest one
-MANIFEST_JOURNAL_PRAGMAS = ('PRAGMA journal_mode = PERSIST', 'PRAGMA journal_size_limit = 0')
+# every connection that writes the manifest runs this: the rollback journal is truncated to nothing after each commit
+# rather than deleted, so the file stays between transactions and its name, flushed once at open (VaultManifest._open()),
+# never needs a folder sync, which mergerfs ignores
+MANIFEST_JOURNAL_MODE = 'PRAGMA journal_mode = TRUNCATE'
 
 class VaultManifest:
 	'''
@@ -6326,8 +6326,7 @@ class VaultManifest:
 		# transactions are explicit: a backup's changes commit together with the version they describe
 		self.conn = sqlite3.connect(self.path, isolation_level=None)
 		try:
-			for pragma in MANIFEST_JOURNAL_PRAGMAS:
-				self.conn.execute(pragma)
+			self.conn.execute(MANIFEST_JOURNAL_MODE)
 			self.conn.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID')
 			schema = self.conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
 			if schema is not None and schema[0] == '1':
