@@ -1230,9 +1230,11 @@ def test_attrib_never_syncs_through_a_users_symlink(tmp_path, kind):
 	assert entry_meta(victim, xattrs) == held
 	version = rv.list_versions(job.job_vault)[-1]
 	assert version.number == 1
-	# the version's L chains to the backed up link, which took the link's own owner and times
+	# the version's L chains to the backed up link, which took the link's own owner and times. a link whose text changed
+	# under the attrib ( outside ) holds other contents than the backed up one, and is copied as a link instead
 	end = rv.chain_end(job.job_vault, version.path, 'L')
-	assert end.path == os.path.join(v0, 'L') and stat.S_ISLNK(end.st.st_mode)
+	assert end.path == os.path.join(v0 if kind == 'into_vault' else version.path, 'L') and stat.S_ISLNK(end.st.st_mode)
+	assert os.readlink(end.path) == os.readlink(link)
 	assert (end.st.st_uid, end.st.st_mtime_ns) == (1111, 1_400_000_000_000_000_000)
 
 

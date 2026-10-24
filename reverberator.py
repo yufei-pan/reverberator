@@ -4276,26 +4276,31 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 	# out of the path, or None for what ended it there ( a delete, or a move onto it ). when counts down the batch, so the
 	# greatest is the soonest after the event at hand
 	later = {}
-	def carried(path):
-		# where what was at path is at the end of the batch, as the moves after it carried it, each found at path or a
-		# folder above it ( its depth, not the number of moves ): path itself when none did, or when one of the path
-		# itself comes first, which the exact-path handling below takes. None when something ended it after a move
-		# carried it
-		bound = None
+	# when the move each entry of a move is keyed by was made
+	moved_when = {}
+	def carried(path, bound = None):
+		# where what was at path is at the end of the batch, as the moves after it ( after the event when was bound )
+		# carried it, each found at path or a folder above it ( its depth, not the number of moves ): path itself when
+		# none did, or when one of the path itself comes first, which the exact-path handling below takes. None when
+		# something ended it after a move carried it
+		moved = False
 		while True:
 			best = None
 			key = path
 			while key:
-				for at, dest in later.get(key, ()):
-					if (bound is None or at < bound) and (best is None or at > best[0]):
-						best = (at, key, dest)
+				entries = later.get(key)
+				if entries:
+					# appended as when grows: the soonest before bound is the last below it
+					i = len(entries) if bound is None else bisect.bisect_left(entries, (bound,))
+					if i and (best is None or entries[i - 1][0] > best[0]):
+						best = (entries[i - 1][0], key, entries[i - 1][1])
 				key = key.rstrip('/').rpartition('/')[0]
 				key = key and key + '/'
 			if best is None or (best[2] is not None and best[1] == path):
 				return path
 			if best[2] is None:
-				return None if bound is not None else path
-			path, bound = best[2] + path[len(best[1]):], best[0]
+				return None if moved else path
+			path, bound, moved = best[2] + path[len(best[1]):], best[0], True
 	when = 0
 	for changeEvent in reversed(change_events):
 		# get the absolute path
@@ -4342,6 +4347,7 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		elif event == 'move' and abs_moved_from:
 			later.setdefault(abs_moved_from, []).append((when, abs_path))
 			later.setdefault(abs_path, []).append((when, None))
+			moved_when.setdefault(abs_path, when)
 		# pre handle move events
 		if event == 'move':
 			if abs_moved_from:
@@ -4387,6 +4393,7 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 			# in all cases, as we cannot simply perform a recursive link as a move in the backup, ( need to backup source data )
 			# we will break the move event into a delete of source and a {event} of dest
 			# here, escalate the current event to the chronologically later move
+			source_key = abs_path
 			moveDest = moveSourceToDestDict[abs_path]
 			if event == 'delete':
 				# Later move-from means dest should not become delete. A paired
@@ -4420,6 +4427,15 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					if DEBUG:
 						backuperTeeLogToTl(abs_path,f'    Escalating {backup_entries[moveDest].event} to {escalated_event} at {backup_entries[moveDest].iso_time} on {moveDest}')
 					backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,escalated_event,abs_path)
+					# no longer a move, it is replayed where the moves after the move it was carried it ( echo new > a;
+					# mv a d/a; mv d e is a modify of e/a ), once they are made
+					now_at = carried(moveDest, moved_when.get(moveDest))
+					if now_at is not None and now_at != moveDest:
+						escalated = backup_entries.pop(moveDest)
+						if now_at not in backup_entries or backup_entries[now_at].event == 'attrib':
+							backup_entries[now_at] = escalated
+							backup_entries.move_to_end(now_at)
+						moveSourceToDestDict[source_key] = now_at
 				else:
 					if DEBUG:
 						backuperTeeLogToTl(abs_path,f'    Already removed event on {moveDest}, skipping escalating')
@@ -6073,7 +6089,16 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		#mcae.run_command(['ln','-fsT',source_file,backup_file_path])
 		if os.path.lexists(backup_file_path):
 			os.remove(backup_file_path)
-		os.symlink(source_file, backup_file_path)
+		try:
+			os.symlink(source_file, backup_file_path)
+		except FileNotFoundError:
+			# a folder above it has no row ( an older daemon made it bare for a file under it ): made, so every backup does
+			# not fail here. the next change under it copies the whole folder ( do_reverb_backup() )
+			parent = os.path.dirname(backup_file_path)
+			if not os.path.lexists(parent):
+				backuperTeeLogToTl(path=source_path,warning=True,message=f'Making {parent}, which no row tracks, for the tracked {file}')
+			os.makedirs(parent, exist_ok=True)
+			os.symlink(source_file, backup_file_path)
 		if pool_guard is not None:
 			pool_guard.poll()
 		if not GREEN_LIGHT.is_set():
@@ -8575,6 +8600,18 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 		total_inode_change += get_path_inodes(*path_pending_to_get_inode_add)
 	if path_pending_to_get_inode_del:
 		total_inode_change -= get_path_inodes(*path_pending_to_get_inode_del)
+	# what a move lands on inside a created folder arrives by the move, and its create copies it not ( mkdir n; mv d n/d )
+	created = {entry for entry, values in backup_entries.items() if values.event == 'create' and entry.endswith('/')}
+	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and created and inside_folders(entry, created)]
+	if carried_in and walk_folders:
+		for entry in carried_in:
+			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list)
+			total_size -= entry_size
+			total_inode_change -= entry_inodes
+	else:
+		for start in range(0, len(carried_in), ARGUMENT_LIMIT):
+			total_size -= get_path_size(*carried_in[start:start + ARGUMENT_LIMIT])
+			total_inode_change -= get_path_inodes(*carried_in[start:start + ARGUMENT_LIMIT])
 	return total_size, total_inode_change
 
 def get_path_fs_info(path:str):
@@ -9450,6 +9487,12 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	# a clock compare between checks, so it runs per entry
 	poll_pools = (lambda: None) if pool_guard is None else pool_guard.poll
 	backup_entries = prepare_backup_entries_for_replay(backup_entries)
+	# the rels the batch's moves land on ( a folder's ending with / ): a folder create copies its tree without them, as
+	# they arrive by their moves ( mkdir n; mv d n/d )
+	move_targets = {os.path.relpath(path,monitor_path) + ('/' if path.endswith('/') else '') for path, values in backup_entries.items() if values.event == 'move'}
+	walk_skip = None if skip_list is None else skip_list.skips
+	if move_targets:
+		walk_skip = (lambda rel: rel in move_targets) if skip_list is None else (lambda rel: rel in move_targets or skip_list.skips(rel))
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
 	# the links of the committed versions, on the chains the re-copy and the attribute sync follow, are told by their
 	# versions' moves, held for this backup
@@ -9471,6 +9514,22 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			manifest.remove_tree(as_folder_entry(rel))
 		else:
 			manifest.discard(rel)
+	def untracked_folder_above(rel):
+		# the topmost folder above rel ( ending with / ) that no row tracks, or None. its parent's row says, in one lookup,
+		# that there is none, as rows are made from the top down
+		parts = rel.rstrip('/').split('/')[:-1]
+		if not parts or manifest.lookup('/'.join(parts) + '/') is not None:
+			return None
+		for depth in range(1, len(parts) + 1):
+			folder = '/'.join(parts[:depth]) + '/'
+			if manifest.lookup(folder) is None:
+				return folder
+	def copy_untracked_folder(folder_rel,mcae):
+		# a folder the version could not make once ( ENOSPC, say ) has no row: making it bare for an entry below it would
+		# leave its other entries out of every version. its create is replayed instead, tracking and copying all of it
+		backuperTeeLogToTl(path=monitor_path,message=f'Copying {os.path.join(monitor_path,folder_rel)} whole: no row tracks it in the version')
+		return copy_path(isDir=True,monitor_path=monitor_path,source_real_path=os.path.join(monitor_path,folder_rel),source_relative_path=folder_rel,
+			file_vault_real_path=os.path.join(backup_folder,folder_rel),backup_folder=backup_folder,mcae=mcae)
 	def copy_path(isDir,monitor_path,source_real_path,source_relative_path,file_vault_real_path,backup_folder,mcae):
 		# returns whether the entry is tracked and copied ( or queued ), as every write into the version goes through real
 		# folders of it only
@@ -9482,6 +9541,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			return False
 		source_relative_path = source_relative_path.rstrip('/')
 		file_vault_real_path = file_vault_real_path.rstrip('/')
+		untracked = untracked_folder_above(source_relative_path)
+		if untracked is not None:
+			return copy_untracked_folder(untracked,mcae)
 		if not real_folders_to(backup_folder,source_relative_path,make=True):
 			not_through_link(source_relative_path,isDir,'copying to')
 			return False
@@ -9497,7 +9559,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			rel_base = as_folder_entry(source_relative_path)
 			# a folder that could not be made: nothing is copied under it
 			unmade = None
-			for subRealPath, subRelativePath, subIsDir in iter_tree_entries(source_real_path,rel_base,skip=None if skip_list is None else skip_list.skips,errors=walk_errors):
+			for subRealPath, subRelativePath, subIsDir in iter_tree_entries(source_real_path,rel_base,skip=walk_skip,errors=walk_errors):
 				# a folder's create queues a copy of everything below it
 				poll_pools()
 				if unmade is not None and subRelativePath.startswith(unmade):
@@ -9565,7 +9627,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			mcae.run_command(['rm','-f',vault_real_path])
 			manifest.discard(relative_path)
 	def attribute_end(source_real_path,relative_path):
-		# the path the attributes of a file go onto ( sync_attributes() ): True when it has none of its own to get, False
+		# the path the attributes of a file go onto ( an attrib's replay ): True when it has none of its own to get, False
 		# after an error line saying why they go nowhere.
 		# onto the version's entry of a file ( its folders are real: real_folders_to() ), which a chain link leaves where
 		# the latest copy is, as only_sync_attributes has it: the end of the chain gets them. a user's symlink, in the
@@ -9621,36 +9683,30 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			kinds = ('a symlink', 'not one') if source_is_link else ('not a symlink', 'a symlink')
 			return refuse(f'it is {kinds[0]}, and its link chain ends at {end_path}, which is {kinds[1]}')
 		return end_path
-	def sync_attributes(source_real_path,relative_path):
-		end = attribute_end(source_real_path,relative_path)
-		return copy_file_meta(source_real_path,end) if isinstance(end,str) else end
-	def only_attributes_differ(source_path,path):
-		# whether path, the end of a moved link's chain, holds the contents of the monitored entry at source_path, as the
-		# comparison judges them ( compare_monitor_entry(): the same link text, or the same size, mtime and tail ), with
-		# other metadata ( entry_metadata() ). a chain end with other contents, as a swap the collapse cannot replay
-		# leaves one, takes nothing: the verification copies it, and no version keeps another file's metadata
+	def same_contents(source_path,path):
+		# whether path, the end of a link's chain, holds the contents of the monitored entry at source_path, as the
+		# comparison judges them ( compare_monitor_entry(): the same link text, or the same size, mtime and tail ). a chain
+		# end with other contents, as a swap the collapse cannot replay leaves one, never takes source_path's metadata,
+		# which would be another file's there. one that cannot be looked at is not
 		try:
 			source, end = os.lstat(source_path), os.lstat(path)
 			if stat.S_IFMT(source.st_mode) != stat.S_IFMT(end.st_mode):
 				return False
 			if stat.S_ISLNK(source.st_mode):
-				if os.readlink(source_path) != os.readlink(path):
-					return False
-			elif (source.st_size, source.st_mtime_ns) != (end.st_size, end.st_mtime_ns):
-				return False
+				return os.readlink(source_path) == os.readlink(path)
+			return (source.st_size, source.st_mtime_ns) == (end.st_size, end.st_mtime_ns) and hash_file(source_path,source.st_size) == hash_file(path,end.st_size)
 		except OSError:
 			return False
+	def only_attributes_differ(source_path,path):
+		# same_contents(), with other metadata ( entry_metadata() ): the moved entry takes it. one with other contents
+		# takes nothing, and the verification copies it
 		try:
 			if entry_metadata(source_path) == entry_metadata(path):
 				return False
 		except OSError:
 			# one that cannot be looked at is taken to differ
 			pass
-		# the tail last, read only for an entry about to take metadata
-		try:
-			return stat.S_ISLNK(source.st_mode) or hash_file(source_path,source.st_size) == hash_file(path,end.st_size)
-		except OSError:
-			return False
+		return same_contents(source_path,path)
 	def own_chain_hop(path):
 		# vault_chain_hop() of a link of this version, by the moves this replay applied; None when that cannot be told
 		try:
@@ -9719,6 +9775,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				 source_relative_path=event_relative_path,
 				 file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
 			elif event_values.event == 'attrib':
+				untracked = untracked_folder_above(event_relative_path)
+				if untracked is not None:
+					applied[event_source_real_path] = copy_untracked_folder(untracked,mcae)
+					continue
 				# the parents a prior version lacked are made, as real folders
 				if not real_folders_to(backup_folder,event_relative_path,make=True):
 					not_through_link(event_relative_path,isDir,'syncing attributes onto')
@@ -9735,11 +9795,16 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					copy_file_meta(event_source_real_path,file_vault_target_path)
 					manifest.add(as_folder_entry(event_relative_path),dirty=True)
 				else:
-					if only_sync_attributes:
+					end = attribute_end(event_source_real_path,event_relative_path) if only_sync_attributes else None
+					if isinstance(end,str) and same_contents(event_source_real_path,end):
 						# we just copy the file metadata
-						sync_attributes(event_source_real_path,event_relative_path)
+						copy_file_meta(event_source_real_path,end)
+					elif only_sync_attributes and not isinstance(end,str):
+						# nothing of its own to sync, or an error line said why not
+						pass
 					else:
-						# we copy the file
+						# with other contents at the end of the chain ( a swap the collapse could not replay left the link
+						# there ), the metadata would be another file's: the file is copied as it is, as without only_sync_attributes
 						cp_af_copy_path(source_path=event_source_real_path,dest_path=file_vault_target_path,mcae=mcae,pending=pending)
 					manifest.add(event_relative_path,dirty=True)
 			elif event_values.event == 'move':

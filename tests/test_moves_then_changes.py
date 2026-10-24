@@ -453,3 +453,146 @@ def test_chmod_then_mv_links_the_moved_file(job, logged, monkeypatch, only_sync_
 	else:
 		assert copies == [os.path.join(v1, 'y')]
 	assert_moved_cleanly(logged)
+
+
+# ---- fix round 2 --------------------------------------------------------------------------------------------------
+
+def test_many_atomic_saves_in_one_batch_collapse_quickly(job, monkeypatch):
+	# write state.tmp, rename it over state.json, 20k times: each path's later events are looked up, not scanned
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda *args, **kwargs: None)
+	m = job.monitor
+	events = deque()
+	for k in range(20000):
+		events.extend((rv.ChangeEvent(3.0 * k, False, 'create', f'{m}/app/state.tmp', None),
+			rv.ChangeEvent(3.0 * k + 1, False, 'modify', f'{m}/app/state.tmp', None),
+			rv.ChangeEvent(3.0 * k + 2, False, 'move', f'{m}/app/state.json', f'{m}/app/state.tmp')))
+	import time
+	started = time.monotonic()
+	entries = rv.change_events_to_backup_entries(events, m)
+	assert time.monotonic() - started < 3
+	assert f'{m}/app/state.json' in entries
+
+
+def test_a_file_changed_moved_into_a_folder_then_the_folder_moved(job, logged):
+	# echo new > a; mv a d/a; mv d e: the modify the move became lands where the live file is
+	seed_monitor(job, {'a': 'a', 'd/keep': 'k'})
+	run_backup(job)
+	m = job.monitor
+	with open(f'{m}/a', 'w') as f:
+		f.write('new')
+	os.rename(f'{m}/a', f'{m}/d/a')
+	os.rename(f'{m}/d', f'{m}/e')
+	v1 = run_backup(job, batch(job, (False, 'modify', 'a', None), (False, 'move', 'd/a', 'a'), (True, 'move', 'e', 'd')))[-1]
+	assert open(resolved(job, v1, 'e/a')).read() == 'new'
+	assert_left_alone(v1, 'e/keep')
+	assert sorted(os.listdir(v1)) == ['e']
+	assert_moved_cleanly(logged)
+
+
+def test_a_new_folder_moved_into_a_folder_then_the_folder_moved(job, logged):
+	# mkdir n; mv n d/n; echo x > d/n/x; mv d e
+	seed_monitor(job, {'d/keep': 'k'})
+	run_backup(job)
+	m = job.monitor
+	os.mkdir(f'{m}/n')
+	os.rename(f'{m}/n', f'{m}/d/n')
+	with open(f'{m}/d/n/x', 'w') as f:
+		f.write('x')
+	os.rename(f'{m}/d', f'{m}/e')
+	v1 = run_backup(job, batch(job, (True, 'create', 'n', None), (True, 'move', 'd/n', 'n'), (False, 'create', 'd/n/x', None),
+		(False, 'modify', 'd/n/x', None), (True, 'move', 'e', 'd')))[-1]
+	assert open(resolved(job, v1, 'e/n/x')).read() == 'x' and tracked(job, 'e/n/')
+	assert sorted(os.listdir(v1)) == ['e']
+	with open(f'{m}/keep2', 'w') as f:
+		f.write('k2')
+	v2 = run_backup(job, batch(job, (False, 'create', 'keep2', None)))[-1]
+	assert open(resolved(job, v2, 'e/n/x')).read() == 'x'
+	assert_moved_cleanly(logged)
+
+
+def test_a_folder_made_then_a_folder_moved_into_it_copies_nothing(job, logged, monkeypatch):
+	# mkdir n; mv d n/d: d arrives by its move, so the new n is copied without it, and not counted for it
+	seed_monitor(job, {f'd/f{i}': str(i) * 100000 for i in range(5)})
+	run_backup(job)
+	m = job.monitor
+	os.mkdir(f'{m}/n')
+	os.rename(f'{m}/d', f'{m}/n/d')
+	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'))
+	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m)
+	assert size < 100000 and inodes == 1
+	copies = copies_made(monkeypatch)
+	v1 = run_backup(job, entries)[-1]
+	assert copies == []
+	for i in range(5):
+		assert_left_alone(v1, f'n/d/f{i}')
+	assert tracked(job, 'n/') and tracked(job, 'n/d/')
+	assert_moved_cleanly(logged)
+
+
+def test_a_folder_left_without_a_row_is_copied_by_the_next_change_under_it(job, logged, monkeypatch):
+	# the version could not make n ( ENOSPC, say ): n/b's create later copies the whole of n, rows and all, and the
+	# backups after it run
+	seed_monitor(job, {'keep': 'k'})
+	run_backup(job)
+	m = job.monitor
+	os.mkdir(f'{m}/n')
+	with open(f'{m}/n/a', 'w') as f:
+		f.write('a')
+	real = rv.make_real_folder
+	def failing(path):
+		if path.rstrip('/').endswith('/n'):
+			return False
+		return real(path)
+	monkeypatch.setattr(rv, 'make_real_folder', failing)
+	run_backup(job, batch(job, (True, 'create', 'n', None), (False, 'create', 'n/a', None)))
+	monkeypatch.setattr(rv, 'make_real_folder', real)
+	assert not tracked(job, 'n/')
+	with open(f'{m}/n/b', 'w') as f:
+		f.write('b')
+	run_backup(job, batch(job, (False, 'create', 'n/b', None), (False, 'modify', 'n/b', None)))
+	assert tracked(job, 'n/') and tracked(job, 'n/a') and tracked(job, 'n/b')
+	for attempt in range(2):
+		with open(f'{m}/keep', 'w') as f:
+			f.write(f'k{attempt}')
+		version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
+	assert open(resolved(job, version, 'n/a')).read() == 'a' and open(resolved(job, version, 'n/b')).read() == 'b'
+
+
+def test_a_vault_with_a_file_row_under_a_folder_without_one_heals(job, logged):
+	# a vault left so by an earlier daemon: the referenced copy makes the folder, and the backup runs
+	seed_monitor(job, {'keep': 'k', 'n/a': 'a'})
+	run_backup(job)
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	manifest.discard('n/')
+	manifest.commit()
+	manifest.close()
+	m = job.monitor
+	with open(f'{m}/keep', 'w') as f:
+		f.write('k2')
+	version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
+	assert open(resolved(job, version, 'n/a')).read() == 'a'
+	with open(f'{m}/n/b', 'w') as f:
+		f.write('b')
+	version = run_backup(job, batch(job, (False, 'create', 'n/b', None), (False, 'modify', 'n/b', None)))[-1]
+	assert tracked(job, 'n/') and open(resolved(job, version, 'n/b')).read() == 'b'
+
+
+def test_an_attrib_on_a_link_left_at_another_files_copy_copies_the_file(job, logged):
+	# a swap the replay cannot apply as made leaves b linked to V0's copy of b while the live b is the old a: a chmod
+	# of b then copies it, and V0's b keeps its own metadata
+	seed_monitor(job, {'a': 'aaa', 'b': 'bbbb'})
+	m = job.monitor
+	os.utime(f'{m}/a', ns=(10 ** 18, 10 ** 18))
+	os.utime(f'{m}/b', ns=(2 * 10 ** 18, 2 * 10 ** 18))
+	v0 = run_backup(job)[0]
+	os.rename(f'{m}/a', f'{m}/t')
+	os.rename(f'{m}/b', f'{m}/a')
+	os.rename(f'{m}/t', f'{m}/b')
+	run_backup(job, batch(job, (False, 'move', 't', 'a'), (False, 'move', 'a', 'b'), (False, 'move', 'b', 't')))
+	before = rv.entry_metadata(os.path.join(v0, 'b'))
+	os.chmod(f'{m}/b', 0o600)
+	v2 = run_backup(job, batch(job, (False, 'attrib', 'b', None)))[-1]
+	assert rv.entry_metadata(os.path.join(v0, 'b')) == before
+	end = resolved(job, v2, 'b')
+	assert open(end).read() == 'aaa' and mode(end) == 0o600
