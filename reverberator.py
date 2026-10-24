@@ -56,7 +56,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = 0.44
+__version__ = 0.45
 
 ## WIP
 
@@ -11188,14 +11188,26 @@ def require_job_vault(job_vault:str):
 	if not there:
 		raise CommandError(f'The vault {job_vault} is not there (is its disk mounted?)', EXIT_COMMAND_FAILED)
 
+def vault_pool_warning(job_vault:str, stream = None) -> bool:
+	'''
+	Warn on stream (stderr by default) when a disk of the mergerfs pool job_vault is on is missing, as what that disk holds
+	of the vault is not shown, and say whether it did. Nothing is printed for a vault off any pool, or on a whole one.
+	'''
+	problem = pool_problem(job_vault)
+	if problem is None:
+		return False
+	print(shown(f'Warning: {problem}: what it holds of {job_vault} is not shown'), file=sys.stderr if stream is None else stream)
+	return True
+
 def history_command(args) -> int:
-	'''Print the versions in which a file or folder changed, newest first. Exits 0 once shown, a path never backed up too.'''
+	'''Print the versions in which a file or folder changed, newest first. Exits 0 once shown, a path never backed up too, 1 when a disk of the vault's pool is missing (warned on stderr).'''
 	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
 	rule, rel = find_job(load_command_rules(rule_path), args.path, args.job)
 	job_vault = job_vault_path(rule)
 	# taken before the versions are listed, so the list is the one left by a removal of the oldest version under way
 	output_closed = False
 	with command_restore_lock(rule.job_name, args.state_dir):
+		warned = vault_pool_warning(job_vault)
 		try:
 			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
@@ -11231,7 +11243,7 @@ def history_command(args) -> int:
 	if kind is None:
 		# the header alone, then why there is nothing to show
 		print(format_history(rule, job_vault, [], 'file', False) + '\n' + never_backed_up(rule, rule_path, rel, args.path.endswith('/')))
-	return 0
+	return EXIT_COMMAND_FAILED if warned else 0
 
 # --- restore: a file, a folder or a whole job copied out of a kept version ---
 
@@ -11764,6 +11776,30 @@ def remove_stale_partials(folder:str, held:str) -> None:
 			if PARTIAL_COPY_NAME.fullmatch(entry.name) and not entry.is_dir(follow_symlinks=False) and not os.path.lexists(os.path.join(held, entry.name)):
 				os.unlink(entry.path)
 
+def is_prune_temp(job_vault:str, version_path:str, rel:str, monitor_path:str, moves:'VaultMoves') -> bool:
+	'''
+	Whether rel in the version at version_path is the temporary a prune cut off between its hard link and its rename left
+	(prune_link_path()): its name is of the partial copy form, and it is the same file as the entry some symlink beside
+	it in the version leads to, which pruning was about to replace by it. A user's file of that name shares no inode with a
+	copy beside it. No salt is read, and any OSError gives False, so the entry is restored as any other.
+	'''
+	name = os.path.basename(rel)
+	if not PARTIAL_COPY_NAME.fullmatch(name):
+		return False
+	folder_rel = os.path.dirname(rel)
+	try:
+		temp_st = os.lstat(os.path.join(version_path, rel))
+		with os.scandir(os.path.join(version_path, folder_rel)) as entries:
+			for entry in entries:
+				if entry.name == name or not entry.is_symlink():
+					continue
+				found = resolve_version_entry(job_vault, version_path, os.path.join(folder_rel, entry.name), monitor_path, moves)
+				if found.kind in ('file', 'symlink') and same_inode(temp_st, os.lstat(found.path)):
+					return True
+	except OSError:
+		return False
+	return False
+
 def lock_restore_target(fd:int, target:str):
 	'''
 	Take the lock a run of a restore holds on its target folder target, open as fd, for as long as it writes there:
@@ -11817,6 +11853,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	first and the target last, so nothing copied into it changes its times afterwards. While anything failed, or when
 	the restore stops, the marker stays and every folder is left as this restore made it, the target 0700, for a run of
 	the same restore to pick up.
+	A file of the walk that is a prune's temporary (is_prune_temp()) is passed over: not restored, counted or warned of.
 	A dangling chain, a link to the live file of a referenced backup, an entry that cannot be read, a failed copy or an
 	OSError is a failure of that entry alone; so is a folder whose place holds a symlink, something else or another
 	user's folder, which is left as it is and never written through: nothing in it is restored. With resume, an entry
@@ -11940,6 +11977,9 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 								clear_partials(dest, entry_path.rstrip('/'), entry_rel)
 							report.restored += 1
 							folders.append((entry_path.rstrip('/'), dest, entry_rel))
+					elif is_prune_temp(job_vault, version.path, entry_rel, monitor_path, moves):
+						# a prune's leftover beside a link of the version, not the user's: passed over, not counted
+						pass
 					else:
 						entry = resolve_version_entry(job_vault, version.path, entry_rel, monitor_path, moves)
 						there = None
@@ -12314,7 +12354,7 @@ def restore_command(args) -> int:
 	own path, moving what is there aside first (the whole job only into its empty monitored path, once asked). A folder
 	restore that stopped or failed part way is picked up by running it again, or kept as it is by running it again
 	with --accept. One run of a restore into a target at a time. Exits 0 once everything was restored (or kept),
-	EXIT_COMMAND_FAILED when anything was not (each named), EXIT_USAGE when it cannot start.
+	EXIT_COMMAND_FAILED when anything was not (each named) or a disk of the vault's pool is missing (warned), EXIT_USAGE when it cannot start.
 	'''
 	if args.in_place and args.dest is not None:
 		raise CommandError('Give a destination folder or --in-place, not both')
@@ -12330,6 +12370,7 @@ def restore_command(args) -> int:
 	job_vault = job_vault_path(rule)
 	# taken before the versions are listed and held to the last copy, so the daemon removes none of them meanwhile
 	with command_restore_lock(rule.job_name, args.state_dir):
+		warned = vault_pool_warning(job_vault)
 		try:
 			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
@@ -12381,7 +12422,7 @@ def restore_command(args) -> int:
 		finally:
 			report.progress(sys.stderr, done=True)
 	print(report.summary())
-	return EXIT_COMMAND_FAILED if report.failed else 0
+	return EXIT_COMMAND_FAILED if report.failed or warned else 0
 
 def run_command(argv:list) -> int:
 	'''Run the command argv names and return its exit status; a CommandError prints its message on stderr.'''

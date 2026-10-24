@@ -14,18 +14,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   folder name between two backups.
 - **Approved:** 2026-10-22, the user's choice "Leave it (Recommended)" on the round 8 design's blind spot.
 
-### Attribute changes after a move in the same batch
-
-- **Kind:** deferred (round 9). This was already in 0.43.
-- **What the operator sees:** a file moved and then chmod'ed, chown'ed or given new xattrs in the same batch (for example
-  `mv x d/x; chmod 600 d/x`) keeps its old mode, owner and xattrs in new versions until the next full comparison. That
-  comparison runs at a restart, a failed attempt or an inotify overflow, so it can be weeks away.
-- **Why:** the replay applies every attribute change before every move, and the check after a batch compares content,
-  not attributes.
-- **Revisit when:** round 9, by replaying attribute changes at or under a move's destination after the moves, or by
-  comparing attributes for the paths a batch's attribute events touched.
-- **Approved:** 2026-10-23, the user's choice "Defer to round 9 (Recommended)".
-
 ### World-readable vault database and change lists
 
 - **Kind:** known limitation.
@@ -57,17 +45,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a vault's size limit needs to be met exactly.
 - **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
 
-### Two kills in a new job's first two backups
-
-- **Kind:** known limitation.
-- **What the operator sees:** a brand-new job whose first backup is killed between its change list and its first
-  `current_version`, and whose second backup is then killed between its manifest's commit and its change list, stops with
-  `reverberator job <name> FAILED: ...` until V1's folder is removed by hand. Nothing is lost.
-- **Why:** that state cannot be told from a mergerfs disk hiding a committed version's list, so the scan refuses rather
-  than guess. Each window is a few milliseconds wide.
-- **Revisit when:** it is seen in practice.
-- **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
-
 ### User symlinks past 40 hops when keep-N is 41 or more
 
 - **Kind:** known limitation, already in 0.43.
@@ -77,26 +54,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** the re-copies every 32-38 hops that keep files under the kernel's limit apply to files only.
 - **Revisit when:** a job keeps 41 or more versions and its vault is browsed by hand.
 - **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
-
-### A kill between the link swap and the change list's placement
-
-- **Kind:** known limitation.
-- **What the operator sees:** if the daemon is killed in the few calls between moving `current_version` to a new version
-  and placing its change list, that job stops with `reverberator job <name> FAILED: ...`. The message says to remove that
-  version's folder by hand once every disk of the vault is there. Nothing is lost.
-- **Why:** the stop is what keeps a committed version whose list a missing disk hides from being taken for a crash.
-- **Revisit when:** round 9's disk check is in place, which may let this state be cleaned up automatically.
-- **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
-
-### A prune's temporary file left in the next version
-
-- **Kind:** deferred (round 9).
-- **What the operator sees:** a prune killed between its hard link and its rename leaves a hidden
-  `.<hash>.reverberator-partial` in the next version. The next prune of that version uses and removes it. Until then, a
-  restore of that folder also writes out the hidden extra file.
-- **Why:** neither restore nor the job's scan recognises pruning's own temporaries yet.
-- **Revisit when:** round 9: make restore and the job's scan recognise and drop them.
-- **Approved:** 2026-10-23, the user's choice "Defer to round 9 (Recommended)".
 
 ### A SnapRAID fix while reverberator runs
 
