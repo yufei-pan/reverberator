@@ -5283,7 +5283,8 @@ def forget_recorded_version(job_vault_path:str) -> None:
 		return
 	conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=rw', uri=True, timeout=1)
 	try:
-		conn.execute(MANIFEST_JOURNAL_MODE)
+		for pragma in MANIFEST_JOURNAL_PRAGMAS:
+			conn.execute(pragma)
 		with conn:
 			conn.execute("DELETE FROM meta WHERE key = 'version'")
 	except sqlite3.OperationalError as e:
@@ -6265,8 +6266,9 @@ def folder_range_end(folder:str) -> str:
 	'''
 	return folder[:-1] + chr(ord(folder[-1]) + 1)
 
-# every connection that writes the manifest runs this: the rollback journal is kept between transactions (VaultManifest._open())
-MANIFEST_JOURNAL_MODE = 'PRAGMA journal_mode = PERSIST'
+# every connection that writes the manifest runs these: the rollback journal is kept between transactions, its name
+# flushed once at open (VaultManifest._open()), and truncated to nothing after each commit, not left as big as the biggest one
+MANIFEST_JOURNAL_PRAGMAS = ('PRAGMA journal_mode = PERSIST', 'PRAGMA journal_size_limit = 0')
 
 class VaultManifest:
 	'''
@@ -6324,10 +6326,8 @@ class VaultManifest:
 		# transactions are explicit: a backup's changes commit together with the version they describe
 		self.conn = sqlite3.connect(self.path, isolation_level=None)
 		try:
-			# the journal is made once and kept, its header zeroed at each commit: sqlite's own sync of the folder after it
-			# makes the journal reaches no disk of a mergerfs pool, so a later transaction must not have to make it
-			self.conn.execute(MANIFEST_JOURNAL_MODE)
-			self.journal_flushed = os.path.lexists(self.path + '-journal')
+			for pragma in MANIFEST_JOURNAL_PRAGMAS:
+				self.conn.execute(pragma)
 			self.conn.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID')
 			schema = self.conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
 			if schema is not None and schema[0] == '1':
@@ -6340,16 +6340,15 @@ class VaultManifest:
 			self.conn.execute(f'CREATE TABLE IF NOT EXISTS entries({self.SCHEMA_1_COLUMNS}, copy_version INTEGER) WITHOUT ROWID')
 			self.conn.execute('CREATE INDEX IF NOT EXISTS dirty_entries ON entries(path) WHERE dirty')
 			self.conn.execute('CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY) WITHOUT ROWID')
-			self.flush_new_journal()
+			# the journal's name on every disk of the vault before any transaction: sqlite's own sync of the folder after it makes
+			# the journal reaches no disk of a mergerfs pool. a rollback or a kill leaves none, or one not flushed, so it is made
+			# empty when missing (sqlite keeps and uses it), and flushed at every open, once per attempt
+			with open(self.path + '-journal', 'ab'):
+				pass
+			fsync_vault_folder(os.path.dirname(self.path))
 		except BaseException:
 			self.conn.close()
 			raise
-
-	def flush_new_journal(self):
-		'''The job vault flushed on its disks (fsync_vault_folder()) once the journal file has first appeared. Raises OSError.'''
-		if not self.journal_flushed and os.path.lexists(self.path + '-journal'):
-			fsync_vault_folder(os.path.dirname(self.path))
-			self.journal_flushed = True
 
 	def _upgrade(self):
 		'''
@@ -6401,7 +6400,6 @@ class VaultManifest:
 			self._set_version(version_path)
 		if self.conn.in_transaction:
 			self.conn.execute('COMMIT')
-		self.flush_new_journal()
 
 	def rollback(self):
 		if self.conn.in_transaction:

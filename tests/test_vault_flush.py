@@ -171,7 +171,7 @@ def journal_of(job_vault):
 	return os.path.join(job_vault, rv.MANIFEST_FILE_NAME + '-journal')
 
 
-def test_the_manifest_keeps_its_journal_and_flushes_the_vault_when_it_first_appears(tmp_path, monkeypatch):
+def test_the_manifest_has_its_journal_and_flushes_the_vault_at_every_open(tmp_path, monkeypatch):
 	job_vault = str(tmp_path / 'job')
 	os.makedirs(job_vault)
 	flushed = []
@@ -186,19 +186,62 @@ def test_the_manifest_keeps_its_journal_and_flushes_the_vault_when_it_first_appe
 		assert os.path.exists(journal_of(job_vault)) and flushed == [job_vault]
 	finally:
 		manifest.close()
+	# once per open, with the journal there
 	rv.VaultManifest(job_vault).close()
-	assert flushed == [job_vault]
-	# a daemon before this one left none between transactions: the first write that makes it is flushed
+	assert flushed == [job_vault, job_vault]
+	# one a daemon before this left none between transactions, or a rollback took, is made again, and flushed
 	os.remove(journal_of(job_vault))
+	rv.VaultManifest(job_vault).close()
+	assert os.path.exists(journal_of(job_vault)) and flushed == [job_vault] * 3
+
+
+def test_the_journal_is_truncated_after_a_big_commit_and_stays(tmp_path):
+	job_vault = str(tmp_path / 'job')
+	os.makedirs(job_vault)
+	version = os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800')
 	manifest = rv.VaultManifest(job_vault)
 	try:
-		assert flushed == [job_vault]
+		assert manifest.conn.execute('PRAGMA journal_size_limit').fetchone()[0] == 0
 		manifest.begin()
-		manifest.add('b.txt')
-		manifest.commit()
-		assert os.path.exists(journal_of(job_vault)) and flushed == [job_vault, job_vault]
+		rels = [f'd/{"a_fairly_long_file_name_" * 4}{i:05d}.txt' for i in range(20000)]
+		for rel in rels:
+			manifest.add(rel)
+		manifest.commit(version)
+		manifest.begin()
+		manifest.discard_many(rels)
+		manifest.commit(version)
+		assert os.path.getsize(os.path.join(job_vault, rv.MANIFEST_FILE_NAME)) > 1_000_000
+		assert os.path.getsize(journal_of(job_vault)) == 0
 	finally:
 		manifest.close()
+
+
+def test_a_rollback_then_the_next_open_makes_and_flushes_the_journal_again(tmp_path, monkeypatch):
+	job_vault = str(tmp_path / 'job')
+	os.makedirs(job_vault)
+	rv.VaultManifest(job_vault).close()
+	hot_persistent_journal(job_vault)
+	# recorded_latest_version() reads in the journal's default mode: its rollback takes the journal away
+	rv.recorded_latest_version(job_vault)
+	assert not os.path.exists(journal_of(job_vault))
+	flushed = []
+	monkeypatch.setattr(rv, 'fsync_vault_folder', flushed.append)
+	rv.VaultManifest(job_vault).close()
+	assert os.path.exists(journal_of(job_vault)) and flushed == [job_vault]
+
+
+def test_a_flush_that_fails_at_open_fails_it_and_the_next_open_flushes_again(tmp_path, monkeypatch):
+	job_vault = str(tmp_path / 'job')
+	os.makedirs(job_vault)
+	def failing(path):
+		raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+	monkeypatch.setattr(rv, 'fsync_vault_folder', failing)
+	with pytest.raises(OSError):
+		rv.VaultManifest(job_vault)
+	flushed = []
+	monkeypatch.setattr(rv, 'fsync_vault_folder', flushed.append)
+	rv.VaultManifest(job_vault).close()
+	assert flushed == [job_vault]
 
 
 def test_forgetting_the_recorded_version_keeps_the_journal_too(tmp_path):
@@ -214,6 +257,22 @@ def test_forgetting_the_recorded_version_keeps_the_journal_too(tmp_path):
 	assert rv.recorded_latest_version(job_vault).recorded is None
 
 
+def hot_persistent_journal(job_vault):
+	'''A write transaction on the manifest killed in its middle, in PERSIST mode, by a process of its own: a hot journal.'''
+	code = ('import os, sqlite3, sys\n'
+		'conn = sqlite3.connect(sys.argv[1], isolation_level=None)\n'
+		'conn.execute("PRAGMA journal_mode = PERSIST")\n'
+		'conn.execute("PRAGMA journal_size_limit = 0")\n'
+		'conn.execute("PRAGMA cache_size = 1")\n'
+		'conn.execute("BEGIN IMMEDIATE")\n'
+		'for i in range(2000):\n'
+		'    conn.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (f"junk{i}", "x" * 500))\n'
+		'os._exit(9)\n')
+	subprocess.run([sys.executable, '-c', code, os.path.join(job_vault, rv.MANIFEST_FILE_NAME)], check=False)
+	with open(journal_of(job_vault), 'rb') as f:
+		assert f.read(8) != bytes(8)
+
+
 def test_a_hot_persistent_journal_is_rolled_back(tmp_path):
 	job_vault = str(tmp_path / 'job')
 	os.makedirs(job_vault)
@@ -221,24 +280,26 @@ def test_a_hot_persistent_journal_is_rolled_back(tmp_path):
 	manifest.begin()
 	manifest.commit(os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800'))
 	manifest.close()
-	code = ('import os, sqlite3, sys\n'
-		'conn = sqlite3.connect(sys.argv[1], isolation_level=None)\n'
-		'conn.execute("PRAGMA journal_mode = PERSIST")\n'
-		'conn.execute("PRAGMA cache_size = 1")\n'
-		'conn.execute("BEGIN IMMEDIATE")\n'
-		'for i in range(2000):\n'
-		'    conn.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (f"junk{i}", "x" * 500))\n'
-		'os._exit(9)\n')
-	path = os.path.join(job_vault, rv.MANIFEST_FILE_NAME)
-	subprocess.run([sys.executable, '-c', code, path], check=False)
-	with open(journal_of(job_vault), 'rb') as f:
-		assert f.read(8) != bytes(8)
+	hot_persistent_journal(job_vault)
 	assert rv.recorded_latest_version(job_vault).recorded == 'V0--2021-01-01_00-00-00_-0800'
+	hot_persistent_journal(job_vault)
 	manifest = rv.VaultManifest(job_vault)
 	try:
 		assert manifest.conn.execute("SELECT count(*) FROM meta WHERE key LIKE 'junk%'").fetchone()[0] == 0
 	finally:
 		manifest.close()
+
+
+def test_an_empty_journal_is_no_hot_one(tmp_path):
+	job_vault = str(tmp_path / 'job')
+	os.makedirs(job_vault)
+	manifest = rv.VaultManifest(job_vault)
+	manifest.begin()
+	manifest.commit(os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800'))
+	manifest.close()
+	assert os.path.getsize(journal_of(job_vault)) == 0
+	assert rv.recorded_latest_version(job_vault).recorded == 'V0--2021-01-01_00-00-00_-0800'
+	assert rv.read_recorded_monitor_paths(job_vault) == ([], False)
 
 
 def test_the_scan_and_a_restart_leave_the_journal_alone(tmp_path):
