@@ -116,7 +116,8 @@ def test_stepper_memory_does_not_grow_with_the_version(job, monkeypatch, how):
 		versions = OrderedDict([(0, rv.VaultEntry(0, v0, 0, 1, 1)), (1, rv.VaultEntry(1, v1, 0, 1, 1))])
 		# each with its change list: the prune stops for a next version without one (Task 2b)
 		for version in (v0, v1):
-			rv.write_change_list(rv.change_list_path(version, 1, 1), [])
+			content = rv.change_list_path(version, 1, 1)
+			rv.place_change_list(content, rv.prepare_change_list(content, []))
 		tracemalloc.start()
 		try:
 			before = tracemalloc.get_traced_memory()[0]

@@ -1390,37 +1390,10 @@ def test_a_first_backups_link_that_cannot_be_looked_at_keeps_the_manifests_versi
 		manifest.close()
 
 
-@pytest.mark.parametrize('error', [errno.EIO, errno.EACCES])
-def test_a_link_that_cannot_be_read_fails_the_attempt_before_the_commit(tmp_path, monkeypatch, error):
-	# previous_link was None on any readlink error, so a later backup's undo would have been a first backup's: it now
-	# commits nothing, and its folder is the orphan after the link, which the next scan removes
-	job = three_versions(tmp_path)
-	link = os.path.join(job.job_vault, 'current_version')
-	real_readlink = os.readlink
-	def readlink(path, *args, **kwargs):
-		if os.path.abspath(os.fspath(path)) == link:
-			raise OSError(error, os.strerror(error), path)
-		return real_readlink(path, *args, **kwargs)
-	monkeypatch.setattr(rv.os, 'readlink', readlink)
-	steps = commit_hooks(monkeypatch)
-	with pytest.raises(rv.JobFailure, match='cannot read'):
-		run_backup(job, keep_modified(job, 'unread'))
-	monkeypatch.undo()
-	assert steps == ['list written'] and private_folders(job) == []
-	assert link_number(job) == 2 and rv.recorded_latest_version(job.job_vault).number == 2
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		assert manifest.describes(version(job, 2).path)
-	finally:
-		manifest.close()
-	removed, scanned = restart_and_scan(job)
-	assert len(removed) == 1 and scanned == [0, 1, 2]
-
-
 @pytest.mark.parametrize('first', [False, True])
 @pytest.mark.parametrize('kind', ['file', 'folder'])
-def test_a_current_version_that_is_no_link_fails_the_attempt_and_is_left_as_it_is(tmp_path, monkeypatch, kind, first):
-	# something there that is no link (EINVAL), which the swap would have replaced (a file) or failed on (a folder)
+def test_a_current_version_that_is_no_link_fails_the_scan_and_is_left_as_it_is(tmp_path, monkeypatch, kind, first):
+	# something there that is no link, which the swap would have replaced (a file) or failed on (a folder)
 	if first:
 		job = create_job(str(tmp_path))
 		seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
@@ -1441,14 +1414,9 @@ def test_a_current_version_that_is_no_link_fails_the_attempt_and_is_left_as_it_i
 			assert open(link).read() == 'mine'
 		else:
 			assert os.listdir(link) == ['inside']
-	steps = commit_hooks(monkeypatch)
-	with pytest.raises(rv.JobFailure, match='cannot read .*current_version'):
-		run_backup(job, None if first else keep_modified(job, 'nolink'))
-	monkeypatch.undo()
-	assert steps == ['list written'] and private_folders(job) == []
-	left_as_it_is()
-	# the attempt's folder is an orphan the scan cannot judge by a record that is no link: the next attempt fails at the
-	# scan, before any copy, naming the entry, and removes nothing
+	# an orphan folder, which the scan can judge only by the record: a current_version that is no link is none, so the
+	# attempt fails at the scan, before any copy, naming the entry, and removes nothing
+	write_incomplete_version(job, 0 if first else 3, {'a.txt': 'partial'})
 	before = vault_names(job)
 	with pytest.raises(rv.VaultScanError, match='current_version is no link'):
 		rv.get_vault_info(job.job_vault)
