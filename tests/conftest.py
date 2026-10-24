@@ -27,11 +27,30 @@ def restore_runtime_globals(tmp_path, monkeypatch):
 	rv.RESTORE_STOP.clear()
 	# the daemon publishes status files: keep them out of /run/reverberator
 	monkeypatch.setenv('REVERB_STATE_DIR', str(tmp_path / 'state'))
+	# and never writes the host's sysctls: a sudo sysctl is answered as refused (a test that fakes run_command itself
+	# replaces this)
+	monkeypatch.setattr(rv.multiCMD, 'run_command', refuse_sudo_sysctl(rv.multiCMD.run_command))
 	yield
 	rv.STATUS_BOARD = None
 	rv.POLL_WAIT_SECONDS = old_poll
 	stop_fs_signature_monitor()
 	rv.GREEN_LIGHT.set()
+
+
+class RefusedTask:
+	'''What multiCMD.run_command returns with return_object=True, for a command that was not run.'''
+	def __init__(self):
+		self.stdout = []
+		self.stderr = ['the test suite never writes host sysctls']
+		self.returncode = 1
+
+
+def refuse_sudo_sysctl(run_command):
+	def guarded(command, *args, **kwargs):
+		if list(command[:2]) == ['sudo', 'sysctl']:
+			return RefusedTask()
+		return run_command(command, *args, **kwargs)
+	return guarded
 
 
 def stop_fs_signature_monitor():
