@@ -629,7 +629,7 @@ class JobControl:
 		self._since = time.time()
 		self._retry_at = None
 		self._failures = 0
-		# the waits for a disk now going on, oldest first, as [token, path, what, started, alert]
+		# the waits for a disk now going on, oldest first, as [token, path, what, started]
 		self._waits = []
 		# the status records, taken in order under _lock and written outside it, one at a time ( _write() )
 		self._writing = threading.Lock()
@@ -666,26 +666,24 @@ class JobControl:
 			record = self._publish()
 		self._write(record)
 
-	def begin_wait(self, path:str, what:str, alert:bool = True) -> object:
+	def begin_wait(self, path:str, what:str) -> object:
 		'''Note the job waiting for path, and return the token update_wait, alerts and end_wait take.'''
 		token = object()
 		with self._lock:
-			self._waits.append([token, path, what, time.time(), alert])
+			self._waits.append([token, path, what, time.time()])
 			record = self._publish()
 		self._write(record)
 		return token
 
 	def alerts(self, token) -> bool:
 		'''
-		Whether the wait of token is the one to alert for its path: its alert is set, and no older wait of the job for
-		that path has it set, so two threads waiting for one path log one marker.
+		Whether the wait of token is the one to alert for its path: no older wait of the job is for that path, so two
+		threads waiting for one path (the watcher and the backuper) log one marker.
 		'''
 		with self._lock:
-			index = next((i for i, wait in enumerate(self._waits) if wait[0] is token), None)
-			if index is None:
-				return False
-			_, path, _, _, alert = self._waits[index]
-			return alert and not any(wait[4] and wait[1] == path for wait in self._waits[:index])
+			index = next(i for i, wait in enumerate(self._waits) if wait[0] is token)
+			path = self._waits[index][1]
+			return not any(wait[1] == path for wait in self._waits[:index])
 
 	def update_wait(self, token, what:str):
 		'''Say what the wait of token waits for now, publishing it when that changed; the wait keeps its start.'''
@@ -1178,14 +1176,14 @@ COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir','wds'],defaults=((
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
 
-def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic, alert:bool = True) -> bool:
+def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic) -> bool:
 	'''
 	Wait until no disk of a mergerfs pool holding path is missing, flag is set and path is a directory. Returns False
 	when the job (with job None, GREEN_LIGHT) says stop. The pool is checked live on every poll, as the flag can lag
 	behind it, and the wait's reason is the pool's problem while there is one, else what.
 	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS, and once the wait
-	it alerted for ends, one line saying the job goes on. With alert False never, for a wait another thread of the job
-	alerts for; of the job's waits for one path, only the oldest that may alert does (JobControl.alerts).
+	it alerted for ends, one line saying the job goes on. Of the job's waits for one path, only the oldest alerts
+	(JobControl.alerts).
 	'''
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	started = clock()
@@ -1203,21 +1201,22 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 				reason = what
 			if job is not None:
 				if token is None:
-					token = job.begin_wait(path, reason, alert)
+					token = job.begin_wait(path, reason)
 				else:
 					job.update_wait(token, reason)
+				# right after the poll, with its reason: once an older wait for path ends, this one only alerts when the
+				# path is still not ready
+				now = clock()
+				if now >= next_alert and job.alerts(token):
+					job_log(job.job_name, f'FAILED: waiting {int((now - started) // 60)} min for {path}: {reason}')
+					alerted = True
+					next_alert = now + DISK_WAIT_REPEAT_SECONDS
 			if flag.is_set():
 				# the filesystem is ready but the path is not there yet, or a disk of its pool is out, so the flag cannot
 				# end the wait
 				time.sleep(POLL_WAIT_SECONDS)
 			else:
 				flag.wait(POLL_WAIT_SECONDS)
-			now = clock()
-			if now >= next_alert and job is not None and alert and job.alerts(token):
-				waited = now - started
-				job_log(job.job_name, f'FAILED: waiting {int(waited // 60)} min for {path}: {reason}')
-				alerted = True
-				next_alert = now + DISK_WAIT_REPEAT_SECONDS
 		return False
 	finally:
 		if token is not None:
@@ -2337,8 +2336,8 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	root_lost = False
 	while running():
-		# at the start the backuper waits for the same filesystem and alerts for both; once the root was lost only this waits
-		if not wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready', alert=root_lost):
+		# the backuper can wait for the same path (at its start, or with a batch pending): the older wait alerts
+		if not wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready'):
 			return False
 		skip_list = watching = None
 		if startup is not None:
@@ -4048,7 +4047,13 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			# a batch whose events collapsed to no entry is backed up too, as what they touched can differ from the vault
 			while not backupEntries and not full_comparison and not scan_folders and touched is None and running():
 				while running() and not to_process_flag.is_set():
-					to_process_flag.wait(POLL_WAIT_SECONDS)
+					# an idle job waits, with its marker, while a filesystem it needs is not ready, as a pool missing a disk
+					if not vault_fs_flag.is_set():
+						wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+					elif not monitor_fs_flag.is_set():
+						wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
+					else:
+						to_process_flag.wait(POLL_WAIT_SECONDS)
 				if not running():
 					break
 				with to_process_lock:

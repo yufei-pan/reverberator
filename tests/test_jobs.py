@@ -411,14 +411,22 @@ def _run_watcher_until(control, path, seconds, monkeypatch):
 	assert not thread.is_alive()
 
 
-def test_watcher_leaves_the_startup_wait_alert_to_the_backuper(tmp_path, poll_fast, monkeypatch, capsys):
-	# the backuper waits for the same monitored filesystem at startup, and its wait is the one that alerts
+def test_the_watcher_and_the_backuper_alert_once_for_the_startup_wait(tmp_path, poll_fast, monkeypatch, capsys):
+	# the backuper waits for the same monitored filesystem at startup: only one of the two waits alerts
 	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 0.1)
 	control = rv.JobControl('j')
 	control.start_attempt()
-	_run_watcher_until(control, str(tmp_path / 'missing'), 0.6, monkeypatch)
+	path = str(tmp_path / 'missing')
+	flag = threading.Event()
+	flag.set()
+	backuper_wait = threading.Thread(target=rv.wait_for_path, args=(control, flag, path, 'monitored filesystem not ready'),
+		daemon=True)
+	backuper_wait.start()
+	_run_watcher_until(control, path, 0.6, monkeypatch)
+	backuper_wait.join(timeout=2)
+	assert not backuper_wait.is_alive()
 	out = capsys.readouterr()
-	assert 'reverberator job j FAILED: waiting' not in out.out + out.err
+	assert (out.out + out.err).count('reverberator job j FAILED: waiting') == 1
 
 
 def test_watcher_alerts_while_waiting_for_a_lost_root(tmp_path, poll_fast, monkeypatch, capsys):
