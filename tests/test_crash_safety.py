@@ -377,13 +377,14 @@ class TestDecrementStepperAbort(unittest.TestCase):
 			# the real file vanished from the oldest version, so V1's link is
 			# already dangling before the stepper ever touches it
 			os.remove(os.path.join(v0, 'a.txt'))
-			self.assertTrue(os.path.islink(os.path.join(v1, 'a.txt')))
+			text = os.readlink(os.path.join(v1, 'a.txt'))
 
 			removed_size, removed_inodes = rv.decrement_stepper(d, 'job', os.path.join(root, 'monitor'))
 
 			self.assertFalse(os.path.isdir(v0))
 			self.assertNotIn(0, d)
-			self.assertFalse(os.path.lexists(os.path.join(v1, 'a.txt')))
+			# left as it is: it reads as missing either way, and a user's link of its form stays the user's (final fix g)
+			self.assertEqual(os.readlink(os.path.join(v1, 'a.txt')), text)
 			self.assertGreater(removed_size + removed_inodes, 0)
 
 	def test_chained_dangling_links_drain_across_successive_steps(self):
@@ -411,7 +412,9 @@ class TestDecrementStepperAbort(unittest.TestCase):
 			rv.decrement_stepper(d, 'job', os.path.join(root, 'monitor'))
 			self.assertFalse(os.path.isdir(v1))
 			self.assertEqual(list(d), [2])
-			self.assertFalse(os.path.lexists(os.path.join(v2, 'a.txt')))
+			# V1's dangling link, left as it was, is what V2 holds now: it names V0, which is gone
+			self.assertEqual(os.readlink(os.path.join(v2, 'a.txt')), os.path.join('..', os.path.basename(v0), 'a.txt'))
+			self.assertFalse(os.path.exists(os.path.join(v2, 'a.txt')))
 
 
 if __name__ == '__main__':

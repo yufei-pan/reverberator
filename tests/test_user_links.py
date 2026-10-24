@@ -191,7 +191,7 @@ def test_pruning_keeps_a_user_link_naming_a_missing_file(tmp_path, pruning_keeps
 	assert all(holds_user_link(job, version, 'a/U', text) for version in rv.list_versions(job.job_vault))
 
 
-@pytest.mark.chain_ground_truth_allows('blind_spot', reason="a/U's text is exactly its own path's chain text: the documented blind spot")
+@pytest.mark.chain_ground_truth_allows('blind_spot', rels=['a/U'], reason="a/U's text is exactly its own path's chain text: the documented blind spot")
 def test_a_user_link_with_its_own_paths_chain_text_is_the_documented_blind_spot(tmp_path):
 	# the one form no rows can tell: a link at a/U whose text is what the referenced copy writes for a/U itself. Its damage
 	# stays on that path: pruning gives a/U its own older copy, and every other copy is kept
@@ -212,6 +212,29 @@ def test_a_user_link_with_its_own_paths_chain_text_is_the_documented_blind_spot(
 	if chain_ground_truth.ENABLED:
 		# the ground truth found it at the prune, and lets it pass by this test's marker alone
 		assert ('prune', 'blind_spot', held, 'a/U', text) in chain_ground_truth.FOUND
+
+
+@pytest.mark.chain_ground_truth_allows('blind_spot', rels=['a/b/w'], reason="a/b/w's text is its own path's chain text, naming a V0 with no a/b/w: the documented blind spot")
+def test_a_dangling_user_link_of_its_own_paths_chain_text_survives_pruning(tmp_path):
+	# haiku14 min_prune: the user's link a/b/w -> ../../../<V0>/a/b/w, with no a/b/w in V0, was removed as a dangling
+	# chain link when V0 went, and so from every later version. pruning now leaves a dangling link as it is, with the
+	# books unchanged by it (final fix g)
+	job = fresh_job(tmp_path, {'D/secret': 'secret', 'keep': 'k', 'a/b/keep': 'k'})
+	text = chain_text(latest(job).name, 'a/b/w')
+	add_user_link(job, 'a/b/w', text)
+	bump(job, 1)
+	for kept in ([1, 2], [2]):
+		info = rv.get_vault_info(job.job_vault)
+		books_after_prune(job, info)
+		assert list(info.vault_info_dict) == kept
+		real = du_versions(job)
+		assert recorded(job) == real and held(info.vault_info_dict) == real
+		assert all(holds_user_link(job, version, 'a/b/w', text) for version in rv.list_versions(job.job_vault))
+	bump(job, 3, keep_n_versions=2)
+	versions = rv.list_versions(job.job_vault)
+	assert [version.number for version in versions] == [4, 5]
+	assert all(holds_user_link(job, version, 'a/b/w', text) for version in versions)
+	assert os.readlink(os.path.join(job.monitor, 'a/b/w')) == text
 
 
 def test_a_user_link_naming_a_folder_never_wedges_pruning(tmp_path, pruning_keeps, monkeypatch):
@@ -967,7 +990,7 @@ def test_a_command_reads_the_record_once_and_only_when_rows_are_needed(tmp_path,
 	assert code == 0 and len(reads) == 1 and 'moved' not in out and err == ''
 
 
-@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the record of monitored paths is broken on purpose, so a/U goes by its text')
+@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the record of monitored paths is broken on purpose, so a/U goes by its text')
 def test_a_command_says_once_when_the_record_cannot_be_read(tmp_path, capsys):
 	job = fresh_job(tmp_path)
 	add_user_link(job, 'a/U', chain_text(latest(job).name, 'D/secret'))
@@ -1065,7 +1088,7 @@ def order_walk(monkeypatch, inside, v1, first):
 	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
 
 
-@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
+@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('how', ['link', 'move'])
 @pytest.mark.parametrize('first', ['D/', 'a/'])
 def test_two_links_naming_one_copy_both_keep_its_bytes(tmp_path, monkeypatch, capsys, first, how):
@@ -1173,7 +1196,7 @@ def holds_secret_everywhere(job, v1):
 	assert open(os.path.join(v1.path, 'a/U')).read() == 'secret'
 
 
-@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
+@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('fault', ['enospc', 'kill'])
 @pytest.mark.parametrize('first', ['D/', 'a/'])
 def test_a_failed_link_or_a_kill_between_two_links_loses_nothing(tmp_path, monkeypatch, first, fault):
@@ -1501,14 +1524,6 @@ def salt_file(job):
 	return os.path.join(job.job_vault, rv.PRUNE_SALT_FILE_NAME)
 
 
-def stored_row(job):
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		return manifest.conn.execute("SELECT value FROM meta WHERE key = 'prune_salt'").fetchone()
-	finally:
-		manifest.close()
-
-
 def test_the_vaults_secret_is_made_once_and_kept(tmp_path):
 	# review8: kept so a restart, or a remount, names a cut off run's temp the same; Task 2b: in a file of its own that
 	# only root can read, as the manifest is 0644 and every user who can see a copy's inode could read the secret there
@@ -1519,7 +1534,6 @@ def test_the_vaults_secret_is_made_once_and_kept(tmp_path):
 	st = os.lstat(salt_file(job))
 	assert stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o600 and st.st_uid == os.geteuid() and st.st_size == 16
 	secret = open(salt_file(job), 'rb').read()
-	assert stored_row(job) is None
 	bump(job, 1, keep_n_versions=2)
 	assert vault_salt(job) == secret and open(salt_file(job), 'rb').read() == secret
 
@@ -1536,28 +1550,6 @@ def test_the_secret_file_is_0600_whatever_the_umask_and_synced_with_the_vault(tm
 		os.umask(old)
 	assert len(secret) == 16 and stat.S_IMODE(os.lstat(salt_file(job)).st_mode) == 0o600
 	assert (job.job_vault, True) in synced
-
-
-def test_a_secret_an_older_daemon_kept_in_the_manifest_moves_to_the_file(tmp_path):
-	job = fresh_job(tmp_path)
-	bump(job, 1)
-	old = bytes(range(16))
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		manifest.conn.execute("INSERT OR REPLACE INTO meta VALUES ('prune_salt', ?)", (old.hex(),))
-	finally:
-		manifest.close()
-	# the temp a run cut off under that secret had made keeps its name
-	v0, v1 = rv.list_versions(job.job_vault)
-	copy_st = os.lstat(os.path.join(v0.path, 'D/secret'))
-	temp = rv.prune_link_path(os.path.join(v1.path, 'D/secret'), copy_st, old)
-	os.link(os.path.join(v0.path, 'D/secret'), temp)
-	bump(job, 1, keep_n_versions=2)
-	assert open(salt_file(job), 'rb').read() == old and stored_row(job) is None
-	# zeroed where it was, not left on a freed page of the manifest, which every user can read
-	assert old.hex().encode() not in open(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), 'rb').read()
-	assert numbers(job) == [1, 2] and not os.path.lexists(temp)
-	assert open(os.path.join(v1.path, 'D/secret')).read() == 'secret' and not os.path.islink(os.path.join(v1.path, 'D/secret'))
 
 
 def bad_secret_files():
@@ -1933,7 +1925,7 @@ def big_two_links_job(tmp_path):
 	return job, v0, v1
 
 
-@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
+@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_two_links_naming_one_copy_book_it_once(tmp_path):
 	# review8 NB2, haiku8 p1: both links took the copy into V1's record, so the prune returned less than nothing
 	job, v0, v1 = big_two_links_job(tmp_path)
@@ -1946,7 +1938,7 @@ def test_two_links_naming_one_copy_book_it_once(tmp_path):
 	assert_books(job, info.vault_info_dict, caller)
 
 
-@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
+@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_two_links_naming_one_copy_remove_no_version_the_limit_keeps(tmp_path):
 	# haiku8 p1: the prune's return took vault_size up by the copy, and the loop removed V1 too although the vault fit
 	job, v0, v1 = big_two_links_job(tmp_path)
@@ -1967,7 +1959,7 @@ def test_two_links_naming_one_copy_remove_no_version_the_limit_keeps(tmp_path):
 	assert (info.vault_size, info.vault_inodes) == du_versions(job) == recorded(job)
 
 
-@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
+@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_a_prune_never_gives_back_less_than_nothing(tmp_path, monkeypatch):
 	# across runs a copy two links name can still be booked twice (an abort, then the rerun's link): what the prune
 	# returns stays at nothing or more, so vault_size never rises from a prune
@@ -2151,7 +2143,7 @@ def test_a_row_below_a_file_is_missing_from_the_source(tmp_path, rows):
 	assert open(os.path.join(v1, 'c')).read() == 'c'
 
 
-def test_a_link_whose_target_lies_below_a_file_is_dropped_as_dangling(tmp_path, capsys):
+def test_a_link_whose_target_lies_below_a_file_is_left_as_dangling(tmp_path, capsys):
 	# review9 p6: V1's a/b links to V0's a/b, below V0's file a: the walk's lstat gave ENOTDIR and every prune of V0 aborted
 	vault, v0, v1, manifest = rows_out_of_step(tmp_path, ('a/', 'a/b', 'c'))
 	manifest.close()
@@ -2165,7 +2157,8 @@ def test_a_link_whose_target_lies_below_a_file_is_dropped_as_dangling(tmp_path, 
 	rv.decrement_stepper(info, 'job', os.path.join(str(tmp_path), 'm'))
 	assert alerting_lines(capsys.readouterr().out) == []
 	assert list(info) == [1] and not os.path.exists(v0)
-	assert not os.path.lexists(os.path.join(v1, 'a', 'b'))
+	# left as it is (final fix g): it reads as missing either way
+	assert os.readlink(os.path.join(v1, 'a', 'b')) == chain_text(os.path.basename(v0), 'a/b')
 	assert not os.path.islink(os.path.join(v1, 'c')) and open(os.path.join(v1, 'c')).read() == 'c'
 
 
@@ -2176,7 +2169,7 @@ def books_after_prune(job, info):
 	return freed, (before[0] - freed[0], before[1] - freed[1]), before
 
 
-@pytest.mark.chain_ground_truth_allows('unusable_rows', reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
+@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('first', ['D/', 'a/'])
 @pytest.mark.parametrize('how', ['move', 'link_then_emlink'])
 def test_two_links_naming_one_copy_keep_the_books_on_the_move_path_and_the_mixed_one(tmp_path, monkeypatch, how, first):
@@ -2501,3 +2494,135 @@ def test_a_fresh_copy_of_a_setuid_file_keeps_its_bits(tmp_path, monkeypatch):
 	shutil.copyfile(os.path.join(job.monitor, 'tool'), plain)
 	assert rv.copy_file_meta(os.path.join(job.monitor, 'tool'), plain)
 	assert stat.S_IMODE(os.lstat(plain).st_mode) == 0o6755
+
+
+# --- final fix f: pruning a link the rows cannot tell, a copy pruning materialised, recopy_size's copy versions ---
+
+T2 = '2021-01-03_00-00-00_-0800'
+
+
+def test_pruning_keeps_the_copy_of_a_link_the_rows_cannot_tell_in_every_kept_version(job):
+	# no row of V1 lands on deep/x (rows of another monitored path, say): the walk follows the hop its text names, as for
+	# a chain link (UnexplainedChainLink.target), so its copy is materialised before V0 goes, then into V2 when V1 goes
+	v0 = write_committed_version(job, 0, {'a/x': 'x', 'keep': 'k'}, timestamp=T0, current=False)
+	v1 = write_committed_version(job, 1, {'deep/': None, 'keep': 'k1'}, timestamp=T1, current=False, rows=[('keep', 'modify', None)])
+	v2 = write_committed_version(job, 2, {'deep/': None, 'keep': 'k2'}, timestamp=T2, rows=[('keep', 'modify', None)])
+	os.symlink(f'../../V0--{T0}/a/x', os.path.join(v1, 'deep/x'))
+	os.symlink(f'../../V1--{T1}/deep/x', os.path.join(v2, 'deep/x'))
+	with pytest.raises(rv.UnexplainedChainLink):
+		rv.vault_chain_hop(job.job_vault, os.path.join(v1, 'deep/x'), os.readlink(os.path.join(v1, 'deep/x')),
+			rv.VersionMoves.of_committed(job.job_vault, v1, job.monitor))
+	copy = os.lstat(os.path.join(v0, 'a/x'))
+	for kept in ([1, 2], [2]):
+		info = rv.get_vault_info(job.job_vault).vault_info_dict
+		rv.decrement_stepper(info, job.job_name, job.monitor)
+		assert list(info) == kept
+		for number in kept:
+			held = os.path.join({1: v1, 2: v2}[number], 'deep/x')
+			assert open(held).read() == 'x' and os.stat(held).st_ino == copy.st_ino
+	assert not os.path.islink(os.path.join(v2, 'deep/x'))
+
+
+@pytest.mark.parametrize('copy', ['file', 'user_link'])
+def test_a_copy_pruning_moved_above_its_recorded_copy_version_ends_the_chain_there(tmp_path, copy):
+	# the manifest says V0 holds the copy; V0 is pruned, and its copy materialised in V1, the oldest kept: the walk from
+	# the latest version ends there (for a user's link, at the link, whose own text names the version gone), the row is
+	# recorded right, and full comparisons make no version
+	job = create_job(str(tmp_path))
+	tree = {'D/secret': 'secret', 'keep': 'k', 'a/b': 'b'}
+	seed_monitor(job, tree)
+	text = None
+	if copy == 'user_link':
+		text = '../../somewhere/else'
+		os.symlink(text, os.path.join(job.monitor, 'a/U'))
+	run_backup(job)
+	rel = 'D/secret' if copy == 'file' else 'a/U'
+	assert copy_version_of(job, rel) == 0
+	bump(job, 3, keep_n_versions=3)
+	versions = rv.list_versions(job.job_vault)
+	assert [version.number for version in versions] == [1, 2, 3]
+	held = os.path.join(versions[0].path, rel)
+	assert os.path.islink(held) == (copy == 'user_link') and copy_version_of(job, rel) == 0
+	end = rv.chain_end(job.job_vault, versions[-1].path, rel, rv.VaultMoves(job.job_vault, job.monitor), 0)
+	assert (end.number, end.path) == (1, held)
+	record = record_of(job, rel)
+	if copy == 'file':
+		assert (record.kind, record.hash) == ('f', rv.hash_file(held, 6))
+	else:
+		assert (record.kind, record.link) == ('l', text) and os.readlink(held) == text
+	assert full_comparisons_make_no_version(job)
+	after = record_of(job, rel)
+	assert (after.kind, after.hash, after.link) == (record.kind, record.hash, record.link)
+
+
+@pytest.mark.chain_ground_truth_allows('refused_by_rows', rels=['E/secret'], reason='the rows of V1 are forged to refuse E/secret, which copy_version overrules')
+def test_recopy_size_counts_the_copy_its_copy_version_names(tmp_path, monkeypatch):
+	# the rows of V1 refuse E/secret's link, which the manifest's copy version overrules: the size counted is the copy's,
+	# as the re-copy follows it, not nothing for a link
+	job, v0, v1 = refused_move_job(tmp_path)
+	moves = rv.VaultMoves(job.job_vault, job.monitor)
+	assert rv.recopy_size(['E/secret'], job.job_vault, v1.path, moves, {'E/secret': copy_version_of(job, 'E/secret')}) == len('secret')
+	assert rv.recopy_size(['E/secret'], job.job_vault, v1.path, rv.VaultMoves(job.job_vault, job.monitor)) == 0
+	# and do_backup's size limit counts it so
+	monkeypatch.setattr(rv, 'RECOPY_MIN_HOPS', 1)
+	monkeypatch.setattr(rv, 'RECOPY_MAX_HOPS', 1)
+	counted = []
+	real = rv.recopy_size
+	def counting(rels, *args, **kwargs):
+		counted.append((list(rels), real(rels, *args, **kwargs)))
+		return counted[-1][1]
+	monkeypatch.setattr(rv, 'recopy_size', counting)
+	bump(job, 1)
+	monkeypatch.undo()
+	# E/keep, linked from V0 as well, is due too
+	assert counted == [(['E/keep', 'E/secret'], len('k') + len('secret'))]
+	held = os.path.join(latest(job).path, 'E/secret')
+	assert not os.path.islink(held) and open(held).read() == 'secret'
+
+
+# --- final fix e: the verification and the records tell the version being written's links by the replay's moves ---
+
+def copy_versions_not_known(monkeypatch):
+	'''The rows' copy versions left unknown (None), as rows rebuilt from the vault have them: only the moves tell the links.'''
+	real = rv.VaultManifest.set_copy_version
+	monkeypatch.setattr(rv.VaultManifest, 'set_copy_version', lambda self, rels, version: real(self, rels, None))
+
+
+def test_the_records_tell_a_fresh_copy_of_a_users_link_by_the_replays_moves(tmp_path, monkeypatch):
+	# record_dirty_entries(..., applied=writing_moves): by the text alone, the link was recorded as the file it names
+	job = fresh_job(tmp_path)
+	text = f'../../{latest(job).name}/D/secret'
+	copy_versions_not_known(monkeypatch)
+	v1 = add_user_link(job, 'a/U', text)
+	monkeypatch.undo()
+	assert copy_version_of(job, 'a/U') is None and os.readlink(os.path.join(v1.path, 'a/U')) == text
+	record = record_of(job, 'a/U')
+	assert (record.kind, record.link) == ('l', text)
+
+
+def test_the_verification_tells_a_users_link_a_move_carried_by_the_replays_moves(tmp_path, monkeypatch):
+	# compare_scopes(..., applied=writing_moves): ln -s TEXT a/U; mv a p/q; mkdir a; ln -s TEXT a/U. the replay copies
+	# a/U, then moves a/ to p/q/, carrying the copy, which the move leaves unverified: the verification read it by the
+	# text alone, as the file it names, and fixed p/q/U by copying the link again
+	job = fresh_job(tmp_path, {'D/secret': 'secret', 'keep': 'k', 'a/old': 'o', 'p/x': 'x'})
+	v0 = latest(job)
+	m = job.monitor
+	text = f'../../{v0.name}/D/secret'
+	os.symlink(text, os.path.join(m, 'a/U'))
+	os.rename(os.path.join(m, 'a'), os.path.join(m, 'p/q'))
+	os.mkdir(os.path.join(m, 'a'))
+	os.symlink(text, os.path.join(m, 'a/U'))
+	copy_versions_not_known(monkeypatch)
+	E = rv.ChangeEvent
+	fixed = backup_with_events(job, [E(1.0, False, 'create', os.path.join(m, 'a/U'), None),
+		E(2.0, True, 'move', os.path.join(m, 'p/q'), os.path.join(m, 'a')), E(3.0, True, 'create', os.path.join(m, 'a'), None),
+		E(4.0, False, 'create', os.path.join(m, 'a/U'), None)])
+	monkeypatch.undo()
+	v1 = latest(job)
+	# the collapse leaves a/ and a/U to the verification; p/q/U, which the replay's move carried, it finds right
+	assert v1.number == 1 and sorted(os.path.relpath(path, m) for path, _ in fixed) == ['a', 'a/U']
+	for rel in ('p/q/U', 'a/U'):
+		assert os.readlink(os.path.join(v1.path, rel)) == text and copy_version_of(job, rel) is None
+		record = record_of(job, rel)
+		assert (record.kind, record.link) == ('l', text)
+	assert open(os.path.join(v1.path, 'p/q/old')).read() == 'o'

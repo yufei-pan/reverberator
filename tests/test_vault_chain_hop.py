@@ -455,3 +455,101 @@ def test_the_moves_kept_are_bounded_by_rows_and_forgotten_with_their_version(job
 	rv.VERSION_MOVES.clear()
 	assert rv.VersionMoves.of_committed(job.job_vault, versions[0], job.monitor).usable
 	assert len(rv.VERSION_MOVES) == 1
+
+
+# --- the indexes of VersionMoves (final fix d): the same answers as the moves read in order ---
+
+def plain_lands_without_source(moves, rel):
+	'''VersionMoves.lands_without_source() as 54a8b21 had it: every move scanned.'''
+	return any(source is None and (dest.rstrip('/') == rel or rel.startswith(dest.rstrip('/') + '/')) for source, dest, _ in moves)
+
+
+def plain_takes(moves, source_rel, dest_rel):
+	'''VersionMoves.takes() as 54a8b21 had it: every move applied in order.'''
+	if plain_lands_without_source(moves, dest_rel):
+		return None
+	path = source_rel
+	for source, dest, is_folder in moves:
+		if source is None:
+			continue
+		if is_folder:
+			if path.startswith(source):
+				path = dest + path[len(source):]
+		elif path == source:
+			path = dest
+	return path == dest_rel
+
+
+def plain_touches(moves, rel):
+	'''VersionMoves.touches() as 54a8b21 had it.'''
+	return any(source is not None and (rel.startswith(source) if is_folder else rel == source) for source, _, is_folder in moves)
+
+
+FOLDERS = ['a/', 'a/b/', 'ab/', 'c/', 'c/d/', 'c/d/e/', 'f/']
+FILES = ['x', 'y', 'a/x', 'a/b/x', 'ab/x', 'a/y', 'c/x', 'c/d/x', 'c/d/e/x', 'f/x', 'a/b/x/z']
+# a folder move's source the rows give without its / (a plain prefix, as the ordered scan reads it), and odd dests
+ODD_SOURCES = ['a', 'c/d', 'a/b']
+
+
+def random_moves(rng, count):
+	'''A list of count move rows: file and folder moves, chains, moves away and back, odd folder sources, sourceless rows.'''
+	moves = []
+	while len(moves) < count:
+		kind = rng.random()
+		if kind < 0.35:
+			source, dest = rng.choice(FILES), rng.choice(FILES)
+			moves.append((source, dest, False))
+			if rng.random() < 0.3:
+				# and back, or on along a chain
+				moves.append((dest, source if rng.random() < 0.5 else rng.choice(FILES), False))
+		elif kind < 0.7:
+			source, dest = rng.choice(FOLDERS), rng.choice(FOLDERS)
+			moves.append((source, dest, True))
+			if rng.random() < 0.3:
+				moves.append((dest, source, True))
+		elif kind < 0.8:
+			moves.append((rng.choice(ODD_SOURCES), rng.choice(FOLDERS), True))
+		elif kind < 0.9:
+			dest = rng.choice(FOLDERS + FILES)
+			moves.append((None, dest, dest.endswith('/')))
+		else:
+			# a file move whose dest is where a folder's rows are, and the reverse
+			moves.append((rng.choice(FILES), rng.choice(FOLDERS).rstrip('/'), False))
+	return moves[:count]
+
+
+@pytest.mark.parametrize('seed', range(8))
+def test_the_indexed_moves_answer_as_the_moves_read_in_order(seed):
+	import random
+	rng = random.Random(seed)
+	queries = FILES + FOLDERS + [folder.rstrip('/') for folder in FOLDERS] + ['', 'q', 'a/b/x/z/w']
+	for _ in range(60):
+		moves = random_moves(rng, rng.randint(0, 24))
+		# appended one at a time, as the replay does, and asked after each: the indexes follow the list
+		applied = []
+		indexed = rv.VersionMoves.applied(applied)
+		for move in moves:
+			applied.append(move)
+			if rng.random() < 0.3 or move is moves[-1]:
+				for rel in queries:
+					assert indexed.lands_without_source(rel) == plain_lands_without_source(applied, rel), (applied, rel)
+					assert indexed.touches(rel) == plain_touches(applied, rel), (applied, rel)
+				for source in queries:
+					for dest in queries:
+						assert indexed.takes(source, dest) == plain_takes(applied, source, dest), (applied, source, dest)
+		# and a committed version's, read whole
+		committed = rv.VersionMoves(moves=list(moves))
+		for source in queries:
+			assert committed.touches(source) == plain_touches(moves, source)
+			for dest in queries:
+				assert committed.takes(source, dest) == plain_takes(moves, source, dest), (moves, source, dest)
+
+
+def test_the_indexed_moves_are_indexed_again_for_a_shorter_list():
+	moves = [('x', 'y', False)]
+	indexed = rv.VersionMoves.applied(moves)
+	assert indexed.takes('x', 'y') is True
+	moves.clear()
+	assert indexed.takes('x', 'y') is False and not indexed.touches('x')
+	moves.append(('y', 'z', False))
+	assert indexed.takes('y', 'z') is True and not indexed.touches('x')

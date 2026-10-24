@@ -191,14 +191,15 @@ def test_link_through_a_backed_up_folder_symlink_is_not_followed_or_pruned_onto(
 	assert os.readlink(f'{v1}/deep/u') == text
 
 
-def test_pruning_drops_a_chain_link_whose_folder_is_gone(job):
-	# nothing to materialise: as for a link whose file is gone, keeping it would hand the broken reference on
+def test_pruning_leaves_a_chain_link_whose_folder_is_gone(job):
+	# nothing to materialise: as for a link whose file is gone, it is left as it is, and reads as missing either way
+	# (final fix g), and the removal is not held back by it
 	v0 = write_committed_version(job, 0, {'keep': 'k'}, timestamp=T, current=False)
 	v1 = write_committed_version(job, 1, {'sub/': None}, timestamp=T)
 	os.symlink(f'../../V0--{T}/sub/x', f'{v1}/sub/x')
 	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
-	assert not os.path.lexists(f'{v1}/sub/x')
+	assert os.readlink(f'{v1}/sub/x') == f'../../V0--{T}/sub/x'
 
 
 DEEP = 'a/' * 1000
