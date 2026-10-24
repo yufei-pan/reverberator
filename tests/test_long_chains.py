@@ -300,10 +300,11 @@ def test_short_jobs_never_recopy(job, monkeypatch):
 	assert version.number == 40 and chain_length(os.path.join(version.path, 'a.txt')) == 32 and learned == []
 	# an upgraded vault knows no copy version, and still nothing is read: the live vaults keep 3 to 5 versions
 	forget_copy_versions(job)
+	# the manifest looks for its journal when opened: that is not a read of the versions
+	manifest = rv.VaultManifest(job.job_vault)
 	looked = []
 	lstat = os.lstat
 	monkeypatch.setattr(os, 'lstat', lambda *args, **kwargs: looked.append(args) or lstat(*args, **kwargs))
-	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		assert rv.recopy_rels(manifest, 213, 209, job.job_vault, version.path) == []
 		assert rv.recopy_rels(manifest, 41, 41 - rv.RECOPY_MIN_HOPS, job.job_vault, version.path) == []

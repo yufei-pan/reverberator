@@ -320,7 +320,8 @@ def test_a_new_change_list_is_synced_with_its_folder(job, monkeypatch):
 	written = [path for path in synced if os.path.basename(path) == os.path.basename(change_list)
 		and os.path.basename(os.path.dirname(path)).startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
 	assert len(written) == 1
-	assert synced.index(os.path.realpath(job.job_vault)) > synced.index(written[0])
+	# (the folder is synced before too, when the manifest's journal first appears)
+	assert any(at > synced.index(written[0]) for at, path in enumerate(synced) if path == os.path.realpath(job.job_vault))
 
 
 def record_monitor_paths(job, pairs):

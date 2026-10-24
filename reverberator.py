@@ -4812,11 +4812,12 @@ def do_backup(backup_entries:dict,
 		# there, removes the version as the orphan at the link + 1, or as a commit cut off before its list was placed
 		manifest.commit(backup_folder)
 		swap_current_version(job_vault,os.path.basename(backup_folder))
-		# the link and the list may sit on different disks of a pool: the link is on its disk before the list is placed
+		# the link and the list may sit on different disks of a pool: the link is on its disk before the list is placed.
+		# a flush that fails fails the attempt, with the list still in its private folder: the next scan settles the commit
 		try:
 			fsync_vault_folder(job_vault)
 		except OSError as e:
-			backuperTeeLogToTl(job_name,f'Could not sync {job_vault} to disk after moving current_version: {e}',warning=True)
+			raise JobFailure(f'cannot sync {job_vault} to disk after moving current_version: {e}; not placing the change list of {backup_folder}')
 		# a disk dropped since the check above
 		pool_guard.require()
 		place_change_list(content_file_name,prepared_list)
@@ -5249,7 +5250,7 @@ def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 	recorded version forgotten, as before a first backup began, so a redo that fails before its commit leaves a
 	leftover the next scan removes. Only once the vault was read whole with no disk of it missing, as nothing can hide
 	a list then. Raises VaultScanError, having deleted nothing, when that fails: the orphan would be removed with the
-	link still on it.
+	link still on it, or the undo is not on the disks.
 	'''
 	link_path = os.path.join(job_vault_path, 'current_version')
 	name = os.path.basename(listing.cut_off)
@@ -5263,6 +5264,9 @@ def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 			with contextlib.suppress(FileNotFoundError):
 				os.remove(link_path)
 			forget_recorded_version(job_vault_path)
+		# on its disks before anything is removed: a power loss that kept the removals and lost the swap back would leave
+		# the commit stuck again
+		fsync_vault_folder(job_vault_path)
 	except (OSError, sqlite3.Error) as e:
 		raise VaultScanError(f'cannot undo the records of {name}, a commit cut off before its list was placed ({where}): {e}')
 
@@ -5279,6 +5283,7 @@ def forget_recorded_version(job_vault_path:str) -> None:
 		return
 	conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=rw', uri=True, timeout=1)
 	try:
+		conn.execute(MANIFEST_JOURNAL_MODE)
 		with conn:
 			conn.execute("DELETE FROM meta WHERE key = 'version'")
 	except sqlite3.OperationalError as e:
@@ -6260,6 +6265,9 @@ def folder_range_end(folder:str) -> str:
 	'''
 	return folder[:-1] + chr(ord(folder[-1]) + 1)
 
+# every connection that writes the manifest runs this: the rollback journal is kept between transactions (VaultManifest._open())
+MANIFEST_JOURNAL_MODE = 'PRAGMA journal_mode = PERSIST'
+
 class VaultManifest:
 	'''
 	The entries of a job's latest committed version and what the vault holds for each, kept in sqlite in the job vault.
@@ -6316,6 +6324,10 @@ class VaultManifest:
 		# transactions are explicit: a backup's changes commit together with the version they describe
 		self.conn = sqlite3.connect(self.path, isolation_level=None)
 		try:
+			# the journal is made once and kept, its header zeroed at each commit: sqlite's own sync of the folder after it
+			# makes the journal reaches no disk of a mergerfs pool, so a later transaction must not have to make it
+			self.conn.execute(MANIFEST_JOURNAL_MODE)
+			self.journal_flushed = os.path.lexists(self.path + '-journal')
 			self.conn.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID')
 			schema = self.conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
 			if schema is not None and schema[0] == '1':
@@ -6328,9 +6340,16 @@ class VaultManifest:
 			self.conn.execute(f'CREATE TABLE IF NOT EXISTS entries({self.SCHEMA_1_COLUMNS}, copy_version INTEGER) WITHOUT ROWID')
 			self.conn.execute('CREATE INDEX IF NOT EXISTS dirty_entries ON entries(path) WHERE dirty')
 			self.conn.execute('CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY) WITHOUT ROWID')
+			self.flush_new_journal()
 		except BaseException:
 			self.conn.close()
 			raise
+
+	def flush_new_journal(self):
+		'''The job vault flushed on its disks (fsync_vault_folder()) once the journal file has first appeared. Raises OSError.'''
+		if not self.journal_flushed and os.path.lexists(self.path + '-journal'):
+			fsync_vault_folder(os.path.dirname(self.path))
+			self.journal_flushed = True
 
 	def _upgrade(self):
 		'''
@@ -6382,6 +6401,7 @@ class VaultManifest:
 			self._set_version(version_path)
 		if self.conn.in_transaction:
 			self.conn.execute('COMMIT')
+		self.flush_new_journal()
 
 	def rollback(self):
 		if self.conn.in_transaction:
