@@ -207,7 +207,8 @@ def wait_for_committed_count(job: JobPaths, count: int, timeout: float = 10.0) -
 class FakePool:
 	'''
 	mergerfs pools in a fake mount table file: a fuse.mergerfs line per pool and an xfs line per branch, mount ids
-	counted up from 100. read() stands in for rv.read_pool_branches. Every change rewrites the file and wakes the monitor.
+	counted up from 100. read() stands in for rv.read_pool_branches and statx_mount() for rv.statx_mount, whose unique
+	mount ids count up from 1000 on every mount. Every change rewrites the file and wakes the monitor.
 	'''
 	ROOT_LINE = '22 1 8:1 / / rw - ext4 /dev/sda1 rw\n'
 
@@ -217,18 +218,22 @@ class FakePool:
 		self.monitor = monitor
 		self.mountinfo_path = os.path.join(self.tmp_path, 'fake_mountinfo')
 		self.next_id = 100
-		# (real mount point, line), in kernel order
+		self.next_unique_id = 1000
+		# (real mount point, line, mountinfo id, unique id), in kernel order
 		self.lines = []
+		# real mount point -> (fstype, source, mountinfo id) of its last mount
+		self.mounted_as = {}
 		# real mount point of a pool -> its branch list as mergerfs gives it
 		self.pools = {}
 		self.unreadable_pools = {}
+		# real path -> {probe: errno} for fail_disk()
 		self.failing = {}
 		self.reads = 0
 		self.write()
 
 	def write(self):
 		with open(self.mountinfo_path, 'w', encoding='utf-8') as f:
-			f.write(self.ROOT_LINE + ''.join(line for _, line in self.lines))
+			f.write(self.ROOT_LINE + ''.join(line for _, line, _, _ in self.lines))
 		self.monitor.wake()
 
 	def named(self, branch:str) -> str:
@@ -238,10 +243,13 @@ class FakePool:
 	def branch_path(self, branch:str) -> str:
 		return os.path.realpath(self.named(branch))
 
-	def line(self, mount_point:str, fstype:str, source:str) -> tuple:
-		mount_id = self.next_id
-		self.next_id += 1
-		return mount_point, f'{mount_id} 22 0:{mount_id} / {mount_point} rw - {fstype} {source} rw\n'
+	def line(self, mount_point:str, fstype:str, source:str, mount_id:int = None) -> tuple:
+		if mount_id is None:
+			mount_id = self.next_id
+			self.next_id += 1
+		self.next_unique_id += 1
+		self.mounted_as[mount_point] = (fstype, source, mount_id)
+		return mount_point, f'{mount_id} 22 0:{mount_id} / {mount_point} rw - {fstype} {source} rw\n', mount_id, self.next_unique_id
 
 	def add(self, mount_point:str, branches:list) -> list:
 		'''A pool at mount_point over branches (paths, or bare names made in tmp_path/disks); the branches' real paths.'''
@@ -258,28 +266,47 @@ class FakePool:
 		return real
 
 	def drop(self, branch:str):
-		'''The branch's line goes; its folder stays, as a disk's mount point does.'''
+		'''The branch's (or a pool's) line goes; its folder stays, as a disk's mount point does.'''
 		real = self.branch_path(branch)
-		self.lines = [(point, line) for point, line in self.lines if point != real]
+		self.lines = [line for line in self.lines if line[0] != real]
 		self.write()
 
-	def mount(self, branch:str):
-		'''The branch is mounted again, with a new mount id.'''
-		self.lines.append(self.line(self.branch_path(branch), 'xfs', '/dev/fake'))
+	def mount(self, branch:str, same_id:bool = False):
+		'''
+		The branch (or a pool) is mounted again: a new unique mount id, and a new mountinfo id unless same_id, as the
+		kernel reuses them.
+		'''
+		real = self.branch_path(branch)
+		fstype, source, mount_id = self.mounted_as[real]
+		self.lines.append(self.line(real, fstype, source, mount_id if same_id else None))
 		self.write()
 
-	def fail_statvfs(self, branch:str, err:int = errno.EIO):
-		if not self.failing:
-			real_statvfs = os.statvfs
+	def fail_disk(self, branch:str, err:int = errno.EIO, probes=('statx', 'readdir')):
+		'''The branch's statx, its readdir or both raise OSError(err), as on a filesystem shut down but still mounted.'''
+		if not any('readdir' in failing for failing in self.failing.values()) and 'readdir' in probes:
+			real_scandir = os.scandir
 
-			def statvfs(path):
-				code = self.failing.get(os.path.realpath(os.fspath(path)))
-				if code is not None:
-					raise OSError(code, os.strerror(code))
-				return real_statvfs(path)
-			self.monkeypatch.setattr(os, 'statvfs', statvfs)
-		self.failing[self.branch_path(branch)] = err
+			def scandir(path='.'):
+				if isinstance(path, (str, bytes, os.PathLike)):
+					code = self.failing.get(os.path.realpath(os.fsdecode(path)), {}).get('readdir')
+					if code is not None:
+						raise OSError(code, os.strerror(code))
+				return real_scandir(path)
+			self.monkeypatch.setattr(os, 'scandir', scandir)
+		self.failing.setdefault(self.branch_path(branch), {}).update((probe, err) for probe in probes)
 		self.write()
+
+	def statx_mount(self, path:str) -> tuple:
+		'''(unique mount id, whether path is a mount root) as rv.statx_mount gives them.'''
+		real = os.path.realpath(path)
+		code = self.failing.get(real, {}).get('statx')
+		if code is not None:
+			raise OSError(code, os.strerror(code))
+		if not os.path.lexists(real):
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		on_top = [unique_id for point, _, _, unique_id in self.lines if point == real]
+		# a path that is no mount root is on the root filesystem
+		return (on_top[-1], True) if on_top else (1, False)
 
 	def unreadable(self, mount_point:str, err:int = errno.ENOTSUP):
 		self.unreadable_pools[os.path.realpath(mount_point)] = err
