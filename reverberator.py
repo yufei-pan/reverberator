@@ -4804,7 +4804,10 @@ def do_backup(backup_entries:dict,
 			manifest.commit(backup_folder)
 			swap_current_version(job_vault,os.path.basename(backup_folder))
 		except BaseException as e:
-			discard_change_list(prepared_list)
+			if isinstance(e, Exception):
+				discard_change_list(prepared_list)
+			# else the interpreter is going: the records may name this version, and the list left in its private folder tells
+			# the scan the commit was cut off (undo_cut_off_commit()), as after a kill
 			if isinstance(e, Exception) and previous_link is None:
 				link_there = entry_there(link_path)
 				if link_there is None:
@@ -4823,8 +4826,9 @@ def do_backup(backup_entries:dict,
 			pool_guard.require()
 			place_change_list(content_file_name,prepared_list)
 		except BaseException as e:
-			# placed or not, its private folder goes (place_change_list() removes it too)
-			discard_change_list(prepared_list)
+			# its private folder goes once the records are back (place_change_list() removes it too); while they name this
+			# version, the list left in it tells the scan the commit was cut off (undo_cut_off_commit())
+			undone = True
 			list_there = entry_there(content_file_name) if isinstance(e, Exception) else True
 			if list_there is None:
 				# the rename may have been made: the version may be committed, so the records stay on it
@@ -4840,7 +4844,10 @@ def do_backup(backup_entries:dict,
 					else:
 						swap_current_version(job_vault,previous_link)
 				except (OSError, sqlite3.Error) as undo_error:
+					undone = False
 					backuperTeeLogToTl(job_name,f'Cannot put {link_path} back to {previous_link} after the change list failed: {undo_error}',error=True)
+			if undone:
+				discard_change_list(prepared_list)
 			raise
 		# a vault this daemon committed to has versions: one that later shows none went away under it
 		VAULTS_WITH_VERSIONS.add(os.path.abspath(job_vault))
@@ -4995,8 +5002,9 @@ def change_list_record(rest:str):
 # carries; kept, the names of the entries kept as they are, though they name no folder there (whose name cannot be read,
 # or of a number a folder there carries); unfinished, the private folders of change lists a crash cut off before
 # write_change_list() renamed them into place, and the temps of the pruning secret one cut off before vault_prune_salt()
-# linked it
-VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans', 'stale', 'kept', 'unfinished'])
+# linked it; cut_off, the path of the orphan of a commit cut off between its link swap and its list's placement, which is
+# among orphans, but may go only with no disk of the vault missing (get_vault_info()), or None
+VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans', 'stale', 'kept', 'unfinished', 'cut_off'])
 
 # what a job vault records of its latest commit (recorded_latest_version()): number, the latest version a commit got
 # under way for, by the current_version link, or failing that by the manifest; link, whether a current_version entry is
@@ -5065,7 +5073,12 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 	out with no error: when its number is the one after the latest version the vault records (recorded_latest_version()),
 	which is a backup cut off before its commit got under way; or, for a first backup cut off so, when it is the only
 	orphan and a V0, there is no current_version entry and no entry with a change list's name, and a manifest is there
-	that records no version. A
+	that records no version. The orphan at the latest version the vault records is listed too, as cut_off, when that is
+	the newest committed version + 1 (V0 in a vault with none), the record is current_version's, or the manifest's with
+	no current_version entry, and its list is still in the private folder it was written in (prepare_change_list()): a
+	commit cut off between its manifest's commit or its link swap and its list's placement. A list removed or renamed by
+	hand leaves no such folder. It is told from a committed version whose list the listing left out only by the caller,
+	who knows whether a disk of the vault is missing. A
 	change list that names no folder there is stale, to be deleted, only when it is a regular file, its folder's name
 	is well formed, that folder is not there, no folder there carries its number, and its number is below the oldest
 	committed version (what a removal cut short leaves, as the prune removes the folder first). Any other entry that
@@ -5176,6 +5189,17 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 		versions = {}
 		change_lists = {}
 		orphans = []
+		cut_off = None
+		def list_unplaced(name:str) -> bool:
+			# whether name's change list is in a private folder of one, as a commit cut off before its placement leaves it;
+			# one that cannot be listed is no evidence
+			for path in unfinished:
+				try:
+					if any(change_list_names(listed, name) for listed in os.listdir(path)):
+						return True
+				except OSError:
+					continue
+			return False
 		for number, name in sorted(numbered.items()):
 			if len(own[name]) > 1:
 				raise VaultScanError(f'the version folder {name} in {job_vault_path} has {len(own[name])} change lists: {", ".join(sorted(own[name]))}')
@@ -5208,6 +5232,12 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 					# got under way; the one it names may be committed with its list out of the listing
 					if number == record.number + 1:
 						continue
+					# the record names it, and it is the newest committed version + 1: a commit cut off before its list was
+					# placed, unless a missing disk hides that list, which only the caller can tell
+					if (number == record.number and number == (max(versions) + 1 if versions else 0) and cut_off is None
+							and (record.manifest is None or not record.link) and list_unplaced(name)):
+						cut_off = folders[name]
+						continue
 					if versions and number < min(versions):
 						hint = 'a removal cut short by a daemon before 0.44 left it (an oldest version whose list went first: once that is sure, remove it by hand)'
 					elif number == record.number:
@@ -5234,7 +5264,7 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 		raise
 	except Exception as e:
 		raise VaultScanError(f'cannot read the vault {job_vault_path}: {type(e).__name__}: {e}')
-	return VaultListing(versions, change_lists, [folders[name] for _, name in orphans], stale, sorted(kept), unfinished)
+	return VaultListing(versions, change_lists, [folders[name] for _, name in orphans], stale, sorted(kept), unfinished, cut_off)
 
 def remove_orphan(job_vault_path:str, path:str) -> bool:
 	'''rm -rf of path, a version folder without a change list in job_vault_path: whether it is gone.'''
@@ -5252,6 +5282,28 @@ def remove_orphan(job_vault_path:str, path:str) -> bool:
 		return False
 	backuperTeeLogToTl(job_vault_path, f'Failed to remove the orphan {path}', error=True)
 	return False
+
+def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
+	'''
+	The records of listing.cut_off, a commit cut off before its list was placed, put back as they were before it, so
+	the scan removes it as the orphan at the link + 1: current_version swapped back to the newest committed version
+	(swap_current_version(), the commit's own atomic replace), or removed when there is none. Only once the vault was
+	read whole with no disk of it missing, as nothing can hide a list then. Raises VaultScanError, having deleted
+	nothing, when that fails: the orphan would be removed with the link still on it.
+	'''
+	link_path = os.path.join(job_vault_path, 'current_version')
+	name = os.path.basename(listing.cut_off)
+	newest = os.path.basename(listing.versions[max(listing.versions)].path) if listing.versions else None
+	where = f'moving {link_path} back to {newest}' if newest else f'removing {link_path}'
+	backuperTeeLogToTl(job_vault_path, f'{name} has no change list, though nothing can hide one (no disk of the vault is missing), and its list is still in its private folder: a commit cut off before its list was placed left it; {where} and removing it', warning=True)
+	try:
+		if newest:
+			swap_current_version(job_vault_path, newest)
+		else:
+			with contextlib.suppress(FileNotFoundError):
+				os.remove(link_path)
+	except OSError as e:
+		raise VaultScanError(f'cannot undo the records of {name}, a commit cut off before its list was placed ({where}): {e}')
 
 def remove_unfinished_change_lists(job_vault_path:str, listing:VaultListing) -> None:
 	'''
@@ -5308,7 +5360,8 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 
 	The scan deletes only what it is certain of, once the whole vault was read (read_job_vault()): the change lists of
 	version folders that are not there, the private folders of change lists a crash cut off, and the version folders
-	without a change list that may go, the orphans of backups that did not commit and of removals cut short. Then a
+	without a change list that may go, the orphans of backups that did not commit and of removals cut short, and that of
+	a commit cut off before its list was placed, once its link is put back (undo_cut_off_commit()). Then a
 	current_version left behind the newest committed version is moved forward (move_current_version_forward()). Raises
 	VaultScanError, having deleted nothing, when the vault cannot be read whole or for certain, and (after the
 	deletions) when an orphan cannot be removed, as the next backup would make a version of its number beside it. The caller's job then fails its attempt, with its FAILED marker: no
@@ -5351,6 +5404,9 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 		raise VaultScanError(reason)
 	for name in listing.kept:
 		backuperTeeLogToTl(job_vault_path, f'Keeping {name}: it names no folder there, and its name does not say it is the change list of a version gone', error=True)
+	if listing.cut_off is not None:
+		# the guard above found every disk of the vault there all along
+		undo_cut_off_commit(job_vault_path, listing)
 	for path in listing.stale:
 		backuperTeeLogToTl(job_vault_path, f'Vault path {path.rpartition("--")[0]} for content {os.path.basename(path)} does not exist, deleting content file...', error=True)
 		try:

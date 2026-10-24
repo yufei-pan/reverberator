@@ -1131,8 +1131,9 @@ def private_folders(job):
 @pytest.mark.parametrize('step', ['writing', 'manifest', 'swap', 'placed'])
 def test_a_crash_at_each_step_of_the_commit(tmp_path, monkeypatch, step):
 	# a kill while the list is written (however long a big one takes) or before the link names the version leaves an
-	# orphan at the link + 1, cleaned up; one between the swap and the rename leaves the link on an orphan, refused
-	# (accepted, a few syscalls wide); one after the rename leaves the version committed
+	# orphan at the link + 1, cleaned up; one between the swap and the rename leaves the link on an orphan at the newest
+	# version + 1, which nothing can hide a list of on a plain folder: the link goes back and the orphan goes; one after
+	# the rename leaves the version committed
 	job = three_versions(tmp_path)
 	committed = committed_folders(job)
 	commit_hooks(monkeypatch, kill_at=step)
@@ -1148,8 +1149,9 @@ def test_a_crash_at_each_step_of_the_commit(tmp_path, monkeypatch, step):
 		run_backup(job, keep_modified(job, 'next'))
 		assert sorted(committed_folders(job)) == [0, 1, 2, 3] and link_number(job) == 3
 	elif step == 'swap':
-		assert link_number(job) == 3 and removed == [] and isinstance(scanned, rv.VaultScanError)
-		assert os.path.isdir(os.path.join(job.job_vault, attempt[0]))
+		assert link_number(job) == 2 and removed == [os.path.join(job.job_vault, attempt[0])] and scanned == [0, 1, 2]
+		run_backup(job, keep_modified(job, 'next'))
+		assert sorted(committed_folders(job)) == [0, 1, 2, 3] and link_number(job) == 3
 	else:
 		assert link_number(job) == 3 and removed == [] and scanned == [0, 1, 2, 3]
 	assert all(os.path.isdir(path) for path in committed.values())
@@ -1157,7 +1159,8 @@ def test_a_crash_at_each_step_of_the_commit(tmp_path, monkeypatch, step):
 
 @pytest.mark.parametrize('step', ['writing', 'manifest', 'swap'])
 def test_a_crash_at_each_step_of_a_first_backups_commit(tmp_path, monkeypatch, step):
-	# a first backup's manifest names V0 from its commit on, with no link before the swap: refused from there
+	# a first backup's manifest names V0 from its commit on, with no link before the swap: on a plain folder, nothing can
+	# hide V0's list, so the V0 a kill left without one goes, and its link with it
 	job = create_job(str(tmp_path))
 	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
 	commit_hooks(monkeypatch, kill_at=step)
@@ -1167,12 +1170,10 @@ def test_a_crash_at_each_step_of_a_first_backups_commit(tmp_path, monkeypatch, s
 	attempt = [name for name in os.listdir(job.job_vault) if name.startswith('V0--')]
 	assert len(attempt) == 1
 	removed, scanned = restart_and_scan(job)
-	if step == 'writing':
-		assert removed == [os.path.join(job.job_vault, attempt[0])] and scanned == [] and private_folders(job) == []
-		run_backup(job)
-		assert sorted(committed_folders(job)) == [0]
-	else:
-		assert removed == [] and isinstance(scanned, rv.VaultScanError)
+	assert removed == [os.path.join(job.job_vault, attempt[0])] and scanned == [] and private_folders(job) == []
+	assert not os.path.lexists(os.path.join(job.job_vault, 'current_version'))
+	run_backup(job)
+	assert sorted(committed_folders(job)) == [0] and link_number(job) == 0
 
 
 def test_a_first_backups_change_list_that_cannot_be_placed_leaves_a_leftover_the_next_attempt_removes(tmp_path, monkeypatch):
@@ -1592,3 +1593,129 @@ def test_the_four_rules_telling_a_versions_change_list_agree(tmp_path):
 	assert all(told[name][0] for name in written)
 	# of the odd ones, only these are change lists: forms format_bytes() writes too
 	assert [name for name in odd if told[name][0]] == [f'{folder}--{record}{extension}' for record in ('1.00_KiB-1.00K_ino', '1.00KiB-1.00_ino', '1_B-1_ino')]
+
+
+# --- round 9, Task 3 fix round 2: a commit cut off between its link swap and its list's placement ---
+
+def vault_on(request, job, where):
+	'''The vault on a plain folder, or on a whole fake mergerfs pool of disks a and b: disk a's path, or None.'''
+	if where == 'plain':
+		return None
+	return request.getfixturevalue('fake_pool').add(job.vault, ['a', 'b'])[0]
+
+
+def cut_off_at_the_swap(job, step='swap'):
+	'''A backup of three_versions' job killed at step of its commit: the folder it left.'''
+	# a monkeypatch of its own: undoing the test's would undo a fake pool's too
+	with pytest.MonkeyPatch.context() as hooks:
+		commit_hooks(hooks, kill_at=step)
+		with pytest.raises(Killed):
+			run_backup(job, keep_modified(job, 'cut'))
+	attempt = [name for name in os.listdir(job.job_vault) if name.startswith('V3--') and os.path.isdir(os.path.join(job.job_vault, name))]
+	assert len(attempt) == 1
+	return os.path.join(job.job_vault, attempt[0])
+
+
+@pytest.mark.parametrize('where', ['plain', 'pool'])
+def test_a_kill_between_the_swap_and_the_placement_is_cleaned_up(tmp_path, monkeypatch, request, capsys, where):
+	job = three_versions(tmp_path)
+	vault_on(request, job, where)
+	attempt = cut_off_at_the_swap(job)
+	assert link_number(job) == 3
+	removed, scanned = restart_and_scan(job)
+	assert removed == [attempt] and scanned == [0, 1, 2] and link_number(job) == 2
+	out = capsys.readouterr()
+	assert f'{os.path.basename(attempt)} has no change list, though nothing can hide one' in out.out + out.err
+	run_backup(job, keep_modified(job, 'next'))
+	assert sorted(committed_folders(job)) == [0, 1, 2, 3] and link_number(job) == 3
+	every_folder_reads_right(job)
+
+
+def test_a_cut_off_commit_is_still_refused_while_a_disk_is_missing(tmp_path, monkeypatch, fake_pool):
+	job = three_versions(tmp_path)
+	attempt = cut_off_at_the_swap(job)
+	_, b = fake_pool.add(job.vault, ['a', 'b'])
+	fake_pool.drop(b)
+	rv.VAULTS_WITH_VERSIONS.clear()
+	with pytest.raises(rv.PoolNotReady) as failure:
+		rv.get_vault_info(job.job_vault)
+	assert failure.value.reason == f'disk {b} of pool {job.vault} is not mounted'
+	assert os.path.isdir(attempt) and link_number(job) == 3
+
+
+def test_a_drop_that_keeps_the_link_on_the_cut_off_commit_lets_the_next_backup_go_on(tmp_path, monkeypatch, fake_pool):
+	# current_version lives on disk a: the drop after the swap hides it, so the undo cannot put it back
+	job = three_versions(tmp_path)
+	a, _ = fake_pool.add(job.vault, ['a', 'b'])
+	link = os.path.join(job.job_vault, 'current_version')
+	hidden = str(tmp_path / 'current_version_on_disk_a')
+	real = rv.swap_current_version
+	swaps = []
+	def swapping(job_vault, text):
+		if swaps:
+			raise OSError(errno.ENOENT, 'current_version is on a disk that is out', link)
+		real(job_vault, text)
+		swaps.append(text)
+		fake_pool.drop(a)
+		os.rename(link, hidden)
+	monkeypatch.setattr(rv, 'swap_current_version', swapping)
+	with pytest.raises(rv.PoolNotReady):
+		run_backup(job, keep_modified(job, 'cut'))
+	monkeypatch.setattr(rv, 'swap_current_version', real)
+	attempt = os.path.join(job.job_vault, swaps[0])
+	fake_pool.mount(a)
+	os.rename(hidden, link)
+	assert link_number(job) == 3 and os.path.isdir(attempt)
+	# the list the commit could not place is still in its private folder, as the undo could not put the link back
+	assert private_folders(job)
+	removed, scanned = restart_and_scan(job)
+	assert removed == [attempt] and scanned == [0, 1, 2] and link_number(job) == 2 and private_folders(job) == []
+	run_backup(job, keep_modified(job, 'next'))
+	assert sorted(committed_folders(job)) == [0, 1, 2, 3] and link_number(job) == 3
+	assert open(os.path.join(committed_folders(job)[3], 'keep')).read() == 'next'
+
+
+def test_two_kills_in_a_new_jobs_first_two_backups_are_cleaned_up(tmp_path, monkeypatch):
+	# V0 committed with no link (a kill between its list and its link, by an older order), then V1 cut off after its
+	# manifest's commit: the manifest names V1, and no link names anything
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	run_backup(job)
+	os.remove(os.path.join(job.job_vault, 'current_version'))
+	commit_hooks(monkeypatch, kill_at='manifest')
+	with pytest.raises(Killed):
+		run_backup(job, keep_modified(job, 'cut'))
+	monkeypatch.undo()
+	assert rv.recorded_latest_version(job.job_vault).number == 1
+	attempt = [os.path.join(job.job_vault, name) for name in os.listdir(job.job_vault) if name.startswith('V1--')]
+	removed, scanned = restart_and_scan(job)
+	assert removed == attempt and scanned == [0] and link_number(job) == 0
+	run_backup(job, keep_modified(job, 'next'))
+	assert sorted(committed_folders(job)) == [0, 1] and link_number(job) == 1
+
+
+@pytest.mark.parametrize('case', ['link_on_a_committed_version', 'link_two_past_the_newest', 'below_the_oldest',
+	'newest_list_removed_by_hand'])
+def test_other_orphans_without_a_list_are_still_refused(tmp_path, monkeypatch, case):
+	job = three_versions(tmp_path)
+	link = os.path.join(job.job_vault, 'current_version')
+	if case == 'link_on_a_committed_version':
+		# an orphan at the newest + 1 that the link, on V1, does not name
+		write_incomplete_version(job, 3, {'keep': 'partial'})
+		rv.swap_current_version(job.job_vault, os.path.basename(version(job, 1).path))
+	elif case == 'link_two_past_the_newest':
+		orphan = write_incomplete_version(job, 4, {'keep': 'partial'}, timestamp='2021-01-05_00-00-00_-0800')
+		rv.swap_current_version(job.job_vault, os.path.basename(orphan))
+	elif case == 'newest_list_removed_by_hand':
+		# the link on V2, the newest + 1 once its list went, but no private folder holds that list
+		os.remove(version(job, 2).change_list)
+	else:
+		# V0's list gone first, and the link on V0
+		v0 = os.path.basename(version(job, 0).path)
+		for name in os.listdir(job.job_vault):
+			if name.startswith(v0 + '--') and name.endswith(rv.CONTENT_FILE_EXTENSION_NAME):
+				os.remove(os.path.join(job.job_vault, name))
+		rv.swap_current_version(job.job_vault, v0)
+	before = vault_names(job)
+	removed, scanned = restart_and_scan(job)
+	assert removed == [] and isinstance(scanned, rv.VaultScanError) and vault_names(job) == before
