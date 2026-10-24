@@ -30,7 +30,23 @@ def restore_runtime_globals(tmp_path, monkeypatch):
 	yield
 	rv.STATUS_BOARD = None
 	rv.POLL_WAIT_SECONDS = old_poll
+	stop_fs_signature_monitor()
 	rv.GREEN_LIGHT.set()
+
+
+def stop_fs_signature_monitor():
+	'''
+	End the fs signature monitor's thread a test started: GREEN_LIGHT set again would keep it running into the next
+	tests, whose memory measures would take in its passes over the mount table. A later register() starts it again.
+	'''
+	with rv.FS_SIGNATURE_MONITOR.lock:
+		thread = rv.FS_SIGNATURE_MONITOR.thread
+	if thread is None or not thread.is_alive():
+		return
+	rv.GREEN_LIGHT.clear()
+	rv.FS_SIGNATURE_MONITOR.wake()
+	thread.join(timeout=10)
+	assert not thread.is_alive(), 'the fs signature monitor did not stop'
 
 
 @pytest.fixture

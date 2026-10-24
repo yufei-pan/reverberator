@@ -211,7 +211,7 @@ def test_a_user_link_with_its_own_paths_chain_text_is_the_documented_blind_spot(
 	assert os.readlink(os.path.join(job.monitor, 'a/U')) == text
 	if chain_ground_truth.ENABLED:
 		# the ground truth found it at the prune, and lets it pass by this test's marker alone
-		assert ('prune', 'blind_spot', held, text) in chain_ground_truth.FOUND
+		assert ('prune', 'blind_spot', held, 'a/U', text) in chain_ground_truth.FOUND
 
 
 def test_a_user_link_naming_a_folder_never_wedges_pruning(tmp_path, pruning_keeps, monkeypatch):
@@ -2419,7 +2419,7 @@ def copy_version_of(job, rel):
 		manifest.close()
 
 
-@pytest.mark.chain_ground_truth_allows('refused_chain', reason='the rows of V1 are forged to refuse E/secret, which copy_version overrules')
+@pytest.mark.chain_ground_truth_allows('refused_by_rows', rels=['E/secret'], reason='the rows of V1 are forged to refuse E/secret, which copy_version overrules')
 @pytest.mark.parametrize('reader', ['comparison', 'sync', 'recopy', 'learned'])
 def test_copy_version_is_authoritative_for_the_latest_version(tmp_path, monkeypatch, reader):
 	# a row whose copy_version names an older version is followed down to it, by the links' text, whatever the rows of
