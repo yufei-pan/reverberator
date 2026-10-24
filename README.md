@@ -16,6 +16,9 @@ Design decision:
 Known limits (each in docs/limitations.md):
 	A mergerfs disk of the vault pool that is out can stop a job with a FAILED marker until it is back, and a prune while one is out could remove oldest-version copies whose links sit on it; a check that every disk is there comes in round 9.
 	A file moved and then chmod'ed, chown'ed or given new xattrs in one batch keeps its old mode, owner and xattrs in new versions until the next full comparison (at a restart, a failed attempt or an inotify overflow); round 9 fixes the order.
+	The vault database (.reverberator_manifest.sqlite) and the change lists are readable by any local user, and list every backed-up file name and size.
+	With keep-N at 41 or more, an unchanged user symlink is reached through more than 40 links, so browsing the vault by hand gives "too many levels of symbolic links" for it; restore gives it back.
+	A prune killed between its hard link and its rename can leave a hidden .<hash>.reverberator-partial in the next version until its next prune, and a restore of that folder in between writes it out too; round 9 drops it.
 
 Failure handling and log markers:
 	A job that fails (an unreadable disk, a vault that is not ready, an error in a thread) is restarted by itself, while the other jobs keep running. The retry delay starts at 60 s, doubles on each failure, and stops at 1 h. It starts again from 60 s once an attempt has run for an hour before failing. While a disk the job needs is missing, the job waits for it, and logs a failure once the wait reaches 15 min, then once an hour while it lasts.
