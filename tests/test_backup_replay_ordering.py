@@ -51,6 +51,21 @@ class TestPruneEntriesUnderDirCreates(unittest.TestCase):
 		pruned = rv.prune_entries_covered_by_dir_creates(entries)
 		self.assertEqual(list(pruned.keys()), ['/mon/venv/'])
 
+	def test_entries_the_walk_of_a_create_skips_for_a_move_are_kept(self):
+		# mkdir n; mv d n/d; chmod n/d/y; mkdir n/d/s; echo > n/d/s/f: the create of n/ leaves n/d to its move, so the
+		# chmod and the create of n/d/s stay, and n/d/s/f is left to the create of n/d/s
+		entries = OrderedDict([
+			('/mon/n/', rv.BackupEntryValues('t1', 'create', None)),
+			('/mon/n/d/', rv.BackupEntryValues('t2', 'move', '/mon/d/')),
+			('/mon/n/d/y', rv.BackupEntryValues('t3', 'attrib', None)),
+			('/mon/n/d/s/', rv.BackupEntryValues('t4', 'create', None)),
+			('/mon/n/d/s/f', rv.BackupEntryValues('t5', 'create', None)),
+			('/mon/n/x', rv.BackupEntryValues('t6', 'modify', None)),
+			('/mon/n/dx', rv.BackupEntryValues('t7', 'modify', None)),
+		])
+		pruned = rv.prune_entries_covered_by_dir_creates(entries)
+		self.assertEqual(list(pruned.keys()), ['/mon/n/', '/mon/n/d/', '/mon/n/d/y', '/mon/n/d/s/'])
+
 
 class TestOrderBackupEntriesForReplay(unittest.TestCase):
 	def test_dir_creates_come_before_descendant_file_creates(self):

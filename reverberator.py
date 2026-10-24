@@ -1232,6 +1232,10 @@ BACKUPER_LOG_PREFIX = '📥'
 HASH_SIZE = 1<<16
 # threads per job comparing entries in delta generation: the vault disks serve many lookups at once
 COMPARE_THREADS = 32
+# how long before its first event a batch's changes may date, for the ctimes the verification of the batch reads its
+# extended attributes by ( touched_scopes() ): the watcher times an event when it reads it, after the change, and a
+# ctime comes from a coarser clock
+VERIFY_CTIME_MARGIN_SECONDS = 2
 # the kernel also gives up resolving a path after 40 links
 MAX_CHAINED_LINKS = 40
 # a new version copies a file again from the vault rather than link it through more links than its name's threshold,
@@ -4157,15 +4161,20 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 	any rows of a folder it replaced, and a folder as the file path. Scans, full scans, self destructs, the root itself
 	and paths outside monitor_path are left out, and so is a scope inside a subtree (a path inside one above it: its own
 	subtree can be skipped by a pattern for folders, which the file is not).
+	changed_since is the monotonic time of the first event: an inode the batch changed (its extended attributes too, or a
+	rename of it) has a ctime from about then on. A batch handed back or resumed (round_tripped) holds its collapsed
+	entries only, timed as they were handed back, so it gives -inf, for every entry.
 
 	Examples:
 		>>> touched_scopes([ChangeEvent(1.0, True, 'move', '/m/E', '/m/D'), ChangeEvent(2.0, False, 'modify', '/m/E/f', None),
 		...     ChangeEvent(3.0, True, 'attrib', '/m/A', None), ChangeEvent(4.0, False, 'move', '/m/b', '/m/a'),
 		...     ChangeEvent(5.0, True, 'attrib', '/m', None), ChangeEvent(6.0, True, 'create', '/m/N', '/elsewhere'),
-		...     ChangeEvent(7.0, True, 'scan', '/m/S', None)], '/m')
-		TouchedScopes(subtrees=['D/', 'E/', 'N/', 'a/', 'b/'], paths=['A', 'A/', 'D', 'E', 'N', 'a', 'b'])
-		>>> touched_scopes([ChangeEvent(1.0, False, 'modify', '/etc/x', None), ChangeEvent(2.0, True, 'attrib', '/', None)], '/')
-		TouchedScopes(subtrees=['etc/x/'], paths=['etc/x'])
+		...     ChangeEvent(7.0, True, 'scan', '/m/S', None)], '/m')[:2]
+		(['D/', 'E/', 'N/', 'a/', 'b/'], ['A', 'A/', 'D', 'E', 'N', 'a', 'b'])
+		>>> touched_scopes([ChangeEvent(1.0, False, 'modify', '/etc/x', None), ChangeEvent(2.0, True, 'attrib', '/', None)], '/')[:2]
+		(['etc/x/'], ['etc/x'])
+		>>> touched_scopes([ChangeEvent(2.0, False, 'modify', '/m/x', None), ChangeEvent(1.5, False, 'modify', '/m/y', None)], '/m').changed_since
+		1.5
 	'''
 	root = os.path.abspath(monitor_path)
 	def rel_of(path):
@@ -4174,9 +4183,12 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 		return None if rel == '.' or rel == '..' or rel.startswith('../') else rel
 	subtrees = set()
 	paths = set()
+	first = None
 	for event in events:
 		if event.event in ('scan', 'full_scan', 'self_destruct'):
 			continue
+		if first is None or event.monotonic_time < first:
+			first = event.monotonic_time
 		rels = [rel_of(event.path)]
 		if event.event == 'move' and event.moved_from:
 			rels.append(rel_of(event.moved_from))
@@ -4199,7 +4211,24 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 		# by a subtree above it, or for a folder by its own subtree
 		folders = scope_folders(rel)
 		return any(folder in kept for folder in (folders if rel.endswith('/') else folders[:-1]))
-	return TouchedScopes(subtrees, sorted(rel for rel in paths if not covered(rel)))
+	changed_since = float('-inf') if first is not None and getattr(events, 'round_tripped', False) else first
+	return TouchedScopes(subtrees, sorted(rel for rel in paths if not covered(rel)), changed_since)
+
+def ctime_bound(changed_since:float) -> int:
+	'''
+	The ctime, in ns, from which an entry counts as changed by a batch whose changes date from changed_since on the
+	monotonic clock (TouchedScopes), VERIFY_CTIME_MARGIN_SECONDS before it: 0, every entry, for -inf. None for None.
+
+	Examples:
+		>>> ctime_bound(None), ctime_bound(float('-inf'))
+		(None, 0)
+		>>> abs(ctime_bound(time.monotonic()) - (time.time_ns() - VERIFY_CTIME_MARGIN_SECONDS * 10 ** 9)) < 10 ** 8
+		True
+	'''
+	if changed_since is None:
+		return None
+	ago = time.monotonic() - changed_since + VERIFY_CTIME_MARGIN_SECONDS
+	return 0 if ago == float('inf') else max(0, time.time_ns() - int(ago * 10 ** 9))
 
 def change_events_to_backup_entries(change_events:deque, monitor_path:str = None) -> OrderedDict:
 	'''
@@ -4282,11 +4311,14 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 	later = {}
 	# when the move whose entry is keyed by its destination was made
 	moved_when = {}
+	# when the event of each entry was made, or for one a move carried there, when that move was
+	entry_when = {}
 	def carried(path, bound = None, moved = False):
 		# where what was at path is at the end of the batch, as the moves after it ( after the event when was bound )
-		# carried it, each found at path or a folder above it ( its depth, not the number of moves ): path itself when
-		# none did, or when one of the path itself comes first, which the exact-path handling below takes. None when
-		# something ended it after a move carried it ( or, with moved, after bound, as the entry was carried that far )
+		# carried it, each found at path or a folder above it ( its depth, not the number of moves ), with when the last
+		# of them was made ( bound when none did ): path itself when none did, or when one of the path itself comes
+		# first, which the exact-path handling below takes. None when something ended it after a move carried it ( or,
+		# with moved, after bound, as the entry was carried that far )
 		while True:
 			best = None
 			key = path
@@ -4300,10 +4332,16 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 				key = key.rstrip('/').rpartition('/')[0]
 				key = key and key + '/'
 			if best is None or (best[2] is not None and best[1] == path):
-				return path
+				return path, bound
 			if best[2] is None:
-				return None if moved else path
+				return (None if moved else path), bound
 			path, bound, moved = best[2] + path[len(best[1]):], best[0], True
+	def stands(path, bound):
+		# whether the entry at path stands against one the move made when bound carried there: an entry of what the
+		# batch did there after that move, or of what came with it, ends it, and so does a move there from before it,
+		# which the replay still needs ( mv q F/c0; mv F G; mv D F ). any other entry from before it is of what that move
+		# replaced ( rm e/*; mv d e ), and gives way
+		return entry_when[path] <= bound or backup_entries[path].event == 'move'
 	when = 0
 	for changeEvent in reversed(change_events):
 		# get the absolute path
@@ -4335,10 +4373,11 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		when += 1
 		event_path = abs_path
 		carried_on = False
+		carry_bound = None
 		if event in ('create', 'modify', 'attrib'):
 			# a change before a move of its path or of a folder above it is replayed where the live tree has it, once the
 			# moves are made ( mv d e; chmod e/y; mv e f is an attrib of f/y )
-			now_at = carried(abs_path)
+			now_at, carry_bound = carried(abs_path)
 			if now_at is None:
 				if DEBUG:
 					backuperTeeLogToTl(abs_path,f'Skipping {event} on {abs_path}: moved, then removed')
@@ -4433,15 +4472,16 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,escalated_event,abs_path)
 					# no longer a move, it is replayed where the moves after the move it was carried it ( echo new > a;
 					# mv a d/a; mv d e is a modify of e/a ), once they are made
-					now_at = carried(moveDest, moved_when.get(moveDest), True) if own else moveDest
+					now_at, escalated_bound = carried(moveDest, moved_when.get(moveDest), True) if own else (moveDest, None)
 					if now_at is None:
 						# removed after the moves carried it ( mv d e; rm -r e ): nothing of it is copied, and what the version
 						# holds at its key goes. the key stays taken, so no earlier event of the path is replayed either
 						backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,'delete',None)
 					elif now_at != moveDest:
 						escalated = backup_entries.pop(moveDest)
-						if now_at not in backup_entries or backup_entries[now_at].event == 'attrib':
+						if now_at not in backup_entries or backup_entries[now_at].event == 'attrib' or not stands(now_at, escalated_bound):
 							backup_entries[now_at] = escalated
+							entry_when[now_at] = escalated_bound
 							backup_entries.move_to_end(now_at)
 						moveSourceToDestDict[source_key] = now_at
 				else:
@@ -4453,6 +4493,11 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 						del backup_entries[abs_path]
 					continue
 			
+		if carried_on and abs_path in backup_entries and not stands(abs_path, carry_bound):
+			# made before the move that carried this one there, and of what that move replaced
+			if DEBUG:
+				backuperTeeLogToTl(abs_path,f'  Replacing the {backup_entries[abs_path].event} on {abs_path}, made before the move that carried this {event} there')
+			del backup_entries[abs_path]
 		# handle repeated events on the same path
 		if abs_path in backup_entries:
 			if DEBUG:
@@ -4516,6 +4561,7 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 			iso_time = (datetime.datetime.now() - datetime.timedelta(seconds=time.monotonic() - changeEvent.monotonic_time)).isoformat()
 			backuperTeeLogToTl(abs_path,f'Adding {event} on {abs_path} at {iso_time} with source {abs_moved_from}')
 			backup_entries[abs_path] = BackupEntryValues(iso_time,event,abs_moved_from)
+			entry_when[abs_path] = carry_bound if carried_on else when
 			if event == 'move':
 				# the entry of a move keyed here is this one's from now
 				moved_when[abs_path] = when
@@ -5534,31 +5580,29 @@ def is_subpath(child, parent):
 	common = os.path.commonpath([child, parent])
 	return common == parent
 
-def _dir_create_prefix(dir_path:str) -> str:
-	return dir_path if dir_path.endswith('/') else dir_path + '/'
-
-def path_covered_by_dir_create(path:str, dir_path:str) -> bool:
-	'''True if path is strictly inside dir_path (dir create covers recursive copy).'''
-	prefix = _dir_create_prefix(dir_path)
-	if path == prefix or path == prefix.rstrip('/'):
-		return False
-	return path.startswith(prefix)
-
 def prune_entries_covered_by_dir_creates(backup_entries:dict) -> OrderedDict:
 	'''
-	Drop create/modify/attrib entries covered by an ancestor directory create.
+	Drop the create, modify and attrib entries the walk of a folder create above them copies.
 
-	Directory creates recursively copy their trees, so child create/modify/attrib
-	(and nested directory creates) are redundant and unsafe to replay first.
-	Deletes and moves are kept.
+	A folder create copies its tree, so the changes inside it (nested folder creates too) are redundant, and unsafe to
+	replay first. Its walk skips the batch's move destinations, which arrive by their moves (mkdir n; mv d n/d), so an
+	entry at or under one of them inside the create is kept (chmod n/d/y), unless a create below that destination copies
+	it (mkdir n/d/s; echo > n/d/s/f). Deletes and moves are kept. The cost is the depth of each entry.
 	'''
-	dir_creates = [p for p, values in backup_entries.items()
-				   if values.event == 'create' and p.endswith('/')]
-	# Also treat paths marked as dirs via trailing slash only (backup entries use /)
+	dir_creates = {path for path, values in backup_entries.items() if values.event == 'create' and path.endswith('/')}
+	move_destinations = {path for path, values in backup_entries.items() if values.event == 'move'}
 	pruned = OrderedDict()
 	for path, values in backup_entries.items():
-		if values.event in ('create', 'modify', 'attrib'):
-			if any(path_covered_by_dir_create(path, d) for d in dir_creates):
+		if values.event in ('create', 'modify', 'attrib') and dir_creates:
+			# each folder above it, nearest first: a create there copies it unless its walk skipped a destination below
+			skipped = False
+			folder = path.rstrip('/').rpartition('/')[0]
+			covered = False
+			while folder and not covered:
+				covered = not skipped and folder + '/' in dir_creates
+				skipped = skipped or folder + '/' in move_destinations
+				folder = folder.rpartition('/')[0]
+			if covered:
 				continue
 		pruned[path] = values
 	return pruned
@@ -6039,20 +6083,25 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	'''
 	Recreate the folders tracked in manifest under backup_folder and link each tracked file to its copy under source_path.
 
-	Entries missing from source_path are dropped from the manifest; one that cannot be looked at stays tracked, and is
-	made or linked as ever, with an error line, as dropping it would leave it out of the new version. Returns False when
-	the backup was interrupted. pool_guard, when given, is polled for each entry: a disk of its pools that drops stops
-	the copy with PoolNotReady.
+	Entries missing from source_path are dropped from the manifest, and so is a folder row where source_path holds no
+	real folder, and a file row where it holds one: a version whose rows hold both a file and a folder of one name, as
+	a swap of the two the collapse could not order can leave, gets the kind source_path has, and nothing is linked
+	through a link to a folder. One that cannot be looked at stays tracked, and is made or linked as ever, with an
+	error line, as dropping it would leave it out of the new version. Nothing is looked up in backup_folder for a file,
+	which is a new folder: a lookup that finds nothing is not cached on a mergerfs vault. Returns False when the backup
+	was interrupted. pool_guard, when given, is polled for each entry: a disk of its pools that drops stops the copy
+	with PoolNotReady.
 	'''
-	def missing_from_source(path:str, kind:str, rel:str) -> bool:
-		# only an entry that is not there is missing: ENOTDIR says so too, for one below a name that is a file there now
+	def source_entry(path:str, kind:str, rel:str):
+		# the lstat of a tracked entry in source_path, never followed: None when it is not there ( ENOTDIR says so too, for
+		# one below a name that is a file there now ), and False when it cannot be looked at
 		try:
-			os.lstat(path)
+			return os.lstat(path)
 		except (FileNotFoundError, NotADirectoryError):
-			return True
+			return None
 		except OSError as e:
 			backuperTeeLogToTl(path=source_path,error=True,message=f'Cannot look at tracked {kind} {rel} in {source_path}, keeping it: {e}')
-		return False
+			return False
 	global BACKUP_SEMAPHORE
 	global GREEN_LIGHT
 	backuperTeeLogToTl(path=source_path,message=f'Creating a referenced copy of {source_path} to {backup_folder}')
@@ -6066,8 +6115,14 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			backuperTeeLogToTl(path=source_path,warning=True,message=f'Dropping a tracked row that names no folder below the version: {folder!r}')
 			missing.append(folder)
 			continue
-		if missing_from_source(source_folder, 'folder', folder):
+		st = source_entry(source_folder.rstrip('/'), 'folder', folder)
+		if st is None:
 			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked folder missing from {source_path}: {folder}')
+			missing.append(folder)
+			continue
+		if st and not stat.S_ISDIR(st.st_mode):
+			# a file or a link there, a user's link to a folder too: its file row, when it has one, makes it
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked folder {folder}: {source_folder.rstrip("/")} is no folder')
 			missing.append(folder)
 			continue
 		os.makedirs(backup_folder_path,exist_ok=True)
@@ -6086,11 +6141,19 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			backuperTeeLogToTl(path=source_path,warning=True,message=f'Dropping a tracked row that names no file below the version: {file!r}')
 			missing.append(file)
 			continue
-		if missing_from_source(source_file_real, 'file', file):
+		st = source_entry(source_file_real, 'file', file)
+		if st is None:
 			# the tracked list claims a file this version does not have. linking it
 			# anyway produces a dangling link that every later version inherits and
 			# chains onto, so drop the entry here and let the list self heal.
 			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked file missing from {source_path}: {file}')
+			missing.append(file)
+			continue
+		if st and stat.S_ISDIR(st.st_mode):
+			# a link to it would let the rows under it ( a folder row of the same name made the folder already ) reach
+			# through it into source_path. the folder keeps what its rows hold, and a comparison of that place copies the
+			# file if the tree holds it
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked file {file}: it is a folder in {source_path}')
 			missing.append(file)
 			continue
 		if relative:
@@ -6100,17 +6163,14 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		# note: no longer using --logical as we are moving to use chained symlinks to reduce run time disk IO
 		#taskObj = multiCMD.run_command(['ln','-fsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
 		#mcae.run_command(['ln','-fsT',source_file,backup_file_path])
-		if os.path.isdir(backup_file_path) and not os.path.islink(backup_file_path):
-			# the folder a folder row of the same name made: the rows hold both, which a replay of a file and a folder
-			# swapped in one batch could leave, and the version only one. the folder keeps what its rows hold, and the
-			# file's row goes, as one missing does: a comparison of that place copies the file if the tree holds it
-			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked file {file}: {backup_file_path} is a folder in the new version, made for the tracked folder of that name')
-			missing.append(file)
-			continue
-		if os.path.lexists(backup_file_path):
-			os.remove(backup_file_path)
 		try:
 			os.symlink(source_file, backup_file_path)
+		except FileExistsError:
+			# a new version holds nothing there, unless a link above it ( a file row linked where rows of both kinds share
+			# a name ) leads elsewhere, which is never written through
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked file {file}: {backup_file_path} is taken in the new version')
+			missing.append(file)
+			continue
 		except FileNotFoundError:
 			# a folder above it has no row ( an older daemon made it bare for a file under it ): made, so every backup does
 			# not fail here. the next change under it copies the whole folder ( do_reverb_backup() )
@@ -6166,12 +6226,19 @@ def drop_xattrs_missing_from(source:str, dest:str):
 	without this an attribute removed from the monitored entry (setfattr -x, or an ACL by setfacl -b, which is
 	system.posix_acl_access) would stay on the vault's entry and come back on a restore. Every namespace is treated as
 	copystat() treats it, security.* and system.* too, and one this filesystem or user cannot remove is left as
-	copystat() leaves one it cannot set. Raises OSError otherwise.
+	copystat() leaves one it cannot set. A source whose filesystem keeps none (ENOTSUP, ENOSYS: a mergerfs pool switched
+	to xattr=nosys) says nothing of which it lacks, so dest keeps them all, as copystat() leaves them. Raises OSError
+	otherwise.
 	'''
 	names = xattr_names(dest)
 	if not names:
 		return
-	kept = set(xattr_names(source))
+	try:
+		kept = set(os.listxattr(source, follow_symlinks=False))
+	except OSError as e:
+		if e.errno in (errno.ENOTSUP, errno.ENOSYS):
+			return
+		raise
 	for name in names:
 		if name in kept:
 			continue
@@ -8159,11 +8226,15 @@ def read_version_record(version_path:str, rel:str, monitor_path:str, fresh:bool 
 	return record
 
 def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_path:str, monitor_path:str, fresh:bool = False, moves:'VaultMoves' = None,
-		copy_version:int = None):
+		copy_version:int = None, xattrs_since:int = None):
 	'''
 	Compare one tracked entry for delta generation, on the compare pool; with fresh, version_path is the version a
 	backup is writing (read_version_record()). moves tells the vault's links, and copy_version, the row's, where its
-	copy is, as read_vault_record() says. Returns (event or None, a record read from the vault to store or None).
+	copy is, as read_vault_record() says. With xattrs_since (ns), an entry otherwise unchanged whose ctime is not before
+	it has its extended attributes compared with the version's (xattrs_differ()), and is an attrib when they differ:
+	a change of them, or a rename, gives the inode a new ctime, so a batch's verification reads those of what the batch
+	changed only, one for a moved folder rather than one per file. A user's symlink, which keeps none here, and a
+	referenced backup's link are left out. Returns (event or None, a record read from the vault to store or None).
 	'''
 	found = None
 	if record.kind is None:
@@ -8188,10 +8259,35 @@ def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_pat
 		backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error getting stat for {monitor_entry}, treating as create')
 		return 'create', found
 	try:
-		return compare_monitor_entry(monitor_entry, monitor_stat, record), found
+		event = compare_monitor_entry(monitor_entry, monitor_stat, record)
+		if (event is None and xattrs_since is not None and monitor_stat.st_ctime_ns >= xattrs_since and record.kind not in ('l', 'r')
+				and xattrs_differ(monitor_entry, os.path.join(version_path, rel))):
+			event = 'attrib'
+		return event, found
 	except Exception as e:
 		backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error comparing {monitor_entry}: {e}, treating as modify')
 		return 'modify', found
+
+def xattrs_differ(monitor_entry:str, vault_entry:str) -> bool:
+	'''
+	Whether the extended attributes of monitor_entry, never followed, and those of vault_entry, followed as its chain
+	links lead to the copy, differ in a name or a value. One whose filesystem keeps none (ENOTSUP, ENOSYS) differs from
+	nothing: copy_file_meta() could not make the two agree. Raises OSError.
+	'''
+	def attributes(path, follow):
+		path = path.rstrip('/') or path
+		try:
+			names = os.listxattr(path, follow_symlinks=follow)
+		except OSError as e:
+			if e.errno in (errno.ENOTSUP, errno.ENOSYS):
+				return None
+			raise
+		return sorted((name, os.getxattr(path, name, follow_symlinks=follow)) for name in names)
+	live = attributes(monitor_entry, False)
+	if live is None:
+		return False
+	kept = attributes(vault_entry, True)
+	return kept is not None and live != kept
 
 def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list = None):
 	'''
@@ -8218,8 +8314,10 @@ def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list
 	yield from iter_tree_entries(path, scope_rel, skip=skip, errors=errors)
 
 # what a comparison covers: subtrees are folder rels ending with /, each compared with everything under it ('' for the
-# whole tree), and paths are file rels or folder rels ending with /, each compared alone
-TouchedScopes = namedtuple('TouchedScopes', ['subtrees', 'paths'])
+# whole tree), and paths are file rels or folder rels ending with /, each compared alone. changed_since, when not None,
+# is the time on the monotonic clock from which a batch's changes date ( -inf when it is not known ): an entry whose
+# ctime is not before it, VERIFY_CTIME_MARGIN_SECONDS to spare, has its extended attributes compared too ( ctime_bound() )
+TouchedScopes = namedtuple('TouchedScopes', ['subtrees', 'paths', 'changed_since'], defaults=(None,))
 
 def scope_folders(rel:str) -> list:
 	'''
@@ -8270,7 +8368,8 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder from a file,
 	and never read back, so their copies stay unchecked. With fresh, version_path is that uncommitted version, and a
 	file read there as a real file of its own (a re-copy, or a copy a move carried) is recorded unchecked too.
-	Without attributes, attribute-only differences are left out.
+	Without attributes, attribute-only differences are left out. With scopes.changed_since, the extended attributes of
+	the entries changed since then, by their ctime, are compared too (compare_entry()), never those of a trusted row.
 	Each subtree is walked, and the rows at or under it the walk did not find are deleted (every such row for the whole
 	tree); each path is looked up alone, a folder without its contents, and the root is never one. A scope nested in a
 	subtree is compared once, with the subtree, and so is an entry two paths name. The scopes are taken in the order of
@@ -8284,6 +8383,7 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	(read_vault_record()).
 	'''
 	start_time = time.monotonic()
+	xattrs_since = ctime_bound(scopes.changed_since)
 	skip = skip_paused(skip, paused)
 	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path if fresh else None,
 		applied=applied if fresh else None)
@@ -8357,7 +8457,8 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 					# this backup just copied it from the tree, as the kind its rel tells
 					pending.append((monitor_entry, rel, (None, None)))
 				else:
-					pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path, fresh, moves, copy_version)))
+					pending.append((monitor_entry, rel, pool.submit(compare_entry, monitor_entry, rel, record, version_path, monitor_path, fresh, moves, copy_version,
+						xattrs_since)))
 			settle(COMPARE_THREADS * 4)
 		# the entries the paths found, as X and X/ name the same one
 		path_entries = set()
@@ -8623,7 +8724,7 @@ def hash_file(path,size = ...,full_hash=False):
 def inside_folders(path:str, folders:set, start:int = 0) -> bool:
 	'''
 	Whether path lies strictly inside one of folders (paths ending with /), checking its parent folders from index start.
-	Same notion as path_covered_by_dir_create, in one set lookup per parent.
+	One set lookup per parent.
 
 	>>> inside_folders('/m/a/b/c', {'/m/a/'}), inside_folders('/m/a/b/', {'/m/a/'})
 	(True, True)
@@ -10051,7 +10152,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# what the batch's events touched is compared with the monitored tree, and the version fixed where they differ:
 		# the collapse into one entry per path cannot replay every order of moves, re-creations and deletes. the rows this
 		# replay copied are compared for presence only, so their copies stay unchecked. a mode or owner that differs
-		# ( compare_monitor_entry(), from the lstat it makes anyway ) is synced as an attrib's replay syncs it, onto the
+		# ( compare_monitor_entry(), from the lstat it makes anyway ), or the extended attributes of an entry whose ctime
+		# says the batch changed it ( ctime_bound() ), are synced as an attrib's replay syncs them, onto the
 		# latest copy, wherever it lives: what the replay missed of an attribute change
 		fixes = OrderedDict()
 		compare_scopes(fixes, manifest, backup_folder, monitor_path, touched, None if skip_list is None else skip_list.skips, paused,
