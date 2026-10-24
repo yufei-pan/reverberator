@@ -1,3 +1,4 @@
+import os
 import reverberator as rv
 
 
@@ -69,4 +70,14 @@ def test_the_suite_never_writes_the_hosts_sysctls():
 	# fails here rather than changing the host)
 	task = rv.multiCMD.run_command(['sudo', 'sysctl', 'reverberator.test.never=1'], timeout=1, quiet=True, return_object=True)
 	assert task.returncode == 1
+	assert task.stderr == ['the test suite never writes host sysctls']
+
+
+def test_a_tests_undo_keeps_the_suites_isolation(monkeypatch, tmp_path):
+	# a test's monkeypatch.undo() must not drop conftest's state folder or sysctl guard (it once sent a test's prune
+	# lock into the live daemon's /run/reverberator)
+	monkeypatch.setenv('REVERB_TEST_UNDONE', '1')
+	monkeypatch.undo()
+	assert os.environ['REVERB_STATE_DIR'] == str(tmp_path / 'state')
+	task = rv.multiCMD.run_command(['sudo', 'sysctl', 'reverberator.test.never=1'], timeout=1, quiet=True, return_object=True)
 	assert task.stderr == ['the test suite never writes host sysctls']

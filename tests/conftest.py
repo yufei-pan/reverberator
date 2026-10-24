@@ -12,7 +12,13 @@ pytest_plugins = ['tests.chain_ground_truth']
 
 
 @pytest.fixture(autouse=True)
-def restore_runtime_globals(tmp_path, monkeypatch):
+def restore_runtime_globals(tmp_path):
+	# the isolation below has a monkeypatch of its own: a test's monkeypatch.undo() would otherwise drop it too
+	with pytest.MonkeyPatch.context() as isolation:
+		yield from isolated_runtime(tmp_path, isolation)
+
+
+def isolated_runtime(tmp_path, monkeypatch):
 	old_poll = rv.POLL_WAIT_SECONDS
 	rv.GREEN_LIGHT.set()
 	# a test may write a version's change list again after its moves were read
