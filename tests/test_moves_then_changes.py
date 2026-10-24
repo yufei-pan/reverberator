@@ -596,3 +596,172 @@ def test_an_attrib_on_a_link_left_at_another_files_copy_copies_the_file(job, log
 	assert rv.entry_metadata(os.path.join(v0, 'b')) == before
 	end = resolved(job, v2, 'b')
 	assert open(end).read() == 'aaa' and mode(end) == 0o600
+
+
+# ---- fix round 3 --------------------------------------------------------------------------------------------------
+
+def assert_version_is_the_tree(job, version):
+	'''Every entry of the monitored tree is in version, of its kind and with its bytes or link text, and nothing else.'''
+	def walk(root):
+		found = set()
+		for folder, dirs, files in os.walk(root):
+			rel_folder = os.path.relpath(folder, root)
+			for name in dirs + files:
+				rel = name if rel_folder == '.' else f'{rel_folder}/{name}'
+				if not rel.startswith('.'):
+					found.add(rel)
+		return found
+	live = walk(job.monitor)
+	for rel in sorted(live):
+		path = os.path.join(job.monitor, rel)
+		got = rv.resolve_version_entry(job.job_vault, version, rel, job.monitor)
+		if os.path.islink(path):
+			assert got.kind == 'symlink' and os.readlink(got.path) == os.readlink(path), (rel, got)
+		elif os.path.isdir(path):
+			assert got.kind == 'folder', (rel, got)
+		else:
+			assert got.kind == 'file' and open(got.path, 'rb').read() == open(path, 'rb').read(), (rel, got)
+	extra = walk(version) - live
+	assert not extra, extra
+
+
+@pytest.mark.parametrize('only_sync_attributes', [True, False])
+def test_a_file_moved_in_a_folder_swapped_in_the_batch_reaches_the_version(job, logged, only_sync_attributes):
+	# fuzz seed 614: swap the folder d459 and the file b ( via t136 ), then rotate b/c1 to b/c1.1 and write a new b/c1
+	seed_monitor(job, {'d459/c1': 'c1', 'd459/x/c0': 'c0', 'b': 'b', 'keep': 'k'})
+	run_backup(job, only_sync_attributes=only_sync_attributes)
+	m = job.monitor
+	os.chmod(f'{m}/d459/x/c0', 0o600)
+	os.rename(f'{m}/d459', f'{m}/t136')
+	os.rename(f'{m}/b', f'{m}/d459')
+	os.rename(f'{m}/t136', f'{m}/b')
+	os.rename(f'{m}/b/c1', f'{m}/b/c1.1')
+	with open(f'{m}/b/c1', 'w') as f:
+		f.write('new')
+	v1 = verified(job, (False, 'attrib', 'd459/x/c0', None), (True, 'move', 't136', 'd459'), (False, 'move', 'd459', 'b'),
+		(True, 'move', 'b', 't136'), (False, 'move', 'b/c1.1', 'b/c1'), (False, 'create', 'b/c1', None), (False, 'modify', 'b/c1', None),
+		only_sync_attributes=only_sync_attributes)
+	assert_version_is_the_tree(job, v1)
+
+
+@pytest.mark.parametrize('only_sync_attributes', [True, False])
+def test_a_link_swapped_into_a_folder_swapped_in_the_batch_reaches_the_version(job, logged, only_sync_attributes):
+	# fuzz seed 483: swap the folder z/d609 and the file n929 ( via z/t188 ), then swap d41/d922/n499 with n929/l741
+	seed_monitor(job, {'z/d609/k': 'k', 'n929': 'n', 'd41/d922/n499': 'nn', 'n28/': None})
+	m = job.monitor
+	os.symlink('nowhere', f'{m}/z/d609/l741')
+	run_backup(job, only_sync_attributes=only_sync_attributes)
+	os.chmod(f'{m}/d41/d922/n499', 0o600)
+	os.chmod(f'{m}/n28', 0o700)
+	os.rename(f'{m}/z/d609', f'{m}/z/t188')
+	os.rename(f'{m}/n929', f'{m}/z/d609')
+	os.rename(f'{m}/z/t188', f'{m}/n929')
+	os.rename(f'{m}/d41/d922/n499', f'{m}/d41/d922/t281')
+	os.rename(f'{m}/n929/l741', f'{m}/d41/d922/n499')
+	os.rename(f'{m}/d41/d922/t281', f'{m}/n929/l741')
+	v1 = verified(job, (False, 'attrib', 'd41/d922/n499', None), (True, 'attrib', 'n28', None), (True, 'move', 'z/t188', 'z/d609'),
+		(False, 'move', 'z/d609', 'n929'), (True, 'move', 'n929', 'z/t188'), (False, 'move', 'd41/d922/t281', 'd41/d922/n499'),
+		(False, 'move', 'd41/d922/n499', 'n929/l741'), (False, 'move', 'n929/l741', 'd41/d922/t281'), only_sync_attributes=only_sync_attributes)
+	assert_version_is_the_tree(job, v1)
+
+
+@pytest.mark.parametrize('verify', [False, True])
+def test_a_folder_moved_into_a_new_folder_where_one_moved_away(job, logged, verify):
+	# mv n n.old; mkdir n; mv d n/d: the move falls back to a copy, which must not leave n/d out as a move target
+	seed_monitor(job, {'n/x': 'x', **{f'd/f{i}': str(i) for i in range(3)}})
+	run_backup(job)
+	m = job.monitor
+	os.rename(f'{m}/n', f'{m}/n.old')
+	os.mkdir(f'{m}/n')
+	os.rename(f'{m}/d', f'{m}/n/d')
+	events = ((True, 'move', 'n.old', 'n'), (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'))
+	v1 = verified(job, *events) if verify else run_backup(job, batch(job, *events))[-1]
+	assert_version_is_the_tree(job, v1)
+	assert not [line for line in logged if 'treating as create' in line]
+
+
+@pytest.mark.parametrize('verify', [False, True])
+def test_a_changed_file_moved_into_a_folder_moved_then_removed(job, logged, verify):
+	# echo new > a; mv a d/a; mv d e; rm -r e: the modify the move became is carried to e/a, which is gone
+	seed_monitor(job, {'a': 'a', 'd/keep': 'k', 'z': 'z'})
+	run_backup(job)
+	m = job.monitor
+	with open(f'{m}/a', 'w') as f:
+		f.write('new')
+	os.rename(f'{m}/a', f'{m}/d/a')
+	os.rename(f'{m}/d', f'{m}/e')
+	os.remove(f'{m}/e/a')
+	os.remove(f'{m}/e/keep')
+	os.rmdir(f'{m}/e')
+	events = ((False, 'modify', 'a', None), (False, 'move', 'd/a', 'a'), (True, 'move', 'e', 'd'),
+		(False, 'delete', 'e/a', None), (False, 'delete', 'e/keep', None), (True, 'delete', 'e', None))
+	v1 = verified(job, *events) if verify else run_backup(job, batch(job, *events))[-1]
+	assert_version_is_the_tree(job, v1)
+	assert_moved_cleanly(logged)
+
+
+class NothingSkipped:
+	'''A skip list with a pattern that skips nothing, so the size estimate walks folders instead of running du.'''
+	def __init__(self, monitor):
+		self.monitor = monitor
+	def __bool__(self):
+		return True
+	def skips(self, rel):
+		return False
+	def folder_rel(self, path):
+		rel = os.path.relpath(path, self.monitor)
+		return '' if rel == '.' else rel.rstrip('/') + '/'
+
+
+def test_the_estimate_leaves_a_move_inside_another_out_once(job):
+	# mkdir n; echo > n/own; mv d n/d; mv y n/d/y: both moves land in the new n, the second inside the first
+	seed_monitor(job, {'d/f': 'd' * 200000, 'y': 'y' * 300000, 'keep': 'k'})
+	run_backup(job)
+	m = job.monitor
+	os.mkdir(f'{m}/n')
+	with open(f'{m}/n/own', 'w') as f:
+		f.write('o' * 100000)
+	os.rename(f'{m}/d', f'{m}/n/d')
+	os.rename(f'{m}/y', f'{m}/n/d/y')
+	entries = batch(job, (True, 'create', 'n', None), (False, 'create', 'n/own', None), (True, 'move', 'n/d', 'd'), (False, 'move', 'n/d/y', 'y'))
+	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m))
+	assert (size, inodes) == (os.lstat(f'{m}/n/own').st_blocks * 512 + os.lstat(f'{m}/n').st_blocks * 512, 2)
+
+
+def test_touching_a_file_syncs_its_times_onto_the_copy(job, logged, monkeypatch):
+	# touch -m, three times: the row's record vouches for the copy's contents, so nothing is copied
+	seed_monitor(job, {'big': 'x' * 300000, 'keep': 'k'})
+	v0 = run_backup(job)[0]
+	run_backup(job)
+	m = job.monitor
+	copies = copies_made(monkeypatch)
+	for n in range(1, 4):
+		os.utime(f'{m}/big', ns=(n * 10 ** 18, n * 10 ** 18))
+		version = verified(job, (False, 'attrib', 'big', None))
+		end = resolved(job, version, 'big')
+		assert copies == [] and end == os.path.join(v0, 'big') and os.lstat(end).st_mtime_ns == n * 10 ** 18
+	assert_moved_cleanly(logged)
+
+
+def test_an_attrib_that_copies_is_counted_by_the_estimate(job, logged):
+	# the swap's stale link of E: the chmod of b copies it, and the estimate counts that copy
+	seed_monitor(job, {'a': 'a' * 200000, 'b': 'b' * 300000})
+	m = job.monitor
+	os.utime(f'{m}/a', ns=(10 ** 18, 10 ** 18))
+	os.utime(f'{m}/b', ns=(2 * 10 ** 18, 2 * 10 ** 18))
+	run_backup(job)
+	os.rename(f'{m}/a', f'{m}/t')
+	os.rename(f'{m}/b', f'{m}/a')
+	os.rename(f'{m}/t', f'{m}/b')
+	run_backup(job, batch(job, (False, 'move', 't', 'a'), (False, 'move', 'a', 'b'), (False, 'move', 'b', 't')))
+	os.chmod(f'{m}/b', 0o600)
+	entries = batch(job, (False, 'attrib', 'b', None))
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		latest = rv.list_versions(job.job_vault)[-1].path
+		copied = rv.attribs_to_copy(entries, manifest, m, job.job_vault, latest)
+		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
+		assert copied == {f'{m}/b'} and size >= 200000
+		assert rv.batch_rewrites(entries, m, True, ['b'], copied)[0] == {'b'}
+	finally:
+		manifest.close()

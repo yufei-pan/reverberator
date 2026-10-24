@@ -4280,14 +4280,13 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 	# out of the path, or None for what ended it there ( a delete, or a move onto it ). when counts down the batch, so the
 	# greatest is the soonest after the event at hand
 	later = {}
-	# when the move each entry of a move is keyed by was made
+	# when the move whose entry is keyed by its destination was made
 	moved_when = {}
-	def carried(path, bound = None):
+	def carried(path, bound = None, moved = False):
 		# where what was at path is at the end of the batch, as the moves after it ( after the event when was bound )
 		# carried it, each found at path or a folder above it ( its depth, not the number of moves ): path itself when
 		# none did, or when one of the path itself comes first, which the exact-path handling below takes. None when
-		# something ended it after a move carried it
-		moved = False
+		# something ended it after a move carried it ( or, with moved, after bound, as the entry was carried that far )
 		while True:
 			best = None
 			key = path
@@ -4351,7 +4350,6 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		elif event == 'move' and abs_moved_from:
 			later.setdefault(abs_moved_from, []).append((when, abs_path))
 			later.setdefault(abs_path, []).append((when, None))
-			moved_when.setdefault(abs_path, when)
 		# pre handle move events
 		if event == 'move':
 			if abs_moved_from:
@@ -4430,11 +4428,17 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 						abs_path, carried_on = event_path, False
 					if DEBUG:
 						backuperTeeLogToTl(abs_path,f'    Escalating {backup_entries[moveDest].event} to {escalated_event} at {backup_entries[moveDest].iso_time} on {moveDest}')
+					# the move's own entry, not one another move from elsewhere left at its destination
+					own = backup_entries[moveDest].event == 'move' and backup_entries[moveDest].source_path == source_key
 					backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,escalated_event,abs_path)
 					# no longer a move, it is replayed where the moves after the move it was carried it ( echo new > a;
 					# mv a d/a; mv d e is a modify of e/a ), once they are made
-					now_at = carried(moveDest, moved_when.get(moveDest))
-					if now_at is not None and now_at != moveDest:
+					now_at = carried(moveDest, moved_when.get(moveDest), True) if own else moveDest
+					if now_at is None:
+						# removed after the moves carried it ( mv d e; rm -r e ): nothing of it is copied, and what the version
+						# holds at its key goes. the key stays taken, so no earlier event of the path is replayed either
+						backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,'delete',None)
+					elif now_at != moveDest:
 						escalated = backup_entries.pop(moveDest)
 						if now_at not in backup_entries or backup_entries[now_at].event == 'attrib':
 							backup_entries[now_at] = escalated
@@ -4512,6 +4516,9 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 			iso_time = (datetime.datetime.now() - datetime.timedelta(seconds=time.monotonic() - changeEvent.monotonic_time)).isoformat()
 			backuperTeeLogToTl(abs_path,f'Adding {event} on {abs_path} at {iso_time} with source {abs_moved_from}')
 			backup_entries[abs_path] = BackupEntryValues(iso_time,event,abs_moved_from)
+			if event == 'move':
+				# the entry of a move keyed here is this one's from now
+				moved_when[abs_path] = when
 			# one carried by a later move goes after the moves, at its place once they are made
 			backup_entries.move_to_end(abs_path,last=carried_on)
 	for path in [path for path, values in backup_entries.items() if values.event == 'move' and values.source_path == path]:
@@ -4750,12 +4757,14 @@ def do_backup(backup_entries:dict,
 				if vaultInfo is None:
 					vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 				return vaultInfo, manifest, True
-			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path,skip_list = skip_list)
+			# the monitored paths the committed versions were written under, as this backup's own connection reads them:
+			# pruning, the chains of the re-copy and those of the attribute changes that copy tell their links by them
+			monitor_paths = manifest_monitor_paths(manifest)
+			# an attribute change copies its file where the vault's copy holds other contents ( do_reverb_backup() )
+			attrib_copies = attribs_to_copy(backup_entries,manifest,monitor_path,job_vault,latest_version_info.path,VaultMoves(job_vault,monitor_path,monitor_paths)) if only_sync_attributes else frozenset()
+			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies)
 			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
 			this_version_number = latest_version_info.version_number + 1
-			# the monitored paths the committed versions were written under, as this backup's own connection reads them:
-			# pruning and the chains of the re-copy tell their links by them
-			monitor_paths = manifest_monitor_paths(manifest)
 			# the files whose link chains would pass their threshold are copied again from the vault, so the size limit
 			# counts them too ( a copy in a link's place takes no inode more ). removing the oldest version moves its
 			# copies into the next one, which shortens their chains: they are counted again after each removal.
@@ -4767,7 +4776,7 @@ def do_backup(backup_entries:dict,
 				# a pass each time: the chains are walked again after each removal
 				moves = VaultMoves(job_vault,monitor_path,monitor_paths)
 				rels = recopy_rels(manifest,this_version_number,oldest_kept,job_vault,latest_version_info.path,moves)
-				rewritten, deleted = batch_rewrites(backup_entries,monitor_path,only_sync_attributes,rels) if rels else (set(), set())
+				rewritten, deleted = batch_rewrites(backup_entries,monitor_path,only_sync_attributes,rels,attrib_copies) if rels else (set(), set())
 				rels = [rel for rel in rels if rel not in deleted]
 				counted = [rel for rel in rels if rel not in rewritten]
 				return oldest_kept, rels, rewritten, recopy_size(counted,job_vault,latest_version_info.path,moves,{rel: manifest.copy_version(rel) for rel in counted})
@@ -7795,14 +7804,97 @@ def recopy_rels(manifest:VaultManifest, new_version:int, oldest_kept:int, job_va
 		manifest.commit()
 	return sorted(due)
 
-def batch_rewrites(backup_entries:dict, monitor_path:str, only_sync_attributes:bool, rels) -> tuple:
+def same_contents(source_path:str, path:str) -> bool:
+	'''
+	Whether path, the end of a link's chain, holds the contents of the monitored entry at source_path, as the comparison
+	judges them (compare_monitor_entry(): the same link text, or the same size, mtime and tail). A chain end with other
+	contents, as a swap the collapse cannot replay leaves one, never takes source_path's metadata, which would be another
+	file's there. One that cannot be looked at does not.
+	'''
+	try:
+		source, end = os.lstat(source_path), os.lstat(path)
+		if stat.S_IFMT(source.st_mode) != stat.S_IFMT(end.st_mode):
+			return False
+		if stat.S_ISLNK(source.st_mode):
+			return os.readlink(source_path) == os.readlink(path)
+		return (source.st_size, source.st_mtime_ns) == (end.st_size, end.st_mtime_ns) and hash_file(source_path,source.st_size) == hash_file(path,end.st_size)
+	except OSError:
+		return False
+
+def record_vouches(record:'ManifestRecord', source_path:str, path:str = None) -> bool:
+	'''
+	Whether a row's record (checked or unchecked) says the copy at path, the end of the row's chain, holds the monitored
+	file at source_path though their times differ (touch -m): the record has the copy's size and mtime (not checked when
+	path is None), and the monitored file's size and tail. A moved row is unverified, so a link a swap left at another
+	file's copy never vouches. One that cannot be looked at does not.
+	'''
+	if record is None or record.kind != 'f':
+		return False
+	try:
+		source = os.lstat(source_path)
+		if path is not None:
+			end = os.lstat(path)
+			if (record.size, record.mtime_ns) != (end.st_size, end.st_mtime_ns):
+				return False
+		return stat.S_ISREG(source.st_mode) and source.st_size == record.size and hash_file(source_path,source.st_size) == record.hash
+	except OSError:
+		return False
+
+def attribs_to_copy(backup_entries:dict, manifest:'VaultManifest', monitor_path:str, job_vault:str, version_path:str, moves:'VaultMoves' = None) -> set:
+	'''
+	The paths of the file attrib entries of backup_entries that the replay copies under only_sync_attributes, read before
+	it from version_path, the latest version: the end of the chain holds other contents than the monitored file, and the
+	row's record does not vouch for it (record_vouches()). A row a move of the batch lands on or under is unverified by
+	then, and is read at the path it moves from. The size limit counts these copies, and batch_rewrites() takes them as
+	written over.
+	'''
+	moved_from = {path: values.source_path for path, values in backup_entries.items() if values.event == 'move' and values.source_path}
+	root = len(monitor_path.rstrip('/'))
+	def landed_on(path):
+		# the destination of the move landing on path or the nearest folder above it, or None
+		while path not in moved_from:
+			parent = path.rstrip('/').rpartition('/')[0]
+			if len(parent) <= root:
+				return None
+			path = parent + '/'
+		return path
+	copied = set()
+	for path, values in backup_entries.items():
+		if values.event != 'attrib' or path.endswith('/'):
+			continue
+		landed = landed_on(path) if moved_from else None
+		rel = os.path.relpath(path if landed is None else moved_from[landed] + path[len(landed):], monitor_path)
+		record, copy_version = manifest.lookup_with_copy_version(rel)
+		if landed is not None:
+			record = None
+		if record is not None and record.kind == 'r':
+			continue
+		if record_vouches(record, path):
+			continue
+		end = chain_end(job_vault, version_path, rel, moves, copy_version)
+		if end is None or stat.S_ISDIR(end.st.st_mode):
+			# the replay refuses it
+			continue
+		try:
+			live_is_link = stat.S_ISLNK(os.lstat(path).st_mode)
+		except OSError:
+			continue
+		if stat.S_ISLNK(end.st.st_mode) and not live_is_link:
+			# a referenced backup's link to the file itself, or a kind the replay refuses
+			continue
+		if not same_contents(path, end.path):
+			copied.add(path)
+	return copied
+
+def batch_rewrites(backup_entries:dict, monitor_path:str, only_sync_attributes:bool, rels, copied = frozenset()) -> tuple:
 	'''
 	(rewritten, deleted): which files of rels the batch backup_entries writes over, or removes, in the version it makes,
 	by its own entry or that of a folder above it. The replay deletes first, then copies, then moves.
 	- deleted: the file or a folder above it is deleted, so a copy of it made again from the vault would be gone before
 	  anything else happens to it.
 	- rewritten: the batch creates or modifies it, moves another file onto it, copies it for an attribute change (when
-	  not only_sync_attributes), or creates or moves onto a folder above it, whose tree it copies file by file.
+	  not only_sync_attributes, or as attribs_to_copy() found it, of the paths copied), or creates or moves onto a folder
+	  above it, whose tree it copies file by file.
 	A file moved away, or in a folder moved away, is neither, as the move takes its entry along.
 
 	Examples:
@@ -7825,7 +7917,7 @@ def batch_rewrites(backup_entries:dict, monitor_path:str, only_sync_attributes:b
 		suffix = '/' if folder else ''
 		if values.event == 'delete':
 			(deleted_folders if folder else deleted_files).add(rel + suffix)
-		elif values.event in ('create', 'modify', 'move') or (values.event == 'attrib' and not only_sync_attributes and not folder):
+		elif values.event in ('create', 'modify', 'move') or (values.event == 'attrib' and not folder and (not only_sync_attributes or path in copied)):
 			(written_folders if folder else written).add(rel + suffix)
 		if values.event == 'move' and values.source_path:
 			(moved_folders if folder else moved).add(os.path.relpath(values.source_path, monitor_path) + suffix)
@@ -8520,7 +8612,7 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', count_size:bool = 
 			inodes += 1
 	return size, inodes
 
-def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None): 
+def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset()): 
 	'''
 	This function gets the size of the backup entries
 
@@ -8530,6 +8622,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 		last_vault_version_path (str): The path of the last vault version
 		monitor_path (str): The path of the monitored path
 		skip_list (SkipList): The job's skip list; with patterns, folders are measured without their skipped contents
+		copied (set): The attrib entries the replay copies under only_sync_attributes ( attribs_to_copy() )
 
 	Returns:
 		tuple: The size and inode change compared to previous backup of the backup entries
@@ -8561,7 +8654,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	for entry in backup_entries:
 		if walk_folders and backup_entries[entry].event != 'delete':
 			event = backup_entries[entry].event
-			if event in ('create', 'modify') or (not only_sync_attributes and event == 'attrib'):
+			if event in ('create', 'modify') or (event == 'attrib' and (not only_sync_attributes or entry in copied)):
 				count_size = not inside_folders(entry, sized_folders, parents_from)
 				# we do not count inode change for attrib / modify / move events
 				count_inodes = event == 'create' and not inside_folders(entry, created_folders, parents_from)
@@ -8577,7 +8670,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 				path_pending_to_get_inode_add.append(entry)
 			else:
 				total_inode_change += 1
-		elif backup_entries[entry].event == 'modify' or (not only_sync_attributes and backup_entries[entry].event == 'attrib'):
+		elif backup_entries[entry].event == 'modify' or (backup_entries[entry].event == 'attrib' and (not only_sync_attributes or entry in copied)):
 			path_pending_to_get_size.append(entry)
 			# we do not count inode change for attrib / modify / move events
 		elif backup_entries[entry].event == 'delete':
@@ -8607,6 +8700,9 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	# what a move lands on inside a created folder arrives by the move, and its create copies it not ( mkdir n; mv d n/d )
 	created = {entry for entry, values in backup_entries.items() if values.event == 'create' and entry.endswith('/')}
 	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and created and inside_folders(entry, created)]
+	# one inside another is taken out with it ( mv d n/d; mv y n/d/y )
+	carried_folders = {entry for entry in carried_in if entry.endswith('/')}
+	carried_in = [entry for entry in carried_in if not inside_folders(entry, carried_folders)]
 	if carried_in and walk_folders:
 		for entry in carried_in:
 			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list)
@@ -9494,9 +9590,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	# the rels the batch's moves land on ( a folder's ending with / ): a folder create copies its tree without them, as
 	# they arrive by their moves ( mkdir n; mv d n/d )
 	move_targets = {os.path.relpath(path,monitor_path) + ('/' if path.endswith('/') else '') for path, values in backup_entries.items() if values.event == 'move'}
+	# and those they still have to take their entries from: a copy of a folder holding one ( the fallback of a move,
+	# swapped in the batch ) leaves it to its move, which must not take the live file now at that name
+	moves_to_come = {os.path.relpath(values.source_path,monitor_path) + ('/' if path.endswith('/') else '') for path, values in backup_entries.items()
+		if values.event == 'move' and values.source_path}
 	walk_skip = None if skip_list is None else skip_list.skips
 	if move_targets:
-		walk_skip = (lambda rel: rel in move_targets) if skip_list is None else (lambda rel: rel in move_targets or skip_list.skips(rel))
+		walk_skip = (lambda rel: rel in move_targets or rel in moves_to_come) if skip_list is None else (lambda rel: rel in move_targets or rel in moves_to_come or skip_list.skips(rel))
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
 	# the links of the committed versions, on the chains the re-copy and the attribute sync follow, are told by their
 	# versions' moves, held for this backup
@@ -9687,20 +9787,6 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			kinds = ('a symlink', 'not one') if source_is_link else ('not a symlink', 'a symlink')
 			return refuse(f'it is {kinds[0]}, and its link chain ends at {end_path}, which is {kinds[1]}')
 		return end_path
-	def same_contents(source_path,path):
-		# whether path, the end of a link's chain, holds the contents of the monitored entry at source_path, as the
-		# comparison judges them ( compare_monitor_entry(): the same link text, or the same size, mtime and tail ). a chain
-		# end with other contents, as a swap the collapse cannot replay leaves one, never takes source_path's metadata,
-		# which would be another file's there. one that cannot be looked at is not
-		try:
-			source, end = os.lstat(source_path), os.lstat(path)
-			if stat.S_IFMT(source.st_mode) != stat.S_IFMT(end.st_mode):
-				return False
-			if stat.S_ISLNK(source.st_mode):
-				return os.readlink(source_path) == os.readlink(path)
-			return (source.st_size, source.st_mtime_ns) == (end.st_size, end.st_mtime_ns) and hash_file(source_path,source.st_size) == hash_file(path,end.st_size)
-		except OSError:
-			return False
 	def only_attributes_differ(source_path,path):
 		# same_contents(), with other metadata ( entry_metadata() ): the moved entry takes it. one with other contents
 		# takes nothing, and the verification copies it
@@ -9800,7 +9886,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					manifest.add(as_folder_entry(event_relative_path),dirty=True)
 				else:
 					end = attribute_end(event_source_real_path,event_relative_path) if only_sync_attributes else None
-					if isinstance(end,str) and same_contents(event_source_real_path,end):
+					if isinstance(end,str) and (same_contents(event_source_real_path,end) or record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end)):
 						# we just copy the file metadata
 						copy_file_meta(event_source_real_path,end)
 					elif only_sync_attributes and not isinstance(end,str):
@@ -9814,6 +9900,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			elif event_values.event == 'move':
 				link_source_relative_path = os.path.relpath(event_values.source_path,monitor_path)
 				link_target_relative_path = event_relative_path
+				moves_to_come.discard(link_source_relative_path + ('/' if isDir else ''))
 				if isDir and os.path.abspath(file_vault_target_path) == '/':
 					# we cannot remove root
 					backuperTeeLogToTl(path=file_vault_target_path,error=True,message='Attempting to move root, skipping')
@@ -9833,6 +9920,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					if not real_folders_to(backup_folder,link_source_relative_path,missing_ok=True) or not real_folders_to(backup_folder,link_target_relative_path,missing_ok=True):
 						# renaming would reach through the link, out of the version
 						raise NotARealFolder(f'a folder above {link_source_backup_real_path} or {link_target_backup_real_path} in the version is not a real folder')
+					if os.path.lexists(link_source_backup_real_path) and (os.path.isdir(link_source_backup_real_path.rstrip('/')) and not os.path.islink(link_source_backup_real_path.rstrip('/'))) != isDir:
+						# an earlier move of the batch left the other kind there ( a file and a folder swapped, which the
+						# collapse cannot order ): renamed, a link would stand where the rows say a folder is
+						raise NotARealFolder(f'{link_source_backup_real_path} is {"not " if isDir else ""}a folder in the version, as an earlier move of the batch left it')
 					if os.path.isdir(link_target_backup_real_path.rstrip('/')) and not os.path.islink(link_target_backup_real_path.rstrip('/')):
 						# the live rename found nothing there, or an empty folder ( rm -rf e; mv d e ): what the version
 						# still holds there is gone, and its rows ( a folder's moved rows replaced them already )
@@ -9881,6 +9972,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						copy_file_meta(event_source_real_path,link_target_backup_real_path)
 				except NotARealFolder as e:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: {e}; doing delete & copy instead')
+					# its own target is copied now, by a folder above it too ( copy_untracked_folder() )
+					move_targets.discard(event_relative_path + ('/' if isDir else ''))
 					copy_path(isDir=isDir,monitor_path=monitor_path,
 					  source_real_path=event_source_real_path,
 					  source_relative_path=event_relative_path,
@@ -9893,6 +9986,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					import traceback
 					backuperTeeLogToTl(path=monitor_path,error=True,message=traceback.format_exc())
 					backuperTeeLogToTl(path=monitor_path,message='Doing delete & copy instead')
+					move_targets.discard(event_relative_path + ('/' if isDir else ''))
 					# if we fail to move, we just copy the file
 					copy_path(isDir=isDir,monitor_path=monitor_path,
 					  source_real_path=event_source_real_path,
@@ -9990,6 +10084,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			backuperTeeLogToTl(path=monitor_path,message=f'Copied {len(copied)} of {len(recopy)} files again from the vault, as their link chains would pass their limit')
 		replay(backup_entries)
 		wait_for_async_commands(mcae)
+		# the moves are made: whatever they left out, the verification's copies take whole
+		move_targets.clear()
+		moves_to_come.clear()
 		if touched is not None and GREEN_LIGHT.is_set():
 			verify()
 	finally:
