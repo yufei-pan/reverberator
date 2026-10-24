@@ -1,6 +1,9 @@
 import errno
 import os
+import stat
 import struct
+import sys
+import time
 from collections import deque
 
 import pytest
@@ -878,3 +881,248 @@ def test_a_file_row_where_a_folder_row_was_made_is_dropped(job, logged):
 	assert open(resolved(job, version, 'n/a')).read() == 'a'
 	assert tracked(job, 'n/') and not tracked(job, 'n')
 	assert [line for line in logged if line.startswith('ERROR Dropping tracked file n') and 'is a folder' in line]
+
+
+# ---- fix round 5 --------------------------------------------------------------------------------------------------
+
+def plant_rows(job, discard=(), add=()):
+	'''Change the rows of the latest version, as an earlier daemon or a swap the collapse could not order left them.'''
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	for rel in discard:
+		manifest.discard(rel)
+	for rel in add:
+		manifest.add(rel)
+	manifest.commit()
+	manifest.close()
+
+
+@pytest.mark.parametrize('change', ['xattr', 'chmod'])
+def test_a_change_carried_into_a_folder_made_in_the_batch_reaches_the_version(job, logged, change):
+	# setfattr -n user.k0 d890/n356; mkdir n460; mv d890 n460/d890 ( fuzz seed 726 ), replayed alone: the create of n460
+	# leaves n460/d890 to its move, so the carried change is replayed there
+	seed_monitor(job, {'d890/n356': 'n', 'keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/d890/n356')
+	run_backup(job)
+	if change == 'xattr':
+		os.setxattr(f'{m}/d890/n356', 'user.k0', b'v')
+	else:
+		os.chmod(f'{m}/d890/n356', 0o600)
+	os.mkdir(f'{m}/n460')
+	os.rename(f'{m}/d890', f'{m}/n460/d890')
+	v1 = run_backup(job, batch(job, (False, 'attrib', 'd890/n356', None), (True, 'create', 'n460', None), (True, 'move', 'n460/d890', 'd890')))[-1]
+	end = resolved(job, v1, 'n460/d890/n356')
+	if change == 'xattr':
+		assert os.listxattr(end) == ['user.k0']
+	else:
+		assert mode(end) == 0o600
+	assert_left_alone(v1, 'n460/d890/n356')
+	assert_moved_cleanly(logged)
+
+
+def test_a_change_after_a_move_into_a_folder_made_in_the_batch_reaches_the_version(job, logged):
+	# mkdir n308; mv d433 n308/d433; setfattr -n user.k2 n308/d433/d902/c0 ( fuzz seed 991, batch 2 )
+	seed_monitor(job, {'d433/d902/c0': 'c', 'keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/d433/d902/c0')
+	run_backup(job)
+	os.mkdir(f'{m}/n308')
+	os.rename(f'{m}/d433', f'{m}/n308/d433')
+	os.setxattr(f'{m}/n308/d433/d902/c0', 'user.k2', b'v')
+	v1 = run_backup(job, batch(job, (True, 'create', 'n308', None), (True, 'move', 'n308/d433', 'd433'), (False, 'attrib', 'n308/d433/d902/c0', None)))[-1]
+	assert os.listxattr(resolved(job, v1, 'n308/d433/d902/c0')) == ['user.k2']
+	assert_left_alone(v1, 'n308/d433/d902/c0')
+	assert_moved_cleanly(logged)
+
+
+def test_a_folder_made_inside_a_folder_moved_into_a_new_one_is_copied_once(job, logged, monkeypatch):
+	# mkdir n; mv d n/d; mkdir n/d/s; echo f > n/d/s/f: the create of n/d/s copies n/d/s/f, and its own entry goes
+	seed_monitor(job, {'d/keep': 'k', 'top': 't'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/d/keep')
+	run_backup(job)
+	os.setxattr(f'{m}/d/keep', 'user.k', b'v')
+	os.mkdir(f'{m}/n')
+	os.rename(f'{m}/d', f'{m}/n/d')
+	os.mkdir(f'{m}/n/d/s')
+	with open(f'{m}/n/d/s/f', 'w') as fh:
+		fh.write('f')
+	copies = copies_made(monkeypatch)
+	v1 = run_backup(job, batch(job, (False, 'attrib', 'd/keep', None), (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'),
+		(True, 'create', 'n/d/s', None), (False, 'create', 'n/d/s/f', None), (False, 'modify', 'n/d/s/f', None)))[-1]
+	assert open(resolved(job, v1, 'n/d/s/f')).read() == 'f'
+	assert os.listxattr(resolved(job, v1, 'n/d/keep')) == ['user.k']
+	assert copies == [os.path.join(v1, 'n/d/s/f')]
+	assert_left_alone(v1, 'n/d/keep')
+	assert_moved_cleanly(logged)
+
+
+def test_a_file_row_over_a_folder_of_the_previous_version_is_dropped(job, logged):
+	# rows hold the file n and the file n/a, and no folder n/, while V0 holds the folder n: n's row goes, so n is never
+	# linked to V0's folder, and nothing is removed or linked through it into V0
+	seed_monitor(job, {'keep': 'k', 'n/a': 'a'})
+	v0 = run_backup(job)[0]
+	plant_rows(job, discard=['n/'], add=['n'])
+	before = os.lstat(os.path.join(v0, 'n/a'))
+	with open(f'{job.monitor}/keep', 'w') as f:
+		f.write('k2')
+	version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
+	after = os.lstat(os.path.join(v0, 'n/a'))
+	assert stat.S_ISREG(after.st_mode) and after.st_ino == before.st_ino
+	assert open(os.path.join(v0, 'n/a')).read() == 'a'
+	assert open(resolved(job, version, 'n/a')).read() == 'a'
+	assert not os.path.islink(os.path.join(version, 'n'))
+	assert not tracked(job, 'n') and tracked(job, 'n/a')
+	assert [line for line in logged if line.startswith('ERROR Dropping tracked file n') and 'is a folder' in line]
+
+
+def test_a_folder_row_over_a_users_link_to_a_folder_is_dropped(job, logged):
+	# a stale row of the folder L, where the version holds the user's link L to a folder: the link stays, as the tree has it
+	seed_monitor(job, {'keep': 'k', 'sub/a': 'a'})
+	m = job.monitor
+	os.symlink('sub', f'{m}/L')
+	run_backup(job)
+	plant_rows(job, add=['L/'])
+	with open(f'{m}/keep', 'w') as f:
+		f.write('k2')
+	version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
+	got = rv.resolve_version_entry(job.job_vault, version, 'L', m)
+	assert got.kind == 'symlink' and os.readlink(got.path) == 'sub'
+	assert tracked(job, 'L') and not tracked(job, 'L/')
+	assert [line for line in logged if line.startswith('ERROR Dropping tracked folder') and 'L/' in line]
+
+
+def test_the_referenced_copy_looks_nothing_up_in_the_new_version_for_a_file(job, monkeypatch):
+	# a vault on mergerfs keeps no negative lookups ( cache.negative_entry=0 ): one per tracked file is seconds a backup
+	seed_monitor(job, {f'd/f{i}': str(i) for i in range(50)})
+	v0 = run_backup(job)[0]
+	inside = []
+	real_copy = rv.do_referenced_copy
+	def copying(*args, **kwargs):
+		inside.append(True)
+		try:
+			return real_copy(*args, **kwargs)
+		finally:
+			inside.pop()
+	monkeypatch.setattr(rv, 'do_referenced_copy', copying)
+	looked = []
+	def by_the_daemon():
+		# called from reverberator.py, or from os.path called from it: not the chain ground truth's own lstat of each link
+		frame = sys._getframe(2)
+		if frame.f_globals.get('__name__') in ('genericpath', 'posixpath'):
+			frame = frame.f_back
+		return frame.f_code.co_filename == rv.__file__
+	def spy(real):
+		def look(path, *args, **kwargs):
+			name = os.fsdecode(path) if isinstance(path, (str, bytes)) else ''
+			if inside and name.startswith(job.job_vault) and not name.startswith(v0) and by_the_daemon():
+				looked.append(name)
+			return real(path, *args, **kwargs)
+		return look
+	monkeypatch.setattr(os, 'stat', spy(os.stat))
+	monkeypatch.setattr(os, 'lstat', spy(os.lstat))
+	with open(f'{job.monitor}/d/f0', 'w') as f:
+		f.write('changed')
+	run_backup(job, batch(job, (False, 'modify', 'd/f0', None)))
+	assert len(looked) < 10, looked
+
+
+def test_a_monitored_filesystem_without_xattrs_strips_none_from_the_vault(job, logged, monkeypatch):
+	# listxattr answers ENOTSUP for the monitored tree ( a mergerfs pool switched to xattr=nosys ): the vault's copy,
+	# V0's too, keeps its xattrs ( Samba's user.DOSATTRIB, say ), as copystat leaves them
+	seed_monitor(job, {'x': 'x', 'keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/x')
+	os.setxattr(f'{m}/x', 'user.k', b'v')
+	v0 = run_backup(job)[0]
+	real = os.listxattr
+	def unsupported(path, *args, **kwargs):
+		if os.fsdecode(path).startswith(m):
+			raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP), path)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'listxattr', unsupported)
+	os.chmod(f'{m}/x', 0o600)
+	version = verified(job, (False, 'attrib', 'x', None))
+	assert real(os.path.join(v0, 'x')) == ['user.k']
+	assert mode(resolved(job, version, 'x')) == 0o600
+	assert_moved_cleanly(logged)
+
+
+def test_an_xattr_set_before_its_folder_moved_onto_an_emptied_folder_reaches_the_version(job, logged):
+	# setfattr -n user.k1 d816/d399/c0; rm d781/d324/*; mv d816/d399 d781/d324 ( fuzz seed 996 ), replayed alone: the
+	# deletes came before the move, so they end nothing it carried to d781/d324/c0
+	seed_monitor(job, {'d816/d399/c0': 'new', 'd781/d324/c0': 'old', 'd781/d324/c1': 'c1', 'keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/d816/d399/c0')
+	run_backup(job)
+	os.setxattr(f'{m}/d816/d399/c0', 'user.k1', b'v')
+	os.remove(f'{m}/d781/d324/c0')
+	os.remove(f'{m}/d781/d324/c1')
+	os.rename(f'{m}/d816/d399', f'{m}/d781/d324')
+	entries = batch(job, (False, 'attrib', 'd816/d399/c0', None), (False, 'delete', 'd781/d324/c0', None),
+		(False, 'delete', 'd781/d324/c1', None), (True, 'move', 'd781/d324', 'd816/d399'))
+	assert entries[f'{m}/d781/d324/c0'].event == 'attrib'
+	v1 = run_backup(job, entries)[-1]
+	end = resolved(job, v1, 'd781/d324/c0')
+	assert open(end).read() == 'new' and os.listxattr(end) == ['user.k1']
+	assert sorted(os.listdir(os.path.join(v1, 'd781/d324'))) == ['c0']
+	assert_left_alone(v1, 'd781/d324/c0')
+	assert_moved_cleanly(logged)
+
+
+def test_a_change_carried_where_a_move_before_it_landed_is_fixed_by_the_verification(job, logged):
+	# chmod D/c0; mv q F/c0; mv F G; mv D F: the move into F/c0 came before the move that carried the chmod there, and
+	# the replay still needs it ( G/c0 is q ), so the carried attrib yields to it, and the verification syncs the mode
+	seed_monitor(job, {'D/c0': 'd', 'q': 'q', 'F/': None, 'keep': 'k'})
+	m = job.monitor
+	run_backup(job)
+	os.chmod(f'{m}/D/c0', 0o600)
+	os.rename(f'{m}/q', f'{m}/F/c0')
+	os.rename(f'{m}/F', f'{m}/G')
+	os.rename(f'{m}/D', f'{m}/F')
+	version = verified(job, (False, 'attrib', 'D/c0', None), (False, 'move', 'F/c0', 'q'), (True, 'move', 'G', 'F'), (True, 'move', 'F', 'D'))
+	assert_version_is_the_tree(job, version)
+	assert mode(resolved(job, version, 'F/c0')) == 0o600
+	assert open(resolved(job, version, 'G/c0')).read() == 'q'
+
+
+@pytest.mark.parametrize('only_sync_attributes', [True, False])
+def test_the_verification_syncs_xattrs_the_replay_missed(job, logged, only_sync_attributes):
+	# the batch lost the setfattr events ( a race ): the verification compares the xattrs of what the batch changed, and
+	# syncs them as an attrib's replay does, a removed one too
+	seed_monitor(job, {'D/a': 'a', 'D/b': 'b', 'keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/D/a')
+	os.setxattr(f'{m}/D/a', 'user.gone', b'g')
+	run_backup(job, only_sync_attributes=only_sync_attributes)
+	os.rename(f'{m}/D', f'{m}/D2')
+	os.setxattr(f'{m}/D2/a', 'user.new', b'n')
+	os.removexattr(f'{m}/D2/a', 'user.gone')
+	version = verified(job, (True, 'move', 'D2', 'D'), only_sync_attributes=only_sync_attributes)
+	end = resolved(job, version, 'D2/a')
+	assert os.listxattr(end) == ['user.new'] and open(end).read() == 'a'
+	assert os.path.islink(os.path.join(version, 'D2/a')) == only_sync_attributes
+	assert_left_alone(version, 'D2/b')
+	assert_moved_cleanly(logged)
+
+
+def test_the_verification_reads_the_xattrs_of_entries_the_batch_changed_only(job, logged, monkeypatch):
+	# a folder moved: its files keep their ctimes, so only the folder's own xattrs are compared, not one pair per file
+	seed_monitor(job, {f'D/f{i}': str(i) for i in range(20)})
+	m = job.monitor
+	run_backup(job)
+	monkeypatch.setattr(rv, 'VERIFY_CTIME_MARGIN_SECONDS', 0.25)
+	time.sleep(0.5)
+	taken = time.monotonic()
+	os.rename(f'{m}/D', f'{m}/E')
+	compared = []
+	real = rv.xattrs_differ
+	def spy(monitor_entry, vault_entry):
+		compared.append(monitor_entry)
+		return real(monitor_entry, vault_entry)
+	monkeypatch.setattr(rv, 'xattrs_differ', spy)
+	events = deque([rv.ChangeEvent(taken, True, 'move', f'{m}/E', f'{m}/D')])
+	run_backup(job, rv.change_events_to_backup_entries(deque(events), m), touched=rv.touched_scopes(events, m))
+	assert compared == [f'{m}/E/']
+	assert_moved_cleanly(logged)

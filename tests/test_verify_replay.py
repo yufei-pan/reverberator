@@ -296,7 +296,7 @@ def test_a_single_modify_compares_one_path(tmp_path, monkeypatch):
 	job, version = replay_sequence(tmp_path, {'a.txt': 'a', 'D/b.txt': 'b'}, {'a.txt': 'changed', 'D/b.txt': 'b'},
 		[('modify', 'a.txt', None, False)], between=lambda job: calls.append(spy_on_compare_scopes(monkeypatch)))
 	# a.txt as a file, and as a folder that would hold the rows of the folder it replaced
-	assert calls[0][:2] == [rv.TouchedScopes(['a.txt/'], ['a.txt']), 1]
+	assert calls[0][:2] == [rv.TouchedScopes(['a.txt/'], ['a.txt'], 0.0), 1]
 	assert changes(job, version) == [('a.txt', 'modify')]
 
 
@@ -304,7 +304,7 @@ def test_folder_attrib_compares_the_folder_only(tmp_path, monkeypatch):
 	calls = []
 	job, version = replay_sequence(tmp_path, {'D/x.txt': 'x', 'D/E/y.txt': 'y'}, {'D/x.txt': 'x', 'D/E/y.txt': 'y'},
 		[('attrib', 'D', None, True), ('attrib', '', None, True)], between=lambda job: calls.append(spy_on_compare_scopes(monkeypatch)))
-	assert calls[0][:2] == [rv.TouchedScopes([], ['D', 'D/']), 1]
+	assert calls[0][:2] == [rv.TouchedScopes([], ['D', 'D/'], 0.0), 1]
 	assert_version_matches_tree(job, version)
 
 
@@ -317,12 +317,17 @@ def test_touched_scopes(job):
 		rv.ChangeEvent(21.0, False, 'modify', os.path.join(job.root, 'outside.txt'), None),
 		rv.ChangeEvent(22.0, True, 'full_scan', job.monitor, None), rv.ChangeEvent(23.0, True, 'self_destruct', job.monitor, None)]
 	# each touched name in both its forms, as a file and as a folder
+	# with the time of the first event, from which the extended attributes of what changed are compared
 	assert rv.touched_scopes(events, job.monitor) == rv.TouchedScopes(['A/g.txt/', 'M/', 'N/', 'S/', 'a.txt/', 'b.txt/', 'in/'],
-		['A', 'A/', 'A/g.txt', 'M', 'N', 'S', 'a.txt', 'b.txt', 'in'])
+		['A', 'A/', 'A/g.txt', 'M', 'N', 'S', 'a.txt', 'b.txt', 'in'], 0.0)
 	assert rv.touched_scopes([], job.monitor) == rv.TouchedScopes([], [])
 	# a job monitoring the root of the filesystem
 	assert rv.touched_scopes([rv.ChangeEvent(1.0, False, 'modify', '/etc/x', None), rv.ChangeEvent(2.0, True, 'create', '/srv', None),
-		rv.ChangeEvent(3.0, True, 'attrib', '/', None)], '/') == rv.TouchedScopes(['etc/x/', 'srv/'], ['etc/x', 'srv'])
+		rv.ChangeEvent(3.0, True, 'attrib', '/', None)], '/') == rv.TouchedScopes(['etc/x/', 'srv/'], ['etc/x', 'srv'], 1.0)
+	# a batch handed back holds its collapsed entries only, timed as they were handed back: every entry's are compared
+	queue = rv.ChangeEventQueue(job.monitor)
+	queue.prepend(raw_events(job, [('modify', 'a.txt', None, False)]))
+	assert rv.touched_scopes(queue.take(), job.monitor).changed_since == float('-inf')
 
 
 def test_verification_respects_skip_list_and_paused_mounts(tmp_path, monkeypatch):
@@ -640,7 +645,8 @@ def test_backuper_passes_what_each_batch_touched(job, monkeypatch):
 		rv.GREEN_LIGHT.clear()
 		thread.join(timeout=5)
 		rv.GREEN_LIGHT.set()
-	assert passed == [rv.TouchedScopes(['a.txt/'], ['a.txt']), rv.TouchedScopes(['N/'], ['N']), None]
+	# with the time of each batch's first event, from which the verification reads the extended attributes of what changed
+	assert passed == [rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0), rv.TouchedScopes(['N/'], ['N'], 2.0), None]
 
 
 def test_the_sweep_never_follows_links(job):
@@ -934,7 +940,7 @@ def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job, monkeypatch
 	try:
 		wait_for_committed_count(job, 2)
 		time.sleep(0.5)
-		assert calls == [(1, rv.TouchedScopes(['a.txt/'], ['a.txt']))]
+		assert calls == [(1, rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0))]
 		assert not queued_full_scan(queue, lock)
 	finally:
 		stop_backuper(thread)
