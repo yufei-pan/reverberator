@@ -56,12 +56,8 @@ file from a deleted one, so:
   - Its disks are its branches: the `user.mergerfs.srcmounts` xattr of `<mount point>/.mergerfs`, split on `:`. It holds
     expanded absolute paths, with no globs and no `=RW` modes. That was checked live on all three pools, mergerfs 2.42.0.
   - Resolve each branch path (`realpath`) before testing it.
-- **Missing.** A branch is missing when it is not a mount point, or when `os.statvfs` of it fails, as for a disk that
-  failed but is still mounted. If the branch list itself cannot be read (EIO, ENOTSUP, or a mergerfs without
-  `srcmounts`), the whole pool counts as not ready, and the reason names the pool.
-- **A disk that comes back counts too.** Each check also compares every branch's mount id (field 1 of
-  `/proc/self/mountinfo`, new on every mount) with the ids taken when the step it guards began. A disk that dropped and
-  came back during a walk or a comparison therefore counts as missing for that step.
+- **Missing.** A branch is missing when no mount sits at its path (statx's `STATX_ATTR_MOUNT_ROOT`), or when its filesystem has failed while still mounted: statx of it fails (a shut-down XFS returns EIO), or, for an f2fs branch, `/sys/fs/f2fs/<device>/stat/cp_status` has the checkpoint-error bit 0x8 (f2fs keeps a dead disk mounted and serves its root from cache, so no other probe fails). If the branch list itself cannot be read (EIO, ENOTSUP, or a mergerfs without `srcmounts`), or the mount table cannot be read, the whole pool counts as not ready, and the reason names it. (Changed after review: `os.statvfs` never fails on a mounted dead XFS or f2fs disk.)
+- **A disk that comes back counts too.** Each check also compares every branch's and the pool's unique mount id (statx `STATX_MNT_ID_UNIQUE`, never reused; `/proc/self/mountinfo`'s ids are reused after an unmount) with the ids taken when the step it guards began, so a disk that dropped and came back during a walk or a comparison counts as missing for that step. Where the kernel gives no unique id (before 6.8), the mount table's ids are used, which can miss a quick remount.
 - **The pause.** While its vault pool or monitored pool has a missing disk, a job does not back up, prune or commit. It
   does not scan its vault while its vault pool has one.
   - It waits through the existing readiness flags and `wait_for_path`, logging the existing marker
