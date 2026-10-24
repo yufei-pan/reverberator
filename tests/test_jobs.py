@@ -430,7 +430,7 @@ def test_the_watcher_and_the_backuper_alert_once_for_the_startup_wait(tmp_path, 
 
 
 def test_watcher_alerts_while_waiting_for_a_lost_root(tmp_path, poll_fast, monkeypatch, capsys):
-	# once the root is lost only the watcher waits for it: the backuper waits for batches
+	# a watcher alone waiting for its lost root is the oldest wait for it, so it alerts itself
 	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 0.1)
 	root = tmp_path / 'root'
 	root.mkdir()

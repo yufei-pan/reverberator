@@ -14,19 +14,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   folder name between two backups.
 - **Approved:** 2026-10-22, the user's choice "Leave it (Recommended)" on the round 8 design's blind spot.
 
-### A pool disk missing during a scan or a prune
-
-- **Kind:** deferred (round 9).
-- **What the operator sees:** with one mergerfs disk of the vault pool out, its change lists, `current_version` or folders
-  can be hidden. A job then stops with `reverberator job <name> FAILED: ...` until the disk is back, or until it is fixed by
-  hand. A prune that runs while a disk is out could still remove copies of the oldest version whose next-version links sit
-  on the missing disk.
-- **Why:** the scan refuses anything it cannot be sure of, but nothing checks that every disk of the pool is present
-  before a scan or a prune.
-- **Revisit when:** round 9, by checking that every branch of the pool is present (mergerfs `srcmounts`) before each scan
-  and each prune, and waiting while one is missing.
-- **Approved:** 2026-10-23, the user's choice "Defer to round 9 (Recommended)".
-
 ### Attribute changes after a move in the same batch
 
 - **Kind:** deferred (round 9). This was already in 0.43.

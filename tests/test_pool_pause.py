@@ -53,10 +53,12 @@ def _v0(job):
 	manifest.close()
 
 
-def _run_backuper(job, control, to_process=None, to_process_lock=None, to_process_flag=None):
+def _run_backuper(job, control, to_process=None, to_process_lock=None, to_process_flag=None, monitor_flag=None):
 	to_process = rv.ChangeEventQueue(job.monitor) if to_process is None else to_process
-	flag = threading.Event()
-	flag.set()
+	flag = monitor_flag
+	if flag is None:
+		flag = threading.Event()
+		flag.set()
 	thread = threading.Thread(target=rv.backuper, args=(job.job_name, to_process,
 		threading.Lock() if to_process_lock is None else to_process_lock, job.monitor, job.vault, 'N/A',
 		threading.Event() if to_process_flag is None else to_process_flag, flag), kwargs=dict(job=control), daemon=True)
@@ -198,29 +200,33 @@ def test_a_disk_dropped_between_batches_pauses_the_next_one(job, fake_pool, grac
 		_stop(control, thread)
 
 
-def test_an_idle_job_reports_a_missing_vault_disk(job, fake_pool, grace, output):
+@pytest.mark.parametrize('side', ['vault', 'monitor'])
+def test_an_idle_job_reports_a_missing_vault_disk(job, fake_pool, grace, output, side):
 	# a job with nothing to back up waits for its next batch: a disk of its pool that drops meanwhile is reported
 	seed_monitor(job, {'a.txt': 'a'})
-	a, _ = fake_pool.add(job.vault, ['a', 'b'])
+	pool = job.vault if side == 'vault' else job.monitor
+	a, _ = fake_pool.add(pool, ['a', 'b'])
 	to_process = rv.ChangeEventQueue(job.monitor)
 	lock = threading.Lock()
 	to_process_flag = threading.Event()
 	control = _control(job)
-	thread = _run_backuper(job, control, to_process, lock, to_process_flag)
+	# the monitor's flag for the monitored path, which clears on a pool problem, as the daemon hands the backuper
+	monitor_flag = rv.FS_SIGNATURE_MONITOR.register(job.monitor, 'N/A') if side == 'monitor' else None
+	thread = _run_backuper(job, control, to_process, lock, to_process_flag, monitor_flag)
 	try:
 		wait_for_committed_count(job, 1)
 		fake_pool.drop(a)
-		wait_until(lambda: _marker(job.vault, f'disk {a} of pool {job.vault} is not mounted') in output(), timeout=5,
+		wait_until(lambda: _marker(pool, f'disk {a} of pool {pool} is not mounted') in output(), timeout=5,
 			message='no waiting marker')
 		fake_pool.mount(a)
-		wait_until(lambda: _goes_on(job.vault) in output(), timeout=5, message='no goes on line')
+		wait_until(lambda: _goes_on(pool) in output(), timeout=5, message='no goes on line')
 		seed_monitor(job, {'b.txt': 'b'})
 		with lock:
 			to_process.append(rv.ChangeEvent(time.monotonic(), False, 'create', os.path.join(job.monitor, 'b.txt'), None))
 		to_process_flag.set()
 		wait_for_committed_count(job, 2)
 		assert os.path.isfile(os.path.join(latest_version(job).path, 'b.txt'))
-		assert output().count(_goes_on(job.vault)) == 1
+		assert output().count(_goes_on(pool)) == 1
 	finally:
 		_stop(control, thread)
 
