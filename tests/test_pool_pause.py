@@ -201,7 +201,7 @@ def test_a_disk_dropped_between_batches_pauses_the_next_one(job, fake_pool, grac
 
 
 @pytest.mark.parametrize('side', ['vault', 'monitor'])
-def test_an_idle_job_reports_a_missing_vault_disk(job, fake_pool, grace, output, side):
+def test_an_idle_job_reports_a_missing_pool_disk(job, fake_pool, grace, output, side):
 	# a job with nothing to back up waits for its next batch: a disk of its pool that drops meanwhile is reported
 	seed_monitor(job, {'a.txt': 'a'})
 	pool = job.vault if side == 'vault' else job.monitor

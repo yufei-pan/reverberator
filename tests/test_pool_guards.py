@@ -285,3 +285,138 @@ def test_a_failed_attempt_waits_then_compares_the_whole_tree(job, fake_pool, mon
 		supervisor.join(timeout=10)
 		rv.GREEN_LIGHT.set()
 	assert not supervisor.is_alive()
+
+
+# --- fix round 1 ---
+
+def two_versions(job):
+	'''V0 holding a.txt and D/x.txt, then V1 creating b.txt, its a.txt and D/x.txt links into V0: their folders.'''
+	seed_monitor(job, {'a.txt': 'a', 'D/x.txt': 'x'})
+	assert backup(job)
+	seed_monitor(job, {'b.txt': 'b'})
+	assert backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]))
+	v0, v1 = version_folder(job, 0), version_folder(job, 1)
+	assert os.path.islink(os.path.join(v1, 'a.txt'))
+	return v0, v1
+
+
+def lists_of(job, folder):
+	name = os.path.basename(folder)
+	return [entry for entry in os.listdir(job.job_vault) if entry.startswith(name + '--') and entry.endswith(rv.CONTENT_FILE_EXTENSION_NAME)]
+
+
+def prune_finishes(job, v0, v1):
+	'''A prune with every disk there removes V0 whole, its copies now V1's.'''
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1]
+	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, 'job', job.monitor)
+	assert not os.path.lexists(v0) and lists_of(job, v0) == []
+	assert open(os.path.join(v1, 'a.txt')).read() == 'a' and not os.path.islink(os.path.join(v1, 'a.txt'))
+	assert open(os.path.join(v1, 'D/x.txt')).read() == 'x'
+
+
+def test_a_prune_never_finishes_an_oldest_version_a_missing_disk_hides(job, fake_pool, tmp_path):
+	# V0's folder lived on disk a alone: with it out, V0 reads as a removal cut short, though V1's links were never
+	# materialised
+	v0, v1 = two_versions(job)
+	a, _ = fake_pool.add(job.vault, ['a', 'b'])
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	fake_pool.drop(a)
+	hidden = str(tmp_path / 'hidden_v0')
+	os.rename(v0, hidden)
+	with pytest.raises(rv.PoolNotReady) as failure:
+		rv.decrement_stepper(info, 'job', job.monitor)
+	assert failure.value.reason == f'disk {a} of pool {job.vault} is not mounted'
+	assert lists_of(job, v0) and list(info) == [0, 1]
+	os.rename(hidden, v0)
+	fake_pool.mount(a)
+	prune_finishes(job, v0, v1)
+
+
+def test_a_disk_dropping_during_the_removal_keeps_the_oldest_versions_lists(job, fake_pool, tmp_path, monkeypatch):
+	# the part of V0 on disk a goes out of sight while rm -rf runs, and is back with the disk
+	v0, v1 = two_versions(job)
+	a, _ = fake_pool.add(job.vault, ['a', 'b'])
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	real = rv.multiCMD.run_command
+	hidden = str(tmp_path / 'hidden_part')
+	def running(command, *args, **kwargs):
+		if command[:2] == ['rm', '-rf']:
+			fake_pool.drop(a)
+			os.makedirs(hidden)
+			os.rename(os.path.join(v0, 'D'), os.path.join(hidden, 'D'))
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(rv.multiCMD, 'run_command', running)
+	with pytest.raises(rv.PoolNotReady):
+		rv.decrement_stepper(info, 'job', job.monitor)
+	monkeypatch.setattr(rv.multiCMD, 'run_command', real)
+	assert lists_of(job, v0) and list(info) == [0, 1]
+	os.makedirs(v0)
+	os.rename(os.path.join(hidden, 'D'), os.path.join(v0, 'D'))
+	fake_pool.mount(a)
+	prune_finishes(job, v0, v1)
+
+
+def test_the_scan_names_the_disk_when_a_drop_hid_a_change_list(job, fake_pool, tmp_path, monkeypatch, capsys):
+	two_versions(job)
+	a, _ = fake_pool.add(job.vault, ['a', 'b'])
+	v0_list = lists_of(job, version_folder(job, 0))[0]
+	real = rv.read_job_vault
+	def reading(*args, **kwargs):
+		fake_pool.drop(a)
+		os.rename(os.path.join(job.job_vault, v0_list), str(tmp_path / 'hidden_list'))
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'read_job_vault', reading)
+	reason = f'disk {a} of pool {job.vault} is not mounted'
+	with pytest.raises(rv.PoolNotReady) as failure:
+		rv.get_vault_info(job.job_vault)
+	assert failure.value.reason == reason and isinstance(failure.value.__cause__, rv.VaultScanError)
+	out = capsys.readouterr()
+	assert f'Cannot scan the vault, nothing in it is removed: {reason}' in out.out + out.err
+
+
+@pytest.mark.parametrize('first', [True, False], ids=['complete_v0', 'replay'])
+def test_copies_stop_while_they_are_waited_for(job, fake_pool, monkeypatch, poll_fast, tmp_path, first):
+	# slow copies, one at a time: the drop comes at the first wait for them, with every copy queued
+	if not first:
+		seed_monitor(job, {'a.txt': 'a'})
+		assert backup(job)
+	log = str(tmp_path / 'started.log')
+	real_command = rv.copy_command
+	monkeypatch.setattr(rv, 'copy_command', lambda source, target: ['sh', '-c', 'echo x >> "$0"; sleep 0.3; exec "$@"', log]
+		+ real_command(source, target))
+	monkeypatch.setattr(rv, 'BACKUP_SEMAPHORE', threading.Semaphore(1))
+	a, _ = fake_pool.add(job.vault, ['a', 'b'])
+	seed_monitor(job, files(20))
+	real_wait = rv.multiCMD.AsyncExecutor.wait
+	started_at_drop = []
+	def waiting(self, *args, **kwargs):
+		if not started_at_drop:
+			fake_pool.drop(a)
+			started_at_drop.append(len(open(log).read().split()) if os.path.exists(log) else 0)
+		return real_wait(self, *args, **kwargs)
+	monkeypatch.setattr(rv.multiCMD.AsyncExecutor, 'wait', waiting)
+	with pytest.raises(rv.PoolNotReady):
+		backup(job) if first else backup(job, OrderedDict(event_entry(job, name, 'create') for name in files(20)))
+	started = len(open(log).read().split()) if os.path.exists(log) else 0
+	assert started_at_drop and started - started_at_drop[0] <= 2, f'{started} of 20 copies started, {started_at_drop} at the drop'
+	assert len(committed_versions(job)) == (0 if first else 1)
+
+
+def test_the_change_list_is_not_placed_when_a_disk_drops_after_the_commit_check(job, fake_pool, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	assert backup(job)
+	v0 = version_folder(job, 0)
+	a, _ = fake_pool.add(job.vault, ['a', 'b'])
+	seed_monitor(job, {'b.txt': 'b'})
+	real = rv.swap_current_version
+	def swapping(*args, **kwargs):
+		result = real(*args, **kwargs)
+		fake_pool.drop(a)
+		return result
+	monkeypatch.setattr(rv, 'swap_current_version', swapping)
+	with pytest.raises(rv.PoolNotReady):
+		backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]))
+	assert committed_versions(job) == [v0]
+	assert lists_of(job, version_folder(job, 1)) == []
+	assert os.readlink(os.path.join(job.job_vault, 'current_version')) == os.path.basename(v0)
+	assert not [name for name in os.listdir(job.job_vault) if name.startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
