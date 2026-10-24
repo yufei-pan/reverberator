@@ -36,17 +36,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a vault is shared with users who must not see other jobs' file names.
 - **Approved:** 2026-10-23, the user's choice "Known limitation".
 
-### current_version left behind by a power loss
-
-- **Kind:** deferred (round 9, with the pool disk check).
-- **What the operator sees:** after a power loss, `current_version` can name the version before the newest one, because
-  the link and the change list may sit on different mergerfs disks. If a disk then also hides the newest change list, the
-  scan could take that newest version for a crashed attempt and remove it.
-- **Why:** nothing flushes the vault folder between the link swap and the list's placement. The second half needs a
-  disk to be missing, which round 9's disk check closes.
-- **Revisit when:** round 9: the disk check, plus an fsync of the job vault after the link swap.
-- **Approved:** 2026-10-23, the user's choice "Defer with the disk check (Recommended)".
-
 ### No flush before a prune's removal
 
 - **Kind:** known limitation.

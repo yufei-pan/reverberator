@@ -2141,8 +2141,8 @@ def test_a_prune_makes_no_change_list_for_the_next_version(tmp_path, monkeypatch
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
 	os.remove(v1.change_list)
 	written = []
-	real_write = rv.write_change_list
-	monkeypatch.setattr(rv, 'write_change_list', lambda name, rows: written.append((name, list(rows))) or real_write(name, rows))
+	real_prepare = rv.prepare_change_list
+	monkeypatch.setattr(rv, 'prepare_change_list', lambda name, rows: written.append((name, list(rows))) or real_prepare(name, rows))
 	assert rv.decrement_stepper(info, job.job_name, job.monitor) == (0, 0)
 	assert written == [] and v1_change_lists(job) == [] and os.path.isdir(v0.path)
 
@@ -2190,7 +2190,8 @@ def test_a_link_whose_target_lies_below_a_file_is_left_as_dangling(tmp_path, cap
 	os.symlink(chain_text(os.path.basename(v0), 'a/b'), os.path.join(v1, 'a', 'b'))
 	os.symlink(chain_text(os.path.basename(v0), 'c'), os.path.join(v1, 'c'))
 	for version in (v0, v1):
-		rv.write_change_list(rv.change_list_path(version, 4096, 3), [])
+		content = rv.change_list_path(version, 4096, 3)
+		rv.place_change_list(content, rv.prepare_change_list(content, []))
 	info = rv.get_vault_info(vault).vault_info_dict
 	capsys.readouterr()
 	rv.decrement_stepper(info, 'job', os.path.join(str(tmp_path), 'm'))

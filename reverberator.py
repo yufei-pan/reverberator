@@ -1800,18 +1800,33 @@ def fsync_path(path:str, folder:bool = False) -> None:
 	finally:
 		os.close(fd)
 
-# the private folder write_change_list() writes a change list in before renaming it into place: made by mkdtemp() in
-# the job vault, which no reader takes for a version or a change list, and removed by get_vault_info() when a crash
-# leaves it
-CHANGE_LIST_FOLDER_PREFIX = '.reverberator-change-list-'
+def fsync_vault_folder(path:str) -> None:
+	'''
+	fsync the vault folder at path on the disks themselves. On a mergerfs pool, whose fsyncdir is ENOSYS (the kernel then
+	takes every later folder fsync through the pool for done), that is the folder on each branch holding it; a branch
+	without it is passed over, and the first other error is raised once every branch was tried. A branch list that cannot
+	be read raises its OSError. Off a pool it is fsync_path(path, folder=True).
+	'''
+	pool = mergerfs_mount(read_mount_table(), path)
+	if pool is None:
+		fsync_path(path, folder=True)
+		return
+	rel = os.path.relpath(os.path.realpath(path), pool)
+	failure = None
+	for branch in read_pool_branches(pool):
+		try:
+			fsync_path(os.path.join(branch, rel), folder=True)
+		except (FileNotFoundError, NotADirectoryError):
+			pass
+		except OSError as e:
+			failure = failure or e
+	if failure is not None:
+		raise failure
 
-def write_change_list(content_file_name:str, rows:list) -> None:
-	'''
-	Write a new version's change list, its commit marker, whole or not at all (prepare_change_list(), then
-	place_change_list()): no reader ever sees part of its rows, a crash before the rename leaves the version
-	uncommitted, and no name planted or raced in the job vault can take the rows elsewhere.
-	'''
-	place_change_list(content_file_name, prepare_change_list(content_file_name, rows))
+# the private folder prepare_change_list() writes a change list in before place_change_list() renames it into place: made
+# by mkdtemp() in the job vault, which no reader takes for a version or a change list, and removed by get_vault_info()
+# when a crash leaves it
+CHANGE_LIST_FOLDER_PREFIX = '.reverberator-change-list-'
 
 def prepare_change_list(content_file_name:str, rows:list) -> str:
 	'''
@@ -1841,7 +1856,7 @@ def place_change_list(content_file_name:str, temp_path:str) -> None:
 	job_vault = os.path.dirname(os.path.abspath(content_file_name))
 	os.replace(temp_path,content_file_name)
 	try:
-		fsync_path(job_vault,folder=True)
+		fsync_vault_folder(job_vault)
 	except OSError as e:
 		backuperTeeLogToTl(content_file_name,f'Could not sync the folder of {content_file_name} to disk: {e}',warning=True)
 	discard_change_list(temp_path)
@@ -4783,18 +4798,9 @@ def do_backup(backup_entries:dict,
 		# its placement only while its list is still in its private folder, and no disk of the vault is missing
 		# (undo_cut_off_commit()); otherwise it is refused, as a missing disk may hide its list
 		prepared_list = prepare_change_list(content_file_name,content_file_content)
-		link_path = os.path.join(job_vault,'current_version')
-		# a current_version that cannot be read, or something there that is no link, fails the attempt before anything is committed, as
-		# the swap would replace what it cannot tell. so does a disk of either pool missing now, or mounted again since the
-		# batch began: a copy may have landed on no disk of the vault, or a file of a missing monitored disk may read as
-		# deleted
+		# a disk of either pool missing now, or mounted again since the batch began, fails the attempt before anything is
+		# committed: a copy may have landed on no disk of the vault, or a file of a missing monitored disk may read as deleted
 		try:
-			try:
-				os.readlink(link_path)
-			except FileNotFoundError:
-				pass
-			except OSError as e:
-				raise JobFailure(f'cannot read {link_path}: {e}: not committing {backup_folder}')
 			pool_guard.require()
 		except JobFailure:
 			discard_change_list(prepared_list)
@@ -4806,6 +4812,11 @@ def do_backup(backup_entries:dict,
 		# there, removes the version as the orphan at the link + 1, or as a commit cut off before its list was placed
 		manifest.commit(backup_folder)
 		swap_current_version(job_vault,os.path.basename(backup_folder))
+		# the link and the list may sit on different disks of a pool: the link is on its disk before the list is placed
+		try:
+			fsync_vault_folder(job_vault)
+		except OSError as e:
+			backuperTeeLogToTl(job_name,f'Could not sync {job_vault} to disk after moving current_version: {e}',warning=True)
 		# a disk dropped since the check above
 		pool_guard.require()
 		place_change_list(content_file_name,prepared_list)
@@ -4948,7 +4959,7 @@ def change_list_record(rest:str):
 # may go; stale, the paths of the change lists whose version folder is not there and whose number no folder there
 # carries; kept, the names of the entries kept as they are, though they name no folder there (whose name cannot be read,
 # or of a number a folder there carries); unfinished, the private folders of change lists a crash cut off before
-# write_change_list() renamed them into place, and the temps of the pruning secret one cut off before vault_prune_salt()
+# place_change_list() renamed them into place, and the temps of the pruning secret one cut off before vault_prune_salt()
 # linked it; cut_off, the path of the orphan of a commit cut off between its link swap and its list's placement, which is
 # among orphans, but may go only with no disk of the vault missing (get_vault_info()), or None
 VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans', 'stale', 'kept', 'unfinished', 'cut_off'])
@@ -8728,7 +8739,7 @@ def vault_prune_salt(job_vault:str, job_name:str):
 			except OSError:
 				pass
 		try:
-			fsync_path(job_vault, folder=True)
+			fsync_vault_folder(job_vault)
 		except OSError as e:
 			# the file holds the whole secret, synced: only its name may not outlast a crash, and one made again then names
 			# a temp a cut off run left otherwise, which stays a stray
