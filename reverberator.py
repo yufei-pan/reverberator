@@ -1547,7 +1547,6 @@ def run_daemon():
 			tl.teeprint(log_text(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}"))
 		backup_size_limit = reverb_rule.backup_size_limit
 		vault_path_signature = reverb_rule.vault_fs_signature
-		job_vault = os.path.join(vault_path, job_name)
 		# kept across the job's attempts, so a retry loses nothing queued
 		to_process = ChangeEventQueue(monitor_path)
 		to_process_lock = threading.Lock()
@@ -3650,12 +3649,15 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				return
 		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
 		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+		# the vault is scanned before the monitored path is waited for (the scan only reads the vault): what a killed
+		# copy left in it goes now, though the path may be long in coming back. a scan that fails fails the attempt
+		job_vault = os.path.join(vault_path,job_name)
+		scanned = get_vault_info(job_vault) if running() and os.path.isdir(job_vault) else None
 		wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 		# batches are compared with the vault only while the monitored path shows the filesystem it shows now
 		root_mount = mount_fingerprint(current_mount_table(),os.path.realpath(monitor_path))
 		if startup is not None and running():
 			# the list is read now that both filesystems are ready, so one on a disk that mounts late still loads
-			job_vault = os.path.join(vault_path,job_name)
 			recorded = None
 			if os.path.isdir(job_vault):
 				manifest = VaultManifest(job_vault)
@@ -3663,7 +3665,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			trusted = True
 			if manifest is not None:
 				# a manifest that does not describe the latest version cannot vouch for the fingerprint it recorded
-				latest_version = get_vault_info(job_vault).vault_info_dict
+				latest_version = (get_vault_info(job_vault) if scanned is None else scanned).vault_info_dict
 				trusted = not latest_version or manifest.describes(latest_version[next(reversed(latest_version))].path)
 			if not startup.load(recorded,trusted):
 				# only this job stops: its watcher sees the failure and exits too
@@ -4327,8 +4329,8 @@ def do_backup(backup_entries:dict,
 						finish_copies(pending,manifest,backup_folder,job_name,reported)
 				finally:
 					# however the backup ends, no copy is left writing into this version. a copy finish_copies did not reach
-					# means this V0 is not committed: the whole folder is removed as an orphan ( on the next attempt, or at
-					# startup after a stop ), so unlinking each partial file of a large tree first would only hold up the stop
+					# means this V0 is not committed: the whole folder is removed as an orphan ( by the job's next vault scan ), so unlinking each
+					# partial file of a large tree first would only hold up the stop
 					stop_copies(mcae,pending,backup_folder,discard=False)
 				mcae.cleanup(timeout=POLL_WAIT_SECONDS)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
@@ -4482,7 +4484,7 @@ def do_backup(backup_entries:dict,
 			if rel not in recopies_rewritten and rel not in verified_deletes and not inside_folders(rel,verified_deletes)]
 		content_file_content += [entry_row(path,values) for path,values in backup_entries.items()]
 		content_file_content += [entry_row(path,values) for path,values in verified]
-		# commit before the content file: without one the version is removed at startup, and a manifest
+		# commit before the content file: without one the version is removed by the job's vault scan, and a manifest
 		# describing a removed version is listed again from the vault
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 		# a disk mounted while this backup walked is remembered too
@@ -4696,7 +4698,8 @@ def change_list_record(rest:str):
 # may go; stale, the paths of the change lists whose version folder is not there and whose number no folder there
 # carries; kept, the names of the entries kept as they are, though they name no folder there (whose name cannot be read,
 # or of a number a folder there carries); unfinished, the private folders of change lists a crash cut off before
-# write_change_list() renamed them into place
+# write_change_list() renamed them into place, and the temps of the pruning secret one cut off before vault_prune_salt()
+# linked it
 VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans', 'stale', 'kept', 'unfinished'])
 
 # what a job vault records of its latest commit (recorded_latest_version()): number, the latest version a commit got
@@ -4795,6 +4798,11 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 			name = entry.name
 			if name.startswith(CHANGE_LIST_FOLDER_PREFIX):
 				if entry.is_dir(follow_symlinks=False):
+					unfinished.append(entry.path)
+				continue
+			if name.startswith(PRUNE_SALT_FILE_NAME + PRUNE_SALT_TEMP_INFIX):
+				# the temp a kill left before the salt file was linked into place (vault_prune_salt()); never a folder of ours
+				if not entry.is_dir(follow_symlinks=False):
 					unfinished.append(entry.path)
 				continue
 			if not (name.startswith('V') and '--' in name):
@@ -4906,7 +4914,7 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 					if versions and number < min(versions):
 						hint = 'a removal cut short by a daemon before 0.44 left it (an oldest version whose list went first: once that is sure, remove it by hand)'
 					elif number == record.number:
-						hint = 'a commit cut off between its link and its list left it (once every disk of the vault is there, remove it by hand and the job goes on)'
+						hint = 'its list may not have been listed, or a commit cut off before its list was placed left it (if it is still refused once every disk of the vault is there, remove it by hand and the job goes on)'
 					else:
 						hint = 'its list may not have been listed (check that every disk of the vault is there)'
 					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and is not the one after the latest recorded version, {record.number}: {hint}')
@@ -4950,16 +4958,19 @@ def remove_orphan(job_vault_path:str, path:str) -> bool:
 
 def remove_unfinished_change_lists(job_vault_path:str, listing:VaultListing) -> None:
 	'''
-	Remove listing.unfinished, the private folders of change lists a crash cut off before their rename into place
-	(prepare_change_list()), from a listing read_job_vault() made whole: real folders whose names begin with
-	CHANGE_LIST_FOLDER_PREFIX, which no reader takes for a version or a change list. A failure is logged, and leaves it.
+	Remove listing.unfinished, what a crash cut off, from a listing read_job_vault() made whole: the private folders of
+	change lists, real folders whose names begin with CHANGE_LIST_FOLDER_PREFIX, which no reader takes for a version or
+	a change list, before their rename into place (prepare_change_list()); and a temp of the pruning secret, a file whose
+	name begins with PRUNE_SALT_FILE_NAME and PRUNE_SALT_TEMP_INFIX, before it was linked. A failure is logged, and leaves it.
 	'''
 	for path in listing.unfinished:
-		backuperTeeLogToTl(job_vault_path, f'Removing unfinished change list: {path}', error=True)
+		folder = os.path.basename(path).startswith(CHANGE_LIST_FOLDER_PREFIX)
+		what = 'change list' if folder else 'pruning secret'
+		backuperTeeLogToTl(job_vault_path, f'Removing unfinished {what}: {path}', error=True)
 		try:
-			shutil.rmtree(path)
+			shutil.rmtree(path) if folder else os.remove(path)
 		except OSError as e:
-			backuperTeeLogToTl(job_vault_path, f'Failed to remove unfinished change list {path}: {e}', error=True)
+			backuperTeeLogToTl(job_vault_path, f'Failed to remove unfinished {what} {path}: {e}', error=True)
 
 def move_current_version_forward(job_vault_path:str, listing:VaultListing) -> None:
 	'''
@@ -8297,6 +8308,9 @@ NO_HARD_LINK_ERRNOS = frozenset({errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.
 # the file in a job vault that holds its secret for the names pruning links copies under (vault_prune_salt()): of the
 # daemon's user alone, mode 0600, as the manifest is readable by every user who can read the vault
 PRUNE_SALT_FILE_NAME = '.reverberator_prune_salt'
+# what a temp the file is written in before it is linked into place has after PRUNE_SALT_FILE_NAME; the job's vault scan
+# removes one a kill left (read_job_vault())
+PRUNE_SALT_TEMP_INFIX = '.tmp-'
 
 def vault_prune_salt(job_vault:str, job_name:str):
 	'''
@@ -8304,8 +8318,10 @@ def vault_prune_salt(job_vault:str, job_name:str):
 	bytes in its file PRUNE_SALT_FILE_NAME, made the first time they are asked for, so a restart or a remount names a
 	temp the same as the run that made it, and no user can work a name out.
 
-	The file is made with O_CREAT, O_EXCL and O_NOFOLLOW at mode 0600 (and fchmod to it, whatever the umask), then synced
-	with the job vault; when another made it first, the file that won is read. A file there is taken only when it is,
+	The 16 bytes are written to a temp beside it (PRUNE_SALT_FILE_NAME and PRUNE_SALT_TEMP_INFIX, then random hex) made
+	with O_CREAT, O_EXCL and O_NOFOLLOW at mode 0600 (and fchmod to it, whatever the umask), synced, and hard linked to
+	PRUNE_SALT_FILE_NAME, so no file with part of the secret is ever there; the temp is removed and the job vault synced.
+	When another linked it first (EEXIST), the file that won is read. A file there is taken only when it is,
 	opened with O_NOFOLLOW, a regular file of the daemon's own user (root) at mode 0600 holding exactly PRUNE_SALT_BYTES
 	bytes, and it is never deleted or written over. None, with a warning, when there is no secret to be had: pruning
 	then names its temps by the copy's inode alone, for this run.
@@ -8341,34 +8357,37 @@ def vault_prune_salt(job_vault:str, job_name:str):
 			raise ValueError(f'is not taken from {path}: it holds {"more than " if len(secret) > PRUNE_SALT_BYTES else ""}{len(secret)} bytes, not {PRUNE_SALT_BYTES}')
 		return secret
 	def make_secret(secret:bytes) -> bool:
-		# the file made to hold secret, synced with the job vault: False when another was there first. raises OSError
+		# the file made to hold secret whole, synced with the job vault: False when another was there first. raises OSError.
+		# written to a temp of its own and linked into place, so no file with part of the secret (or none) is ever there
+		temp = path + PRUNE_SALT_TEMP_INFIX + os.urandom(8).hex()
+		fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
 		try:
-			fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-		except FileExistsError:
-			return False
-		try:
-			os.fchmod(fd, 0o600)
-			left = memoryview(secret)
-			while left:
-				left = left[os.write(fd, left):]
-			os.fsync(fd)
-		except BaseException:
-			# the file this call made, and nothing else: it holds no whole secret, and would be refused from now on
 			try:
-				if same_inode(os.lstat(path), os.fstat(fd)):
-					os.remove(path)
+				os.fchmod(fd, 0o600)
+				left = memoryview(secret)
+				while left:
+					left = left[os.write(fd, left):]
+				os.fsync(fd)
+			finally:
+				os.close(fd)
+			try:
+				os.link(temp, path)
+				won = True
+			except FileExistsError:
+				won = False
+		finally:
+			# the temp is this call's own, and never read as the secret: a kill before this leaves it to the job's vault scan
+			try:
+				os.remove(temp)
 			except OSError:
 				pass
-			os.close(fd)
-			raise
-		os.close(fd)
 		try:
 			fsync_path(job_vault, folder=True)
 		except OSError as e:
 			# the file holds the whole secret, synced: only its name may not outlast a crash, and one made again then names
 			# a temp a cut off run left otherwise, which stays a stray
 			backuperTeeLogToTl(job_name, f"The vault's secret for pruning's temp names was made in {path}, but {job_vault} cannot be synced: {e}", warning=True)
-		return True
+		return won
 	try:
 		secret = read_secret()
 		if secret is None:

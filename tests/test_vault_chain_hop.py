@@ -409,7 +409,7 @@ def test_a_change_list_appears_whole_or_not_at_all(job, monkeypatch):
 	lists = [path for path in written if path.endswith(rv.CONTENT_FILE_EXTENSION_NAME)]
 	assert lists and all(os.path.basename(os.path.dirname(path)).startswith(rv.CHANGE_LIST_FOLDER_PREFIX) for path in lists)
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
-	# a crash, unlike the error, leaves what was written of the list: the next start removes it with the version
+	# a crash, unlike the error, leaves what was written of the list: the next scan of the vault removes it with the version
 	v1 = [os.path.join(job.job_vault, name) for name in os.listdir(job.job_vault) if name.startswith('V1--')]
 	assert len(v1) == 1
 	leftover = os.path.join(job.job_vault, rv.CHANGE_LIST_FOLDER_PREFIX + 'crashed', f'{os.path.basename(v1[0])}--8.00_KiB-2_ino{rv.CONTENT_FILE_EXTENSION_NAME}')

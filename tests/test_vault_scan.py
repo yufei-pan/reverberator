@@ -497,12 +497,12 @@ def test_a_removal_cut_short_between_folder_and_list_leaves_a_list_the_scan_dele
 
 @pytest.mark.parametrize('number, hint', [
 	(0, 'a removal cut short by a daemon before 0.44'),
-	(2, 'a commit cut off between its link and its list'),
+	(2, 'its list may not have been listed, or a commit cut off before its list was placed left it (if it is still refused once every disk of the vault is there, remove it by hand and the job goes on)'),
 	(5, 'its list may not have been listed (check that every disk of the vault is there)'),
 ], ids=['below_the_oldest', 'the_one_the_link_names', 'past_the_one_after'])
 def test_an_orphans_refusal_says_what_may_have_left_it(tmp_path, number, hint):
 	# current_version names V2: V0, below the oldest committed version, may be a removal cut short; V2, the number the
-	# record names, a commit cut off after its link; V5, neither it nor the one after, may be out of the listing. Each
+	# record names, a commit cut off after its link or a list a disk hides; V5, neither it nor the one after, may be out of the listing. Each
 	# one line, and nothing is removed
 	job = three_versions(tmp_path)
 	if number == 5:
@@ -515,7 +515,7 @@ def test_an_orphans_refusal_says_what_may_have_left_it(tmp_path, number, hint):
 	reason = failure.value.reason
 	assert '\n' not in reason and hint in reason
 	# and not the other hints
-	assert sum(other in reason for other in ('a removal cut short', 'a commit cut off', 'may not have been listed')) == 1
+	assert sum(other in reason for other in ('a removal cut short', 'a commit cut off before its list', '(check that every disk of the vault is there)')) == 1
 	assert_nothing_done(job, before, backup_keeping_two(job))
 
 
