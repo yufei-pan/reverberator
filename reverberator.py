@@ -1835,17 +1835,16 @@ def place_change_list(content_file_name:str, temp_path:str) -> None:
 	'''
 	A change list prepare_change_list() wrote at temp_path renamed into place, the commit point of its version, then the
 	job vault fsynced and the private folder removed. A failed sync of the folder after the rename is only logged, as
-	the version is committed by then.
+	the version is committed by then. A rename that fails raises, and leaves the list in its private folder: the job's
+	next scan tells the version's commit was cut off by it (read_job_vault()).
 	'''
 	job_vault = os.path.dirname(os.path.abspath(content_file_name))
+	os.replace(temp_path,content_file_name)
 	try:
-		os.replace(temp_path,content_file_name)
-		try:
-			fsync_path(job_vault,folder=True)
-		except OSError as e:
-			backuperTeeLogToTl(content_file_name,f'Could not sync the folder of {content_file_name} to disk: {e}',warning=True)
-	finally:
-		discard_change_list(temp_path)
+		fsync_path(job_vault,folder=True)
+	except OSError as e:
+		backuperTeeLogToTl(content_file_name,f'Could not sync the folder of {content_file_name} to disk: {e}',warning=True)
+	discard_change_list(temp_path)
 
 def discard_change_list(temp_path:str) -> None:
 	'''The private folder of a change list prepare_change_list() wrote at temp_path removed, with what is left in it.'''
@@ -4780,19 +4779,20 @@ def do_backup(backup_entries:dict,
 		# names this version, so a crash there leaves an orphan at the link + 1, which the next scan removes. then the
 		# manifest, current_version, and the list's rename into place, the commit point, last: neither record ever
 		# names a version before this one while this one's list is there, so the scan can take the version after the
-		# link for a leftover (read_job_vault()), and one the link names without a list is never removed
+		# link for a leftover (read_job_vault()). one the records name without a list is taken for a commit cut off before
+		# its placement only while its list is still in its private folder, and no disk of the vault is missing
+		# (undo_cut_off_commit()); otherwise it is refused, as a missing disk may hide its list
 		prepared_list = prepare_change_list(content_file_name,content_file_content)
 		link_path = os.path.join(job_vault,'current_version')
-		# the link as it is before the commit, which an undo puts back: None only when there is none (a first backup). one
-		# that cannot be read, or something there that is no link, fails the attempt before anything is committed, as an
-		# undo would take a later backup for a first one, or replace what it cannot tell. so does a disk of either pool
-		# missing now, or mounted again since the batch began: a copy may have landed on no disk of the vault, or a file
-		# of a missing monitored disk may read as deleted
+		# a current_version that cannot be read, or something there that is no link, fails the attempt before anything is committed, as
+		# the swap would replace what it cannot tell. so does a disk of either pool missing now, or mounted again since the
+		# batch began: a copy may have landed on no disk of the vault, or a file of a missing monitored disk may read as
+		# deleted
 		try:
 			try:
-				previous_link = os.readlink(link_path)
+				os.readlink(link_path)
 			except FileNotFoundError:
-				previous_link = None
+				pass
 			except OSError as e:
 				raise JobFailure(f'cannot read {link_path}: {e}: not committing {backup_folder}')
 			pool_guard.require()
@@ -4800,55 +4800,15 @@ def do_backup(backup_entries:dict,
 			discard_change_list(prepared_list)
 			manifest.rollback()
 			raise
-		try:
-			manifest.commit(backup_folder)
-			swap_current_version(job_vault,os.path.basename(backup_folder))
-		except BaseException as e:
-			if isinstance(e, Exception):
-				discard_change_list(prepared_list)
-			# else the interpreter is going: the records may name this version, and the list left in its private folder tells
-			# the scan the commit was cut off (undo_cut_off_commit()), as after a kill
-			if isinstance(e, Exception) and previous_link is None:
-				link_there = entry_there(link_path)
-				if link_there is None:
-					backuperTeeLogToTl(job_name,f'Cannot tell whether {link_path} was made after the commit failed: leaving the records as they are',error=True)
-				elif not link_there:
-					# a first backup whose link could not be made: a manifest naming V0 with no link would be refused for
-					# good, so it records no version again, as before the backup began
-					try:
-						manifest.forget_version()
-					except sqlite3.Error as undo_error:
-						backuperTeeLogToTl(job_name,f'Cannot drop the version the manifest records after {link_path} could not be made: {undo_error}',error=True)
-			raise
-		try:
-			# a disk dropped since the check above: the list could be made in its empty folder on the root disk, and be hidden
-			# once it is back
-			pool_guard.require()
-			place_change_list(content_file_name,prepared_list)
-		except BaseException as e:
-			# its private folder goes once the records are back (place_change_list() removes it too); while they name this
-			# version, the list left in it tells the scan the commit was cut off (undo_cut_off_commit())
-			undone = True
-			list_there = entry_there(content_file_name) if isinstance(e, Exception) else True
-			if list_there is None:
-				# the rename may have been made: the version may be committed, so the records stay on it
-				backuperTeeLogToTl(job_name,f'Cannot tell whether {content_file_name} is in place after its rename failed: leaving the records as they are',error=True)
-			elif not list_there:
-				# the version is not committed: the link goes back to the one that is, so the scan of the next attempt
-				# removes this one as the version after the link
-				try:
-					if previous_link is None:
-						# a first backup: no link, and a manifest that records no version, as before it began
-						os.remove(link_path)
-						manifest.forget_version()
-					else:
-						swap_current_version(job_vault,previous_link)
-				except (OSError, sqlite3.Error) as undo_error:
-					undone = False
-					backuperTeeLogToTl(job_name,f'Cannot put {link_path} back to {previous_link} after the change list failed: {undo_error}',error=True)
-			if undone:
-				discard_change_list(prepared_list)
-			raise
+		# from here on the records name this version. a failure, a kill, or a disk dropping leaves them and the list in its
+		# private folder as they are: nothing is written while a disk may be out (a link or a list could land in its
+		# empty folder on the root disk, and be hidden once it is back), and the job's next scan, once every disk is
+		# there, removes the version as the orphan at the link + 1, or as a commit cut off before its list was placed
+		manifest.commit(backup_folder)
+		swap_current_version(job_vault,os.path.basename(backup_folder))
+		# a disk dropped since the check above
+		pool_guard.require()
+		place_change_list(content_file_name,prepared_list)
 		# a vault this daemon committed to has versions: one that later shows none went away under it
 		VAULTS_WITH_VERSIONS.add(os.path.abspath(job_vault))
 		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)
@@ -4861,19 +4821,6 @@ def do_backup(backup_entries:dict,
 		if opened_manifest:
 			manifest.close()
 		raise
-
-def entry_there(path:str):
-	'''
-	True when lstat() finds path, False when it is not there (ENOENT, or ENOTDIR: a name above it is no folder), None when
-	that cannot be told, as on EIO: an undo decides only on a False.
-	'''
-	try:
-		os.lstat(path)
-	except (FileNotFoundError, NotADirectoryError):
-		return False
-	except OSError:
-		return None
-	return True
 
 def swap_current_version(job_vault:str, text:str) -> None:
 	'''Point job_vault's current_version link at text, swapped in under a temporary name, so the link is never missing.'''
@@ -5287,9 +5234,11 @@ def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 	'''
 	The records of listing.cut_off, a commit cut off before its list was placed, put back as they were before it, so
 	the scan removes it as the orphan at the link + 1: current_version swapped back to the newest committed version
-	(swap_current_version(), the commit's own atomic replace), or removed when there is none. Only once the vault was
-	read whole with no disk of it missing, as nothing can hide a list then. Raises VaultScanError, having deleted
-	nothing, when that fails: the orphan would be removed with the link still on it.
+	(swap_current_version(), the commit's own atomic replace), or, when there is none, removed and the manifest's
+	recorded version forgotten, as before a first backup began, so a redo that fails before its commit leaves a
+	leftover the next scan removes. Only once the vault was read whole with no disk of it missing, as nothing can hide
+	a list then. Raises VaultScanError, having deleted nothing, when that fails: the orphan would be removed with the
+	link still on it.
 	'''
 	link_path = os.path.join(job_vault_path, 'current_version')
 	name = os.path.basename(listing.cut_off)
@@ -5302,8 +5251,28 @@ def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 		else:
 			with contextlib.suppress(FileNotFoundError):
 				os.remove(link_path)
-	except OSError as e:
+			forget_recorded_version(job_vault_path)
+	except (OSError, sqlite3.Error) as e:
 		raise VaultScanError(f'cannot undo the records of {name}, a commit cut off before its list was placed ({where}): {e}')
+
+def forget_recorded_version(job_vault_path:str) -> None:
+	'''
+	The version job_vault_path's manifest records forgotten, when there is a manifest: opened as recorded_latest_version()
+	opens it, creating nothing. Raises sqlite3.Error.
+	'''
+	path = os.path.join(job_vault_path, MANIFEST_FILE_NAME)
+	if not os.path.lexists(path):
+		return
+	conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=rw', uri=True, timeout=1)
+	try:
+		with conn:
+			conn.execute("DELETE FROM meta WHERE key = 'version'")
+	except sqlite3.OperationalError as e:
+		# a manifest that never had its meta table records no version
+		if 'no such table' not in str(e):
+			raise
+	finally:
+		conn.close()
 
 def remove_unfinished_change_lists(job_vault_path:str, listing:VaultListing) -> None:
 	'''
@@ -6407,10 +6376,6 @@ class VaultManifest:
 	@property
 	def in_transaction(self) -> bool:
 		return self.conn.in_transaction
-
-	def forget_version(self):
-		'''Record no version: a first backup's commit undone before its change list was written (do_backup()).'''
-		self.conn.execute("DELETE FROM meta WHERE key = 'version'")
 
 	def _set_version(self, version_path:str):
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (os.path.basename(os.path.normpath(version_path)),))
