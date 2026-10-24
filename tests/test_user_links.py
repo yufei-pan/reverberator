@@ -1614,33 +1614,72 @@ def test_a_secret_file_that_fails_the_checks_is_left_and_pruning_names_by_the_in
 	assert numbers(job) == [1, 2] and open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
 
 
+def salt_temps(job):
+	return [name for name in os.listdir(job.job_vault) if name.startswith(rv.PRUNE_SALT_FILE_NAME + rv.PRUNE_SALT_TEMP_INFIX)]
+
+
 def test_a_secret_file_another_made_first_is_the_one_read(tmp_path, monkeypatch):
 	job = fresh_job(tmp_path)
 	theirs = bytes(range(100, 116))
-	real_open = os.open
-	def racing_open(path, flags, *args, **kwargs):
-		if os.fspath(path) == salt_file(job) and flags & os.O_EXCL:
-			fd = real_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-			os.write(fd, theirs)
-			os.close(fd)
-		return real_open(path, flags, *args, **kwargs)
-	monkeypatch.setattr(rv.os, 'open', racing_open)
+	real_link = os.link
+	def racing_link(source, dest, *args, **kwargs):
+		if os.fspath(dest) == salt_file(job):
+			with open(dest, 'wb') as f:
+				f.write(theirs)
+			os.chmod(dest, 0o600)
+		return real_link(source, dest, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'link', racing_link)
 	assert vault_salt(job) == theirs
 	monkeypatch.undo()
-	assert open(salt_file(job), 'rb').read() == theirs
+	assert open(salt_file(job), 'rb').read() == theirs and salt_temps(job) == []
 
 
-def test_a_secret_file_that_cannot_be_written_is_not_left_half_made(tmp_path, monkeypatch, capsys):
+def test_two_creators_racing_end_with_one_secret_file_and_both_use_it(tmp_path):
 	job = fresh_job(tmp_path)
-	real_write = os.write
-	def write(fd, data):
-		if os.path.realpath(f'/proc/self/fd/{fd}') == salt_file(job):
-			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-		return real_write(fd, data)
-	monkeypatch.setattr(rv.os, 'write', write)
-	assert vault_salt(job) is None
+	start = threading.Barrier(2)
+	got = []
+	def create():
+		start.wait()
+		got.append(vault_salt(job))
+	threads = [threading.Thread(target=create) for _ in range(2)]
+	for thread in threads:
+		thread.start()
+	for thread in threads:
+		thread.join()
+	assert len(got) == 2 and got[0] == got[1] and len(got[0]) == 16
+	assert open(salt_file(job), 'rb').read() == got[0] and salt_temps(job) == []
+	# the loser of a link that is already there reads the winner's, whatever the order
+	assert vault_salt(job) == got[0]
+
+
+def test_a_kill_after_the_temps_write_before_the_link_leaves_no_secret_file_and_the_next_prune_makes_one(tmp_path, monkeypatch):
+	job = fresh_job(tmp_path)
+	class Killed(BaseException):
+		pass
+	def killed_link(source, dest, *args, **kwargs):
+		raise Killed
+	real_remove = os.remove
+	# a kill runs nothing after it, not even the cleanup of the temp
+	monkeypatch.setattr(rv.os, 'link', killed_link)
+	monkeypatch.setattr(rv.os, 'remove', lambda path, *args, **kwargs: None if rv.PRUNE_SALT_TEMP_INFIX in os.fspath(path) else real_remove(path, *args, **kwargs))
+	with pytest.raises(Killed):
+		vault_salt(job)
 	monkeypatch.undo()
 	assert not os.path.lexists(salt_file(job))
+	assert [len(open(os.path.join(job.job_vault, name), 'rb').read()) for name in salt_temps(job)] == [16]
+	secret = vault_salt(job)
+	assert len(secret) == 16 and open(salt_file(job), 'rb').read() == secret
+
+
+def test_a_kill_that_leaves_the_temp_is_cleaned_by_the_scan_and_never_taken_for_the_secret(tmp_path):
+	job = fresh_job(tmp_path)
+	temp = salt_file(job) + rv.PRUNE_SALT_TEMP_INFIX + '0123456789abcdef'
+	with open(temp, 'wb') as f:
+		f.write(bytes(range(16)))
+	os.chmod(temp, 0o600)
+	assert not os.path.lexists(salt_file(job))
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0]
+	assert not os.path.lexists(temp) and not os.path.lexists(salt_file(job))
 	assert len(vault_salt(job)) == 16
 
 
