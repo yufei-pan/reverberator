@@ -3171,6 +3171,11 @@ AT_FDCWD = -100
 STATX_MNT_ID_UNIQUE = 0x4000
 STATX_ATTR_MOUNT_ROOT = 0x2000
 STATX_SIZE = 256
+# f2fs keeps a dead disk mounted and answers statx and readdir from cache: its checkpoint's flags (in hex in sysfs, under
+# the name of its device) carry CP_ERROR_FLAG once it has stopped on an error
+F2FS_FSTYPE = b'f2fs'
+F2FS_SYSFS_PATH = '/sys/fs/f2fs'
+F2FS_CP_ERROR_FLAG = 0x8
 
 def load_statx():
 	'''libc's statx(), None when this libc has none.'''
@@ -3245,6 +3250,19 @@ def mount_id_at(mount_table:list, mount_point:str):
 	ids = [fingerprint[0] for point, fingerprint in mount_table if point == mount_point]
 	return ids[-1] if ids else None
 
+def f2fs_failed(mount_table:list, mount_point:str) -> bool:
+	'''
+	Whether the f2fs mounted at mount_point (the topmost mount there) has stopped on an error; False when it is not f2fs.
+	Raises OSError when its checkpoint status cannot be read.
+	'''
+	fingerprints = [fingerprint for point, fingerprint in mount_table if point == mount_point]
+	if not fingerprints or fingerprints[-1][4:5] != (F2FS_FSTYPE,):
+		return False
+	# sysfs names it after the device its source resolves to: /dev/mapper/x is there as dm-<n>
+	device = os.path.basename(os.path.realpath(os.fsdecode(fingerprints[-1][3])))
+	with open(os.path.join(F2FS_SYSFS_PATH, device, 'stat', 'cp_status'), 'rb') as f:
+		return bool(int(f.read(), 16) & F2FS_CP_ERROR_FLAG)
+
 # pool: the mergerfs mount point; ids: (branch realpath, mount id or None while it is missing) in branch order;
 # problem: what is wrong with the pool, or None; pool_id: the pool's own mount id.
 # pool is None when the mount table cannot be read (problem says so): which pool holds the path is not known.
@@ -3254,13 +3272,14 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 	'''
 	The state of the mergerfs pool holding path: its branches' mount ids, and what is wrong (pool_problem()'s texts).
 	None when path is on no mergerfs mount; no branch list is read then. A branch is missing when nothing is mounted at
-	its resolved path, or when its statx or a read of its root fails, as for a disk that failed but is still mounted.
+	its resolved path, when its statx fails, as for a shut-down XFS that is still mounted, or when it is an f2fs whose
+	checkpoint reports an error.
 	'''
 	if mount_table is None:
 		try:
 			mount_table = read_mount_table()
 		except OSError as e:
-			return PoolState(None, (), f'the mount table cannot be read: {e}', None)
+			return PoolState(None, (), f'the mount table cannot be read: {e.strerror or e}', None)
 	pool = mergerfs_mount(mount_table, path)
 	if pool is None:
 		return None
@@ -3272,22 +3291,21 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 	try:
 		branches = read_pool_branches(pool)
 	except OSError as e:
-		return PoolState(pool, (), f'the disks of pool {pool} cannot be listed: {e}', pool_id)
+		return PoolState(pool, (), f'the disks of pool {pool} cannot be listed: {e.strerror or e}', pool_id)
 	ids = []
 	unmounted = []
-	unreadable = []
+	failed = []
 	for branch in branches:
 		branch = os.path.realpath(branch)
 		try:
 			mount_id = mount_id_at(mount_table, branch)
 			if mount_id is None:
 				unmounted.append(branch)
-			else:
-				# a shut-down XFS or f2fs stays mounted and its statfs still answers, but reading its root fails
-				with os.scandir(branch) as entries:
-					next(entries, None)
+			elif f2fs_failed(mount_table, branch):
+				failed.append(f'disk {branch} of pool {pool} has failed: its f2fs checkpoint reports an error')
+				mount_id = None
 		except OSError as e:
-			unreadable.append(f'disk {branch} of pool {pool} cannot be read: {e}')
+			failed.append(f'disk {branch} of pool {pool} cannot be read: {e.strerror or e}')
 			mount_id = None
 		ids.append((branch, mount_id))
 	problems = []
@@ -3295,19 +3313,19 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 		problems.append(f'disk {unmounted[0]} of pool {pool} is not mounted')
 	elif unmounted:
 		problems.append(f'disks {", ".join(unmounted)} of pool {pool} are not mounted')
-	problems.extend(unreadable)
+	problems.extend(failed)
 	return PoolState(pool, tuple(ids), '; '.join(problems) or None, pool_id)
 
 def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None) -> 'str | None':
 	'''
 	What is wrong now with the mergerfs pool holding path, None when nothing is or path is on no pool. With since (a
 	pool_state() taken when a step began), the pool gone or mounted again since then counts too, and so does a disk
-	mounted since then, even one dropped and back.
+	mounted since then, even one dropped and back. A step that began with a problem (since's) keeps it: with no whole
+	pool to compare with, the step fails, and the next one takes a fresh state.
 	'''
+	if since is not None and since.problem:
+		return since.problem
 	state = pool_state(path, mount_table)
-	if since is not None and since.pool is None:
-		# taken while the mount table could not be read: there is nothing to compare with
-		since = None
 	if state is None:
 		# a lazy umount of the pool leaves the path on its empty mount folder
 		return None if since is None else f'pool {since.pool} is not mounted'
@@ -3315,7 +3333,8 @@ def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None) ->
 		return state.problem
 	problems = [state.problem] if state.problem else []
 	if since is not None:
-		if state.pool_id != since.pool_id:
+		# a pool id statx could not read is not compared
+		if None not in (state.pool_id, since.pool_id) and state.pool_id != since.pool_id:
 			problems.insert(0, f'pool {state.pool} was mounted again during this step')
 		before = dict(since.ids)
 		problems.extend(f'disk {branch} of pool {state.pool} was mounted again during this step'
@@ -3681,6 +3700,7 @@ class fs_signature_monitor:
 		Re-check every pair whose containing mount changed since its last check, and with recheck_failed those whose last
 		check failed. The mount table read for it goes to the subscribers first.
 		'''
+		table_read = False
 		try:
 			with open(self.mountinfo_path, 'rb') as f:
 				mount_table = parse_mount_table(f.read())
@@ -3688,12 +3708,19 @@ class fs_signature_monitor:
 			# not handed to the subscribers: they would take every inner mount for unmounted
 			mount_table = []
 		else:
+			table_read = True
 			# before the signature checks, so a slow df or lsblk does not hold back a watcher following an inner mount
 			self.notify(mount_table)
 		with self.lock:
 			keys = list(self.flags)
 		for key in keys:
 			path, signature = key
+			if not table_read:
+				with self.lock:
+					last = self.fingerprints.get(key)
+				# a pool's disks cannot be told without the table: its flag stays as it is for this pass
+				if last is not None and last[1] is not None:
+					continue
 			real = os.path.realpath(path)
 			# a pool's branches are mounts of their own: one dropping or coming back changes the fingerprint too
 			state = pool_state(real, mount_table)
