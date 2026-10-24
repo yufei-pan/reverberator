@@ -2420,7 +2420,8 @@ def test_a_users_link_made_where_a_folder_moved_from_is_never_retargeted(tmp_pat
 		rv.ChangeEvent(2.0, True, 'create', os.path.join(m, 'a'), None), rv.ChangeEvent(3.0, False, 'create', os.path.join(m, 'a/U'), None)])
 	monkeypatch.undo()
 	v1 = latest(job)
-	assert seen and seen[0][0] and seen[0][1] == seen[0][0]
+	# the new a/ is copied after the move ( round 9 ), so the move carries no copy of U; whatever it carried keeps its text
+	assert seen and all(after == before for before, after in seen)
 	assert os.readlink(os.path.join(v1.path, 'a/U')) == text and not os.path.lexists(os.path.join(v1.path, 'p/q/U'))
 	assert open(os.path.join(v1.path, 'p/q/old')).read() == 'o'
 
@@ -2659,8 +2660,9 @@ def test_the_verification_tells_a_users_link_a_move_carried_by_the_replays_moves
 		E(4.0, False, 'create', os.path.join(m, 'a/U'), None)])
 	monkeypatch.undo()
 	v1 = latest(job)
-	# the collapse leaves a/ and a/U to the verification; p/q/U, which the replay's move carried, it finds right
-	assert v1.number == 1 and sorted(os.path.relpath(path, m) for path, _ in fixed) == ['a', 'a/U']
+	# the collapse carries the first a/U to p/q/U, after the move, and copies the new a/ after it too ( round 9 ): the
+	# verification finds both right
+	assert v1.number == 1 and fixed == []
 	for rel in ('p/q/U', 'a/U'):
 		assert os.readlink(os.path.join(v1.path, rel)) == text and copy_version_of(job, rel) is None
 		record = record_of(job, rel)

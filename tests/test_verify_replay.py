@@ -134,7 +134,8 @@ SEQUENCES = {
 		{('D/old.txt', 'delete'), ('D/sub/', 'delete'), ('D/sub/deep.txt', 'delete')}),
 	'c': ({**BASE, 'E/e.txt': 'e'}, {'keep.txt': 'keep', 'D/e.txt': 'e'},
 		[('delete', 'D', None, True), ('move', 'D', 'E', True)],
-		{('D/old.txt', 'delete'), ('D/sub/', 'delete')}),
+		# the rename replaces the emptied D the version still held: nothing is left to fix
+		set()),
 	'd4': (BASE, {'keep.txt': 'keep', 'D/x.txt': 'moved in'},
 		[('delete', 'D', None, True), ('create', 'D', None, True)],
 		{('D/old.txt', 'delete'), ('D/sub/', 'delete'), ('D/sub/deep.txt', 'delete')}),
@@ -149,7 +150,8 @@ SEQUENCES = {
 		{('D2/old.txt', 'delete')}),
 	'e1': ({'f': 'old', 'keep.txt': 'k'}, {'f~': 'old', 'f': 'new', 'keep.txt': 'k'},
 		[('move', 'f~', 'f', False), ('create', 'f', None, False), ('modify', 'f', None, False)],
-		{('f~', 'modify'), ('f', 'create')}),
+		# the new f is copied after the old one moved away: nothing is left to fix
+		set()),
 	'e2': ({'f': 'old', 'keep.txt': 'k'}, {'f': 'new', 'keep.txt': 'k'},
 		[('move', 'f~', 'f', False), ('create', 'f', None, False), ('modify', 'f', None, False), ('delete', 'f~', None, False)],
 		{('f', 'create')}),
@@ -161,7 +163,8 @@ SEQUENCES = {
 		{('D/', 'create'), ('D/new.txt', 'create'), ('D.new/', 'delete'), ('D.new/new.txt', 'delete')}),
 	'd5': (BASE, {'keep.txt': 'keep', 'D2/old.txt': 'old', 'D2/sub/deep.txt': 'deep', 'D/new.txt': 'new'},
 		[('move', 'D2', 'D', True), ('create', 'D', None, True)],
-		{('D/', 'create'), ('D/new.txt', 'create'), ('D2/new.txt', 'delete')}),
+		# the new D is copied after the old one moved away: nothing is left to fix
+		set()),
 	'f3': (BASE, {'keep.txt': 'keep', 'D2/old.txt': 'old', 'D2/sub/deep.txt': 'deep', 'D2/new.txt': 'x'},
 		[('create', 'D/new.txt', None, False), ('modify', 'D/new.txt', None, False), ('move', 'D2', 'D', True)],
 		{('D2/new.txt', 'create')}),
@@ -360,21 +363,44 @@ def test_fresh_copies_keep_unchecked(tmp_path):
 		manifest.close()
 
 
-def test_attribute_only_differences_are_not_replayed(tmp_path):
+def test_the_verification_syncs_attributes_the_replay_missed(tmp_path):
+	# the batch lost the chmod's event ( a race ): the verification compares mode and owner too, and syncs them onto the
+	# shared copy at the chain's end, as an attrib's replay does
 	job = create_job(str(tmp_path))
 	seed_monitor(job, {'D/a.txt': 'a', 'D/b.txt': 'b'})
 	run_backup(job)
 	v0 = latest_version(job).path
-	v0_mode = stat.S_IMODE(os.lstat(os.path.join(v0, 'D/a.txt')).st_mode)
+	b_mode = stat.S_IMODE(os.lstat(os.path.join(v0, 'D/b.txt')).st_mode)
 	os.rename(os.path.join(job.monitor, 'D'), os.path.join(job.monitor, 'D2'))
 	os.chmod(os.path.join(job.monitor, 'D2/a.txt'), 0o600)
-	assert v0_mode != 0o600
+	assert stat.S_IMODE(os.lstat(os.path.join(v0, 'D/a.txt')).st_mode) != 0o600
 	events = raw_events(job, [('move', 'D2', 'D', True)])
 	run_backup(job, rv.change_events_to_backup_entries(deque(events)), touched=rv.touched_scopes(events, job.monitor))
 	version = rv.list_versions(job.job_vault)[-1]
-	assert changes(job, version) == [('D2/', 'move')]
-	assert stat.S_IMODE(os.lstat(os.path.join(v0, 'D/a.txt')).st_mode) == v0_mode
+	assert changes(job, version) == [('D2/', 'move'), ('D2/a.txt', 'attrib')]
+	assert stat.S_IMODE(os.lstat(os.path.join(v0, 'D/a.txt')).st_mode) == 0o600
+	assert stat.S_IMODE(os.lstat(os.path.join(v0, 'D/b.txt')).st_mode) == b_mode
 	assert os.path.islink(os.path.join(version.path, 'D2/a.txt'))
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason='chown needs root')
+def test_the_verification_syncs_an_owner_the_replay_missed_and_a_user_links_own(tmp_path):
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/a.txt': 'a'})
+	os.symlink('a.txt', os.path.join(job.monitor, 'D/l'))
+	run_backup(job)
+	v0 = latest_version(job).path
+	os.rename(os.path.join(job.monitor, 'D'), os.path.join(job.monitor, 'D2'))
+	os.chown(os.path.join(job.monitor, 'D2/a.txt'), 1234, 1234)
+	os.lchown(os.path.join(job.monitor, 'D2/l'), 1234, 1234)
+	events = raw_events(job, [('move', 'D2', 'D', True)])
+	run_backup(job, rv.change_events_to_backup_entries(deque(events)), touched=rv.touched_scopes(events, job.monitor))
+	version = rv.list_versions(job.job_vault)[-1]
+	assert sorted(changes(job, version)) == [('D2/', 'move'), ('D2/a.txt', 'attrib'), ('D2/l', 'attrib')]
+	for rel in ('D/a.txt', 'D/l'):
+		st = os.lstat(os.path.join(v0, rel))
+		assert (st.st_uid, st.st_gid) == (1234, 1234), rel
+	assert os.readlink(os.path.join(v0, 'D/l')) == 'a.txt'
 
 
 def older_versions(job, synced=()):
@@ -517,7 +543,8 @@ def test_interrupted_verification_commits_nothing(tmp_path, monkeypatch, name):
 		rv.GREEN_LIGHT.set()
 	assert committed is False
 	if name == 'c':
-		assert swept[0][0] == ['D/old.txt', 'D/sub/']
+		# the rename replaced the emptied D, so there is nothing to sweep
+		assert swept == [([], [])]
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		assert list(manifest.conn.execute('SELECT * FROM entries ORDER BY path')) == rows_before

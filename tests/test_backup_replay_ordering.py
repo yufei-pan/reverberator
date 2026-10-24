@@ -96,6 +96,13 @@ class TestOrderBackupEntriesForReplay(unittest.TestCase):
 		])
 		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/d/y', '/m/e/'])
 
+	def test_a_change_at_a_move_source_after_the_move_comes_after_it(self):
+		entries = OrderedDict([
+			('/m/f~', rv.BackupEntryValues('t1', 'move', '/m/f')),
+			('/m/f', rv.BackupEntryValues('t2', 'create', None)),
+		])
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/f~', '/m/f'])
+
 
 class TestReverbBackupNewTreeFileBeforeParent(unittest.TestCase):
 	def test_new_tree_succeeds_when_entries_list_files_before_dirs(self):
