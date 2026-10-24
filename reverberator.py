@@ -600,6 +600,14 @@ class VaultScanError(JobFailure):
 	next attempt reads the vault again.
 	'''
 
+class PoolNotReady(JobFailure):
+	'''
+	A disk of a mergerfs pool a step works on is missing, or was mounted again during the step (PoolGuard): its reason
+	is pool_problem()'s text. Never permanent: the next attempt waits for the disk.
+	'''
+	def __init__(self, reason:str):
+		super().__init__(reason, permanent=False)
+
 class JobControl:
 	'''
 	One job's state across its attempts, shared by its watcher and backuper.
@@ -1124,6 +1132,12 @@ def job_retry_delay(failures:int) -> float:
 	return min(JOB_RETRY_FIRST_SECONDS * 2 ** min(failures - 1, 64), JOB_RETRY_MAX_SECONDS)
 
 MOUNTINFO_PATH = '/proc/self/mountinfo'
+# a mergerfs pool lists its branches (its disks) in an xattr of the control file at its root
+MERGERFS_FSTYPE = b'fuse.mergerfs'
+MERGERFS_CONTROL_FILE = '.mergerfs'
+MERGERFS_BRANCHES_XATTR = 'user.mergerfs.srcmounts'
+# how often a PoolGuard's poll() checks the pools while a step writes into a version
+POOL_CHECK_SECONDS = 1.0
 
 ARG_MAX = os.sysconf('SC_ARG_MAX')
 ARGUMENT_LIMIT = (ARG_MAX - 4096) // 2048
@@ -3054,7 +3068,7 @@ def parse_mount_table(mountinfo:bytes) -> list:
 	r'''
 	Parse /proc/self/mountinfo content into (mount_point, fingerprint) pairs in kernel order.
 
-	The fingerprint (mount id, device, fs root, source) changes whenever the mount is replaced,
+	The fingerprint (mount id, device, fs root, source, fstype) changes whenever the mount is replaced,
 	and later entries stack on top of earlier ones at the same mount point.
 
 	Examples:
@@ -3063,7 +3077,7 @@ def parse_mount_table(mountinfo:bytes) -> list:
 		>>> [mount_point for mount_point, _ in table]
 		['/', '/mnt/my disk']
 		>>> table[1][1]
-		(b'40', b'8:17', b'/data', b'/dev/sdb1')
+		(b'40', b'8:17', b'/data', b'/dev/sdb1', b'xfs')
 		>>> parse_mount_table(b'garbage\n')
 		[]
 	'''
@@ -3074,12 +3088,13 @@ def parse_mount_table(mountinfo:bytes) -> list:
 			continue
 		# optional fields end at a lone '-', followed by fs type and source
 		try:
-			source = fields[fields.index(b'-', 6) + 2]
+			separator = fields.index(b'-', 6)
+			fstype, source = fields[separator + 1], fields[separator + 2]
 		except (ValueError, IndexError):
-			source = b''
+			fstype = source = b''
 		# mountinfo octal-escapes space, tab, newline and backslash
 		mount_point = re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8)]), fields[4])
-		mount_table.append((os.fsdecode(mount_point), (fields[0], fields[2], fields[3], source)))
+		mount_table.append((os.fsdecode(mount_point), (fields[0], fields[2], fields[3], source, fstype)))
 	return mount_table
 
 def mount_fingerprint(mount_table:list, path:str):
@@ -3145,6 +3160,125 @@ def current_mount_table() -> list:
 			return parse_mount_table(f.read())
 	except Exception:
 		return []
+
+def read_pool_branches(mount_point:str) -> list:
+	'''
+	The branches (disks) of the mergerfs pool mounted at mount_point, as mergerfs lists them: expanded absolute paths.
+	Raises OSError as os.getxattr does (ENODATA, ENOTSUP, EIO).
+	'''
+	value = os.fsdecode(os.getxattr(os.path.join(mount_point, MERGERFS_CONTROL_FILE), MERGERFS_BRANCHES_XATTR))
+	return [branch for branch in value.split(':') if branch]
+
+def mergerfs_mount(mount_table:list, path:str) -> 'str | None':
+	'''
+	The mount point of the mergerfs mount holding path once resolved; None when the mount holding it is not mergerfs.
+
+	Examples:
+		>>> table = [('/', (b'1', b'8:1', b'/', b'/dev/sda1', b'ext4')), ('/mnt/pool', (b'2', b'0:42', b'/', b'pool', b'fuse.mergerfs'))]
+		>>> mergerfs_mount(table, '/mnt/pool/reverb_doctest/vault')
+		'/mnt/pool'
+		>>> mergerfs_mount(table, '/reverb_doctest') is None
+		True
+		>>> mergerfs_mount([('/', ('1',))], '/reverb_doctest') is None
+		True
+	'''
+	fingerprint = mount_fingerprint(mount_table, os.path.realpath(path))
+	if fingerprint is None or fingerprint[4:5] != (MERGERFS_FSTYPE,):
+		return None
+	return next(point for point, mount in mount_table if mount == fingerprint)
+
+# pool: the mergerfs mount point; ids: (branch realpath, mount id or None while it is missing) in branch order;
+# problem: what is wrong with the pool, or None
+PoolState = namedtuple('PoolState', ['pool', 'ids', 'problem'])
+
+def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
+	'''
+	The state of the mergerfs pool holding path: its branches' mount ids, and what is wrong (pool_problem()'s texts).
+	None when path is on no mergerfs mount; no branch list is read then. A branch is missing when no mount sits at its
+	resolved path, or when os.statvfs of it fails, as for a disk that failed but is still mounted.
+	'''
+	if mount_table is None:
+		mount_table = current_mount_table()
+	pool = mergerfs_mount(mount_table, path)
+	if pool is None:
+		return None
+	try:
+		branches = read_pool_branches(pool)
+	except OSError as e:
+		return PoolState(pool, (), f'the disks of pool {pool} cannot be listed: {e}')
+	# the topmost of stacked mounts is the one there
+	mounted = {mount_point: fingerprint[0] for mount_point, fingerprint in mount_table}
+	ids = []
+	unmounted = []
+	unreadable = []
+	for branch in branches:
+		branch = os.path.realpath(branch)
+		mount_id = mounted.get(branch)
+		if mount_id is None:
+			unmounted.append(branch)
+		else:
+			try:
+				os.statvfs(branch)
+			except OSError as e:
+				unreadable.append(f'disk {branch} of pool {pool} cannot be read: {e}')
+				mount_id = None
+		ids.append((branch, mount_id))
+	problems = []
+	if len(unmounted) == 1:
+		problems.append(f'disk {unmounted[0]} of pool {pool} is not mounted')
+	elif unmounted:
+		problems.append(f'disks {", ".join(unmounted)} of pool {pool} are not mounted')
+	problems.extend(unreadable)
+	return PoolState(pool, tuple(ids), '; '.join(problems) or None)
+
+def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None) -> 'str | None':
+	'''
+	What is wrong now with the mergerfs pool holding path, None when nothing is or path is on no pool. With since (a
+	pool_state() taken when a step began), a disk mounted since then, even one dropped and back, counts too.
+	'''
+	state = pool_state(path, mount_table)
+	if state is None:
+		return None
+	problems = [state.problem] if state.problem else []
+	if since is not None:
+		before = dict(since.ids)
+		problems.extend(f'disk {branch} of pool {state.pool} was mounted again during this step'
+			for branch, mount_id in state.ids if mount_id is not None and before.get(branch) != mount_id)
+	return '; '.join(problems) or None
+
+class PoolGuard:
+	'''
+	The mergerfs pools holding paths, as they were when a step began. require() fails the step with PoolNotReady once a
+	disk of one is missing or was mounted again since; poll() does so at most once every POOL_CHECK_SECONDS, so it can
+	run per entry. Paths on no pool are never checked.
+	'''
+	def __init__(self, paths, clock = time.monotonic):
+		mount_table = current_mount_table()
+		self.states = [(path, state) for path, state in ((path, pool_state(path, mount_table)) for path in paths) if state is not None]
+		self.clock = clock
+		self.next_check = None
+
+	def problem(self) -> 'str | None':
+		if not self.states:
+			return None
+		mount_table = current_mount_table()
+		for path, since in self.states:
+			problem = pool_problem(path, since, mount_table)
+			if problem:
+				return problem
+		return None
+
+	def require(self) -> None:
+		problem = self.problem()
+		if problem:
+			raise PoolNotReady(problem)
+
+	def poll(self) -> None:
+		now = self.clock()
+		if self.next_check is not None and now < self.next_check:
+			return
+		self.next_check = now + POOL_CHECK_SECONDS
+		self.require()
 
 def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList' = None) -> dict:
 	'''
@@ -3488,12 +3622,16 @@ class fs_signature_monitor:
 			keys = list(self.flags)
 		for key in keys:
 			path, signature = key
-			fingerprint = mount_fingerprint(mount_table, os.path.realpath(path))
+			real = os.path.realpath(path)
+			# a pool's branches are mounts of their own: one dropping or coming back changes the fingerprint too
+			state = pool_state(real, mount_table)
+			fingerprint = (mount_fingerprint(mount_table, real), state)
 			with self.lock:
 				if self.fingerprints.get(key, ...) == fingerprint and (self.states.get(key) or not recheck_failed):
 					continue
 				generation = self.generations.get(key, 0)
-			fs_ok = check_fs_signature(path, signature)
+			# df and lsblk run only on a whole pool
+			fs_ok = (state is None or state.problem is None) and check_fs_signature(path, signature)
 			with self.lock:
 				if key not in self.flags or self.generations.get(key, 0) != generation:
 					continue
@@ -3505,7 +3643,9 @@ class fs_signature_monitor:
 						fs_event.set()
 					else:
 						fs_event.clear()
-			if changed:
+			if changed and state is not None and state.problem is not None:
+				watcherTeeLogToTl(path, f'{path}: {state.problem}, pausing.')
+			elif changed:
 				watcherTeeLogToTl(path, f'FS signature {signature} for {path} ' + ('verified.' if fs_ok else 'does not match, pausing.'))
 
 	def run(self):
