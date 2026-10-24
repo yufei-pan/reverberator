@@ -2193,10 +2193,14 @@ class inotify_resource_manager:
 				return False
 			if value is ...:
 				value = getattr(self,value_name)
-			# check if the current value is less
+			# a limit is only ever raised above a value just read: a read that fails (sysctl past its timeout under load
+			# gives 0) writes nothing, as doubling an unknown limit would write 0 over the host's
 			rtn = self.getSysctlValues(field)
-			if rtn and rtn > value:
-				tl.info(log_text(f'Current {field} is already higher than {value}'))
+			if not rtn:
+				tl.info(log_text(f'Not setting {field} to {value}: its current value cannot be read'))
+				return False
+			if rtn >= value:
+				tl.info(log_text(f'Current {field} is already {rtn}, at least {value}'))
 				setattr(self,value_name,rtn)
 				return False
 			task = multiCMD.run_command(['sudo','sysctl',f'{field}={value}'],timeout=1,quiet=True,return_object=True)
