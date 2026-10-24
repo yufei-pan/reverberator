@@ -31,6 +31,7 @@ import json
 import tempfile
 import stat
 import array
+import bisect
 import errno
 import fcntl
 import marshal
@@ -4424,7 +4425,7 @@ def do_backup(backup_entries:dict,
 				# can change the records too, by the links it replaced first
 				nonlocal vault_size, vault_inodes
 				if not prune_salt:
-					prune_salt.append(vault_prune_salt(job_vault, job_name, manifest))
+					prune_salt.append(vault_prune_salt(job_vault, job_name))
 				oldest = next(iter(vault_info_dict))
 				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths,prune_salt=prune_salt[0])
 				vault_size -= removed_size
@@ -4473,9 +4474,7 @@ def do_backup(backup_entries:dict,
 		this_size, this_inodes = measure_version_usage(manifest, backup_folder)
 		vault_size += this_size
 		vault_inodes += this_inodes
-		backup_size_str = format_bytes(this_size,use_1024_bytes=True,to_str=True).replace(' ','_')
-		backup_inode_str = format_bytes(this_inodes,use_1024_bytes=False,to_str=True).replace(' ','')
-		content_file_name = f'{backup_folder}--{backup_size_str}B-{backup_inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
+		content_file_name = change_list_path(backup_folder,this_size,this_inodes)
 		# a copy made again is no change: its own event, which history and the restore picker pass over. one the
 		# verification then deleted, by itself or with a folder above it, is gone from the version
 		recopy_time = datetime.datetime.now().isoformat()
@@ -4498,27 +4497,44 @@ def do_backup(backup_entries:dict,
 		# link for a leftover (read_job_vault()), and one the link names without a list is never removed
 		prepared_list = prepare_change_list(content_file_name,content_file_content)
 		link_path = os.path.join(job_vault,'current_version')
+		# the link as it is before the commit, which an undo puts back: None only when there is none (a first backup). one
+		# that cannot be read, or something there that is no link, fails the attempt before anything is committed, as an
+		# undo would take a later backup for a first one, or replace what it cannot tell
 		try:
 			previous_link = os.readlink(link_path)
-		except OSError:
+		except FileNotFoundError:
 			previous_link = None
+		except OSError as e:
+			discard_change_list(prepared_list)
+			manifest.rollback()
+			if e.errno == errno.EINVAL:
+				raise JobFailure(f'{link_path} is there but is no link: not committing {backup_folder}, and leaving it as it is')
+			raise JobFailure(f'cannot read {link_path}: {e}: not committing {backup_folder}')
 		try:
 			manifest.commit(backup_folder)
 			swap_current_version(job_vault,os.path.basename(backup_folder))
 		except BaseException as e:
 			discard_change_list(prepared_list)
-			if isinstance(e, Exception) and previous_link is None and not os.path.lexists(link_path):
-				# a first backup whose link could not be made: a manifest naming V0 with no link would be refused for
-				# good, so it records no version again, as before the backup began
-				try:
-					manifest.forget_version()
-				except sqlite3.Error as undo_error:
-					backuperTeeLogToTl(job_name,f'Cannot drop the version the manifest records after {link_path} could not be made: {undo_error}',error=True)
+			if isinstance(e, Exception) and previous_link is None:
+				link_there = entry_there(link_path)
+				if link_there is None:
+					backuperTeeLogToTl(job_name,f'Cannot tell whether {link_path} was made after the commit failed: leaving the records as they are',error=True)
+				elif not link_there:
+					# a first backup whose link could not be made: a manifest naming V0 with no link would be refused for
+					# good, so it records no version again, as before the backup began
+					try:
+						manifest.forget_version()
+					except sqlite3.Error as undo_error:
+						backuperTeeLogToTl(job_name,f'Cannot drop the version the manifest records after {link_path} could not be made: {undo_error}',error=True)
 			raise
 		try:
 			place_change_list(content_file_name,prepared_list)
 		except BaseException as e:
-			if isinstance(e, Exception) and not os.path.lexists(content_file_name):
+			list_there = entry_there(content_file_name) if isinstance(e, Exception) else True
+			if list_there is None:
+				# the rename may have been made: the version may be committed, so the records stay on it
+				backuperTeeLogToTl(job_name,f'Cannot tell whether {content_file_name} is in place after its rename failed: leaving the records as they are',error=True)
+			elif not list_there:
 				# the version is not committed: the link goes back to the one that is, so the scan of the next attempt
 				# removes this one as the version after the link
 				try:
@@ -4543,6 +4559,19 @@ def do_backup(backup_entries:dict,
 		if opened_manifest:
 			manifest.close()
 		raise
+
+def entry_there(path:str):
+	'''
+	True when lstat() finds path, False when it is not there (ENOENT, or ENOTDIR: a name above it is no folder), None when
+	that cannot be told, as on EIO: an undo decides only on a False.
+	'''
+	try:
+		os.lstat(path)
+	except (FileNotFoundError, NotADirectoryError):
+		return False
+	except OSError:
+		return None
+	return True
 
 def swap_current_version(job_vault:str, text:str) -> None:
 	'''Point job_vault's current_version link at text, swapped in under a temporary name, so the link is never missing.'''
@@ -4634,6 +4663,19 @@ def persist_pending_transactions(job_name:str, vault_path:str, to_process:'Chang
 # what a change list's name holds after its version folder's name and --: the size and inodes it records, as
 # change_list_path() writes them (format_bytes(), its spaces as _ or left out), and the change list extension
 CHANGE_LIST_RECORD = re.compile(r'([0-9]+(?:\.[0-9]+)?)_?((?:[KMGTP]i)?)B-([0-9]+(?:\.[0-9]+)?)([KMGTP]?)_ino' + re.escape(CONTENT_FILE_EXTENSION_NAME))
+
+def change_list_names(name:str, folder_name:str) -> bool:
+	'''
+	Whether name is that of a change list of the version folder named folder_name: folder_name, --, and the record
+	change_list_record() reads. read_job_vault(), the prune's look at what is left of a version (decrement_stepper()) and
+	parse_change_list_name() (so read_version_moves() and list_versions()) all tell a version's change list by it.
+
+	Examples:
+		>>> [change_list_names(name, 'V1--2021-01-01_00-00-00_-0800') for name in ('V1--2021-01-01_00-00-00_-0800--1_B-1_ino.modified_contents.nsv',
+		...     'V1--2021-01-01_00-00-00_-0800.stray', 'V1--2021-01-01_00-00-00_-0800--1_B-1_ino.modified_contents.nsv~')]
+		[True, False, False]
+	'''
+	return name.startswith(folder_name + '--') and change_list_record(name[len(folder_name) + 2:]) is not None
 
 def change_list_record(rest:str):
 	'''
@@ -4803,7 +4845,7 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 			if owners:
 				list_named = True
 				claimed.update(owners)
-				usable = [owner for owner in owners if is_file and owner in version_folders and change_list_record(name[len(owner) + 2:]) is not None]
+				usable = [owner for owner in owners if is_file and owner in version_folders and change_list_names(name, owner)]
 				if not usable:
 					raise VaultScanError(f'{name} in {job_vault_path} is named after the folder {owners[-1]}, but cannot be read as its change list (a regular file named after it and its record)')
 				for owner in usable:
@@ -4864,7 +4906,7 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 					# got under way; the one it names may be committed with its list out of the listing
 					if number == record.number + 1:
 						continue
-					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and is not the one after the latest recorded version, {record.number}: its list may not have been listed')
+					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and is not the one after the latest recorded version, {record.number}: its list may not have been listed (check that every disk of the vault is there), or a removal cut short by a daemon before 0.44 left it (an oldest version whose list went first: once that is sure, remove it by hand)')
 				raise VaultScanError(f'{name} in {job_vault_path} has no change list, and the latest committed version cannot be told')
 		stale = []
 		for number, folder, path in gone:
@@ -4903,6 +4945,44 @@ def remove_orphan(job_vault_path:str, path:str) -> bool:
 	backuperTeeLogToTl(job_vault_path, f'Failed to remove the orphan {path}', error=True)
 	return False
 
+def remove_unfinished_change_lists(job_vault_path:str, listing:VaultListing) -> None:
+	'''
+	Remove listing.unfinished, the private folders of change lists a crash cut off before their rename into place
+	(prepare_change_list()), from a listing read_job_vault() made whole: real folders whose names begin with
+	CHANGE_LIST_FOLDER_PREFIX, which no reader takes for a version or a change list. A failure is logged, and leaves it.
+	'''
+	for path in listing.unfinished:
+		backuperTeeLogToTl(job_vault_path, f'Removing unfinished change list: {path}', error=True)
+		try:
+			shutil.rmtree(path)
+		except OSError as e:
+			backuperTeeLogToTl(job_vault_path, f'Failed to remove unfinished change list {path}: {e}', error=True)
+
+def move_current_version_forward(job_vault_path:str, listing:VaultListing) -> None:
+	'''
+	After a scan that read job_vault_path whole and deleted all it had to: when current_version is a link naming a
+	version below the newest committed one listed, swap it forward to that version (swap_current_version(), the
+	commit's own atomic replace), as a daemon before 0.44 left it, writing the change list before the link: a later
+	attempt cut off then leaves its orphan at the link + 1 again, which the next scan removes. It never goes back, and
+	anything there that is no link naming a version is left as it is. A failure is logged: the scan is still whole.
+	'''
+	if not listing.versions:
+		return
+	newest = max(listing.versions)
+	link_path = os.path.join(job_vault_path, 'current_version')
+	try:
+		number = vault_version_number(os.path.basename(os.fsdecode(os.readlink(link_path)).rstrip('/')))
+	except OSError:
+		return
+	if number is None or number >= newest:
+		return
+	name = os.path.basename(listing.versions[newest].path)
+	backuperTeeLogToTl(job_vault_path, f'{link_path} names V{number}, behind the newest committed version {name}: moving it forward', warning=True)
+	try:
+		swap_current_version(job_vault_path, name)
+	except OSError as e:
+		backuperTeeLogToTl(job_vault_path, f'Cannot move {link_path} forward to {name}: {e}', error=True)
+
 def remove_incomplete_vault_versions(job_vault_path: str) -> list:
 	'''
 	At the daemon's start: remove the version folders without a change list, which a crash or a stop leaves (a version
@@ -4921,12 +5001,7 @@ def remove_incomplete_vault_versions(job_vault_path: str) -> list:
 		return deleted
 	if listing is None:
 		return deleted
-	for path in listing.unfinished:
-		backuperTeeLogToTl(job_vault_path, f'Removing unfinished change list: {path}', error=True)
-		try:
-			shutil.rmtree(path)
-		except OSError as e:
-			backuperTeeLogToTl(job_vault_path, f'Failed to remove unfinished change list {path}: {e}', error=True)
+	remove_unfinished_change_lists(job_vault_path, listing)
 	for path in listing.orphans:
 		if remove_orphan(job_vault_path, path):
 			deleted.append(path)
@@ -4945,10 +5020,11 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	fails then, before anything is deleted, as a backup would start a whole V0 beside them once they showed again.
 
 	The scan deletes only what it is certain of, once the whole vault was read (read_job_vault()): the change lists of
-	version folders that are not there, and the version folders without a change list that may go, the orphans of
-	backups that did not commit and of removals cut short. Raises VaultScanError, having deleted nothing, when the vault
-	cannot be read whole or for certain, and (after the deletions) when an orphan cannot be removed, as the next backup
-	would make a version of its number beside it. The caller's job then fails its attempt, with its FAILED marker: no
+	version folders that are not there, the private folders of change lists a crash cut off, and the version folders
+	without a change list that may go, the orphans of backups that did not commit and of removals cut short. Then a
+	current_version left behind the newest committed version is moved forward (move_current_version_forward()). Raises
+	VaultScanError, having deleted nothing, when the vault cannot be read whole or for certain, and (after the
+	deletions) when an orphan cannot be removed, as the next backup would make a version of its number beside it. The caller's job then fails its attempt, with its FAILED marker: no
 	backup prunes or writes on a partial view.
 	'''
 	# job vault subfolder should follow: V{version}--{ISO8601ish time}
@@ -4980,9 +5056,11 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 			os.remove(path)
 		except Exception as e:
 			backuperTeeLogToTl(job_vault_path, f'Error deleting {path}: {e}', error=True)
+	remove_unfinished_change_lists(job_vault_path, listing)
 	kept = [path for path in listing.orphans if not remove_orphan(job_vault_path, path)]
 	if kept:
 		raise VaultScanError(f'cannot remove the incomplete versions {", ".join(kept)}, and a backup would make a version of their number beside them')
+	move_current_version_forward(job_vault_path, listing)
 	vault_info_dict = OrderedDict()
 	vault_size = 0
 	vault_inodes = 0
@@ -5604,14 +5682,21 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 			backuperTeeLogToTl(path=source_file,error=True,message=f'Not copying the metadata of {source_file} onto {backup_file_path}: it is a symlink, and {backup_file_path} is not one')
 			return False
 		# copy the file metadata, the owner first: a chown clears S_ISUID and S_ISGID of a file, even for root (and its
-		# security.capability), so copystat's mode and extended attributes come after it
+		# security.capability), so copystat's mode and extended attributes come after it. a chown that fails (EPERM on a
+		# filesystem that keeps no owners, say) still lets the mode, times and extended attributes be copied, as before
+		# 0.44, and the whole is reported failed
 		st = os.stat(source_file)
+		owned = True
 		if os.name == 'posix':
-			os.chown(backup_file_path, st.st_uid, st.st_gid)
+			try:
+				os.chown(backup_file_path, st.st_uid, st.st_gid)
+			except OSError as e:
+				owned = False
+				backuperTeeLogToTl(path=source_file,error=True,message=f'Failed to copy the owner of {source_file} onto {backup_file_path}: {e}')
 		copystat(source_file,backup_file_path)
 		# to the nanosecond, as copystat set them: times passed as floats come back up to a few hundred ns off
 		os.utime(backup_file_path, ns=(st.st_atime_ns, st.st_mtime_ns))
-		return True
+		return owned
 	except Exception as _:
 		backuperTeeLogToTl(path=source_file,error=True,message=f'Failed to copy metadata {source_file} -> {backup_file_path}')
 		import traceback
@@ -6012,33 +6097,6 @@ class VaultManifest:
 		if not pairs or pairs[-1][1] != monitor_path:
 			pairs.append((version_number, monitor_path))
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('monitor_paths', ?)", (json.dumps([[number, storable_name(path)] for number, path in pairs]),))
-
-	def stored_prune_salt(self):
-		'''
-		The secret for pruning's temp names a daemon before 0.44 kept in meta as hex (prune_salt), which every user who can
-		read the manifest can read: vault_prune_salt() makes the vault's secret file with it, once, then drops the row
-		(forget_prune_salt()). None when there is none, or it is not PRUNE_SALT_BYTES bytes.
-		'''
-		row = self.conn.execute("SELECT value FROM meta WHERE key = 'prune_salt'").fetchone()
-		if row is None:
-			return None
-		try:
-			salt = bytes.fromhex(row[0])
-		except (TypeError, ValueError):
-			return None
-		return salt if len(salt) == PRUNE_SALT_BYTES else None
-
-	def forget_prune_salt(self):
-		'''
-		Drop the prune_salt row, once the vault's secret file holds a secret (with the caller's transaction, if one is
-		open). secure_delete zeroes it where it was: a freed page keeps a deleted row's bytes in the file otherwise.
-		'''
-		was = self.conn.execute('PRAGMA secure_delete').fetchone()[0]
-		self.conn.execute('PRAGMA secure_delete = ON')
-		try:
-			self.conn.execute("DELETE FROM meta WHERE key = 'prune_salt'")
-		finally:
-			self.conn.execute(f'PRAGMA secure_delete = {int(was)}')
 
 	def describes(self, version_path:str) -> bool:
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
@@ -6533,7 +6591,9 @@ class VersionMoves:
 	lists whole) or holds no rows (every version after the first has one), or a row lies outside the monitored path;
 	why says which.
 	of_committed() reads a committed version's change list, once, when first asked; applied() takes the moves the
-	replay of the version being written has made, before its change list exists.
+	replay of the version being written has made, before its change list exists. takes(), touches() and
+	lands_without_source() answer by indexes of the moves (_index()), visiting only the moves that apply to a path, so
+	telling a link costs no scan of every move.
 
 	Examples:
 		>>> moves = VersionMoves.applied([('d/x', 'e/x', False), ('d/', 'f/', True), ('f/y', 'y', False), (None, 'n/', True)])
@@ -6560,6 +6620,16 @@ class VersionMoves:
 		self._job_vault = change_list_folder
 		self.rows = 0
 		self._lock = threading.Lock()
+		# the indexes of the moves (_index()), up to the first _indexed of them: a file move's source -> the positions of
+		# the moves from it (an int for one, a list in order for more), a folder move's source (ending with /) -> the
+		# same, the positions of folder moves whose source does not end with / (matched as a plain prefix, so read in
+		# order), and the dests of the move rows without a source, their / stripped
+		self._index_lock = threading.Lock()
+		self._indexed = 0
+		self._file_sources = {}
+		self._folder_sources = {}
+		self._odd_folders = []
+		self._sourceless = set()
 
 	@classmethod
 	def of_committed(cls, job_vault:str, version_path:str, monitor_path:str, monitor_paths:list = None) -> 'VersionMoves':
@@ -6629,33 +6699,104 @@ class VersionMoves:
 		self._read()
 		return self._usable
 
+	def _index(self) -> list:
+		'''
+		The moves, with the indexes brought up to them: the replay appends to the list of the version being written, so
+		the moves added since the last call are indexed now (a list that got shorter is indexed again). Returns the moves.
+		'''
+		moves = self.moves
+		if self._indexed == len(moves):
+			return moves
+		with self._index_lock:
+			if self._indexed > len(moves):
+				self._indexed = 0
+				self._file_sources, self._folder_sources, self._odd_folders, self._sourceless = {}, {}, [], set()
+			for at in range(self._indexed, len(moves)):
+				source, dest, is_folder = moves[at]
+				if source is None:
+					self._sourceless.add(dest.rstrip('/'))
+					continue
+				if is_folder and not source.endswith('/'):
+					self._odd_folders.append(at)
+					continue
+				table = self._folder_sources if is_folder else self._file_sources
+				held = table.get(source)
+				if held is None:
+					table[source] = at
+				elif isinstance(held, int):
+					table[source] = [held, at]
+				else:
+					held.append(at)
+			self._indexed = len(moves)
+		return moves
+
+	@staticmethod
+	def _first_after(held, after:int):
+		'''The first position in held (an int, a list in order, or None) above after; None when there is none.'''
+		if held is None:
+			return None
+		if isinstance(held, int):
+			return held if held > after else None
+		at = bisect.bisect_right(held, after)
+		return held[at] if at < len(held) else None
+
+	def _next_move(self, moves:list, path:str, after:int):
+		'''
+		The position of the first move after position after that applies to path: a file move from path itself, or a
+		folder move from a folder above it (its source a prefix of path ending with /, or any prefix for one whose source
+		does not end with /); None when none does.
+		'''
+		found = self._first_after(self._file_sources.get(path), after)
+		if self._folder_sources:
+			at = path.find('/')
+			while at != -1:
+				candidate = self._first_after(self._folder_sources.get(path[:at + 1]), after)
+				if candidate is not None and (found is None or candidate < found):
+					found = candidate
+				at = path.find('/', at + 1)
+		for candidate in self._odd_folders:
+			if found is not None and candidate > found:
+				break
+			if candidate > after and path.startswith(moves[candidate][0]):
+				found = candidate
+				break
+		return found
+
 	def lands_without_source(self, rel:str) -> bool:
 		'''Whether a move row without a source lands on rel or on a folder above it.'''
-		return any(source is None and (dest.rstrip('/') == rel or rel.startswith(dest.rstrip('/') + '/'))
-			for source, dest, _ in self.moves)
+		self._index()
+		if not self._sourceless:
+			return False
+		if rel in self._sourceless:
+			return True
+		at = rel.find('/')
+		while at != -1:
+			if rel[:at] in self._sourceless:
+				return True
+			at = rel.find('/', at + 1)
+		return False
 
 	def takes(self, source_rel:str, dest_rel:str) -> 'bool | None':
 		'''
 		Whether the moves, applied in order to a file or to a folder and what is under it, take source_rel to dest_rel;
-		None when that cannot be told, as a move row without a source lands on dest_rel or a folder above it.
+		None when that cannot be told, as a move row without a source lands on dest_rel or a folder above it. Only the
+		moves that apply to the path, as it is at each, are visited, found by the indexes (_next_move()).
 		'''
 		if self.lands_without_source(dest_rel):
 			return None
+		moves = self._index()
 		path = source_rel
-		for source, dest, is_folder in self.moves:
-			if source is None:
-				continue
-			if is_folder:
-				if path.startswith(source):
-					path = dest + path[len(source):]
-			elif path == source:
-				path = dest
-		return path == dest_rel
+		at = -1
+		while True:
+			at = self._next_move(moves, path, at)
+			if at is None:
+				return path == dest_rel
+			source, dest, is_folder = moves[at]
+			path = dest + path[len(source):] if is_folder else dest
 
 	def touches(self, rel:str) -> bool:
 		'''Whether any move applies to rel, itself or a folder above it: the first one to do so meets rel unmoved.'''
-		return any(source is not None and (rel.startswith(source) if is_folder else rel == source)
-			for source, _, is_folder in self.moves)
+		return self._next_move(self._index(), rel, -1) is not None
 
 	def tells(self, named:str, rel:str, version_name:str) -> tuple:
 		'''
@@ -6749,8 +6890,8 @@ def read_version_moves(job_vault:str, version_path:str, monitor:str) -> tuple:
 	version_path, which job_vault is listed for, as (source_rel, dest_rel, is_folder) under monitor, the monitored path
 	it was written under (absolute and normalised), and the hashes of the rels all its rows land on; moves is None, and
 	why says why, when the rows cannot be used. lasting says whether every list was read in full, so the answer is the
-	same every time. Of two lists for one version (pruning makes a header-only one when the name it works out from the
-	recorded sizes is not there), the one with rows counts.
+	same every time. Of two lists for one version (a prune before 0.44 made a header-only one when the name it worked out
+	from the recorded sizes was not there), the one with rows counts.
 	'''
 	name = os.path.basename(version_path)
 	try:
@@ -8189,7 +8330,7 @@ NO_HARD_LINK_ERRNOS = frozenset({errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.
 # daemon's user alone, mode 0600, as the manifest is readable by every user who can read the vault
 PRUNE_SALT_FILE_NAME = '.reverberator_prune_salt'
 
-def vault_prune_salt(job_vault:str, job_name:str, manifest:'VaultManifest' = None):
+def vault_prune_salt(job_vault:str, job_name:str):
 	'''
 	The job vault's secret for the names pruning hard links copies under (prune_link_path()): PRUNE_SALT_BYTES random
 	bytes in its file PRUNE_SALT_FILE_NAME, made the first time they are asked for, so a restart or a remount names a
@@ -8198,10 +8339,8 @@ def vault_prune_salt(job_vault:str, job_name:str, manifest:'VaultManifest' = Non
 	The file is made with O_CREAT, O_EXCL and O_NOFOLLOW at mode 0600 (and fchmod to it, whatever the umask), then synced
 	with the job vault; when another made it first, the file that won is read. A file there is taken only when it is,
 	opened with O_NOFOLLOW, a regular file of the daemon's own user (root) at mode 0600 holding exactly PRUNE_SALT_BYTES
-	bytes, and it is never deleted or written over. A secret a daemon before 0.44 kept in manifest's meta (which every
-	user can read) is the one the file is made with, so a temp a cut off run left keeps its name, and its row is dropped
-	once the file holds a secret. None, with a warning, when there is no secret to be had: pruning then names its temps
-	by the copy's inode alone, for this run.
+	bytes, and it is never deleted or written over. None, with a warning, when there is no secret to be had: pruning
+	then names its temps by the copy's inode alone, for this run.
 	'''
 	path = os.path.join(job_vault, PRUNE_SALT_FILE_NAME)
 	def without(why:str):
@@ -8262,16 +8401,10 @@ def vault_prune_salt(job_vault:str, job_name:str, manifest:'VaultManifest' = Non
 			# a temp a cut off run left otherwise, which stays a stray
 			backuperTeeLogToTl(job_name, f"The vault's secret for pruning's temp names was made in {path}, but {job_vault} cannot be synced: {e}", warning=True)
 		return True
-	stored = None
-	if manifest is not None:
-		try:
-			stored = manifest.stored_prune_salt()
-		except sqlite3.Error as e:
-			backuperTeeLogToTl(job_name, f"Cannot read the manifest for a secret an older daemon kept there: {e}", warning=True)
 	try:
 		secret = read_secret()
 		if secret is None:
-			made = os.urandom(PRUNE_SALT_BYTES) if stored is None else stored
+			made = os.urandom(PRUNE_SALT_BYTES)
 			try:
 				won = make_secret(made)
 			except OSError as e:
@@ -8281,11 +8414,6 @@ def vault_prune_salt(job_vault:str, job_name:str, manifest:'VaultManifest' = Non
 				return without(f'went from {path} as it was made')
 	except ValueError as e:
 		return without(str(e))
-	if stored is not None:
-		try:
-			manifest.forget_prune_salt()
-		except sqlite3.Error as e:
-			backuperTeeLogToTl(job_name, f"Cannot drop from the manifest the secret an older daemon kept there: {e}", warning=True)
 	return secret
 
 def prune_link_path(link_path:str, copy_st:os.stat_result, salt:bytes) -> str:
@@ -8386,8 +8514,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	Each version's record of what it holds, which its change list's name keeps and a restart sums, is kept in du's
 	measure (st_blocks * 512, and an inode an entry), never by st_nlink, which mergerfs can show stale for a second
 	after a link: a copy materialised moves from the oldest version's record to the next one's, once a run however many
-	links name it (by its inode, in a PathHashes), and the link it replaces, or a dangling link dropped, leaves the
-	next one's. Both records are written, by renaming the change lists, before the removal, so a run cut off then, or a
+	links name it (by its inode, in a PathHashes), and the link it replaces leaves the next one's. A link whose target
+	is already missing is left as it is: a chain link reads as missing either way, and a user's link of that form
+	stays. Both records are written, by renaming the change lists, before the removal, so a run cut off then, or a
 	removal cut short, leaves them true, and when it is aborted. Returns how far the two records went down in all,
 	(bytes, inodes), so the caller's sums of every version's record (vault_size, vault_inodes) stay theirs whether or
 	not the oldest version went: the oldest version's record and what the next one lost, when it went; never less than
@@ -8422,8 +8551,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	applyingVaultEntry = vault_info_dict[applyingVersionNumber]
 	job_vault = os.path.dirname(referenceVaultPath)
 	# the books, each [bytes, inodes]: the copies the next version took from the reference vault, the entries it no
-	# longer holds (the links replaced, the dangling links dropped), and the copies made for it besides (for a second
-	# link naming a copy the walk moved)
+	# longer holds (the links replaced), and the copies made for it besides (for a second link naming a copy the walk
+	# moved). a dangling link left as it is is in none
 	transferred, unlinked, copied = [0, 0], [0, 0], [0, 0]
 	def book(books:list, st:os.stat_result) -> None:
 		books[0] += st.st_blocks * 512
@@ -8551,8 +8680,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		# V0--<timestamp>.stray beside it. raises OSError when the job vault cannot be listed or a list looked at
 		names = os.listdir(job_vault)
 		lists = sorted(os.path.join(job_vault, name) for name in names
-			if name.startswith(folder_name + '--') and change_list_record(name[len(folder_name) + 2:]) is not None
-			and stat.S_ISREG(os.lstat(os.path.join(job_vault, name)).st_mode))
+			if change_list_names(name, folder_name) and stat.S_ISREG(os.lstat(os.path.join(job_vault, name)).st_mode))
 		return folder_name in names, lists
 	# only a folder that is not there is gone: one that cannot be looked at may hold every copy the next version links
 	try:
@@ -8630,11 +8758,12 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			moved_home.add(target)
 		else:
 			moved_away[target] = link
-	def drop_dangling(file:str, file_st:os.stat_result, linkTarget:str) -> None:
+	def meet_dangling(file:str, file_st:os.stat_result, linkTarget:str) -> None:
 		# the target is gone: moved into this version by this walk for another link (one of the two a user's link the rows
-		# could not tell), whose copy this one gets too; else the link was dangling before. removing the reference vault
-		# loses nothing that is not already lost, and keeping the link would carry the broken reference forward into every
-		# later version. drop it and keep stepping, as aborting here wedges retention forever
+		# could not tell), whose copy this one gets too; else the link was dangling before, and is left as it is. a chain
+		# link whose copy is gone reads as missing either way, and a user's link of that form (the blind spot, as
+		# a/U -> ../../<V0>/a/U with no a/U in V0) stays the user's in every kept version. nothing of it is transferred
+		# or freed, so the books do not change
 		taken = moved_to(linkTarget)
 		if taken is not None:
 			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{file} and {taken} both link to {linkTarget}: one is a user\'s link that cannot be told from a chain link, so both get its copy')
@@ -8645,16 +8774,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			book(unlinked, file_st)
 			book(copied, made)
 			return
-		try:
-			# only while it is still the link the walk saw: whatever stands there now is not removed
-			if not same_inode(os.lstat(file), file_st):
-				raise OSError(errno.EEXIST, 'it is no longer the link', file)
-			os.remove(file)
-		except Exception as removeError:
-			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error removing dangling link {file} -> {linkTarget}: {removeError}')
-		else:
-			book(unlinked, file_st)
-			backuperTeeLogToTl(path=referenceVaultPath,message=f'Removed dangling link {file} -> {linkTarget} as the target is already missing')
+		backuperTeeLogToTl(path=referenceVaultPath,message=f'Leaving the dangling link {file} -> {linkTarget} as it is: its target is already missing')
 	def move_copy(file:str, file_st:os.stat_result, linkTarget:str, target_st:os.stat_result) -> bool:
 		# the copy moved in place of the link, for a filesystem that cannot hard link it: whether it is there now
 		try:
@@ -8763,7 +8883,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			target_st = os.lstat(linkTarget)
 		except (FileNotFoundError, NotADirectoryError):
 			# ENOTDIR: a name on the way to it is a file in the reference vault, so it is not there either
-			drop_dangling(file, file_st, linkTarget)
+			meet_dangling(file, file_st, linkTarget)
 			continue
 		except OSError as e:
 			failed(f'Error looking at {linkTarget}: {e}')
@@ -9341,7 +9461,8 @@ KeptVersion = namedtuple('KeptVersion', ['number', 'path', 'name', 'timestamp', 
 def parse_change_list_name(name:str):
 	'''
 	The version a change list file name stands for: (number, folder name, timestamp, size, inodes), None when name is not
-	one. The name is the version folder's, then --<size>-<inodes>_ino and the change list extension.
+	one. The name is the version folder's, then -- and the record change_list_record() reads (its size, inodes and the
+	change list extension), the rule every reader of the vault tells a version's change list by (change_list_names()).
 
 	Examples:
 		>>> parse_change_list_name('V3--2021-01-01_00-00-00_-0800--1.50_KiB-12_ino.modified_contents.nsv')[:2]
@@ -9350,20 +9471,21 @@ def parse_change_list_name(name:str):
 		True
 		>>> parse_change_list_name('V3--x--1_KiB-1_ino.modified_contents.nsv') is None
 		True
+		>>> [parse_change_list_name('V3--2021-01-01_00-00-00_-0800--' + rest) for rest in ('junk.modified_contents.nsv', '1.00_KB-1_ino.modified_contents.nsv')]
+		[None, None]
 	'''
-	if not name.endswith(CONTENT_FILE_EXTENSION_NAME):
-		return None
-	number = vault_version_number(name)
-	folder_name, _, size_inodes = strip_suffix(name, CONTENT_FILE_EXTENSION_NAME).rpartition('--')
+	folder_name, _, record = name.rpartition('--')
+	number = vault_version_number(folder_name)
 	if number is None or not is_version_folder_name(folder_name):
+		return None
+	sizes = change_list_record(record)
+	if sizes is None:
 		return None
 	try:
 		timestamp = datetime.datetime.strptime(folder_name.partition('--')[2], VAULT_TIMESTAMP_FORMAT).timestamp()
-		size = format_bytes(size_inodes.partition('-')[0].replace('_',''), to_int=True)
-		inodes = format_bytes(size_inodes.rpartition('-')[2].replace('_ino',''), to_int=True)
-	except Exception:
+	except ValueError:
 		return None
-	return number, folder_name, timestamp, size, inodes
+	return number, folder_name, timestamp, *sizes
 
 def list_versions(job_vault:str) -> list:
 	'''

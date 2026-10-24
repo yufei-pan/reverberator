@@ -1,4 +1,6 @@
+import errno
 import os
+import stat
 import sys
 import threading
 import pytest
@@ -154,3 +156,60 @@ def test_copy_file_meta_keeps_times_to_the_nanosecond(tmp_path):
 	assert (copy.st_atime_ns, copy.st_mtime_ns) == (1_600_000_000_123_456_789, 1_500_000_000_987_654_321)
 	assert (copy.st_mode, copy.st_uid, copy.st_gid) == (st.st_mode, st.st_uid, st.st_gid)
 	assert rv.copy_file_meta(str(source), str(tmp_path / 'absent')) is False
+
+
+def metadata_pair(tmp_path):
+	'''(source, dest): a source file with mode 0640, ns times and (where the filesystem keeps them) a user xattr, and a plain dest.'''
+	source, dest = tmp_path / 'source', tmp_path / 'dest'
+	source.write_text('x')
+	dest.write_text('x')
+	os.chmod(source, 0o640)
+	os.chmod(dest, 0o600)
+	os.utime(source, ns=(1_600_000_000_123_456_789, 1_500_000_000_987_654_321))
+	try:
+		os.setxattr(source, 'user.kept', b'yes')
+	except OSError:
+		pass
+	return str(source), str(dest)
+
+
+def mode_times_xattrs(path):
+	st = os.stat(path)
+	try:
+		xattrs = {name: os.getxattr(path, name) for name in os.listxattr(path)}
+	except OSError:
+		xattrs = None
+	return stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs
+
+
+def test_copy_file_meta_still_copies_mode_times_and_xattrs_when_the_chown_fails(tmp_path, monkeypatch, capsys):
+	# final fix c: the chown before copystat raised EPERM, and nothing else was copied (0.43 copied the rest first)
+	source, dest = metadata_pair(tmp_path)
+	def chown(path, uid, gid, *args, **kwargs):
+		raise PermissionError(errno.EPERM, os.strerror(errno.EPERM), path)
+	monkeypatch.setattr(rv.os, 'chown', chown)
+	capsys.readouterr()
+	assert rv.copy_file_meta(source, dest) is False
+	monkeypatch.undo()
+	assert mode_times_xattrs(dest) == mode_times_xattrs(source)
+	assert os.strerror(errno.EPERM) in capsys.readouterr().out
+
+
+def test_copy_file_meta_fails_when_copystat_fails_after_the_chown(tmp_path, monkeypatch, capsys):
+	# the owner is set first, then copystat: one that fails is reported, and the times are not set by ns over it
+	source, dest = metadata_pair(tmp_path)
+	owners = []
+	real_chown = os.chown
+	def chown(path, uid, gid, *args, **kwargs):
+		owners.append((os.fspath(path), uid, gid))
+		return real_chown(path, uid, gid, *args, **kwargs)
+	def copystat(*args, **kwargs):
+		raise OSError(errno.EIO, os.strerror(errno.EIO))
+	monkeypatch.setattr(rv.os, 'chown', chown)
+	monkeypatch.setattr(rv, 'copystat', copystat)
+	capsys.readouterr()
+	assert rv.copy_file_meta(source, dest) is False
+	monkeypatch.undo()
+	assert owners == [(dest, os.stat(source).st_uid, os.stat(source).st_gid)]
+	assert stat.S_IMODE(os.stat(dest).st_mode) == 0o600
+	assert 'Failed to copy metadata' in capsys.readouterr().out
