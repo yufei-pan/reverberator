@@ -4272,6 +4272,31 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 	backup_entries = OrderedDict()
 	pendingMoveSourceParents = set()
 	moveSourceToDestDict = {}
+	# what the events after the one at hand did to each path ( a folder's ending with / ), as (when, where to): a move
+	# out of the path, or None for what ended it there ( a delete, or a move onto it ). when counts down the batch, so the
+	# greatest is the soonest after the event at hand
+	later = {}
+	def carried(path):
+		# where what was at path is at the end of the batch, as the moves after it carried it, each found at path or a
+		# folder above it ( its depth, not the number of moves ): path itself when none did, or when one of the path
+		# itself comes first, which the exact-path handling below takes. None when something ended it after a move
+		# carried it
+		bound = None
+		while True:
+			best = None
+			key = path
+			while key:
+				for at, dest in later.get(key, ()):
+					if (bound is None or at < bound) and (best is None or at > best[0]):
+						best = (at, key, dest)
+				key = key.rstrip('/').rpartition('/')[0]
+				key = key and key + '/'
+			if best is None or (best[2] is not None and best[1] == path):
+				return path
+			if best[2] is None:
+				return None if bound is not None else path
+			path, bound = best[2] + path[len(best[1]):], best[0]
+	when = 0
 	for changeEvent in reversed(change_events):
 		# get the absolute path
 		to_add = True
@@ -4299,6 +4324,24 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		if os.path.abspath(changeEvent.path) == root:
 			# the monitored root itself ( an attrib on it ): its version is the version folder, no entry of it
 			continue
+		when += 1
+		event_path = abs_path
+		carried_on = False
+		if event in ('create', 'modify', 'attrib'):
+			# a change before a move of its path or of a folder above it is replayed where the live tree has it, once the
+			# moves are made ( mv d e; chmod e/y; mv e f is an attrib of f/y )
+			now_at = carried(abs_path)
+			if now_at is None:
+				if DEBUG:
+					backuperTeeLogToTl(abs_path,f'Skipping {event} on {abs_path}: moved, then removed')
+				continue
+			carried_on = now_at != abs_path
+			abs_path = now_at
+		if event == 'delete':
+			later.setdefault(event_path, []).append((when, None))
+		elif event == 'move' and abs_moved_from:
+			later.setdefault(abs_moved_from, []).append((when, abs_path))
+			later.setdefault(abs_path, []).append((when, None))
 		# pre handle move events
 		if event == 'move':
 			if abs_moved_from:
@@ -4357,10 +4400,12 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 				else:
 					to_add = False
 					continue
+			elif event == 'attrib':
+				# the move's own step syncs the attributes onto the moved entry, which stays a link
+				if DEBUG:
+					backuperTeeLogToTl(abs_path,f'  Leaving the attributes of {abs_path} to its move to {moveDest}')
+				continue
 			else:
-				if event == 'attrib':
-					# escalate to check file content also as it is not possible to sync attrib only to a symlink
-					event = 'modify'
 				if DEBUG:
 					backuperTeeLogToTl(abs_path,f'  Seperating move event from {abs_path} to {moveDest}')
 				if moveDest in backup_entries:
@@ -4370,6 +4415,8 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					else:
 						escalated_event = event
 						event = 'delete'
+						# the source's link goes before the moves, where it still is
+						abs_path, carried_on = event_path, False
 					if DEBUG:
 						backuperTeeLogToTl(abs_path,f'    Escalating {backup_entries[moveDest].event} to {escalated_event} at {backup_entries[moveDest].iso_time} on {moveDest}')
 					backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,escalated_event,abs_path)
@@ -4445,7 +4492,8 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 			iso_time = (datetime.datetime.now() - datetime.timedelta(seconds=time.monotonic() - changeEvent.monotonic_time)).isoformat()
 			backuperTeeLogToTl(abs_path,f'Adding {event} on {abs_path} at {iso_time} with source {abs_moved_from}')
 			backup_entries[abs_path] = BackupEntryValues(iso_time,event,abs_moved_from)
-			backup_entries.move_to_end(abs_path,last=False)
+			# one carried by a later move goes after the moves, at its place once they are made
+			backup_entries.move_to_end(abs_path,last=carried_on)
 	for path in [path for path, values in backup_entries.items() if values.event == 'move' and values.source_path == path]:
 		# moved away and back ( mv D D2; mv D2 D ): nothing to rename
 		backuperTeeLogToTl(path,f'Dropping the move of {path} onto itself')
@@ -5493,8 +5541,9 @@ def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 	1. deletes, deepest paths first (children before parents)
 	2. create/modify/attrib, shallowest first (parents before children)
 	3. moves, preserving relative order
-	4. create/modify/attrib at or under a path a move earlier in backup_entries landed on, shallowest first: made
-	   before it, they would stand in its way ( mv d e; echo > e/new makes e/ before the rename onto it )
+	4. create/modify/attrib at or under a path a move earlier in backup_entries landed on or left, shallowest first:
+	   made before it, they would stand in its way ( mv d e; echo > e/new makes e/ before the rename onto it ), or be
+	   moved away with it ( mv f f~; echo new > f )
 
 	Examples:
 		>>> list(order_backup_entries_for_replay(OrderedDict([('/m/d/y', BackupEntryValues('t', 'attrib', None)),
@@ -5506,7 +5555,7 @@ def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 	moves = []
 	rest = []
 	after = []
-	# where the moves seen so far landed, without a trailing /
+	# where the moves seen so far landed and left, without a trailing /
 	landed = set()
 	def under_a_move(path):
 		# path and each folder above it, so it costs its depth, not the number of moves
@@ -5522,6 +5571,7 @@ def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 		elif values.event == 'move':
 			moves.append((path, values))
 			landed.add(path.rstrip('/'))
+			landed.add((values.source_path or '').rstrip('/'))
 		elif landed and under_a_move(path):
 			after.append((path, values))
 		else:
@@ -7897,7 +7947,10 @@ def compare_monitor_entry(monitor_entry:str, monitor_stat:os.stat_result, record
 	if kind == 'd':
 		return 'attrib' if attrs_differ else None
 	if kind == 'l':
-		return 'modify' if os.readlink(monitor_entry) != record.link else None
+		if os.readlink(monitor_entry) != record.link:
+			return 'modify'
+		# a link has a mode of its own on no filesystem here, but an owner ( lchown )
+		return 'attrib' if (monitor_stat.st_uid, monitor_stat.st_gid) != (record.uid, record.gid) else None
 	if monitor_stat.st_size != record.size or monitor_stat.st_mtime_ns != record.mtime_ns:
 		return 'modify'
 	# the tail catches contents rewritten in place without moving the mtime
@@ -9711,7 +9764,14 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					if not real_folders_to(backup_folder,link_source_relative_path,missing_ok=True) or not real_folders_to(backup_folder,link_target_relative_path,missing_ok=True):
 						# renaming would reach through the link, out of the version
 						raise NotARealFolder(f'a folder above {link_source_backup_real_path} or {link_target_backup_real_path} in the version is not a real folder')
-					if os.path.lexists(link_target_backup_real_path):
+					if os.path.isdir(link_target_backup_real_path.rstrip('/')) and not os.path.islink(link_target_backup_real_path.rstrip('/')):
+						# the live rename found nothing there, or an empty folder ( rm -rf e; mv d e ): what the version
+						# still holds there is gone, and its rows ( a folder's moved rows replaced them already )
+						backuperTeeLogToTl(path=monitor_path,message=f'Removing {link_target_backup_real_path}, which the move of {link_source_backup_real_path} replaces')
+						if not isDir:
+							manifest.remove_tree(as_folder_entry(link_target_relative_path))
+						remove_entry(link_target_backup_real_path.rstrip('/'))
+					elif os.path.lexists(link_target_backup_real_path):
 						os.remove(link_target_backup_real_path)
 					os.rename(link_source_backup_real_path,link_target_backup_real_path)
 					# the links it renamed are told by it from here on, its own retarget first
@@ -9736,14 +9796,18 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					# end holds the file's contents with other metadata ( mv x d/x; chmod 600 d/x, whose attrib the collapse
 					# folds into the move ): onto the end, or by a copy. a user's symlink, or a link that cannot be told, gets
 					# its own owner and times only ( copy_file_meta() )
-					if not isDir and os.path.islink(link_target_backup_real_path) and own_chain_hop(link_target_backup_real_path) is not None:
+					if not os.path.lexists(event_source_real_path):
+						# moved on again in the batch ( mv d/a d/b; mv d e ): the later move, or the verification, takes it
+						pass
+					elif not isDir and os.path.islink(link_target_backup_real_path) and own_chain_hop(link_target_backup_real_path) is not None:
 						end = attribute_end(event_source_real_path,link_target_relative_path)
 						if isinstance(end,str) and only_attributes_differ(event_source_real_path,end):
 							if only_sync_attributes:
 								copy_file_meta(event_source_real_path,end)
 							else:
 								cp_af_copy_path(source_path=event_source_real_path,dest_path=link_target_backup_real_path,mcae=mcae,pending=pending)
-								manifest.add(link_target_relative_path,dirty=True)
+							# recorded again, as an attrib's replay is
+							manifest.add(link_target_relative_path,dirty=True)
 					else:
 						copy_file_meta(event_source_real_path,link_target_backup_real_path)
 				except NotARealFolder as e:
@@ -9777,11 +9841,12 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	def verify():
 		# what the batch's events touched is compared with the monitored tree, and the version fixed where they differ:
 		# the collapse into one entry per path cannot replay every order of moves, re-creations and deletes. the rows this
-		# replay copied are compared for presence only, so their copies stay unchecked, and attribute-only differences are
-		# left to the attribute handling, which syncs them onto the latest copy, wherever it lives
+		# replay copied are compared for presence only, so their copies stay unchecked. a mode or owner that differs
+		# ( compare_monitor_entry(), from the lstat it makes anyway ) is synced as an attrib's replay syncs it, onto the
+		# latest copy, wherever it lives: what the replay missed of an attribute change
 		fixes = OrderedDict()
 		compare_scopes(fixes, manifest, backup_folder, monitor_path, touched, None if skip_list is None else skip_list.skips, paused,
-			monitor_path if job_name is None else job_name, reported, trusted=manifest.dirty_rels(), attributes=False, fresh=True,
+			monitor_path if job_name is None else job_name, reported, trusted=manifest.dirty_rels(), fresh=True,
 			applied=writing_moves)
 		if not GREEN_LIGHT.is_set():
 			return

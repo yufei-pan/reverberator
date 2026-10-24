@@ -80,14 +80,14 @@ def test_delete_then_modify_then_move_keeps_dest_modify():
 	assert entries[f'{P}/a'].event == 'delete'
 
 
-def test_attrib_then_move_escalates_dest():
+def test_attrib_then_move_stays_a_move():
 	entries = rv.change_events_to_backup_entries(deque([
 		_ev(1, False, 'attrib', f'{P}/a', None),
 		_ev(2, False, 'move', f'{P}/b', f'{P}/a'),
 	]))
-	# Attrib immediately before a later move-from cannot stay a symlink-only
-	# attrib on dest; coalescer escalates dest from 'move' to 'modify'.
-	assert entries[f'{P}/b'].event == 'modify'
+	# the move's own step syncs the attributes onto the moved link ( round 9 ): the move stays a move, not a copy
+	assert list(entries) == [f'{P}/b']
+	assert entries[f'{P}/b'].event == 'move'
 	assert entries[f'{P}/b'].source_path == f'{P}/a'
 
 
