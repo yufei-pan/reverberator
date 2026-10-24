@@ -5492,22 +5492,46 @@ def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 
 	1. deletes, deepest paths first (children before parents)
 	2. create/modify/attrib, shallowest first (parents before children)
-	3. moves last, preserving relative order
+	3. moves, preserving relative order
+	4. create/modify/attrib at or under a path a move earlier in backup_entries landed on, shallowest first: made
+	   before it, they would stand in its way ( mv d e; echo > e/new makes e/ before the rename onto it )
+
+	Examples:
+		>>> list(order_backup_entries_for_replay(OrderedDict([('/m/d/y', BackupEntryValues('t', 'attrib', None)),
+		...     ('/m/e/', BackupEntryValues('t', 'move', '/m/d/')), ('/m/e/new', BackupEntryValues('t', 'create', None)),
+		...     ('/m/x', BackupEntryValues('t', 'modify', None))])))
+		['/m/x', '/m/d/y', '/m/e/', '/m/e/new']
 	'''
 	deletes = []
 	moves = []
 	rest = []
+	after = []
+	# where the moves seen so far landed, without a trailing /
+	landed = set()
+	def under_a_move(path):
+		# path and each folder above it, so it costs its depth, not the number of moves
+		path = path.rstrip('/')
+		while path:
+			if path in landed:
+				return True
+			path = path.rpartition('/')[0]
+		return False
 	for path, values in backup_entries.items():
 		if values.event == 'delete':
 			deletes.append((path, values))
 		elif values.event == 'move':
 			moves.append((path, values))
+			landed.add(path.rstrip('/'))
+		elif landed and under_a_move(path):
+			after.append((path, values))
 		else:
 			rest.append((path, values))
 	deletes.sort(key=lambda pv: (-pv[0].rstrip('/').count(os.sep), -len(pv[0]), pv[0]))
-	rest.sort(key=lambda pv: (pv[0].rstrip('/').count(os.sep), len(pv[0]), pv[0]))
+	shallowest_first = lambda pv: (pv[0].rstrip('/').count(os.sep), len(pv[0]), pv[0])
+	rest.sort(key=shallowest_first)
+	after.sort(key=shallowest_first)
 	ordered = OrderedDict()
-	for path, values in deletes + rest + moves:
+	for path, values in deletes + rest + moves + after:
 		ordered[path] = values
 	return ordered
 
@@ -6007,6 +6031,33 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			return False
 	manifest.discard_many(missing)
 	return True
+
+def entry_metadata(path:str) -> tuple:
+	'''
+	What copy_file_meta() copies of the entry at path, by lstat, never followed: ('link', uid, gid, mtime_ns) for a
+	symlink, else (st_mode, uid, gid, mtime_ns, its extended attributes as sorted (name, value) pairs), so two entries
+	with equal ones need no copy between them. A filesystem without extended attributes has none. Raises OSError.
+
+	Examples:
+		>>> import tempfile
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     open(os.path.join(folder, 'a'), 'w').close()
+		...     os.symlink('a', os.path.join(folder, 'l'))
+		...     entry_metadata(os.path.join(folder, 'l'))[0], entry_metadata(os.path.join(folder, 'a'))[0] == os.lstat(os.path.join(folder, 'a')).st_mode
+		('link', True)
+	'''
+	path = path.rstrip('/') or path
+	st = os.lstat(path)
+	if stat.S_ISLNK(st.st_mode):
+		return ('link', st.st_uid, st.st_gid, st.st_mtime_ns)
+	try:
+		names = os.listxattr(path, follow_symlinks=False)
+	except OSError as e:
+		if e.errno not in (errno.ENOTSUP, errno.ENOSYS):
+			raise
+		names = []
+	return (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns,
+		tuple(sorted((name, os.getxattr(path, name, follow_symlinks=False)) for name in names)))
 
 def copy_file_meta(source_file:str,backup_file_path:str):
 	'''
@@ -9460,7 +9511,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# we just remove the file
 			mcae.run_command(['rm','-f',vault_real_path])
 			manifest.discard(relative_path)
-	def sync_attributes(source_real_path,relative_path):
+	def attribute_end(source_real_path,relative_path):
+		# the path the attributes of a file go onto ( sync_attributes() ): True when it has none of its own to get, False
+		# after an error line saying why they go nowhere.
 		# onto the version's entry of a file ( its folders are real: real_folders_to() ), which a chain link leaves where
 		# the latest copy is, as only_sync_attributes has it: the end of the chain gets them. a user's symlink, in the
 		# version or at the chain's end, gets only its own owner and times ( copy_file_meta() ), never what it points to.
@@ -9474,7 +9527,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# guards a chain that ends anywhere else, such as a folder
 		entry = os.path.abspath(os.path.join(backup_folder,relative_path))
 		if not os.path.islink(entry):
-			return copy_file_meta(source_real_path,entry)
+			return entry
 		def refuse(why):
 			backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: {why}')
 			return False
@@ -9514,7 +9567,37 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		if stat.S_ISLNK(end_mode) != source_is_link:
 			kinds = ('a symlink', 'not one') if source_is_link else ('not a symlink', 'a symlink')
 			return refuse(f'it is {kinds[0]}, and its link chain ends at {end_path}, which is {kinds[1]}')
-		return copy_file_meta(source_real_path,end_path)
+		return end_path
+	def sync_attributes(source_real_path,relative_path):
+		end = attribute_end(source_real_path,relative_path)
+		return copy_file_meta(source_real_path,end) if isinstance(end,str) else end
+	def only_attributes_differ(source_path,path):
+		# whether path, the end of a moved link's chain, holds the contents of the monitored entry at source_path, as the
+		# comparison judges them ( compare_monitor_entry(): the same link text, or the same size, mtime and tail ), with
+		# other metadata ( entry_metadata() ). a chain end with other contents, as a swap the collapse cannot replay
+		# leaves one, takes nothing: the verification copies it, and no version keeps another file's metadata
+		try:
+			source, end = os.lstat(source_path), os.lstat(path)
+			if stat.S_IFMT(source.st_mode) != stat.S_IFMT(end.st_mode):
+				return False
+			if stat.S_ISLNK(source.st_mode):
+				if os.readlink(source_path) != os.readlink(path):
+					return False
+			elif (source.st_size, source.st_mtime_ns) != (end.st_size, end.st_mtime_ns):
+				return False
+		except OSError:
+			return False
+		try:
+			if entry_metadata(source_path) == entry_metadata(path):
+				return False
+		except OSError:
+			# one that cannot be looked at is taken to differ
+			pass
+		# the tail last, read only for an entry about to take metadata
+		try:
+			return stat.S_ISLNK(source.st_mode) or hash_file(source_path,source.st_size) == hash_file(path,end.st_size)
+		except OSError:
+			return False
 	def own_chain_hop(path):
 		# vault_chain_hop() of a link of this version, by the moves this replay applied; None when that cannot be told
 		try:
@@ -9648,10 +9731,20 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						for retarget_path,retarget_error in retarget_errors:
 							backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot re-target the links at {retarget_path}, moved to another folder depth: {retarget_error}; '
 								'they keep their text, which still names their versions, and the next comparison checks them')
-					# sync the current attrs from the source onto the moved vault entry, but never through a symlink: a chained
-					# one, told by the moves this replay applied, would rewrite the previous version's metadata, and gets none.
-					# a user's symlink, or a link that cannot be told, gets its own owner and times only ( copy_file_meta() )
-					if not os.path.islink(link_target_backup_real_path) or own_chain_hop(link_target_backup_real_path) is None:
+					# sync the current attrs from the source onto the moved vault entry, but never through a symlink. a chain
+					# link, told by the moves this replay applied, gets them as an attrib's replay gives them when its chain
+					# end holds the file's contents with other metadata ( mv x d/x; chmod 600 d/x, whose attrib the collapse
+					# folds into the move ): onto the end, or by a copy. a user's symlink, or a link that cannot be told, gets
+					# its own owner and times only ( copy_file_meta() )
+					if not isDir and os.path.islink(link_target_backup_real_path) and own_chain_hop(link_target_backup_real_path) is not None:
+						end = attribute_end(event_source_real_path,link_target_relative_path)
+						if isinstance(end,str) and only_attributes_differ(event_source_real_path,end):
+							if only_sync_attributes:
+								copy_file_meta(event_source_real_path,end)
+							else:
+								cp_af_copy_path(source_path=event_source_real_path,dest_path=link_target_backup_real_path,mcae=mcae,pending=pending)
+								manifest.add(link_target_relative_path,dirty=True)
+					else:
 						copy_file_meta(event_source_real_path,link_target_backup_real_path)
 				except NotARealFolder as e:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: {e}; doing delete & copy instead')
