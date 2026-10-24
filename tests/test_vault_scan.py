@@ -1157,6 +1157,37 @@ def test_a_crash_at_each_step_of_the_commit(tmp_path, monkeypatch, step):
 	assert all(os.path.isdir(path) for path in committed.values())
 
 
+def test_an_error_reading_the_manifest_in_a_first_backups_clean_up_removes_nothing(tmp_path, monkeypatch):
+	# review-t3d p8: the clean-up took an I/O error on the manifest for "no manifest", so it removed V0 and its link but
+	# left the manifest naming V0, and a redo that then failed before its commit was refused for good
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	commit_hooks(monkeypatch, kill_at='swap')
+	with pytest.raises(Killed):
+		run_backup(job)
+	monkeypatch.undo()
+	manifest = os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME)
+	real_lstat = os.lstat
+	def lstat(path, *args, **kwargs):
+		if os.fspath(path) == manifest:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return real_lstat(path, *args, **kwargs)
+	with pytest.MonkeyPatch.context() as m:
+		m.setattr(rv.os, 'lstat', lstat)
+		removed, scanned = restart_and_scan(job)
+	assert removed == [] and isinstance(scanned, rv.VaultScanError)
+	def copy_failed(*args, **kwargs):
+		raise rv.JobFailure('a copy failed')
+	with pytest.MonkeyPatch.context() as m:
+		m.setattr(rv, 'finish_copies', copy_failed)
+		with pytest.raises(rv.JobFailure):
+			run_backup(job)
+	removed, scanned = restart_and_scan(job)
+	assert not isinstance(scanned, rv.VaultScanError) and scanned == []
+	run_backup(job)
+	assert sorted(committed_folders(job)) == [0]
+
+
 @pytest.mark.parametrize('step', ['writing', 'manifest', 'swap'])
 def test_a_crash_at_each_step_of_a_first_backups_commit(tmp_path, monkeypatch, step):
 	# a first backup's manifest names V0 from its commit on, with no link before the swap: on a plain folder, nothing can
