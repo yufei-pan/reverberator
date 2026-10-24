@@ -25,6 +25,7 @@ import re
 import hashlib
 import select
 import contextlib
+import ctypes
 import inspect
 import sqlite3
 import json
@@ -3153,13 +3154,55 @@ def inner_mount_points(mount_table:list, monitor_path:str) -> list:
 	prefix = root.rstrip('/') + '/'
 	return sorted({mount_point for mount_point, _ in mount_table if mount_point != root and mount_point.startswith(prefix)})
 
+def read_mount_table() -> list:
+	'''The mount table now, as parse_mount_table gives it. Raises OSError when it cannot be read.'''
+	with open(MOUNTINFO_PATH, 'rb') as f:
+		return parse_mount_table(f.read())
+
 def current_mount_table() -> list:
 	'''The mount table now, as parse_mount_table gives it; [] when it cannot be read.'''
 	try:
-		with open(MOUNTINFO_PATH, 'rb') as f:
-			return parse_mount_table(f.read())
+		return read_mount_table()
 	except Exception:
 		return []
+
+# statx(2): the unique mount id (never reused, unlike mountinfo's) and whether a path is the root of a mount
+AT_FDCWD = -100
+STATX_MNT_ID_UNIQUE = 0x4000
+STATX_ATTR_MOUNT_ROOT = 0x2000
+STATX_SIZE = 256
+
+def load_statx():
+	'''libc's statx(), None when this libc has none.'''
+	try:
+		statx = ctypes.CDLL(None, use_errno=True).statx
+	except (OSError, AttributeError):
+		return None
+	statx.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+	statx.restype = ctypes.c_int
+	return statx
+
+LIBC_STATX = load_statx()
+
+def statx_mount(path:str) -> 'tuple | None':
+	'''
+	(unique mount id, whether path is a mount root) of path from statx; None when there is no statx, or the kernel
+	reports no unique mount id or mount root flag. Raises OSError as statx fails, FileNotFoundError for a missing path.
+	'''
+	if LIBC_STATX is None:
+		return None
+	buffer = ctypes.create_string_buffer(STATX_SIZE)
+	if LIBC_STATX(AT_FDCWD, os.fsencode(path), 0, STATX_MNT_ID_UNIQUE, buffer) != 0:
+		code = ctypes.get_errno()
+		if code == errno.ENOSYS:
+			return None
+		raise OSError(code, os.strerror(code), path)
+	raw = buffer.raw
+	field = lambda offset, size: int.from_bytes(raw[offset:offset + size], sys.byteorder)
+	# struct statx: stx_mask at 0, stx_attributes at 8, stx_attributes_mask at 56, stx_mnt_id at 144
+	if not field(0, 4) & STATX_MNT_ID_UNIQUE or not field(56, 8) & STATX_ATTR_MOUNT_ROOT:
+		return None
+	return field(144, 8), bool(field(8, 8) & STATX_ATTR_MOUNT_ROOT)
 
 def read_pool_branches(mount_point:str) -> list:
 	'''
@@ -3187,41 +3230,65 @@ def mergerfs_mount(mount_table:list, path:str) -> 'str | None':
 		return None
 	return next(point for point, mount in mount_table if mount == fingerprint)
 
+def mount_id_at(mount_table:list, mount_point:str):
+	'''
+	The mount id of what is mounted at mount_point (a resolved path), None when nothing is: statx's unique id, or
+	without one mountinfo's id of the topmost mount there. Raises OSError when statx fails.
+	'''
+	try:
+		found = statx_mount(mount_point)
+	except FileNotFoundError:
+		return None
+	if found is not None:
+		return found[0] if found[1] else None
+	# mountinfo ids are reused, so a disk dropped and mounted again within a step can come back with the same one
+	ids = [fingerprint[0] for point, fingerprint in mount_table if point == mount_point]
+	return ids[-1] if ids else None
+
 # pool: the mergerfs mount point; ids: (branch realpath, mount id or None while it is missing) in branch order;
-# problem: what is wrong with the pool, or None
-PoolState = namedtuple('PoolState', ['pool', 'ids', 'problem'])
+# problem: what is wrong with the pool, or None; pool_id: the pool's own mount id.
+# pool is None when the mount table cannot be read (problem says so): which pool holds the path is not known.
+PoolState = namedtuple('PoolState', ['pool', 'ids', 'problem', 'pool_id'])
 
 def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 	'''
 	The state of the mergerfs pool holding path: its branches' mount ids, and what is wrong (pool_problem()'s texts).
-	None when path is on no mergerfs mount; no branch list is read then. A branch is missing when no mount sits at its
-	resolved path, or when os.statvfs of it fails, as for a disk that failed but is still mounted.
+	None when path is on no mergerfs mount; no branch list is read then. A branch is missing when nothing is mounted at
+	its resolved path, or when its statx or a read of its root fails, as for a disk that failed but is still mounted.
 	'''
 	if mount_table is None:
-		mount_table = current_mount_table()
+		try:
+			mount_table = read_mount_table()
+		except OSError as e:
+			return PoolState(None, (), f'the mount table cannot be read: {e}', None)
 	pool = mergerfs_mount(mount_table, path)
 	if pool is None:
 		return None
 	try:
+		pool_id = mount_id_at(mount_table, pool)
+	except OSError:
+		# a mergerfs that does not answer: its branch list cannot be read either, which says so
+		pool_id = None
+	try:
 		branches = read_pool_branches(pool)
 	except OSError as e:
-		return PoolState(pool, (), f'the disks of pool {pool} cannot be listed: {e}')
-	# the topmost of stacked mounts is the one there
-	mounted = {mount_point: fingerprint[0] for mount_point, fingerprint in mount_table}
+		return PoolState(pool, (), f'the disks of pool {pool} cannot be listed: {e}', pool_id)
 	ids = []
 	unmounted = []
 	unreadable = []
 	for branch in branches:
 		branch = os.path.realpath(branch)
-		mount_id = mounted.get(branch)
-		if mount_id is None:
-			unmounted.append(branch)
-		else:
-			try:
-				os.statvfs(branch)
-			except OSError as e:
-				unreadable.append(f'disk {branch} of pool {pool} cannot be read: {e}')
-				mount_id = None
+		try:
+			mount_id = mount_id_at(mount_table, branch)
+			if mount_id is None:
+				unmounted.append(branch)
+			else:
+				# a shut-down XFS or f2fs stays mounted and its statfs still answers, but reading its root fails
+				with os.scandir(branch) as entries:
+					next(entries, None)
+		except OSError as e:
+			unreadable.append(f'disk {branch} of pool {pool} cannot be read: {e}')
+			mount_id = None
 		ids.append((branch, mount_id))
 	problems = []
 	if len(unmounted) == 1:
@@ -3229,18 +3296,27 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 	elif unmounted:
 		problems.append(f'disks {", ".join(unmounted)} of pool {pool} are not mounted')
 	problems.extend(unreadable)
-	return PoolState(pool, tuple(ids), '; '.join(problems) or None)
+	return PoolState(pool, tuple(ids), '; '.join(problems) or None, pool_id)
 
 def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None) -> 'str | None':
 	'''
 	What is wrong now with the mergerfs pool holding path, None when nothing is or path is on no pool. With since (a
-	pool_state() taken when a step began), a disk mounted since then, even one dropped and back, counts too.
+	pool_state() taken when a step began), the pool gone or mounted again since then counts too, and so does a disk
+	mounted since then, even one dropped and back.
 	'''
 	state = pool_state(path, mount_table)
+	if since is not None and since.pool is None:
+		# taken while the mount table could not be read: there is nothing to compare with
+		since = None
 	if state is None:
-		return None
+		# a lazy umount of the pool leaves the path on its empty mount folder
+		return None if since is None else f'pool {since.pool} is not mounted'
+	if state.pool is None:
+		return state.problem
 	problems = [state.problem] if state.problem else []
 	if since is not None:
+		if state.pool_id != since.pool_id:
+			problems.insert(0, f'pool {state.pool} was mounted again during this step')
 		before = dict(since.ids)
 		problems.extend(f'disk {branch} of pool {state.pool} was mounted again during this step'
 			for branch, mount_id in state.ids if mount_id is not None and before.get(branch) != mount_id)
@@ -3250,20 +3326,16 @@ class PoolGuard:
 	'''
 	The mergerfs pools holding paths, as they were when a step began. require() fails the step with PoolNotReady once a
 	disk of one is missing or was mounted again since; poll() does so at most once every POOL_CHECK_SECONDS, so it can
-	run per entry. Paths on no pool are never checked.
+	run per entry. Paths on no pool are never checked; while the mount table cannot be read, each path counts as on one.
 	'''
 	def __init__(self, paths, clock = time.monotonic):
-		mount_table = current_mount_table()
-		self.states = [(path, state) for path, state in ((path, pool_state(path, mount_table)) for path in paths) if state is not None]
+		self.states = [(path, state) for path, state in ((path, pool_state(path)) for path in paths) if state is not None]
 		self.clock = clock
 		self.next_check = None
 
 	def problem(self) -> 'str | None':
-		if not self.states:
-			return None
-		mount_table = current_mount_table()
 		for path, since in self.states:
-			problem = pool_problem(path, since, mount_table)
+			problem = pool_problem(path, since)
 			if problem:
 				return problem
 		return None
