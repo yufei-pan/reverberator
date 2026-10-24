@@ -1519,6 +1519,25 @@ def test_a_first_backup_killed_while_its_list_is_written_with_a_hot_journal_is_c
 	assert sorted(committed_folders(job)) == [0] and link_number(job) == 0 and private_folders(job) == []
 
 
+def test_a_hot_journal_is_rolled_back_by_a_scan_that_comes_before_any_open_of_the_manifest(tmp_path, monkeypatch):
+	# the backuper scans its vault before it opens the manifest (review18): a read only open cannot roll a hot journal
+	# back ("attempt to write a readonly database"), which failed every attempt of a new job whose first backup was killed
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	commit_hooks(monkeypatch, kill_at='writing')
+	monkeypatch.setattr(rv, 'discard_change_list', lambda temp_path: None)
+	with pytest.raises(Killed):
+		run_backup(job)
+	monkeypatch.undo()
+	hot_journal(job)
+	rv.VAULTS_WITH_VERSIONS.clear()
+	assert dict(rv.get_vault_info(job.job_vault).vault_info_dict) == {}
+	assert not os.path.exists(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME) + '-journal')
+	assert private_folders(job) == [] and not [name for name in os.listdir(job.job_vault) if name.startswith('V0--')]
+	run_backup(job)
+	assert sorted(committed_folders(job)) == [0] and link_number(job) == 0
+
+
 def test_the_jobs_scan_removes_only_real_folders_of_the_private_prefix(tmp_path):
 	job = three_versions(tmp_path)
 	private = os.path.join(job.job_vault, rv.CHANGE_LIST_FOLDER_PREFIX + 'cut')
