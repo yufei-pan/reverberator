@@ -4738,8 +4738,9 @@ def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 	except OSError as e:
 		raise VaultScanError(f'cannot look at {path}: {e}')
 	try:
-		# quoted as bytes, so a vault path that is not UTF-8 is opened as it is; read only, creating nothing
-		conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=ro', uri=True, timeout=1)
+		# quoted as bytes, so a vault path that is not UTF-8 is opened as it is; creating nothing (mode=rw fails on a missing
+		# file), and rolling back a hot journal a killed write left, which a read only open cannot
+		conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=rw', uri=True, timeout=1)
 		try:
 			row = conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
 		finally:
