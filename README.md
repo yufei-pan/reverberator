@@ -14,7 +14,6 @@ Design decision:
 	Each job vault gets .reverberator_prune_salt at the job's first prune, a root-only 0600 file whose secret names pruning's temporary files. Leave it in place. A temp of it (.reverberator_prune_salt.tmp-*) that a kill left is removed by the job's next vault scan.
 
 Known limits (each in docs/limitations.md):
-	A mergerfs disk of the vault pool that is out can stop a job with a FAILED marker until it is back, and a prune while one is out could remove oldest-version copies whose links sit on it; a check that every disk is there comes in round 9.
 	A file moved and then chmod'ed, chown'ed or given new xattrs in one batch keeps its old mode, owner and xattrs in new versions until the next full comparison (at a restart, a failed attempt or an inotify overflow); round 9 fixes the order.
 	The vault database (.reverberator_manifest.sqlite) and the change lists are readable by any local user, and list every backed-up file name and size.
 	With keep-N at 41 or more, an unchanged user symlink is reached through more than 40 links, so browsing the vault by hand gives "too many levels of symbolic links" for it; restore gives it back.

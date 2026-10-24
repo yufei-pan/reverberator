@@ -2336,7 +2336,7 @@ def watcher(monitor_fs_flag:threading.Event,monitor_path:str,to_process:ChangeEv
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	root_lost = False
 	while running():
-		# the backuper can wait for the same path (at its start, or with a batch pending): the older wait alerts
+		# the backuper can wait for the same path (at its start, with a batch pending, or idle): the older wait alerts
 		if not wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready'):
 			return False
 		skip_list = watching = None
@@ -3817,7 +3817,7 @@ FS_SIGNATURE_MONITOR = fs_signature_monitor()
 
 #%% ---- Backup ----
 def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,monitor_path:str,vault_path:str,vaultInfo:VaultInfo = None,
-			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None) -> tuple:
+			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,pool_guard:'PoolGuard' = None) -> tuple:
 	'''
 	Fold a batch's scan events (scan_folders, the folders they name) into its backup_entries: each scanned folder is
 	compared with the latest version, and what that finds replaces the batch's entries at or under it. A folder inside
@@ -3825,7 +3825,7 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 	Returns (vaultInfo, manifest, full_comparison): full_comparison asks for the whole tree instead, for a scan of the
 	monitored path itself or a vault with no version yet. JobFailure is raised, before anything is compared, when the
 	monitored path no longer shows the filesystem root_mount fingerprints. reported holds the unreadable paths this batch
-	already logged.
+	already logged. pool_guard goes to each comparison (delta_generate_backup_entries()).
 	'''
 	scopes = scan_scopes(monitor_path,scan_folders)
 	if scopes == ['']:
@@ -3856,7 +3856,7 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 				break
 			found = OrderedDict()
 			delta_generate_backup_entries(found,latest_version_info,monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,
-				reported=reported,scope_rel=scope_rel,paused=paused)
+				reported=reported,scope_rel=scope_rel,paused=paused,pool_guard=pool_guard)
 			backup_entries.update(found)
 	except BaseException:
 		if opened_manifest:
@@ -3994,13 +3994,15 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 			if not running():
 				break
+			# the pools as the batch begins: a disk that drops from here on stops it ( do_backup() )
+			pool_guard = PoolGuard([vault_path, monitor_path])
 			# an unreadable path is reported once for the batch, by its comparison or its backup
 			reported = set()
 			# whether the whole tree is compared right after this batch
 			follow_up = False
 			if scan_folders and not full_comparison:
 				vaultInfo,manifest,full_comparison = compare_scanned_folders(backupEntries,scan_folders,job_name,monitor_path,vault_path,
-					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported)
+					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported,pool_guard=pool_guard)
 				if not running():
 					break
 				if full_comparison:
@@ -4018,7 +4020,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
-					  reported=reported,touched=None if full_comparison else touched)
+					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard)
 				if not committed:
 					# the batch goes back to the queue on the way out
 					if GREEN_LIGHT.is_set():
@@ -4508,7 +4510,7 @@ def do_backup(backup_entries:dict,
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
 			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,
-			 touched:'TouchedScopes' = None):
+			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
 	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
 	# reported: the unreadable paths already logged for this batch, so each is logged once
@@ -4516,6 +4518,9 @@ def do_backup(backup_entries:dict,
 	# comparison has none. with no backup_entries, only the touched scopes are compared with the latest version: a new
 	# version, its replay verified with touched, is made only when they differ
 	# move events sync attrs from source where the vault entry is a real file/dir ( see do_reverb_backup )
+	# pool_guard: the mergerfs pools of vault_path and monitor_path as they were when the batch began ( taken here when
+	# None ). its poll stops the copies once a disk of one drops, and nothing is committed unless both are whole and
+	# never mounted again since: PoolNotReady fails the attempt
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -4525,6 +4530,8 @@ def do_backup(backup_entries:dict,
 	global BACKUP_ENTRY_VALUES_HEADER
 	# this function will do the actual backup
 	skip = None if skip_list is None else skip_list.skips
+	if pool_guard is None:
+		pool_guard = PoolGuard([vault_path, monitor_path])
 	job_vault = os.path.join(vault_path,job_name)
 	if not os.path.lexists(job_vault):
 		try:
@@ -4589,6 +4596,7 @@ def do_backup(backup_entries:dict,
 					# the walk yields each folder before its contents
 					walk_errors = []
 					for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=walk_skip,errors=walk_errors):
+						pool_guard.poll()
 						backupEntryPath = os.path.join(backup_folder,relativePath)
 						manifest.add(relativePath,dirty=True)
 						if isDir:
@@ -4598,6 +4606,7 @@ def do_backup(backup_entries:dict,
 							cp_af_copy_path(monitorEntry,backupEntryPath,mcae,pending)
 					# copies still running must stop writing before a failed root orphans this version
 					while GREEN_LIGHT.is_set() and mcae.runningThreads:
+						pool_guard.poll()
 						mcae.wait(timeout=POLL_WAIT_SECONDS)
 					if GREEN_LIGHT.is_set():
 						finish_copies(pending,manifest,backup_folder,job_name,reported)
@@ -4618,7 +4627,7 @@ def do_backup(backup_entries:dict,
 				# would at a copy ( a re-copy copies such a link as it is ), so they count as copied in V0
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors,copy_version=this_version_number)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
-				do_referenced_copy(monitor_path,backup_folder,manifest)
+				do_referenced_copy(monitor_path,backup_folder,manifest,pool_guard=pool_guard)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
@@ -4630,7 +4639,7 @@ def do_backup(backup_entries:dict,
 					# tree: what they touched is compared, and what differs is replayed and verified as a batch is
 					backuperTeeLogToTl(job_name,'The batch collapsed to no backup entries, comparing the places it touched with the vault')
 				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported,
-					scope_rel='' if touched is None else touched,paused=paused)
+					scope_rel='' if touched is None else touched,paused=paused,pool_guard=pool_guard)
 				if not GREEN_LIGHT.is_set():
 					# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
 					backup_entries.clear()
@@ -4650,7 +4659,8 @@ def do_backup(backup_entries:dict,
 			if not backup_entries:
 				backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
 				# no differences after a complete walk, or none left outside paused folders: the tree matches the
-				# manifest under this skip list
+				# manifest under this skip list, if every disk of both pools was there all along
+				pool_guard.require()
 				manifest.begin()
 				manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 				manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
@@ -4737,7 +4747,8 @@ def do_backup(backup_entries:dict,
 				nonlocal paused
 				paused = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported,
-				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts)
+				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,
+				pool_guard=pool_guard)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -4774,15 +4785,21 @@ def do_backup(backup_entries:dict,
 		link_path = os.path.join(job_vault,'current_version')
 		# the link as it is before the commit, which an undo puts back: None only when there is none (a first backup). one
 		# that cannot be read, or something there that is no link, fails the attempt before anything is committed, as an
-		# undo would take a later backup for a first one, or replace what it cannot tell
+		# undo would take a later backup for a first one, or replace what it cannot tell. so does a disk of either pool
+		# missing now, or mounted again since the batch began: a copy may have landed on no disk of the vault, or a file
+		# of a missing monitored disk may read as deleted
 		try:
-			previous_link = os.readlink(link_path)
-		except FileNotFoundError:
-			previous_link = None
-		except OSError as e:
+			try:
+				previous_link = os.readlink(link_path)
+			except FileNotFoundError:
+				previous_link = None
+			except OSError as e:
+				raise JobFailure(f'cannot read {link_path}: {e}: not committing {backup_folder}')
+			pool_guard.require()
+		except JobFailure:
 			discard_change_list(prepared_list)
 			manifest.rollback()
-			raise JobFailure(f'cannot read {link_path}: {e}: not committing {backup_folder}')
+			raise
 		try:
 			manifest.commit(backup_folder)
 			swap_current_version(job_vault,os.path.basename(backup_folder))
@@ -5290,14 +5307,23 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	current_version left behind the newest committed version is moved forward (move_current_version_forward()). Raises
 	VaultScanError, having deleted nothing, when the vault cannot be read whole or for certain, and (after the
 	deletions) when an orphan cannot be removed, as the next backup would make a version of its number beside it. The caller's job then fails its attempt, with its FAILED marker: no
-	backup prunes or writes on a partial view.
+	backup prunes or writes on a partial view. A disk of the vault's mergerfs pool missing once the vault was read, or
+	mounted again since the read began, raises PoolNotReady the same way, having deleted nothing.
 	'''
 	# job vault subfolder should follow: V{version}--{ISO8601ish time}
 	# ex. V0--2021-01-01_00-00-00_-0800
+	# a disk of the vault pool that drops while the vault is read hides what it holds: what the read shows is acted on
+	# only with every disk there all along
+	guard = PoolGuard([job_vault_path])
 	try:
 		listing = read_job_vault(job_vault_path)
 	except VaultScanError as e:
 		backuperTeeLogToTl(job_vault_path, f'Cannot read the vault, nothing in it is removed: {e.reason}', error=True)
+		raise
+	try:
+		guard.require()
+	except PoolNotReady as e:
+		backuperTeeLogToTl(job_vault_path, f'Cannot scan the vault, nothing in it is removed: {e.reason}', error=True)
 		raise
 	if listing is None:
 		if os.path.abspath(job_vault_path) in VAULTS_WITH_VERSIONS:
@@ -5852,13 +5878,14 @@ def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, dis
 	else:
 		pending.clear()
 
-def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False) -> bool:
+def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None) -> bool:
 	'''
 	Recreate the folders tracked in manifest under backup_folder and link each tracked file to its copy under source_path.
 
 	Entries missing from source_path are dropped from the manifest; one that cannot be looked at stays tracked, and is
 	made or linked as ever, with an error line, as dropping it would leave it out of the new version. Returns False when
-	the backup was interrupted.
+	the backup was interrupted. pool_guard, when given, is polled for each entry: a disk of its pools that drops stops
+	the copy with PoolNotReady.
 	'''
 	def missing_from_source(path:str, kind:str, rel:str) -> bool:
 		# only an entry that is not there is missing: ENOTDIR says so too, for one below a name that is a file there now
@@ -5888,6 +5915,8 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			continue
 		os.makedirs(backup_folder_path,exist_ok=True)
 		copy_file_meta(source_folder,backup_folder_path)
+		if pool_guard is not None:
+			pool_guard.poll()
 		if not GREEN_LIGHT.is_set():
 			backuperTeeLogToTl(path=source_path,error=True,message='Backup process interrupted, stopping')
 			return False
@@ -5917,6 +5946,8 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		if os.path.lexists(backup_file_path):
 			os.remove(backup_file_path)
 		os.symlink(source_file, backup_file_path)
+		if pool_guard is not None:
+			pool_guard.poll()
 		if not GREEN_LIGHT.is_set():
 			backuperTeeLogToTl(path=source_path,error=True,message='Backup process interrupted, stopping')
 			return False
@@ -8157,7 +8188,8 @@ def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_
 	removed.append(rel)
 	return []
 
-def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel = '',paused:set = None) -> VaultManifest:
+def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel = '',paused:set = None,
+		pool_guard:'PoolGuard' = None) -> VaultManifest:
 	'''
 	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest
 	(compare_scopes() over the whole tree, or scope_rel) in a transaction of its own, which it commits.
@@ -8172,6 +8204,9 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	for a batch: only its scopes are compared, as compare_scopes() compares them.
 	The paused inner mounts (paused_inner_mounts, from the remembered ones and the mount table now when not given) are
 	not walked and keep their tracked rows; a scope that is skipped or inside a paused folder compares nothing.
+	With pool_guard, nothing is recorded unless the pools it holds stayed whole: what was read of the vault while a
+	disk of it was out, as a listing of the version that misses that disk's files, is rolled back, and PoolNotReady
+	raised.
 	Returns the manifest, opened in the job vault when none is given.
 	'''
 	if manifest is None:
@@ -8199,6 +8234,8 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 		manifest.rebuild(version_path)
 	try:
 		compare_scopes(backupEntries, manifest, version_path, monitor_path, scopes, skip=skips, paused=paused, job_name=job_name, reported=reported)
+		if pool_guard is not None:
+			pool_guard.require()
 	except JobFailure:
 		manifest.rollback()
 		raise
@@ -8770,7 +8807,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	Two links naming one copy (one of them a user's link the rows could not tell) each get it. A version, change list,
 	link or copy that cannot be looked at, linked or moved, or a removal that fails, keeps the oldest version: the
 	removal is aborted, and job_name's FAILED marker logged, then again every DISK_WAIT_REPEAT_SECONDS by clock while it
-	lasts, as no version is removed meanwhile and the vault keeps growing. Only a folder that is not there is gone: a
+	lasts, as no version is removed meanwhile and the vault keeps growing. A disk of the job vault's or monitor_path's
+	mergerfs pool missing at the removal, or mounted again since the walk began, keeps it the same way, then raises
+	PoolNotReady to fail the attempt. Only a folder that is not there is gone: a
 	kept oldest version whose folder is gone, as a removal cut short leaves it, is finished by removing what is left of
 	its paths.
 	Each version's record of what it holds, which its change list's name keeps and a restart sums, is kept in du's
@@ -9104,6 +9143,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		return True
 	# the next version's rows, read once for the whole walk
 	moves = VaultMoves(job_vault,monitor_path,monitor_paths).of(applyingVaultEntry.path)
+	# a disk of either pool that drops during the walk, even one back by its end, can hide a link into the reference
+	# vault: checked against the pools as they are now, right before the removal
+	guard = PoolGuard([job_vault, monitor_path])
 	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs).
 	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another.
 	# a folder that cannot be listed, or an entry that cannot be looked at, may hold this version's only way to a copy
@@ -9183,6 +9225,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	# the folder first, its change lists only once it is gone: a removal cut short leaves a list whose folder went (a
 	# stale list below the oldest, which the scan deletes) or the version committed, never a folder without a list,
 	# which the scan could not tell from a version whose list a listing left out
+	problem = guard.problem()
+	if problem:
+		# the attempt fails, and its retry scans the vault again, so the caller's sums need not be right
+		keep_oldest(problem)
+		raise PoolNotReady(problem)
 	removed = not multiCMD.run_command(['rm','-rf',own_folder],quiet=True,return_code_only=True)
 	gone = there(referenceVaultPath) is False
 	if gone:
@@ -9200,7 +9247,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
 					 recopy:list = (),recopied:list = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
-					 recheck_mounts = None) -> VaultManifest:
+					 recheck_mounts = None,pool_guard:'PoolGuard' = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
@@ -9219,12 +9266,16 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	then a delete for each entry removed, then a create for each one missing; one the replay could not apply is left
 	out. recheck_mounts(fixes), when given, runs once the comparison walked the tree: it drops the fixes under inner
 	mounts unmounted meanwhile, and raises JobFailure when the monitored root's filesystem changed.
+	pool_guard, when given, is polled while copies are queued and waited for: a disk of its pools that drops stops them
+	with PoolNotReady, so nothing more is written into the version.
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
 	global GREEN_LIGHT
 	if reported is None:
 		reported = set()
+	# a clock compare between checks, so it runs per entry
+	poll_pools = (lambda: None) if pool_guard is None else pool_guard.poll
 	backup_entries = prepare_backup_entries_for_replay(backup_entries)
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
 	# the links of the committed versions, on the chains the re-copy and the attribute sync follow, are told by their
@@ -9274,6 +9325,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# a folder that could not be made: nothing is copied under it
 			unmade = None
 			for subRealPath, subRelativePath, subIsDir in iter_tree_entries(source_real_path,rel_base,skip=None if skip_list is None else skip_list.skips,errors=walk_errors):
+				# a folder's create queues a copy of everything below it
+				poll_pools()
 				if unmade is not None and subRelativePath.startswith(unmade):
 					continue
 				subVaultPath = os.path.join(backup_folder,subRelativePath)
@@ -9402,6 +9455,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	def wait_for_async_commands(mcae):
 		# returns the rels of the copies put in place
 		while GREEN_LIGHT.is_set() and mcae.runningThreads:
+			poll_pools()
 			mcae.wait(timeout=POLL_WAIT_SECONDS)
 		if not GREEN_LIGHT.is_set():
 			return []
@@ -9438,6 +9492,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		applied = {}
 		need_delete_barrier = False
 		for event_source_real_path, event_values in entries.items():
+			# a big batch queues its copies long before its first wait for them
+			poll_pools()
 			applied[event_source_real_path] = True
 			backuperTeeLogToTl(path=monitor_path,message=f'Processing {event_source_real_path} {event_values}')
 			event_relative_path = os.path.relpath(path=event_source_real_path,start=monitor_path)
@@ -9610,7 +9666,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		if not manifest.describes(latest_version_info.path):
 			backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {latest_version_info.path}, listing it')
 			manifest.rebuild(latest_version_info.path)
-		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True):
+		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard):
 			return manifest
 		backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
 		mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
@@ -9618,6 +9674,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# over the links the referenced copy just made: a copy that fails leaves the link
 			job_vault = os.path.dirname(os.path.abspath(backup_folder))
 			for rel in recopy:
+				poll_pools()
 				if not GREEN_LIGHT.is_set():
 					break
 				if not real_folders_to(backup_folder,rel):
