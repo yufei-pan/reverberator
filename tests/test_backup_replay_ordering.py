@@ -80,6 +80,22 @@ class TestOrderBackupEntriesForReplay(unittest.TestCase):
 		keys = list(ordered.keys())
 		self.assertLess(keys.index('/mon/a/b.txt'), keys.index('/mon/a/'))
 
+	def test_changes_at_or_under_a_move_destination_after_the_move_come_after_the_moves(self):
+		entries = OrderedDict([
+			('/m/e/', rv.BackupEntryValues('t1', 'move', '/m/d/')),
+			('/m/e/y', rv.BackupEntryValues('t2', 'attrib', None)),
+			('/m/e/new', rv.BackupEntryValues('t3', 'create', None)),
+			('/m/x', rv.BackupEntryValues('t4', 'modify', None)),
+		])
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/x', '/m/e/', '/m/e/y', '/m/e/new'])
+
+	def test_changes_before_a_move_stay_before_it(self):
+		entries = OrderedDict([
+			('/m/d/y', rv.BackupEntryValues('t1', 'attrib', None)),
+			('/m/e/', rv.BackupEntryValues('t2', 'move', '/m/d/')),
+		])
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/d/y', '/m/e/'])
+
 
 class TestReverbBackupNewTreeFileBeforeParent(unittest.TestCase):
 	def test_new_tree_succeeds_when_entries_list_files_before_dirs(self):
