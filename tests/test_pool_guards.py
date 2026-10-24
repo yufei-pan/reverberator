@@ -416,7 +416,14 @@ def test_the_change_list_is_not_placed_when_a_disk_drops_after_the_commit_check(
 	monkeypatch.setattr(rv, 'swap_current_version', swapping)
 	with pytest.raises(rv.PoolNotReady):
 		backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]))
-	assert committed_versions(job) == [v0]
-	assert lists_of(job, version_folder(job, 1)) == []
+	monkeypatch.setattr(rv, 'swap_current_version', real)
+	v1 = version_folder(job, 1)
+	assert committed_versions(job) == [v0] and lists_of(job, v1) == []
+	# nothing is written while the disk is out: the link stays on V1, and its list in its private folder
+	private = lambda: [name for name in os.listdir(job.job_vault) if name.startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
+	assert os.readlink(os.path.join(job.job_vault, 'current_version')) == os.path.basename(v1) and private()
+	# with the disk back, the scan takes V1 for a commit cut off before its list was placed
+	fake_pool.mount(a)
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0]
 	assert os.readlink(os.path.join(job.job_vault, 'current_version')) == os.path.basename(v0)
-	assert not [name for name in os.listdir(job.job_vault) if name.startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
+	assert not os.path.lexists(v1) and private() == []
