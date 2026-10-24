@@ -1,4 +1,5 @@
 import errno
+import threading
 import os
 import stat
 import struct
@@ -8,7 +9,7 @@ from collections import deque
 
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup
+from tests.harness import seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions
 
 pytestmark = pytest.mark.unit
 
@@ -1125,4 +1126,308 @@ def test_the_verification_reads_the_xattrs_of_entries_the_batch_changed_only(job
 	events = deque([rv.ChangeEvent(taken, True, 'move', f'{m}/E', f'{m}/D')])
 	run_backup(job, rv.change_events_to_backup_entries(deque(events), m), touched=rv.touched_scopes(events, m))
 	assert compared == [f'{m}/E/']
+	assert_moved_cleanly(logged)
+
+
+# --- the final fix wave of round 9 ---
+
+def listing_enodata(monkeypatch, root, name='security.capability'):
+	'''os.listxattr also lists name for every entry under root, whose os.getxattr answers ENODATA, as mergerfs with
+	security_capability=false does for security.capability.'''
+	real_list, real_get = os.listxattr, os.getxattr
+	def under(path):
+		path = os.fsdecode(path)
+		return path == root or path.startswith(root + '/')
+	def listing(path, *args, **kwargs):
+		names = real_list(path, *args, **kwargs)
+		return names + [name] if under(path) else names
+	def getting(path, attribute, *args, **kwargs):
+		if attribute == name and under(path):
+			raise OSError(errno.ENODATA, os.strerror(errno.ENODATA), path)
+		return real_get(path, attribute, *args, **kwargs)
+	monkeypatch.setattr(os, 'listxattr', listing)
+	monkeypatch.setattr(os, 'getxattr', getting)
+
+
+def test_xattrs_differ_skips_a_listed_name_that_has_no_value(job, monkeypatch):
+	seed_monitor(job, {'x': 'x'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/x')
+	os.setxattr(f'{m}/x', 'user.k', b'v')
+	v0 = run_backup(job)[0]
+	listing_enodata(monkeypatch, m)
+	assert rv.xattrs_differ(f'{m}/x', os.path.join(v0, 'x')) is False
+	os.setxattr(f'{m}/x', 'user.k', b'w')
+	assert rv.xattrs_differ(f'{m}/x', os.path.join(v0, 'x')) is True
+
+
+def test_a_listed_xattr_without_a_value_copies_no_moved_folder(job, logged, monkeypatch):
+	# a folder moved on a mergerfs pool that lists security.capability and answers ENODATA for it: its xattrs compare
+	# equal, so its tree is not copied again
+	seed_monitor(job, {'D/a': 'a', 'D/b': 'b', 'keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/D/a')
+	run_backup(job)
+	listing_enodata(monkeypatch, m)
+	copies = copies_made(monkeypatch)
+	os.rename(f'{m}/D', f'{m}/E')
+	version = verified(job, (True, 'move', 'E', 'D'))
+	assert copies == []
+	assert not [line for line in logged if 'treating as modify' in line]
+	assert_left_alone(version, 'E/a')
+	assert_left_alone(version, 'E/b')
+
+
+class SteppedClock:
+	'''The time module, with a wall clock step seconds ahead of the real one.'''
+	def __init__(self, step):
+		self.step = step
+	def __getattr__(self, name):
+		return getattr(time, name)
+	def time_ns(self):
+		return time.time_ns() + int(self.step * 10 ** 9)
+	def time(self):
+		return time.time() + self.step
+
+
+def test_an_xattr_changed_5_s_before_its_batchs_first_event_is_compared(job, logged):
+	# chrony steps the clock forward by a second or two right after boot: an entry the batch changed can have a ctime up
+	# to VERIFY_CTIME_MARGIN_SECONDS (10 s) before its batch's first event, and its xattrs are still compared
+	seed_monitor(job, {'D/a': 'a', 'keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/D/a')
+	run_backup(job)
+	os.rename(f'{m}/D', f'{m}/D2')
+	os.setxattr(f'{m}/D2/a', 'user.new', b'n')
+	events = deque([rv.ChangeEvent(time.monotonic() + 5, True, 'move', f'{m}/D2', f'{m}/D')])
+	version = run_backup(job, rv.change_events_to_backup_entries(deque(events), m), touched=rv.touched_scopes(events, m))[-1]
+	assert os.listxattr(resolved(job, version, 'D2/a')) == ['user.new']
+	assert_moved_cleanly(logged)
+
+
+def test_the_queue_stamps_the_wall_clock_time_of_a_batchs_first_event():
+	queue = rv.ChangeEventQueue('/m')
+	assert queue.first_wall_ns is None
+	before = time.time_ns()
+	queue.append(rv.ChangeEvent(1.0, False, 'modify', '/m/a', None))
+	stamp = queue.first_wall_ns
+	assert before <= stamp <= time.time_ns()
+	queue.append(rv.ChangeEvent(2.0, False, 'modify', '/m/b', None))
+	assert queue.first_wall_ns == stamp
+	taken = queue.take()
+	assert taken.first_wall_ns == stamp and queue.first_wall_ns is None
+	assert rv.touched_scopes(taken, '/m').changed_since_wall == stamp
+
+
+def test_the_ctime_bound_is_the_earlier_of_the_two_clocks(monkeypatch):
+	margin = rv.VERIFY_CTIME_MARGIN_SECONDS * 10 ** 9
+	now = time.time_ns()
+	# a wall clock that stepped forward a minute after the first event: the first event's wall time is the earlier
+	monkeypatch.setattr(rv, 'time', SteppedClock(60))
+	assert abs(rv.ctime_bound(time.monotonic(), now) - (now - margin)) < 10 ** 8
+	# one that stepped back a minute: now less the time since the first event is the earlier
+	monkeypatch.setattr(rv, 'time', SteppedClock(-60))
+	assert abs(rv.ctime_bound(time.monotonic(), now) - (now - 60 * 10 ** 9 - margin)) < 10 ** 8
+	# a full comparison's bound is a wall time alone
+	assert rv.ctime_bound(None, now) == now - margin
+	assert rv.ctime_bound(float('-inf'), now) == 0 and rv.ctime_bound(None) is None
+
+
+def test_an_xattr_changed_before_a_forward_clock_step_is_compared(job, logged, monkeypatch):
+	# the wall clock steps forward a minute between the batch's first event and its verification: the bound is the first
+	# event's wall time, so the xattr the batch lost is still synced
+	seed_monitor(job, {'D/a': 'a', 'keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/D/a')
+	run_backup(job)
+	os.rename(f'{m}/D', f'{m}/D2')
+	os.setxattr(f'{m}/D2/a', 'user.new', b'n')
+	queue = rv.ChangeEventQueue(m)
+	queue.append(rv.ChangeEvent(time.monotonic(), True, 'move', f'{m}/D2', f'{m}/D'))
+	taken = queue.take()
+	monkeypatch.setattr(rv, 'time', SteppedClock(60))
+	version = run_backup(job, rv.change_events_to_backup_entries(taken, m), touched=rv.touched_scopes(taken, m))[-1]
+	assert os.listxattr(resolved(job, version, 'D2/a')) == ['user.new']
+	assert_moved_cleanly(logged)
+
+
+@pytest.mark.parametrize('only_sync_attributes', [True, False])
+def test_a_full_comparison_syncs_an_xattr_set_while_nothing_watched(job, logged, only_sync_attributes):
+	# setfattr right after the daemon starts, before its watches are in place ( race_xattr.py ): the comparison at the
+	# start reads the xattrs of the entries changed since the version before the latest, by their ctime
+	seed_monitor(job, {'x': 'x', 'y': 'y'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/x')
+	run_backup(job, only_sync_attributes=only_sync_attributes)
+	os.setxattr(f'{m}/x', 'user.race', b'r')
+	versions = run_backup(job, only_sync_attributes=only_sync_attributes)
+	assert len(versions) == 2
+	end = resolved(job, versions[-1], 'x')
+	assert os.listxattr(end) == ['user.race'] and open(end).read() == 'x'
+	assert_left_alone(versions[-1], 'y')
+	assert_moved_cleanly(logged)
+
+
+class Killed(BaseException):
+	pass
+
+
+def test_a_killed_commit_then_a_restart_drops_an_xattr_the_user_removed(job, logged, monkeypatch):
+	# setfattr -x user.gone x; the backup of its attrib is killed before its replay; at the restart the whole tree is
+	# compared ( extra_xattr.py ): the xattr is gone from the new version
+	seed_monitor(job, {'x': 'x', 'y': 'y'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/x')
+	os.setxattr(f'{m}/x', 'user.gone', b'g')
+	run_backup(job)
+	os.removexattr(f'{m}/x', 'user.gone')
+	def killed(*args, **kwargs):
+		raise Killed()
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'do_reverb_backup', killed)
+		with pytest.raises(Killed):
+			rv.do_backup(batch(job, (False, 'attrib', 'x', None)), job_name=job.job_name, monitor_path=m, vault_path=job.vault,
+				keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+	rv.VERSION_MOVES.clear()
+	rv.REAL_VAULT_FOLDERS.clear()
+	versions = run_backup(job)
+	assert len(versions) == 2
+	assert os.listxattr(resolved(job, versions[-1], 'x')) == []
+
+
+def test_a_full_comparison_reads_the_xattrs_of_recently_changed_entries_only(job, monkeypatch):
+	# entries whose ctime is before the bound cost one compare of numbers each, and no xattr read
+	seed_monitor(job, {f'f{i}': str(i) for i in range(20)})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/f0')
+	monkeypatch.setattr(rv, 'VERIFY_CTIME_MARGIN_SECONDS', 0.25)
+	time.sleep(1.5)
+	run_backup(job)
+	os.setxattr(f'{m}/f3', 'user.k', b'v')
+	compared = []
+	real = rv.xattrs_differ
+	def spy(monitor_entry, vault_entry):
+		compared.append(monitor_entry)
+		return real(monitor_entry, vault_entry)
+	monkeypatch.setattr(rv, 'xattrs_differ', spy)
+	versions = run_backup(job)
+	assert compared == [f'{m}/f3']
+	assert os.listxattr(resolved(job, versions[-1], 'f3')) == ['user.k']
+
+
+def nested_swap(job):
+	'''
+	Fuzz seed 1358, batch 4: two folders swapped, P and x/Q, then a file inside the one now at x/Q swapped with the one now
+	at P ( P/s/f is a file, and it ends at P; what was x/Q ends at x/Q/s/f ). Returns the watcher's events.
+	'''
+	m = job.monitor
+	os.rename(f'{m}/P', f'{m}/t')
+	os.rename(f'{m}/x/Q', f'{m}/P')
+	os.rename(f'{m}/t', f'{m}/x/Q')
+	os.rename(f'{m}/x/Q/s/f', f'{m}/x/Q/s/t2')
+	os.rename(f'{m}/P', f'{m}/x/Q/s/f')
+	os.rename(f'{m}/x/Q/s/t2', f'{m}/P')
+	return ((True, 'move', 't', 'P'), (True, 'move', 'P', 'x/Q'), (True, 'move', 'x/Q', 't'),
+		(False, 'move', 'x/Q/s/t2', 'x/Q/s/f'), (True, 'move', 'x/Q/s/f', 'P'), (False, 'move', 'P', 'x/Q/s/t2'))
+
+
+NESTED_TREE = {'P/s/f': 'F', 'P/pk': 'pk', 'x/Q/qk': 'qk', 'keep': 'k'}
+
+
+@pytest.mark.parametrize('verify', [False, True])
+def test_a_folder_moved_into_a_folder_moved_onto_its_place_commits_its_batch(job, logged, verify):
+	# the collapse moves P onto x/Q first, so the move of what was x/Q to x/Q/s/f finds a folder to be moved into itself,
+	# and falls back to delete & copy: the delete of x/Q goes first, then the copy, which is not removed under it
+	seed_monitor(job, NESTED_TREE)
+	run_backup(job)
+	events = nested_swap(job)
+	if verify:
+		version = verified(job, *events)
+		assert_version_is_the_tree(job, version)
+	else:
+		version = run_backup(job, batch(job, *events))[-1]
+	assert open(resolved(job, version, 'P')).read() == 'F'
+	assert open(resolved(job, version, 'x/Q/s/f/qk')).read() == 'qk'
+
+
+def test_a_failed_batch_is_followed_by_a_full_comparison_in_the_job_loop(job, monkeypatch, capsys):
+	# fuzz seed 1358 in the daemon's own retry loop: the batch's attempt fails ( a copy into the vault failing once, as
+	# the delete & copy of its nested move did at c4b0e30 ), the job is retried, and its next attempt compares the
+	# whole tree instead of replaying the batch it handed back, which commits a version that is the tree
+	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.01)
+	seed_monitor(job, NESTED_TREE)
+	run_backup(job)
+	m = job.monitor
+	attempts = []
+	def watcher(monitor_fs_flag, monitor_path, to_process, to_process_lock, to_process_flag, irm, low, high, startup, control, signature):
+		# the watcher's part of a start: its watches are in place once the skip list is loaded; on the first attempt the
+		# batch comes once the comparison at the start has committed
+		attempts.append(control)
+		while control.should_run() and not startup.loaded.is_set():
+			time.sleep(0.01)
+		startup.watching.set()
+		if len(attempts) == 1:
+			while control.should_run() and not control.committed.is_set():
+				time.sleep(0.01)
+			events = nested_swap(job)
+			with to_process_lock:
+				for is_dir, event, rel, source in events:
+					to_process.append(rv.ChangeEvent(time.monotonic(), is_dir, event, f'{m}/{rel}', None if source is None else f'{m}/{source}'))
+			to_process_flag.set()
+		while control.should_run():
+			time.sleep(0.01)
+	monkeypatch.setattr(rv, 'watcher', watcher)
+	backups = []
+	real_backup = rv.do_backup
+	def backup(entries, **kwargs):
+		# a whole comparison is a backup of no entries for no touched places
+		backups.append('batch' if entries or kwargs.get('touched') is not None else 'whole')
+		return real_backup(entries, **kwargs)
+	monkeypatch.setattr(rv, 'do_backup', backup)
+	real_replay = rv.do_reverb_backup
+	def replay(*args, **kwargs):
+		if backups.count('batch') == 1 and not replay.failed:
+			replay.failed = True
+			raise rv.JobFailure(f'copying {m}/P into the vault failed: cp: No such file or directory')
+		return real_replay(*args, **kwargs)
+	replay.failed = False
+	monkeypatch.setattr(rv, 'do_reverb_backup', replay)
+	to_process, lock, flag, ready = rv.ChangeEventQueue(m), threading.Lock(), threading.Event(), threading.Event()
+	ready.set()
+	start_attempt = rv.job_attempt_starter(job.job_name, (job.job_name, m), (ready, m, to_process, lock, flag, None, 1, 1),
+		(job.job_name, to_process, lock, m, job.vault, 'N/A', flag, ready, True, True, 0, '0', False))
+	control = rv.JobControl(job.job_name)
+	supervisor = threading.Thread(target=lambda: rv.run_job(control, start_attempt), daemon=True)
+	supervisor.start()
+	try:
+		wait_for_committed_count(job, 2, timeout=30)
+	finally:
+		rv.GREEN_LIGHT.clear()
+		supervisor.join(timeout=10)
+		rv.GREEN_LIGHT.set()
+	assert not supervisor.is_alive()
+	text = capsys.readouterr().out
+	assert f'reverberator job {job.job_name} FAILED: ' in text and 'RECOVERED after 1 failed attempts' in text
+	# each start compares the whole tree: the batch handed back is not replayed again
+	assert backups == ['whole', 'batch', 'whole']
+	assert len(attempts) == 2 and len(committed_versions(job)) == 2
+	assert_version_is_the_tree(job, latest_version(job).path)
+
+
+def test_an_attrib_whose_record_vouches_reads_no_vault_copy(job, logged, monkeypatch):
+	# chown -R over many files: each file's record vouches for its copy, so only the live file is read, never the
+	# vault copy's tail
+	seed_monitor(job, {'x': 'x' * 100000, 'keep': 'k'})
+	m = job.monitor
+	run_backup(job)
+	os.chmod(f'{m}/x', 0o600)
+	read = []
+	real = rv.same_contents
+	def spy(source_path, path):
+		read.append(path)
+		return real(source_path, path)
+	monkeypatch.setattr(rv, 'same_contents', spy)
+	version = run_backup(job, batch(job, (False, 'attrib', 'x', None)))[-1]
+	assert read == []
+	assert mode(resolved(job, version, 'x')) == 0o600 and os.path.islink(os.path.join(version, 'x'))
 	assert_moved_cleanly(logged)

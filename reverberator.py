@@ -223,6 +223,9 @@ class ChangeEventQueue:
 	round_tripped says that some of the events lost their raw form: a batch handed back after a backup that did not
 	commit, or loaded from the pending transactions, holds only its collapsed entries (backup_entries_to_change_events()).
 	prepend() and the pending load set it for events other than scans, and take() moves it to the batch it takes.
+	first_wall_ns is the wall clock time, in ns, at which the first event came into an empty queue (None while empty),
+	which take() moves along too: with the first event's monotonic time, the batch's verification tells which entries it
+	changed even when the wall clock stepped between ( ctime_bound() ).
 
 	Examples:
 		>>> queue = ChangeEventQueue('/m')
@@ -250,6 +253,7 @@ class ChangeEventQueue:
 
 	def clear(self):
 		self.round_tripped = False
+		self.first_wall_ns = None
 		# (event count, zlib compressed marshal of the events' fields), oldest first
 		self._blocks = []
 		# the newest events, not packed yet
@@ -306,6 +310,8 @@ class ChangeEventQueue:
 			self._full_scan = event
 			self._count = 1
 			return
+		if not self._count:
+			self.first_wall_ns = time.time_ns()
 		self._recent.append(event)
 		self._count += 1
 		if len(self._recent) >= QUEUE_BLOCK_EVENTS:
@@ -359,7 +365,7 @@ class ChangeEventQueue:
 		taken = ChangeEventQueue(self.monitor_path)
 		taken._blocks, taken._recent, taken._count = self._blocks, self._recent, self._count
 		taken._packed_bytes, taken._full_scan = self._packed_bytes, self._full_scan
-		taken.round_tripped = self.round_tripped
+		taken.round_tripped, taken.first_wall_ns = self.round_tripped, self.first_wall_ns
 		self.clear()
 		return taken
 
@@ -1233,9 +1239,10 @@ HASH_SIZE = 1<<16
 # threads per job comparing entries in delta generation: the vault disks serve many lookups at once
 COMPARE_THREADS = 32
 # how long before its first event a batch's changes may date, for the ctimes the verification of the batch reads its
-# extended attributes by ( touched_scopes() ): the watcher times an event when it reads it, after the change, and a
-# ctime comes from a coarser clock
-VERIFY_CTIME_MARGIN_SECONDS = 2
+# extended attributes by ( ctime_bound() ): the watcher times an event when it reads it, after the change, a ctime comes
+# from a coarser clock, and chrony has stepped the wall clock by 1-2 s right after boot. a full comparison takes it off
+# its version's time too ( full_comparison_since() )
+VERIFY_CTIME_MARGIN_SECONDS = 10
 # the kernel also gives up resolving a path after 40 links
 MAX_CHAINED_LINKS = 40
 # a new version copies a file again from the vault rather than link it through more links than its name's threshold,
@@ -3878,7 +3885,7 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 				break
 			found = OrderedDict()
 			delta_generate_backup_entries(found,latest_version_info,monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,
-				reported=reported,scope_rel=scope_rel,paused=paused,pool_guard=pool_guard)
+				reported=reported,scope_rel=scope_rel,paused=paused,pool_guard=pool_guard,changed_since_wall=full_comparison_since(vaultInfo.vault_info_dict))
 			backup_entries.update(found)
 	except BaseException:
 		if opened_manifest:
@@ -4162,8 +4169,9 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 	and paths outside monitor_path are left out, and so is a scope inside a subtree (a path inside one above it: its own
 	subtree can be skipped by a pattern for folders, which the file is not).
 	changed_since is the monotonic time of the first event: an inode the batch changed (its extended attributes too, or a
-	rename of it) has a ctime from about then on. A batch handed back or resumed (round_tripped) holds its collapsed
-	entries only, timed as they were handed back, so it gives -inf, for every entry.
+	rename of it) has a ctime from about then on. changed_since_wall is the wall clock time a ChangeEventQueue took when
+	its first event came in (first_wall_ns), None for events of another kind. A batch handed back or resumed
+	(round_tripped) holds its collapsed entries only, timed as they were handed back, so it gives -inf, for every entry.
 
 	Examples:
 		>>> touched_scopes([ChangeEvent(1.0, True, 'move', '/m/E', '/m/D'), ChangeEvent(2.0, False, 'modify', '/m/E/f', None),
@@ -4212,23 +4220,30 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 		folders = scope_folders(rel)
 		return any(folder in kept for folder in (folders if rel.endswith('/') else folders[:-1]))
 	changed_since = float('-inf') if first is not None and getattr(events, 'round_tripped', False) else first
-	return TouchedScopes(subtrees, sorted(rel for rel in paths if not covered(rel)), changed_since)
+	return TouchedScopes(subtrees, sorted(rel for rel in paths if not covered(rel)), changed_since,
+		getattr(events, 'first_wall_ns', None) if first is not None else None)
 
-def ctime_bound(changed_since:float) -> int:
+def ctime_bound(changed_since:float, changed_since_wall:int = None) -> int:
 	'''
 	The ctime, in ns, from which an entry counts as changed by a batch whose changes date from changed_since on the
-	monotonic clock (TouchedScopes), VERIFY_CTIME_MARGIN_SECONDS before it: 0, every entry, for -inf. None for None.
+	monotonic clock and changed_since_wall (ns) on the wall clock (TouchedScopes): the earlier of changed_since_wall and
+	now less the time since changed_since, so a wall clock step either way between the two hides no change, less
+	VERIFY_CTIME_MARGIN_SECONDS. 0, every entry, for a changed_since of -inf; None when neither is known.
 
 	Examples:
-		>>> ctime_bound(None), ctime_bound(float('-inf'))
-		(None, 0)
+		>>> ctime_bound(None), ctime_bound(float('-inf')), ctime_bound(None, 10 ** 12) == 10 ** 12 - VERIFY_CTIME_MARGIN_SECONDS * 10 ** 9
+		(None, 0, True)
 		>>> abs(ctime_bound(time.monotonic()) - (time.time_ns() - VERIFY_CTIME_MARGIN_SECONDS * 10 ** 9)) < 10 ** 8
 		True
 	'''
-	if changed_since is None:
+	if changed_since == float('-inf'):
+		return 0
+	since = [] if changed_since_wall is None else [changed_since_wall]
+	if changed_since is not None:
+		since.append(time.time_ns() - int((time.monotonic() - changed_since) * 10 ** 9))
+	if not since:
 		return None
-	ago = time.monotonic() - changed_since + VERIFY_CTIME_MARGIN_SECONDS
-	return 0 if ago == float('inf') else max(0, time.time_ns() - int(ago * 10 ** 9))
+	return max(0, min(since) - int(VERIFY_CTIME_MARGIN_SECONDS * 10 ** 9))
 
 def change_events_to_backup_entries(change_events:deque, monitor_path:str = None) -> OrderedDict:
 	'''
@@ -4309,8 +4324,6 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 	# out of the path, or None for what ended it there ( a delete, or a move onto it ). when counts down the batch, so the
 	# greatest is the soonest after the event at hand
 	later = {}
-	# when the move whose entry is keyed by its destination was made
-	moved_when = {}
 	# when the event of each entry was made, or for one a move carried there, when that move was
 	entry_when = {}
 	def carried(path, bound = None, moved = False):
@@ -4472,7 +4485,7 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,escalated_event,abs_path)
 					# no longer a move, it is replayed where the moves after the move it was carried it ( echo new > a;
 					# mv a d/a; mv d e is a modify of e/a ), once they are made
-					now_at, escalated_bound = carried(moveDest, moved_when.get(moveDest), True) if own else (moveDest, None)
+					now_at, escalated_bound = carried(moveDest, entry_when.get(moveDest), True) if own else (moveDest, None)
 					if now_at is None:
 						# removed after the moves carried it ( mv d e; rm -r e ): nothing of it is copied, and what the version
 						# holds at its key goes. the key stays taken, so no earlier event of the path is replayed either
@@ -4562,9 +4575,6 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 			backuperTeeLogToTl(abs_path,f'Adding {event} on {abs_path} at {iso_time} with source {abs_moved_from}')
 			backup_entries[abs_path] = BackupEntryValues(iso_time,event,abs_moved_from)
 			entry_when[abs_path] = carry_bound if carried_on else when
-			if event == 'move':
-				# the entry of a move keyed here is this one's from now
-				moved_when[abs_path] = when
 			# one carried by a later move goes after the moves, at its place once they are made
 			backup_entries.move_to_end(abs_path,last=carried_on)
 	for path in [path for path, values in backup_entries.items() if values.event == 'move' and values.source_path == path]:
@@ -4774,7 +4784,7 @@ def do_backup(backup_entries:dict,
 					# tree: what they touched is compared, and what differs is replayed and verified as a batch is
 					backuperTeeLogToTl(job_name,'The batch collapsed to no backup entries, comparing the places it touched with the vault')
 				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported,
-					scope_rel='' if touched is None else touched,paused=paused,pool_guard=pool_guard)
+					scope_rel='' if touched is None else touched,paused=paused,pool_guard=pool_guard,changed_since_wall=full_comparison_since(vault_info_dict))
 				if not GREEN_LIGHT.is_set():
 					# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
 					backup_entries.clear()
@@ -8272,7 +8282,9 @@ def xattrs_differ(monitor_entry:str, vault_entry:str) -> bool:
 	'''
 	Whether the extended attributes of monitor_entry, never followed, and those of vault_entry, followed as its chain
 	links lead to the copy, differ in a name or a value. One whose filesystem keeps none (ENOTSUP, ENOSYS) differs from
-	nothing: copy_file_meta() could not make the two agree. Raises OSError.
+	nothing: copy_file_meta() could not make the two agree. A name listed whose value reads as ENODATA (gone since the
+	listing, or mergerfs with security_capability=false, which lists security.capability and gives no value) is left out,
+	as copystat() leaves it. Raises OSError.
 	'''
 	def attributes(path, follow):
 		path = path.rstrip('/') or path
@@ -8282,7 +8294,14 @@ def xattrs_differ(monitor_entry:str, vault_entry:str) -> bool:
 			if e.errno in (errno.ENOTSUP, errno.ENOSYS):
 				return None
 			raise
-		return sorted((name, os.getxattr(path, name, follow_symlinks=follow)) for name in names)
+		pairs = []
+		for name in names:
+			try:
+				pairs.append((name, os.getxattr(path, name, follow_symlinks=follow)))
+			except OSError as e:
+				if e.errno != errno.ENODATA:
+					raise
+		return sorted(pairs)
 	live = attributes(monitor_entry, False)
 	if live is None:
 		return False
@@ -8315,9 +8334,10 @@ def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list
 
 # what a comparison covers: subtrees are folder rels ending with /, each compared with everything under it ('' for the
 # whole tree), and paths are file rels or folder rels ending with /, each compared alone. changed_since, when not None,
-# is the time on the monotonic clock from which a batch's changes date ( -inf when it is not known ): an entry whose
-# ctime is not before it, VERIFY_CTIME_MARGIN_SECONDS to spare, has its extended attributes compared too ( ctime_bound() )
-TouchedScopes = namedtuple('TouchedScopes', ['subtrees', 'paths', 'changed_since'], defaults=(None,))
+# is the time on the monotonic clock from which a batch's changes date ( -inf when it is not known ), and
+# changed_since_wall, when not None, the time in ns on the wall clock: an entry whose ctime is not before the earlier,
+# VERIFY_CTIME_MARGIN_SECONDS to spare, has its extended attributes compared too ( ctime_bound() )
+TouchedScopes = namedtuple('TouchedScopes', ['subtrees', 'paths', 'changed_since', 'changed_since_wall'], defaults=(None, None))
 
 def scope_folders(rel:str) -> list:
 	'''
@@ -8368,8 +8388,9 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder from a file,
 	and never read back, so their copies stay unchecked. With fresh, version_path is that uncommitted version, and a
 	file read there as a real file of its own (a re-copy, or a copy a move carried) is recorded unchecked too.
-	Without attributes, attribute-only differences are left out. With scopes.changed_since, the extended attributes of
-	the entries changed since then, by their ctime, are compared too (compare_entry()), never those of a trusted row.
+	Without attributes, attribute-only differences are left out. With scopes.changed_since or changed_since_wall, the
+	extended attributes of the entries changed since then, by their ctime (ctime_bound()), are compared too
+	(compare_entry()), never those of a trusted row.
 	Each subtree is walked, and the rows at or under it the walk did not find are deleted (every such row for the whole
 	tree); each path is looked up alone, a folder without its contents, and the root is never one. A scope nested in a
 	subtree is compared once, with the subtree, and so is an entry two paths name. The scopes are taken in the order of
@@ -8383,7 +8404,7 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	(read_vault_record()).
 	'''
 	start_time = time.monotonic()
-	xattrs_since = ctime_bound(scopes.changed_since)
+	xattrs_since = ctime_bound(scopes.changed_since, scopes.changed_since_wall)
 	skip = skip_paused(skip, paused)
 	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path if fresh else None,
 		applied=applied if fresh else None)
@@ -8627,8 +8648,32 @@ def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_
 	removed.append(rel)
 	return []
 
+def full_comparison_since(vault_info_dict:OrderedDict) -> int:
+	'''
+	The wall clock time, in ns, from which a full comparison with the newest of the committed versions vault_info_dict
+	lists also compares an entry's extended attributes (by its ctime, VERIFY_CTIME_MARGIN_SECONDS to spare): an xattr-only
+	change made while nothing watched (the daemon down or starting, events lost in an overflow) is then backed up. That
+	is the time the version before the newest was made, when one is kept, as the newest one's batch was taken after that
+	version was committed, and its folder is named only after its comparison and pruning; else the newest one's own.
+	Entries whose ctime is older cost one comparison of numbers each. None with no version.
+
+	Examples:
+		>>> full_comparison_since(OrderedDict([(4, VaultEntry(4, '/v/V4', 100.0, 0, 0)), (5, VaultEntry(5, '/v/V5', 200.0, 0, 0))]))
+		100000000000
+		>>> full_comparison_since(OrderedDict([(0, VaultEntry(0, '/v/V0', '1970-01-01_00-00-05_+0000', 0, 0))]))
+		5000000000
+	'''
+	versions = list(vault_info_dict.values())[-2:]
+	if not versions:
+		return None
+	timestamp = versions[0].timestamp
+	if isinstance(timestamp, str):
+		# a version this daemon committed keeps its folder's text
+		timestamp = datetime.datetime.strptime(timestamp, VAULT_TIMESTAMP_FORMAT).timestamp()
+	return int(timestamp * 10 ** 9)
+
 def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel = '',paused:set = None,
-		pool_guard:'PoolGuard' = None) -> VaultManifest:
+		pool_guard:'PoolGuard' = None,changed_since_wall:int = None) -> VaultManifest:
 	'''
 	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest
 	(compare_scopes() over the whole tree, or scope_rel) in a transaction of its own, which it commits.
@@ -8641,6 +8686,8 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	With scope_rel, a folder rel ending with /, only that folder is compared: it is looked up like any entry, and only
 	tracked rows at or under it can be found deleted. scope_rel can also be a TouchedScopes, as touched_scopes() gives
 	for a batch: only its scopes are compared, as compare_scopes() compares them.
+	With changed_since_wall (ns, full_comparison_since()), the whole tree or scope_rel also has the extended attributes
+	of the entries changed since then compared, by their ctime (ctime_bound()); a TouchedScopes keeps its own times.
 	The paused inner mounts (paused_inner_mounts, from the remembered ones and the mount table now when not given) are
 	not walked and keep their tracked rows; a scope that is skipped or inside a paused folder compares nothing.
 	With pool_guard, nothing is recorded unless the pools it holds stayed whole: what was read of the vault while a
@@ -8653,7 +8700,7 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	skips = None if skip_list is None else skip_list.skips
 	if paused is None:
 		paused = paused_inner_mounts(monitor_path, manifest.inner_mounts, current_mount_table(), skips)
-	scopes = scope_rel if isinstance(scope_rel, TouchedScopes) else TouchedScopes([scope_rel], [])
+	scopes = scope_rel if isinstance(scope_rel, TouchedScopes) else TouchedScopes([scope_rel], [], None, changed_since_wall)
 	if scope_rel:
 		# checked before the transaction, as a scope compared nothing in leaves the manifest as it is. compare_scopes()
 		# passes over each touched scope that is skipped
@@ -9878,6 +9925,16 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# we just remove the file
 			mcae.run_command(['rm','-f',vault_real_path])
 			manifest.discard(relative_path)
+	def delete_and_copy(isDir,source_real_path,relative_path,vault_real_path,moved_from_vault_path,moved_from_relative_path,mcae):
+		# a move that cannot be renamed in the version: what its source holds there goes, then the monitored entry is
+		# copied to its place. the delete is waited for first, as the place can lie under the source ( mv P x/Q; mv x/Q
+		# x/Q/s/f in one batch: the version's x/Q is P by then, to be moved into itself ), and a delete running beside
+		# the copy would remove it under its feet
+		delete_path(isDir=isDir,vault_real_path=moved_from_vault_path,relative_path=moved_from_relative_path,mcae=mcae)
+		wait_for_async_commands(mcae)
+		copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=source_real_path,source_relative_path=relative_path,
+			file_vault_real_path=vault_real_path,backup_folder=backup_folder,mcae=mcae)
+		wait_for_async_commands(mcae)
 	def attribute_end(source_real_path,relative_path):
 		# the path the attributes of a file go onto ( an attrib's replay ): True when it has none of its own to get, False
 		# after an error line saying why they go nowhere.
@@ -10034,7 +10091,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					manifest.add(as_folder_entry(event_relative_path),dirty=True)
 				else:
 					end = attribute_end(event_source_real_path,event_relative_path) if only_sync_attributes else None
-					if isinstance(end,str) and (same_contents(event_source_real_path,end) or record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end)):
+					# the row's record first, which reads the monitored file only: the copy's tail, on the vault's disks, is
+					# read only for a record that does not vouch ( a moved row never does )
+					if isinstance(end,str) and (record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end) or same_contents(event_source_real_path,end)):
 						# we just copy the file metadata
 						copy_file_meta(event_source_real_path,end)
 					elif only_sync_attributes and not isinstance(end,str):
@@ -10121,13 +10180,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: {e}; doing delete & copy instead')
 					# its own target is copied now, by a folder above it too ( copy_untracked_folder() )
 					move_targets.discard(event_relative_path + ('/' if isDir else ''))
-					copy_path(isDir=isDir,monitor_path=monitor_path,
-					  source_real_path=event_source_real_path,
-					  source_relative_path=event_relative_path,
-					  file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
-					delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
-					  relative_path=link_source_relative_path,mcae=mcae)
-					wait_for_async_commands(mcae)
+					delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
 				except Exception as _:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
 					import traceback
@@ -10135,13 +10188,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					backuperTeeLogToTl(path=monitor_path,message='Doing delete & copy instead')
 					move_targets.discard(event_relative_path + ('/' if isDir else ''))
 					# if we fail to move, we just copy the file
-					copy_path(isDir=isDir,monitor_path=monitor_path,
-					  source_real_path=event_source_real_path,
-					  source_relative_path=event_relative_path,
-					  file_vault_real_path=file_vault_target_path,backup_folder=backup_folder,mcae=mcae)
-					delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,
-					  relative_path=link_source_relative_path,mcae=mcae)
-					wait_for_async_commands(mcae)
+					delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
 				# the copy fallback keeps the rows move_tree moved too, so both ways need the re-check
 				if isDir and skip_list is not None and skip_list.location_dependent:
 					recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
@@ -11188,15 +11235,16 @@ def require_job_vault(job_vault:str):
 	if not there:
 		raise CommandError(f'The vault {job_vault} is not there (is its disk mounted?)', EXIT_COMMAND_FAILED)
 
-def vault_pool_warning(job_vault:str, stream = None) -> bool:
+def vault_pool_warning(job_vault:str) -> bool:
 	'''
-	Warn on stream (stderr by default) when a disk of the mergerfs pool job_vault is on is missing, as what that disk holds
-	of the vault is not shown, and say whether it did. Nothing is printed for a vault off any pool, or on a whole one.
+	Warn on stderr when a disk of the mergerfs pool job_vault is on is missing (or the pool cannot be read), as what is
+	shown of the vault may be incomplete, and say whether it did. Nothing is printed for a vault off any pool, or on a
+	whole one.
 	'''
 	problem = pool_problem(job_vault)
 	if problem is None:
 		return False
-	print(shown(f'Warning: {problem}: what it holds of {job_vault} is not shown'), file=sys.stderr if stream is None else stream)
+	print(shown(f'Warning: {problem}: {job_vault} may be incomplete'), file=sys.stderr)
 	return True
 
 def history_command(args) -> int:
@@ -11794,7 +11842,8 @@ def is_prune_temp(job_vault:str, version_path:str, rel:str, monitor_path:str, mo
 				if entry.name == name or not entry.is_symlink():
 					continue
 				found = resolve_version_entry(job_vault, version_path, os.path.join(folder_rel, entry.name), monitor_path, moves)
-				if found.kind in ('file', 'symlink') and same_inode(temp_st, os.lstat(found.path)):
+				# a referenced first version's link into the monitored path is pruned as a copy is ( kind 'referenced' )
+				if found.kind in ('file', 'symlink', 'referenced') and same_inode(temp_st, os.lstat(found.path)):
 					return True
 	except OSError:
 		return False
