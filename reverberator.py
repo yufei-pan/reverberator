@@ -6100,6 +6100,13 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		# note: no longer using --logical as we are moving to use chained symlinks to reduce run time disk IO
 		#taskObj = multiCMD.run_command(['ln','-fsLT',source_file,backup_file_path],quiet=True,return_object=True,wait_for_return=False,sem=BACKUP_SEMAPHORE)
 		#mcae.run_command(['ln','-fsT',source_file,backup_file_path])
+		if os.path.isdir(backup_file_path) and not os.path.islink(backup_file_path):
+			# the folder a folder row of the same name made: the rows hold both, which a replay of a file and a folder
+			# swapped in one batch could leave, and the version only one. the folder keeps what its rows hold, and the
+			# file's row goes, as one missing does: a comparison of that place copies the file if the tree holds it
+			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked file {file}: {backup_file_path} is a folder in the new version, made for the tracked folder of that name')
+			missing.append(file)
+			continue
 		if os.path.lexists(backup_file_path):
 			os.remove(backup_file_path)
 		try:
@@ -6138,22 +6145,49 @@ def entry_metadata(path:str) -> tuple:
 	st = os.lstat(path)
 	if stat.S_ISLNK(st.st_mode):
 		return ('link', st.st_uid, st.st_gid, st.st_mtime_ns)
+	return (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns,
+		tuple(sorted((name, os.getxattr(path, name, follow_symlinks=False)) for name in xattr_names(path))))
+
+def xattr_names(path:str) -> list:
+	'''
+	The names of the extended attributes of path itself, never followed. A filesystem without them (ENOTSUP, or ENOSYS as
+	mergerfs with xattr=nosys gives) has none. Raises OSError.
+	'''
 	try:
-		names = os.listxattr(path, follow_symlinks=False)
+		return os.listxattr(path, follow_symlinks=False)
 	except OSError as e:
 		if e.errno not in (errno.ENOTSUP, errno.ENOSYS):
 			raise
-		names = []
-	return (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns,
-		tuple(sorted((name, os.getxattr(path, name, follow_symlinks=False)) for name in names)))
+		return []
+
+def drop_xattrs_missing_from(source:str, dest:str):
+	'''
+	Remove from dest, never followed, the extended attributes source lacks: copystat() only sets those source has, so
+	without this an attribute removed from the monitored entry (setfattr -x, or an ACL by setfacl -b, which is
+	system.posix_acl_access) would stay on the vault's entry and come back on a restore. Every namespace is treated as
+	copystat() treats it, security.* and system.* too, and one this filesystem or user cannot remove is left as
+	copystat() leaves one it cannot set. Raises OSError otherwise.
+	'''
+	names = xattr_names(dest)
+	if not names:
+		return
+	kept = set(xattr_names(source))
+	for name in names:
+		if name in kept:
+			continue
+		try:
+			os.removexattr(dest, name, follow_symlinks=False)
+		except OSError as e:
+			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES):
+				raise
 
 def copy_file_meta(source_file:str,backup_file_path:str):
 	'''
-	Copy source_file's mode, times, owner and extended attributes onto backup_file_path. A symlink at backup_file_path
-	is never followed, even named with a trailing / as a folder's rel is: it gets only its own owner and times, from
-	source_file's own (by lstat), as a link has no mode or extended attributes of its own here. A symlink source_file
-	onto anything else is refused, with an error line: what it leads to is another entry, whose metadata is not its own.
-	Returns whether it worked; an error line says why not.
+	Copy source_file's mode, times, owner and extended attributes onto backup_file_path, which keeps none source_file
+	lacks (drop_xattrs_missing_from()). A symlink at backup_file_path is never followed, even named with a trailing / as
+	a folder's rel is: it gets only its own owner and times, from source_file's own (by lstat), as a link has no mode or
+	extended attributes of its own here. A symlink source_file onto anything else is refused, with an error line: what
+	it leads to is another entry, whose metadata is not its own. Returns whether it worked; an error line says why not.
 	'''
 	try:
 		# a trailing / makes the kernel follow a link to a folder
@@ -6182,6 +6216,8 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 			except OSError as e:
 				owned = False
 				backuperTeeLogToTl(path=source_file,error=True,message=f'Failed to copy the owner of {source_file} onto {backup_file_path}: {e}')
+		# before copystat's mode, which can make the entry read-only
+		drop_xattrs_missing_from(source_file,backup_file_path)
 		copystat(source_file,backup_file_path)
 		# to the nanosecond, as copystat set them: times passed as floats come back up to a few hundred ns off
 		os.utime(backup_file_path, ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -7844,31 +7880,46 @@ def attribs_to_copy(backup_entries:dict, manifest:'VaultManifest', monitor_path:
 	'''
 	The paths of the file attrib entries of backup_entries that the replay copies under only_sync_attributes, read before
 	it from version_path, the latest version: the end of the chain holds other contents than the monitored file, and the
-	row's record does not vouch for it (record_vouches()). A row a move of the batch lands on or under is unverified by
-	then, and is read at the path it moves from. The size limit counts these copies, and batch_rewrites() takes them as
-	written over.
+	row's record does not vouch for it (record_vouches()). A row a move of the batch before the entry lands on or under is
+	unverified by then, and is read where the latest version has it: back through each such move, the last first, as the
+	replay makes the moves in their order in backup_entries before the changes after them (mv d x; mv x/m a reads a/big
+	at d/m/big). The size limit counts these copies, and batch_rewrites() takes them as written over.
 	'''
-	moved_from = {path: values.source_path for path, values in backup_entries.items() if values.event == 'move' and values.source_path}
+	# each move by where it lands, with its place among the entries
+	moved_from = {path: (index, values.source_path) for index, (path, values) in enumerate(backup_entries.items())
+		if values.event == 'move' and values.source_path}
 	root = len(monitor_path.rstrip('/'))
-	def landed_on(path):
-		# the destination of the move landing on path or the nearest folder above it, or None
-		while path not in moved_from:
+	def moved_before(path, bound):
+		# the last move before the entry at bound that landed on path or a folder above it, as (index, destination,
+		# source), or None. path and each folder above it, so it costs the path's depth
+		last = None
+		while True:
+			found = moved_from.get(path)
+			if found is not None and found[0] < bound and (last is None or found[0] > last[0]):
+				last = (found[0], path, found[1])
 			parent = path.rstrip('/').rpartition('/')[0]
 			if len(parent) <= root:
-				return None
+				return last
 			path = parent + '/'
-		return path
+	def latest_place(path, bound):
+		# where the latest version has the entry at path and bound, and whether a move of the batch before it carried it
+		moved = False
+		while moved_from:
+			hop = moved_before(path, bound)
+			if hop is None:
+				break
+			bound, landed, source = hop
+			path, moved = source + path[len(landed):], True
+		return path, moved
 	copied = set()
-	for path, values in backup_entries.items():
+	for index, (path, values) in enumerate(backup_entries.items()):
 		if values.event != 'attrib' or path.endswith('/'):
 			continue
-		landed = landed_on(path) if moved_from else None
-		rel = os.path.relpath(path if landed is None else moved_from[landed] + path[len(landed):], monitor_path)
+		place, moved = latest_place(path, index)
+		rel = os.path.relpath(place, monitor_path)
 		record, copy_version = manifest.lookup_with_copy_version(rel)
-		if landed is not None:
+		if moved:
 			record = None
-		if record is not None and record.kind == 'r':
-			continue
 		if record_vouches(record, path):
 			continue
 		end = chain_end(job_vault, version_path, rel, moves, copy_version)
@@ -9590,13 +9641,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	# the rels the batch's moves land on ( a folder's ending with / ): a folder create copies its tree without them, as
 	# they arrive by their moves ( mkdir n; mv d n/d )
 	move_targets = {os.path.relpath(path,monitor_path) + ('/' if path.endswith('/') else '') for path, values in backup_entries.items() if values.event == 'move'}
-	# and those they still have to take their entries from: a copy of a folder holding one ( the fallback of a move,
-	# swapped in the batch ) leaves it to its move, which must not take the live file now at that name
-	moves_to_come = {os.path.relpath(values.source_path,monitor_path) + ('/' if path.endswith('/') else '') for path, values in backup_entries.items()
-		if values.event == 'move' and values.source_path}
 	walk_skip = None if skip_list is None else skip_list.skips
 	if move_targets:
-		walk_skip = (lambda rel: rel in move_targets or rel in moves_to_come) if skip_list is None else (lambda rel: rel in move_targets or rel in moves_to_come or skip_list.skips(rel))
+		walk_skip = (lambda rel: rel in move_targets) if skip_list is None else (lambda rel: rel in move_targets or skip_list.skips(rel))
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
 	# the links of the committed versions, on the chains the re-copy and the attribute sync follow, are told by their
 	# versions' moves, held for this backup
@@ -9900,7 +9947,6 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			elif event_values.event == 'move':
 				link_source_relative_path = os.path.relpath(event_values.source_path,monitor_path)
 				link_target_relative_path = event_relative_path
-				moves_to_come.discard(link_source_relative_path + ('/' if isDir else ''))
 				if isDir and os.path.abspath(file_vault_target_path) == '/':
 					# we cannot remove root
 					backuperTeeLogToTl(path=file_vault_target_path,error=True,message='Attempting to move root, skipping')
@@ -10086,7 +10132,6 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		wait_for_async_commands(mcae)
 		# the moves are made: whatever they left out, the verification's copies take whole
 		move_targets.clear()
-		moves_to_come.clear()
 		if touched is not None and GREEN_LIGHT.is_set():
 			verify()
 	finally:
