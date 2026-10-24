@@ -5258,10 +5258,13 @@ def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 def forget_recorded_version(job_vault_path:str) -> None:
 	'''
 	The version job_vault_path's manifest records forgotten, when there is a manifest: opened as recorded_latest_version()
-	opens it, creating nothing. Raises sqlite3.Error.
+	opens it, creating nothing. Raises sqlite3.Error, and OSError when the manifest cannot be looked at: only one not there
+	records no version.
 	'''
 	path = os.path.join(job_vault_path, MANIFEST_FILE_NAME)
-	if not os.path.lexists(path):
+	try:
+		os.lstat(path)
+	except FileNotFoundError:
 		return
 	conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=rw', uri=True, timeout=1)
 	try:
