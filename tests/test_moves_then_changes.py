@@ -1,5 +1,6 @@
 import errno
 import os
+import struct
 from collections import deque
 
 import pytest
@@ -642,6 +643,8 @@ def test_a_file_moved_in_a_folder_swapped_in_the_batch_reaches_the_version(job, 
 		(True, 'move', 'b', 't136'), (False, 'move', 'b/c1.1', 'b/c1'), (False, 'create', 'b/c1', None), (False, 'modify', 'b/c1', None),
 		only_sync_attributes=only_sync_attributes)
 	assert_version_is_the_tree(job, v1)
+	# b/c1 → b/c1.1 renames what the fallback copy of b put at b/c1; the verification compares the moved row in full
+	assert not [line for line in logged if 'Failed to move' in line]
 
 
 @pytest.mark.parametrize('only_sync_attributes', [True, False])
@@ -765,3 +768,113 @@ def test_an_attrib_that_copies_is_counted_by_the_estimate(job, logged):
 		assert rv.batch_rewrites(entries, m, True, ['b'], copied)[0] == {'b'}
 	finally:
 		manifest.close()
+
+
+# ---- fix round 4 --------------------------------------------------------------------------------------------------
+
+def test_an_attrib_after_chained_moves_is_counted_by_the_estimate(job):
+	# mv d x; mv x/m a; touch -m a/big: the latest version has a/big at d/m/big, two moves back, and its chain end there
+	# holds another mtime, so the attribute change copies it
+	seed_monitor(job, {'d/m/big': 'b' * 300000, 'd/keep': 'k', 'keep': 'k'})
+	run_backup(job)
+	run_backup(job)
+	m = job.monitor
+	os.rename(f'{m}/d', f'{m}/x')
+	os.rename(f'{m}/x/m', f'{m}/a')
+	os.utime(f'{m}/a/big', ns=(10 ** 18, 10 ** 18))
+	entries = batch(job, (True, 'move', 'x', 'd'), (True, 'move', 'a', 'x/m'), (False, 'attrib', 'a/big', None))
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		latest = rv.list_versions(job.job_vault)[-1].path
+		copied = rv.attribs_to_copy(entries, manifest, m, job.job_vault, latest)
+		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
+	finally:
+		manifest.close()
+	assert copied == {f'{m}/a/big'} and size >= 300000
+
+
+def user_xattrs_or_skip(path):
+	try:
+		os.setxattr(path, 'user.probe', b'1')
+	except OSError as e:
+		if e.errno in (errno.ENOTSUP, errno.EPERM):
+			pytest.skip('user xattrs are unsupported here')
+		raise
+	os.removexattr(path, 'user.probe')
+
+
+@pytest.mark.parametrize('rel', ['x', 'd/'])
+def test_a_removed_xattr_is_gone_from_the_newest_version(job, logged, rel):
+	# setfattr -x user.k: the sync leaves the copy, or the version's folder, with the monitored entry's xattrs only
+	seed_monitor(job, {'x': 'x', 'd/keep': 'k'})
+	m = job.monitor
+	path = os.path.join(m, rel.rstrip('/'))
+	user_xattrs_or_skip(path)
+	os.setxattr(path, 'user.k', b'v')
+	os.setxattr(path, 'user.stays', b's')
+	run_backup(job)
+	os.removexattr(path, 'user.k')
+	version = verified(job, (rel.endswith('/'), 'attrib', rel.rstrip('/'), None))
+	got = rv.resolve_version_entry(job.job_vault, version, rel.rstrip('/'), m)
+	assert got.kind in ('file', 'folder') and os.listxattr(got.path) == ['user.stays']
+	assert_moved_cleanly(logged)
+
+
+def test_a_removed_xattr_then_a_move_is_gone_from_the_newest_version(job, logged):
+	# setfattr -x user.k x; mv x d/x ( fuzz seed 10 ): the move step syncs the moved file's metadata, the removal too
+	seed_monitor(job, {'x': 'x', 'd/keep': 'k'})
+	m = job.monitor
+	user_xattrs_or_skip(f'{m}/x')
+	os.setxattr(f'{m}/x', 'user.k', b'v')
+	run_backup(job)
+	os.removexattr(f'{m}/x', 'user.k')
+	os.rename(f'{m}/x', f'{m}/d/x')
+	version = verified(job, (False, 'attrib', 'x', None), (False, 'move', 'd/x', 'x'))
+	assert os.listxattr(resolved(job, version, 'd/x')) == []
+	assert_moved_cleanly(logged)
+
+
+def access_acl(uid):
+	# a POSIX access ACL as the kernel stores it in system.posix_acl_access: version 2, then (tag, perm, id) entries for
+	# the owner, a named user, the group, the mask and others
+	undefined = 0xffffffff
+	entries = ((0x01, 6, undefined), (0x02, 6, uid), (0x04, 4, undefined), (0x10, 6, undefined), (0x20, 4, undefined))
+	return struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *entry) for entry in entries)
+
+
+def test_a_removed_acl_is_gone_from_the_newest_version(job, logged):
+	# setfacl -b x: an ACL is an extended attribute, which the sync removes from the shared copy too, so a restore does
+	# not give the ACL back
+	seed_monitor(job, {'x': 'x', 'keep': 'k'})
+	m = job.monitor
+	try:
+		os.setxattr(f'{m}/x', 'system.posix_acl_access', access_acl(1234))
+	except OSError as e:
+		if e.errno in (errno.ENOTSUP, errno.EPERM):
+			pytest.skip('POSIX ACLs are unsupported here')
+		raise
+	v0 = run_backup(job)[0]
+	assert 'system.posix_acl_access' in os.listxattr(os.path.join(v0, 'x'))
+	os.removexattr(f'{m}/x', 'system.posix_acl_access')
+	version = verified(job, (False, 'attrib', 'x', None))
+	assert 'system.posix_acl_access' not in os.listxattr(resolved(job, version, 'x'))
+	assert_moved_cleanly(logged)
+
+
+def test_a_file_row_where_a_folder_row_was_made_is_dropped(job, logged):
+	# a vault whose rows hold both a file and a folder of one name ( fuzz seed 858 at 36b48f6 ): the referenced copy
+	# makes the folder, drops the file's row with an error line, and the backup runs
+	seed_monitor(job, {'keep': 'k', 'n/a': 'a'})
+	run_backup(job)
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	manifest.add('n')
+	manifest.commit()
+	manifest.close()
+	m = job.monitor
+	with open(f'{m}/keep', 'w') as f:
+		f.write('k2')
+	version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
+	assert open(resolved(job, version, 'n/a')).read() == 'a'
+	assert tracked(job, 'n/') and not tracked(job, 'n')
+	assert [line for line in logged if line.startswith('ERROR Dropping tracked file n') and 'is a folder' in line]
