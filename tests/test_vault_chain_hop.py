@@ -417,8 +417,7 @@ def test_a_change_list_appears_whole_or_not_at_all(job, monkeypatch):
 	with open(leftover, 'w') as f:
 		f.write('path')
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
-	removed = rv.remove_incomplete_vault_versions(job.job_vault)
-	assert [os.path.basename(path).partition('--')[0] for path in removed] == ['V1']
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0]
 	assert sorted(name for name in os.listdir(job.job_vault) if name.startswith(('V1', rv.CHANGE_LIST_FOLDER_PREFIX))) == []
 
 
@@ -487,12 +486,9 @@ def plain_touches(moves, rel):
 
 FOLDERS = ['a/', 'a/b/', 'ab/', 'c/', 'c/d/', 'c/d/e/', 'f/']
 FILES = ['x', 'y', 'a/x', 'a/b/x', 'ab/x', 'a/y', 'c/x', 'c/d/x', 'c/d/e/x', 'f/x', 'a/b/x/z']
-# a folder move's source the rows give without its / (a plain prefix, as the ordered scan reads it), and odd dests
-ODD_SOURCES = ['a', 'c/d', 'a/b']
-
 
 def random_moves(rng, count):
-	'''A list of count move rows: file and folder moves, chains, moves away and back, odd folder sources, sourceless rows.'''
+	'''A list of count move rows: file and folder moves, chains, moves away and back, sourceless rows.'''
 	moves = []
 	while len(moves) < count:
 		kind = rng.random()
@@ -507,9 +503,7 @@ def random_moves(rng, count):
 			moves.append((source, dest, True))
 			if rng.random() < 0.3:
 				moves.append((dest, source, True))
-		elif kind < 0.8:
-			moves.append((rng.choice(ODD_SOURCES), rng.choice(FOLDERS), True))
-		elif kind < 0.9:
+		elif kind < 0.85:
 			dest = rng.choice(FOLDERS + FILES)
 			moves.append((None, dest, dest.endswith('/')))
 		else:
@@ -545,11 +539,31 @@ def test_the_indexed_moves_answer_as_the_moves_read_in_order(seed):
 				assert committed.takes(source, dest) == plain_takes(moves, source, dest), (moves, source, dest)
 
 
-def test_the_indexed_moves_are_indexed_again_for_a_shorter_list():
+def test_a_list_of_moves_that_got_shorter_is_a_bug_the_index_asserts_on():
+	# the replay's list only grows, so the indexes are never rebuilt for a shorter one
 	moves = [('x', 'y', False)]
 	indexed = rv.VersionMoves.applied(moves)
 	assert indexed.takes('x', 'y') is True
 	moves.clear()
-	assert indexed.takes('x', 'y') is False and not indexed.touches('x')
-	moves.append(('y', 'z', False))
-	assert indexed.takes('y', 'z') is True and not indexed.touches('x')
+	with pytest.raises(AssertionError):
+		indexed.takes('x', 'y')
+
+
+@pytest.mark.parametrize('case', ['folder', 'nested'])
+def test_a_hand_edited_folder_move_without_its_slash_reads_as_the_slashed_one(tmp_path, case):
+	# the daemon writes a folder move's source with its /, and the replay takes it as a folder; a list edited by hand may
+	# lack it, and is read as the slashed form, not as a plain prefix (which 'a' would make of 'ab/x' too)
+	monitor = str(tmp_path / 'mon')
+	rows = {'folder': [('new/', 'move', 'old')], 'nested': [('x/new/', 'move', 'x/old')]}[case]
+	slashed = [(rel, event, None if source is None else source + '/') for rel, event, source in rows]
+	read = []
+	for name, kept in (('hand', rows), ('daemon', slashed)):
+		path = write_change_list(str(tmp_path / f'{name}.nsv'), monitor, kept)
+		read.append(rv.read_change_list_moves(path, monitor)[0])
+	assert read[0] == read[1] == [(rows[0][2] + '/', rows[0][0], True)]
+	source = rows[0][2]
+	for moves in (rv.VersionMoves(moves=read[0]), rv.VersionMoves(moves=read[1])):
+		assert moves.takes(f'{source}/f', f'{rows[0][0]}f') is True
+		assert moves.takes(f'{source}/deep/f', f'{rows[0][0]}deep/f') is True
+		assert moves.touches(f'{source}/f') and not moves.touches(f'{source}x/f') and not moves.touches(source)
+		assert moves.takes(f'{source}x/f', f'{rows[0][0]}x/f') is False

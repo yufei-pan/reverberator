@@ -12,7 +12,7 @@ from tests.harness import tracked_manifest
 pytestmark = pytest.mark.unit
 
 
-class TestRemoveIncompleteVaultVersions(unittest.TestCase):
+class TestGetVaultInfoRemovesIncompleteVersions(unittest.TestCase):
 	def test_deletes_vdir_without_content_file_keeps_committed(self):
 		with tempfile.TemporaryDirectory() as job_vault:
 			committed = os.path.join(job_vault, 'V1--2021-01-01_00-00-00_-0800')
@@ -28,11 +28,11 @@ class TestRemoveIncompleteVaultVersions(unittest.TestCase):
 				f.write('path\tiso_time\tevent\tsource_path\n')
 			# the commit's current_version: what says V2 is the attempt after the latest commit (Task 2b)
 			os.symlink(os.path.basename(committed), os.path.join(job_vault, 'current_version'))
-			deleted = rv.remove_incomplete_vault_versions(job_vault)
+			info = rv.get_vault_info(job_vault)
 			self.assertTrue(os.path.isdir(committed))
 			self.assertTrue(os.path.isfile(content))
 			self.assertFalse(os.path.isdir(orphan))
-			self.assertEqual(deleted, [orphan])
+			self.assertEqual(list(info.vault_info_dict), [1])
 
 
 class TestGetVaultInfoOrphans(unittest.TestCase):
@@ -56,7 +56,6 @@ class TestGetVaultInfoOrphans(unittest.TestCase):
 			os.makedirs(orphan)
 			with self.assertRaises(rv.VaultScanError):
 				rv.get_vault_info(job_vault)
-			self.assertEqual(rv.remove_incomplete_vault_versions(job_vault), [])
 			self.assertTrue(os.path.isdir(orphan))
 
 

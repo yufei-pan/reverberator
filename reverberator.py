@@ -1548,7 +1548,6 @@ def run_daemon():
 		backup_size_limit = reverb_rule.backup_size_limit
 		vault_path_signature = reverb_rule.vault_fs_signature
 		job_vault = os.path.join(vault_path, job_name)
-		remove_incomplete_vault_versions(job_vault)
 		# kept across the job's attempts, so a retry loses nothing queued
 		to_process = ChangeEventQueue(monitor_path)
 		to_process_lock = threading.Lock()
@@ -1763,8 +1762,8 @@ def fsync_path(path:str, folder:bool = False) -> None:
 		os.close(fd)
 
 # the private folder write_change_list() writes a change list in before renaming it into place: made by mkdtemp() in
-# the job vault, which no reader takes for a version or a change list, and removed by remove_incomplete_vault_versions()
-# when a crash leaves it
+# the job vault, which no reader takes for a version or a change list, and removed by get_vault_info() when a crash
+# leaves it
 CHANGE_LIST_FOLDER_PREFIX = '.reverberator-change-list-'
 
 def write_change_list(content_file_name:str, rows:list) -> None:
@@ -1779,7 +1778,7 @@ def prepare_change_list(content_file_name:str, rows:list) -> str:
 	'''
 	The slow part of writing a change list: its rows written whole into a private folder of its own in the job vault
 	(mkdtemp(), CHANGE_LIST_FOLDER_PREFIX), under its own name, and fsynced. Returns that file's path, for
-	place_change_list() (or discard_change_list()). A crash leaves the private folder, which the startup cleanup removes;
+	place_change_list() (or discard_change_list()). A crash leaves the private folder, which the job's next scan removes;
 	an error removes it, and raises.
 	'''
 	job_vault = os.path.dirname(os.path.abspath(content_file_name))
@@ -1811,7 +1810,7 @@ def place_change_list(content_file_name:str, temp_path:str) -> None:
 
 def discard_change_list(temp_path:str) -> None:
 	'''The private folder of a change list prepare_change_list() wrote at temp_path removed, with what is left in it.'''
-	# empty once the list is in place; one a crash leaves, or one not emptied here, is removed at the next start
+	# empty once the list is in place; one a crash leaves, or one not emptied here, is removed by the job's next scan
 	with contextlib.suppress(OSError):
 		os.remove(temp_path)
 	with contextlib.suppress(OSError):
@@ -4507,8 +4506,6 @@ def do_backup(backup_entries:dict,
 		except OSError as e:
 			discard_change_list(prepared_list)
 			manifest.rollback()
-			if e.errno == errno.EINVAL:
-				raise JobFailure(f'{link_path} is there but is no link: not committing {backup_folder}, and leaving it as it is')
 			raise JobFailure(f'cannot read {link_path}: {e}: not committing {backup_folder}')
 		try:
 			manifest.commit(backup_folder)
@@ -4587,7 +4584,7 @@ def make_version_folder(job_name:str, path:str) -> bool:
 	the complete backup write into it as into an empty folder of their own, and a leftover of that name (an attempt
 	that did not commit, in the same second) could hold a link they would write through. When something is there,
 	an error line says so and nothing is made: the attempt fails, the next one gets a name of its own, and the leftover
-	goes at the next start, as any incomplete version does (remove_incomplete_vault_versions()). Other errors are
+	goes at the job's next scan, as any incomplete version does (get_vault_info()). Other errors are
 	raised.
 	'''
 	try:
@@ -4713,7 +4710,7 @@ def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 	The latest version a commit got under way for, as job_vault_path records it: by the text of its current_version
 	link (even dangling), or failing that by the version the manifest's meta records, read only and only then. A commit
 	sets both before it writes its change list, the commit point (do_backup()), so neither names a version before one
-	whose list is there. Raises VaultScanError when either cannot be read.
+	whose list is there. Raises VaultScanError when either cannot be read, or current_version is no link.
 	'''
 	link = os.path.join(job_vault_path, 'current_version')
 	number = None
@@ -4726,10 +4723,10 @@ def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 	except FileNotFoundError:
 		has_link = False
 	except OSError as e:
-		if e.errno != errno.EINVAL:
-			raise VaultScanError(f'cannot read {link}: {e}')
-		# something else than a link there
-		has_link = True
+		if e.errno == errno.EINVAL:
+			# never the daemon's own: it makes the entry by a link's swap alone
+			raise VaultScanError(f'{link} is no link, which the daemon\'s own never is: it is left as it is (move it away and the job goes on)')
+		raise VaultScanError(f'cannot read {link}: {e}')
 	path = os.path.join(job_vault_path, MANIFEST_FILE_NAME)
 	try:
 		os.lstat(path)
@@ -4906,7 +4903,13 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 					# got under way; the one it names may be committed with its list out of the listing
 					if number == record.number + 1:
 						continue
-					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and is not the one after the latest recorded version, {record.number}: its list may not have been listed (check that every disk of the vault is there), or a removal cut short by a daemon before 0.44 left it (an oldest version whose list went first: once that is sure, remove it by hand)')
+					if versions and number < min(versions):
+						hint = 'a removal cut short by a daemon before 0.44 left it (an oldest version whose list went first: once that is sure, remove it by hand)'
+					elif number == record.number:
+						hint = 'a commit cut off between its link and its list left it (once every disk of the vault is there, remove it by hand and the job goes on)'
+					else:
+						hint = 'its list may not have been listed (check that every disk of the vault is there)'
+					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and is not the one after the latest recorded version, {record.number}: {hint}')
 				raise VaultScanError(f'{name} in {job_vault_path} has no change list, and the latest committed version cannot be told')
 		stale = []
 		for number, folder, path in gone:
@@ -4982,30 +4985,6 @@ def move_current_version_forward(job_vault_path:str, listing:VaultListing) -> No
 		swap_current_version(job_vault_path, name)
 	except OSError as e:
 		backuperTeeLogToTl(job_vault_path, f'Cannot move {link_path} forward to {name}: {e}', error=True)
-
-def remove_incomplete_vault_versions(job_vault_path: str) -> list:
-	'''
-	At the daemon's start: remove the version folders without a change list, which a crash or a stop leaves (a version
-	is committed only when its change list is there), and the private folders of change lists a crash cut off, once the
-	whole vault was read for certain (read_job_vault()). A vault that cannot be loses nothing: the error is logged, and
-	the job's own scan fails on it too.
-
-	Returns:
-		list: Absolute paths of deleted version directories.
-	'''
-	deleted = []
-	try:
-		listing = read_job_vault(job_vault_path)
-	except VaultScanError as e:
-		backuperTeeLogToTl(job_vault_path, f'Not removing incomplete versions, nothing in the vault is removed: {e.reason}', error=True)
-		return deleted
-	if listing is None:
-		return deleted
-	remove_unfinished_change_lists(job_vault_path, listing)
-	for path in listing.orphans:
-		if remove_orphan(job_vault_path, path):
-			deleted.append(path)
-	return deleted
 
 # the job vaults (absolute paths) a scan of this daemon found committed versions in: one that is not there afterwards,
 # or shows no committed version, went away under the daemon (as a mergerfs branch dropping out shows it), and is no new
@@ -6622,13 +6601,11 @@ class VersionMoves:
 		self._lock = threading.Lock()
 		# the indexes of the moves (_index()), up to the first _indexed of them: a file move's source -> the positions of
 		# the moves from it (an int for one, a list in order for more), a folder move's source (ending with /) -> the
-		# same, the positions of folder moves whose source does not end with / (matched as a plain prefix, so read in
-		# order), and the dests of the move rows without a source, their / stripped
+		# same, and the dests of the move rows without a source, their / stripped
 		self._index_lock = threading.Lock()
 		self._indexed = 0
 		self._file_sources = {}
 		self._folder_sources = {}
-		self._odd_folders = []
 		self._sourceless = set()
 
 	@classmethod
@@ -6702,22 +6679,17 @@ class VersionMoves:
 	def _index(self) -> list:
 		'''
 		The moves, with the indexes brought up to them: the replay appends to the list of the version being written, so
-		the moves added since the last call are indexed now (a list that got shorter is indexed again). Returns the moves.
+		the moves added since the last call are indexed now (the list only grows). Returns the moves.
 		'''
 		moves = self.moves
 		if self._indexed == len(moves):
 			return moves
 		with self._index_lock:
-			if self._indexed > len(moves):
-				self._indexed = 0
-				self._file_sources, self._folder_sources, self._odd_folders, self._sourceless = {}, {}, [], set()
+			assert self._indexed <= len(moves), 'the moves of a version only grow'
 			for at in range(self._indexed, len(moves)):
 				source, dest, is_folder = moves[at]
 				if source is None:
 					self._sourceless.add(dest.rstrip('/'))
-					continue
-				if is_folder and not source.endswith('/'):
-					self._odd_folders.append(at)
 					continue
 				table = self._folder_sources if is_folder else self._file_sources
 				held = table.get(source)
@@ -6740,11 +6712,10 @@ class VersionMoves:
 		at = bisect.bisect_right(held, after)
 		return held[at] if at < len(held) else None
 
-	def _next_move(self, moves:list, path:str, after:int):
+	def _next_move(self, path:str, after:int):
 		'''
 		The position of the first move after position after that applies to path: a file move from path itself, or a
-		folder move from a folder above it (its source a prefix of path ending with /, or any prefix for one whose source
-		does not end with /); None when none does.
+		folder move from a folder above it (its source a prefix of path ending with /); None when none does.
 		'''
 		found = self._first_after(self._file_sources.get(path), after)
 		if self._folder_sources:
@@ -6754,12 +6725,6 @@ class VersionMoves:
 				if candidate is not None and (found is None or candidate < found):
 					found = candidate
 				at = path.find('/', at + 1)
-		for candidate in self._odd_folders:
-			if found is not None and candidate > found:
-				break
-			if candidate > after and path.startswith(moves[candidate][0]):
-				found = candidate
-				break
 		return found
 
 	def lands_without_source(self, rel:str) -> bool:
@@ -6788,7 +6753,7 @@ class VersionMoves:
 		path = source_rel
 		at = -1
 		while True:
-			at = self._next_move(moves, path, at)
+			at = self._next_move(path, at)
 			if at is None:
 				return path == dest_rel
 			source, dest, is_folder = moves[at]
@@ -6796,7 +6761,8 @@ class VersionMoves:
 
 	def touches(self, rel:str) -> bool:
 		'''Whether any move applies to rel, itself or a folder above it: the first one to do so meets rel unmoved.'''
-		return self._next_move(self._index(), rel, -1) is not None
+		self._index()
+		return self._next_move(rel, -1) is not None
 
 	def tells(self, named:str, rel:str, version_name:str) -> tuple:
 		'''
@@ -6877,7 +6843,9 @@ def read_change_list_moves(change_list:str, monitor:str) -> tuple:
 			if dest:
 				landed.add(hash(dest))
 			if row.event == 'move':
-				moves.append((source, dest, dest.endswith('/')))
+				is_folder = dest.endswith('/')
+				# the daemon writes a folder move's source with its /, which a hand-edited list may lack: every folder source ends with /
+				moves.append((source + '/' if is_folder and source is not None and not source.endswith('/') else source, dest, is_folder))
 	except (OSError, ValueError) as e:
 		return None, frozenset(), f'its change list cannot be read: {e}', False, False
 	if not rows:

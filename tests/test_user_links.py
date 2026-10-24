@@ -752,7 +752,7 @@ def test_a_change_list_is_written_in_a_private_folder(job, monkeypatch):
 	assert [row.path for row in rv.iter_change_list(change_list)] == [os.path.join(job.monitor, 'a')]
 
 
-def test_startup_removes_a_private_change_list_folder_a_crash_left(job):
+def test_the_scan_removes_a_private_change_list_folder_a_crash_left(job):
 	seed_monitor(job, {'a': 'a'})
 	run_backup(job)
 	left = os.path.join(job.job_vault, rv.CHANGE_LIST_FOLDER_PREFIX + 'abc123')
@@ -769,7 +769,7 @@ def test_startup_removes_a_private_change_list_folder_a_crash_left(job):
 		f.write('k')
 	linked = os.path.join(job.job_vault, rv.CHANGE_LIST_FOLDER_PREFIX + 'link')
 	os.symlink(outside, linked)
-	rv.remove_incomplete_vault_versions(job.job_vault)
+	rv.get_vault_info(job.job_vault)
 	assert not os.path.lexists(left)
 	assert all(os.path.isdir(other) for other in others)
 	assert os.path.islink(linked) and os.path.exists(os.path.join(outside, 'kept'))

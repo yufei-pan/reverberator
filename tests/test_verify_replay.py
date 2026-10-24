@@ -525,7 +525,7 @@ def test_interrupted_verification_commits_nothing(tmp_path, monkeypatch, name):
 		manifest.close()
 	incomplete = [name for name in os.listdir(job.job_vault) if name.startswith('V1--')]
 	assert incomplete
-	rv.remove_incomplete_vault_versions(job.job_vault)
+	rv.get_vault_info(job.job_vault)
 	assert not [name for name in os.listdir(job.job_vault) if name.startswith('V1--')]
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
 
