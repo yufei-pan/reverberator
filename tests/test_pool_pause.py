@@ -171,7 +171,35 @@ def test_the_watcher_keeps_queuing_while_the_vault_pool_is_out(job, fake_pool, g
 		_stop(control, watcher, backuper)
 
 
-def test_a_disk_dropped_between_batches_pauses_the_next_one(job, fake_pool, grace, output):
+@pytest.mark.parametrize('side', ['vault', 'monitor'])
+def test_a_disk_dropped_between_batches_pauses_the_next_one(job, fake_pool, grace, output, side):
+	seed_monitor(job, {'a.txt': 'a'})
+	pool = job.vault if side == 'vault' else job.monitor
+	disk, _ = fake_pool.add(pool, ['d1', 'd2'])
+	to_process = rv.ChangeEventQueue(job.monitor)
+	lock = threading.Lock()
+	to_process_flag = threading.Event()
+	control = _control(job)
+	thread = _run_backuper(job, control, to_process, lock, to_process_flag)
+	try:
+		wait_for_committed_count(job, 1)
+		fake_pool.drop(disk)
+		seed_monitor(job, {'b.txt': 'b'})
+		with lock:
+			to_process.append(rv.ChangeEvent(time.monotonic(), False, 'create', os.path.join(job.monitor, 'b.txt'), None))
+		to_process_flag.set()
+		wait_until(lambda: _marker(pool, f'disk {disk} of pool {pool} is not mounted') in output(), timeout=5,
+			message='no waiting marker')
+		assert len(committed_versions(job)) == 1
+		fake_pool.mount(disk)
+		wait_for_committed_count(job, 2)
+		assert os.path.isfile(os.path.join(latest_version(job).path, 'b.txt'))
+	finally:
+		_stop(control, thread)
+
+
+def test_an_idle_job_reports_a_missing_vault_disk(job, fake_pool, grace, output):
+	# a job with nothing to back up waits for its next batch: a disk of its pool that drops meanwhile is reported
 	seed_monitor(job, {'a.txt': 'a'})
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
 	to_process = rv.ChangeEventQueue(job.monitor)
@@ -182,53 +210,56 @@ def test_a_disk_dropped_between_batches_pauses_the_next_one(job, fake_pool, grac
 	try:
 		wait_for_committed_count(job, 1)
 		fake_pool.drop(a)
+		wait_until(lambda: _marker(job.vault, f'disk {a} of pool {job.vault} is not mounted') in output(), timeout=5,
+			message='no waiting marker')
+		fake_pool.mount(a)
+		wait_until(lambda: _goes_on(job.vault) in output(), timeout=5, message='no goes on line')
 		seed_monitor(job, {'b.txt': 'b'})
 		with lock:
 			to_process.append(rv.ChangeEvent(time.monotonic(), False, 'create', os.path.join(job.monitor, 'b.txt'), None))
 		to_process_flag.set()
-		wait_until(lambda: _marker(job.vault, f'disk {a} of pool {job.vault} is not mounted') in output(), timeout=5,
-			message='no waiting marker')
-		assert len(committed_versions(job)) == 1
-		fake_pool.mount(a)
 		wait_for_committed_count(job, 2)
 		assert os.path.isfile(os.path.join(latest_version(job).path, 'b.txt'))
+		assert output().count(_goes_on(job.vault)) == 1
 	finally:
 		_stop(control, thread)
 
 
-def _wait_in_thread(control, flag, path, alert, results):
+def _wait_in_thread(control, flag, path, results):
 	thread = threading.Thread(target=lambda: results.append(rv.wait_for_path(control, flag, path,
-		'monitored filesystem not ready', alert=alert)), daemon=True)
+		'monitored filesystem not ready')), daemon=True)
 	thread.start()
 	return thread
 
 
-@pytest.mark.parametrize('first_alert', [True, False])
-def test_a_lost_root_alerts_once_with_a_batch_pending(tmp_path, grace, output, first_alert):
-	# the watcher's lost-root wait (alert=True), or its start-up wait (alert=False), and the batch loop's monitored wait
+@pytest.mark.parametrize('phase', [0, 1 / 3, 2 / 3])
+def test_a_lost_root_alerts_once_with_a_batch_pending(tmp_path, grace, output, phase):
+	# the watcher's lost-root wait and the batch loop's monitored wait, half a poll apart, both past the grace when the
+	# root comes back at phase of a poll period
 	path = str(tmp_path / 'root')
 	control = rv.JobControl('job')
 	control.start_attempt()
 	flag = threading.Event()
 	flag.set()
 	results = []
-	first = _wait_in_thread(control, flag, path, first_alert, results)
+	first = _wait_in_thread(control, flag, path, results)
 	second = None
 	try:
 		wait_until(lambda: len(control._waits) == 1, timeout=5, message='first wait not begun')
-		second = _wait_in_thread(control, flag, path, True, results)
+		time.sleep(rv.POLL_WAIT_SECONDS / 2)
+		second = _wait_in_thread(control, flag, path, results)
 		wait_until(lambda: len(control._waits) == 2, timeout=5, message='second wait not begun')
 		first_token, second_token = (wait[0] for wait in control._waits)
-		assert control.alerts(first_token) is first_alert and control.alerts(second_token) is not first_alert
+		assert control.alerts(first_token) and not control.alerts(second_token)
 		marker = _marker(path, 'monitored filesystem not ready')
 		wait_until(lambda: marker in output(), timeout=5, message='no waiting marker')
-		time.sleep(0.4)
+		time.sleep(0.4 + phase * rv.POLL_WAIT_SECONDS)
 		assert output().count(marker) == 1
 		os.makedirs(path)
 		first.join(timeout=5)
 		second.join(timeout=5)
 		assert results == [True, True]
-		assert output().count(_goes_on(path)) == 1
+		assert output().count(marker) == 1 and output().count(_goes_on(path)) == 1
 	finally:
 		_stop(control, *(thread for thread in (first, second) if thread is not None))
 
