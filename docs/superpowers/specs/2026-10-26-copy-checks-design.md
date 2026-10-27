@@ -205,6 +205,25 @@ queued; after a signalled take, the same as today; a new watcher started while t
 new folder's events only until the next take; the order: an event read before the take is discarded, one read after it
 is kept (scripted reads with `scripted_watch`).
 
+## Goal 8: a folder renamed before the watcher handles its create is watched at its new path (pre-existing)
+
+`mkdir d; mv d e` (or a tool that makes a folder under a temporary name and renames it) can rename the folder before the
+watcher handles d's CREATE: `initializeFolderWatchers()` then finds d gone and returns -1 silently, and the cookie-matched
+move d -> e only renames the watches d already had, which are none, so e is never watched and every later change made
+in it never reaches a batch. Found by Task 2's second-opinion stress run (327 changes and 45 renames lost in two 60 s
+runs, almost all under folders renamed within a millisecond of their mkdir; repro
+scratchpad r10/haiku-t2/repro_05e1d07.py). A silent wrong result; added to this round as Goals 6 and 7 were.
+
+**Rule:** when a folder moves in from a known source (the cookie-matched move) and no watch maps to its old path, the
+watcher adds the destination's watches as for a new folder (`initializeFolderWatchers()` with `newDirWDs`, so its
+events are discarded until the batch is taken, the batch's recursive copy holding its contents). A folder that had
+watches is handled as today. A chain of renames before the watcher catches up ends watched at its last name.
+
+**Tests:** scripted reads (`scripted_watch`): CREATE|ISDIR d, then MOVED_FROM d / MOVED_TO e with the same cookie, with d
+gone when its create is handled; e gets a watch, and an event under e's new wd is recorded after the next take; a chain
+d -> e -> f ends watched at f; a folder that had watches moves its watches as today (no new add_watch). A real watcher:
+`mkdir d; mv d e` in quick succession, then a file in e reaches a batch.
+
 ## Goal 4: version 0.46, docs
 
 - `__version__ = 0.46` and pyproject.toml `version = "0.46"`.

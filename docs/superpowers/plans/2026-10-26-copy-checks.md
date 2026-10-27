@@ -726,7 +726,7 @@ def test_a_resumed_scan_with_differences_is_followed_by_a_full_comparison(job, p
 ### Task 7: A batch taken without the watcher's signal does not leave new folders' events discarded (Goal 7)
 
 Added by the main session after Task 2's review (pre-existing; the spec's Goal 7). Run after Task 4, which edits the
-same watcher loop; execution order is 1, 2, 3, 4, 5, 7, 8, 6.
+same watcher loop; execution order is 1, 2, 3, 4, 5, 7, 8, 9, 6.
 
 **Files:**
 - Modify: `reverberator.py` (`ChangeEventQueue`: `__init__`, `take`, docstring; `watchFolder`: the `processPending`
@@ -788,6 +788,33 @@ Added by the main session after Task 2's review (pre-existing; the spec's Goal 6
   inner-mount watcher tests must pass unchanged).
 - [ ] **Step 5: Commit:** "The watcher adds each folder's watch as its walk reaches it, before reading the folder, so a
   folder made while the walk runs is watched."
+
+**Calls to confirm:** added to round 10 by the main session (a pre-existing silent loss).
+
+---
+
+### Task 9: A folder renamed before the watcher handles its create is watched at its new path (Goal 8)
+
+Added by the main session after Task 2's second-opinion stress run (pre-existing; the spec's Goal 8). Execution order is
+1, 2, 3, 4, 5, 7, 8, 9, 6.
+
+**Files:**
+- Modify: `reverberator.py` (`watchFolder`: the cookie-matched MOVED_TO branch for a folder).
+- Test: `tests/test_matched_time.py` (scripted), `tests/test_inotify.py` (a real watcher).
+
+**Interfaces:**
+- In the cookie-matched folder move, when no `wdDic` entry maps to the old path or below it, call
+  `initializeFolderWatchers(inotify_obj, eventPath, wdDic, irm, watch_flags, newDirWDs, skip_list=..., job_name=...)`
+  after queueing the move. Otherwise the wdDic rewrite runs as today. A -1 (the destination gone too, renamed again)
+  is left for the next rename's handling, as the create branch leaves its -1 today.
+
+- [ ] **Step 1: Write the failing tests** per the spec's Goal 8 Tests, starting from the repro
+  (/tmp/claude-0/-mnt-optane-work-reverberator/8ad4e979-212b-4a0b-9477-1847dfee5560/scratchpad/r10/haiku-t2/repro_05e1d07.py).
+- [ ] **Step 2: Run them and see them fail.**
+- [ ] **Step 3: Implement** per Interfaces, with a comment saying why (the create was handled after the folder had left).
+- [ ] **Step 4: Run them and see them pass; run both full suites.**
+- [ ] **Step 5: Commit:** "A folder renamed before the watcher handles its create gets its watches at its new name, so
+  changes made in it later reach a batch."
 
 **Calls to confirm:** added to round 10 by the main session (a pre-existing silent loss).
 
