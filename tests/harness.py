@@ -359,7 +359,8 @@ class FakePool:
 def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, **watch_kwargs) -> tuple:
 	'''
 	Run rv.watchFolder on monitor, in this thread, with an inotify that returns each item of reads in turn and then stops.
-	An item is a list of (mask, name, cookie) on the root watch (wd 1), or a callable taking the queue and returning such a
+	An item is a list of (mask, name, cookie) on the root watch (wd 1), or of (mask, name, cookie, wd) on another folder's
+	watch (each folder the watcher adds gets the next wd from 2), or a callable taking the queue and returning such a
 	list. After the last item the fake clears rv.GREEN_LIGHT (conftest sets it again) and returns [].
 	Returns (queue, flag, returned): returned holds the wall clock ns at which each read returned.
 	'''
@@ -381,7 +382,7 @@ def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, 
 			item = pending.pop(0)
 			item = item(queue) if callable(item) else item
 			returned.append(time.time_ns())
-			return [Event(1, mask, cookie, name) for mask, name, cookie in item]
+			return [Event(event[3] if len(event) > 3 else 1, event[0], event[2], event[1]) for event in item]
 		def add_watch(self, path, mask):
 			return 1
 		def rm_watch(self, wd):

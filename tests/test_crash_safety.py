@@ -122,7 +122,7 @@ class TestWatcherInitFailure(unittest.TestCase):
 			rv.initializeFolderWatchers = lambda *a, **k: 42
 			result = rv.watchFolder(
 				'/monitor',
-				deque(),
+				rv.ChangeEventQueue('/monitor'),
 				threading.Lock(),
 				threading.Event(),
 				rv.inotify_resource_manager(),

@@ -236,6 +236,8 @@ class ChangeEventQueue:
 	events, the move-outs held since an earlier read (a pair can straddle one read boundary); after an empty read, every
 	one held. take() copies it into the batch and keeps it here, and touched_scopes() compares those paths, so a batch
 	taken while one is held has no phantom at its old place, and a rename split by a take stays a move.
+	takes counts the batches take() moved out, which clear() leaves: the watcher compares it with the count it saw last
+	to learn of every take, signalled or not, and records events in the folders it created meanwhile again.
 
 	Examples:
 		>>> queue = ChangeEventQueue('/m')
@@ -262,11 +264,14 @@ class ChangeEventQueue:
 		>>> queue.pending_move_outs.add('/m/gone')
 		>>> queue.take().pending_move_outs, queue.pending_move_outs
 		({'/m/gone'}, {'/m/gone'})
+		>>> queue.takes
+		4
 	'''
 	def __init__(self, monitor_path:str = ''):
 		self.monitor_path = monitor_path
 		self.read_wall_ns = None
 		self.pending_move_outs = set()
+		self.takes = 0
 		self.clear()
 
 	def clear(self):
@@ -387,6 +392,7 @@ class ChangeEventQueue:
 		taken.read_wall_ns = self.read_wall_ns
 		taken.pending_move_outs = set(self.pending_move_outs)
 		self.clear()
+		self.takes += 1
 		return taken
 
 	def compact(self):
@@ -2502,7 +2508,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
 		append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	newDirWDs = set()
-	processPending = False
+	# the takes this watcher knows of: one made before it started says nothing of the folders it creates
+	with to_process_lock:
+		seen_takes = to_process.takes
 	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
 	# the inner mounts followed (path -> fingerprint), from a table read before any watch is added: every mount change
 	# after it shows in a table the monitor hands over later
@@ -2536,11 +2544,15 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			# every change made before this moment is in this read or an earlier one
 			read_began = time.time_ns()
 			events =  inotify_obj.read(timeout=read_delay * 1000)
-			if processPending and not to_process_flag.is_set():
-				# the backuper took the batch, so its recursive folder copies run from now on: record events in those folders again.
-				# check before the delays below can signal again, as a fresh signal hides that the batch was taken
+			with to_process_lock:
+				taken = to_process.takes != seen_takes
+				seen_takes = to_process.takes
+			if taken:
+				# a batch was taken, signalled or not (the backuper's startup take, or one a predecessor's flag asked
+				# for), so its recursive folder copies run from now on: record events in those folders again. right after
+				# the read: an event read before the take happened before it, and the copy holds it; one read after it
+				# may come after the copy passed its entry, and is kept (a kept duplicate costs nothing)
 				newDirWDs.clear()
-				processPending = False
 				lastProcessTime = time.monotonic()
 			with mount_table_lock:
 				mount_table, latest_mount_table[0] = latest_mount_table[0], None
@@ -2567,12 +2579,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				if quiet and to_process and not to_process_flag.is_set():
 					watcherTeeLogToTl(monitor_path,'Timeout elapsed, signaling backuper to process')
 					to_process_flag.set()
-					processPending = True
 				continue
 			if to_process and not to_process_flag.is_set() and time.monotonic() - lastProcessTime > max_shapshot_delay_seconds:
 				watcherTeeLogToTl(monitor_path,'Max Delay timeout elapsed, signaling backuper to process')
 				to_process_flag.set()
-				processPending = True
 			lastReadTime = time.monotonic()
 			if DEBUG:
 				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]

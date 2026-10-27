@@ -43,12 +43,12 @@ def _probe(job, to_process, lock, name='probe.txt'):
 	wait_until(lambda: any(event.path == path for event in _events(to_process, lock)), message='probe not seen')
 
 
-def _take_batch(to_process_flag):
+def _take_batch(to_process, lock, to_process_flag):
 	# as the backuper does: once it takes a batch, the watcher records events in the folders it saw created again
 	wait_until(to_process_flag.is_set, message='watcher did not signal the backuper')
+	with lock:
+		to_process.take()
 	to_process_flag.clear()
-	# the watcher signals again only after it saw the flag cleared
-	wait_until(to_process_flag.is_set, message='watcher did not signal the backuper again')
 
 
 def _stop(thread):
@@ -229,7 +229,7 @@ def test_folder_recreated_at_moved_away_path_keeps_its_watches(job, poll_fast, m
 		# a new folder takes the old path before the move expires: its fresh watches stay
 		os.makedirs(os.path.join(data, 'sub'))
 		wait_until(lambda: any(e.event == 'delete' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no delete')
-		_take_batch(flag)
+		_take_batch(to_process, lock, flag)
 		fresh = os.path.join(data, 'sub', 'z')
 		open(fresh, 'w').write('z')
 		wait_until(lambda: any(e.path == fresh for e in _events(to_process, lock)), message='recreated folder not watched')
@@ -248,7 +248,7 @@ def test_folder_moved_back_before_its_move_expires_keeps_its_watches(job, poll_f
 		# restored from the trash: inotify hands back the watches the folder already had
 		os.rename(os.path.join(job.monitor, '.trash', 'data'), data)
 		wait_until(lambda: any(e.event == 'delete' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no delete')
-		_take_batch(flag)
+		_take_batch(to_process, lock, flag)
 		restored = os.path.join(data, 'sub', 'y')
 		open(restored, 'w').write('y')
 		wait_until(lambda: any(e.path == restored for e in _events(to_process, lock)), message='restored folder not watched')
