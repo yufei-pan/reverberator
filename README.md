@@ -19,6 +19,10 @@ Known limits (each in docs/limitations.md):
 	The vault database (.reverberator_manifest.sqlite) and the change lists are readable by any local user, and list every backed-up file name and size.
 	With keep-N at 41 or more, an unchanged user symlink is reached through more than 40 links, so browsing the vault by hand gives "too many levels of symbolic links" for it; restore gives it back.
 	Before snapraid fix rebuilds a disk of a pool, stop reverberator (systemctl stop reverberator), and start it again once the fix ends: a replaced disk counts as there as soon as it is mounted, so jobs would resume while its files are still being restored.
+	A file written only through mmap raises no inotify event, so it is backed up at its next normal write; a chmod or chown of it in the same batch keeps its old bytes in that version (round 10 looks at this).
+	After mkdir d; mv f d/f in one batch, the versions made in the next ~30 s show f at its old place as well (round 10 fixes it).
+	With a size limit, a backup can go over it until the next prune by a few KB (the new version's own folders, links and xattr blocks), or by the size of a file kept under a folder moved into a new folder.
+	The pause on a missing pool disk tells a quickly swapped disk apart only on kernel 6.8 or newer, and notices a dying disk only once its filesystem fails or flags an error.
 
 Failure handling and log markers:
 	A job that fails (an unreadable disk, a vault that is not ready, an error in a thread) is restarted by itself, while the other jobs keep running. The retry delay starts at 60 s, doubles on each failure, and stops at 1 h. It starts again from 60 s once an attempt has run for an hour before failing. While a disk the job needs is missing, the job waits for it, and logs a failure once the wait reaches 15 min, then once an hour while it lasts.
