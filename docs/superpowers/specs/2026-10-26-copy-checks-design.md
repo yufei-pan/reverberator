@@ -223,15 +223,24 @@ in it never reaches a batch. Found by Task 2's second-opinion stress run (327 ch
 runs, almost all under folders renamed within a millisecond of their mkdir; repro
 scratchpad r10/haiku-t2/repro_05e1d07.py). A silent wrong result; added to this round as Goals 6 and 7 were.
 
-**Rule:** when a folder moves in from a known source (the cookie-matched move) and no watch maps to its old path, the
-watcher adds the destination's watches as for a new folder (`initializeFolderWatchers()` with `newDirWDs`, so its
-events are discarded until the batch is taken, the batch's recursive copy holding its contents). A folder that had
-watches is handled as today. A chain of renames before the watcher catches up ends watched at its last name.
+**Rule (revised after Task 8's review, which found two more ways to the same loss: a folder renamed while the walk
+is inside it, whose unwalked subfolders then get ENOENT, and a subfolder created and its parent moved in one read, whose
+create is handled at the old path):** after a folder moves in from a known source (the cookie-matched move) and its
+watches are rewritten to the new path, the watcher always walks the destination again (`initializeFolderWatchers()` on
+it, with the watcher's `unwatched`, without `newDirWDs`): each folder already watched gives back its own watch (Task 8's
+count fix makes that idempotent), and each one missing gets one. This replaces a conditional rule ("when no watch maps to
+the old path") that fired in neither of those cases, and the add half of `rewatch_moved_folder()` (its removal of watches
+a location-dependent skip list now skips stays); `get_all_folders()` goes if nothing else uses it. Cost: one walk of the
+moved subtree per folder rename (scandir and add_watch per folder; jobs with location-dependent skip lists pay it today).
+A chain of renames before the watcher catches up ends watched at its last name.
 
 **Tests:** scripted reads (`scripted_watch`): CREATE|ISDIR d, then MOVED_FROM d / MOVED_TO e with the same cookie, with d
 gone when its create is handled; e gets a watch, and an event under e's new wd is recorded after the next take; a chain
-d -> e -> f ends watched at f; a folder that had watches moves its watches as today (no new add_watch). A real watcher:
-`mkdir d; mv d e` in quick succession, then a file in e reaches a batch.
+d -> e -> f ends watched at f; a folder that had watches keeps them (the re-walk adds no second watch, and the watch
+count stays equal to the watches held). Real watcher: `mkdir d; mv d e` in quick succession, then a file in e reaches a
+batch; `mkdir A; mkdir A/b; mv A C` at once, then a file in C/b reaches a batch; a rename landing while the startup walk
+is inside the folder (the review's probe), then files in every subfolder reach a batch; under a location-dependent skip
+list, a moved folder's newly wanted subfolders are watched and its newly skipped ones are not.
 
 ## Goal 4: version 0.46, docs
 
