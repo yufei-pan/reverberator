@@ -2658,6 +2658,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# the source stays in cookieDic so it still expires into its delete; its old-path watches are stale now
 						remove_watches_under(inotify_obj,wdDic,irm,cookieDic[event.cookie].path)
 						forget_unwatched_under(unwatched,cookieDic[event.cookie].path)
+					if isDir and event.mask & (flags.DELETE | flags.MOVED_FROM):
+						# gone from here; its new place, if in the tree, is walked when its move-in is read
+						forget_unwatched_under(unwatched,eventPath)
 					continue
 				if skipped and not event.mask & (flags.MOVED_FROM | flags.MOVED_TO):
 					if DEBUG:
@@ -2748,7 +2751,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 								wdDic[wd] = new_wd_path
 							forget_unwatched_under(unwatched,cookie_value.path)
 							if skip_list is not None and skip_list.location_dependent:
-								rewatch_moved_folder(inotify_obj,eventPath,wdDic,irm,skip_list)
+								remove_newly_skipped_watches(inotify_obj,eventPath,wdDic,irm,skip_list)
 							# the folder can move before its watches are all in place: renamed before its create was handled
 							# (mkdir d; mv d e), while the walk was inside it, or with a subfolder whose create is handled at
 							# the old path. this walk hands each folder watched already its own watch back and watches the
@@ -3016,7 +3019,7 @@ def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,ir
 		removed += 1
 	return removed
 
-def rewatch_moved_folder(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:bidict,irm:inotify_resource_manager,skip_list:'SkipList') -> int:
+def remove_newly_skipped_watches(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:bidict,irm:inotify_resource_manager,skip_list:'SkipList') -> int:
 	'''After a folder moved, remove the watches below it on folders the skip list leaves out at the new location, or that
 	are in one it leaves out; returns how many were removed. The walk of the moved folder watches those it wants there.'''
 	folder_norm = folder_path.rstrip('/')

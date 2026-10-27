@@ -828,3 +828,22 @@ def test_read_times_publish_again_once_an_unwatched_folder_is_gone(job, tmp_path
 			os.rename(P, os.path.join(job.monitor, 'Q'))
 		# nothing is left that the watcher should watch and does not
 		wait_until(lambda: _published(to_process, lock), timeout=3, message='no read time though nothing is unwatched')
+
+
+@pytest.mark.parametrize('gone', ['deleted', 'moved out'])
+def test_read_times_publish_again_once_an_unwatched_folder_in_a_new_folder_is_gone(job, tmp_path, poll_fast, monkeypatch, gone):
+	N = os.path.join(job.monitor, 'N')
+	bad = os.path.join(N, 'bad')
+	real = os.scandir
+	with _ready_watch(job) as (to_process, lock, flag):
+		# N is made after the first take, so its events are not recorded until the next take: bad's delete or move-out too
+		_fail_scandir(monkeypatch, bad)
+		os.makedirs(os.path.join(bad, 'sub'))
+		wait_until(lambda: _has_create(to_process, lock, N), message='no create of N')
+		wait_until(lambda: not _published(to_process, lock), message='bad is not unwatched')
+		monkeypatch.setattr(os, 'scandir', real)
+		if gone == 'deleted':
+			shutil.rmtree(bad)
+		else:
+			os.rename(bad, str(tmp_path / 'bad'))
+		wait_until(lambda: _published(to_process, lock), timeout=3, message='no read time though nothing is unwatched')
