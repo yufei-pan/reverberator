@@ -671,7 +671,7 @@ def test_a_resumed_scan_with_differences_is_followed_by_a_full_comparison(job, p
 - [ ] **Step 2: Run the first test.**
   - Run: `.venv/bin/python -m pytest -q -p no:cacheprovider tests/test_job_startup.py -k only_scans_pending`
   - Expected on the current code: FAIL. The wait for a second version times out: the resume compares only `disk/`, and the scans-only branch never reaches the follow-up.
-  - If it PASSES instead: delete both tests and stop. The task ends with a report saying Goal 5 is not an issue, and why (the log lines that show the whole tree was compared).
+  - If it PASSES instead, implement the edits anyway (ruling after Task 3's review): a resumed scans-only batch that is not round-tripped hands its do_backup() the restarted watcher's read time, which advances the matched key past the downtime; keep both tests, the second pins the carry.
 
 - [ ] **Step 3: Implement** the three edits in Interfaces.
 
@@ -789,7 +789,18 @@ Added by the main session after Task 2's review (pre-existing; the spec's Goal 6
 - [ ] **Step 5: Commit:** "The watcher adds each folder's watch as its walk reaches it, before reading the folder, so a
   folder made while the walk runs is watched."
 
-**Calls to confirm:** added to round 10 by the main session (a pre-existing silent loss).
+- **Also (ruling after Task 3's review):** while the watcher holds an existing folder it should watch but does not (one
+  the walk found unreadable, or one whose `add_watch` failed with anything but ENOENT/ENOTDIR), it publishes no read time:
+  both publish sites write `read_wall_ns = None`, sticky for that watcher's life (a new watcher, after a restart or a lost
+  root, starts clean). A fresh batch then carries the matched time forward instead of advancing it past changes no event
+  reports; full comparisons still advance it with their own start. `initializeFolderWatchers()` returns, or records in a
+  set the watcher passes it, the folders it left unwatched. Test: a folder unreadable at the walk, then a fresh batch
+  elsewhere: the batch's `matched_since` is None and the key is carried (the review's probe:
+  /tmp/claude-0/-mnt-optane-work-reverberator/8ad4e979-212b-4a0b-9477-1847dfee5560/scratchpad/r10/review-t3/copy/tests/test_probe_t3.py,
+  `test_probe_an_unreadable_folder_carries_the_time_for_one_attempt_only`).
+
+**Calls to confirm:** added to round 10 by the main session (a pre-existing silent loss); an unwatched folder stops the
+watcher publishing read times for its life.
 
 ---
 
