@@ -66,13 +66,14 @@ def test_times_from_an_earlier_boot_in_a_file_dated_in_the_future_are_rebased(jo
 	assert max(datetime.datetime.fromisoformat(values.iso_time) for values in entries.values()) <= datetime.datetime.now()
 
 
-def test_scan_rows_alone_are_not_round_tripped(job):
+def test_scan_rows_alone_are_round_tripped(job):
+	# a restart cannot tell what changed while the daemon was down outside the folders the scans name
 	seed_monitor(job, {'disk/': None})
 	pending = write_pending(job, [rv.ChangeEvent(time.monotonic(), True, 'scan', os.path.join(job.monitor, 'disk'), None)])
 	resumable(job, pending, time.time() - 1)
 	queue = rv.ChangeEventQueue(job.monitor)
 	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue) is True
-	assert not queue.round_tripped
+	assert queue.round_tripped
 
 
 def logged(monkeypatch):
