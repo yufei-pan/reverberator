@@ -1243,11 +1243,6 @@ COMPARE_THREADS = 32
 # from a coarser clock, and chrony has stepped the wall clock by 1-2 s right after boot. a full comparison takes it off
 # its version's time too ( full_comparison_since() )
 VERIFY_CTIME_MARGIN_SECONDS = 10
-# a copy read back from the vault is recorded as checked only once its ctime is this old, and unchecked until then (a
-# power loss can still leave a short copy, which a read now would find in the page cache and call fine): copies older
-# than this are trusted to be on disk. this host writes dirty pages back after 30 s, at 15 s intervals, and ten times
-# that covers a congested writeback
-CHECKED_COPY_AGE_SECONDS = 600
 # the kernel also gives up resolving a path after 40 links
 MAX_CHAINED_LINKS = 40
 # a new version copies a file again from the vault rather than link it through more links than its name's threshold,
@@ -1832,6 +1827,58 @@ def fsync_vault_folder(path:str) -> None:
 	for branch in read_pool_branches(pool):
 		try:
 			fsync_path(os.path.join(branch, rel), folder=True)
+		except (FileNotFoundError, NotADirectoryError):
+			pass
+		except OSError as e:
+			failure = failure or e
+	if failure is not None:
+		raise failure
+
+def load_syncfs():
+	'''libc's syncfs(), None when this libc has none (Python has no os.syncfs).'''
+	try:
+		syncfs = ctypes.CDLL(None, use_errno=True).syncfs
+	except (OSError, AttributeError):
+		return None
+	syncfs.argtypes = [ctypes.c_int]
+	syncfs.restype = ctypes.c_int
+	return syncfs
+
+LIBC_SYNCFS = load_syncfs()
+
+def syncfs_folder(path:str) -> None:
+	'''
+	syncfs the filesystem holding the folder at path: every dirty page of it is written before this returns, and a
+	writeback error the filesystem met since and never reported is raised. Raises OSError (ENOSYS without a libc
+	syncfs, FileNotFoundError or NotADirectoryError for a path that is no folder).
+	'''
+	if LIBC_SYNCFS is None:
+		raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), path)
+	fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+	try:
+		if LIBC_SYNCFS(fd) != 0:
+			code = ctypes.get_errno()
+			raise OSError(code, os.strerror(code), path)
+	finally:
+		os.close(fd)
+
+def sync_vault_filesystems(job_vault:str) -> None:
+	'''
+	Write out everything dirty on the disks holding the job vault at job_vault, for a comparison to record the copies it
+	read back as checked (compare_scopes()). On a mergerfs pool, whose sync does not reach the disks, that is each branch
+	holding the job vault (as fsync_vault_folder() finds them); off a pool, the job vault's own filesystem. A branch
+	without the folder is passed over, and the first other error is raised once every branch was tried. A branch list
+	that cannot be read raises its OSError.
+	'''
+	pool = mergerfs_mount(read_mount_table(), job_vault)
+	if pool is None:
+		syncfs_folder(job_vault)
+		return
+	rel = os.path.relpath(os.path.realpath(job_vault), pool)
+	failure = None
+	for branch in read_pool_branches(pool):
+		try:
+			syncfs_folder(os.path.join(branch, rel))
 		except (FileNotFoundError, NotADirectoryError):
 			pass
 		except OSError as e:
@@ -6536,8 +6583,7 @@ class VaultManifest:
 	(no record yet), which it then records. Rows a backup writes are dirty until they are recorded from the new
 	version, before its changes commit. kind is d (folder), f (regular file), o (other file type), l (symlink, its
 	target in link) or r (a referenced backup's link to the monitored file itself). A file copied by a backup stays
-	unchecked until delta generation reads the copy back from the vault once it is CHECKED_COPY_AGE_SECONDS old, as a
-	crash can keep its bytes from the disk.
+	unchecked until delta generation reads the copy back from the vault, as a crash can keep its bytes from the disk.
 	Paths and link targets are stored through storable_name() and read back through stored_name(), so a name that is
 	not UTF-8 is tracked like any other; rows sort by stored path, in which a folder still comes right before the paths
 	under it. copy_version is the number of the version a backup copied a file into (set_copy_version()), kept while
@@ -8086,8 +8132,7 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 	copy_version, for the version the manifest describes, is the number its row gives for the version holding the copy
 	(VaultManifest.copy_version()): the links above that version are followed by their text, whatever the moves say,
 	and the entry there is the end, as chain_end() has it; so an entry this version copied (copy_version its own
-	number) is read as it is, a user's link as the link. A regular file's record is unchecked while the chain end's
-	ctime is within CHECKED_COPY_AGE_SECONDS of now. Returns None when there is nothing readable there, or a link
+	number) is read as it is, a user's link as the link. Returns None when there is nothing readable there, or a link
 	there cannot be looked at (UncheckedVaultLink).
 	'''
 	entry = os.path.abspath(os.path.join(version_path, rel))
@@ -8130,9 +8175,7 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 			return None
 		kind = entry_kind(st.st_mode)
 		file_hash = hash_file(entry, st.st_size) if kind == 'f' else None
-		# a regular file whose chain end is younger than CHECKED_COPY_AGE_SECONDS may not be on the disk yet
-		young = kind == 'f' and st.st_ctime_ns > time.time_ns() - CHECKED_COPY_AGE_SECONDS * 10 ** 9
-		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 1 if young else 0)
+		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 0)
 	except (OSError, UncheckedVaultLink):
 		return None
 
@@ -8395,7 +8438,9 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	The vault is read, at version_path only, for unverified rows and unchecked copies, and what is read is recorded, as
 	delta_generate_backup_entries() describes. The trusted rels are rows this backup wrote from the monitored tree and
 	has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder from a file,
-	and never read back, so their copies stay unchecked. With fresh, version_path is that uncommitted version, and a
+	and never read back, so their copies stay unchecked. A file read back is recorded checked only after one sync of the
+	vault's filesystems made in this comparison, before its first such record (sync_vault_filesystems()); when that fails,
+	every file record it stores is unchecked, with one warning. With fresh, version_path is that uncommitted version, and a
 	file read there as a real file of its own (a re-copy, or a copy a move carried) is recorded unchecked too.
 	Without attributes, attribute-only differences are left out. With scopes.changed_since or changed_since_wall, the
 	extended attributes of the entries changed since then, by their ctime (ctime_bound()), are compared too
@@ -8453,12 +8498,27 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	recorded = 0
 	walk_errors = []
 	path_errors = []
+	# whether this comparison has synced the vault's filesystems yet, and whether that failed
+	synced = False
+	sync_failed = False
 	def settle(limit):
-		nonlocal recorded
+		nonlocal recorded, synced, sync_failed
 		while len(pending) > limit:
 			monitor_entry, rel, outcome = pending.popleft()
 			event, found = outcome.result() if isinstance(outcome, Future) else outcome
 			if found is not None:
+				if found.kind == 'f':
+					if not synced and not found.unchecked:
+						# the first copy to record as checked: all those read back here were made before this sync, so
+						# once it succeeds they are on the disks, and a writeback error it meets keeps them unchecked
+						synced = True
+						try:
+							sync_vault_filesystems(os.path.dirname(os.path.abspath(version_path)))
+						except Exception as e:
+							sync_failed = True
+							backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Could not sync the vault to disk: {e}; copies read back are kept unchecked until a comparison can')
+					if sync_failed:
+						found = found._replace(unchecked=1)
 				manifest.set_records(((rel, found),))
 				recorded += 1
 			if event and (attributes or event != 'attrib'):

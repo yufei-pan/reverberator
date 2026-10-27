@@ -1,7 +1,9 @@
+import errno
 import os
 from collections import OrderedDict
 import pytest
 import reverberator as rv
+from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.harness import seed_monitor, tracked_manifest, run_backup, latest_version, event_entry
 
 pytestmark = pytest.mark.unit
@@ -38,7 +40,6 @@ def test_backup_records_what_the_new_version_holds(job):
 
 
 def test_cold_start_reads_each_copy_back_once_then_only_the_monitored_side(job, monkeypatch):
-	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)   # this test's copies count as old
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	run_backup(job)
 	reads = count_vault_reads(monkeypatch)
@@ -49,37 +50,43 @@ def test_cold_start_reads_each_copy_back_once_then_only_the_monitored_side(job, 
 	assert reads == []
 
 
-def test_a_young_copy_reads_back_unchecked_and_an_old_one_checked(job, monkeypatch):
-	seed_monitor(job, {'a.txt': 'hello', 'sub/': None})
-	v0 = run_backup(job)[0]
-	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 600)
-	assert rv.read_vault_record(v0, 'a.txt', job.monitor).unchecked == 1
-	assert rv.read_vault_record(v0, 'sub/', job.monitor).unchecked == 0
-	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)
-	assert rv.read_vault_record(v0, 'a.txt', job.monitor).unchecked == 0
+def recording_sync(monkeypatch, failing=False):
+	'''rv.sync_vault_filesystems replaced by a recorder of the job vaults it is asked to sync, raising EIO when failing.'''
+	calls = []
+	def sync(job_vault):
+		calls.append(job_vault)
+		if failing:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), job_vault)
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', sync)
+	return calls
 
 
-def test_a_full_comparison_checks_copies_only_once_they_are_old(job, monkeypatch):
-	seed_monitor(job, {'a.txt': 'hello'})
-	run_backup(job)
-	run_backup(job)                                   # the restart's full comparison right after the backup
+def warning_lines(monkeypatch):
+	'''The backuper log's messages from now on: (message, whether a warning).'''
+	lines = []
+	real = rv.backuperTeeLogToTl
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda path, message, **kw: lines.append((message, bool(kw.get('warning')))) or real(path, message, **kw))
+	return lines
+
+
+def unchecked_flags(job):
 	manifest = rv.VaultManifest(job.job_vault)
-	assert manifest.lookup('a.txt').unchecked == 1
-	manifest.close()
-	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)
-	run_backup(job)                                   # one after the window
-	manifest = rv.VaultManifest(job.job_vault)
-	assert manifest.lookup('a.txt').unchecked == 0
-	manifest.close()
+	try:
+		return {rel: manifest.lookup(rel).unchecked for rel in manifest.files}
+	finally:
+		manifest.close()
 
 
 @pytest.mark.parametrize('loss', ['truncated', 'zeroed'])
 def test_a_copy_lost_after_a_batch_read_it_back_is_copied_again(job, monkeypatch, loss):
-	# the power-loss test: a later batch's check reads the young copy back (0.45 recorded it checked), then a failed
-	# writeback leaves the copy short or zeroed, and the restart's full comparison must still catch it
+	# the power-loss test: a later batch's check reads the copy back while the vault sync fails, so the copy stays
+	# unchecked (0.45 recorded it checked from the page cache); then a failed writeback leaves it short or zeroed, and the
+	# restart's full comparison must still catch it
 	seed_monitor(job, {'a.txt': 'hello world'})
 	copy = os.path.join(run_backup(job)[0], 'a.txt')
+	recording_sync(monkeypatch, failing=True)
 	run_backup(job, OrderedDict(), touched=rv.TouchedScopes(['a.txt/'], ['a.txt'], None, None))
+	assert unchecked_flags(job) == {'a.txt': 1}
 	st = os.lstat(copy)
 	if loss == 'truncated':
 		os.truncate(copy, 3)
@@ -87,12 +94,67 @@ def test_a_copy_lost_after_a_batch_read_it_back_is_copied_again(job, monkeypatch
 		with open(copy, 'r+b') as f:
 			f.write(b'\0' * st.st_size)
 		os.utime(copy, ns=(st.st_atime_ns, st.st_mtime_ns))
-	lines = []
-	real = rv.backuperTeeLogToTl
-	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda path, message, **kw: lines.append(message) or real(path, message, **kw))
+	recording_sync(monkeypatch)
+	lines = warning_lines(monkeypatch)
 	versions = run_backup(job)
-	assert any('does not match its record, copying again' in line for line in lines)
+	assert any('does not match its record, copying again' in message for message, _ in lines)
 	assert open(os.path.join(versions[-1], 'a.txt')).read() == 'hello world'
+
+
+def test_a_comparison_syncs_once_however_many_copies_it_checks(job, monkeypatch):
+	seed_monitor(job, {**{f'f{i}.txt': str(i) for i in range(6)}, 'sub/g.txt': 'g'})
+	calls = recording_sync(monkeypatch)
+	run_backup(job)
+	assert calls == [] and set(unchecked_flags(job).values()) == {1}
+	run_backup(job)                                   # the next start reads all seven back
+	assert calls == [job.job_vault]
+	assert set(unchecked_flags(job).values()) == {0}
+
+
+def test_a_failed_sync_keeps_the_copies_unchecked_with_one_warning_and_the_next_comparison_checks_them(job, monkeypatch):
+	seed_monitor(job, {f'f{i}.txt': str(i) for i in range(4)})
+	run_backup(job)
+	calls = recording_sync(monkeypatch, failing=True)
+	lines = warning_lines(monkeypatch)
+	run_backup(job)
+	assert calls == [job.job_vault]
+	assert set(unchecked_flags(job).values()) == {1}
+	failures = [message for message, warning in lines if warning and 'sync' in message]
+	assert len(failures) == 1
+	calls = recording_sync(monkeypatch)
+	run_backup(job)
+	assert calls == [job.job_vault]
+	assert set(unchecked_flags(job).values()) == {0}
+
+
+def test_a_comparison_storing_no_checked_file_record_makes_no_sync(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	run_backup(job)
+	calls = recording_sync(monkeypatch)
+	run_backup(job)                                   # every row is checked: nothing is read back
+	assert calls == []
+	# a batch's own new copy is read back fresh, so it is recorded unchecked
+	seed_monitor(job, {'b.txt': 'b'})
+	run_backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]), touched=rv.TouchedScopes(['b.txt/'], ['b.txt'], None, None))
+	assert calls == []
+	assert unchecked_flags(job)['b.txt'] == 1
+
+
+def test_the_real_sync_succeeds_on_the_test_filesystem(job):
+	os.makedirs(job.job_vault, exist_ok=True)
+	REAL_SYNC_VAULT_FILESYSTEMS(job.job_vault)
+	with pytest.raises(OSError):
+		rv.syncfs_folder(os.path.join(job.job_vault, 'not there'))
+
+
+def test_copies_a_backup_wrote_stay_unchecked_without_any_patch(job):
+	seed_monitor(job, {'a.txt': 'hello'})
+	v0 = run_backup(job)[0]
+	assert rv.read_copied_record(v0, 'a.txt', job.monitor).unchecked == 1
+	assert rv.read_version_record(v0, 'a.txt', job.monitor, True).unchecked == 1
+	# read back from a committed version, a copy is checked, as the vault sync of the comparison stands behind it
+	assert rv.read_vault_record(v0, 'a.txt', job.monitor).unchecked == 0
 
 
 def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
@@ -109,7 +171,6 @@ def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
 
 
 def test_content_rewritten_keeping_size_and_mtime_is_modify_without_reading_the_vault(job, monkeypatch):
-	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)   # this test's copies count as old
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
 	run_backup(job)
