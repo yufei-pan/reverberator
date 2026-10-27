@@ -39,21 +39,27 @@ checked once it is old enough. Nothing is flushed: no fsync on the write path or
 - Why 600 s: this host writes dirty pages back after 30 s (`vm.dirty_expire_centisecs` 3000) at 15 s intervals
   (`vm.dirty_writeback_centisecs` 1500); ten times that covers a congested writeback. Copies older than that are trusted
   to be on disk, as they are today.
-- A copy whose ctime moves later (a prune's hard link changes its link count) only waits again: never less safe.
+- A copy whose ctime moves later only waits again, never less safe: a prune hard-links nearly every chain end, so the
+  wait renews at each prune (negligible on the live jobs, which version at most hourly).
 - The rule applies wherever a read-back is stored as checked: compare_entry's unchecked and unverified branches and any
   other caller that stores `read_vault_record()`'s file record with `unchecked = 0`. Records of copies the backup just
   made already stay unchecked (`read_copied_record()`, `read_version_record(fresh=True)`).
 - Mismatch handling is unchanged: a copy whose read-back does not match its record is copied again, young or old.
 
 **My call against the agreed words:** the user agreed to "flush a copy just before it is marked checked". Leaving a young
-copy unchecked instead costs nothing, which is what the user's words weigh ("compare to cossting every single write"): an
+copy unchecked instead adds no flush, which is what the user's words weigh ("compare to cossting every single write"): an
 fsync of a clean XFS file still issues a device cache flush, and a restart's full comparison checks every copy made since
-the previous one, so the agreed route would pay tens of thousands of flushes after a week of backups. What it gives up:
-the agreed route relies on nothing, while this one relies on the kernel writing dirty data back within 600 s (true here;
-not on a host tuned to hold dirty data longer, or a slow network vault), on that writeback not failing silently (an
-fsync would return the error; a read-back from the page cache does not; on XFS a failed writeback shuts the filesystem
-down, which round 9's pool check pauses on), and on the wall clock not stepping forward by minutes. The README says so in
-one line. Listed in Calls to confirm.
+the previous one, so the agreed route would pay tens of thousands of flushes after a week of backups. Its own cost: every
+comparison inside the window reads each young copy back again (warm, from the page cache: about 1.6 s per 20K copies
+locally, more through mergerfs), and the copy is read once more at the first comparison after the window, usually cold
+(about 360 reads/s on the work job's vault, so ~9 min for a 190K-file batch). What it gives up: the agreed route relies
+on nothing, while this one relies on the kernel writing dirty data back within 600 s (true here; not on a host tuned to
+hold dirty data longer, or a slow network vault), on the wall clock not stepping forward by minutes, and on writeback not
+failing silently: a data-writeback I/O error waits for the next fsync, which never comes, and does not shut XFS down
+(only log and metadata write errors do), so after an isolated data-write error a read-back from the page cache once the
+copy is 10 min old records checked a copy whose bytes never reached the disk; the fsync route would have caught it. A
+disk that drops out fails its log writes within seconds and does shut XFS down, which round 9's pool check pauses on.
+The README says so in one line. Listed in Calls to confirm.
 
 - The check sits in `read_vault_record()`, which already holds the chain end's `st`; `compare_entry`'s branches (through
   `compare_scopes`' `set_records`) are the only path by which a checked file record is stored, and `record_dirty_entries`
