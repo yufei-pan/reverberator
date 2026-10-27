@@ -226,6 +226,10 @@ class ChangeEventQueue:
 	first_wall_ns is the wall clock time, in ns, at which the first event came into an empty queue (None while empty),
 	which take() moves along too: with the first event's monotonic time, the batch's verification tells which entries it
 	changed even when the wall clock stepped between ( ctime_bound() ).
+	read_wall_ns is the wall clock time, in ns, at which the watcher began its latest read whose events are all queued
+	(None until the watcher sets it): every change made before it has its event in the queue or an earlier batch.
+	Only the watcher sets it, under the lock, and clear() and a full scan leave it: an older stamp is a safe claim. take()
+	copies it into the batch and keeps it here.
 
 	Examples:
 		>>> queue = ChangeEventQueue('/m')
@@ -246,9 +250,13 @@ class ChangeEventQueue:
 		>>> queue.append(ChangeEvent(5.0, False, 'modify', '/m/log', None))
 		>>> [event.event for event in queue]
 		['full_scan']
+		>>> queue.read_wall_ns = 7
+		>>> queue.take().read_wall_ns, queue.read_wall_ns
+		(7, 7)
 	'''
 	def __init__(self, monitor_path:str = ''):
 		self.monitor_path = monitor_path
+		self.read_wall_ns = None
 		self.clear()
 
 	def clear(self):
@@ -366,6 +374,7 @@ class ChangeEventQueue:
 		taken._blocks, taken._recent, taken._count = self._blocks, self._recent, self._count
 		taken._packed_bytes, taken._full_scan = self._packed_bytes, self._full_scan
 		taken.round_tripped, taken.first_wall_ns = self.round_tripped, self.first_wall_ns
+		taken.read_wall_ns = self.read_wall_ns
 		self.clear()
 		return taken
 
@@ -2503,6 +2512,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 		running = GREEN_LIGHT.is_set if job is None else job.should_run
 		while running():
 			read_delay = max(min(POLL_WAIT_SECONDS, min_snapshot_delay_seconds), 0.00001)
+			# every change made before this moment is in this read or an earlier one
+			read_began = time.time_ns()
 			events =  inotify_obj.read(timeout=read_delay * 1000)
 			if processPending and not to_process_flag.is_set():
 				# the backuper took the batch, so its recursive folder copies run from now on: record events in those folders again.
@@ -2528,6 +2539,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
 				append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 			if not events:
+				# nothing more is pending from this read, so its time is the batch's matched time
+				with to_process_lock:
+					to_process.read_wall_ns = read_began
 				if to_process and not to_process_flag.is_set() and time.monotonic() - lastReadTime > min_snapshot_delay_seconds:
 					watcherTeeLogToTl(monitor_path,'Timeout elapsed, signaling backuper to process')
 					to_process_flag.set()
@@ -2700,6 +2714,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'modify',eventPath,None))
 				else:
 					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
+			# every event of this read is queued: a batch taken from now on may claim the vault matched the tree as of read_began
+			with to_process_lock:
+				to_process.read_wall_ns = read_began
 	return WATCH_RESULT_OK
 
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):

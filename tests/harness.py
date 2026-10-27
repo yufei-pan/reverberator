@@ -1,5 +1,6 @@
 import errno
 import os
+import threading
 import time
 from collections import namedtuple, OrderedDict
 from datetime import datetime
@@ -352,6 +353,45 @@ class FakePool:
 		if err is not None:
 			raise OSError(err, os.strerror(err), os.path.join(mount_point, '.mergerfs'))
 		return list(self.pools[pool])
+
+
+def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, **watch_kwargs) -> tuple:
+	'''
+	Run rv.watchFolder on monitor, in this thread, with an inotify that returns each item of reads in turn and then stops.
+	An item is a list of (mask, name, cookie) on the root watch (wd 1), or a callable taking the queue and returning such a
+	list. After the last item the fake clears rv.GREEN_LIGHT (conftest sets it again) and returns [].
+	Returns (queue, flag, returned): returned holds the wall clock ns at which each read returned.
+	'''
+	queue = rv.ChangeEventQueue(monitor) if queue is None else queue
+	flag = threading.Event() if flag is None else flag
+	returned = []
+	Event = namedtuple('Event', ['wd', 'mask', 'cookie', 'name'])
+	pending = list(reads)
+	class FakeINotify:
+		def __enter__(self):
+			return self
+		def __exit__(self, *args):
+			return False
+		def read(self, timeout=None):
+			if not pending:
+				rv.GREEN_LIGHT.clear()
+				returned.append(time.time_ns())
+				return []
+			item = pending.pop(0)
+			item = item(queue) if callable(item) else item
+			returned.append(time.time_ns())
+			return [Event(1, mask, cookie, name) for mask, name, cookie in item]
+		def add_watch(self, path, mask):
+			return 1
+		def rm_watch(self, wd):
+			pass
+	def initialize(inotify_obj, monitor_path, wdDic, *args, **kwargs):
+		wdDic[1] = monitor_path
+		return 1
+	monkeypatch.setattr(rv.inotify_simple, 'INotify', FakeINotify)
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', initialize)
+	rv.watchFolder(monitor, queue, threading.Lock(), flag, rv.inotify_resource_manager(), **watch_kwargs)
+	return queue, flag, returned
 
 
 def reverberator_script() -> str:
