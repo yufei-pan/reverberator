@@ -136,17 +136,24 @@ that returns nothing means no pair is still coming: no grace is needed. The max-
 before the current read's events are handled) keeps today's behaviour, so a split pair is never broken; the timeout
 stays as it is.
 
-- Left over: a move-out pending at a max-delay hand-over still shows its phantom in that version. That is a would-be
-  known limitation for the user, not written down until they agree.
+- (Superseded by the revision below: the max-delay case is covered by the check after the batch.)
 - A create at the move-out's source already queues the move-out first (`queue_pending_move_from_at()`), so the order is
   kept.
 - The batch then holds the delete of a.txt and the create of d/a.txt (the new folder's walk), and the check after the
   batch compares a.txt as a touched path, as the user's words asked.
 
-**My call against the agreed words:** the user agreed to "the check after a batch also compares paths whose move-out is
-still waiting for its pair". Handing the expired move-out over as its delete does that (its path is touched) and also
-keeps the phantom out of the replay, with no new event kind and no pending-batch format change. Listed in Calls to
-confirm.
+**Revised after Task 4's review (2026-10-27 night), back to the agreed words:** the quiet rule above changes nothing on
+the live jobs: their pair timeout equals their quiet delay (1 to 12 h), so by the time the tree is quiet the timeout has
+already expired the move-out; their phantoms come from batches taken at the max-delay hand-over, while the tree is busy,
+and from moves out of the tree as well as into new folders. So, as the user agreed ("the check after a batch also
+compares paths whose move-out is still waiting for its pair"): the watcher keeps the set of paths whose move-out it holds
+on the queue (under its lock, updated wherever a move-out is added or popped), `take()` carries it into the batch, and the
+batch's touched scopes include those paths. The check after the batch then finds such a path gone from the tree and
+removes it from the version, whichever hand-over took the batch; the move-out's later delete is then a no-op, and a pair
+that still came (none can, after a read) would be a move from a path the version lacks, which falls back to a copy. The
+quiet rule stays: it makes the replay itself right on short delays. Tests: at a max-delay hand-over with a move-out
+pending, the batch's version lacks the moved path; a folder moved out of the tree while the tree is busy is gone from that
+version; a move-out popped by a create at its source is not compared as pending.
 
 **Tests:** `mkdir d; mv a.txt d/a.txt` in one batch gives a version with only d/a.txt; a move-out that is a batch's last
 event lands in that batch; a move-out pending at a max-delay hand-over still pairs with a move-in read after it (inject
