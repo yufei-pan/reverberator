@@ -148,7 +148,8 @@ def committed_versions(job: JobPaths) -> list:
 	if not os.path.isdir(job.job_vault):
 		return []
 	found = []
-	for name in sorted(os.listdir(job.job_vault)):
+	# by version number, as V10 sorts before V9 as text
+	for name in sorted(os.listdir(job.job_vault), key=lambda name: (rv.vault_version_number(name) or 0, name)):
 		if not (name.startswith('V') and '--' in name):
 			continue
 		if rv.CONTENT_FILE_EXTENSION_NAME in name:

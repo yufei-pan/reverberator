@@ -2,7 +2,7 @@ import os
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_committed_version, committed_versions, tracked_manifest
+from tests.harness import seed_monitor, write_committed_version, committed_versions, tracked_manifest, run_backup, event_entry
 
 pytestmark = pytest.mark.unit
 
@@ -192,3 +192,15 @@ def test_current_version_is_swapped_atomically(job, monkeypatch):
 		keep_n_versions=0, backup_size_limit='0')[1].close()
 	assert link not in removed and os.readlink(link) != first
 	assert not os.path.lexists(os.path.join(job.job_vault, '.current_version.tmp'))
+
+
+
+def test_committed_versions_are_in_version_order_past_v9(job):
+	seed_monitor(job, {'a.txt': '0'})
+	run_backup(job)
+	for n in range(1, 11):
+		with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
+			f.write(str(n))
+		latest = run_backup(job, OrderedDict([event_entry(job, 'a.txt', 'modify')]))[-1]
+	assert os.path.basename(latest).startswith('V10--')
+	assert [rv.vault_version_number(os.path.basename(path)) for path in committed_versions(job)] == list(range(11))

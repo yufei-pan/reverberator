@@ -230,6 +230,10 @@ class ChangeEventQueue:
 	(None until the watcher sets it): every change made before it has its event in the queue or an earlier batch.
 	Only the watcher sets it, under the lock, and clear() and a full scan leave it: an older stamp is a safe claim. take()
 	copies it into the batch and keeps it here.
+	pending_move_outs is the set of absolute paths whose move-out the watcher holds, waiting for its pair: no event of
+	the queue says they are gone. The watcher adds each as it holds it and drops those no longer held once a read's events
+	are all queued, so the set is never smaller than what is held. take() copies it into the batch and keeps it here,
+	and touched_scopes() compares those paths, so a batch taken while one is held has no phantom at its old place.
 
 	Examples:
 		>>> queue = ChangeEventQueue('/m')
@@ -253,10 +257,14 @@ class ChangeEventQueue:
 		>>> queue.read_wall_ns = 7
 		>>> queue.take().read_wall_ns, queue.read_wall_ns
 		(7, 7)
+		>>> queue.pending_move_outs.add('/m/gone')
+		>>> queue.take().pending_move_outs, queue.pending_move_outs
+		({'/m/gone'}, {'/m/gone'})
 	'''
 	def __init__(self, monitor_path:str = ''):
 		self.monitor_path = monitor_path
 		self.read_wall_ns = None
+		self.pending_move_outs = set()
 		self.clear()
 
 	def clear(self):
@@ -375,6 +383,7 @@ class ChangeEventQueue:
 		taken._packed_bytes, taken._full_scan = self._packed_bytes, self._full_scan
 		taken.round_tripped, taken.first_wall_ns = self.round_tripped, self.first_wall_ns
 		taken.read_wall_ns = self.read_wall_ns
+		taken.pending_move_outs = set(self.pending_move_outs)
 		self.clear()
 		return taken
 
@@ -2461,7 +2470,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	def add_pending_move_from(cookie,change_event:ChangeEvent):
 		pop_pending_move_from(cookie)
 		pendingMoveFromEvents[cookie] = change_event
-		pendingMoveFromPaths.setdefault(change_event.path.rstrip('/'),{})[cookie] = None
+		path_norm = change_event.path.rstrip('/')
+		pendingMoveFromPaths.setdefault(path_norm,{})[cookie] = None
+		# at once, as the backuper can take the batch while this read's events are handled
+		with to_process_lock:
+			to_process.pending_move_outs.add(path_norm)
 	def pop_pending_move_from(cookie) -> ChangeEvent:
 		change_event = pendingMoveFromEvents.pop(cookie,None)
 		if change_event is not None:
@@ -2551,6 +2564,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				# nothing more is pending from this read, so its time is the batch's matched time
 				with to_process_lock:
 					to_process.read_wall_ns = read_began
+					to_process.pending_move_outs = set(pendingMoveFromPaths)
 				if quiet and to_process and not to_process_flag.is_set():
 					watcherTeeLogToTl(monitor_path,'Timeout elapsed, signaling backuper to process')
 					to_process_flag.set()
@@ -2723,9 +2737,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'modify',eventPath,None))
 				else:
 					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
-			# every event of this read is queued: a batch taken from now on may claim the vault matched the tree as of read_began
+			# every event of this read is queued: a batch taken from now on may claim the vault matched the tree as of read_began,
+			# and a move-out popped in it has its event queued, so it is no longer held
 			with to_process_lock:
 				to_process.read_wall_ns = read_began
+				to_process.pending_move_outs = set(pendingMoveFromPaths)
 	return WATCH_RESULT_OK
 
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
@@ -4233,6 +4249,8 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 	any rows of a folder it replaced, and a folder as the file path. Scans, full scans, self destructs, the root itself
 	and paths outside monitor_path are left out, and so is a scope inside a subtree (a path inside one above it: its own
 	subtree can be skipped by a pattern for folders, which the file is not).
+	The paths whose move-out the watcher held when the batch was taken (a ChangeEventQueue's pending_move_outs) are
+	compared as either kind too: such a path is gone from the tree, and its delete may come only in a later batch.
 	changed_since is the monotonic time of the first event: an inode the batch changed (its extended attributes too, or a
 	rename of it) has a ctime from about then on. changed_since_wall is the wall clock time a ChangeEventQueue took when
 	its first event came in (first_wall_ns), None for events of another kind. A batch handed back or resumed
@@ -4248,6 +4266,11 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 		(['etc/x/'], ['etc/x'])
 		>>> touched_scopes([ChangeEvent(2.0, False, 'modify', '/m/x', None), ChangeEvent(1.5, False, 'modify', '/m/y', None)], '/m').changed_since
 		1.5
+		>>> queue = ChangeEventQueue('/m')
+		>>> queue.append(ChangeEvent(1.0, False, 'modify', '/m/x', None))
+		>>> queue.pending_move_outs.update({'/m/gone', '/m/x/old'})
+		>>> touched_scopes(queue, '/m')[:2]
+		(['gone/', 'x/'], ['gone', 'x'])
 	'''
 	root = os.path.abspath(monitor_path)
 	def rel_of(path):
@@ -4278,6 +4301,11 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 		if event.is_dir:
 			# a folder made where a file was leaves the file's row
 			paths.update(rels)
+	for path in getattr(events, 'pending_move_outs', ()):
+		rel = rel_of(path)
+		if rel is not None:
+			subtrees.add(rel + '/')
+			paths.add(rel)
 	subtrees = sorted(rel for rel in subtrees if not inside_folders(rel, subtrees))
 	kept = set(subtrees)
 	def covered(rel):
