@@ -222,7 +222,8 @@ class ChangeEventQueue:
 	A 'scan' event (compare that one folder with the vault) is kept like any other event.
 	round_tripped says that some of the events lost their raw form: a batch handed back after a backup that did not
 	commit, or loaded from the pending transactions, holds only its collapsed entries (backup_entries_to_change_events()).
-	prepend() and the pending load set it for events other than scans, and take() moves it to the batch it takes.
+	prepend() sets it for events other than scans, the pending load for any rows (a batch of scans only, resumed after a
+	restart, cannot tell what changed while the daemon was down), and take() moves it to the batch it takes.
 	first_wall_ns is the wall clock time, in ns, at which the first event came into an empty queue (None while empty),
 	which take() moves along too: with the first event's monotonic time, the batch's verification tells which entries it
 	changed even when the wall clock stepped between ( ctime_bound() ).
@@ -3112,8 +3113,9 @@ def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_p
 				None if moved_from is None else stored_name(moved_from)
 			))
 			loaded_count += 1
-		if any(row[2] != 'scan' for row in pending_rows_raw.values()) and not to_process.full_scan_requested:
-			# a batch handed back before the stop was saved as its collapsed entries only
+		if pending_rows_raw and not to_process.full_scan_requested:
+			# a batch handed back before the stop was saved as its collapsed entries only, and a batch of scans only cannot
+			# tell what changed while the daemon was down, outside the folders it names: the whole tree is compared after it
 			to_process.round_tripped = True
 		try:
 			os.remove(pending_transactions_path)
@@ -4070,6 +4072,9 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			with to_process_lock:
 				if resumed:
 					to_process.prepend(list(restored))
+					if restored.round_tripped:
+						# prepend() sets it for events other than scans only
+						to_process.round_tripped = True
 				else:
 					# a full scan absorbs whatever the watcher queued meanwhile
 					to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
@@ -4143,13 +4148,14 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					break
 				if job is not None:
 					job.mark_committed()
-				if round_tripped and not full_comparison:
-					# the collapse can drop a path its entries no longer name, as git's ref deleted after a rename over it:
-					# the verification compared only what they name, so the whole tree is compared next, as at a start
-					# with nothing to resume. it runs now, without waiting for the watcher's signal, and the queue is left
-					# to the watcher: its new folders' events are recorded again only once it sees its batch taken
-					backuperTeeLogToTl(job_name,'The batch backed up was handed back or resumed, keeping only its collapsed entries: comparing the whole tree next')
-					follow_up = True
+			if round_tripped and not full_comparison:
+				# the collapse can drop a path its entries no longer name, as git's ref deleted after a rename over it:
+				# the verification compared only what they name, so the whole tree is compared next, as at a start
+				# with nothing to resume. a batch of scans only, resumed, cannot tell what changed while the daemon was
+				# down outside its folders. it runs now, without waiting for the watcher's signal, and the queue is left
+				# to the watcher: its new folders' events are recorded again only once it sees its batch taken
+				backuperTeeLogToTl(job_name,'The batch backed up was handed back or resumed, keeping only its collapsed entries: comparing the whole tree next')
+				follow_up = True
 			backupEntries.clear()
 			scan_folders = []
 			touched = None

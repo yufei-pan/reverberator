@@ -47,6 +47,12 @@ def _resumable_pending(job, path):
 	return pending
 
 
+def _age(job):
+	for dirpath, dirnames, filenames in os.walk(job.monitor):
+		for name in [dirpath] + [os.path.join(dirpath, n) for n in dirnames + filenames]:
+			os.utime(name, (1000, 1000))
+
+
 def _count_deltas(monkeypatch):
 	'''The number of versions committed when each delta generation began.'''
 	calls = []
@@ -258,3 +264,50 @@ def test_the_vault_scan_runs_while_the_job_waits_for_its_monitored_path(job, pol
 		assert len(committed_versions(job)) == 1
 	finally:
 		_stop(thread)
+
+
+def test_a_restart_with_only_scans_pending_compares_the_whole_tree(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b', 'disk/x': 'x'})
+	_age(job)                                               # every monitored entry at mtime 1000, before V0
+	_v0(job)
+	# while the daemon is down, outside the scanned folder
+	os.chmod(os.path.join(job.monitor, 'a.txt'), 0o600)
+	b = os.path.join(job.monitor, 'b.txt')
+	open(b, 'w').write('changed while down')
+	os.utime(b, (1000, 1000))
+	pending = write_pending(job, [rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None)])
+	os.utime(pending, (2000, 2000))
+	startup = rv.JobStartup(job.job_name, job.monitor)
+	startup.watching.set()
+	thread = _run_backuper(job, startup)
+	try:
+		v1 = wait_for_committed_count(job, 2)[1]
+	finally:
+		_stop(thread)
+	assert not os.path.exists(pending)
+	assert open(os.path.join(v1, 'b.txt')).read() == 'changed while down'
+	assert os.stat(os.path.join(v1, 'a.txt')).st_mode & 0o777 == 0o600
+
+
+def test_a_resumed_scan_with_differences_is_followed_by_a_full_comparison(job, poll_fast):
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b', 'disk/x': 'x'})
+	_age(job)
+	_v0(job)
+	b, x = os.path.join(job.monitor, 'b.txt'), os.path.join(job.monitor, 'disk', 'x')
+	for path, text in ((b, 'changed while down'), (x, 'x changed while down')):
+		open(path, 'w').write(text)
+		os.utime(path, (1000, 1000))
+	pending = write_pending(job, [rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None)])
+	os.utime(pending, (2000, 2000))
+	startup = rv.JobStartup(job.job_name, job.monitor)
+	startup.watching.set()
+	thread = _run_backuper(job, startup)
+	try:
+		v1, v2 = wait_for_committed_count(job, 3)[1:3]     # the resumed scan's version, then the follow-up's
+	finally:
+		_stop(thread)
+	assert open(os.path.join(v1, 'disk', 'x')).read() == 'x changed while down'
+	assert open(os.path.join(v2, 'b.txt')).read() == 'changed while down'
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.matched[0] == os.path.basename(v2)      # the follow-up advanced it; the resumed batch carried nothing
+	manifest.close()
