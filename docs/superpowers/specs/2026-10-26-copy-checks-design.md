@@ -41,10 +41,16 @@ per comparison as a warning. A comparison that stores no checked file record mak
 fresh copies stay unchecked (`read_copied_record()`, `read_version_record(fresh=True)`). Nothing is flushed on the write
 path.
 
-- Why it is enough: `syncfs` returns only once every dirty page of that filesystem is written, so every copy read back in
-  the comparison (all made before it) is on disk once it succeeds; and it returns a writeback error the filesystem met
-  since and never reported (errseq), so an isolated data-write error keeps the copy unchecked instead of trusting the page
-  cache.
+- Why it is enough for a power loss: `syncfs` returns only once every dirty page of that filesystem is written, so every
+  copy read back in the comparison (all made before it) is on disk once it succeeds.
+- What it does not cover (an open question for the user, not written down until they rule): a data-writeback I/O error
+  is reported once (errseq), to the first `syncfs` after it, so that comparison keeps its copies unchecked and warns; a
+  later comparison's sync, or another job's or process's on the same disk, gets 0, and its read-back from the page cache,
+  which still holds the good bytes, records the copy checked; after a reboot the copy reads back zeroed or short, and no
+  comparison reads it again. XFS does not shut down on a data-write error (probed on a dm error target). The warning is a
+  log line only (firewatcher alerts on FAILED, UNREADABLE and STOPPED). A fix, if the user wants one: a failed sync is
+  remembered per branch until the next reboot (a marker under /run), and while it is there every comparison keeps that
+  pool's file records unchecked, so the restart after the reboot reads them from disk.
 - The sync sits where the records are stored (`compare_scopes`' settling, the caller's thread), not in
   `read_vault_record()`, which runs on the compare pool; the read-backs themselves are unchanged.
 - Mismatch handling is unchanged: a copy whose read-back does not match its record is copied again.
@@ -56,9 +62,12 @@ an isolated data-writeback I/O error (which does not shut XFS down; only log and
 copies at every comparison inside the window. One `syncfs` per comparison that marks copies checked is the agreed flush,
 at one flush per comparison instead of one per copy (an fsync of a clean XFS file still issues a device cache flush, so a
 per-copy flush would pay tens of thousands after a week of backups), and it needs no age, no clock and no window. Its
-cost: a comparison that checks copies waits until the vault disks' dirty data, other writers' included, is written,
-which writeback would do within ~45 s anyway; on the live jobs that is a restart's or a failed attempt's full comparison,
-and the rare batch check that meets an older unchecked copy. Listed in Calls to confirm.
+cost: a comparison that checks copies waits until the vault disks' dirty data, other writers' included, is written: about
+1-2 s with the disks idle, up to ~15-50 s during a download burst on the same disks (dirty limit ~2-2.8 GB on HDDs), more
+if the writes are seek-bound; other jobs and readers go on meanwhile. On the live jobs that is a restart's or a failed
+attempt's full comparison (about 6 of the 8 jobs read something back from the vault at a restart), and a batch check that
+meets an older unchecked copy or a moved or renamed file (its rows are read back through a link): about one a day in the
+Oct 23-26 logs. Listed in Calls to confirm.
 
 **Tests:**
 - The power-loss test the user agreed to: a backup copies a file; a later batch's check reads that copy back while the
