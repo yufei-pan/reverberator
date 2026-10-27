@@ -1,6 +1,7 @@
 import contextlib
 import errno
 import os
+import shutil
 import threading
 import time
 import pytest
@@ -619,3 +620,92 @@ def test_a_folder_watched_twice_is_counted_once(tmp_path):
 		# a folder made while its parent's walk ran is in the walk and raises its create, which watches it again
 		rv.initializeFolderWatchers(inotify_obj, str(tmp_path / 'k'), wdDic, irm, WATCH_FLAGS)
 		assert irm.current_user_watches == len(wdDic) == _kernel_watches(inotify_obj) == 3
+
+
+def test_a_walk_tells_again_what_under_its_folder_is_unwatched(tmp_path, monkeypatch):
+	for rel in ('u/v', 'u/w', 'k'):
+		os.makedirs(tmp_path / rel)
+	root, u, k = str(tmp_path), str(tmp_path / 'u'), str(tmp_path / 'k')
+	real = os.scandir
+	_fail_scandir(monkeypatch, u)
+	irm = rv.inotify_resource_manager()
+	wdDic, unwatched = rv.bidict(), set()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
+		assert unwatched == {u}
+		# u readable again, w not: a walk of u drops what it had and adds back what still fails; k is not walked
+		unwatched.add(k)
+		monkeypatch.setattr(os, 'scandir', real)
+		_fail_scandir(monkeypatch, os.path.join(u, 'w'))
+		rv.initializeFolderWatchers(inotify_obj, u, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
+		assert unwatched == {os.path.join(u, 'w'), k}
+		monkeypatch.setattr(os, 'scandir', real)
+		rv.initializeFolderWatchers(inotify_obj, u, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
+		assert unwatched == {k}
+
+
+def test_read_times_publish_again_once_an_unreadable_folder_is_made_again_and_walked(job, poll_fast, monkeypatch):
+	bad = os.path.join(job.monitor, 'bad')
+	os.makedirs(os.path.join(bad, 'sub'))
+	real = os.scandir
+	_fail_scandir(monkeypatch, bad)
+	to_process = rv.ChangeEventQueue(job.monitor)
+	flag = threading.Event()
+	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=0.2)
+	try:
+		_wait_watch_ready(job, to_process, lock)
+		with lock:
+			assert to_process.read_wall_ns is None
+		monkeypatch.setattr(os, 'scandir', real)
+		shutil.rmtree(bad)
+		os.makedirs(os.path.join(bad, 'sub'))
+		wait_until(lambda: _has_create(to_process, lock, bad), message='no create of bad')
+		_consume_batch(to_process, lock, flag)
+		x = os.path.join(bad, 'sub', 'x.txt')
+		open(x, 'w').write('x')
+		wait_until(lambda: _has_create(to_process, lock, x), message='bad/sub not watched after it was made again')
+		def published():
+			with lock:
+				return to_process.read_wall_ns is not None
+		wait_until(published, timeout=3, message='no read time though nothing is unwatched')
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=2)
+		rv.GREEN_LIGHT.set()
+
+
+def test_a_folder_moved_ahead_of_the_walk_keeps_its_watch_at_its_new_name(job, poll_fast, monkeypatch):
+	m = job.monitor
+	F = os.path.join(m, 'A', 'F')
+	os.makedirs(os.path.join(F, 'sub'))
+	for i in range(6):
+		os.makedirs(os.path.join(m, f'X{i}'))
+	real = rv.inotify_simple.INotify.add_watch
+	watched_paths, moved = set(), []
+	def add_watch(self, path, mask):
+		wd = real(self, path, mask)
+		watched_paths.add(os.path.abspath(path).rstrip('/'))
+		if not moved and os.path.abspath(path).rstrip('/') == F:
+			targets = [os.path.join(m, f'X{i}') for i in range(6) if os.path.join(m, f'X{i}') not in watched_paths]
+			if targets:
+				# mv A/F X/G after F's watch is added and before F is read, into a folder the walk has not reached: no
+				# MOVED_TO comes, reading F fails with ENOENT, and the walk later finds G with F's watch
+				G = os.path.join(targets[0], 'G')
+				os.rename(F, G)
+				moved.append(G)
+		return wd
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'add_watch', add_watch)
+	to_process = rv.ChangeEventQueue(m)
+	flag = threading.Event()
+	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=0.2)
+	try:
+		_wait_watch_ready(job, to_process, lock)
+		assert moved, 'the walk reached every X before A'
+		_consume_batch(to_process, lock, flag)
+		direct = os.path.join(moved[0], 'direct.txt')
+		open(direct, 'w').write('d')
+		wait_until(lambda: _has_create(to_process, lock, direct), timeout=3, message='the moved folder lost its watch')
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=2)
+		rv.GREEN_LIGHT.set()
