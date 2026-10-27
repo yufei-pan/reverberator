@@ -229,6 +229,7 @@ def test_unknown_schema_is_started_over(job):
 
 
 def test_upgraded_database_reads_nothing_from_the_vault(job, monkeypatch):
+	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)   # this test's copies count as old
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	run_backup(job)
 	# the second backup reads the copies back once, so every row is recorded and checked

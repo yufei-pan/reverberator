@@ -1243,6 +1243,11 @@ COMPARE_THREADS = 32
 # from a coarser clock, and chrony has stepped the wall clock by 1-2 s right after boot. a full comparison takes it off
 # its version's time too ( full_comparison_since() )
 VERIFY_CTIME_MARGIN_SECONDS = 10
+# a copy read back from the vault is recorded as checked only once its ctime is this old, and unchecked until then (a
+# power loss can still leave a short copy, which a read now would find in the page cache and call fine): copies older
+# than this are trusted to be on disk. this host writes dirty pages back after 30 s, at 15 s intervals, and ten times
+# that covers a congested writeback
+CHECKED_COPY_AGE_SECONDS = 600
 # the kernel also gives up resolving a path after 40 links
 MAX_CHAINED_LINKS = 40
 # a new version copies a file again from the vault rather than link it through more links than its name's threshold,
@@ -6531,7 +6536,8 @@ class VaultManifest:
 	(no record yet), which it then records. Rows a backup writes are dirty until they are recorded from the new
 	version, before its changes commit. kind is d (folder), f (regular file), o (other file type), l (symlink, its
 	target in link) or r (a referenced backup's link to the monitored file itself). A file copied by a backup stays
-	unchecked until delta generation reads the copy back from the vault, as a crash can keep its bytes from the disk.
+	unchecked until delta generation reads the copy back from the vault once it is CHECKED_COPY_AGE_SECONDS old, as a
+	crash can keep its bytes from the disk.
 	Paths and link targets are stored through storable_name() and read back through stored_name(), so a name that is
 	not UTF-8 is tracked like any other; rows sort by stored path, in which a folder still comes right before the paths
 	under it. copy_version is the number of the version a backup copied a file into (set_copy_version()), kept while
@@ -8080,7 +8086,8 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 	copy_version, for the version the manifest describes, is the number its row gives for the version holding the copy
 	(VaultManifest.copy_version()): the links above that version are followed by their text, whatever the moves say,
 	and the entry there is the end, as chain_end() has it; so an entry this version copied (copy_version its own
-	number) is read as it is, a user's link as the link. Returns None when there is nothing readable there, or a link
+	number) is read as it is, a user's link as the link. A regular file's record is unchecked while the chain end's
+	ctime is within CHECKED_COPY_AGE_SECONDS of now. Returns None when there is nothing readable there, or a link
 	there cannot be looked at (UncheckedVaultLink).
 	'''
 	entry = os.path.abspath(os.path.join(version_path, rel))
@@ -8123,7 +8130,9 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 			return None
 		kind = entry_kind(st.st_mode)
 		file_hash = hash_file(entry, st.st_size) if kind == 'f' else None
-		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 0)
+		# a regular file whose chain end is younger than CHECKED_COPY_AGE_SECONDS may not be on the disk yet
+		young = kind == 'f' and st.st_ctime_ns > time.time_ns() - CHECKED_COPY_AGE_SECONDS * 10 ** 9
+		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 1 if young else 0)
 	except (OSError, UncheckedVaultLink):
 		return None
 

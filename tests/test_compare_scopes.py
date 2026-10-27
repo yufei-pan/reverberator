@@ -79,6 +79,7 @@ def test_trusted_rels_are_not_read_from_the_vault(job, monkeypatch):
 
 
 def test_it_leaves_the_transaction_open(job, monkeypatch):
+	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)   # this test's copies count as old
 	v0, manifest = backed_up(job, {'a.txt': 'a', 'D/x.txt': 'x'})
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
 	before = rows(manifest)
