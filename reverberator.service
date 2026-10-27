@@ -1,7 +1,10 @@
 [Unit]
 Description=Reverberator recursive versioning backup daemon
-After=network-online.target
-Wants=network-online.target
+# Start once the clock is set: read stamps taken under a clock that is later stepped back hide changes from full
+# comparisons. time-sync.target waits for the sync only when the time daemon's wait unit is enabled
+# (chrony-wait.service, systemd-time-wait-sync.service); without it, use the ExecStartPre wait below.
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple
@@ -13,6 +16,10 @@ Group=root
 WorkingDirectory=/opt/reverberator
 ExecStart=/usr/bin/env python3 /opt/reverberator/reverberator.py /etc/reverberator/reverb_rule.tsv
 
+# With chrony and no wait unit enabled: wait up to ~5 min for the sync, then start anyway (add chrony.service to
+# After= so chronyd is up first; the start timeout must cover the wait).
+#ExecStartPre=-/usr/bin/chronyc waitsync 30 0.1
+#TimeoutStartSec=360
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=5
