@@ -3977,6 +3977,9 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	full_comparison = False
 	# whether the batch is one handed back or resumed, whose events are only its collapsed entries
 	round_tripped = False
+	# the wall clock time at which the watcher began its latest read whose events were all queued before the batch was
+	# taken ( ChangeEventQueue.read_wall_ns ): every change made before it is in this batch or an earlier one
+	batch_read_ns = None
 	def batch_scopes(batch):
 		scopes = touched_scopes(batch, monitor_path)
 		return scopes if scopes.subtrees or scopes.paths else None
@@ -4064,6 +4067,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
 				touched = batch_scopes(to_process_temp)
 				round_tripped = to_process_temp.round_tripped
+				batch_read_ns = to_process_temp.read_wall_ns
 				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 		vaultInfo = None
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
@@ -4098,10 +4102,14 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				# events collapsed to no entry
 				full_comparison = full_comparison or (not backupEntries and touched is None)
 			if backupEntries or full_comparison or touched is not None:
+				# from when the attempt sees the whole tree: a full comparison's walk sees every change made before it
+				# begins; a fresh batch holds every change made before its read time. a batch handed back or resumed
+				# lost its raw events, and the watcher's read time says nothing of them
+				matched_since = time.time_ns() if full_comparison else None if round_tripped else batch_read_ns
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
-					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard)
+					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since)
 				if not committed:
 					# the batch goes back to the queue on the way out
 					if GREEN_LIGHT.is_set():
@@ -4127,6 +4135,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			# a stop before it runs saves it as a full scan request, as any full comparison
 			full_comparison = follow_up
 			round_tripped = False
+			batch_read_ns = None
 			# a batch whose events collapsed to no entry is backed up too, as what they touched can differ from the vault
 			while not backupEntries and not full_comparison and not scan_folders and touched is None and running():
 				while running() and not to_process_flag.is_set():
@@ -4153,6 +4162,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
 					touched = batch_scopes(to_process_temp)
 					round_tripped = to_process_temp.round_tripped
+					batch_read_ns = to_process_temp.read_wall_ns
 					backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 			if log_journal:
 				journalPath = os.path.join(vault_path,job_name,'journal.tsv')
@@ -4707,7 +4717,7 @@ def do_backup(backup_entries:dict,
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
 			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,
-			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None):
+			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
 	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
 	# reported: the unreadable paths already logged for this batch, so each is logged once
@@ -4718,6 +4728,9 @@ def do_backup(backup_entries:dict,
 	# pool_guard: the mergerfs pools of vault_path and monitor_path as they were when the batch began ( taken here when
 	# None ). its poll stops the copies once a disk of one drops, and nothing is committed unless both are whole and
 	# never mounted again since: PoolNotReady fails the attempt
+	# matched_since: the wall clock time, in ns, from which this attempt sees the whole tree ( a full comparison, or a fresh
+	# batch's read time ), None when it does not. the commit records it as the vault's matched time ( VaultManifest.matched )
+	# only when no inner mount was paused and nothing was logged unreadable; else it carries the old time forward
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -4779,6 +4792,7 @@ def do_backup(backup_entries:dict,
 			this_version_number = 0
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V0--{this_timestamp}')
+			latest_version_info = None
 			if not make_version_folder(job_name,backup_folder):
 				return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 			manifest.begin()
@@ -4836,7 +4850,7 @@ def do_backup(backup_entries:dict,
 					# tree: what they touched is compared, and what differs is replayed and verified as a batch is
 					backuperTeeLogToTl(job_name,'The batch collapsed to no backup entries, comparing the places it touched with the vault')
 				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported,
-					scope_rel='' if touched is None else touched,paused=paused,pool_guard=pool_guard,changed_since_wall=full_comparison_since(vault_info_dict))
+					scope_rel='' if touched is None else touched,paused=paused,pool_guard=pool_guard,changed_since_wall=full_comparison_since(vault_info_dict,manifest.matched))
 				if not GREEN_LIGHT.is_set():
 					# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
 					backup_entries.clear()
@@ -4861,6 +4875,7 @@ def do_backup(backup_entries:dict,
 				manifest.begin()
 				manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 				manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
+				manifest.record_matched(latest_version_info.path,matched_since if not paused and not reported else None,latest_version_info.path)
 				manifest.commit()
 				if vaultInfo is None:
 					vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
@@ -4995,6 +5010,9 @@ def do_backup(backup_entries:dict,
 		# private folder as they are: nothing is written while a disk may be out (a link or a list could land in its
 		# empty folder on the root disk, and be hidden once it is back), and the job's next scan, once every disk is
 		# there, removes the version as the orphan at the link + 1, or as a commit cut off before its list was placed
+		# the paused inner mounts as the verification left them
+		manifest.record_matched(backup_folder,matched_since if not paused and not reported else None,
+			None if latest_version_info is None else latest_version_info.path)
 		manifest.commit(backup_folder)
 		swap_current_version(job_vault,os.path.basename(backup_folder))
 		# the link and the list may sit on different disks of a pool: the link is on its disk before the list is placed.
@@ -6734,6 +6752,34 @@ class VaultManifest:
 	def set_inner_mounts(self, rels:list):
 		'''Record the inner mount points (folder rels ending with /); the caller holds the transaction.'''
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('inner_mounts', ?)", (json.dumps([storable_name(rel) for rel in rels]),))
+
+	# matched, JSON [version folder name, wall clock ns]: from when the vault is known to match the whole tree, as that
+	# version holds it ( full_comparison_since() ). written only by do_backup()'s commits, in their transaction, never by
+	# the commit delta_generate_backup_entries() makes of what it read
+	@property
+	def matched(self) -> tuple:
+		'''(version folder name, wall clock ns) the matched key records, or None when it is absent or does not parse.'''
+		row = self.conn.execute("SELECT value FROM meta WHERE key = 'matched'").fetchone()
+		try:
+			name, since = json.loads(row[0])
+		except (TypeError, ValueError):
+			return None
+		if not isinstance(name, str) or not isinstance(since, int) or isinstance(since, bool):
+			return None
+		return name, since
+
+	def record_matched(self, version_path:str, since:int = None, base_path:str = None):
+		'''
+		Record that the vault matches the whole tree from since (wall clock ns) on, as version_path holds it. With no
+		since, the time recorded for base_path, the version version_path builds on, is carried over to version_path;
+		nothing is written when the key names another version or there is none. The caller holds the transaction.
+		'''
+		if since is None:
+			recorded = self.matched
+			if base_path is None or recorded is None or recorded[0] != os.path.basename(os.path.normpath(base_path)):
+				return
+			since = recorded[1]
+		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('matched', ?)", (json.dumps([os.path.basename(os.path.normpath(version_path)), since]),))
 
 	@property
 	def monitor_paths(self) -> list:
@@ -8719,24 +8765,31 @@ def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_
 	removed.append(rel)
 	return []
 
-def full_comparison_since(vault_info_dict:OrderedDict) -> int:
+def full_comparison_since(vault_info_dict:OrderedDict, matched:tuple = None) -> int:
 	'''
 	The wall clock time, in ns, from which a full comparison with the newest of the committed versions vault_info_dict
 	lists also compares an entry's extended attributes (by its ctime, VERIFY_CTIME_MARGIN_SECONDS to spare): an xattr-only
 	change made while nothing watched (the daemon down or starting, events lost in an overflow) is then backed up. That
-	is the time the version before the newest was made, when one is kept, as the newest one's batch was taken after that
-	version was committed, and its folder is named only after its comparison and pruning; else the newest one's own.
-	Entries whose ctime is older cost one comparison of numbers each. None with no version.
+	is the time of matched (VaultManifest.matched: from when the vault matched the whole tree) when it names the newest
+	version's folder. Else (no key, one from before 0.46, or one naming a version the scan rolled back) it is the time the
+	version before the newest was made, when one is kept, as the newest one's batch was taken after that version was
+	committed, and its folder is named only after its comparison and pruning; else the newest one's own. Entries whose
+	ctime is older cost one comparison of numbers each. None with no version.
 
 	Examples:
-		>>> full_comparison_since(OrderedDict([(4, VaultEntry(4, '/v/V4', 100.0, 0, 0)), (5, VaultEntry(5, '/v/V5', 200.0, 0, 0))]))
+		>>> versions = OrderedDict([(4, VaultEntry(4, '/v/V4', 100.0, 0, 0)), (5, VaultEntry(5, '/v/V5', 200.0, 0, 0))])
+		>>> full_comparison_since(versions)
 		100000000000
+		>>> full_comparison_since(versions, ('V5', 150 * 10 ** 9)), full_comparison_since(versions, ('V4', 150 * 10 ** 9))
+		(150000000000, 100000000000)
 		>>> full_comparison_since(OrderedDict([(0, VaultEntry(0, '/v/V0', '1970-01-01_00-00-05_+0000', 0, 0))]))
 		5000000000
 	'''
 	versions = list(vault_info_dict.values())[-2:]
 	if not versions:
 		return None
+	if matched is not None and matched[0] == os.path.basename(os.path.normpath(versions[-1].path)):
+		return matched[1]
 	timestamp = versions[0].timestamp
 	if isinstance(timestamp, str):
 		# a version this daemon committed keeps its folder's text
