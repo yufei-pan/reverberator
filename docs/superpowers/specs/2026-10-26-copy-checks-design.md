@@ -31,49 +31,49 @@ comparison runs at every restart, so after a power loss the restart reads back e
 batch's check, or a restart within seconds, can read a copy back from the page cache and record it checked before its
 bytes reach the disk; a power loss then leaves a short copy that nothing reads back again.
 
-**Rule:** a record read back from the vault for a regular file is stored as checked only when the copy it read (the
-chain end) last changed at least `CHECKED_COPY_AGE_SECONDS` = 600 ago, by its `st_ctime`. A younger copy is stored
-unchecked (the record read is still stored, so the row is no longer unverified), and a later read-back records it
-checked once it is old enough. Nothing is flushed: no fsync on the write path or the read path.
+**Rule (revised 2026-10-27 night, after Task 1's review; see the call below):** a comparison stores a regular file's
+read-back as checked only after a successful sync of the vault's filesystems made in that comparison. Before storing its
+first such record, the comparison syncs once: `syncfs` (through ctypes; Python has no `os.syncfs`) on each mergerfs
+branch that holds the job vault, found as round 9's per-branch flush finds them, or on the vault's own filesystem when it
+is on no pool. If any sync fails or cannot be made, every file record that comparison stores is kept unchecked (the record
+read is still stored, so the row is no longer unverified), and a later comparison tries again; the failure is logged once
+per comparison as a warning. A comparison that stores no checked file record makes no sync: most batches' checks, whose
+fresh copies stay unchecked (`read_copied_record()`, `read_version_record(fresh=True)`). Nothing is flushed on the write
+path.
 
-- Why 600 s: this host writes dirty pages back after 30 s (`vm.dirty_expire_centisecs` 3000) at 15 s intervals
-  (`vm.dirty_writeback_centisecs` 1500); ten times that covers a congested writeback. Copies older than that are trusted
-  to be on disk, as they are today.
-- A copy whose ctime moves later only waits again, never less safe: a prune hard-links nearly every chain end, so the
-  wait renews at each prune (negligible on the live jobs, which version at most hourly).
-- The rule applies wherever a read-back is stored as checked: compare_entry's unchecked and unverified branches and any
-  other caller that stores `read_vault_record()`'s file record with `unchecked = 0`. Records of copies the backup just
-  made already stay unchecked (`read_copied_record()`, `read_version_record(fresh=True)`).
-- Mismatch handling is unchanged: a copy whose read-back does not match its record is copied again, young or old.
+- Why it is enough: `syncfs` returns only once every dirty page of that filesystem is written, so every copy read back in
+  the comparison (all made before it) is on disk once it succeeds; and it returns a writeback error the filesystem met
+  since and never reported (errseq), so an isolated data-write error keeps the copy unchecked instead of trusting the page
+  cache.
+- The sync sits where the records are stored (`compare_scopes`' settling, the caller's thread), not in
+  `read_vault_record()`, which runs on the compare pool; the read-backs themselves are unchanged.
+- Mismatch handling is unchanged: a copy whose read-back does not match its record is copied again.
 
-**My call against the agreed words:** the user agreed to "flush a copy just before it is marked checked". Leaving a young
-copy unchecked instead adds no flush, which is what the user's words weigh ("compare to cossting every single write"): an
-fsync of a clean XFS file still issues a device cache flush, and a restart's full comparison checks every copy made since
-the previous one, so the agreed route would pay tens of thousands of flushes after a week of backups. Its own cost: every
-comparison inside the window reads each young copy back again (warm, from the page cache: about 1.6 s per 20K copies
-locally, more through mergerfs), and the copy is read once more at the first comparison after the window, usually cold
-(about 360 reads/s on the work job's vault, so ~9 min for a 190K-file batch). What it gives up: the agreed route relies
-on nothing, while this one relies on the kernel writing dirty data back within 600 s (true here; not on a host tuned to
-hold dirty data longer, or a slow network vault), on the wall clock not stepping forward by minutes, and on writeback not
-failing silently: a data-writeback I/O error waits for the next fsync, which never comes, and does not shut XFS down
-(only log and metadata write errors do), so after an isolated data-write error a read-back from the page cache once the
-copy is 10 min old records checked a copy whose bytes never reached the disk; the fsync route would have caught it. A
-disk that drops out fails its log writes within seconds and does shut XFS down, which round 9's pool check pauses on.
-The README says so in one line. Listed in Calls to confirm.
+**My call, back to the agreed words:** the user agreed to "flush a copy just before it is marked checked", weighing the
+cost of "every single write". Task 1 first built an age rule instead (a copy younger than 600 s by its ctime stays
+unchecked, nothing flushed). Its review showed that route relies on the kernel's writeback timing and the clock, misses
+an isolated data-writeback I/O error (which does not shut XFS down; only log and metadata errors do), and re-reads young
+copies at every comparison inside the window. One `syncfs` per comparison that marks copies checked is the agreed flush,
+at one flush per comparison instead of one per copy (an fsync of a clean XFS file still issues a device cache flush, so a
+per-copy flush would pay tens of thousands after a week of backups), and it needs no age, no clock and no window. Its
+cost: a comparison that checks copies waits until the vault disks' dirty data, other writers' included, is written,
+which writeback would do within ~45 s anyway; on the live jobs that is a restart's or a failed attempt's full comparison,
+and the rare batch check that meets an older unchecked copy. Listed in Calls to confirm.
 
-- The check sits in `read_vault_record()`, which already holds the chain end's `st`; `compare_entry`'s branches (through
-  `compare_scopes`' `set_records`) are the only path by which a checked file record is stored, and `record_dirty_entries`
-  stores `read_copied_record()`'s, which stays unchecked.
-
-**Tests** (ctime cannot be set back from userspace: patch the constant or the clock):
-- The power-loss test the user agreed to, made to exercise this round's fix: a backup copies a file; a later batch's
-  check reads that young copy back (on 0.45 this records it checked; now it stays unchecked); the copy is then lost as a
-  failed writeback leaves it, (a) truncated to a shorter or empty file, and (b) its bytes replaced with zeros of the same
-  length and its mtime set back; a restart's full comparison logs that the copy does not match its record and copies it
-  again, and the new version restores the right bytes. On 0.45 case (b) after the later batch's read-back is not caught.
-- A copy read back while younger than the window stays unchecked; the same read-back once it is older records it checked.
-- A restart's full comparison right after a backup leaves that backup's copies unchecked; one after the window records
-  them checked.
+**Tests:**
+- The power-loss test the user agreed to: a backup copies a file; a later batch's check reads that copy back while the
+  vault sync fails (patched), so it stays unchecked (0.45 recorded it checked from the page cache); the copy is then lost
+  as a failed writeback leaves it, (a) truncated to a shorter or empty file, and (b) its bytes replaced with zeros of the
+  same length and its mtime set back; a restart's full comparison logs that the copy does not match its record and copies
+  it again, and the new version restores the right bytes. On 0.45, both cases after the later batch's read-back are not
+  caught.
+- A comparison that reads back an unchecked copy syncs exactly once before storing it, and stores it checked when the
+  sync succeeds; a comparison with many such copies still syncs once.
+- When the sync fails, every file record of that comparison stays unchecked, one warning is logged, and the next
+  comparison syncs again and records them checked.
+- A batch check that stores no checked file record makes no sync.
+- The real helper on the test's filesystem succeeds (no patch), and on a fake pool it syncs each branch that holds the
+  job vault.
 
 ## Goal 2: a full comparison's xattr bound is the time the vault last matched the tree
 
@@ -160,15 +160,15 @@ resumed pending batch counts as round-tripped, so the follow-up full comparison 
   "Full comparisons read every changed entry's xattrs since the previous version", "A file moved into a folder made in
   the same batch shows at its old place too"); the mmap entry stays until the user decides. README: remove the phantom's
   known-limits line; rewrite line 12's statement of today's bound ("since the version before the latest was made") to the
-  matched time; line 7's "checked like any other copy at the next comparison" gains "once 10 min old"; one line says
-  copies are trusted once 10 min old, assuming the kernel writes dirty data back within that.
+  matched time; one line says a copy is recorded checked only after the comparison that reads it back has synced
+  the vault's disks (syncfs, once per comparison), and that a failed sync keeps it unchecked.
 
 ## Non-goals
 
 - mmap writes (researched separately; the user decides).
 - Any change to the change-list, pending-batch or history formats. The new meta key is an addition the older daemon
   ignores.
-- Flushing copies, folders or the vault on the write path.
+- Flushing copies, folders or the vault on the write path, or once per copy.
 
 ## Constraints
 
