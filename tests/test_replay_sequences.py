@@ -22,7 +22,7 @@ def _fast(poll_fast, monkeypatch):
 class Watch:
 	'''The real watchFolder on the monitored tree, its queue taken batch by batch as the backuper takes it.'''
 
-	def __init__(self, job):
+	def __init__(self, job, min_snapshot_delay_seconds=0):
 		self.job = job
 		self.queue = rv.ChangeEventQueue(job.monitor)
 		self.lock = threading.Lock()
@@ -31,7 +31,7 @@ class Watch:
 		self.control = rv.JobControl(job.job_name)
 		self.control.start_attempt()
 		self.thread = threading.Thread(target=rv.watchFolder, kwargs=dict(monitor_path=job.monitor, to_process=self.queue,
-			to_process_lock=self.lock, to_process_flag=self.flag, irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=0,
+			to_process_lock=self.lock, to_process_flag=self.flag, irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=min_snapshot_delay_seconds,
 			max_shapshot_delay_seconds=60, job=self.control), daemon=True)
 		self.thread.start()
 		probe = os.path.join(job.monitor, '.watch_ready')
@@ -85,10 +85,10 @@ def backup_batch(backuper, job, batch):
 	return rv.list_versions(job.job_vault)[-1]
 
 
-def start(tmp_path, before):
+def start(tmp_path, before, min_snapshot_delay_seconds=0):
 	'''
-	V0 of before, the job's backuper and the real watcher on the monitored tree. Returns (job, the folder outside it,
-	the watcher, the backuper).
+	V0 of before, the job's backuper and the real watcher on the monitored tree, quiet after min_snapshot_delay_seconds.
+	Returns (job, the folder outside it, the watcher, the backuper).
 	'''
 	job = create_job(str(tmp_path))
 	outside = os.path.join(job.root, 'outside')
@@ -97,7 +97,7 @@ def start(tmp_path, before):
 	run_backup(job)
 	backuper = RunningBackuper(job)
 	try:
-		return job, outside, Watch(job), backuper
+		return job, outside, Watch(job, min_snapshot_delay_seconds), backuper
 	except BaseException:
 		backuper.stop()
 		raise
@@ -291,9 +291,9 @@ def test_sequence_git_pattern_removes_the_ref(tmp_path):
 
 
 def test_sequence_late_delete(tmp_path):
-	# mv D/old.txt <outside>; mv D D2: the watcher holds the move out of the tree until it expires, so its delete reaches
-	# a later batch than D's rename
-	job, outside, watch, backuper = start(tmp_path, BASE)
+	# mv D/old.txt <outside>; mv D D2: the watcher holds the move out of the tree until the tree is quiet, so a batch taken
+	# before then, as at the max-delay hand-over, has D's rename and a later batch the delete
+	job, outside, watch, backuper = start(tmp_path, BASE, min_snapshot_delay_seconds=2)
 	try:
 		try:
 			os.rename(mon(job, 'D/old.txt'), os.path.join(outside, 'old.txt'))

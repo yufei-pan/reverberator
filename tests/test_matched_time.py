@@ -285,3 +285,12 @@ def test_an_xattr_set_while_down_reaches_the_follow_up_version(job, monkeypatch)
 	finally:
 		stop_backuper(thread)
 	assert os.getxattr(os.path.join(v2, 'b.txt'), 'user.down') == b'1'
+
+
+def test_a_move_out_pending_at_a_max_delay_hand_over_still_pairs(job, monkeypatch):
+	flags = rv.inotify_simple.flags
+	reads = [[(flags.CREATE, 'f', 0)], [(flags.MOVED_FROM, 'a', 7)], [(flags.MOVED_TO, 'b', 7)]]
+	queue, flag, _ = scripted_watch(monkeypatch, job.monitor, reads, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=0)
+	assert flag.is_set()
+	m = job.monitor
+	assert [(e.event, e.path, e.moved_from) for e in queue] == [('create', f'{m}/f', None), ('move', f'{m}/b', f'{m}/a')]
