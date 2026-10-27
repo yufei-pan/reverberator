@@ -38,6 +38,7 @@ def test_backup_records_what_the_new_version_holds(job):
 
 
 def test_cold_start_reads_each_copy_back_once_then_only_the_monitored_side(job, monkeypatch):
+	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)   # this test's copies count as old
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	run_backup(job)
 	reads = count_vault_reads(monkeypatch)
@@ -46,6 +47,52 @@ def test_cold_start_reads_each_copy_back_once_then_only_the_monitored_side(job, 
 	reads.clear()
 	assert len(run_backup(job)) == 1
 	assert reads == []
+
+
+def test_a_young_copy_reads_back_unchecked_and_an_old_one_checked(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'hello', 'sub/': None})
+	v0 = run_backup(job)[0]
+	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 600)
+	assert rv.read_vault_record(v0, 'a.txt', job.monitor).unchecked == 1
+	assert rv.read_vault_record(v0, 'sub/', job.monitor).unchecked == 0
+	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)
+	assert rv.read_vault_record(v0, 'a.txt', job.monitor).unchecked == 0
+
+
+def test_a_full_comparison_checks_copies_only_once_they_are_old(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'hello'})
+	run_backup(job)
+	run_backup(job)                                   # the restart's full comparison right after the backup
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.lookup('a.txt').unchecked == 1
+	manifest.close()
+	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)
+	run_backup(job)                                   # one after the window
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.lookup('a.txt').unchecked == 0
+	manifest.close()
+
+
+@pytest.mark.parametrize('loss', ['truncated', 'zeroed'])
+def test_a_copy_lost_after_a_batch_read_it_back_is_copied_again(job, monkeypatch, loss):
+	# the power-loss test: a later batch's check reads the young copy back (0.45 recorded it checked), then a failed
+	# writeback leaves the copy short or zeroed, and the restart's full comparison must still catch it
+	seed_monitor(job, {'a.txt': 'hello world'})
+	copy = os.path.join(run_backup(job)[0], 'a.txt')
+	run_backup(job, OrderedDict(), touched=rv.TouchedScopes(['a.txt/'], ['a.txt'], None, None))
+	st = os.lstat(copy)
+	if loss == 'truncated':
+		os.truncate(copy, 3)
+	else:
+		with open(copy, 'r+b') as f:
+			f.write(b'\0' * st.st_size)
+		os.utime(copy, ns=(st.st_atime_ns, st.st_mtime_ns))
+	lines = []
+	real = rv.backuperTeeLogToTl
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda path, message, **kw: lines.append(message) or real(path, message, **kw))
+	versions = run_backup(job)
+	assert any('does not match its record, copying again' in line for line in lines)
+	assert open(os.path.join(versions[-1], 'a.txt')).read() == 'hello world'
 
 
 def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
@@ -62,6 +109,7 @@ def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
 
 
 def test_content_rewritten_keeping_size_and_mtime_is_modify_without_reading_the_vault(job, monkeypatch):
+	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)   # this test's copies count as old
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
 	run_backup(job)

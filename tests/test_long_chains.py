@@ -230,7 +230,8 @@ def test_recopy_at_its_own_threshold(job):
 		assert f.read() == 'kept'
 
 
-def test_recopy_comes_from_the_vault(job):
+def test_recopy_comes_from_the_vault(job, monkeypatch):
+	monkeypatch.setattr(rv, 'CHECKED_COPY_AGE_SECONDS', 0)   # this test's copies count as old
 	name = name_with_threshold(32)
 	seed_monitor(job, {name: 'backed up', 'c.txt': 'c'})
 	live = os.path.join(job.monitor, name)
