@@ -149,8 +149,10 @@ and from moves out of the tree as well as into new folders. So, as the user agre
 compares paths whose move-out is still waiting for its pair"): the watcher keeps the set of paths whose move-out it holds
 on the queue (under its lock, updated wherever a move-out is added or popped), `take()` carries it into the batch, and the
 batch's touched scopes include those paths. The check after the batch then finds such a path gone from the tree and
-removes it from the version, whichever hand-over took the batch; the move-out's later delete is then a no-op, and a pair
-that still came (none can, after a read) would be a move from a path the version lacks, which falls back to a copy. The
+removes it from the version, whichever hand-over took the batch; the move-out's later delete is then a no-op. A pair can
+straddle one read boundary (or a take mid-read), so a move-out is carried only once a whole read has passed since it was
+read (at an empty read, every held one): a rename split by a take stays a move in the next batch (revised after Task 4's
+fix-round review). The
 quiet rule stays: it makes the replay itself right on short delays. Tests: at a max-delay hand-over with a move-out
 pending, the batch's version lacks the moved path; a folder moved out of the tree while the tree is busy is gone from that
 version; a move-out popped by a create at its source is not compared as pending.
