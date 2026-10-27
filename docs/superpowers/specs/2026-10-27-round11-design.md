@@ -1,7 +1,7 @@
-# Round 11: mmap, a remembered sync failure, a chain length per job, rewrites made while down, no empty versions
+# Round 11: mmap, a remembered sync failure, a chain length per job, no empty versions
 
-Version 0.47. The five items the user deferred to round 11 on 2026-10-27 (docs/limitations.md), with the mechanisms the
-user chose.
+Version 0.47. Four of the five items the user deferred to round 11 on 2026-10-27 (docs/limitations.md), with the
+mechanisms the user chose; the fifth (Goal 4) was dropped by the user and becomes a known limitation.
 
 ## The user's words
 
