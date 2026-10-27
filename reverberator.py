@@ -2480,6 +2480,16 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			if cookie_value is not None and cookie_value.wds:
 				remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
 			append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
+	def expire_move_out(cookie):
+		if DEBUG:
+			watcherTeeLogToTl(monitor_path,f'Adding expired unmatched move_from as delete for cookie {cookie}')
+		# also drop the cookie so a late MOVED_TO is treated as a create instead of a move from a deleted source
+		cookie_value = cookieDic.pop(cookie,None)
+		if cookie_value is not None and cookie_value.wds:
+			# the folder left for a place with no watch (out of the tree, or into a skipped folder) and took its
+			# watches along: they would report its new contents under the old path. gone before its delete is queued
+			remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
+		append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	newDirWDs = set()
 	processPending = False
 	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
@@ -2529,20 +2539,19 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			now = time.monotonic()
 			expired_move_cookies = [cookie for cookie, change_event in pendingMoveFromEvents.items() if now - change_event.monotonic_time > move_pair_timeout]
 			for cookie in expired_move_cookies:
-				if DEBUG:
-					watcherTeeLogToTl(monitor_path,f'Adding expired unmatched move_from as delete for cookie {cookie}')
-				# also drop the cookie so a late MOVED_TO is treated as a create instead of a move from a deleted source
-				cookie_value = cookieDic.pop(cookie,None)
-				if cookie_value is not None and cookie_value.wds:
-					# the folder left for a place with no watch (out of the tree, or into a skipped folder) and took its
-					# watches along: they would report its new contents under the old path. gone before its delete is queued
-					remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
-				append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
+				expire_move_out(cookie)
 			if not events:
+				quiet = time.monotonic() - lastReadTime > min_snapshot_delay_seconds
+				if quiet:
+					# a rename queues its move-in right after its move-out, so once a read finds the tree quiet no pair is
+					# still coming: no grace is needed. each move-out still held is its delete now, in this batch, even
+					# one signalled and not taken yet, rather than a phantom at its old place until the pair timeout
+					for cookie in list(pendingMoveFromEvents):
+						expire_move_out(cookie)
 				# nothing more is pending from this read, so its time is the batch's matched time
 				with to_process_lock:
 					to_process.read_wall_ns = read_began
-				if to_process and not to_process_flag.is_set() and time.monotonic() - lastReadTime > min_snapshot_delay_seconds:
+				if quiet and to_process and not to_process_flag.is_set():
 					watcherTeeLogToTl(monitor_path,'Timeout elapsed, signaling backuper to process')
 					to_process_flag.set()
 					processPending = True
