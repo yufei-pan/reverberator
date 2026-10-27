@@ -28,7 +28,7 @@ def _consume_batch(to_process, lock, to_process_flag):
 	'''Drain to_process then clear the flag, same order as backuper.'''
 	wait_until(to_process_flag.is_set, message='watcher did not signal process')
 	with lock:
-		to_process.clear()
+		to_process.take()
 	to_process_flag.clear()
 
 
@@ -152,6 +152,57 @@ def _has_create(to_process, lock, path):
 	return any(e.event == 'create' and e.path.rstrip('/') == path for e in _events(to_process, lock))
 
 
+def test_new_dir_events_recorded_after_an_unsignalled_take(job, poll_fast):
+	# the backuper's startup take sets no flag and clears none
+	to_process = rv.ChangeEventQueue(job.monitor)
+	flag = threading.Event()
+	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=86400)
+	try:
+		_wait_watch_ready(job, to_process, lock)
+		dpath = os.path.join(job.monitor, 'd')
+		os.mkdir(dpath)
+		wait_until(lambda: _has_create(to_process, lock, dpath), message='mkdir d not seen')
+		with lock:
+			to_process.take()
+		child = os.path.join(dpath, 'f.txt')
+		open(child, 'w').write('f')
+		wait_until(lambda: _has_create(to_process, lock, child), message='file in new dir lost after an unsignalled take')
+		assert not flag.is_set()
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=2)
+		rv.GREEN_LIGHT.set()
+
+
+def test_a_watcher_started_with_the_flag_set_records_new_dir_events_after_the_next_take(job, poll_fast):
+	# a restarted watcher finds its predecessor's signal still set: the batch is not taken yet
+	to_process = rv.ChangeEventQueue(job.monitor)
+	flag = threading.Event()
+	flag.set()
+	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=0, max_shapshot_delay_seconds=0)
+	try:
+		_wait_watch_ready(job, to_process, lock)
+		dpath = os.path.join(job.monitor, 'd')
+		os.mkdir(dpath)
+		wait_until(lambda: _has_create(to_process, lock, dpath), message='mkdir d not seen')
+		before = os.path.join(dpath, 'a.txt')
+		open(before, 'w').write('a')
+		marker = os.path.join(job.monitor, 'marker.txt')
+		open(marker, 'w').write('m')
+		wait_until(lambda: _has_create(to_process, lock, marker), message='marker not seen')
+		# the batch's recursive copy of d holds a.txt
+		assert not _has_create(to_process, lock, before)
+		with lock:
+			to_process.take()
+		after = os.path.join(dpath, 'b.txt')
+		open(after, 'w').write('b')
+		wait_until(lambda: _has_create(to_process, lock, after), message='file in new dir lost after the next take')
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=2)
+		rv.GREEN_LIGHT.set()
+
+
 def test_subdir_created_inside_new_dir_before_batch_is_watched(job, poll_fast):
 	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
@@ -219,7 +270,7 @@ def test_new_dir_events_recorded_after_batch_taken_when_max_delay_rearms(job, po
 		# the backuper takes the batch holding d's recursive copy while the watcher is still
 		# appending other events, so the watcher's next pass finds work queued and the flag clear
 		with lock:
-			to_process.clear()
+			to_process.take()
 		busy = os.path.join(job.monitor, 'busy.txt')
 		open(busy, 'w').write('b')
 		wait_until(lambda: _has_create(to_process, lock, busy), message='busy create not seen')
