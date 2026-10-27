@@ -266,6 +266,9 @@ class ChangeEventQueue:
 		({'/m/gone'}, {'/m/gone'})
 		>>> queue.takes
 		4
+		>>> queue.clear()
+		>>> queue.takes
+		4
 	'''
 	def __init__(self, monitor_path:str = ''):
 		self.monitor_path = monitor_path
@@ -2508,6 +2511,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
 		append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	newDirWDs = set()
+	# the folders that exist and that this watcher should watch but does not (unreadable, or their watch failed): no event
+	# reports a change in them, so while it holds one, for its whole life, it publishes no read time
+	unwatched = set()
 	# the takes this watcher knows of: one made before it started says nothing of the folders it creates
 	with to_process_lock:
 		seen_takes = to_process.takes
@@ -2525,7 +2531,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	irm.increaseUserInstances()
 	with irm, inotify_simple.INotify() as inotify_obj, FS_SIGNATURE_MONITOR.subscription(store_mount_table):
 		job_name = None if job is None else job.job_name
-		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name)
+		mainWatchDescriptor = initializeFolderWatchers(inotify_obj,monitor_path,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
 		if mainWatchDescriptor == -1:
 			watcherTeeLogToTl(monitor_path,f'Failed to initialize folder watchers for {monitor_path}',error=True)
 			return WATCH_RESULT_INIT_FAILED
@@ -2556,7 +2562,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				lastProcessTime = time.monotonic()
 			with mount_table_lock:
 				mount_table, latest_mount_table[0] = latest_mount_table[0], None
-			if mount_table is not None and follow_inner_mounts(inotify_obj,monitor_path,mount_table,inner_mounts,wdDic,irm,watch_flags,to_process,to_process_lock,skip_list,job_name):
+			if mount_table is not None and follow_inner_mounts(inotify_obj,monitor_path,mount_table,inner_mounts,wdDic,irm,watch_flags,to_process,to_process_lock,skip_list,job_name,unwatched):
 				# like an event, so the backuper waits for the tree to settle before comparing the folders
 				lastReadTime = time.monotonic()
 			now = time.monotonic()
@@ -2571,10 +2577,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					# one signalled and not taken yet, rather than a phantom at its old place until the pair timeout
 					for cookie in list(pendingMoveFromEvents):
 						expire_move_out(cookie)
-				# nothing more is pending from this read, so its time is the batch's matched time, and no pair is still
-				# coming for a move-out held now
+				# nothing more is pending from this read, so its time is the batch's matched time (none while a folder is
+				# unwatched), and no pair is still coming for a move-out held now
 				with to_process_lock:
-					to_process.read_wall_ns = read_began
+					to_process.read_wall_ns = None if unwatched else read_began
 					to_process.pending_move_outs = set(pendingMoveFromPaths)
 				if quiet and to_process and not to_process_flag.is_set():
 					watcherTeeLogToTl(monitor_path,'Timeout elapsed, signaling backuper to process')
@@ -2641,7 +2647,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					if isDir and not skipped and event.mask & (flags.CREATE | flags.MOVED_TO):
 						# the recursive copy holds this folder, but it still needs watches for later changes,
 						# and a folder moved in keeps its watches under its old path until they are added again here
-						initializeFolderWatchers(inotify_obj,os.path.join(wdDic[event.wd],event.name),wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name)
+						initializeFolderWatchers(inotify_obj,os.path.join(wdDic[event.wd],event.name),wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
 					if isDir and event.mask & flags.MOVED_TO and event.cookie in cookieDic:
 						# the source stays in cookieDic so it still expires into its delete; its old-path watches are stale now
 						remove_watches_under(inotify_obj,wdDic,irm,cookieDic[event.cookie].path)
@@ -2655,7 +2661,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						watcherTeeLogToTl(monitor_path,f'Create event detected for {eventPath}')
 					queue_pending_move_from_at(eventPath,monTime)
 					if isDir:
-						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name)
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.DELETE:
 					if DEBUG:
@@ -2731,14 +2737,14 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 									watcherTeeLogToTl(monitor_path,f'Updating wdDic entry {wd}: {wd_path} -> {new_wd_path}')
 								wdDic[wd] = new_wd_path
 							if skip_list is not None and skip_list.location_dependent:
-								rewatch_moved_folder(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list)
+								rewatch_moved_folder(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list,unwatched)
 					else:
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Cookie not found for {event.cookie}')
 							watcherTeeLogToTl(monitor_path,f'Treating move as create event for {eventPath}')
 						queue_pending_move_from_at(eventPath,monTime)
 						if isDir:
-							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name)
+							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.MODIFY:
 					if DEBUG:
@@ -2749,9 +2755,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			# a pair can straddle one read boundary: a move-out read in this read may still pair in the next one, so only
 			# those held since an earlier read are carried (a batch carrying one whose move then came would lose it)
 			unpaired = {path for path, cookies in pendingMoveFromPaths.items() if any(pendingMoveFromEvents[cookie].monotonic_time < monTime for cookie in cookies)}
-			# every event of this read is queued: a batch taken from now on may claim the vault matched the tree as of read_began
+			# every event of this read is queued: a batch taken from now on may claim the vault matched the tree as of read_began,
+			# unless a folder is unwatched
 			with to_process_lock:
-				to_process.read_wall_ns = read_began
+				to_process.read_wall_ns = None if unwatched else read_began
 				to_process.pending_move_outs = unpaired
 	return WATCH_RESULT_OK
 
@@ -2809,41 +2816,67 @@ class bidict(dict):
 			del self.inverse[self[key]]
 		super(bidict, self).__delitem__(key)
 
-def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None,job_name:str = None):
+def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None):
+	'''
+	Watch monitor_path and every folder under it that the skip list keeps; returns monitor_path's watch, or -1 without one.
+	Each folder's watch is added as the walk reaches it, before the walk reads the folder: a folder made in it afterwards
+	raises its create, and one made before is in the walk, so cp -r or tar x racing the walk leaves nothing unwatched.
+	A folder the walk cannot read gets no watch: nothing can be told about what is in it.
+	Each folder left unwatched that is still there (unreadable, or its watch failed other than by being gone) is added to
+	unwatched when given: no event reports a change in it.
+	'''
 	if not os.path.exists(monitor_path):
 		return -1
-	irm.increaseUserWatches()
-	watcherTeeLogToTl(monitor_path,f'Adding watch for {monitor_path}')
-	try:
-		parentWatchDescriptor = inotify_obj.add_watch(monitor_path, watch_flags)
-	except Exception as e:
-		watcherTeeLogToTl(monitor_path,f'Failed to add watch for {monitor_path}: {e}',error=True)
-		# counted above but never taken: an inner mount that keeps failing would add up over a long run
-		irm.decreaseUserWatches()
-		return -1
-	if newDirWds is not None:
-		newDirWds.add(parentWatchDescriptor)
-	wdDic[parentWatchDescriptor] = monitor_path
-	unreadable = []
-	allFolders = get_all_folders(monitor_path,skip_list,unreadable)
-	# an unreadable folder gets no watch: nothing can be told about what is in it
-	unreadable_folders = {folder.rstrip('/') for folder, _ in unreadable if folder.rstrip('/') != monitor_path.rstrip('/')}
-	for folder, error in unreadable:
-		if folder.rstrip('/') in unreadable_folders:
-			watcherTeeLogToTl(monitor_path,f'Not watching unreadable folder {folder}: {error}',error=True)
-	allFolders = [folder for folder in allFolders if folder.rstrip('/') not in unreadable_folders]
-	watcherTeeLogToTl(monitor_path,f'Adding watch for {len(allFolders)} sub folders')
-	irm.increaseUserWatches(len(allFolders))
-	for folder in allFolders:
+	def watch(folder:str):
+		irm.increaseUserWatches()
 		try:
-			childWd = inotify_obj.add_watch(folder, watch_flags)
-			if newDirWds is not None:
-				newDirWds.add(childWd)
-			wdDic[childWd] = folder
+			wd = inotify_obj.add_watch(folder, watch_flags)
 		except Exception as e:
 			watcherTeeLogToTl(monitor_path,f'Failed to add watch for {folder}: {e}',error=True)
+			# counted above but never taken: an inner mount that keeps failing would add up over a long run
 			irm.decreaseUserWatches()
+			if unwatched is not None and getattr(e,'errno',None) not in (errno.ENOENT, errno.ENOTDIR):
+				unwatched.add(folder.rstrip('/') or '/')
+			return None
+		if wd in wdDic:
+			# held already: a folder made while its parent's walk ran is in the walk and raises its create too
+			irm.decreaseUserWatches()
+		if newDirWds is not None:
+			newDirWds.add(wd)
+		wdDic[wd] = folder
+		return wd
+	watcherTeeLogToTl(monitor_path,f'Adding watch for {monitor_path}')
+	parentWatchDescriptor = watch(monitor_path)
+	if parentWatchDescriptor is None:
+		return -1
+	rel_base = '' if skip_list is None else skip_list.folder_rel(monitor_path)
+	errors = []
+	watched = {}
+	for folder, _, is_dir in iter_tree_entries(monitor_path, rel_base, skip=None if skip_list is None else skip_list.skips, errors=errors):
+		if is_dir:
+			wd = watch(folder)
+			if wd is not None:
+				watched[folder.rstrip('/')] = wd
+	root_norm = monitor_path.rstrip('/') or '/'
+	for rel, error in errors:
+		folder = unreadable_path(monitor_path, rel[len(rel_base):])
+		if unwatched is not None and getattr(error,'errno',None) not in (errno.ENOENT, errno.ENOTDIR):
+			unwatched.add(folder)
+		if folder == root_norm:
+			# keeps its watch, for the events of what is in it
 			continue
+		watcherTeeLogToTl(monitor_path,f'Not watching unreadable folder {folder}: {error}',error=True)
+		wd = watched.pop(folder, None)
+		if wd is not None and wd in wdDic:
+			try:
+				inotify_obj.rm_watch(wd)
+			except OSError:
+				pass
+			del wdDic[wd]
+			if newDirWds is not None:
+				newDirWds.discard(wd)
+			irm.decreaseUserWatches()
+	watcherTeeLogToTl(monitor_path,f'Watching {len(watched)} sub folders')
 	return parentWatchDescriptor
 
 def watches_under(wdDic:bidict,folder_path:str) -> tuple:
@@ -2876,11 +2909,12 @@ def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:ino
 		removed += 1
 	return removed
 
-def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None) -> int:
+def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None) -> int:
 	'''
 	Bring the watches in line with a new mount table. Each inner mount mounted, unmounted or replaced since inner_mounts
 	(path -> fingerprint, updated here) is watched again from what is there now, and gets a 'scan' event so the backuper
-	compares that folder with the vault. Returns how many folders it queued.
+	compares that folder with the vault. Returns how many folders it queued. Folders left unwatched go into unwatched
+	( initializeFolderWatchers() ).
 	An unmounted disk's watches go with its IN_UNMOUNT events, or here if those come later (a lazy unmount sends none
 	while the disk is still in use); the mount point folder it uncovers is watched in their place.
 	'''
@@ -2897,7 +2931,7 @@ def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,moun
 		watcherTeeLogToTl(monitor_path,f'Inner mount {mount_point} {change}, watching what is there now and comparing it with the vault')
 		remove_watches_under(inotify_obj,wdDic,irm,mount_point)
 		# not into newDirWDs: the scan compares what is there already, and later events in it are recorded as they come
-		initializeFolderWatchers(inotify_obj,mount_point,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name)
+		initializeFolderWatchers(inotify_obj,mount_point,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
 		if fingerprint is None:
 			del inner_mounts[mount_point]
 		else:
@@ -2946,9 +2980,13 @@ def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,ir
 		removed += 1
 	return removed
 
-def rewatch_moved_folder(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,skip_list:'SkipList') -> None:
-	'''After a folder moved, make its watches match what the skip list wants at the new location.'''
-	wanted = get_all_folders(folder_path,skip_list)
+def rewatch_moved_folder(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,skip_list:'SkipList',unwatched:set = None) -> None:
+	'''After a folder moved, make its watches match what the skip list wants at the new location. Folders left unwatched
+	go into unwatched ( initializeFolderWatchers() ).'''
+	errors = []
+	wanted = get_all_folders(folder_path,skip_list,errors)
+	if unwatched is not None:
+		unwatched.update(folder for folder, error in errors if getattr(error,'errno',None) not in (errno.ENOENT, errno.ENOTDIR))
 	wanted_norm = {folder.rstrip('/') for folder in wanted}
 	folder_norm = folder_path.rstrip('/')
 	prefix = folder_norm + '/'
@@ -2972,6 +3010,8 @@ def rewatch_moved_folder(inotify_obj:inotify_simple.INotify,folder_path:str,wdDi
 		except Exception as e:
 			watcherTeeLogToTl(folder_path,f'Failed to add watch for {folder}: {e}',error=True)
 			irm.decreaseUserWatches()
+			if unwatched is not None and getattr(e,'errno',None) not in (errno.ENOENT, errno.ENOTDIR):
+				unwatched.add(folder.rstrip('/'))
 
 def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = False, skip = None, errors:list = None):
 	'''

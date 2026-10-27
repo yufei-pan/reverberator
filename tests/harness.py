@@ -389,7 +389,7 @@ def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, 
 			pass
 	next_wd = [2]
 	def initialize(inotify_obj, monitor_path, wdDic, irm, watch_flags, newDirWds=None, **kwargs):
-		# wd 1 is the root only: any other folder gets a watch of its own, which the scripted events never name
+		# wd 1 is the root only: any other folder gets a watch of its own, which a scripted event names in its 4th field
 		wd = 1 if monitor_path == monitor else next_wd[0]
 		if wd != 1:
 			next_wd[0] += 1
