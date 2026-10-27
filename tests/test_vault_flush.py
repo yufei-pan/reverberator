@@ -290,7 +290,7 @@ def test_forgetting_the_recorded_version_keeps_the_journal_too(tmp_path):
 	manifest.commit(os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800'))
 	manifest.close()
 	os.remove(journal_of(job_vault))
-	rv.forget_recorded_version(job_vault)
+	rv.forget_manifest_meta(job_vault)
 	assert os.path.exists(journal_of(job_vault))
 	assert rv.recorded_latest_version(job_vault).recorded is None
 

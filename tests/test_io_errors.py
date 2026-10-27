@@ -262,7 +262,7 @@ def test_two_copies_to_one_destination_both_finish(job):
 	manifest.rollback(); manifest.close()
 
 
-def _finish_one(job, src, stderr, temp_content=None, returncode=1, rel='a.txt'):
+def _finish_one(job, src, stderr, temp_content=None, returncode=1, rel='a.txt', unsynced=None):
 	'''Finish one failed copy of src over the version entry rel, linked to the previous version; returns its path.'''
 	version = os.path.join(job.job_vault, 'V1--x')
 	dest = os.path.join(version, rel)
@@ -274,7 +274,7 @@ def _finish_one(job, src, stderr, temp_content=None, returncode=1, rel='a.txt'):
 	manifest = _tracked(job, version, rel)
 	try:
 		rv.finish_copies([rv.PendingCopy(FakeTask(returncode, [line.format(src=src, temp=temp) for line in stderr]), src, temp, dest)],
-			manifest, version, job.job_name)
+			manifest, version, job.job_name, unsynced=unsynced)
 	finally:
 		manifest.rollback(); manifest.close()
 	return dest
@@ -316,10 +316,13 @@ def test_metadata_only_failure_accepts_the_copy(job, capsys, temp_content):
 	open(src, 'w').write('abc')
 	stderr = ["cp: failed to preserve ownership for '{temp}': Operation not permitted", "cp: preserving times for '{temp}': Operation not permitted"]
 	if temp_content is not None:
-		dest = _finish_one(job, src, stderr, temp_content=temp_content)
+		unsynced = []
+		dest = _finish_one(job, src, stderr, temp_content=temp_content, unsynced=unsynced)
 		assert not os.path.islink(dest) and open(dest).read() == temp_content
 		out = ''.join(capsys.readouterr())
 		assert 'without all of its metadata' in out and src in out and 'UNREADABLE' not in out
+		# its extended attributes may be missing: the backup does not record that the vault matched the tree
+		assert unsynced == [src]
 	else:
 		# no partial file: nothing arrived to accept
 		with pytest.raises(rv.JobFailure):
