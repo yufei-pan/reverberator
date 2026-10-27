@@ -8,7 +8,9 @@ import pytest
 import reverberator as rv
 from tests.harness import (scripted_watch, seed_monitor, run_backup, event_entry, latest_version, wait_until,
 	wait_for_committed_count, write_pending)
+from tests.test_inner_mounts import _fake_mounts
 from tests.test_moves_then_changes import user_xattrs_or_skip
+from tests.test_verify_replay import start_backuper, stop_backuper
 
 pytestmark = pytest.mark.unit
 
@@ -93,29 +95,6 @@ def modify(job, rel, text):
 	return OrderedDict([event_entry(job, rel, 'modify')])
 
 
-def _fake_mounts(monkeypatch, job, mounted):
-	table = [('/', ('1',))] + [(os.path.join(job.monitor, rel.rstrip('/')), (rel,)) for rel in mounted]
-	monkeypatch.setattr(rv, 'current_mount_table', lambda: table)
-
-
-def start_backuper(job, queue):
-	'''The job's backuper on queue, as the daemon runs it, with no watcher: (thread, to_process_lock, to_process_flag).'''
-	lock = threading.Lock()
-	flag = threading.Event()
-	control = rv.JobControl(job.job_name)
-	control.start_attempt()
-	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag),
-		kwargs=dict(job=control), daemon=True)
-	thread.start()
-	return thread, lock, flag
-
-
-def stop_backuper(thread):
-	rv.GREEN_LIGHT.clear()
-	thread.join(timeout=5)
-	rv.GREEN_LIGHT.set()
-
-
 def record_matched_since(monkeypatch):
 	'''The matched_since of each do_backup() call.'''
 	calls = []
@@ -177,6 +156,26 @@ def test_an_attempt_that_met_an_unreadable_folder_carries_the_time_forward(job, 
 	v0 = rv.list_versions(job.job_vault)[-1].path
 	run_backup(job, matched_since=200)                      # a full comparison that could not read bad/
 	assert matched(job) == (name(v0), 100)
+
+
+def test_a_failed_metadata_copy_carries_the_time_forward(job, monkeypatch):
+	user_xattrs_or_skip(job.monitor)
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job, matched_since=100)
+	a = os.path.join(job.monitor, 'a.txt')
+	os.setxattr(a, 'user.x', b'1')
+	real = rv.copystat
+	def copystat(src, dst, *args, **kwargs):
+		if os.fspath(src) == a:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), dst)
+		return real(src, dst, *args, **kwargs)
+	monkeypatch.setattr(rv, 'copystat', copystat)
+	# the attrib's copy of a's metadata onto the vault's copy fails, and its verification's again: the batch commits without it
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'a.txt', 'attrib')]), matched_since=time.time_ns())[-1]
+	assert matched(job) == (name(v1), 100)
+	monkeypatch.setattr(rv, 'copystat', real)
+	v2 = run_backup(job, matched_since=time.time_ns())[-1]  # a later full comparison still reads a's xattrs
+	assert v2 != v1 and os.getxattr(os.path.join(v2, 'a.txt'), 'user.x') == b'1'
 
 
 def test_delta_generation_writes_no_key(job):

@@ -1632,14 +1632,37 @@ def cut_off_at_the_swap(job, step='swap', **backup_options):
 	return os.path.join(job.job_vault, attempt[0])
 
 
-def test_a_cut_off_commits_key_is_not_used_once_the_scan_rolls_it_back(tmp_path):
+@pytest.mark.parametrize('step', ['manifest', 'swap'])
+def test_a_cut_off_commits_key_goes_once_the_scan_rolls_it_back(tmp_path, step):
 	job = three_versions(tmp_path)
-	attempt = cut_off_at_the_swap(job, matched_since=time.time_ns())
+	attempt = cut_off_at_the_swap(job, step, matched_since=time.time_ns())
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.matched[0] == os.path.basename(attempt)
+	manifest.close()
 	restart_and_scan(job)
 	infos = rv.get_vault_info(job.job_vault).vault_info_dict
 	manifest = rv.VaultManifest(job.job_vault)
-	assert manifest.matched[0] == os.path.basename(attempt)
+	# a commit later in the same second, carrying a key, would find the rolled back commit's name
+	assert manifest.matched is None
 	assert rv.full_comparison_since(infos, manifest.matched) == rv.full_comparison_since(infos)
+	manifest.close()
+
+
+def test_forgetting_removed_versions_keeps_a_key_naming_another_version(tmp_path):
+	job_vault = str(tmp_path / 'job')
+	os.makedirs(job_vault)
+	manifest = rv.VaultManifest(job_vault)
+	manifest.begin()
+	manifest.record_matched(os.path.join(job_vault, 'V2--b'), 5)
+	manifest.commit(os.path.join(job_vault, 'V3--c'))
+	manifest.close()
+	rv.forget_manifest_meta(job_vault, version=False, gone={'V3--c'})
+	manifest = rv.VaultManifest(job_vault)
+	assert manifest.matched == ('V2--b', 5) and manifest.describes(os.path.join(job_vault, 'V3--c'))
+	manifest.close()
+	rv.forget_manifest_meta(job_vault, gone={'V2--b', 'V4--d'})
+	manifest = rv.VaultManifest(job_vault)
+	assert manifest.matched is None and not manifest.describes(os.path.join(job_vault, 'V3--c'))
 	manifest.close()
 
 

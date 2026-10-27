@@ -207,9 +207,9 @@ def test_a_plain_move_leaves_the_shared_copy_alone(job, logged, monkeypatch):
 	before = rv.entry_metadata(shared)
 	calls = []
 	real = rv.copy_file_meta
-	def spy(source_file, backup_file_path):
+	def spy(source_file, backup_file_path, *args):
 		calls.append(os.path.abspath(backup_file_path))
-		return real(source_file, backup_file_path)
+		return real(source_file, backup_file_path, *args)
 	monkeypatch.setattr(rv, 'copy_file_meta', spy)
 	m = job.monitor
 	os.rename(f'{m}/x', f'{m}/d/x')

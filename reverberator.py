@@ -3977,9 +3977,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	full_comparison = False
 	# whether the batch is one handed back or resumed, whose events are only its collapsed entries
 	round_tripped = False
-	# the wall clock time at which the watcher began its latest read whose events were all queued before the batch was
-	# taken ( ChangeEventQueue.read_wall_ns ): every change made before it is in this batch or an earlier one
-	batch_read_ns = None
 	def batch_scopes(batch):
 		scopes = touched_scopes(batch, monitor_path)
 		return scopes if scopes.subtrees or scopes.paths else None
@@ -4067,7 +4064,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
 				touched = batch_scopes(to_process_temp)
 				round_tripped = to_process_temp.round_tripped
-				batch_read_ns = to_process_temp.read_wall_ns
 				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 		vaultInfo = None
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
@@ -4103,9 +4099,9 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				full_comparison = full_comparison or (not backupEntries and touched is None)
 			if backupEntries or full_comparison or touched is not None:
 				# from when the attempt sees the whole tree: a full comparison's walk sees every change made before it
-				# begins; a fresh batch holds every change made before its read time. a batch handed back or resumed
-				# lost its raw events, and the watcher's read time says nothing of them
-				matched_since = time.time_ns() if full_comparison else None if round_tripped else batch_read_ns
+				# begins; a fresh batch, the one taken last, holds every change made before the watcher's read time it
+				# carries. a batch handed back or resumed lost its raw events, and the read time says nothing of them
+				matched_since = time.time_ns() if full_comparison else None if round_tripped else to_process_temp.read_wall_ns
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
@@ -4135,7 +4131,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			# a stop before it runs saves it as a full scan request, as any full comparison
 			full_comparison = follow_up
 			round_tripped = False
-			batch_read_ns = None
 			# a batch whose events collapsed to no entry is backed up too, as what they touched can differ from the vault
 			while not backupEntries and not full_comparison and not scan_folders and touched is None and running():
 				while running() and not to_process_flag.is_set():
@@ -4162,7 +4157,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
 					touched = batch_scopes(to_process_temp)
 					round_tripped = to_process_temp.round_tripped
-					batch_read_ns = to_process_temp.read_wall_ns
 					backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 			if log_journal:
 				journalPath = os.path.join(vault_path,job_name,'journal.tsv')
@@ -4730,7 +4724,8 @@ def do_backup(backup_entries:dict,
 	# never mounted again since: PoolNotReady fails the attempt
 	# matched_since: the wall clock time, in ns, from which this attempt sees the whole tree ( a full comparison, or a fresh
 	# batch's read time ), None when it does not. the commit records it as the vault's matched time ( VaultManifest.matched )
-	# only when no inner mount was paused and nothing was logged unreadable; else it carries the old time forward
+	# only when no inner mount was paused, nothing was logged unreadable and every metadata copy worked; else it carries
+	# the old time forward
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -4754,6 +4749,8 @@ def do_backup(backup_entries:dict,
 	# a manifest opened here is closed here if the backup raises, as the caller never gets it back
 	if reported is None:
 		reported = set()
+	# the entries whose metadata could not be copied, which may lack their extended attributes in the new version
+	unsynced = []
 	opened_manifest = manifest is None
 	if opened_manifest:
 		manifest = VaultManifest(job_vault)
@@ -4812,7 +4809,7 @@ def do_backup(backup_entries:dict,
 						manifest.add(relativePath,dirty=True)
 						if isDir:
 							os.makedirs(backupEntryPath,exist_ok=True)
-							copy_file_meta(monitorEntry,backupEntryPath)
+							copy_file_meta(monitorEntry,backupEntryPath,unsynced)
 						else:
 							cp_af_copy_path(monitorEntry,backupEntryPath,mcae,pending)
 					# copies still running must stop writing before a failed root orphans this version
@@ -4820,7 +4817,7 @@ def do_backup(backup_entries:dict,
 						pool_guard.poll()
 						mcae.wait(timeout=POLL_WAIT_SECONDS)
 					if GREEN_LIGHT.is_set():
-						finish_copies(pending,manifest,backup_folder,job_name,reported)
+						finish_copies(pending,manifest,backup_folder,job_name,reported,unsynced)
 				finally:
 					# however the backup ends, no copy is left writing into this version. a copy finish_copies did not reach
 					# means this V0 is not committed: the whole folder is removed as an orphan ( by the job's next vault scan ), so unlinking each
@@ -4838,7 +4835,7 @@ def do_backup(backup_entries:dict,
 				# would at a copy ( a re-copy copies such a link as it is ), so they count as copied in V0
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors,copy_version=this_version_number)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
-				do_referenced_copy(monitor_path,backup_folder,manifest,pool_guard=pool_guard)
+				do_referenced_copy(monitor_path,backup_folder,manifest,pool_guard=pool_guard,unsynced=unsynced)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
@@ -4962,7 +4959,7 @@ def do_backup(backup_entries:dict,
 				paused = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported,
 				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,
-				pool_guard=pool_guard)
+				pool_guard=pool_guard,unsynced=unsynced)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -5011,7 +5008,7 @@ def do_backup(backup_entries:dict,
 		# empty folder on the root disk, and be hidden once it is back), and the job's next scan, once every disk is
 		# there, removes the version as the orphan at the link + 1, or as a commit cut off before its list was placed
 		# the paused inner mounts as the verification left them
-		manifest.record_matched(backup_folder,matched_since if not paused and not reported else None,
+		manifest.record_matched(backup_folder,matched_since if not paused and not reported and not unsynced else None,
 			None if latest_version_info is None else latest_version_info.path)
 		manifest.commit(backup_folder)
 		swap_current_version(job_vault,os.path.basename(backup_folder))
@@ -5466,18 +5463,18 @@ def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 		else:
 			with contextlib.suppress(FileNotFoundError):
 				os.remove(link_path)
-			forget_recorded_version(job_vault_path)
+			forget_manifest_meta(job_vault_path)
 		# on its disks before anything is removed: a power loss that kept the removals and lost the swap back would leave
 		# the commit stuck again
 		fsync_vault_folder(job_vault_path)
 	except (OSError, sqlite3.Error) as e:
 		raise VaultScanError(f'cannot undo the records of {name}, a commit cut off before its list was placed ({where}): {e}')
 
-def forget_recorded_version(job_vault_path:str) -> None:
+def forget_manifest_meta(job_vault_path:str, version:bool = True, gone:set = frozenset()) -> None:
 	'''
-	The version job_vault_path's manifest records forgotten, when there is a manifest: opened as recorded_latest_version()
-	opens it, creating nothing. Raises sqlite3.Error, and OSError when the manifest cannot be looked at: only one not there
-	records no version.
+	The version job_vault_path's manifest records forgotten (with version), and its matched key when it names one of the
+	folder names gone, when there is a manifest: opened as recorded_latest_version() opens it, creating nothing. Raises
+	sqlite3.Error, and OSError when the manifest cannot be looked at: only one not there records no version.
 	'''
 	path = os.path.join(job_vault_path, MANIFEST_FILE_NAME)
 	try:
@@ -5488,7 +5485,11 @@ def forget_recorded_version(job_vault_path:str) -> None:
 	try:
 		conn.execute(MANIFEST_JOURNAL_MODE)
 		with conn:
-			conn.execute("DELETE FROM meta WHERE key = 'version'")
+			if version:
+				conn.execute("DELETE FROM meta WHERE key = 'version'")
+			row = conn.execute("SELECT value FROM meta WHERE key = 'matched'").fetchone() if gone else None
+			if row is not None and (parse_matched(row[0]) or (None,))[0] in gone:
+				conn.execute("DELETE FROM meta WHERE key = 'matched'")
 	except sqlite3.OperationalError as e:
 		# a manifest that never had its meta table records no version
 		if 'no such table' not in str(e):
@@ -5552,7 +5553,8 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	The scan deletes only what it is certain of, once the whole vault was read (read_job_vault()): the change lists of
 	version folders that are not there, the private folders of change lists a crash cut off, and the version folders
 	without a change list that may go, the orphans of backups that did not commit and of removals cut short, and that of
-	a commit cut off before its list was placed, once its link is put back (undo_cut_off_commit()). Then a
+	a commit cut off before its list was placed, once its link is put back (undo_cut_off_commit()); the manifest's
+	matched key goes first when it names one of those folders (VaultManifest.matched). Then a
 	current_version left behind the newest committed version is moved forward (move_current_version_forward()). Raises
 	VaultScanError, having deleted nothing, when the vault cannot be read whole or for certain, and (after the
 	deletions) when an orphan cannot be removed, as the next backup would make a version of its number beside it. The caller's job then fails its attempt, with its FAILED marker: no
@@ -5605,6 +5607,14 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 		except Exception as e:
 			backuperTeeLogToTl(job_vault_path, f'Error deleting {path}: {e}', error=True)
 	remove_unfinished_change_lists(job_vault_path, listing)
+	if listing.orphans:
+		# a matched key naming an orphan, as a commit cut off leaves it, goes first: a commit later in the same second
+		# reuses the folder name, and the key would claim a time the vault never matched. one that cannot go stays, as
+		# only that reuse makes it count, and a scan that fails over it would stop the job
+		try:
+			forget_manifest_meta(job_vault_path, version=False, gone={os.path.basename(path) for path in listing.orphans})
+		except (OSError, sqlite3.Error) as e:
+			backuperTeeLogToTl(job_vault_path, f'Cannot forget the matched time of a version being removed: {e}', error=True)
 	kept = [path for path in listing.orphans if not remove_orphan(job_vault_path, path)]
 	if kept:
 		raise VaultScanError(f'cannot remove the incomplete versions {", ".join(kept)}, and a backup would make a version of their number beside them')
@@ -6064,7 +6074,7 @@ def copy_failure_side(source_path:str, temp_path:str, lines:list) -> str:
 		return 'vanished'
 	return 'vault' if source_readable(source_path) else 'source'
 
-def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_name:str, reported:set = None) -> list:
+def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_name:str, reported:set = None, unsynced:list = None) -> list:
 	'''
 	Put the copies of pending in place once the executor has finished them, and empty pending.
 
@@ -6072,7 +6082,8 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 	file it could not keep (a warning says so): a failed read or write of the contents gets a line of its own. One that
 	failed leaves the destination as it was, keeping the last backed-up copy, when its source failed: silently when the
 	source is gone, with an UNREADABLE line (once per backup, with reported) when it could not be read. A destination holding nothing then stops being tracked in manifest, whose paths
-	are relative to version_path. Each copy put in place is recorded in manifest as held by version_path, in the
+	are relative to version_path. The source of a copy put in place without all of its metadata is appended to unsynced,
+	when given, as copy_file_meta() appends to failed. Each copy put in place is recorded in manifest as held by version_path, in the
 	transaction committing that version, and returned (as its path relative to version_path). When writing into the
 	vault is what failed, JobFailure is raised once every copy is dealt with.
 	'''
@@ -6088,6 +6099,8 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 			if not succeeded and lines and all(copy_metadata_failure(line, temp_name) for line in lines) and os.path.lexists(copy.temp_path):
 				backuperTeeLogToTl(path=copy.source_path,warning=True,message=f'Copied {copy.source_path} to {copy.dest_path} without all of its metadata: {error}')
 				succeeded = True
+				if unsynced is not None:
+					unsynced.append(copy.source_path)
 			if succeeded and not real_folders_to(version_path, os.path.relpath(copy.dest_path, version_path), missing_ok=True):
 				# a folder above it is now a link or a file in the version: the copy is not put in place through it, and its
 				# partial file is left alone, as removing it would reach through the link too. it went with the folder it was
@@ -6159,7 +6172,7 @@ def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, dis
 	else:
 		pending.clear()
 
-def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None) -> bool:
+def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None,unsynced:list = None) -> bool:
 	'''
 	Recreate the folders tracked in manifest under backup_folder and link each tracked file to its copy under source_path.
 
@@ -6170,7 +6183,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	error line, as dropping it would leave it out of the new version. Nothing is looked up in backup_folder for a file,
 	which is a new folder: a lookup that finds nothing is not cached on a mergerfs vault. Returns False when the backup
 	was interrupted. pool_guard, when given, is polled for each entry: a disk of its pools that drops stops the copy
-	with PoolNotReady.
+	with PoolNotReady. A folder whose metadata could not be copied is appended to unsynced ( copy_file_meta()'s failed ).
 	'''
 	def source_entry(path:str, kind:str, rel:str):
 		# the lstat of a tracked entry in source_path, never followed: None when it is not there ( ENOTDIR says so too, for
@@ -6206,7 +6219,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			missing.append(folder)
 			continue
 		os.makedirs(backup_folder_path,exist_ok=True)
-		copy_file_meta(source_folder,backup_folder_path)
+		copy_file_meta(source_folder,backup_folder_path,unsynced)
 		if pool_guard is not None:
 			pool_guard.poll()
 		if not GREEN_LIGHT.is_set():
@@ -6328,13 +6341,15 @@ def drop_xattrs_missing_from(source:str, dest:str):
 			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES):
 				raise
 
-def copy_file_meta(source_file:str,backup_file_path:str):
+def copy_file_meta(source_file:str,backup_file_path:str,failed:list = None):
 	'''
 	Copy source_file's mode, times, owner and extended attributes onto backup_file_path, which keeps none source_file
 	lacks (drop_xattrs_missing_from()). A symlink at backup_file_path is never followed, even named with a trailing / as
 	a folder's rel is: it gets only its own owner and times, from source_file's own (by lstat), as a link has no mode or
 	extended attributes of its own here. A symlink source_file onto anything else is refused, with an error line: what
 	it leads to is another entry, whose metadata is not its own. Returns whether it worked; an error line says why not.
+	source_file is appended to failed, when given, when an error may have left backup_file_path without its extended
+	attributes: a comparison by the times reads them again only of an entry changed since ( VaultManifest.matched ).
 	'''
 	try:
 		# a trailing / makes the kernel follow a link to a folder
@@ -6370,6 +6385,8 @@ def copy_file_meta(source_file:str,backup_file_path:str):
 		os.utime(backup_file_path, ns=(st.st_atime_ns, st.st_mtime_ns))
 		return owned
 	except Exception as _:
+		if failed is not None:
+			failed.append(source_file)
 		backuperTeeLogToTl(path=source_file,error=True,message=f'Failed to copy metadata {source_file} -> {backup_file_path}')
 		import traceback
 		backuperTeeLogToTl(path=source_file,error=True,message=traceback.format_exc())
@@ -6592,6 +6609,23 @@ def folder_range_end(folder:str) -> str:
 # never needs a folder sync, which mergerfs ignores
 MANIFEST_JOURNAL_MODE = 'PRAGMA journal_mode = TRUNCATE'
 
+def parse_matched(value:str) -> tuple:
+	'''
+	The matched meta key's value (VaultManifest.matched) as (version folder name, wall clock ns), or None when it does
+	not parse.
+
+	Examples:
+		>>> parse_matched('["V5--b", 7]'), parse_matched('["V5--b", true]'), parse_matched('[5]'), parse_matched('x')
+		(('V5--b', 7), None, None, None)
+	'''
+	try:
+		name, since = json.loads(value)
+	except (TypeError, ValueError):
+		return None
+	if not isinstance(name, str) or not isinstance(since, int) or isinstance(since, bool):
+		return None
+	return name, since
+
 class VaultManifest:
 	'''
 	The entries of a job's latest committed version and what the vault holds for each, kept in sqlite in the job vault.
@@ -6760,13 +6794,7 @@ class VaultManifest:
 	def matched(self) -> tuple:
 		'''(version folder name, wall clock ns) the matched key records, or None when it is absent or does not parse.'''
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'matched'").fetchone()
-		try:
-			name, since = json.loads(row[0])
-		except (TypeError, ValueError):
-			return None
-		if not isinstance(name, str) or not isinstance(since, int) or isinstance(since, bool):
-			return None
-		return name, since
+		return None if row is None else parse_matched(row[0])
 
 	def record_matched(self, version_path:str, since:int = None, base_path:str = None):
 		'''
@@ -9880,7 +9908,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
 					 recopy:list = (),recopied:list = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
-					 recheck_mounts = None,pool_guard:'PoolGuard' = None) -> VaultManifest:
+					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
@@ -9901,12 +9929,16 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	mounts unmounted meanwhile, and raises JobFailure when the monitored root's filesystem changed.
 	pool_guard, when given, is polled while copies are queued and waited for: a disk of its pools that drops stops them
 	with PoolNotReady, so nothing more is written into the version.
+	Each entry whose metadata could not be copied, which may lack its extended attributes, is appended to unsynced
+	( copy_file_meta()'s failed ).
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
 	global GREEN_LIGHT
 	if reported is None:
 		reported = set()
+	if unsynced is None:
+		unsynced = []
 	# a clock compare between checks, so it runs per entry
 	poll_pools = (lambda: None) if pool_guard is None else pool_guard.poll
 	backup_entries = prepare_backup_entries_for_replay(backup_entries)
@@ -9977,7 +10009,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# whatever stood at its place is gone
 			manifest.discard(source_relative_path)
 			manifest.add(as_folder_entry(source_relative_path),dirty=True)
-			copy_file_meta(source_file=source_real_path,backup_file_path=file_vault_real_path)
+			copy_file_meta(source_file=source_real_path,backup_file_path=file_vault_real_path,failed=unsynced)
 			walk_errors = []
 			rel_base = as_folder_entry(source_relative_path)
 			# a folder that could not be made: nothing is copied under it
@@ -9995,7 +10027,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						continue
 					manifest.discard(subRelativePath[:-1])
 					manifest.add(subRelativePath,dirty=True)
-					copy_file_meta(source_file=subRealPath,backup_file_path=subVaultPath)
+					copy_file_meta(source_file=subRealPath,backup_file_path=subVaultPath,failed=unsynced)
 					continue
 				if not os.path.lexists(subRealPath):
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not tracking {subRelativePath}: source no longer exists')
@@ -10140,7 +10172,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		if not GREEN_LIGHT.is_set():
 			return []
 		# what was copied takes its place before anything renames, removes or records it
-		return finish_copies(pending,manifest,backup_folder,monitor_path if job_name is None else job_name,reported)
+		return finish_copies(pending,manifest,backup_folder,monitor_path if job_name is None else job_name,reported,unsynced)
 	def recheck_moved_folder(folder_rel,mcae):
 		# a location-dependent pattern may judge the moved contents differently at the new place
 		under = list(manifest.iter_under(folder_rel))
@@ -10211,7 +10243,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						continue
 					# we just copy the folder metadata
 					os.makedirs(file_vault_target_path,exist_ok=True)
-					copy_file_meta(event_source_real_path,file_vault_target_path)
+					copy_file_meta(event_source_real_path,file_vault_target_path,unsynced)
 					manifest.add(as_folder_entry(event_relative_path),dirty=True)
 				else:
 					end = attribute_end(event_source_real_path,event_relative_path) if only_sync_attributes else None
@@ -10219,7 +10251,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					# read only for a record that does not vouch ( a moved row never does )
 					if isinstance(end,str) and (record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end) or same_contents(event_source_real_path,end)):
 						# we just copy the file metadata
-						copy_file_meta(event_source_real_path,end)
+						copy_file_meta(event_source_real_path,end,unsynced)
 					elif only_sync_attributes and not isinstance(end,str):
 						# nothing of its own to sync, or an error line said why not
 						pass
@@ -10293,13 +10325,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						end = attribute_end(event_source_real_path,link_target_relative_path)
 						if isinstance(end,str) and only_attributes_differ(event_source_real_path,end):
 							if only_sync_attributes:
-								copy_file_meta(event_source_real_path,end)
+								copy_file_meta(event_source_real_path,end,unsynced)
 							else:
 								cp_af_copy_path(source_path=event_source_real_path,dest_path=link_target_backup_real_path,mcae=mcae,pending=pending)
 							# recorded again, as an attrib's replay is
 							manifest.add(link_target_relative_path,dirty=True)
 					else:
-						copy_file_meta(event_source_real_path,link_target_backup_real_path)
+						copy_file_meta(event_source_real_path,link_target_backup_real_path,unsynced)
 				except NotARealFolder as e:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: {e}; doing delete & copy instead')
 					# its own target is copied now, by a folder above it too ( copy_untracked_folder() )
@@ -10375,7 +10407,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		if not manifest.describes(latest_version_info.path):
 			backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {latest_version_info.path}, listing it')
 			manifest.rebuild(latest_version_info.path)
-		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard):
+		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard,unsynced=unsynced):
 			return manifest
 		backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
 		mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
