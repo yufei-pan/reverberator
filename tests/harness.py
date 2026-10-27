@@ -385,9 +385,16 @@ def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, 
 			return 1
 		def rm_watch(self, wd):
 			pass
-	def initialize(inotify_obj, monitor_path, wdDic, *args, **kwargs):
-		wdDic[1] = monitor_path
-		return 1
+	next_wd = [2]
+	def initialize(inotify_obj, monitor_path, wdDic, irm, watch_flags, newDirWds=None, **kwargs):
+		# wd 1 is the root only: any other folder gets a watch of its own, which the scripted events never name
+		wd = 1 if monitor_path == monitor else next_wd[0]
+		if wd != 1:
+			next_wd[0] += 1
+			if newDirWds is not None:
+				newDirWds.add(wd)
+		wdDic[wd] = monitor_path
+		return wd
 	monkeypatch.setattr(rv.inotify_simple, 'INotify', FakeINotify)
 	monkeypatch.setattr(rv, 'initializeFolderWatchers', initialize)
 	rv.watchFolder(monitor, queue, threading.Lock(), flag, rv.inotify_resource_manager(), **watch_kwargs)

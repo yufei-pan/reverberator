@@ -39,4 +39,31 @@ def test_a_max_delay_hand_over_carries_the_previous_reads_time(job, monkeypatch)
 		min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=0)
 	# read 0 began before it returned; read 1's events were not all queued when it was handed over
 	assert flag.seen and flag.seen[0] is not None and flag.seen[0] <= returned[0]
-	assert queue.read_wall_ns >= returned[0]
+
+
+class RecordingQueue(rv.ChangeEventQueue):
+	'''Records the read time a taker would see as each event is queued.'''
+	def __init__(self, monitor):
+		self.seen = []
+		super().__init__(monitor)
+	def append(self, event):
+		self.seen.append((event.path.rsplit('/', 1)[-1], self.read_wall_ns))
+		super().append(event)
+
+
+def test_no_read_time_is_visible_before_all_its_events_are_queued(job, monkeypatch):
+	flags = rv.inotify_simple.flags
+	reads = [[(flags.CREATE, 'a', 0), (flags.CREATE, 'b', 0)], [(flags.CREATE, 'c', 0), (flags.CREATE, 'd', 0)]]
+	queue = RecordingQueue(job.monitor)
+	_, _, returned = scripted_watch(monkeypatch, job.monitor, reads, queue=queue, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=0)
+	seen = dict(queue.seen)
+	# while read 0's events are queued no read is published; while read 1's are, only read 0's time, which began before it returned
+	assert seen['a'] is None and seen['b'] is None
+	assert seen['c'] is not None and seen['c'] <= returned[0] and seen['d'] <= returned[0]
+
+
+def test_a_scripted_folder_create_does_not_re_root_later_events(job, monkeypatch):
+	flags = rv.inotify_simple.flags
+	reads = [[(flags.CREATE | flags.ISDIR, 'd', 0)], [(flags.CREATE, 'x', 0)]]
+	queue, _, _ = scripted_watch(monkeypatch, job.monitor, reads, min_snapshot_delay_seconds=3600)
+	assert [(e.event, e.path) for e in queue] == [('create', job.monitor + '/d'), ('create', job.monitor + '/x')]
