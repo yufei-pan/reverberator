@@ -135,7 +135,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** the batch's collapse slows: 12,500 round trips of one folder take 49 s, as every event
-  inside it is carried through each rename. Normal use, even 50k moves of different paths, stays under a second.
+  inside it is carried through each rename. The watcher slows too, as each of those moves also walks the folder again:
+  for a folder of 5,000 subfolders (37 ms a walk) they add about 460 s of watcher time. Normal use, even 50k moves of
+  different paths, stays under a second.
 - **Why:** a memo that fixes it does not fit in a small, clean change.
 - **Revisit when:** a real workload does this.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
