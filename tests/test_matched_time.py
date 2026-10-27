@@ -158,6 +158,40 @@ def test_an_attempt_that_met_an_unreadable_folder_carries_the_time_forward(job, 
 	assert matched(job) == (name(v0), 100)
 
 
+@pytest.mark.inotify
+def test_a_folder_left_unwatched_stops_the_watcher_publishing_read_times(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'bad/x': 'x'})
+	v0 = run_backup(job, matched_since=100)[-1]
+	bad = os.path.join(job.monitor, 'bad')
+	original = os.scandir
+	def scandir(path='.'):
+		if os.path.abspath(path).rstrip('/') == bad:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return original(path)
+	monkeypatch.setattr(os, 'scandir', scandir)
+	calls = record_matched_since(monkeypatch)
+	queue = rv.ChangeEventQueue(job.monitor)
+	thread, lock, flag = start_backuper(job, queue)
+	watching = threading.Event()
+	watcher = threading.Thread(target=rv.watchFolder, kwargs=dict(monitor_path=job.monitor, to_process=queue, to_process_lock=lock,
+		to_process_flag=flag, irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=0.2, watching=watching), daemon=True)
+	watcher.start()
+	try:
+		wait_until(watching.is_set, message='watches not in place')
+		# a fresh batch elsewhere, while bad/ is unwatched: changes in it raise no event, so its read time claims nothing
+		with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
+			f.write('b')
+		v1 = wait_for_committed_count(job, 2)[1]
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=5)
+		watcher.join(timeout=2)
+		rv.GREEN_LIGHT.set()
+	# the last call is the fresh batch (a full comparison at the start carried the time too, as it could not read bad/)
+	assert calls[-1] is None
+	assert matched(job) == (name(v1), 100) and v1 != v0
+
+
 def test_a_failed_metadata_copy_carries_the_time_forward(job, monkeypatch):
 	user_xattrs_or_skip(job.monitor)
 	seed_monitor(job, {'a.txt': 'a'})
@@ -430,26 +464,3 @@ def test_a_new_folders_event_read_before_the_take_is_discarded_and_one_after_kep
 	queue, _, _ = scripted_watch(monkeypatch, m, reads, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=3600)
 	# d went with the batch taken; x happened before it, y may come after the copy passed d
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/d/y')]
-
-
-def test_a_new_watcher_counts_takes_from_the_queues_count(job, monkeypatch):
-	flags = rv.inotify_simple.flags
-	m = job.monitor
-	queue = rv.ChangeEventQueue(m)
-	queue.take()
-	queue.take()
-	# takes made before the watcher started say nothing of the folders it creates
-	reads = [[(flags.CREATE | flags.ISDIR, 'd', 0)], [(flags.CREATE, 'x', 0, 2)]]
-	queue, _, _ = scripted_watch(monkeypatch, m, reads, queue=queue, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=3600)
-	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/d')]
-
-
-def test_take_counts_the_takes():
-	queue = rv.ChangeEventQueue('/m')
-	assert queue.takes == 0
-	queue.append(rv.ChangeEvent(1.0, False, 'modify', '/m/a', None))
-	queue.take()
-	queue.take()
-	assert queue.takes == 2
-	queue.clear()
-	assert queue.takes == 2

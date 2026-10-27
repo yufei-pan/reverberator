@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import os
 import threading
 import time
@@ -514,3 +515,107 @@ def test_a_folder_moved_out_while_the_tree_is_busy_is_gone_from_the_version(job,
 	version = back_up_each(job, batches)
 	assert not os.path.lexists(os.path.join(version, 'd'))
 	assert open(os.path.join(version, 'keep.txt')).read() == 'k'
+
+
+def test_a_folder_made_while_the_walk_reads_its_parent_is_watched(job, poll_fast, monkeypatch):
+	a = os.path.join(job.monitor, 'd', 'a')
+	os.makedirs(a)
+	b = os.path.join(a, 'b')
+	real = os.scandir
+	class Listing:
+		# as cp -r or tar x goes on: b is made in a right after the walk has listed a
+		def __init__(self, entries):
+			self.entries = entries
+		def __enter__(self):
+			return self
+		def __iter__(self):
+			return iter(self.entries)
+		def __exit__(self, *exc_info):
+			self.entries.close()
+			if not os.path.exists(b):
+				os.mkdir(b)
+	def scandir(path='.'):
+		entries = real(path)
+		return Listing(entries) if os.path.abspath(path) == a else entries
+	monkeypatch.setattr(os, 'scandir', scandir)
+	to_process = rv.ChangeEventQueue(job.monitor)
+	flag = threading.Event()
+	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=0.2)
+	try:
+		_wait_watch_ready(job, to_process, lock)
+		assert os.path.isdir(b)
+		_consume_batch(to_process, lock, flag)
+		x = os.path.join(b, 'x.txt')
+		open(x, 'w').write('a later change in the folder made during the walk')
+		wait_until(lambda: _has_create(to_process, lock, x), timeout=3, message='a change in the folder made during the walk is not queued')
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=2)
+		rv.GREEN_LIGHT.set()
+
+
+def _kernel_watches(inotify_obj):
+	with open(f'/proc/self/fdinfo/{inotify_obj.fileno()}', encoding='utf-8') as f:
+		return sum(line.startswith('inotify wd:') for line in f)
+
+
+def _fail_scandir(monkeypatch, folder, code=errno.EIO):
+	real = os.scandir
+	def scandir(path='.'):
+		if os.path.abspath(path) == folder:
+			raise OSError(code, os.strerror(code), path)
+		return real(path)
+	monkeypatch.setattr(os, 'scandir', scandir)
+
+
+WATCH_FLAGS = rv.inotify_simple.flags.CREATE | rv.inotify_simple.flags.MODIFY
+
+
+def test_an_unreadable_folder_gives_its_watch_back_and_is_left_unwatched(tmp_path, monkeypatch):
+	for rel in ('k/s', 'u/v'):
+		os.makedirs(tmp_path / rel)
+	root, k, u = str(tmp_path), str(tmp_path / 'k'), str(tmp_path / 'u')
+	_fail_scandir(monkeypatch, u)
+	irm = rv.inotify_resource_manager()
+	wdDic, unwatched = rv.bidict(), set()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		assert rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched) != -1
+		# nothing can be told about what is in u: neither it nor v is watched
+		assert sorted(path.rstrip('/') for path in wdDic.values()) == [root, k, os.path.join(k, 's')]
+		assert irm.current_user_watches == len(wdDic) == _kernel_watches(inotify_obj)
+	assert unwatched == {u}
+
+
+@pytest.mark.parametrize('code, left_unwatched', [(errno.EACCES, True), (errno.ENOSPC, True), (errno.ENOENT, False), (errno.ENOTDIR, False)],
+	ids=['EACCES', 'ENOSPC', 'ENOENT', 'ENOTDIR'])
+def test_a_folder_whose_watch_fails_is_left_unwatched_unless_it_is_gone(tmp_path, code, left_unwatched):
+	for rel in ('k/s', 'f/g'):
+		os.makedirs(tmp_path / rel)
+	root, f = str(tmp_path), str(tmp_path / 'f')
+	class Failing:
+		def __init__(self, inner):
+			self.inner = inner
+		def add_watch(self, path, mask):
+			if path.rstrip('/') == f:
+				raise OSError(code, os.strerror(code), path)
+			return self.inner.add_watch(path, mask)
+		def rm_watch(self, wd):
+			return self.inner.rm_watch(wd)
+	irm = rv.inotify_resource_manager()
+	wdDic, unwatched = rv.bidict(), set()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		rv.initializeFolderWatchers(Failing(inotify_obj), root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
+		assert f not in {path.rstrip('/') for path in wdDic.values()}
+		assert irm.current_user_watches == len(wdDic) == _kernel_watches(inotify_obj)
+	assert unwatched == ({f} if left_unwatched else set())
+
+
+def test_a_folder_watched_twice_is_counted_once(tmp_path):
+	os.makedirs(tmp_path / 'k' / 's')
+	irm = rv.inotify_resource_manager()
+	wdDic = rv.bidict()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		rv.initializeFolderWatchers(inotify_obj, str(tmp_path), wdDic, irm, WATCH_FLAGS)
+		# a folder made while its parent's walk ran is in the walk and raises its create, which watches it again
+		rv.initializeFolderWatchers(inotify_obj, str(tmp_path / 'k'), wdDic, irm, WATCH_FLAGS)
+		assert irm.current_user_watches == len(wdDic) == _kernel_watches(inotify_obj) == 3
