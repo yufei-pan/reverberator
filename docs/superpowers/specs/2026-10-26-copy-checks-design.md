@@ -173,4 +173,4 @@ resumed pending batch counts as round-tripped, so the follow-up full comparison 
 
 ## Left to the builder
 
-Exact names beyond those above, where the age check sits, and how the take time reaches the commit.
+Exact names beyond those above, and how the read time reaches the final commit.
