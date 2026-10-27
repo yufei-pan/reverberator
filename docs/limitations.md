@@ -62,3 +62,129 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** nothing tells a disk being rebuilt from one that is whole.
 - **Revisit when:** it bites.
 - **Approved:** 2026-10-23, the user's choice "Known limitation, README says stop it (Recommended)".
+
+### Kernels before 6.8 and the pool check
+
+- **Kind:** known limitation.
+- **What the operator sees:** on a kernel before 6.8, a disk of a pool swapped very quickly for another may not pause its
+  jobs. This host runs 7.0.
+- **Why:** statx gives no unique mount id before 6.8, so the check falls back to mountinfo ids, which the kernel reuses.
+- **Revisit when:** reverberator runs on an older kernel.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### A disk that is dying but not yet failed
+
+- **Kind:** known limitation.
+- **What the operator sees:** jobs keep writing to a dying disk until its filesystem shuts down (XFS) or flags a
+  checkpoint error (f2fs); only then do they pause, as for a missing disk.
+- **Why:** catching it earlier needs SMART or I/O-error watching, which is a separate tool.
+- **Revisit when:** a disk fails without its filesystem noticing.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### Two pools out at once are reported one after the other
+
+- **Kind:** known limitation.
+- **What the operator sees:** when a vault disk and a monitored disk are both missing, an idle or batching job's waiting
+  marker names one pool; once that pool is back, a second marker names the other. Nothing is lost.
+- **Why:** each wait is for one path, and a combined wait would add a part for a rare case.
+- **Revisit when:** the two-step report confuses.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### Copies marked checked before they reach the disk
+
+- **Kind:** deferred (round 10).
+- **What the operator sees:** after a power loss, a copy made in the last ~30 s can be short on disk while the vault
+  database marks it checked, so the restart's full comparison does not read it back, and that version keeps the short
+  copy until the file changes.
+- **Why:** copies are never flushed when written, by design: each stays unchecked until a full comparison (every
+  restart) reads it back and copies again any that does not match. But a later batch's check can read a recent copy back
+  from the page cache and mark it checked before its bytes reach the disk.
+- **Revisit when:** round 10: add a power-loss test (a newest copy left short, then a restart copies it again), and
+  flush a copy just before it is marked checked: one fsync per copy, never on the write path.
+- **Approved:** 2026-10-26. The user: "I am thinking this is less of a big deal because we are a backup tool? compare to
+  cossting every single write, (fine on our setup but maybe very costly on network vaults?) maybe a full compare is
+  less costly? considering this will only happen on power loss?", then "Defer to round 10 (Recommended)".
+
+### Files written through mmap
+
+- **Kind:** deferred (round 10).
+- **What the operator sees:** a file written through mmap raises no inotify event. If its mode, owner or xattrs then
+  change in the same batch, the version keeps its old bytes under the new metadata, and a full comparison does not see
+  it either (same size, mtime as synced, same tail), until the file is written normally again. 0.44 did the same.
+- **Why:** the only sure fix is reading whole files.
+- **Revisit when:** round 10: look for a way to catch mmap writes, or to tell that a file is mmapped.
+- **Approved:** 2026-10-26. The user: "let's defer. let's see if we can catch something, or if we can know if a file is
+  mmaped".
+
+### A file moved and then touched in one batch is copied again
+
+- **Kind:** known limitation.
+- **What the operator sees:** a file moved and then given a new mtime (`touch -m`, `rsync -t`) in the same batch is
+  copied again whole by the check after the batch, and the size estimate does not count that copy.
+- **Why:** letting a moved row vouch for its copy would weaken the guard that keeps a swap from putting one file's
+  metadata on another's copy.
+- **Revisit when:** it costs noticeable space.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### Swaps in one batch are repaired by copies
+
+- **Kind:** known limitation.
+- **What the operator sees:** a swap collapsed in one batch (`mv a t; mv b a; mv t b`) copies both files again instead of
+  renaming them, and logs `Failed to move … delete & copy instead` at ERROR level (firewatcher does not alert on it). The
+  result is right.
+- **Why:** renaming them in one step would need a change-list format change.
+- **Revisit when:** the change list's format changes for another reason.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### Full comparisons read every changed entry's xattrs since the previous version
+
+- **Kind:** deferred (round 10).
+- **What the operator sees:** a full comparison (restart, failed attempt, overflow) also compares the xattrs of every entry
+  changed since the version before the newest. After a version that changed every entry, that is all of them: on the
+  0.45 restart, panruixin_files' comparison took 252 s instead of 15-21 s, and it stays that slow until that job's next
+  version. Nothing is wrong, only slow.
+- **Why:** that version's time is the latest time the vault holds for when it last matched the tree.
+- **Revisit when:** round 10: the vault database records when each batch or comparison last found the vault matching,
+  and that becomes the bound.
+- **Approved:** 2026-10-26, the user's choice "Defer to round 10 (Recommended)".
+
+### A file moved into a folder made in the same batch shows at its old place too
+
+- **Kind:** deferred (round 10). This was already in 0.44.
+- **What the operator sees:** after `mkdir d; mv a.txt d/a.txt` in one batch, the versions made in the next ~30 s hold
+  a.txt at its old place as well as d/a.txt, which the live tree does not.
+- **Why:** the move into the brand-new folder is not seen, so its move-out waits ~30 s for a pair before it becomes a
+  delete, and the check after a batch does not look at its path meanwhile.
+- **Revisit when:** round 10: the check after a batch also compares the paths whose move-out is still waiting for its
+  pair.
+- **Approved:** 2026-10-26, the user's choice "Defer to round 10 (Recommended)".
+
+### A move into a folder made after an earlier move in one batch
+
+- **Kind:** known limitation.
+- **What the operator sees:** `mv d e; mkdir e/sub; mv x e/sub/x` in one batch falls back to delete & copy for x, logging
+  `Failed to move … delete & copy instead` at ERROR level (firewatcher does not alert on it), and x is copied once more.
+  The result is right.
+- **Why:** replaying such moves in batch order is a larger change to the replay for one extra copy in a rare order.
+- **Revisit when:** it is seen often.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### One folder renamed back and forth thousands of times in one batch
+
+- **Kind:** known limitation.
+- **What the operator sees:** the batch's collapse slows: 12,500 round trips of one folder take 49 s, as every event
+  inside it is carried through each rename. Normal use, even 50k moves of different paths, stays under a second.
+- **Why:** a memo that fixes it does not fit in a small, clean change.
+- **Revisit when:** a real workload does this.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### Size estimates leave out a version's own small blocks
+
+- **Kind:** known limitation.
+- **What the operator sees:** with a size limit, the estimate made before a backup leaves out the new version's own
+  folders, links and xattr blocks (a few KB, at most ~77 KB in testing) and a change kept under a folder moved into a new
+  folder (up to that file's size), so a vault can go over its limit by that much until the next prune. The sizes recorded
+  after each backup are measured, so later prunes are right.
+- **Why:** counting them would add estimates for a small, one-batch overshoot.
+- **Revisit when:** a vault's limit is tight enough for it to matter.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
