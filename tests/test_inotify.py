@@ -410,11 +410,12 @@ def test_a_move_out_reaches_a_batch_signalled_before_it(job, tmp_path, poll_fast
 
 def busy_takes(job, to_process, lock, flag, after):
 	'''
-	Write a new file every 0.1 s, so the tree is never quiet, and take each batch the watcher signals, until one more
-	after the first batch for which after(rels) holds: every event read before that batch's take is then handled.
+	Write a new file every 0.1 s, so the tree is never quiet, and take each batch the watcher signals, until two more
+	after the first batch for which after(rels) holds: a move-out read before that batch's take then has a whole read
+	behind it, so the last batch carries it if it is still held.
 	'''
 	batches = []
-	seen = False
+	more = None
 	deadline = time.monotonic() + 10
 	k = 0
 	while time.monotonic() < deadline:
@@ -422,9 +423,12 @@ def busy_takes(job, to_process, lock, flag, after):
 		k += 1
 		if flag.is_set():
 			batches.append(taken(to_process, lock, flag))
-			if seen:
-				return batches
-			seen = after(rels(job, batches[-1]))
+			if more is not None:
+				more -= 1
+				if not more:
+					return batches
+			elif after(rels(job, batches[-1])):
+				more = 2
 		time.sleep(0.1)
 	raise AssertionError('the watcher signalled no batch')
 

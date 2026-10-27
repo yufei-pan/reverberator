@@ -230,10 +230,11 @@ class ChangeEventQueue:
 	(None until the watcher sets it): every change made before it has its event in the queue or an earlier batch.
 	Only the watcher sets it, under the lock, and clear() and a full scan leave it: an older stamp is a safe claim. take()
 	copies it into the batch and keeps it here.
-	pending_move_outs is the set of absolute paths whose move-out the watcher holds, waiting for its pair: no event of
-	the queue says they are gone. The watcher adds each as it holds it and drops those no longer held once a read's events
-	are all queued, so the set is never smaller than what is held. take() copies it into the batch and keeps it here,
-	and touched_scopes() compares those paths, so a batch taken while one is held has no phantom at its old place.
+	pending_move_outs is the set of absolute paths whose move-out the watcher holds and whose pair can no longer come: no
+	event of the queue says they are gone. The watcher sets it once a read's events are all queued: after a read with
+	events, the move-outs held since an earlier read (a pair can straddle one read boundary); after an empty read, every
+	one held. take() copies it into the batch and keeps it here, and touched_scopes() compares those paths, so a batch
+	taken while one is held has no phantom at its old place, and a rename split by a take stays a move.
 
 	Examples:
 		>>> queue = ChangeEventQueue('/m')
@@ -2470,11 +2471,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	def add_pending_move_from(cookie,change_event:ChangeEvent):
 		pop_pending_move_from(cookie)
 		pendingMoveFromEvents[cookie] = change_event
-		path_norm = change_event.path.rstrip('/')
-		pendingMoveFromPaths.setdefault(path_norm,{})[cookie] = None
-		# at once, as the backuper can take the batch while this read's events are handled
-		with to_process_lock:
-			to_process.pending_move_outs.add(path_norm)
+		pendingMoveFromPaths.setdefault(change_event.path.rstrip('/'),{})[cookie] = None
 	def pop_pending_move_from(cookie) -> ChangeEvent:
 		change_event = pendingMoveFromEvents.pop(cookie,None)
 		if change_event is not None:
@@ -2561,7 +2558,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					# one signalled and not taken yet, rather than a phantom at its old place until the pair timeout
 					for cookie in list(pendingMoveFromEvents):
 						expire_move_out(cookie)
-				# nothing more is pending from this read, so its time is the batch's matched time
+				# nothing more is pending from this read, so its time is the batch's matched time, and no pair is still
+				# coming for a move-out held now
 				with to_process_lock:
 					to_process.read_wall_ns = read_began
 					to_process.pending_move_outs = set(pendingMoveFromPaths)
@@ -2737,11 +2735,13 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'modify',eventPath,None))
 				else:
 					watcherTeeLogToTl(monitor_path,f'Unprocessed event {event}')
-			# every event of this read is queued: a batch taken from now on may claim the vault matched the tree as of read_began,
-			# and a move-out popped in it has its event queued, so it is no longer held
+			# a pair can straddle one read boundary: a move-out read in this read may still pair in the next one, so only
+			# those held since an earlier read are carried (a batch carrying one whose move then came would lose it)
+			unpaired = {path for path, cookies in pendingMoveFromPaths.items() if any(pendingMoveFromEvents[cookie].monotonic_time < monTime for cookie in cookies)}
+			# every event of this read is queued: a batch taken from now on may claim the vault matched the tree as of read_began
 			with to_process_lock:
 				to_process.read_wall_ns = read_began
-				to_process.pending_move_outs = set(pendingMoveFromPaths)
+				to_process.pending_move_outs = unpaired
 	return WATCH_RESULT_OK
 
 def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):

@@ -296,7 +296,7 @@ def test_a_move_out_pending_at_a_max_delay_hand_over_still_pairs(job, monkeypatc
 	assert [(e.event, e.path, e.moved_from) for e in queue] == [('create', f'{m}/f', None), ('move', f'{m}/b', f'{m}/a')]
 
 
-def test_a_move_out_held_when_a_batch_is_taken_goes_with_it(job, monkeypatch):
+def test_a_move_out_held_for_a_whole_read_goes_with_a_batch_taken_after_it(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
 	batches = []
@@ -304,13 +304,66 @@ def test_a_move_out_held_when_a_batch_is_taken_goes_with_it(job, monkeypatch):
 		# the backuper takes the batch the max-delay hand-over signalled, before this read's events are handled
 		batches.append(queue.take())
 		return [(flags.CREATE, 'g', 0)]
-	reads = [[(flags.CREATE, 'f', 0)], [(flags.MOVED_FROM, 'a', 7), (flags.MOVED_FROM | flags.ISDIR, 'D', 8)], take]
+	reads = [[(flags.CREATE, 'f', 0)], [(flags.MOVED_FROM, 'a', 7)], [(flags.MOVED_FROM | flags.ISDIR, 'D', 8)], take]
 	queue, flag, _ = scripted_watch(monkeypatch, m, reads, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=0)
 	assert [(e.event, e.path) for e in batches[0]] == [('create', f'{m}/f')]
-	assert batches[0].pending_move_outs == {f'{m}/a', f'{m}/D'}
-	# still held: the queue keeps its own
+	# a read has passed since a's move-out, so its pair cannot come; D's could still come in the next read
+	assert batches[0].pending_move_outs == {f'{m}/a'}
+	# still held, and an empty read carries every held one: the queue keeps its own
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/g')]
 	assert queue.pending_move_outs == {f'{m}/a', f'{m}/D'}
+
+
+def capture_errors(monkeypatch):
+	lines = []
+	real = rv.backuperTeeLogToTl
+	def spy(path, message, error=False, **kwargs):
+		if error:
+			lines.append(message)
+		return real(path, message, error=error, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', spy)
+	return lines
+
+
+def take_before_first(monkeypatch, kind, batches):
+	'''Take the queue right before the watcher queues its first event of kind: a take landing mid-read.'''
+	real = rv.append_change_event
+	def wrapped(to_process, lock, event):
+		if not batches and event.event == kind:
+			batches.append(to_process.take())
+		return real(to_process, lock, event)
+	monkeypatch.setattr(rv, 'append_change_event', wrapped)
+
+
+@pytest.mark.parametrize('split', ['mid-read', 'across reads'])
+def test_a_rename_split_by_a_take_stays_a_move_in_the_next_batch(job, monkeypatch, split):
+	seed_monitor(job, {'D/sub/x': 'x' * 1000, 'D/y': 'y', 'keep.txt': 'k', 'f': 'f'})
+	run_backup(job)
+	m = job.monitor
+	os.rename(os.path.join(m, 'D'), os.path.join(m, 'E'))
+	flags = rv.inotify_simple.flags
+	batches = []
+	moved_from, moved_to = (flags.MOVED_FROM | flags.ISDIR, 'D', 7), (flags.MOVED_TO | flags.ISDIR, 'E', 7)
+	if split == 'mid-read':
+		take_before_first(monkeypatch, 'move', batches)
+		reads = [[(flags.MODIFY, 'f', 0), moved_from, moved_to]]
+	else:
+		reads = [[(flags.MODIFY, 'f', 0), moved_from], lambda queue: batches.append(queue.take()) or [moved_to]]
+	queue, _, _ = scripted_watch(monkeypatch, m, reads, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=3600)
+	first, second = batches[0], queue.take()
+	assert [(e.event, e.path) for e in first] == [('modify', f'{m}/f')]
+	assert [(e.event, e.path, e.moved_from) for e in second] == [('move', f'{m}/E', f'{m}/D')]
+	monkeypatch.undo()
+	rv.GREEN_LIGHT.set()
+	errors = capture_errors(monkeypatch)
+	run_backup(job, rv.change_events_to_backup_entries(first, m), touched=rv.touched_scopes(first, m))
+	v2 = run_backup(job, rv.change_events_to_backup_entries(second, m), touched=rv.touched_scopes(second, m))[-1]
+	assert errors == []
+	assert not os.path.lexists(os.path.join(v2, 'D'))
+	# moved in the vault, not copied again
+	assert os.path.islink(os.path.join(v2, 'E', 'sub', 'x')) and open(os.path.join(v2, 'E', 'sub', 'x')).read() == 'x' * 1000
+	# its pair could still come when the first batch was taken
+	assert not first.pending_move_outs
 
 
 def test_a_move_out_no_longer_held_is_not_carried(job, monkeypatch):
