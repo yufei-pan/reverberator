@@ -847,3 +847,28 @@ def test_read_times_publish_again_once_an_unwatched_folder_in_a_new_folder_is_go
 		else:
 			os.rename(bad, str(tmp_path / 'bad'))
 		wait_until(lambda: _published(to_process, lock), timeout=3, message='no read time though nothing is unwatched')
+
+
+def test_a_rewalk_that_cannot_read_a_held_folder_keeps_its_watch(job, poll_fast, monkeypatch):
+	P, Q = os.path.join(job.monitor, 'P'), os.path.join(job.monitor, 'Q')
+	S = os.path.join(Q, 'S')
+	os.makedirs(os.path.join(P, 'S'))
+	real = os.scandir
+	failed = []
+	def scandir(path='.'):
+		if os.path.abspath(path) == S:
+			# S renamed in Q after the re-walk listed Q: reading it fails, and its own rename event handles it
+			failed.append(path)
+			raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		return real(path)
+	with _ready_watch(job) as (to_process, lock, flag):
+		monkeypatch.setattr(os, 'scandir', scandir)
+		# mv P Q walks Q again; S's watch is held from before the walk, so the walk's error on S leaves it in place
+		os.rename(P, Q)
+		wait_until(lambda: failed, message='the re-walk did not reach S')
+		wait_until(lambda: _moved_to(to_process, lock, Q), message='no move')
+		monkeypatch.setattr(os, 'scandir', real)
+		_consume_batch(to_process, lock, flag)
+		late = os.path.join(S, 'late.txt')
+		open(late, 'w').write('a later change in the held folder')
+		wait_until(lambda: _has_create(to_process, lock, late), timeout=3, message='the re-walk dropped a watch it did not add')

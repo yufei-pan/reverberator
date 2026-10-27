@@ -2840,7 +2840,8 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	Watch monitor_path and every folder under it that the skip list keeps; returns monitor_path's watch, or -1 without one.
 	Each folder's watch is added as the walk reaches it, before the walk reads the folder: a folder made in it afterwards
 	raises its create, and one made before is in the walk, so cp -r or tar x racing the walk leaves nothing unwatched.
-	A folder the walk cannot read gets no watch: nothing can be told about what is in it.
+	A folder the walk cannot read gets no watch from it: nothing can be told about what is in it. One whose watch was held
+	before the walk keeps it ( a subfolder renamed after the walk listed its parent ): its own rename or delete event handles it.
 	Each folder left unwatched that is still there (unreadable, or its watch failed other than by being gone) is added to
 	unwatched when given: no event reports a change in it. The walk tells again what under monitor_path is unwatched, so
 	what unwatched held there before goes first ( a folder made again, or a disk mounted again, is watched in full ).
@@ -2848,6 +2849,8 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	if not os.path.exists(monitor_path):
 		return -1
 	root_norm = monitor_path.rstrip('/') or '/'
+	# the watches this walk added, not ones it found held: only those does it take back
+	added = set()
 	# the walk goes into inner mounts too, so what it drops there it adds back if it still fails
 	forget_unwatched_under(unwatched,root_norm)
 	def watch(folder:str):
@@ -2864,6 +2867,8 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 		if wd in wdDic:
 			# held already: a folder made while its parent's walk ran is in the walk and raises its create too
 			irm.decreaseUserWatches()
+		else:
+			added.add(wd)
 		if newDirWds is not None:
 			newDirWds.add(wd)
 		wdDic[wd] = folder
@@ -2887,8 +2892,12 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 		if folder == root_norm:
 			# keeps its watch, for the events of what is in it
 			continue
-		watcherTeeLogToTl(monitor_path,f'Not watching unreadable folder {folder}: {error}',error=True)
 		wd = watched.pop(folder, None)
+		if wd is not None and wd not in added:
+			# held before this walk ( a subfolder renamed after the walk listed its parent ): its own rename or delete
+			# event handles it, and the events already queued on its watch still come
+			continue
+		watcherTeeLogToTl(monitor_path,f'Not watching unreadable folder {folder}: {error}',error=True)
 		# only while the watch is still the folder's here: one moved ahead of the walk (renamed before it was read, into a
 		# folder not walked yet) is found again at its new name, and add_watch hands back the same watch for it
 		if wd is not None and wdDic.get(wd, '').rstrip('/') == folder:
