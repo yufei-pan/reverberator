@@ -1620,16 +1620,27 @@ def vault_on(request, job, where):
 	return request.getfixturevalue('fake_pool').add(job.vault, ['a', 'b'])[0]
 
 
-def cut_off_at_the_swap(job, step='swap'):
-	'''A backup of three_versions' job killed at step of its commit: the folder it left.'''
+def cut_off_at_the_swap(job, step='swap', **backup_options):
+	'''A backup of three_versions' job killed at step of its commit, run with backup_options: the folder it left.'''
 	# a monkeypatch of its own: undoing the test's would undo a fake pool's too
 	with pytest.MonkeyPatch.context() as hooks:
 		commit_hooks(hooks, kill_at=step)
 		with pytest.raises(Killed):
-			run_backup(job, keep_modified(job, 'cut'))
+			run_backup(job, keep_modified(job, 'cut'), **backup_options)
 	attempt = [name for name in os.listdir(job.job_vault) if name.startswith('V3--') and os.path.isdir(os.path.join(job.job_vault, name))]
 	assert len(attempt) == 1
 	return os.path.join(job.job_vault, attempt[0])
+
+
+def test_a_cut_off_commits_key_is_not_used_once_the_scan_rolls_it_back(tmp_path):
+	job = three_versions(tmp_path)
+	attempt = cut_off_at_the_swap(job, matched_since=time.time_ns())
+	restart_and_scan(job)
+	infos = rv.get_vault_info(job.job_vault).vault_info_dict
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.matched[0] == os.path.basename(attempt)
+	assert rv.full_comparison_since(infos, manifest.matched) == rv.full_comparison_since(infos)
+	manifest.close()
 
 
 @pytest.mark.parametrize('where', ['plain', 'pool'])
