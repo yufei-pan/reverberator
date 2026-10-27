@@ -51,6 +51,26 @@ def _start_watch(job, to_process, to_process_flag, min_snapshot_delay_seconds=0,
 	return thread, lock
 
 
+def test_a_read_time_past_a_change_means_its_event_is_queued(job, poll_fast):
+	to_process = rv.ChangeEventQueue(job.monitor)
+	flag = threading.Event()
+	thread, lock = _start_watch(job, to_process, flag)
+	try:
+		_wait_watch_ready(job, to_process, lock)
+		path = os.path.join(job.monitor, 'f.txt')
+		open(path, 'w').write('a')
+		done = time.time_ns()
+		def published():
+			with lock:
+				return (to_process.read_wall_ns or 0) > done, [e for e in to_process if e.path == path and e.event == 'create']
+		wait_until(lambda: published()[0], message='no read time past the change')
+		assert published()[1]
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=2)
+		rv.GREEN_LIGHT.set()
+
+
 def test_file_create_modify_delete_attrib(job, poll_fast):
 	to_process = rv.ChangeEventQueue()
 	flag = threading.Event()
