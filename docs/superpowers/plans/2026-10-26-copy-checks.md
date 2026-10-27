@@ -827,6 +827,11 @@ Added by the main session after Task 2's second-opinion stress run (pre-existing
 - [ ] **Step 5: Commit:** "A folder renamed before the watcher handles its create gets its watches at its new name, so
   changes made in it later reach a batch."
 
+- **Also (from Task 8's report):** `rewatch_moved_folder()`, used for a folder move under a location-dependent skip list,
+  still lists the whole moved folder and only then adds the missing watches: the same race Task 8 closed in
+  `initializeFolderWatchers()`. Give it the same order (each folder's watch added as the walk reaches it, before reading
+  it), reusing Task 8's walk where it fits, with a test like Task 8's walk-race test on a moved folder.
+
 **Calls to confirm:** added to round 10 by the main session (a pre-existing silent loss).
 
 ---
