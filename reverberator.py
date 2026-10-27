@@ -4154,7 +4154,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				# with nothing to resume. a batch of scans only, resumed, cannot tell what changed while the daemon was
 				# down outside its folders. it runs now, without waiting for the watcher's signal, and the queue is left
 				# to the watcher: its new folders' events are recorded again only once it sees its batch taken
-				backuperTeeLogToTl(job_name,'The batch backed up was handed back or resumed, keeping only its collapsed entries: comparing the whole tree next')
+				backuperTeeLogToTl(job_name,'The batch was handed back or resumed: comparing the whole tree next')
 				follow_up = True
 			backupEntries.clear()
 			scan_folders = []
