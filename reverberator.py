@@ -1818,15 +1818,23 @@ def fsync_vault_folder(path:str) -> None:
 	without it is passed over, and the first other error is raised once every branch was tried. A branch list that cannot
 	be read raises its OSError. Off a pool it is fsync_path(path, folder=True).
 	'''
+	on_vault_branches(path, lambda folder: fsync_path(folder, folder=True))
+
+def on_vault_branches(path:str, action) -> None:
+	'''
+	Run action(folder) on the folder at path on the disks themselves. On a mergerfs pool that is the folder on each branch
+	holding it; a branch without it is passed over, and the first other OSError is raised once every branch was tried. A
+	branch list that cannot be read raises its OSError. Off a pool it is action(path).
+	'''
 	pool = mergerfs_mount(read_mount_table(), path)
 	if pool is None:
-		fsync_path(path, folder=True)
+		action(path)
 		return
 	rel = os.path.relpath(os.path.realpath(path), pool)
 	failure = None
 	for branch in read_pool_branches(pool):
 		try:
-			fsync_path(os.path.join(branch, rel), folder=True)
+			action(os.path.join(branch, rel))
 		except (FileNotFoundError, NotADirectoryError):
 			pass
 		except OSError as e:
@@ -1834,26 +1842,17 @@ def fsync_vault_folder(path:str) -> None:
 	if failure is not None:
 		raise failure
 
-def load_syncfs():
-	'''libc's syncfs(), None when this libc has none (Python has no os.syncfs).'''
-	try:
-		syncfs = ctypes.CDLL(None, use_errno=True).syncfs
-	except (OSError, AttributeError):
-		return None
-	syncfs.argtypes = [ctypes.c_int]
-	syncfs.restype = ctypes.c_int
-	return syncfs
-
-LIBC_SYNCFS = load_syncfs()
+# Python has no os.syncfs
+LIBC_SYNCFS = ctypes.CDLL(None, use_errno=True).syncfs
+LIBC_SYNCFS.argtypes = [ctypes.c_int]
+LIBC_SYNCFS.restype = ctypes.c_int
 
 def syncfs_folder(path:str) -> None:
 	'''
 	syncfs the filesystem holding the folder at path: every dirty page of it is written before this returns, and a
-	writeback error the filesystem met since and never reported is raised. Raises OSError (ENOSYS without a libc
-	syncfs, FileNotFoundError or NotADirectoryError for a path that is no folder).
+	writeback error the filesystem met since and never reported (once: the next sync gets 0) is raised. Raises
+	OSError, FileNotFoundError or NotADirectoryError for a path that is no folder.
 	'''
-	if LIBC_SYNCFS is None:
-		raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS), path)
 	fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
 	try:
 		if LIBC_SYNCFS(fd) != 0:
@@ -1866,25 +1865,9 @@ def sync_vault_filesystems(job_vault:str) -> None:
 	'''
 	Write out everything dirty on the disks holding the job vault at job_vault, for a comparison to record the copies it
 	read back as checked (compare_scopes()). On a mergerfs pool, whose sync does not reach the disks, that is each branch
-	holding the job vault (as fsync_vault_folder() finds them); off a pool, the job vault's own filesystem. A branch
-	without the folder is passed over, and the first other error is raised once every branch was tried. A branch list
-	that cannot be read raises its OSError.
+	holding the job vault (on_vault_branches()); off a pool, the job vault's own filesystem.
 	'''
-	pool = mergerfs_mount(read_mount_table(), job_vault)
-	if pool is None:
-		syncfs_folder(job_vault)
-		return
-	rel = os.path.relpath(os.path.realpath(job_vault), pool)
-	failure = None
-	for branch in read_pool_branches(pool):
-		try:
-			syncfs_folder(os.path.join(branch, rel))
-		except (FileNotFoundError, NotADirectoryError):
-			pass
-		except OSError as e:
-			failure = failure or e
-	if failure is not None:
-		raise failure
+	on_vault_branches(job_vault, lambda folder: syncfs_folder(folder))
 
 # the private folder prepare_change_list() writes a change list in before place_change_list() renames it into place: made
 # by mkdtemp() in the job vault, which no reader takes for a version or a change list, and removed by get_vault_info()
@@ -8510,13 +8493,15 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 				if found.kind == 'f':
 					if not synced and not found.unchecked:
 						# the first copy to record as checked: all those read back here were made before this sync, so
-						# once it succeeds they are on the disks, and a writeback error it meets keeps them unchecked
+						# once it succeeds they are on the disks. a data-write error is reported once, to the first sync
+						# after it: this comparison keeps its copies unchecked, but a later comparison's sync gets 0 and
+						# can record a copy checked from the page cache
 						synced = True
 						try:
 							sync_vault_filesystems(os.path.dirname(os.path.abspath(version_path)))
 						except Exception as e:
 							sync_failed = True
-							backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Could not sync the vault to disk: {e}; copies read back are kept unchecked until a comparison can')
+							backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed ({e}), so this comparison\'s copies read back stay unchecked')
 					if sync_failed:
 						found = found._replace(unchecked=1)
 				manifest.set_records(((rel, found),))
