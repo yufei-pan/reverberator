@@ -166,15 +166,15 @@ def test_location_dependent_move_rewatches_subtree(job, poll_fast):
 		_stop(thread)
 
 
-def test_location_free_move_does_not_rewatch(job, poll_fast, monkeypatch):
+def test_a_location_free_move_skips_the_newly_skipped_watch_removal(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a/': None, 'b/': None})
 	calls = []
-	monkeypatch.setattr(rv, 'rewatch_moved_folder', lambda *args, **kwargs: calls.append(args))
+	monkeypatch.setattr(rv, 'remove_newly_skipped_watches', lambda *args, **kwargs: calls.append(args))
 	thread, to_process, lock = _start(job, ['*.tmp'])
 	try:
 		os.rename(os.path.join(job.monitor, 'a'), os.path.join(job.monitor, 'b', 'a'))
 		wait_until(lambda: any(e.event == 'move' for e in _events(to_process, lock)), message='move not seen')
-		# the probe is read after the move, so a re-walk of the moved folder would have happened by now
+		# the probe is read after the move, so the removal would have run by now: a name-only list skips the same folders anywhere
 		_probe(job, to_process, lock)
 		assert calls == []
 	finally:
