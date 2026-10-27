@@ -356,12 +356,15 @@ class FakePool:
 		return list(self.pools[pool])
 
 
-def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, **watch_kwargs) -> tuple:
+def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, watches:dict = None, irm=None, **watch_kwargs) -> tuple:
 	'''
 	Run rv.watchFolder on monitor, in this thread, with an inotify that returns each item of reads in turn and then stops.
 	An item is a list of (mask, name, cookie) on the root watch (wd 1), or of (mask, name, cookie, wd) on another folder's
 	watch (each folder the watcher adds gets the next wd from 2), or a callable taking the queue and returning such a
 	list. After the last item the fake clears rv.GREEN_LIGHT (conftest sets it again) and returns [].
+	With watches (a dict), the watcher's own walk runs on the folders on disk, and the fake hands out watches as the kernel
+	does, one per folder, kept in watches as (st_dev, st_ino) -> wd from 1 (the root): watching a folder that is gone
+	raises ENOENT, and a folder watched again, at any name, gets its watch back.
 	Returns (queue, flag, returned): returned holds the wall clock ns at which each read returned.
 	'''
 	queue = rv.ChangeEventQueue(monitor) if queue is None else queue
@@ -384,10 +387,20 @@ def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, 
 			returned.append(time.time_ns())
 			return [Event(event[3] if len(event) > 3 else 1, event[0], event[2], event[1]) for event in item]
 		def add_watch(self, path, mask):
-			return 1
+			if watches is None:
+				return 1
+			st = os.stat(path)
+			key = (st.st_dev, st.st_ino)
+			if key not in watches:
+				watches[key] = next_kernel_wd[0]
+				next_kernel_wd[0] += 1
+			return watches[key]
 		def rm_watch(self, wd):
-			pass
+			if watches is not None:
+				for key in [key for key, held in watches.items() if held == wd]:
+					del watches[key]
 	next_wd = [2]
+	next_kernel_wd = [1]
 	def initialize(inotify_obj, monitor_path, wdDic, irm, watch_flags, newDirWds=None, **kwargs):
 		# wd 1 is the root only: any other folder gets a watch of its own, which a scripted event names in its 4th field
 		wd = 1 if monitor_path == monitor else next_wd[0]
@@ -398,8 +411,9 @@ def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, 
 		wdDic[wd] = monitor_path
 		return wd
 	monkeypatch.setattr(rv.inotify_simple, 'INotify', FakeINotify)
-	monkeypatch.setattr(rv, 'initializeFolderWatchers', initialize)
-	rv.watchFolder(monitor, queue, threading.Lock(), flag, rv.inotify_resource_manager(), **watch_kwargs)
+	if watches is None:
+		monkeypatch.setattr(rv, 'initializeFolderWatchers', initialize)
+	rv.watchFolder(monitor, queue, threading.Lock(), flag, rv.inotify_resource_manager() if irm is None else irm, **watch_kwargs)
 	return queue, flag, returned
 
 

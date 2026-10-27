@@ -709,3 +709,122 @@ def test_a_folder_moved_ahead_of_the_walk_keeps_its_watch_at_its_new_name(job, p
 		rv.GREEN_LIGHT.clear()
 		thread.join(timeout=2)
 		rv.GREEN_LIGHT.set()
+
+
+def _in_one_read(monkeypatch, step):
+	'''Run step while the watcher waits to read, so every change step makes comes in the same read.'''
+	real_read = rv.inotify_simple.INotify.read
+	waiting, go = threading.Event(), threading.Event()
+	def read(self, *args, **kwargs):
+		waiting.set()
+		go.wait(5)
+		return real_read(self, *args, **kwargs)
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+	try:
+		assert waiting.wait(5), 'the watcher did not read'
+		step()
+	finally:
+		monkeypatch.setattr(rv.inotify_simple.INotify, 'read', real_read)
+		go.set()
+
+
+@contextlib.contextmanager
+def _ready_watch(job, **watch_kwargs):
+	'''A real watcher at a 0.2 s quiet hand-over, ready and with its first batch taken.'''
+	to_process = rv.ChangeEventQueue(job.monitor)
+	flag = threading.Event()
+	lock = threading.Lock()
+	thread = threading.Thread(target=rv.watchFolder, kwargs=dict(monitor_path=job.monitor, to_process=to_process, to_process_lock=lock,
+		to_process_flag=flag, irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=0.2, **watch_kwargs), daemon=True)
+	thread.start()
+	try:
+		_wait_watch_ready(job, to_process, lock)
+		_consume_batch(to_process, lock, flag)
+		yield to_process, lock, flag
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=2)
+		rv.GREEN_LIGHT.set()
+
+
+def _moved_to(to_process, lock, path):
+	return any(e.event == 'move' and e.path.rstrip('/') == path for e in _events(to_process, lock))
+
+
+def test_a_folder_made_and_renamed_at_once_is_watched_at_its_new_name(job, poll_fast, monkeypatch):
+	d, e = os.path.join(job.monitor, 'd'), os.path.join(job.monitor, 'e')
+	with _ready_watch(job) as (to_process, lock, flag):
+		# mkdir d; mv d e, as a tool that makes a folder under a temporary name does: d is gone when its create is handled
+		_in_one_read(monkeypatch, lambda: (os.mkdir(d), os.rename(d, e)))
+		wait_until(lambda: _moved_to(to_process, lock, e), message='no move')
+		_consume_batch(to_process, lock, flag)
+		late = os.path.join(e, 'late.txt')
+		open(late, 'w').write('a later change in the renamed folder')
+		wait_until(lambda: _has_create(to_process, lock, late), timeout=3, message='the renamed folder is not watched')
+
+
+@pytest.mark.parametrize('made', ['in the same read', 'before'])
+def test_a_subfolder_made_as_its_parent_moves_is_watched(job, poll_fast, monkeypatch, made):
+	A, C = os.path.join(job.monitor, 'A'), os.path.join(job.monitor, 'C')
+	if made == 'before':
+		os.mkdir(A)
+	with _ready_watch(job) as (to_process, lock, flag):
+		# mkdir A; mkdir A/b; mv A C: b's create, if A had a watch to raise one, is handled at A/b, gone by then
+		_in_one_read(monkeypatch, lambda: (os.makedirs(os.path.join(A, 'b')), os.rename(A, C)))
+		wait_until(lambda: _moved_to(to_process, lock, C), message='no move')
+		_consume_batch(to_process, lock, flag)
+		late = os.path.join(C, 'b', 'late.txt')
+		open(late, 'w').write('a later change in the subfolder')
+		wait_until(lambda: _has_create(to_process, lock, late), timeout=3, message='the subfolder is not watched')
+
+
+def test_a_folder_renamed_while_the_walk_is_inside_it_is_watched_in_full(job, poll_fast, monkeypatch):
+	F, G = os.path.join(job.monitor, 'F'), os.path.join(job.monitor, 'G')
+	for child in ('c1', 'c2', 'c3'):
+		os.makedirs(os.path.join(F, child, 'deep'))
+	real = os.scandir
+	renamed = []
+	def scandir(path='.'):
+		entries = real(path)
+		if not renamed and isinstance(path, str) and os.path.abspath(path).startswith(F + '/'):
+			# mv F G while the walk reads one of F's subfolders: the ones it has not read yet are gone at their old path
+			os.rename(F, G)
+			renamed.append(path)
+		return entries
+	monkeypatch.setattr(os, 'scandir', scandir)
+	with _ready_watch(job) as (to_process, lock, flag):
+		monkeypatch.setattr(os, 'scandir', real)
+		# the move went with the first batch, read before the watcher was ready
+		assert renamed
+		late = [os.path.join(G, child, 'deep', 'late.txt') for child in ('c1', 'c2', 'c3')]
+		for path in late:
+			open(path, 'w').write('a later change')
+		wait_until(lambda: all(_has_create(to_process, lock, path) for path in late), timeout=3,
+			message=f'not every subfolder is watched: {[path for path in late if not _has_create(to_process, lock, path)]}')
+
+
+def _published(to_process, lock):
+	with lock:
+		return to_process.read_wall_ns is not None
+
+
+@pytest.mark.parametrize('gone', ['deleted', 'moved out', 'moved to a skipped name', 'its parent moved'])
+def test_read_times_publish_again_once_an_unwatched_folder_is_gone(job, tmp_path, poll_fast, monkeypatch, gone):
+	P = os.path.join(job.monitor, 'P')
+	bad = os.path.join(P, 'bad')
+	os.makedirs(os.path.join(bad, 'sub'))
+	real = os.scandir
+	_fail_scandir(monkeypatch, bad)
+	with _ready_watch(job, skip_list=rv.SkipList(job.monitor, ['old_*/'])) as (to_process, lock, flag):
+		assert not _published(to_process, lock)
+		monkeypatch.setattr(os, 'scandir', real)
+		if gone == 'deleted':
+			shutil.rmtree(bad)
+		elif gone == 'moved out':
+			os.rename(bad, str(tmp_path / 'bad'))
+		elif gone == 'moved to a skipped name':
+			os.rename(bad, os.path.join(P, 'old_bad'))
+		else:
+			os.rename(P, os.path.join(job.monitor, 'Q'))
+		# nothing is left that the watcher should watch and does not
+		wait_until(lambda: _published(to_process, lock), timeout=3, message='no read time though nothing is unwatched')
