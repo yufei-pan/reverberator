@@ -294,3 +294,50 @@ def test_a_move_out_pending_at_a_max_delay_hand_over_still_pairs(job, monkeypatc
 	assert flag.is_set()
 	m = job.monitor
 	assert [(e.event, e.path, e.moved_from) for e in queue] == [('create', f'{m}/f', None), ('move', f'{m}/b', f'{m}/a')]
+
+
+def test_a_move_out_held_when_a_batch_is_taken_goes_with_it(job, monkeypatch):
+	flags = rv.inotify_simple.flags
+	m = job.monitor
+	batches = []
+	def take(queue):
+		# the backuper takes the batch the max-delay hand-over signalled, before this read's events are handled
+		batches.append(queue.take())
+		return [(flags.CREATE, 'g', 0)]
+	reads = [[(flags.CREATE, 'f', 0)], [(flags.MOVED_FROM, 'a', 7), (flags.MOVED_FROM | flags.ISDIR, 'D', 8)], take]
+	queue, flag, _ = scripted_watch(monkeypatch, m, reads, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=0)
+	assert [(e.event, e.path) for e in batches[0]] == [('create', f'{m}/f')]
+	assert batches[0].pending_move_outs == {f'{m}/a', f'{m}/D'}
+	# still held: the queue keeps its own
+	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/g')]
+	assert queue.pending_move_outs == {f'{m}/a', f'{m}/D'}
+
+
+def test_a_move_out_no_longer_held_is_not_carried(job, monkeypatch):
+	flags = rv.inotify_simple.flags
+	m = job.monitor
+	# popped by a create at its source, and by its pair
+	reads = [[(flags.MOVED_FROM, 'a', 7)], [(flags.CREATE, 'a', 0)], [(flags.MOVED_FROM, 'b', 8)], [(flags.MOVED_TO, 'c', 8)]]
+	queue, _, _ = scripted_watch(monkeypatch, m, reads, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=3600)
+	assert [(e.event, e.path) for e in queue] == [('delete', f'{m}/a'), ('create', f'{m}/a'), ('move', f'{m}/c')]
+	assert queue.pending_move_outs == set()
+	assert queue.take().pending_move_outs == set()
+
+
+def test_a_batch_compares_the_paths_whose_move_out_is_held(job):
+	seed_monitor(job, {'a.txt': 'a', 'D/sub/x': 'x', 'b.txt': 'b', 'keep.txt': 'k'})
+	run_backup(job, matched_since=100)
+	m = job.monitor
+	os.rename(os.path.join(m, 'a.txt'), os.path.join(job.root, 'a.txt'))
+	os.rename(os.path.join(m, 'D'), os.path.join(job.root, 'D'))
+	queue = rv.ChangeEventQueue(m)
+	open(os.path.join(m, 'b.txt'), 'w').write('bb')
+	queue.append(rv.ChangeEvent(time.monotonic(), False, 'modify', f'{m}/b.txt', None))
+	queue.pending_move_outs = {f'{m}/a.txt', f'{m}/D'}
+	batch = queue.take()
+	v1 = run_backup(job, rv.change_events_to_backup_entries(batch, m), touched=rv.touched_scopes(batch, m), matched_since=200)[-1]
+	assert not os.path.lexists(os.path.join(v1, 'a.txt'))
+	assert not os.path.lexists(os.path.join(v1, 'D'))
+	assert open(os.path.join(v1, 'b.txt')).read() == 'bb' and open(os.path.join(v1, 'keep.txt')).read() == 'k'
+	# the stamp the batch carries is recorded as before
+	assert matched(job) == (name(v1), 200)

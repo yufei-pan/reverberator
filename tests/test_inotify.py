@@ -318,11 +318,11 @@ def test_recreated_monitored_root_is_compared_with_the_vault(job, poll_fast, mon
 
 
 @contextlib.contextmanager
-def _quiet_watch(job):
+def _quiet_watch(job, max_shapshot_delay_seconds=60):
 	'''A real watcher at a 1 s quiet hand-over and the default pair timeout, ready and with its first batch taken.'''
 	to_process = rv.ChangeEventQueue(job.monitor)
 	flag = threading.Event()
-	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=1)
+	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=1, max_shapshot_delay_seconds=max_shapshot_delay_seconds)
 	try:
 		_wait_watch_ready(job, to_process, lock)
 		_consume_batch(to_process, lock, flag)
@@ -405,3 +405,57 @@ def test_a_move_out_reaches_a_batch_signalled_before_it(job, tmp_path, poll_fast
 		wait_until(flag.is_set, timeout=5)                 # signalled, not taken: the backuper is busy
 		os.rename(os.path.join(job.monitor, 'a.txt'), str(tmp_path / 'a.txt'))
 		wait_until(lambda: ('delete', 'a.txt') in rels(job, _events(to_process, lock)), timeout=5)
+
+
+
+def busy_takes(job, to_process, lock, flag, after):
+	'''
+	Write a new file every 0.1 s, so the tree is never quiet, and take each batch the watcher signals, until one more
+	after the first batch for which after(rels) holds: every event read before that batch's take is then handled.
+	'''
+	batches = []
+	seen = False
+	deadline = time.monotonic() + 10
+	k = 0
+	while time.monotonic() < deadline:
+		open(os.path.join(job.monitor, f'busy_{k}.txt'), 'w').write('b')
+		k += 1
+		if flag.is_set():
+			batches.append(taken(to_process, lock, flag))
+			if seen:
+				return batches
+			seen = after(rels(job, batches[-1]))
+		time.sleep(0.1)
+	raise AssertionError('the watcher signalled no batch')
+
+
+def back_up_each(job, batches):
+	for batch in batches:
+		version = run_backup(job, rv.change_events_to_backup_entries(batch, job.monitor), touched=rv.touched_scopes(batch, job.monitor))[-1]
+	return version
+
+
+def test_a_file_moved_into_a_new_folder_while_the_tree_is_busy_leaves_only_its_new_place(job, poll_fast):
+	seed_monitor(job, {'f.txt': 'f', 'keep.txt': 'k'})
+	run_backup(job)
+	with _quiet_watch(job, max_shapshot_delay_seconds=0) as (to_process, lock, flag):
+		os.mkdir(os.path.join(job.monitor, 'd'))
+		os.rename(os.path.join(job.monitor, 'f.txt'), os.path.join(job.monitor, 'd', 'f.txt'))
+		batches = busy_takes(job, to_process, lock, flag, lambda got: ('create', 'd') in got)
+	# taken at max-delay hand-overs while the move-out is still held: none of them has its delete
+	assert not [b for b in batches if ('delete', 'f.txt') in rels(job, b)]
+	version = back_up_each(job, batches)
+	assert not os.path.lexists(os.path.join(version, 'f.txt'))
+	assert open(os.path.join(version, 'd', 'f.txt')).read() == 'f'
+
+
+def test_a_folder_moved_out_while_the_tree_is_busy_is_gone_from_the_version(job, tmp_path, poll_fast):
+	seed_monitor(job, {'d/sub/x': 'x', 'keep.txt': 'k'})
+	run_backup(job)
+	with _quiet_watch(job, max_shapshot_delay_seconds=0) as (to_process, lock, flag):
+		os.rename(os.path.join(job.monitor, 'd'), str(tmp_path / 'd'))
+		batches = busy_takes(job, to_process, lock, flag, lambda got: True)
+	assert not [b for b in batches if ('delete', 'd') in rels(job, b)]
+	version = back_up_each(job, batches)
+	assert not os.path.lexists(os.path.join(version, 'd'))
+	assert open(os.path.join(version, 'keep.txt')).read() == 'k'
