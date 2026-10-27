@@ -2823,10 +2823,15 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	raises its create, and one made before is in the walk, so cp -r or tar x racing the walk leaves nothing unwatched.
 	A folder the walk cannot read gets no watch: nothing can be told about what is in it.
 	Each folder left unwatched that is still there (unreadable, or its watch failed other than by being gone) is added to
-	unwatched when given: no event reports a change in it.
+	unwatched when given: no event reports a change in it. The walk tells again what under monitor_path is unwatched, so
+	what unwatched held there before goes first ( a folder made again, or a disk mounted again, is watched in full ).
 	'''
 	if not os.path.exists(monitor_path):
 		return -1
+	root_norm = monitor_path.rstrip('/') or '/'
+	if unwatched:
+		prefix = root_norm.rstrip('/') + '/'
+		unwatched.difference_update([folder for folder in unwatched if folder == root_norm or folder.startswith(prefix)])
 	def watch(folder:str):
 		irm.increaseUserWatches()
 		try:
@@ -2857,7 +2862,6 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			wd = watch(folder)
 			if wd is not None:
 				watched[folder.rstrip('/')] = wd
-	root_norm = monitor_path.rstrip('/') or '/'
 	for rel, error in errors:
 		folder = unreadable_path(monitor_path, rel[len(rel_base):])
 		if unwatched is not None and getattr(error,'errno',None) not in (errno.ENOENT, errno.ENOTDIR):
@@ -2867,7 +2871,9 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			continue
 		watcherTeeLogToTl(monitor_path,f'Not watching unreadable folder {folder}: {error}',error=True)
 		wd = watched.pop(folder, None)
-		if wd is not None and wd in wdDic:
+		# only while the watch is still the folder's here: one moved ahead of the walk (renamed before it was read, into a
+		# folder not walked yet) is found again at its new name, and add_watch hands back the same watch for it
+		if wd is not None and wdDic.get(wd, '').rstrip('/') == folder:
 			try:
 				inotify_obj.rm_watch(wd)
 			except OSError:
