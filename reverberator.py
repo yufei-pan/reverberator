@@ -6789,7 +6789,8 @@ class VaultManifest:
 
 	# matched, JSON [version folder name, wall clock ns]: from when the vault is known to match the whole tree, as that
 	# version holds it ( full_comparison_since() ). written only by do_backup()'s commits, in their transaction, never by
-	# the commit delta_generate_backup_entries() makes of what it read
+	# the commit delta_generate_backup_entries() makes of what it read; the vault scan deletes it when it names a version
+	# folder the scan removes ( get_vault_info() )
 	@property
 	def matched(self) -> tuple:
 		'''(version folder name, wall clock ns) the matched key records, or None when it is absent or does not parse.'''
@@ -10110,6 +10111,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			return entry
 		def refuse(why):
 			backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: {why}')
+			# the version keeps the file's old extended attributes
+			unsynced.append(source_real_path)
 			return False
 		vault = os.path.dirname(os.path.abspath(backup_folder))
 		copy_version = manifest.copy_version(relative_path)
@@ -10233,12 +10236,14 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				# the parents a prior version lacked are made, as real folders
 				if not real_folders_to(backup_folder,event_relative_path,make=True):
 					not_through_link(event_relative_path,isDir,'syncing attributes onto')
+					unsynced.append(event_source_real_path)
 					applied[event_source_real_path] = False
 					continue
 				if isDir:
 					if os.path.lexists(file_vault_target_path) and (os.path.islink(file_vault_target_path) or not os.path.isdir(file_vault_target_path)):
 						# the folder's metadata would go through the link, or onto another row's entry
 						backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {event_source_real_path} onto {file_vault_target_path}, which is not a real folder in the version')
+						unsynced.append(event_source_real_path)
 						applied[event_source_real_path] = False
 						continue
 					# we just copy the folder metadata

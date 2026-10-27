@@ -178,6 +178,25 @@ def test_a_failed_metadata_copy_carries_the_time_forward(job, monkeypatch):
 	assert v2 != v1 and os.getxattr(os.path.join(v2, 'a.txt'), 'user.x') == b'1'
 
 
+def test_a_refused_attribute_sync_carries_the_time_forward(job, monkeypatch):
+	user_xattrs_or_skip(job.monitor)
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	run_backup(job, matched_since=100)
+	v1 = run_backup(job, modify(job, 'b.txt', 'bb'), matched_since=200)[-1]
+	assert os.path.islink(os.path.join(v1, 'a.txt'))
+	os.setxattr(os.path.join(job.monitor, 'a.txt'), 'user.x', b'1')
+	real = rv.chain_end
+	def chain_end(vault, version_path, rel, *args, **kwargs):
+		return None if rel.rstrip('/') == 'a.txt' else real(vault, version_path, rel, *args, **kwargs)
+	monkeypatch.setattr(rv, 'chain_end', chain_end)
+	# a's link chain cannot be followed: its attributes are not synced. the batch was read well after the change
+	v2 = run_backup(job, OrderedDict([event_entry(job, 'a.txt', 'attrib')]), matched_since=time.time_ns() + 20 * 10 ** 9)[-1]
+	assert matched(job) == (name(v2), 200)
+	monkeypatch.setattr(rv, 'chain_end', real)
+	v3 = run_backup(job, matched_since=time.time_ns())[-1]  # a later full comparison still reads a's xattrs
+	assert v3 != v2 and os.getxattr(os.path.join(v3, 'a.txt'), 'user.x') == b'1'
+
+
 def test_delta_generation_writes_no_key(job):
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
