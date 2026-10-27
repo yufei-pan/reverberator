@@ -90,21 +90,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the two-step report confuses.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
 
-### Copies marked checked before they reach the disk
-
-- **Kind:** deferred (round 10).
-- **What the operator sees:** after a power loss, a copy made in the last ~30 s can be short on disk while the vault
-  database marks it checked, so the restart's full comparison does not read it back, and that version keeps the short
-  copy until the file changes.
-- **Why:** copies are never flushed when written, by design: each stays unchecked until a full comparison (every
-  restart) reads it back and copies again any that does not match. But a later batch's check can read a recent copy back
-  from the page cache and mark it checked before its bytes reach the disk.
-- **Revisit when:** round 10: add a power-loss test (a newest copy left short, then a restart copies it again), and
-  flush a copy just before it is marked checked: one fsync per copy, never on the write path.
-- **Approved:** 2026-10-26. The user: "I am thinking this is less of a big deal because we are a backup tool? compare to
-  cossting every single write, (fine on our setup but maybe very costly on network vaults?) maybe a full compare is
-  less costly? considering this will only happen on power loss?", then "Defer to round 10 (Recommended)".
-
 ### Files written through mmap
 
 - **Kind:** deferred (round 10).
@@ -135,29 +120,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** renaming them in one step would need a change-list format change.
 - **Revisit when:** the change list's format changes for another reason.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
-
-### Full comparisons read every changed entry's xattrs since the previous version
-
-- **Kind:** deferred (round 10).
-- **What the operator sees:** a full comparison (restart, failed attempt, overflow) also compares the xattrs of every entry
-  changed since the version before the newest. After a version that changed every entry, that is all of them: on the
-  0.45 restart, panruixin_files' comparison took 252 s instead of 15-21 s, and it stays that slow until that job's next
-  version. Nothing is wrong, only slow.
-- **Why:** that version's time is the latest time the vault holds for when it last matched the tree.
-- **Revisit when:** round 10: the vault database records when each batch or comparison last found the vault matching,
-  and that becomes the bound.
-- **Approved:** 2026-10-26, the user's choice "Defer to round 10 (Recommended)".
-
-### A file moved into a folder made in the same batch shows at its old place too
-
-- **Kind:** deferred (round 10). This was already in 0.44.
-- **What the operator sees:** after `mkdir d; mv a.txt d/a.txt` in one batch, the versions made in the next ~30 s hold
-  a.txt at its old place as well as d/a.txt, which the live tree does not.
-- **Why:** the move into the brand-new folder is not seen, so its move-out waits ~30 s for a pair before it becomes a
-  delete, and the check after a batch does not look at its path meanwhile.
-- **Revisit when:** round 10: the check after a batch also compares the paths whose move-out is still waiting for its
-  pair.
-- **Approved:** 2026-10-26, the user's choice "Defer to round 10 (Recommended)".
 
 ### A move into a folder made after an earlier move in one batch
 
