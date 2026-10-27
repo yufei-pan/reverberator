@@ -813,14 +813,18 @@ Added by the main session after Task 2's second-opinion stress run (pre-existing
 - Modify: `reverberator.py` (`watchFolder`: the cookie-matched MOVED_TO branch for a folder).
 - Test: `tests/test_matched_time.py` (scripted), `tests/test_inotify.py` (a real watcher).
 
-**Interfaces:**
-- In the cookie-matched folder move, when no `wdDic` entry maps to the old path or below it, call
-  `initializeFolderWatchers(inotify_obj, eventPath, wdDic, irm, watch_flags, newDirWDs, skip_list=..., job_name=...)`
-  after queueing the move. Otherwise the wdDic rewrite runs as today. A -1 (the destination gone too, renamed again)
-  is left for the next rename's handling, as the create branch leaves its -1 today.
+**Interfaces (revised after Task 8's review; the spec's Goal 8 Rule is the authority):**
+- In the cookie-matched folder move, after the `wdDic` rewrite, always call `initializeFolderWatchers(inotify_obj,
+  eventPath, wdDic, irm, watch_flags, skip_list=..., job_name=..., unwatched=...)` (no `newDirWds`): idempotent for
+  watches already held, and it adds those missing. A -1 (the destination gone too, renamed again) is left for the next
+  rename's handling. `rewatch_moved_folder()` keeps only its removal of watches the skip list now skips; its add half
+  goes (the re-walk does it), and `get_all_folders()` goes if nothing else uses it.
 
-- [ ] **Step 1: Write the failing tests** per the spec's Goal 8 Tests, starting from the repro
-  (/tmp/claude-0/-mnt-optane-work-reverberator/8ad4e979-212b-4a0b-9477-1847dfee5560/scratchpad/r10/haiku-t2/repro_05e1d07.py).
+- [ ] **Step 1: Write the failing tests** per the spec's Goal 8 Tests, starting from the repros
+  (/tmp/claude-0/-mnt-optane-work-reverberator/8ad4e979-212b-4a0b-9477-1847dfee5560/scratchpad/r10/haiku-t2/repro_05e1d07.py;
+  the review's /tmp/claude-0/-mnt-optane-work-reverberator/8ad4e979-212b-4a0b-9477-1847dfee5560/scratchpad/r10/review-t8/test_probe_t8.py
+  (rename inside a walked subtree) and test_probe_t8d.py (a subfolder's create handled after its parent moved); its
+  scratch fix is in review-t8/fixc/).
 - [ ] **Step 2: Run them and see them fail.**
 - [ ] **Step 3: Implement** per Interfaces, with a comment saying why (the create was handled after the folder had left).
 - [ ] **Step 4: Run them and see them pass; run both full suites.**
