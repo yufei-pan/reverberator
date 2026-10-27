@@ -723,6 +723,76 @@ def test_a_resumed_scan_with_differences_is_followed_by_a_full_comparison(job, p
 
 ---
 
+### Task 7: A batch taken without the watcher's signal does not leave new folders' events discarded (Goal 7)
+
+Added by the main session after Task 2's review (pre-existing; the spec's Goal 7). Run after Task 4, which edits the
+same watcher loop; execution order is 1, 2, 3, 4, 5, 7, 8, 6.
+
+**Files:**
+- Modify: `reverberator.py` (`ChangeEventQueue`: `__init__`, `take`, docstring; `watchFolder`: the `processPending`
+  check right after `inotify_obj.read()`, and the two places that set `processPending`).
+- Test: `tests/test_matched_time.py` (scripted reads), `tests/test_inotify.py` (a real watcher).
+
+**Interfaces:**
+- Produces: `ChangeEventQueue.takes: int`, 0 at `__init__`, incremented by `take()` (on the queue taken from; the batch
+  returned keeps whatever, it is never read). Callers hold `to_process_lock`.
+- Produces: in `watchFolder`, `seen_takes`, read from the queue under the lock when the watcher starts; right after each
+  read returns, under the lock: when `to_process.takes != seen_takes`, clear `newDirWDs`, reset `lastProcessTime`, and
+  take the new count. `processPending` and its two setters go; the signal conditions are otherwise unchanged.
+
+- [ ] **Step 1: Write the failing tests.**
+  - Scripted (`scripted_watch`, whose reads may be callables taking the queue): read 0 creates folder `d` (CREATE|ISDIR;
+    the harness gives it a fresh wd in `newDirWds`), read 1 is a callable that takes the queue (`queue.take()`, no flag)
+    and returns an event in `d` (CREATE `x` on d's wd); assert the event in d is queued. A variant whose read 1 does not
+    take: the event in d is discarded (today's behaviour, kept).
+  - Real watcher (`_start_watch`): `mkdir d` and wait for its create to be queued, take the queue directly under the
+    lock (no flag cleared, no signal), write `d/f`, and assert its event is queued within the timeout. On 0.45 it is
+    discarded until a signalled take.
+  - A watcher started while the flag is already set (`flag.set()` before `_start_watch`): a new folder's events are
+    discarded until the next take, then kept.
+- [ ] **Step 2: Run them and see them fail** (the unsignalled-take tests).
+- [ ] **Step 3: Implement** per Interfaces, with a comment at the check saying why it sits right after the read.
+- [ ] **Step 4: Run them and see them pass; run both full suites.**
+- [ ] **Step 5: Commit:** "The watcher learns of every take from a count on the queue, not only of those it signalled,
+  so after the backuper's startup take a new folder's later events are recorded again."
+
+**Calls to confirm:** added to round 10 by the main session (a pre-existing silent loss); `processPending` goes.
+
+---
+
+### Task 8: A folder made while the watcher walks its parent is watched (Goal 6)
+
+Added by the main session after Task 2's review (pre-existing; the spec's Goal 6).
+
+**Files:**
+- Modify: `reverberator.py` (`initializeFolderWatchers`; `get_all_folders` only if nothing else uses it).
+- Test: `tests/test_inotify.py` or `tests/test_jobs.py`, beside the existing `initializeFolderWatchers` tests.
+
+**Interfaces:**
+- `initializeFolderWatchers()` keeps its signature and return value. It adds the root's watch first (as today), then
+  walks with `iter_tree_entries()` and adds each folder's watch as the walk yields it, before the walk reads that folder.
+  A folder the walk then reports unreadable (its `errors`) has its watch removed (`rm_watch`, `wdDic`, `newDirWds`, and
+  the `irm` count given back) and is logged as today ("Not watching unreadable folder ..."). Skipped folders are not
+  descended into and get no watch, as today. `irm.increaseUserWatches()` is called per watch added (or once per batch of
+  them), and every watch removed or failed is given back.
+
+- [ ] **Step 1: Write the failing test,** from the review's probe
+  (/tmp/claude-0/-mnt-optane-work-reverberator/8ad4e979-212b-4a0b-9477-1847dfee5560/scratchpad/r10/review-t2/copy/tests/test_probe_walk_race.py):
+  make the walk itself create `d/a/b` right after `d/a` is listed and before `d/a`'s watch would be added on 0.45
+  (wrap `rv.iter_tree_entries` or `os.scandir` to create it at the right moment), then assert `d/a/b` is watched (a
+  change in it is queued by a real watcher, or its path is in `wdDic`). Plus: the watch count given to the `irm` equals
+  the watches held, with an unreadable folder in the tree.
+- [ ] **Step 2: Run it and see it fail.**
+- [ ] **Step 3: Implement** per Interfaces.
+- [ ] **Step 4: Run it and see it pass; run both full suites** (the existing unreadable-folder, skip-list and
+  inner-mount watcher tests must pass unchanged).
+- [ ] **Step 5: Commit:** "The watcher adds each folder's watch as its walk reaches it, before reading the folder, so a
+  folder made while the walk runs is watched."
+
+**Calls to confirm:** added to round 10 by the main session (a pre-existing silent loss).
+
+---
+
 ## Self-review
 
 - **Spec coverage:**

@@ -162,6 +162,49 @@ failing test (stop with scan events pending, change a file elsewhere while it is
 the change); if it passes on 0.45, this goal is dropped as not an issue, with the reason in the report. Otherwise any
 resumed pending batch counts as round-tripped, so the follow-up full comparison runs.
 
+## Goal 6: a folder made while the watcher walks its parent is watched (pre-existing, found by Task 2's review)
+
+`initializeFolderWatchers()` lists the whole subtree (`get_all_folders()`) and only then adds the watches. A folder made
+inside an already-listed folder before that folder's watch is added raises no event (no watch yet) and is not in the
+list, so it is never watched, nor is anything made under it later: `cp -r`, `tar x` or rsync of a tree into a watched
+folder race the walk, and so does the root's startup walk. Its recursive copy backs up what is there at copy time, and
+every later change in it is missing from the versions until the next full comparison (in practice the next restart). A
+silent wrong result, so worth fixing (the user's rules); added to this round by the main session while the user slept,
+listed in Calls to confirm.
+
+**Rule:** `initializeFolderWatchers()` adds each folder's watch as the walk yields it, before the walk reads that folder
+(`iter_tree_entries()` yields a folder before its contents and reads nothing up front): a folder made in it after its
+watch is added raises its event, and one made before is in the walk. A folder that then turns out unreadable has its
+watch removed again and is logged as today. The counts given to the resource manager stay right (one watch each, the
+ones removed given back). Nothing else changes: the same folders end up watched when nothing races the walk.
+
+**Tests:** a folder made inside a listed folder between the listing and the watch (simulate the race by making it from
+the walk, the way the review's probe does: scratchpad r10/review-t2/copy/tests/test_probe_walk_race.py) is watched, and a
+change in it is queued; the unreadable-folder and skip-list behaviour of today's tests is unchanged; the watch count
+given to `irm` matches the watches held.
+
+## Goal 7: a batch taken without the watcher's signal does not leave new folders' events discarded (pre-existing)
+
+Events in a folder created during a batch are discarded until that batch is taken, as its recursive copy holds the
+folder. The watcher learns of the take only through `processPending` and the flag it set: a take it did not signal (the
+backuper's startup take at every attempt, which follows the resume check's whole-tree walk when a pending file exists;
+a restarted watcher, or a retry's new one, finding its predecessor's flag still set) leaves `newDirWDs` uncleared, and
+every later event in those folders is discarded; if all activity is there, nothing is ever queued. A silent wrong result
+(review probe: scratchpad r10/review-t2/copy/tests/test_probe_newdirs.py); added to this round as Goal 6 was.
+
+**Rule:** `ChangeEventQueue.take()` counts takes (`takes`, an int on the queue, under the same lock as every queue use).
+Right after each read returns, the watcher compares the count with the one it saw last; when it moved, it clears
+`newDirWDs` and resets `lastProcessTime`, as the signalled take does today. `processPending` goes. A new watcher starts
+from the queue's current count. Why right after the read: an event read before the take happened before it, so the
+recursive copy (made after the take) holds it; an event read after the take may come after the copy passed that entry,
+and must be kept (a kept duplicate costs nothing). The same placement also closes today's window in which a copy finished
+before the watcher's next loop could still have its folder's events discarded.
+
+**Tests:** after an unsignalled take (take the queue directly, no flag), a change in a folder created before the take is
+queued; after a signalled take, the same as today; a new watcher started while the queue's flag is still set discards a
+new folder's events only until the next take; the order: an event read before the take is discarded, one read after it
+is kept (scripted reads with `scripted_watch`).
+
 ## Goal 4: version 0.46, docs
 
 - `__version__ = 0.46` and pyproject.toml `version = "0.46"`.
