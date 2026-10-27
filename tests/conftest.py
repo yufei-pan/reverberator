@@ -10,6 +10,9 @@ from tests.harness import FakePool, create_job, reverberator_script
 # the chain-link ground truth over the whole suite (REVERB_CHAIN_GROUND_TRUTH=0 turns it off)
 pytest_plugins = ['tests.chain_ground_truth']
 
+# the real helper, for the one test that runs it: isolated_runtime() replaces it for every test
+REAL_SYNC_VAULT_FILESYSTEMS = rv.sync_vault_filesystems
+
 
 @pytest.fixture(autouse=True)
 def restore_runtime_globals(tmp_path):
@@ -36,6 +39,9 @@ def isolated_runtime(tmp_path, monkeypatch):
 	# and never writes the host's sysctls: a sudo sysctl is answered as refused (a test that fakes run_command itself
 	# replaces this)
 	monkeypatch.setattr(rv.multiCMD, 'run_command', refuse_sudo_sysctl(rv.multiCMD.run_command))
+	# a real syncfs would flush the whole (ext4) filesystem under /tmp for every comparison that checks a copy; tests that count
+	# or fail syncs patch it themselves
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: None)
 	yield
 	rv.STATUS_BOARD = None
 	rv.POLL_WAIT_SECONDS = old_poll

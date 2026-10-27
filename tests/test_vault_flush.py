@@ -10,6 +10,7 @@ import sys
 from collections import OrderedDict
 import pytest
 import reverberator as rv
+from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.harness import committed_versions, event_entry, seed_monitor
 from tests.test_vault_scan import (cut_off_at_the_swap, keep_modified, link_number, private_folders, restart_and_scan, run_backup,
 	three_versions, vault_names)
@@ -67,6 +68,43 @@ def test_an_error_on_one_branch_still_flushes_the_others(tmp_path, fake_pool, mo
 		rv.fsync_vault_folder(job_path)
 	assert failure.value.errno == errno.EIO
 	assert calls == [(os.path.join(a, 'job'), True), (os.path.join(c, 'job'), True)]
+
+
+def recording_syncfs(monkeypatch, failing=()):
+	'''rv.syncfs_folder replaced by a recorder of paths, raising EIO for those in failing and FileNotFoundError for a folder not there.'''
+	calls = []
+	def syncfs(path):
+		if not os.path.isdir(path):
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		calls.append(path)
+		if path in failing:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
+	return calls
+
+
+def test_the_vault_sync_on_a_pool_reaches_each_branch_holding_it(tmp_path, fake_pool, monkeypatch):
+	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
+	calls = recording_syncfs(monkeypatch)
+	REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+	assert calls == [os.path.join(a, 'job'), os.path.join(c, 'job')]
+
+
+def test_the_vault_sync_on_a_pool_tries_every_branch_before_it_raises(tmp_path, fake_pool, monkeypatch):
+	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
+	calls = recording_syncfs(monkeypatch, failing=[os.path.join(a, 'job')])
+	with pytest.raises(OSError) as failure:
+		REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+	assert failure.value.errno == errno.EIO
+	assert calls == [os.path.join(a, 'job'), os.path.join(c, 'job')]
+
+
+def test_the_vault_sync_off_any_pool_reaches_the_vault_itself(tmp_path, monkeypatch):
+	path = str(tmp_path / 'job')
+	os.makedirs(path)
+	calls = recording_syncfs(monkeypatch)
+	REAL_SYNC_VAULT_FILESYSTEMS(path)
+	assert calls == [path]
 
 
 def test_the_commit_flushes_the_job_vault_after_the_swap(job, monkeypatch):
