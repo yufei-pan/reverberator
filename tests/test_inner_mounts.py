@@ -73,6 +73,35 @@ def test_watcher_survives_inner_unmount_and_rewatches_on_remount(job, poll_fast)
 		subprocess.call(['umount', inner])
 
 
+
+@pytest.mark.privileged
+@needs_root
+def test_a_walk_of_the_root_tells_again_what_is_unwatched_in_an_inner_mount(tmp_path, monkeypatch):
+	root = str(tmp_path / 'm')
+	inner = os.path.join(root, 'disk')
+	os.makedirs(inner)
+	subprocess.check_call(['mount', '-t', 'tmpfs', 'tmpfs', inner])
+	try:
+		u = os.path.join(inner, 'u')
+		os.makedirs(os.path.join(u, 'v'))
+		real = os.scandir
+		def scandir(path='.'):
+			if isinstance(path, str) and os.path.abspath(path) == u:
+				raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+			return real(path)
+		monkeypatch.setattr(os, 'scandir', scandir)
+		irm = rv.inotify_resource_manager()
+		wdDic, unwatched = rv.bidict(), set()
+		with rv.inotify_simple.INotify() as inotify_obj:
+			rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, rv.inotify_simple.flags.CREATE, unwatched=unwatched)
+			assert inner + '/' in wdDic.values() and unwatched == {u}
+			# the walk goes into the inner mount, so a walk of the root, which drops what it held under the root, adds u back
+			rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, rv.inotify_simple.flags.CREATE, unwatched=unwatched)
+			assert unwatched == {u}
+	finally:
+		subprocess.call(['umount', inner])
+
+
 ROOT_LINE = '22 1 8:1 / / rw - ext4 /dev/sda1 rw\n'
 
 

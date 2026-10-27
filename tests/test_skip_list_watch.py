@@ -346,3 +346,40 @@ def test_create_after_an_evicted_move_out_queues_no_second_delete(job, tmp_path,
 		assert [e.event for e in events if e.path == b] == ['delete']
 	finally:
 		_stop(thread)
+
+
+def test_a_folder_made_while_a_moved_folders_walk_reads_its_parent_is_watched(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'projects/foo/build/': None, 'archive/': None})
+	build = os.path.join(job.monitor, 'archive', 'foo', 'build')
+	sub = os.path.join(build, 'sub')
+	real = os.scandir
+	class Listing:
+		# as cp -r or tar x goes on in the moved folder: sub is made in build, newly wanted there, right after the walk lists it
+		def __init__(self, entries):
+			self.entries = entries
+		def __enter__(self):
+			return self
+		def __iter__(self):
+			return iter(self.entries)
+		def __exit__(self, *exc_info):
+			self.entries.close()
+			if not os.path.exists(sub):
+				os.mkdir(sub)
+	def scandir(path='.'):
+		entries = real(path)
+		return Listing(entries) if isinstance(path, str) and os.path.abspath(path) == build else entries
+	monkeypatch.setattr(os, 'scandir', scandir)
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, ['projects/*/build/'], flag)
+	try:
+		os.rename(os.path.join(job.monitor, 'projects', 'foo'), os.path.join(job.monitor, 'archive', 'foo'))
+		wait_until(lambda: os.path.isdir(sub), message='the moved folder was not walked')
+		# build was watched before it was read, so sub's create is raised
+		wait_until(lambda: any(e.event == 'create' and e.path.rstrip('/') == sub for e in _events(to_process, lock)), timeout=3,
+			message='the folder made during the walk raised no create')
+		_take_batch(to_process, lock, flag)
+		x = os.path.join(sub, 'x.txt')
+		open(x, 'w').write('x')
+		wait_until(lambda: any(e.path == x for e in _events(to_process, lock)), timeout=3, message='the folder made during the walk is not watched')
+	finally:
+		_stop(thread)

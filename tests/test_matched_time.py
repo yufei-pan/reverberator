@@ -464,3 +464,48 @@ def test_a_new_folders_event_read_before_the_take_is_discarded_and_one_after_kep
 	queue, _, _ = scripted_watch(monkeypatch, m, reads, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=3600)
 	# d went with the batch taken; x happened before it, y may come after the copy passed d
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/d/y')]
+
+
+def test_a_folder_renamed_before_its_create_is_handled_is_watched_at_its_new_name(job, monkeypatch):
+	flags = rv.inotify_simple.flags
+	m = job.monitor
+	def made_and_renamed(queue):
+		# mkdir d; mv d e: both done before the watcher reads either, so d is gone when its create is handled
+		os.mkdir(os.path.join(m, 'e'))
+		return [(flags.CREATE | flags.ISDIR, 'd', 0), (flags.MOVED_FROM | flags.ISDIR, 'd', 7), (flags.MOVED_TO | flags.ISDIR, 'e', 7)]
+	reads = [made_and_renamed, take_then([(flags.CREATE, 'x', 0, 2)])]
+	queue, _, _ = scripted_watch(monkeypatch, m, reads, watches={}, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=3600)
+	# e got the next watch, 2, and a change in it reaches the queue
+	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/e/x')]
+
+
+def test_a_chain_of_renames_before_the_watcher_catches_up_ends_watched_at_its_last_name(job, monkeypatch):
+	flags = rv.inotify_simple.flags
+	m = job.monitor
+	def made_and_renamed_twice(queue):
+		os.mkdir(os.path.join(m, 'f'))
+		return [(flags.CREATE | flags.ISDIR, 'd', 0), (flags.MOVED_FROM | flags.ISDIR, 'd', 7), (flags.MOVED_TO | flags.ISDIR, 'e', 7),
+			(flags.MOVED_FROM | flags.ISDIR, 'e', 8), (flags.MOVED_TO | flags.ISDIR, 'f', 8)]
+	reads = [made_and_renamed_twice, take_then([(flags.CREATE, 'x', 0, 2)])]
+	queue, _, _ = scripted_watch(monkeypatch, m, reads, watches={}, min_snapshot_delay_seconds=3600, max_shapshot_delay_seconds=3600)
+	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/f/x')]
+
+
+def test_a_moved_folder_keeps_the_watches_it_had(job, monkeypatch):
+	flags = rv.inotify_simple.flags
+	m = job.monitor
+	os.makedirs(os.path.join(m, 'd', 's'))
+	watches, irm, counts = {}, rv.inotify_resource_manager(), []
+	def rename(queue):
+		os.rename(os.path.join(m, 'd'), os.path.join(m, 'e'))
+		return [(flags.MOVED_FROM | flags.ISDIR, 'd', 7), (flags.MOVED_TO | flags.ISDIR, 'e', 7)]
+	def count(queue):
+		queue.take()
+		counts.append((irm.current_user_watches, len(watches)))
+		return [(flags.CREATE, 'x', 0, 3)]
+	# the walk at the start watched the root (1), d (2) and d/s (3)
+	queue, _, _ = scripted_watch(monkeypatch, m, [rename, count], watches=watches, irm=irm, min_snapshot_delay_seconds=3600,
+		max_shapshot_delay_seconds=3600)
+	# the walk of e hands back the watches e and e/s had: none is added or counted twice
+	assert counts == [(3, 3)]
+	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/e/s/x')]

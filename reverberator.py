@@ -2492,23 +2492,29 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				if not cookies:
 					del pendingMoveFromPaths[path_norm]
 		return change_event
+	def forget_moved_away(cookie_value):
+		# the folder left for a place with no watch (out of the tree, or into a skipped folder) and took its watches
+		# along: they would report its new contents under the old path. what under that path was unwatched is gone too
+		if cookie_value.isDir:
+			forget_unwatched_under(unwatched,cookie_value.path)
+		if cookie_value.wds:
+			remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
 	def queue_pending_move_from_at(path:str,monTime:float):
 		# something new is at the path a folder or file moved away from: that move was not a deletion that can wait,
 		# or the delete it expires into would land after this create and remove what is there
 		for cookie in list(pendingMoveFromPaths.get(path.rstrip('/'),())):
 			cookie_value = cookieDic.pop(cookie,None)
-			if cookie_value is not None and cookie_value.wds:
-				remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
+			if cookie_value is not None:
+				forget_moved_away(cookie_value)
 			append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	def expire_move_out(cookie):
 		if DEBUG:
 			watcherTeeLogToTl(monitor_path,f'Adding expired unmatched move_from as delete for cookie {cookie}')
 		# also drop the cookie so a late MOVED_TO is treated as a create instead of a move from a deleted source
 		cookie_value = cookieDic.pop(cookie,None)
-		if cookie_value is not None and cookie_value.wds:
-			# the folder left for a place with no watch (out of the tree, or into a skipped folder) and took its
-			# watches along: they would report its new contents under the old path. gone before its delete is queued
-			remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
+		if cookie_value is not None:
+			# gone before its delete is queued
+			forget_moved_away(cookie_value)
 		append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	newDirWDs = set()
 	# the folders that exist and that this watcher should watch but does not (unreadable, or their watch failed): no event
@@ -2651,6 +2657,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					if isDir and event.mask & flags.MOVED_TO and event.cookie in cookieDic:
 						# the source stays in cookieDic so it still expires into its delete; its old-path watches are stale now
 						remove_watches_under(inotify_obj,wdDic,irm,cookieDic[event.cookie].path)
+						forget_unwatched_under(unwatched,cookieDic[event.cookie].path)
 					continue
 				if skipped and not event.mask & (flags.MOVED_FROM | flags.MOVED_TO):
 					if DEBUG:
@@ -2666,6 +2673,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				elif event.mask & flags.DELETE:
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Delete event detected for {eventPath}')
+					if isDir:
+						# the kernel drops its watch; a folder in it that was unwatched is gone with it
+						forget_unwatched_under(unwatched,eventPath)
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'delete',eventPath,None))
 				elif event.mask & flags.ATTRIB:
 					if DEBUG:
@@ -2687,8 +2697,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						pop_pending_move_from(evicted_cookie)
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Adding delete event for {cookie_value.path}')
-						if cookie_value.wds:
-							remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
+						forget_moved_away(cookie_value)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,cookie_value.isDir,'delete',cookie_value.path,None))
 					#append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,None))
 					add_pending_move_from(event.cookie,ChangeEvent(monTime,isDir,'delete',eventPath,None))
@@ -2703,6 +2712,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							append_change_event(to_process, to_process_lock, ChangeEvent(monTime,cookie_value.isDir,'delete',cookie_value.path,None))
 							if cookie_value.isDir:
 								remove_watches_under(inotify_obj,wdDic,irm,cookie_value.path)
+								forget_unwatched_under(unwatched,cookie_value.path)
 						elif DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Skipping move to event for skipped path {eventPath}')
 						continue
@@ -2736,8 +2746,14 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 								if DEBUG:
 									watcherTeeLogToTl(monitor_path,f'Updating wdDic entry {wd}: {wd_path} -> {new_wd_path}')
 								wdDic[wd] = new_wd_path
+							forget_unwatched_under(unwatched,cookie_value.path)
 							if skip_list is not None and skip_list.location_dependent:
-								rewatch_moved_folder(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list,unwatched)
+								rewatch_moved_folder(inotify_obj,eventPath,wdDic,irm,skip_list)
+							# the folder can move before its watches are all in place: renamed before its create was handled
+							# (mkdir d; mv d e), while the walk was inside it, or with a subfolder whose create is handled at
+							# the old path. this walk hands each folder watched already its own watch back and watches the
+							# rest; one gone again (renamed on) is walked when that rename is handled
+							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
 					else:
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Cookie not found for {event.cookie}')
@@ -2829,9 +2845,8 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	if not os.path.exists(monitor_path):
 		return -1
 	root_norm = monitor_path.rstrip('/') or '/'
-	if unwatched:
-		prefix = root_norm.rstrip('/') + '/'
-		unwatched.difference_update([folder for folder in unwatched if folder == root_norm or folder.startswith(prefix)])
+	# the walk goes into inner mounts too, so what it drops there it adds back if it still fails
+	forget_unwatched_under(unwatched,root_norm)
 	def watch(folder:str):
 		irm.increaseUserWatches()
 		try:
@@ -2896,24 +2911,39 @@ def raise_queue_limit_for_removals(irm:inotify_resource_manager,count:int):
 	if count > irm.max_queued_events / 2:
 		irm.increaseInotifyMaxQueueEvents(max(irm.max_queued_events * 2, count * 2))
 
-def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str) -> int:
-	'''Remove the watch on folder_path and every watch below it; returns how many were removed.'''
-	folder_norm = folder_path.rstrip('/')
-	prefix = folder_norm + '/'
-	removed = 0
-	raise_queue_limit_for_removals(irm,len(watches_under(wdDic,folder_path)))
-	for wd, wd_path in list(wdDic.items()):
-		wd_norm = wd_path.rstrip('/')
-		if wd_norm != folder_norm and not wd_norm.startswith(prefix):
-			continue
+def remove_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,wds) -> int:
+	'''Remove the watches wds, each one held in wdDic; returns how many were removed.'''
+	raise_queue_limit_for_removals(irm,len(wds))
+	for wd in wds:
 		try:
 			inotify_obj.rm_watch(wd)
 		except OSError:
 			pass
 		del wdDic[wd]
 		irm.decreaseUserWatches()
-		removed += 1
-	return removed
+	return len(wds)
+
+def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str) -> int:
+	'''Remove the watch on folder_path and every watch below it; returns how many were removed.'''
+	return remove_watches(inotify_obj,wdDic,irm,watches_under(wdDic,folder_path))
+
+def forget_unwatched_under(unwatched:set,folder_path:str) -> None:
+	'''
+	Drop folder_path and every folder below it from unwatched (a set of normalized folder paths, or None).
+
+	Examples:
+		>>> unwatched = {'/m/a', '/m/a/b', '/m/ab', '/m/c'}
+		>>> forget_unwatched_under(unwatched, '/m/a/')
+		>>> sorted(unwatched)
+		['/m/ab', '/m/c']
+		>>> forget_unwatched_under(unwatched, '/')
+		>>> unwatched
+		set()
+	'''
+	if unwatched:
+		folder_norm = folder_path.rstrip('/') or '/'
+		prefix = folder_norm.rstrip('/') + '/'
+		unwatched.difference_update([folder for folder in unwatched if folder == folder_norm or folder.startswith(prefix)])
 
 def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None) -> int:
 	'''
@@ -2986,38 +3016,13 @@ def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,ir
 		removed += 1
 	return removed
 
-def rewatch_moved_folder(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,skip_list:'SkipList',unwatched:set = None) -> None:
-	'''After a folder moved, make its watches match what the skip list wants at the new location. Folders left unwatched
-	go into unwatched ( initializeFolderWatchers() ).'''
-	errors = []
-	wanted = get_all_folders(folder_path,skip_list,errors)
-	if unwatched is not None:
-		unwatched.update(folder for folder, error in errors if getattr(error,'errno',None) not in (errno.ENOENT, errno.ENOTDIR))
-	wanted_norm = {folder.rstrip('/') for folder in wanted}
+def rewatch_moved_folder(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:bidict,irm:inotify_resource_manager,skip_list:'SkipList') -> int:
+	'''After a folder moved, remove the watches below it on folders the skip list leaves out at the new location, or that
+	are in one it leaves out; returns how many were removed. The walk of the moved folder watches those it wants there.'''
 	folder_norm = folder_path.rstrip('/')
 	prefix = folder_norm + '/'
-	watched = set()
-	for wd, wd_path in list(wdDic.items()):
-		if wd not in wdDic:
-			continue
-		wd_norm = wd_path.rstrip('/')
-		if wd_norm == folder_norm or not wd_norm.startswith(prefix):
-			continue
-		if wd_norm in wanted_norm:
-			watched.add(wd_norm)
-		else:
-			remove_watches_under(inotify_obj,wdDic,irm,wd_path)
-	for folder in wanted:
-		if folder.rstrip('/') in watched:
-			continue
-		irm.increaseUserWatches()
-		try:
-			wdDic[inotify_obj.add_watch(folder,watch_flags)] = folder
-		except Exception as e:
-			watcherTeeLogToTl(folder_path,f'Failed to add watch for {folder}: {e}',error=True)
-			irm.decreaseUserWatches()
-			if unwatched is not None and getattr(e,'errno',None) not in (errno.ENOENT, errno.ENOTDIR):
-				unwatched.add(folder.rstrip('/'))
+	return remove_watches(inotify_obj,wdDic,irm,[wd for wd, wd_path in wdDic.items() if wd_path.startswith(prefix)
+		and wd_path.rstrip('/') != folder_norm and skips_folder_or_parent(skip_list.skips,skip_list.folder_rel(wd_path))])
 
 def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = False, skip = None, errors:list = None):
 	'''
@@ -3079,15 +3084,6 @@ def log_unreadable(job_name:str, root:str, errors:list, reported:set = None):
 				continue
 			reported.add(path)
 		job_log(job_name, f'UNREADABLE: {path}: {error}; keeping its last backed-up copy')
-
-def get_all_folders(path, skip_list:'SkipList' = None, errors:list = None):
-	'''The folders under path. Unreadable ones are in the list too, and appended to errors as (absolute path, error).'''
-	rel_base = '' if skip_list is None else skip_list.folder_rel(path)
-	walk_errors = []
-	folders = [entry_path for entry_path, _, is_dir in iter_tree_entries(path, rel_base, skip=None if skip_list is None else skip_list.skips, errors=walk_errors) if is_dir]
-	if errors is not None:
-		errors.extend((unreadable_path(path, rel[len(rel_base):]), error) for rel, error in walk_errors)
-	return folders
 
 
 def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:ChangeEventQueue, skip_list:'SkipList' = None) -> bool:
