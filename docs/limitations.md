@@ -152,3 +152,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** counting them would add estimates for a small, one-batch overshoot.
 - **Revisit when:** a vault's limit is tight enough for it to matter.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### Changes made outside the watched folder
+
+- **Kind:** known limitation.
+- **What the operator sees:** an xattr-only change made outside the watched folder (straight onto a disk of a mergerfs
+  pool, such as /mnt/impulse_data/<disk>/..., or a remote write on a network filesystem) raises no event, and once a
+  later batch moves the vault's matched time past it, no full comparison reads it: that xattr is missing from the
+  versions until the file changes again. Content changes are still caught, by size and mtime.
+- **Why:** round 10's matched time bounds a full comparison's xattr reads to what changed since the vault last matched
+  the whole tree, and that bound assumes every change goes through the watched folder.
+- **Revisit when:** a job monitors a network filesystem, or files are changed on a pool's disks directly.
+- **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".

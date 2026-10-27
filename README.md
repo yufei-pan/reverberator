@@ -23,6 +23,7 @@ Known limits (each in docs/limitations.md):
 	A file written only through mmap raises no inotify event, so it is backed up at its next normal write; a chmod or chown of it in the same batch keeps its old bytes in that version (round 10 looks at this).
 	With a size limit, a backup can go over it until the next prune by a few KB (the new version's own folders, links and xattr blocks), or by the size of a file kept under a folder moved into a new folder.
 	The pause on a missing pool disk tells a quickly swapped disk apart only on kernel 6.8 or newer, and notices a dying disk only once its filesystem fails or flags an error.
+	An extended-attribute-only change made outside the watched folder (straight onto a disk of a pool, or a remote write on a network filesystem) is backed up only when the file next changes.
 
 Failure handling and log markers:
 	A job that fails (an unreadable disk, a vault that is not ready, an error in a thread) is restarted by itself, while the other jobs keep running. The retry delay starts at 60 s, doubles on each failure, and stops at 1 h. It starts again from 60 s once an attempt has run for an hour before failing. While a disk the job needs is missing, the job waits for it, and logs a failure once the wait reaches 15 min, then once an hour while it lasts.
