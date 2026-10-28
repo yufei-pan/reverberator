@@ -37,7 +37,7 @@ mount point matters. "Mounted" means a mount point of the live mount table (`par
 equals the normalised fstab mount point; the vault path goes through non-strict realpath and is matched by path
 component (`p == mp or p.startswith(mp + '/')`, never a plain prefix: /mnt/jank must not match /mnt/jank_data/...). A
 missing or unreadable fstab names nothing; a mount table that cannot be read means not there (wait), as `pool_state()`
-does. An fstab mount point that contains a symlink never matches (fails open, as today). The fstab is read at each check
+does. An fstab mount point that the mount table does not list is resolved (non-strict realpath) before matching, so a symlinked mount point is judged too; a listed one is never stat'ed, so a hung mounted filesystem cannot block the check (the main session's call after the task 1 review). The fstab is read at each check
 (about 10 KB).
 
 The signature (the user's "pool or signature") is checked as today, by the vault wait once the path exists; before the
