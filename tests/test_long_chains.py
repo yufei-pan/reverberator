@@ -244,7 +244,7 @@ def test_no_limit_keeps_chains_as_long_as_the_versions(job, monkeypatch):
 	# a full comparison reads it back through 45 links and finds it whole: no version, no copy
 	assert backup(job, chain_length=0).number == 45
 	assert lookup(job, 'a.txt').unchecked == 0
-	assert not [line for line in lines if 'again from the vault' in line or 'Error comparing' in line]
+	assert not [line for line in lines if 'again from the vault' in line or 'Error comparing' in line or 'copying again' in line]
 
 
 def test_an_xattr_change_reaches_a_copy_45_links_away(job):

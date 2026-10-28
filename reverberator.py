@@ -1860,18 +1860,21 @@ def fsync_vault_folder(path:str) -> None:
 def vault_disks(path:str) -> tuple:
 	'''
 	(pooled, disks): the (disk, folder) of each disk holding the vault folder at path, and whether they are the branches of
-	a mergerfs pool. On a pool, whose own sync and folder sync do not reach the disks, that is (branch, the folder on it) for
-	each branch the pool lists, whether it holds the folder or not; a branch list that cannot be read raises its OSError.
-	Off a pool it is [(the mount point holding path, path)], or [(path, path)] when the mount table has none. The mount
-	table is read once.
+	a mergerfs pool. A disk is named by the mount point holding it (the kernel reports a write error once per mounted
+	filesystem), or by the branch or path itself when the mount table has none; branches that are folders of one filesystem
+	name the same disk. On a pool, whose own sync and folder sync do not reach the disks, that is (the branch's disk, the
+	folder on the branch) for each branch the pool lists, whether it holds the folder or not; a branch list that cannot be
+	read raises its OSError. Off a pool it is [(the disk holding path, path)]. The mount table is read once.
 	'''
 	table = read_mount_table()
 	pool = mergerfs_mount(table, path)
+	def disk_of(folder:str) -> str:
+		held = mount_holding(table, os.path.realpath(folder))
+		return held[0] if held else folder
 	if pool is None:
-		held = mount_holding(table, os.path.realpath(path))
-		return False, [(held[0] if held else path, path)]
+		return False, [(disk_of(path), path)]
 	rel = os.path.relpath(os.path.realpath(path), pool)
-	return True, [(branch, os.path.join(branch, rel)) for branch in read_pool_branches(pool)]
+	return True, [(disk_of(branch), os.path.join(branch, rel)) for branch in read_pool_branches(pool)]
 
 def on_vault_branches(path:str, action) -> None:
 	'''
@@ -1914,13 +1917,16 @@ def sync_vault_filesystems(job_vault:str) -> dict:
 	Write out everything dirty on the disks holding the job vault at job_vault, for a comparison to record the copies it
 	read back as checked (compare_scopes()), once syncfs_folder() was tried on every one of them (vault_disks()): on a
 	mergerfs pool, whose sync does not reach the disks, each branch holding the job vault; off a pool, the job vault's own
-	filesystem. Returns {disk: None, or the OSError its sync raised}. On a pool a branch without the job vault is left out;
-	a branch list that cannot be read raises its OSError, and so does a job vault gone off a pool (its disk may be gone
-	too, and that says nothing of a write error).
+	filesystem. Each disk is synced once, through the first folder that holds the job vault: branches that are folders of one
+	filesystem share its one sync and its one error. Returns {disk: None, or the OSError its sync raised}. On a pool a branch
+	without the job vault is left out; a branch list that cannot be read raises its OSError, and so does a job vault gone
+	off a pool (its disk may be gone too, and that says nothing of a write error).
 	'''
 	pooled, disks = vault_disks(job_vault)
 	results = {}
 	for disk, folder in disks:
+		if disk in results:
+			continue
 		try:
 			syncfs_folder(folder)
 			results[disk] = None
@@ -1941,8 +1947,6 @@ VAULT_SYNC_MARKER_PREFIX = 'vault-sync-failed-'
 VAULT_SYNC_LOCK = threading.Lock()
 # the disks whose failed sync could not be recorded in a marker: remembered until reverberator stops
 UNRECORDED_FAILED_DISKS = set()
-# the longest file name the filesystems take, in bytes
-MAX_FILE_NAME = 255
 
 def current_boot_id() -> str:
 	'''This boot's id. Raises OSError when it cannot be read.'''
@@ -1951,17 +1955,13 @@ def current_boot_id() -> str:
 
 def vault_sync_marker_path(disk:str) -> str:
 	'''
-	The marker file of a disk: one file in the state folder, named by the disk's path percent-encoded (unique, readable), or
-	by the sha256 of its bytes when that and the temp name of mark_failed_sync() would not fit a file name.
+	The marker file of a disk: one file in the state folder, named by the disk's path percent-encoded (unique, readable). A
+	disk path too long for the name and the temp name of mark_failed_sync() to fit a file name gets no marker: writing it
+	raises OSError, and check_vault_sync() remembers the disk in memory with its alert.
 	>>> os.path.basename(vault_sync_marker_path('/mnt/jank_data/a58'))
 	'vault-sync-failed-%2Fmnt%2Fjank_data%2Fa58'
-	>>> len(os.path.basename(vault_sync_marker_path('/' + 'x' * 300)))
-	82
 	'''
-	name = VAULT_SYNC_MARKER_PREFIX + urllib.parse.quote(os.fsencode(disk), safe='')
-	if len(name) + len('.' + '.tmp') > MAX_FILE_NAME:
-		name = VAULT_SYNC_MARKER_PREFIX + hashlib.sha256(os.fsencode(disk)).hexdigest()
-	return os.path.join(state_dir_path(), name)
+	return os.path.join(state_dir_path(), VAULT_SYNC_MARKER_PREFIX + urllib.parse.quote(os.fsencode(disk), safe=''))
 
 def read_vault_sync_marker(path:str) -> 'dict | None':
 	'''The marker file's content ({disk, boot_id, error}), None when it cannot be read or is no marker.'''
@@ -4341,7 +4341,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	# batch that runs delays the next one, as the interval is not checked until the batch has returned
 	last_full_comparison = time.monotonic()
 	def comparison_due():
-		# compared, never waited on: a rule cell can read as up to about 6e25 s, past threading.TIMEOUT_MAX, which a wait refuses
+		# compared, never waited on: a rule cell can read as large as a float allows (about 1.8e308 s), far past threading.TIMEOUT_MAX, which a wait refuses
 		return full_comparison_interval > 0 and time.monotonic() - last_full_comparison >= full_comparison_interval
 	def batch_scopes(batch):
 		scopes = touched_scopes(batch, monitor_path)
@@ -5113,9 +5113,9 @@ def do_backup(backup_entries:dict,
 	# never mounted again since: PoolNotReady fails the attempt
 	# matched_since: the wall clock time, in ns, from which this attempt sees the whole tree ( a full comparison, or a fresh
 	# batch's read time ), None when it does not. the commit records it as the vault's matched time ( VaultManifest.matched )
-	# chain_length: the job's Chain Length, 0 for no limit, None for DEFAULT_CHAIN_LENGTH; it sets when a file is copied again ( recopy_hops() )
 	# only when no inner mount was paused, nothing was logged unreadable and every metadata copy worked; else it carries
 	# the old time forward
+	# chain_length: the job's Chain Length, 0 for no limit, None for DEFAULT_CHAIN_LENGTH; it sets when a file is copied again ( recopy_hops() )
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -5230,7 +5230,8 @@ def do_backup(backup_entries:dict,
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
 			if backup_entries and manifest.describes(latest_version_info.path):
-				# a delete of what the vault holds no path of would make a version with no change
+				# a delete of what the vault holds no path of would make a version with no change. dropping it is safe: deletes
+				# replay first, onto a version that holds only the tracked rows, so such a delete would remove nothing
 				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path)
 				if dropped:
 					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
@@ -8765,7 +8766,8 @@ def compare_monitor_entry(monitor_entry:str, monitor_stat:os.stat_result, record
 
 def link_chain_end(path:str) -> str:
 	'''
-	The path of the first entry that is not a link on the chain of links starting at path. Each link is followed by its
+	The path of the first entry that is not a link on the chain of links starting at path, every link on the chain followed,
+	whoever's it is: its callers keep users' links away (only f and o records reach it). Each link is followed by its
 	text, with lstat, so no path resolution meets more than one link and the kernel's limit of 40 never applies. The
 	first hop resolves the folder of path with os.path.realpath; each later hop joins the text to the folder of its link
 	with os.path.normpath, as the vault's folders are real. Raises OSError (ELOOP) for a path met twice, FileNotFoundError
@@ -8878,9 +8880,9 @@ def xattrs_differ(monitor_entry:str, vault_entry:str) -> bool:
 	'''
 	Whether the extended attributes of monitor_entry, never followed, and those of vault_entry, followed hop by hop as its
 	chain links lead to the copy (link_chain_end(), a chain of any length), differ in a name or a value. One whose
-	filesystem keeps none (ENOTSUP, ENOSYS) differs from nothing: copy_file_meta() could not make the two agree. A name listed whose value reads as ENODATA (gone since the
-	listing, or mergerfs with security_capability=false, which lists security.capability and gives no value) is left out,
-	as copystat() leaves it. Raises OSError.
+	filesystem keeps none (ENOTSUP, ENOSYS) differs from nothing: copy_file_meta() could not make the two agree. A name
+	listed whose value reads as ENODATA (gone since the listing, or mergerfs with security_capability=false, which lists
+	security.capability and gives no value) is left out, as copystat() leaves it. Raises OSError.
 	'''
 	def attributes(path, follow):
 		path = path.rstrip('/') or path
@@ -9065,7 +9067,7 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 							bad_disks = check_vault_sync(os.path.dirname(os.path.abspath(version_path)), job_name)
 							if bad_disks:
 								sync_failed = True
-								backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed on {", ".join(bad_disks)} since boot, so this comparison\'s copies read back stay unchecked')
+								backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed on {", ".join(bad_disks)} since boot (since reverberator started, for a disk whose marker could not be written), so this comparison\'s copies read back stay unchecked')
 						except Exception as e:
 							sync_failed = True
 							backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed ({e}), so this comparison\'s copies read back stay unchecked')
