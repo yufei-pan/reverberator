@@ -108,6 +108,21 @@ def test_the_vault_sync_off_any_pool_reaches_the_vault_itself(tmp_path, monkeypa
 	assert results == {rv.mount_holding(rv.read_mount_table(), os.path.realpath(path))[0]: None}
 
 
+def test_the_vault_sync_off_any_pool_gives_an_error_other_than_a_missing_folder_as_the_disks_result(tmp_path, monkeypatch):
+	path = str(tmp_path / 'job')
+	os.makedirs(path)
+	recording_syncfs(monkeypatch, failing=[path])
+	results = REAL_SYNC_VAULT_FILESYSTEMS(path)
+	assert list(results.values())[0].errno == errno.EIO and list(results) == [rv.mount_holding(rv.read_mount_table(), os.path.realpath(path))[0]]
+
+
+def test_the_vault_sync_off_any_pool_raises_for_a_vault_that_is_gone(tmp_path, monkeypatch):
+	calls = recording_syncfs(monkeypatch)
+	with pytest.raises(FileNotFoundError):
+		REAL_SYNC_VAULT_FILESYSTEMS(str(tmp_path / 'gone'))
+	assert calls == []
+
+
 def test_the_vault_sync_raises_when_the_branch_list_cannot_be_read(tmp_path, fake_pool, monkeypatch):
 	job_path, _ = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
 	def unreadable(mount_point):
