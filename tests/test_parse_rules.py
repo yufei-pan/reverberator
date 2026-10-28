@@ -202,7 +202,7 @@ def test_parse_rules_upgrades_old_header_in_place(job, newline):
 	lines = _old_rule_file(job, newline)
 	assert rv.parse_rules(job.rule_path)[0].skip_list_file == ''
 	got = open(job.rule_path, newline='').read().split(newline)
-	assert got[0] == '\t'.join(rv.REVERB_RULE_TSV_HEADER)
+	assert got[0] == HEADER_12
 	assert got[1] == lines[1] + '\t' + rv.SKIP_LIST_COLUMN_DESCRIPTIONS[0]
 	assert got[2] == lines[2] + '\t' + rv.SKIP_LIST_COLUMN_DESCRIPTIONS[1]
 	assert got[3:5] == lines[3:5] and got[5:] == ['']
@@ -242,11 +242,12 @@ def test_resolve_skip_list_path(tmp_path):
 		assert rv.resolve_skip_list_path(cell, rule) is None
 
 
-def test_sample_rule_file_has_skip_column(tmp_path):
+def test_sample_rule_file_has_all_14_columns(tmp_path):
 	path = tmp_path / 'sample.tsv'
 	path.write_text(rv.SAMPLE_REVERB_RULE_FILE.strip() + '\n')
-	first = path.read_text().splitlines()[0].split('\t')
-	assert [cell.strip() for cell in first] == rv.REVERB_RULE_TSV_HEADER
+	lines = path.read_text().splitlines()
+	assert [cell.strip() for cell in lines[0].split('\t')] == rv.REVERB_RULE_TSV_HEADER
+	assert [len(line.split('\t')) for line in lines[1:3]] == [14, 14]
 	assert rv.upgrade_rule_file_header(str(path)) is False
 
 
@@ -257,7 +258,7 @@ def test_upgrade_follows_symlinked_rule_file(job, tmp_path):
 	os.symlink(real, job.rule_path)
 	assert rv.upgrade_rule_file_header(job.rule_path) is True
 	assert os.path.islink(job.rule_path)
-	assert real.read_text().split('\n')[0] == '\t'.join(rv.REVERB_RULE_TSV_HEADER)
+	assert real.read_text().split('\n')[0] == HEADER_12
 
 
 def test_parse_rules_survives_failed_header_upgrade(job, monkeypatch):
@@ -342,3 +343,108 @@ def test_parse_rules_missing_file_leaves_a_marker_line(tmp_path, capsys):
 	assert exc.value.code == rv.EXIT_ALL_STOPPED
 	captured = capsys.readouterr()
 	assert 'reverberator EXITING with error: rule file' in captured.out + captured.err
+
+
+HEADER_12 = '\t'.join(rv.REVERB_RULE_TSV_HEADER[:12])
+HEADER_14 = '\t'.join(rv.REVERB_RULE_TSV_HEADER)
+
+
+def _rule_file(job, header, *rows):
+	with open(job.rule_path, 'w', newline='') as f:
+		f.write('\n'.join([header] + [row if isinstance(row, str) else '\t'.join(row) for row in rows]) + '\n')
+
+
+def test_a_12_column_rule_file_is_read_as_it_is(job, capsys):
+	_rule_file(job, HEADER_12, rule_row(job))
+	before = open(job.rule_path, newline='').read()
+	rule, = rv.parse_rules(job.rule_path)
+	assert (rule.full_comparison_interval, rule.chain_length) == ('', '')
+	assert open(job.rule_path, newline='').read() == before
+	# the file's own header was passed, so TSVZ found no mismatch
+	assert 'Header mismatch' not in capsys.readouterr().out
+
+
+def test_new_cells_under_a_12_column_header_are_read(job):
+	_rule_file(job, HEADER_12, rule_row(job) + ['12h', '20'])
+	rule, = rv.parse_rules(job.rule_path)
+	assert (rule.full_comparison_interval, rule.chain_length) == ('12h', '20')
+
+
+@pytest.mark.parametrize('header', [HEADER_12, HEADER_14])
+def test_rows_with_trailing_tabs_or_fewer_cells_are_read(job, tmp_path, header):
+	other = create_job(str(tmp_path / 'other'), 'other')
+	_rule_file(job, header, '\t'.join(rule_row(job) + ['1d', '', '', '']), '\t'.join(rule_row(other)[:11]))
+	by_name = {rule.job_name: rule for rule in rv.parse_rules(job.rule_path)}
+	assert (by_name[job.job_name].full_comparison_interval, by_name[job.job_name].chain_length) == ('1d', '')
+	assert (by_name['other'].full_comparison_interval, by_name['other'].chain_length) == ('', '')
+
+
+def test_a_defaults_row_of_11_cells_still_fills_and_leaves_the_new_fields_blank(job):
+	_rule_file(job, HEADER_12, '#_defaults_#\t\t/var/reverbs/\tauto\t60\t86400\tTrue\tTrue\t0\t5%,i5%\tauto',
+		rule_row(job, min_snapshot=''))
+	rule, = rv.parse_rules(job.rule_path)
+	assert rule.min_shapshot_time == '60' and (rule.full_comparison_interval, rule.chain_length) == ('', '')
+
+
+def test_a_defaults_row_can_set_the_new_columns(job):
+	_rule_file(job, HEADER_14, '\t'.join(['#_defaults_#'] + [''] * 11 + ['1d', '20']), rule_row(job))
+	rule, = rv.parse_rules(job.rule_path)
+	assert (rule.full_comparison_interval, rule.chain_length) == ('1d', '20')
+
+
+@pytest.mark.parametrize('extra', [[], ['12h']])
+def test_a_row_written_back_keeps_its_cell_count(job, extra):
+	_rule_file(job, HEADER_12, rule_row(job, min_snapshot='auto') + extra)
+	rv.parse_rules(job.rule_path)
+	row = open(job.rule_path).read().splitlines()[1].split('\t')
+	assert len(row) == 12 + len(extra) and row[4] == str(rv.DEFAULT_SNAPSHOT_DELAY) and row[12:] == extra
+
+
+def test_rule_file_header_is_the_files_own_prefix_of_12_or_more(job):
+	for n in (12, 13, 14):
+		_rule_file(job, '\t'.join(rv.REVERB_RULE_TSV_HEADER[:n]), rule_row(job))
+		assert rv.rule_file_header(job.rule_path) == rv.REVERB_RULE_TSV_HEADER[:n]
+	# a cell with trailing blanks still holds its name, as TSVZ judges it
+	_rule_file(job, HEADER_12 + ' ', rule_row(job))
+	assert rv.rule_file_header(job.rule_path) == rv.REVERB_RULE_TSV_HEADER[:12]
+
+
+def test_rule_file_header_is_the_whole_header_when_the_file_has_no_known_prefix(job, tmp_path):
+	_rule_file(job, '\t'.join(rv.REVERB_RULE_TSV_HEADER[:11]), rule_row(job))
+	assert rv.rule_file_header(job.rule_path) == rv.REVERB_RULE_TSV_HEADER
+	_rule_file(job, '\t'.join(['x'] * 12), rule_row(job))
+	assert rv.rule_file_header(job.rule_path) == rv.REVERB_RULE_TSV_HEADER
+	assert rv.rule_file_header(str(tmp_path / 'missing.tsv')) == rv.REVERB_RULE_TSV_HEADER
+
+
+@pytest.mark.parametrize('text, seconds', [('1d', 86400), ('1h30m', 5400), ('90', 90), ('1.5h', 5400), (' 2M 5S ', 125)])
+def test_parse_duration(text, seconds):
+	assert rv.parse_duration(text) == seconds
+
+
+@pytest.mark.parametrize('text', ['', ' ', '-5', '+5', 'h', '1w', '12hh', '1d-2h', 'soon', '1e3'])
+def test_parse_duration_rejects(text):
+	with pytest.raises(ValueError):
+		rv.parse_duration(text)
+
+
+@pytest.mark.parametrize('cell, seconds', [('', 0), ('0', 0), (' none ', 0), ('OFF', 0), ('auto', 0), ('1d', 86400),
+	('12h', 43200), ('30m', 1800), ('45s', 45), (' 1D ', 86400), ('90', 90), ('1h 30m', 5400), ('1.5h', 5400)])
+def test_full_comparison_interval_cells(cell, seconds, capsys):
+	assert rv.read_full_comparison_interval(cell, 'j') == seconds
+	assert 'Full Comparison Interval' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('cell', ['1w', 'soon', '-5', '12hh', 'h', '1d-2h'])
+def test_a_bad_full_comparison_interval_is_off_with_an_error(cell, capsys):
+	assert rv.read_full_comparison_interval(cell, 'j') == 0
+	out = capsys.readouterr().out
+	assert 'Full Comparison Interval' in out and '1d, 12h, 30m or 45s' in out
+
+
+@pytest.mark.parametrize('cell, links, error', [('', 40, False), ('auto', 40, False), ('40', 40, False), (' 20 ', 20, False),
+	('0', 0, False), ('None', 0, False), ('3', 3, False), ('2', 3, True), ('1', 3, True), ('-4', 3, True), ('x', 40, True),
+	('20.5', 40, True)])
+def test_chain_length_cells(cell, links, error, capsys):
+	assert rv.read_chain_length(cell, 'j') == links
+	assert ('Chain Length' in capsys.readouterr().out) == error

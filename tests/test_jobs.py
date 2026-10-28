@@ -629,6 +629,19 @@ def test_watcher_invalidates_its_signature_on_self_destruct_for_an_ordinary_job(
 	assert calls == [(path, 'UUID-RULE')]
 
 
+def test_job_attempt_starter_passes_the_backuper_keywords(monkeypatch):
+	got = []
+	monkeypatch.setattr(rv, 'watcher', lambda *a, **k: None)
+	monkeypatch.setattr(rv, 'backuper', lambda *a, **k: got.append(k))
+	starter = rv.job_attempt_starter('j', ('j', '/m'), (None, '/m'), ('j', None, None, '/m', 'v', 'N/A', None, None), None, None,
+		dict(full_comparison_interval=3600.0, chain_length=20))
+	control = rv.JobControl('j')
+	control.start_attempt()
+	for thread in starter(control, 1):
+		thread.join(timeout=5)
+	assert got == [dict(full_comparison_interval=3600.0, chain_length=20)]
+
+
 def test_interrupted_full_comparison_is_requeued(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	def interrupted(*args, **kwargs):
