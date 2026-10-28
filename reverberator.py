@@ -22,6 +22,7 @@ import resource
 import datetime
 import unicodedata
 import re
+import math
 import hashlib
 import select
 import contextlib
@@ -1105,6 +1106,9 @@ DEFAULT_ONLY_SYNC_ATTRIBUTES = True
 DEFAULT_KEEP_N_VERSIONS = 0
 DEFAULT_BACKUP_SIZE_LIMIT = '5%'
 # the most links a path into the vault may meet; the Chain Length column's blank, and its smallest limit
+# parse_duration's units, in seconds
+DURATION_UNITS = {unit:seconds for seconds, units in ((604800, 'w week weeks'), (86400, 'd day days'), (3600, 'h hr hrs hour hours'),
+	(60, 'm min mins minute minutes'), (1, 's sec secs second seconds')) for unit in units.split()}
 DEFAULT_CHAIN_LENGTH = 40
 MIN_CHAIN_LENGTH = 3
 
@@ -1649,7 +1653,7 @@ def run_daemon():
 		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate, monitor_path_signature,
 			dict(full_comparison_interval=full_comparison_interval, chain_length=chain_length))
 		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
-		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {full_comparison_interval}s, chain length: {chain_length}'))
+		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {f'{full_comparison_interval:g}s' if full_comparison_interval else 'off'}, chain length: {chain_length or 'no limit'}'))
 		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
 		supervisor.start()
 		supervisors.append(supervisor)
@@ -1955,18 +1959,20 @@ def discard_change_list(temp_path:str) -> None:
 
 def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 	'''
-	Replace rule rows in place. rows maps the job name cell as written in the file to its new full row.
-	For each key the last line whose first cell (stripped) equals it becomes the new row and earlier lines with that
-	key are removed (TSVZ already ignored them); every other line is kept byte for byte, line endings included.
-	The new row drops its trailing empty cells past the replaced line's own cell count, so a 12 cell row stays 12 cells;
-	a filled in cell beyond it is kept, as when a 5 cell row gets its defaults.
+	Change cells of rule rows in place. rows maps the job name cell as written in the file to {cell index: new value}.
+	For each key (compared stripped on both sides) the last line whose first cell (stripped) equals it is split into its own
+	cells, extended with empty cells only as far as the highest changed index needs, and has just those cells set; earlier
+	lines with that key are removed (TSVZ already ignored them). Every other cell of that line stays as written, so a blank
+	cell the defaults row fills on read stays blank, and cells past the 14th are kept. Every other line is kept byte for byte,
+	line endings included.
 
 	Args:
 		rule_file (str): The rule file
-		rows (dict): Written job name cell -> new row (list of cells)
+		rows (dict): Written job name cell -> {cell index: new value}
 	'''
 	if not rows:
 		return
+	rows = {key.strip():changes for key, changes in rows.items()}
 	rule_file = os.path.realpath(rule_file)
 	with open(rule_file, 'r', newline='', encoding='utf-8') as f:
 		lines = f.read().split('\n')
@@ -1981,11 +1987,12 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 		if key not in last_index:
 			result.append(line)
 		elif last_index[key] == i:
-			row = list(rows[key])
-			own = len(line.rstrip('\r').split('\t'))
-			while len(row) > own and row[-1] == '':
-				row.pop()
-			result.append('\t'.join(row) + line[len(line.rstrip('\r')):])
+			cells = line.rstrip('\r').split('\t')
+			changes = rows[key]
+			cells += [''] * (max(changes) + 1 - len(cells))
+			for index, value in changes.items():
+				cells[index] = value
+			result.append('\t'.join(cells) + line[len(line.rstrip('\r')):])
 	replace_file_text(rule_file, '\n'.join(result))
 
 def resolve_skip_list_path(cell:str, rule_file:str) -> 'str | None':
@@ -2008,23 +2015,40 @@ def resolve_skip_list_path(cell:str, rule_file:str) -> 'str | None':
 
 def parse_duration(text:str) -> float:
 	'''
-	A duration in seconds: a plain number (seconds) or one or more <number><unit> groups, units d, h, m and s.
-	Case and spaces are ignored; a sign, an empty text or anything else raises ValueError.
+	A duration in seconds: a plain number (seconds) or one or more <number><unit> groups, spaces allowed at the ends, between
+	a number and its unit and between groups. Units, in any case: w, d, h, m, s, with the spellings week(s), day(s), hr(s),
+	hour(s), min(s), minute(s), sec(s), second(s). A bare uppercase M is an error (minute or month?), as are a sign, spaces
+	inside a number, an empty text, a result that is not finite and anything else.
 
 	>>> parse_duration('1d'), parse_duration('1h30m'), parse_duration('90'), parse_duration('1.5h')
 	(86400.0, 5400.0, 90.0, 5400.0)
-	>>> parse_duration('-5')
+	>>> parse_duration('1w'), parse_duration('30min'), parse_duration('2 hours'), parse_duration('1 day'), parse_duration('5sec')
+	(604800.0, 1800.0, 7200.0, 86400.0, 5.0)
+	>>> parse_duration('1hr'), parse_duration('1H30Min'), parse_duration('1 h 30 min')
+	(3600.0, 5400.0, 5400.0)
+	>>> parse_duration('1M')
 	Traceback (most recent call last):
-	ValueError: not a duration: '-5'
+	ValueError: not a duration: '1M'
+	>>> parse_duration('1 30m')
+	Traceback (most recent call last):
+	ValueError: not a duration: '1 30m'
 	'''
-	cleaned = ''.join(text.lower().split())
-	number = r'(?:\d+(?:\.\d*)?|\.\d+)'
+	number = r'(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)'
+	group = f'({number})\\s*([a-zA-Z]+)'
+	cleaned = text.strip()
 	if re.fullmatch(number, cleaned):
-		return float(cleaned)
-	if not re.fullmatch(f'(?:{number}[dhms])+', cleaned):
+		seconds = float(cleaned)
+	elif re.fullmatch(f'{group}(?:\\s*{group})*', cleaned):
+		seconds = 0.0
+		for amount, unit in re.findall(group, cleaned):
+			if unit == 'M' or unit.lower() not in DURATION_UNITS:
+				raise ValueError(f'not a duration: {text!r}')
+			seconds += float(amount) * DURATION_UNITS[unit.lower()]
+	else:
 		raise ValueError(f'not a duration: {text!r}')
-	units = {'d':86400, 'h':3600, 'm':60, 's':1}
-	return float(sum(float(amount) * units[unit] for amount, unit in re.findall(f'({number})([dhms])', cleaned)))
+	if not math.isfinite(seconds):
+		raise ValueError(f'not a duration: {text!r}')
+	return seconds
 
 def read_full_comparison_interval(cell:str, job_name:str) -> float:
 	'''
@@ -2058,7 +2082,7 @@ def read_chain_length(cell:str, job_name:str) -> int:
 		return 0
 	try:
 		links = int(text)
-		if links >= MIN_CHAIN_LENGTH:
+		if links == 0 or links >= MIN_CHAIN_LENGTH:
 			return links
 		value = MIN_CHAIN_LENGTH
 	except ValueError:
@@ -2139,7 +2163,8 @@ def parse_rules(rule_file:str, read_only:bool = False):
 	rulesToUpdate = {}
 	returnReverbRules = []
 	for ruleName in rules:
-		ruleList = list(rules[ruleName]) + [''] * (len(REVERB_RULE_HEADER) - len(rules[ruleName]))
+		# TSVZ pads or cuts every row to 14 cells, and has filled its blank cells from the defaults row
+		ruleList = list(rules[ruleName])
 		if DEBUG:
 			tl.teeprint(log_text(f'Checking rule: {ruleList}'))
 		ruleUpdated = False
@@ -2252,12 +2277,13 @@ def parse_rules(rule_file:str, read_only:bool = False):
 		# check if the rule is explicit
 		if ruleUpdated:
 			tl.info(log_text(f'Updating rule {ruleName}: {inRule}'))
-			rulesToUpdate[ruleName] = list(inRule.values())
+			# only the cells this changed are written back: the others stay as the file has them, blank ones the defaults row fills included
+			rulesToUpdate[ruleName] = (inRule['job_name'], {i:value for i, (value, before) in enumerate(zip(inRule.values(), ruleList)) if value != before})
 		returnReverbRules.append(ReverbRule(**inRule))
 	# rewrite the updated rows in place once; a row whose cleaned name collides with another's is left as written,
 	# as renaming it would merge the two rows in the file; a row whose name cleaned to nothing is left as written too
 	colliding = colliding_job_names(returnReverbRules)
-	rulesToUpdate = {name:row for name,row in rulesToUpdate.items() if row[0] not in colliding and row[0] != ''}
+	rulesToUpdate = {name:changes for name,(job_name,changes) in rulesToUpdate.items() if job_name not in colliding and job_name != '' and changes}
 	if rulesToUpdate and not read_only:
 		try:
 			rewrite_rule_rows(rule_file,rulesToUpdate)
