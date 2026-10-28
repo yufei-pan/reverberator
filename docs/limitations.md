@@ -171,18 +171,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a job monitors a network filesystem, or files are changed on a pool's disks directly.
 - **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
 
-### A vault disk's data-write error caught by one comparison only
-
-- **Kind:** deferred (round 11).
-- **What the operator sees:** a vault disk that fails a data write but keeps working (XFS does not shut down on a data
-  write error) reports the error once, to the next comparison's sync, which keeps its copies unchecked and logs a
-  warning; a later comparison's sync gets no error, and its read-back from the page cache, which still holds the good
-  bytes, records the copy checked. After a reboot the copy reads back short or zeroed, and no comparison reads it again.
-- **Why:** syncfs reports a writeback error once; the read-back cannot tell the page cache from the disk.
-- **Revisit when:** round 11: remember a failed sync per disk until the next reboot (a marker under /run), and while it is
-  there keep that pool's copies unchecked, so the restart after the reboot reads them from disk.
-- **Approved:** 2026-10-27, the user's choice "Defer to round 11 (Recommended)".
-
 ### A copy whose start was lost after a power loss
 
 - **Kind:** known limitation.
@@ -247,37 +235,24 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** it is seen.
 - **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
 
-### A configurable chain length
-
-- **Kind:** deferred (round 11).
-- **What the operator sees:** a version's unchanged file is reached through a chain of links into older versions, re-copied
-  every 32-38 hops. Anything reading the vault through the kernel (hand browsing, cp, other tools) can get "too many
-  levels of symbolic links" for chains over about 20 links while mounts change on the host (Docker does this), as the
-  kernel then counts links twice. reverberator follows chains itself and is unaffected; the live jobs keep 3-5 versions.
-- **Why:** the re-copy distance is fixed.
-- **Revisit when:** round 11: make the re-copy distance configurable, default the current one, with a README note on
-  lowering it to about 20 where tools read the vault through the kernel; no limit can suit users who never browse by
-  hand (reverberator's own chain follower then needs no limit either).
-- **Approved:** 2026-10-27, the user: "make this max chain length configurable? let's default to our current one and keep
-  some notes about your case so user knows to change it on systems that may only want 20 linkx. and for users that do
-  not intend to manually copy them, then maybe no link limit is acceptable."
-
 ### A rewrite made while down that keeps size and mtime
 
-- **Kind:** deferred (round 11), already in 0.45.
+- **Kind:** known limitation, already in 0.45.
 - **What the operator sees:** a file rewritten in place while the daemon is down, at the same size and with its mtime set
   back, changed only before its last 64 KiB, is missed at the restart and kept wrong until it changes again.
 - **Why:** a full comparison checks size, mtime and the tail hash; utime cannot set ctime back, but ctime is not checked.
-- **Revisit when:** round 11: a full comparison reads the whole file when its ctime is after the matched time while its
-  size and mtime are unchanged.
-- **Approved:** 2026-10-27, the user's choice "Defer to round 11 (Recommended)".
+  Reading the whole file when its ctime is after the matched time would catch it, but making that check affordable
+  needed three more parts, for a rare case.
+- **Revisit when:** such rewrites are seen in practice.
+- **Approved:** 2026-10-27, the user's choice "Defer to round 11 (Recommended)"; then 2026-10-27, on that whole-file
+  check: "why do we bother?", then "Drop it, known limitation (Recommended)".
 
-### A version with no change after a carried move-out
+### A write error in the middle of a copy after the reboot
 
-- **Kind:** deferred (round 11).
-- **What the operator sees:** when a batch carries a pending move-out and removes its phantom, the move-out's own delete
-  arrives at the pair timeout (1-12 h on the live jobs) and, if nothing else changed, makes a version identical to the
-  one before; 0.45 made the same extra version, so the count is unchanged.
-- **Why:** a delete of a path the vault no longer tracks still counts as work for a batch.
-- **Revisit when:** round 11: drop such deletes before deciding a batch has work, so it ends in "No differences".
-- **Approved:** 2026-10-27, the user's choice "Defer to round 11 (Recommended)".
+- **Kind:** known limitation.
+- **What the operator sees:** after the reboot that ends a vault disk's failed-sync marker, the restart's full comparison
+  reads each unchecked copy back by its size, mtime and last 64 KiB. A page lost in the middle of a file to the write
+  error passes, and the copy stays wrong until the file changes again.
+- **Why:** reading every unchecked copy whole at a restart costs a full read of everything copied since the last check.
+- **Revisit when:** a vault disk keeps working after write errors, so this is met.
+- **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
