@@ -1,10 +1,11 @@
 import errno
 import os
+import threading
 from collections import OrderedDict
 import pytest
 import reverberator as rv
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
-from tests.harness import seed_monitor, tracked_manifest, run_backup, latest_version, event_entry
+from tests.harness import create_job, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry
 
 pytestmark = pytest.mark.unit
 
@@ -129,18 +130,104 @@ def test_a_marker_from_a_previous_boot_is_ignored_and_removed(job, monkeypatch, 
 	assert set(unchecked_flags(job).values()) == {0} and markers() == []
 
 
-def test_a_marker_that_cannot_be_written_is_logged_and_the_copies_stay_unchecked(job, monkeypatch, boot, tmp_path, capsys):
+@pytest.mark.parametrize('trigger', ['state folder is a file', 'boot id unreadable', 'folder at the marker path'])
+def test_a_marker_that_cannot_be_written_is_alerted_and_remembered_until_reverberator_stops(job, monkeypatch, boot, tmp_path, capsys, trigger):
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
-	blocked = tmp_path / 'not_a_folder'
-	blocked.write_text('')
-	monkeypatch.setenv('REVERB_STATE_DIR', str(blocked))
+	if trigger == 'state folder is a file':
+		blocked = tmp_path / 'not_a_folder'
+		blocked.write_text('')
+		monkeypatch.setenv('REVERB_STATE_DIR', str(blocked))
+	elif trigger == 'boot id unreadable':
+		boot.unlink()
+	else:
+		os.makedirs(rv.vault_sync_marker_path('/mnt/d1'))
 	disk_sync(monkeypatch, {'/mnt/d1': errno.EIO})
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {1}
+	out = capsys.readouterr().out
+	assert 'VAULT WRITE ERROR: disk /mnt/d1 failed a sync' in out and 'cannot record it until a reboot' in out
+	assert rv.UNRECORDED_FAILED_DISKS == {'/mnt/d1'}
+	boot.write_text('boot-1\n')
+	disk_sync(monkeypatch, {'/mnt/d1': None})              # the error was reported once: the next sync gets 0
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {1} and 'VAULT WRITE ERROR' not in capsys.readouterr().out
+	disk_sync(monkeypatch, {'/mnt/d2': None})              # a disk that never failed holds nothing
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {0}
+
+
+def test_an_unreadable_boot_id_keeps_the_copies_unchecked_with_one_warning(job, monkeypatch, boot, capsys):
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	run_backup(job)
+	boot.unlink()
+	disk_sync(monkeypatch, {'/mnt/d1': None})
 	lines = warning_lines(monkeypatch)
 	run_backup(job)
 	assert set(unchecked_flags(job).values()) == {1}
-	assert any('Cannot record that disk /mnt/d1 failed a sync' in message for message, _ in lines)
-	assert 'VAULT WRITE ERROR' not in capsys.readouterr().out
+	assert len([message for message, warning in lines if warning and 'sync of the vault failed' in message]) == 1
+	boot.write_text('boot-1\n')
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {0}
+
+
+def test_a_sync_that_raises_leaves_no_marker(job, monkeypatch, boot):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	recording_sync(monkeypatch, failing=True)
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {1} and markers() == [] and rv.UNRECORDED_FAILED_DISKS == set()
+
+
+def test_a_long_disk_path_is_named_by_its_hash_and_marked(boot):
+	error = OSError(errno.EIO, 'Input/output error')
+	long_disks = ['/' + 'x' * 300, '/' + 'x' * 299 + 'y']
+	for disk in long_disks:
+		assert rv.mark_failed_sync(disk, error) is True
+		assert rv.mark_failed_sync(disk, error) is False
+	assert rv.failed_sync_disks() == set(long_disks) and len(markers()) == 2
+	assert all(len(name) <= 250 and name.startswith(rv.VAULT_SYNC_MARKER_PREFIX) for name in markers())
+	# the longest name that still fits is the readable one
+	fits = os.path.basename(rv.vault_sync_marker_path('/' + 'x' * 180))
+	assert fits == rv.VAULT_SYNC_MARKER_PREFIX + '%2F' + 'x' * 180
+
+
+def test_a_second_job_syncing_the_disk_after_the_failed_sync_waits_for_its_marker(tmp_path, monkeypatch, boot):
+	# job a's sync of disk X meets the kernel's one error and it syncs Y slowly; job b's sync of X then gets 0, as the kernel
+	# reports an error once, and b must not record its copies checked before a has marked X
+	a = create_job(str(tmp_path / 'ra'), 'job_a')
+	b = create_job(str(tmp_path / 'rb'), 'job_b')
+	seed_monitor(a, {'a.txt': 'a'})
+	seed_monitor(b, {'b.txt': 'b'})
+	run_backup(a)
+	run_backup(b)
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', REAL_SYNC_VAULT_FILESYSTEMS)
+	monkeypatch.setattr(rv, 'vault_disks', lambda path: (True, [('/fake/X', 'X:' + path), ('/fake/Y', 'Y:' + path)]))
+	unseen = [True]
+	a_hit = threading.Event()
+	release_a = threading.Event()
+	def syncfs(folder):
+		if folder[0] == 'X':
+			if unseen:
+				unseen.pop()
+				a_hit.set()
+				raise OSError(errno.EIO, os.strerror(errno.EIO), folder)
+			return
+		if threading.current_thread().name == 'A':
+			release_a.wait(10)
+	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
+	thread_a = threading.Thread(target=run_backup, args=(a,), name='A')
+	thread_b = threading.Thread(target=run_backup, args=(b,), name='B')
+	thread_a.start()
+	assert a_hit.wait(10)
+	thread_b.start()
+	thread_b.join(1)                   # without the lock b is done by now, with its copies checked
+	release_a.set()
+	thread_a.join(10)
+	thread_b.join(10)
+	assert not thread_a.is_alive() and not thread_b.is_alive()
+	assert set(unchecked_flags(a).values()) == {1} and set(unchecked_flags(b).values()) == {1}
+	assert rv.failed_sync_disks() == {'/fake/X'}
 
 
 def test_a_marker_is_written_once_per_boot(boot):

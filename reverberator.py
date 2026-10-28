@@ -1864,30 +1864,21 @@ def fsync_vault_folder(path:str) -> None:
 	'''
 	on_vault_branches(path, lambda folder: fsync_path(folder, folder=True))
 
-class VaultDisks(list):
-	'''The (disk, folder) list vault_disks() gives, with whether the disks are the branches of a pool.'''
-	pooled = False
-
-def vault_disks(path:str) -> list:
+def vault_disks(path:str) -> tuple:
 	'''
-	The (disk, folder) of each disk holding the vault folder at path. On a mergerfs pool, whose own sync and folder sync do
-	not reach the disks, that is (branch, the folder on it) for each branch the pool lists, whether it holds the folder or
-	not (pooled is True); a branch list that cannot be read raises its OSError. Off a pool it is [(the mount point holding
-	path, path)], or [(path, path)] when the mount table has none. The mount table is read once.
+	(pooled, disks): the (disk, folder) of each disk holding the vault folder at path, and whether they are the branches of
+	a mergerfs pool. On a pool, whose own sync and folder sync do not reach the disks, that is (branch, the folder on it) for
+	each branch the pool lists, whether it holds the folder or not; a branch list that cannot be read raises its OSError.
+	Off a pool it is [(the mount point holding path, path)], or [(path, path)] when the mount table has none. The mount
+	table is read once.
 	'''
 	table = read_mount_table()
 	pool = mergerfs_mount(table, path)
 	if pool is None:
 		held = mount_holding(table, os.path.realpath(path))
-		return VaultDisks([(held[0] if held else path, path)])
+		return False, [(held[0] if held else path, path)]
 	rel = os.path.relpath(os.path.realpath(path), pool)
-	disks = VaultDisks((branch, os.path.join(branch, rel)) for branch in read_pool_branches(pool))
-	disks.pooled = True
-	return disks
-
-def missing_on_branch(disks:list, error:OSError) -> bool:
-	'''Whether error is a pool branch not holding the folder, which is normal: a folder off a pool that is gone is an error.'''
-	return disks.pooled and isinstance(error, (FileNotFoundError, NotADirectoryError))
+	return True, [(branch, os.path.join(branch, rel)) for branch in read_pool_branches(pool)]
 
 def on_vault_branches(path:str, action) -> None:
 	'''
@@ -1895,13 +1886,13 @@ def on_vault_branches(path:str, action) -> None:
 	on each branch holding it; a branch without it is passed over, and the first other OSError is raised once every
 	branch was tried. A branch list that cannot be read raises its OSError. Off a pool it is action(path).
 	'''
-	disks = vault_disks(path)
+	pooled, disks = vault_disks(path)
 	failure = None
 	for _, folder in disks:
 		try:
 			action(folder)
 		except OSError as e:
-			if not missing_on_branch(disks, e):
+			if not (pooled and isinstance(e, (FileNotFoundError, NotADirectoryError))):
 				failure = failure or e
 	if failure is not None:
 		raise failure
@@ -1931,24 +1922,34 @@ def sync_vault_filesystems(job_vault:str) -> dict:
 	read back as checked (compare_scopes()), once syncfs_folder() was tried on every one of them (vault_disks()): on a
 	mergerfs pool, whose sync does not reach the disks, each branch holding the job vault; off a pool, the job vault's own
 	filesystem. Returns {disk: None, or the OSError its sync raised}. On a pool a branch without the job vault is left out;
-	a branch list that cannot be read raises its OSError.
+	a branch list that cannot be read raises its OSError, and so does a job vault gone off a pool (its disk may be gone
+	too, and that says nothing of a write error).
 	'''
-	disks = vault_disks(job_vault)
+	pooled, disks = vault_disks(job_vault)
 	results = {}
 	for disk, folder in disks:
 		try:
 			syncfs_folder(folder)
 			results[disk] = None
+		except (FileNotFoundError, NotADirectoryError):
+			if not pooled:
+				raise
 		except OSError as e:
-			if not missing_on_branch(disks, e):
-				results[disk] = e
+			results[disk] = e
 	return results
 
 # the boot id the kernel makes anew at each boot, and the start of the name of a disk's marker in the state folder
 BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
 VAULT_SYNC_MARKER_PREFIX = 'vault-sync-failed-'
-# several jobs' comparisons can meet one disk at once
-VAULT_SYNC_MARKER_LOCK = threading.Lock()
+# The kernel reports a disk's writeback error once, to the first sync that meets it, so every other job's sync of the disk
+# gets 0 and its comparison would record copies checked that never reached the disk. A comparison holds this lock from
+# its sync of the vault until the error that sync met is marked (check_vault_sync()), and the helpers below expect their
+# caller to hold it.
+VAULT_SYNC_LOCK = threading.Lock()
+# the disks whose failed sync could not be recorded in a marker: remembered until reverberator stops
+UNRECORDED_FAILED_DISKS = set()
+# the longest file name the filesystems take, in bytes
+MAX_FILE_NAME = 255
 
 def current_boot_id() -> str:
 	'''This boot's id. Raises OSError when it cannot be read.'''
@@ -1957,11 +1958,17 @@ def current_boot_id() -> str:
 
 def vault_sync_marker_path(disk:str) -> str:
 	'''
-	The marker file of a disk: one file in the state folder, named by the disk's path percent-encoded (unique, readable).
+	The marker file of a disk: one file in the state folder, named by the disk's path percent-encoded (unique, readable), or
+	by the sha256 of its bytes when that and the temp name of mark_failed_sync() would not fit a file name.
 	>>> os.path.basename(vault_sync_marker_path('/mnt/jank_data/a58'))
 	'vault-sync-failed-%2Fmnt%2Fjank_data%2Fa58'
+	>>> len(os.path.basename(vault_sync_marker_path('/' + 'x' * 300)))
+	82
 	'''
-	return os.path.join(state_dir_path(), VAULT_SYNC_MARKER_PREFIX + urllib.parse.quote(os.fsencode(disk), safe=''))
+	name = VAULT_SYNC_MARKER_PREFIX + urllib.parse.quote(os.fsencode(disk), safe='')
+	if len(name) + len('.' + '.tmp') > MAX_FILE_NAME:
+		name = VAULT_SYNC_MARKER_PREFIX + hashlib.sha256(os.fsencode(disk)).hexdigest()
+	return os.path.join(state_dir_path(), name)
 
 def read_vault_sync_marker(path:str) -> 'dict | None':
 	'''The marker file's content ({disk, boot_id, error}), None when it cannot be read or is no marker.'''
@@ -1977,53 +1984,73 @@ def mark_failed_sync(disk:str, error:OSError) -> bool:
 	Remember that a sync of disk failed, until the next reboot: write its marker in the state folder (made when missing), one
 	line of JSON holding the disk, this boot's id and the error, through a temp file renamed into place. Returns True; or
 	False, writing nothing, when a marker of this boot already stands for the disk. Raises OSError when the marker cannot
-	be written. A disk's error is reported once (the kernel's next sync gets 0), so this is the only memory of it.
+	be written. A disk's error is reported once (the kernel's next sync gets 0), so this is the only memory of it. The caller
+	holds VAULT_SYNC_LOCK.
 	'''
-	with VAULT_SYNC_MARKER_LOCK:
-		boot_id = current_boot_id()
-		path = vault_sync_marker_path(disk)
-		marker = read_vault_sync_marker(path)
-		if marker is not None and marker['boot_id'] == boot_id:
-			return False
-		os.makedirs(os.path.dirname(path), exist_ok=True)
-		temp_path = os.path.join(os.path.dirname(path), '.' + os.path.basename(path) + '.tmp')
-		try:
-			with open(temp_path, 'w', encoding='utf-8') as f:
-				f.write(json.dumps({'disk': disk, 'boot_id': boot_id, 'error': str(error)}) + '\n')
-			os.replace(temp_path, path)
-		except BaseException:
-			with contextlib.suppress(OSError):
-				os.remove(temp_path)
-			raise
-		return True
+	boot_id = current_boot_id()
+	path = vault_sync_marker_path(disk)
+	marker = read_vault_sync_marker(path)
+	if marker is not None and marker['boot_id'] == boot_id:
+		return False
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	temp_path = os.path.join(os.path.dirname(path), '.' + os.path.basename(path) + '.tmp')
+	try:
+		with open(temp_path, 'w', encoding='utf-8') as f:
+			f.write(json.dumps({'disk': disk, 'boot_id': boot_id, 'error': str(error)}) + '\n')
+		os.replace(temp_path, path)
+	except BaseException:
+		with contextlib.suppress(OSError):
+			os.remove(temp_path)
+		raise
+	return True
 
 def failed_sync_disks() -> set:
 	'''
 	The disks whose marker holds this boot's id (read from the file's content, never from its name). A marker that cannot
 	be read is ignored; one of another boot is removed, errors ignored. A missing state folder gives an empty set. Raises
-	OSError when the boot id cannot be read.
+	OSError when the boot id cannot be read. The caller holds VAULT_SYNC_LOCK.
 	'''
 	boot_id = current_boot_id()
 	state = state_dir_path()
 	disks = set()
-	with VAULT_SYNC_MARKER_LOCK:
-		try:
-			names = os.listdir(state)
-		except OSError:
-			return disks
-		for name in names:
-			if not name.startswith(VAULT_SYNC_MARKER_PREFIX):
-				continue
-			path = os.path.join(state, name)
-			marker = read_vault_sync_marker(path)
-			if marker is None:
-				continue
-			if marker['boot_id'] == boot_id:
-				disks.add(marker['disk'])
-			else:
-				with contextlib.suppress(OSError):
-					os.remove(path)
+	try:
+		names = os.listdir(state)
+	except OSError:
+		return disks
+	for name in names:
+		if not name.startswith(VAULT_SYNC_MARKER_PREFIX):
+			continue
+		path = os.path.join(state, name)
+		marker = read_vault_sync_marker(path)
+		if marker is None:
+			continue
+		if marker['boot_id'] == boot_id:
+			disks.add(marker['disk'])
+		else:
+			with contextlib.suppress(OSError):
+				os.remove(path)
 	return disks
+
+def check_vault_sync(job_vault:str, job_name:str) -> list:
+	'''
+	The sync of a comparison's vault (sync_vault_filesystems()), and what it means for the copies the comparison read back:
+	the sorted disks holding job_vault that failed a sync now, or that failed one since boot (a marker of this boot) or
+	since reverberator started (UNRECORDED_FAILED_DISKS). Each disk that failed now is marked (mark_failed_sync()) and
+	alerted once, with the VAULT WRITE ERROR line; when its marker cannot be written the alert says so, and the disk is
+	remembered in UNRECORDED_FAILED_DISKS. Any exception is the caller's failed sync. All of it holds VAULT_SYNC_LOCK, so
+	no other comparison's sync of a disk gets its 0 before the error is recorded.
+	'''
+	with VAULT_SYNC_LOCK:
+		results = sync_vault_filesystems(job_vault)
+		failed = {disk: e for disk, e in results.items() if e is not None}
+		for disk, e in failed.items():
+			try:
+				if mark_failed_sync(disk, e):
+					job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); its copies stay unchecked until a reboot')
+			except OSError as marker_error:
+				UNRECORDED_FAILED_DISKS.add(disk)
+				job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); cannot record it until a reboot ({marker_error}), so it is remembered only until reverberator stops')
+		return sorted(set(failed) | ((failed_sync_disks() | UNRECORDED_FAILED_DISKS) & set(results)))
 
 # the private folder prepare_change_list() writes a change list in before place_change_list() renames it into place: made
 # by mkdtemp() in the job vault, which no reader takes for a version or a change list, and removed by get_vault_info()
@@ -8881,8 +8908,9 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	vault's filesystems made in this comparison, before its first such record (sync_vault_filesystems()); when that fails,
 	every file record it stores is unchecked, with one warning. A disk whose sync failed is marked until the next reboot
 	(mark_failed_sync(): the kernel reports a writeback error once), and while a disk holding the vault has its marker
-	every comparison's copies are unchecked, so the restart after the reboot reads them back. With fresh, version_path is that uncommitted version, and a
-	file read there as a real file of its own (a re-copy, or a copy a move carried) is recorded unchecked too.
+	every comparison's copies are unchecked, so the restart after the reboot reads them back. With fresh, version_path is
+	that uncommitted version, and a file read there as a real file of its own (a re-copy, or a copy a move carried) is
+	recorded unchecked too.
 	Without attributes, attribute-only differences are left out. With scopes.changed_since or changed_since_wall, the
 	extended attributes of the entries changed since then, by their ctime (ctime_bound()), are compared too
 	(compare_entry()), never those of a trusted row.
@@ -8952,21 +8980,11 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 					if not synced and not found.unchecked:
 						# the first copy to record as checked: all those read back here were made before this sync, so
 						# once it succeeds they are on the disks. a data-write error is reported once, to the first sync
-						# after it: this comparison keeps its copies unchecked, but a later comparison's sync gets 0 and
-						# can record a copy checked from the page cache
+						# after it, so check_vault_sync() marks the disk until the reboot: every comparison that syncs
+						# it keeps its copies unchecked, not only the one whose sync saw the error
 						synced = True
 						try:
-							results = sync_vault_filesystems(os.path.dirname(os.path.abspath(version_path)))
-							failed = {disk: e for disk, e in results.items() if e is not None}
-							for disk, e in failed.items():
-								try:
-									if mark_failed_sync(disk, e):
-										job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); its copies stay unchecked until a reboot')
-								except OSError as marker_error:
-									backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot record that disk {disk} failed a sync: {marker_error}')
-							# a disk that failed a sync since boot may have lost writes the kernel reported once, to some
-							# comparison's sync: its copies stay unchecked until the reboot, whichever job made them
-							bad_disks = sorted(set(failed) | (failed_sync_disks() & set(results)))
+							bad_disks = check_vault_sync(os.path.dirname(os.path.abspath(version_path)), job_name)
 							if bad_disks:
 								sync_failed = True
 								backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed on {", ".join(bad_disks)} since boot, so this comparison\'s copies read back stay unchecked')
