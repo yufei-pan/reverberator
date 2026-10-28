@@ -94,30 +94,24 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 ### Files written through mmap
 
-- **Kind:** deferred (round 11).
-- **What the operator sees:** a file written through mmap raises no inotify event. If its mode, owner or xattrs then
-  change in the same batch, the version keeps its old bytes under the new metadata, and a full comparison does not see
-  it either (the metadata sync put the new mtime on the old copy), until the file is written normally again. A file
-  written only through mmap (mein's QQ MMKV files, for example) is backed up only at a restart's full comparison.
-- **Why:** no inotify or fanotify flag reports mmap stores (round 10's research: scratchpad r10/mmap/report.md); an mmap
-  store does move the file's mtime.
-- **Revisit when:** round 11: (1) an attribute-only change whose live mtime moved is copied rather than synced, so the
-  mtime stays a true signal for later comparisons (a touch of a big unchanged file then costs one copy); (2) a scheduled
-  full comparison per job, configurable in the rule file and off by default, for files that get no event at all.
+- **Kind:** known limitation.
+- **What the operator sees:** a write through mmap raises no inotify event, so 0.47 relies on the mtime it moves: an
+  attribute-only change whose mtime moved copies the file, and a full comparison (a restart, or the job's Full
+  Comparison Interval when set) copies a file whose mtime moved. What is left: (1) a second store into a page still
+  dirty from an earlier one moves no mtime, so a copy taken between them misses the later store until the mtime next
+  moves; (2) an mmap write followed by setting the mtime back is not seen; (3) a copy that a 0.46 or older daemon synced
+  after an mmap write (old bytes under the new mtime) stays wrong until the file is written again; (4) a file written
+  only through mmap (mein's QQ MMKV files) is backed up only at a restart, or at the Full Comparison Interval if one is
+  set.
+- **Why:** no inotify or fanotify flag reports mmap stores (round 10's research: scratchpad r10/mmap/report.md); the
+  kernel moves the mtime only on the first store into a clean page.
+- **Revisit when:** a kernel interface reports mmap stores, or a job's files are seen stale this way.
 - **Approved:** 2026-10-26, "let's defer. let's see if we can catch something, or if we can know if a file is mmaped";
   2026-10-27: "should we trust mtime change as indication of file is changed to just do the copy? this way we only do
   one read and one write not three reads and one write in most cases", then "Keep it, round 11 (Recommended)", and for
-  the scheduled comparison "Configurable per job and default off".
-
-### A file moved and then touched in one batch is copied again
-
-- **Kind:** known limitation.
-- **What the operator sees:** a file moved and then given a new mtime (`touch -m`, `rsync -t`) in the same batch is
-  copied again whole by the check after the batch, and the size estimate does not count that copy.
-- **Why:** letting a moved row vouch for its copy would weaken the guard that keeps a swap from putting one file's
-  metadata on another's copy.
-- **Revisit when:** it costs noticeable space.
-- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+  the scheduled comparison "Configurable per job and default off"; 2026-10-28, on what is left after 0.47: "Known
+  limitation, as listed (Recommended)". The entry "A file moved and then touched in one batch is copied again" was
+  removed the same day ("Remove it (Recommended)"): every touch that moves the mtime now copies the file.
 
 ### Swaps in one batch are repaired by copies
 
@@ -160,6 +154,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** counting them would add estimates for a small, one-batch overshoot.
 - **Revisit when:** a vault's limit is tight enough for it to matter.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+
+### A vault keeping one version can pass its size limit
+
+- **Kind:** known limitation.
+- **What the operator sees:** a vault keeping a single version can pass its Backup Size Limit by the size of a change,
+  as its only version is never removed; it comes back under once a second version exists and the old one can be pruned.
+- **Why:** removing the only version would leave no backup.
+- **Revisit when:** a single-version job with a tight limit is used.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
 ### Changes made outside the watched folder
 
@@ -258,3 +261,98 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** reading every unchecked copy whole at a restart costs a full read of everything copied since the last check.
 - **Revisit when:** a vault disk keeps working after write errors, so this is met.
 - **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
+
+### One lock for every comparison's vault sync
+
+- **Kind:** known limitation.
+- **What the operator sees:** all comparisons' vault syncs take one lock, so a write error is marked before another job
+  syncs that disk; a vault disk that hangs in a sync (SCSI timeouts, a link-reset loop) stalls every job's checked
+  records, on any pool, not only the jobs on that disk.
+- **Why:** a lock per disk needs a lock table; on this host every vault is on /mnt/jank.
+- **Revisit when:** a host keeps vaults on several pools.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
+
+### A failed sync that cannot be recorded, after a restart
+
+- **Kind:** known limitation.
+- **What the operator sees:** when a vault disk's failed sync cannot be recorded (the state folder is broken or full),
+  the alert still goes out and the disk is remembered in memory; if reverberator restarts before the next reboot, that
+  memory is gone, and copies on that disk read back from the page cache can be recorded checked, though after the reboot
+  they may be bad.
+- **Why:** it needs a disk write error and a broken state folder at once, and the alert has told the operator.
+- **Revisit when:** it is met.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
+
+### Bind mounts and btrfs subvolumes get separate failed-sync markers
+
+- **Kind:** known limitation.
+- **What the operator sees:** markers are kept per mount point, so a vault reached through a bind mount of another
+  vault's disk, or btrfs subvolumes of one filesystem, get separate markers, and a write error one job's sync sees can
+  be missed by the other job.
+- **Why:** the kernel keeps the error per filesystem, which userspace sees only by mount point or device number; neither
+  layout is used on this host.
+- **Revisit when:** such a layout is used.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
+
+### A rewritten rule row keeps the defaults it was given
+
+- **Kind:** known limitation, already before 0.47.
+- **What the operator sees:** when reverberator fills a rule row's auto cells, it writes that row's resolved columns 1-12
+  back, values taken from the #_defaults_# row included, so a later edit of the defaults row no longer reaches that job.
+  Columns 13 and 14 are never written.
+- **Why:** filling in defaults and auto fields is how the rule file records what each job runs with.
+- **Revisit when:** a host relies on editing the defaults row for jobs already started.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
+
+### A file edited during a full comparison is copied twice
+
+- **Kind:** known limitation, already before 0.47.
+- **What the operator sees:** an edit made while a full comparison runs lands in the comparison's version, and the next
+  batch (from the edit's event) copies the file again into one more version: an extra copy and version, no wrong
+  result. Jobs with a Full Comparison Interval meet it a little more often.
+- **Why:** the fix sits in the replay's core path, a risk not worth an extra version.
+- **Revisit when:** it costs noticeable space.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
+
+### A resumed batch of only untracked deletes walks the tree twice
+
+- **Kind:** known limitation.
+- **What the operator sees:** after a restart that resumes a pending file holding only a carried move-out's late
+  delete, the delete is dropped and the whole tree is compared twice (the empty batch's comparison, then the resumed
+  batch's follow-up), with no version; 0.46 made an empty version there instead.
+- **Why:** one extra full walk at a rare restart, and no wrong result.
+- **Revisit when:** such restarts are frequent.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
+
+### Writes under a vault that is not mounted
+
+- **Kind:** deferred (round 12), already before 0.47.
+- **What the operator sees:** with the vault's pool unmounted, a reverberator start creates the job's vault folder under
+  the bare mount point on the root disk, and a stop with queued changes writes its pending file there too. Both are
+  hidden once the pool mounts; nothing is lost, as the next start compares the whole tree.
+- **Why:** the start creates a missing vault path, and the stop persists pending changes, without checking that the
+  vault's pool or signature is there.
+- **Revisit when:** round 12: never create or write into a vault path whose pool or signature is not ready; keep queued
+  changes as a full-comparison request instead.
+- **Approved:** 2026-10-28, the user's choice "Defer to round 12 (Recommended)".
+
+### A chmod reads each file's vault copy once at commit
+
+- **Kind:** deferred (round 12), already before 0.47.
+- **What the operator sees:** a chmod or chown that keeps the mtime reads each file's last 64 KiB from the vault disks
+  once when the batch commits, even when its record already vouches for the copy: a chmod -R or chown -R over panruixin
+  (~223k files) costs ~223k random reads on the HDD pool, minutes to tens of minutes.
+- **Why:** the commit records each changed row by hashing its chain end.
+- **Revisit when:** round 12: keep the record's hash when it vouches for the copy, so an attribute-only change reads
+  nothing from the vault.
+- **Approved:** 2026-10-28, the user's choice "Defer to round 12 (Recommended)".
+
+### A delete whose rm fails leaves the entry in the version
+
+- **Kind:** deferred (round 12), already before 0.47.
+- **What the operator sees:** if removing an entry from a new version fails without failing the disk (EACCES, EBUSY),
+  that version keeps a file its database no longer lists: no comparison can see it, a later delete of it is ignored,
+  and restoring that version brings the deleted file back.
+- **Why:** the replay's delete does not check its rm's result.
+- **Revisit when:** round 12: check each rm's result and fail the batch (handed back and retried) when one fails.
+- **Approved:** 2026-10-28, the user's choice "Defer to round 12 (Recommended)".

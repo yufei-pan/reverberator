@@ -146,7 +146,7 @@ def test_a_marker_that_cannot_be_written_is_alerted_and_remembered_until_reverbe
 	run_backup(job)
 	assert set(unchecked_flags(job).values()) == {1}
 	out = capsys.readouterr().out
-	assert 'VAULT WRITE ERROR: disk /mnt/d1 failed a sync' in out and 'cannot record it until a reboot' in out
+	assert 'VAULT WRITE ERROR: disk /mnt/d1 failed a sync' in out and 'its marker cannot be written' in out
 	assert rv.UNRECORDED_FAILED_DISKS == {'/mnt/d1'}
 	boot.write_text('boot-1\n')
 	disk_sync(monkeypatch, {'/mnt/d1': None})              # the error was reported once: the next sync gets 0
@@ -192,7 +192,7 @@ def test_a_disk_path_too_long_for_a_marker_name_is_remembered_in_memory_with_its
 	run_backup(job)
 	assert set(unchecked_flags(job).values()) == {1}
 	out = capsys.readouterr().out
-	assert 'VAULT WRITE ERROR' in out and 'cannot record it until a reboot' in out
+	assert 'VAULT WRITE ERROR' in out and 'its marker cannot be written' in out
 	assert markers() == [] and rv.UNRECORDED_FAILED_DISKS == {long_disk}
 	disk_sync(monkeypatch, {long_disk: None})              # the error was reported once: the next sync gets 0
 	run_backup(job)
