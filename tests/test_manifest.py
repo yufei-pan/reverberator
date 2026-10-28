@@ -51,14 +51,105 @@ def test_cold_start_reads_each_copy_back_once_then_only_the_monitored_side(job, 
 
 
 def recording_sync(monkeypatch, failing=False):
-	'''rv.sync_vault_filesystems replaced by a recorder of the job vaults it is asked to sync, raising EIO when failing.'''
+	'''
+	rv.sync_vault_filesystems replaced by a recorder of the job vaults it is asked to sync, answering {} (no disk failed), and
+	raising EIO when failing, as it does for a branch list it cannot read.
+	'''
 	calls = []
 	def sync(job_vault):
 		calls.append(job_vault)
 		if failing:
 			raise OSError(errno.EIO, os.strerror(errno.EIO), job_vault)
+		return {}
 	monkeypatch.setattr(rv, 'sync_vault_filesystems', sync)
 	return calls
+
+
+def disk_sync(monkeypatch, results):
+	'''rv.sync_vault_filesystems answering results ({disk: None or an errno}) for any job vault.'''
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: {disk: None if code is None else OSError(code, os.strerror(code))
+		for disk, code in results.items()})
+
+
+@pytest.fixture
+def boot(tmp_path, monkeypatch):
+	path = tmp_path / 'boot_id'
+	path.write_text('boot-1\n')
+	monkeypatch.setattr(rv, 'BOOT_ID_PATH', str(path))
+	return path
+
+
+def markers():
+	state = rv.state_dir_path()
+	return sorted(name for name in os.listdir(state) if name.startswith(rv.VAULT_SYNC_MARKER_PREFIX)) if os.path.isdir(state) else []
+
+
+def test_a_disk_that_failed_a_sync_keeps_copies_unchecked_until_a_reboot(job, monkeypatch, boot, capsys):
+	seed_monitor(job, {f'f{i}.txt': str(i) for i in range(4)})
+	run_backup(job)
+	disk_sync(monkeypatch, {'/mnt/d1': errno.EIO})
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {1}
+	assert capsys.readouterr().out.count('VAULT WRITE ERROR: disk /mnt/d1 failed a sync') == 1
+	disk_sync(monkeypatch, {'/mnt/d1': None})              # the error was reported once: the next sync gets 0
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {1} and 'VAULT WRITE ERROR' not in capsys.readouterr().out
+	boot.write_text('boot-2\n')                            # the reboot
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {0}
+
+
+def test_a_second_disk_error_gets_its_own_marker_and_alert(job, monkeypatch, boot, capsys):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	disk_sync(monkeypatch, {'/mnt/d1': errno.EIO, '/mnt/d2': None})
+	run_backup(job)
+	disk_sync(monkeypatch, {'/mnt/d1': None, '/mnt/d2': errno.EIO})
+	run_backup(job)
+	assert rv.failed_sync_disks() == {'/mnt/d1', '/mnt/d2'} and len(markers()) == 2
+	assert capsys.readouterr().out.count('VAULT WRITE ERROR') == 2
+
+
+def test_a_marker_of_a_disk_not_holding_the_vault_holds_nothing(job, monkeypatch, boot):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	assert rv.mark_failed_sync('/mnt/other', OSError(errno.EIO, 'Input/output error')) is True
+	disk_sync(monkeypatch, {'/mnt/d1': None})
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {0}
+
+
+def test_a_marker_from_a_previous_boot_is_ignored_and_removed(job, monkeypatch, boot):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	rv.mark_failed_sync('/mnt/d1', OSError(errno.EIO, 'Input/output error'))
+	boot.write_text('boot-2\n')
+	disk_sync(monkeypatch, {'/mnt/d1': None})
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {0} and markers() == []
+
+
+def test_a_marker_that_cannot_be_written_is_logged_and_the_copies_stay_unchecked(job, monkeypatch, boot, tmp_path, capsys):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	blocked = tmp_path / 'not_a_folder'
+	blocked.write_text('')
+	monkeypatch.setenv('REVERB_STATE_DIR', str(blocked))
+	disk_sync(monkeypatch, {'/mnt/d1': errno.EIO})
+	lines = warning_lines(monkeypatch)
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {1}
+	assert any('Cannot record that disk /mnt/d1 failed a sync' in message for message, _ in lines)
+	assert 'VAULT WRITE ERROR' not in capsys.readouterr().out
+
+
+def test_a_marker_is_written_once_per_boot(boot):
+	error = OSError(errno.EIO, 'Input/output error')
+	assert rv.mark_failed_sync('/mnt/d1', error) is True
+	assert rv.mark_failed_sync('/mnt/d1', error) is False
+	boot.write_text('boot-2\n')
+	assert rv.failed_sync_disks() == set()
+	assert rv.mark_failed_sync('/mnt/d1', error) is True and rv.failed_sync_disks() == {'/mnt/d1'}
 
 
 def warning_lines(monkeypatch):
