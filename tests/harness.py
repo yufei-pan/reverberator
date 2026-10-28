@@ -19,6 +19,18 @@ def create_job(root: str, job_name: str = 'job') -> JobPaths:
 	return JobPaths(root, monitor, vault, job_name, os.path.join(vault, job_name), os.path.join(root, 'rule.tsv'))
 
 
+def fstab_escape(mount_point: str) -> str:
+	'''A mount point as fstab (and mountinfo) write it: backslash, space, tab and newline octal-escaped.'''
+	return ''.join({'\\': '\\134', ' ': '\\040', '\t': '\\011', '\n': '\\012'}.get(c, c) for c in mount_point)
+
+
+def write_fstab(*mount_points: str) -> str:
+	'''Write rv.FSTAB_PATH naming mount_points, one line each; the path.'''
+	with open(rv.FSTAB_PATH, 'w', encoding='utf-8') as f:
+		f.write(''.join(f'/dev/fake{i} {fstab_escape(mount_point)} xfs defaults 0 0\n' for i, mount_point in enumerate(mount_points)))
+	return rv.FSTAB_PATH
+
+
 def write_tree(root: str, tree: dict) -> None:
 	os.makedirs(root, exist_ok=True)
 	for rel, content in tree.items():
@@ -255,7 +267,7 @@ class FakePool:
 			self.next_id += 1
 		self.next_unique_id += 1
 		self.mounted_as[mount_point] = (fstype, source, mount_id)
-		return mount_point, f'{mount_id} 22 0:{mount_id} / {mount_point} rw - {fstype} {source} rw\n', mount_id, self.next_unique_id
+		return mount_point, f'{mount_id} 22 0:{mount_id} / {fstab_escape(mount_point)} rw - {fstype} {source} rw\n', mount_id, self.next_unique_id
 
 	def f2fs_source(self, branch:str) -> str:
 		'''A /dev/mapper-like link to a dm-<n> device for a new f2fs branch, whose cp_status says it is whole.'''
@@ -290,6 +302,14 @@ class FakePool:
 		self.pools[pool] = listed
 		self.lines.append(self.line(pool, 'fuse.mergerfs', 'pool'))
 		self.lines.extend(self.line(b, fstype, self.f2fs_source(b) if fstype == 'f2fs' else '/dev/fake') for b in real)
+		self.write()
+		return real
+
+	def add_mount(self, mount_point:str, fstype:str = 'xfs') -> str:
+		'''A plain mount (source /dev/fake) at mount_point, made when missing; its real path.'''
+		os.makedirs(mount_point, exist_ok=True)
+		real = os.path.realpath(mount_point)
+		self.lines.append(self.line(real, fstype, '/dev/fake'))
 		self.write()
 		return real
 
