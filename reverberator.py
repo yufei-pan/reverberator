@@ -3998,6 +3998,18 @@ def scan_scopes(monitor_path:str, folders) -> list:
 			scopes.append(rel)
 	return scopes
 
+def drop_untracked_deletes(backup_entries:dict, manifest:'VaultManifest', monitor_path:str) -> int:
+	'''
+	Drop the delete entries of paths the manifest does not track ( no row at the path, at the path with /, or under it ),
+	which have nothing in the vault to delete; returns how many went. Every other entry and the order stay.
+	A move-out carried over a phantom is deleted at the pair timeout, after the phantom's removal took its path from the vault.
+	'''
+	untracked = [path for path, values in backup_entries.items() if values.event == 'delete' and not manifest.tracks(os.path.relpath(path, monitor_path))]
+	for path in untracked:
+		del backup_entries[path]
+	return len(untracked)
+
+
 def drop_entries_under(backup_entries:dict, folder_paths:list) -> int:
 	'''
 	Drop the backup entries at or under any of folder_paths (absolute, ending with /), whose vault entries a comparison
@@ -5217,6 +5229,11 @@ def do_backup(backup_entries:dict,
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
+			if backup_entries and manifest.describes(latest_version_info.path):
+				# a delete of what the vault holds no path of would make a version with no change
+				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path)
+				if dropped:
+					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
 			if not backup_entries:
 				if touched is None:
 					backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
@@ -7280,6 +7297,11 @@ class VaultManifest:
 		'''Stop tracking folder and everything under it.'''
 		folder = storable_name(folder)
 		self.conn.execute('DELETE FROM entries WHERE path >= ? AND path < ?', (folder, folder_range_end(folder)))
+
+	def tracks(self, rel:str) -> bool:
+		'''Whether a row is at rel, at rel + '/' ( a folder ), or under rel + '/' ( rel has no trailing slash ).'''
+		folder = storable_name(rel) + '/'
+		return self.conn.execute('SELECT 1 FROM entries WHERE path = ? OR path >= ? AND path < ? LIMIT 1', (folder[:-1], folder, folder_range_end(folder))).fetchone() is not None
 
 	def iter_under(self, folder:str):
 		'''Tracked paths strictly under folder (which ends with /), sorted.'''
