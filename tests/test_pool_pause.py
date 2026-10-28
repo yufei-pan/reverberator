@@ -6,7 +6,7 @@ from collections import OrderedDict
 import pytest
 import reverberator as rv
 from tests.harness import (committed_versions, latest_version, seed_monitor, wait_for_committed_count, wait_until,
-	write_incomplete_version)
+	write_fstab, write_incomplete_version)
 
 pytestmark = pytest.mark.unit
 
@@ -304,3 +304,104 @@ def test_a_wait_that_never_alerted_ends_silently(job, fake_pool, poll_fast, monk
 	thread.join(timeout=5)
 	assert results == [True]
 	assert 'FAILED: waiting' not in output() and 'goes on' not in output()
+
+
+def _not_mounted(mount_point):
+	return f'{mount_point} is not mounted ({rv.FSTAB_PATH} names it)'
+
+
+def test_a_vault_wait_waits_for_its_fstab_mount_with_the_marker(job, fake_pool, grace, output):
+	write_fstab(job.vault)
+	control = _control(job)
+	flag = threading.Event()
+	flag.set()
+	results = []
+	thread = threading.Thread(target=lambda: results.append(rv.wait_for_path(control, flag, job.vault,
+		'vault filesystem not ready', vault=True)), daemon=True)
+	thread.start()
+	try:
+		wait_until(lambda: _marker(job.vault, _not_mounted(job.vault)) in output(), timeout=5, message='no waiting marker')
+		assert thread.is_alive()
+		fake_pool.add_mount(job.vault)
+		thread.join(timeout=5)
+		assert results == [True] and _goes_on(job.vault) in output()
+	finally:
+		_stop(control, thread)
+
+
+def test_a_monitored_path_wait_does_not_read_fstab(job, fake_pool, poll_fast):
+	write_fstab(job.monitor)
+	control = _control(job)
+	flag = threading.Event()
+	flag.set()
+	assert rv.wait_for_path(control, flag, job.monitor, 'monitored filesystem not ready') is True
+
+
+def test_the_start_makes_a_missing_vault_path_once_its_fstab_mount_is_mounted(job, tmp_path, fake_pool, grace, output, monkeypatch):
+	jank = str(tmp_path / 'jank')
+	os.makedirs(jank)
+	job = job._replace(vault=os.path.join(jank, 'reverbs'), job_vault=os.path.join(jank, 'reverbs', job.job_name))
+	write_fstab(jank)
+	seed_monitor(job, {'a.txt': 'a'})
+	# the signature passes only on the folder made, and a pair that failed is not checked again for an hour: the
+	# backup comes at once only when the monitor learns of the new folder at once
+	monkeypatch.setattr(rv, 'check_fs_signature', lambda path, signature: os.path.isdir(path))
+	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 3600)
+	control = _control(job)
+	thread = _run_backuper(job, control)
+	try:
+		wait_until(lambda: _marker(job.vault, _not_mounted(jank)) in output(), timeout=5, message='no waiting marker')
+		assert not os.path.lexists(job.vault)
+		fake_pool.add_mount(jank)
+		wait_for_committed_count(job, 1, timeout=10)
+	finally:
+		_stop(control, thread)
+
+
+def test_a_bare_vault_folder_under_an_unmounted_fstab_mount_is_never_backed_up_into(job, fake_pool, grace, output):
+	# 0.47 left such folders on the root disk
+	write_fstab(job.vault)
+	seed_monitor(job, {'a.txt': 'a'})
+	control = _control(job)
+	thread = _run_backuper(job, control)
+	try:
+		wait_until(lambda: _marker(job.vault, _not_mounted(job.vault)) in output(), timeout=5, message='no waiting marker')
+		time.sleep(0.3)
+		assert committed_versions(job) == [] and not os.path.lexists(job.job_vault)
+		fake_pool.add_mount(job.vault)
+		wait_for_committed_count(job, 1)
+	finally:
+		_stop(control, thread)
+
+
+def test_a_vault_disk_unmounted_mid_run_holds_the_next_batch(job, fake_pool, grace, output):
+	write_fstab(job.vault)
+	fake_pool.add_mount(job.vault)
+	seed_monitor(job, {'a.txt': 'a'})
+	control = _control(job)
+	to_process, lock, to_process_flag = rv.ChangeEventQueue(job.monitor), threading.Lock(), threading.Event()
+	thread = _run_backuper(job, control, to_process, lock, to_process_flag)
+	try:
+		wait_for_committed_count(job, 1)
+		fake_pool.drop(job.vault)
+		seed_monitor(job, {'b.txt': 'b'})
+		with lock:
+			to_process.append(rv.ChangeEvent(time.monotonic(), False, 'create', os.path.join(job.monitor, 'b.txt'), None))
+		to_process_flag.set()
+		wait_until(lambda: _marker(job.vault, _not_mounted(job.vault)) in output(), timeout=5, message='no waiting marker')
+		time.sleep(0.3)
+		assert len(committed_versions(job)) == 1
+		fake_pool.mount(job.vault)
+		wait_for_committed_count(job, 2)
+	finally:
+		_stop(control, thread)
+
+
+def test_a_vault_path_that_cannot_be_made_fails_the_attempt(job, fake_pool, poll_fast):
+	blocker = os.path.join(job.root, 'blocker')
+	open(blocker, 'w').write('x')
+	job = job._replace(vault=os.path.join(blocker, 'vault'), job_vault=os.path.join(blocker, 'vault', job.job_name))
+	control = _control(job)
+	thread = _run_backuper(job, control)
+	thread.join(timeout=5)
+	assert not thread.is_alive() and 'does not exist and cannot be created' in control.failure.reason

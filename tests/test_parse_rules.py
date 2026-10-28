@@ -2,7 +2,7 @@ import os
 import pytest
 import TSVZ
 import reverberator as rv
-from tests.harness import write_rule, rule_row, create_job
+from tests.harness import write_rule, rule_row, create_job, write_fstab
 
 pytestmark = pytest.mark.unit
 
@@ -520,3 +520,48 @@ def test_a_job_name_written_with_a_leading_space_is_matched_when_written_back(jo
 	capsys.readouterr()
 	rv.parse_rules(job.rule_path)
 	assert 'dirty Job Name' not in capsys.readouterr().out
+
+
+def _asking(monkeypatch):
+	asked = []
+	monkeypatch.setattr(rv, 'get_fs_signatures', lambda path: asked.append(path) or ['fake-uuid'])
+	return asked
+
+
+@pytest.mark.parametrize('where', ['missing', 'under a file'])
+def test_parse_rules_makes_no_vault_path_and_keeps_its_signature_auto(job, monkeypatch, where):
+	if where == 'under a file':
+		open(os.path.join(job.root, 'blocker'), 'w').write('x')
+		vault = os.path.join(job.root, 'blocker', 'vault')
+	else:
+		vault = os.path.join(job.root, 'pool', 'reverbs')
+	row = rule_row(job, min_snapshot='auto', vault_fs_signature='auto')
+	row[2] = vault
+	with open(job.rule_path, 'w') as f:
+		f.write('\t'.join(rv.REVERB_RULE_TSV_HEADER) + '\n' + '\t'.join(row) + '\n')
+	asked = _asking(monkeypatch)
+	rule, = rv.parse_rules(job.rule_path)
+	written = open(job.rule_path).read().splitlines()[1].split('\t')
+	assert rule.vault_fs_signature == 'auto' and vault not in asked and not os.path.lexists(vault)
+	# the row is still written back for the cells filled
+	assert written[4] == str(rv.DEFAULT_SNAPSHOT_DELAY) and written[10] == 'auto'
+
+
+def test_parse_rules_fills_the_vault_signature_only_once_its_fstab_mount_is_mounted(job, fake_pool, monkeypatch):
+	write_fstab(job.vault)
+	write_rule(job, vault_fs_signature='auto')
+	asked = _asking(monkeypatch)
+	rule, = rv.parse_rules(job.rule_path)
+	assert rule.vault_fs_signature == 'auto' and job.vault not in asked
+	fake_pool.add_mount(job.vault)
+	rule, = rv.parse_rules(job.rule_path)
+	assert rule.vault_fs_signature == 'fake-uuid'
+
+
+def test_parse_rules_fills_no_vault_signature_on_a_pool_missing_a_disk(job, fake_pool, monkeypatch):
+	a, _ = fake_pool.add(job.vault, ['a', 'b'])
+	fake_pool.drop(a)
+	write_rule(job, vault_fs_signature='auto')
+	asked = _asking(monkeypatch)
+	rule, = rv.parse_rules(job.rule_path)
+	assert rule.vault_fs_signature == 'auto' and job.vault not in asked

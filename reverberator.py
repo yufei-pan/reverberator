@@ -1221,11 +1221,15 @@ COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir','wds'],defaults=((
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
 
-def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic) -> bool:
+def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic, vault:bool = False, create:bool = False) -> bool:
 	'''
-	Wait until no disk of a mergerfs pool holding path is missing, flag is set and path is a directory. Returns False
-	when the job (with job None, GREEN_LIGHT) says stop. The pool is checked live on every poll, as the flag can lag
-	behind it, and the wait's reason is the pool's problem while there is one, else what.
+	Wait until the disk holding path is there, flag is set and path is a directory. Returns False when the job (with
+	job None, GREEN_LIGHT) says stop. The disk is checked live on every poll, as the flag can lag behind it, and the
+	wait's reason is its problem while there is one, else what. A monitored path's wait (vault False) needs no disk of
+	a mergerfs pool holding it missing (pool_problem()); a vault wait needs its fstab mount mounted too
+	(vault_disk_problem()). flag None: no signature flag, the wait ends once the disk is there and path is a folder.
+	create (with vault): once the disk is there and nothing is at path, it is made (os.makedirs), so never under a bare
+	mount point; a path that cannot be made raises JobFailure.
 	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS, and once the wait
 	it alerted for ends, one line saying the job goes on. Of the job's waits for one path, only the oldest alerts
 	(JobControl.alerts).
@@ -1237,9 +1241,14 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 	alerted = False
 	try:
 		while running():
-			reason = pool_problem(path)
+			reason = vault_disk_problem(path) if vault else pool_problem(path)
+			if reason is None and create and not os.path.lexists(path):
+				try:
+					os.makedirs(path, exist_ok=True)
+				except OSError as e:
+					raise JobFailure(f'vault path {path} does not exist and cannot be created: {e}')
 			if reason is None:
-				if flag.is_set() and os.path.isdir(path):
+				if (flag is None or flag.is_set()) and os.path.isdir(path):
 					if alerted:
 						tl.teeok(cut_line(shown(f'reverberator job {job.job_name} goes on: {path} is ready again after {int((clock() - started) // 60)} min')))
 					return True
@@ -1256,7 +1265,7 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 					job_log(job.job_name, f'FAILED: waiting {int((now - started) // 60)} min for {path}: {reason}')
 					alerted = True
 					next_alert = now + DISK_WAIT_REPEAT_SECONDS
-			if flag.is_set():
+			if flag is None or flag.is_set():
 				# the filesystem is ready but the path is not there yet, or a disk of its pool is out, so the flag cannot
 				# end the wait
 				time.sleep(POLL_WAIT_SECONDS)
@@ -2252,7 +2261,7 @@ def parse_rules(rule_file:str, read_only:bool = False):
 
 	Args:
 		rule_file (str): The rule file
-		read_only (bool): For the commands: change nothing on disk, so no header upgrade, no vault folder made, no
+		read_only (bool): For the commands: change nothing on disk, so no header upgrade, no
 			signature looked up (those cells stay as written) and nothing written back, and a missing or empty
 			rule file raises RuleFileError rather than ending the process
 
@@ -2398,21 +2407,27 @@ def parse_rules(rule_file:str, read_only:bool = False):
 		if read_only:
 			pass
 		elif not inRule["vault_fs_signature"] or inRule["vault_fs_signature"].lower() == 'auto':
-			if not os.path.exists(inRule["vault_path"]):
-				# try create it 
-				try:
-					os.makedirs(inRule["vault_path"],exist_ok=True)
-				except Exception as _:
-					tl.teelog(log_text(f'Warning: Rule {ruleName} with {inRule["vault_path"]} does not exist and failed to create it. Ignoring rule...'),level='warning')
-					continue
-			signatures = get_fs_signatures(inRule["vault_path"])
-			if signatures and signatures[0]:
-				inRule["vault_fs_signature"] = signatures[0]
-				tl.teelog(log_text(f'Auto filled Vault File System Signature for {ruleName}: {inRule["vault_fs_signature"]}'),level='info')
-				ruleUpdated = True
+			vault_path = inRule["vault_path"]
+			# no folder is made here: the job's start makes it once its disk is there
+			if not os.path.lexists(vault_path):
+				why = 'does not exist yet'
+			elif not os.path.isdir(vault_path):
+				why = 'is not a folder'
 			else:
-				tl.teelog(log_text(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...'),level='warning')
+				problem = vault_disk_problem(vault_path)
+				why = None if problem is None else f'is on a disk that is not there: {problem}'
+			if why is not None:
+				tl.teelog(log_text(f'Warning: Rule {ruleName} has Vault Path {vault_path} which {why}: its Vault File System Signature stays auto until a start after the job has made the folder'),level='warning')
 				inRule["vault_fs_signature"] = 'auto'
+			else:
+				signatures = get_fs_signatures(vault_path)
+				if signatures and signatures[0]:
+					inRule["vault_fs_signature"] = signatures[0]
+					tl.teelog(log_text(f'Auto filled Vault File System Signature for {ruleName}: {inRule["vault_fs_signature"]}'),level='info')
+					ruleUpdated = True
+				else:
+					tl.teelog(log_text(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...'),level='warning')
+					inRule["vault_fs_signature"] = 'auto'
 		# check if the rule is explicit
 		if ruleUpdated:
 			tl.info(log_text(f'Updating rule {ruleName}: {inRule}'))
@@ -4415,19 +4430,12 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		scopes = touched_scopes(batch, monitor_path)
 		return scopes if scopes.subtrees or scopes.paths else None
 	try:
-		# if the vault path does not exist, create it
 		if not os.path.lexists(vault_path):
-			try:
-				os.makedirs(vault_path,exist_ok=True)
-			except Exception as e:
-				if job is None:
-					watcherTeeLogToTl(monitor_path,f'Warning: Vault path {vault_path} does not exist and failed to create it. Backuper Stopped!',error=True)
-				else:
-					watcherTeeLogToTl(monitor_path,f'Vault path {vault_path} does not exist and failed to create it: {e}',error=True)
-					job.fail(f'vault path {vault_path} does not exist and cannot be created: {e}')
+			# made once its disk is there, never under a bare mount point; registered after, so the signature monitor checks the new folder at once
+			if not wait_for_path(job, None, vault_path, 'vault path not made yet', vault=True, create=True):
 				return
 		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
-		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready', vault=True)
 		# the vault is scanned before the monitored path is waited for (the scan only reads the vault): what a killed
 		# copy left in it goes now, though the path may be long in coming back. a scan that fails fails the attempt
 		job_vault = os.path.join(vault_path,job_name)
@@ -4505,7 +4513,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		vaultInfo = None
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while running():
-			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready', vault=True)
 			if not running():
 				break
 			# a disk of the monitored pool out would show its files as deleted: the batch waits for it too
@@ -4576,7 +4584,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				while running() and not to_process_flag.is_set() and not comparison_due():
 					# an idle job waits, with its marker, while a filesystem it needs is not ready, as a pool missing a disk
 					if not vault_fs_flag.is_set():
-						wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+						wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready', vault=True)
 					elif not monitor_fs_flag.is_set():
 						wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 					else:
