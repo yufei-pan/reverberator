@@ -1186,6 +1186,8 @@ def job_retry_delay(failures:int) -> float:
 	return min(JOB_RETRY_FIRST_SECONDS * 2 ** min(failures - 1, 64), JOB_RETRY_MAX_SECONDS)
 
 MOUNTINFO_PATH = '/proc/self/mountinfo'
+# the mounts the admin means to have: a vault under one of them is on its disk only while it is mounted
+FSTAB_PATH = '/etc/fstab'
 # a mergerfs pool lists its branches (its disks) in an xattr of the control file at its root
 MERGERFS_FSTYPE = b'fuse.mergerfs'
 MERGERFS_CONTROL_FILE = '.mergerfs'
@@ -3792,6 +3794,53 @@ def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None) ->
 		problems.extend(f'disk {branch} of pool {state.pool} was mounted again during this step'
 			for branch, mount_id in state.ids if mount_id is not None and before.get(branch) != mount_id)
 	return '; '.join(problems) or None
+
+def parse_fstab(content:bytes) -> list:
+	r'''
+	The mount points (field 2) of /etc/fstab content, in file order. Blank and comment lines, lines with fewer than 2
+	fields, and fields that are not absolute paths (none, swap) are skipped; fstab's octal escapes are decoded and the
+	path normalised.
+
+	Examples:
+		>>> parse_fstab(b'# /dev/old /mnt/old xfs 0 0\n\nUUID=1 /mnt/my\\040disk/ xfs defaults 0 0\nnone swap sw 0 0\nlonely\n')
+		['/mnt/my disk']
+	'''
+	mount_points = []
+	for line in content.splitlines():
+		fields = line.split()
+		if len(fields) < 2 or fields[0].startswith(b'#'):
+			continue
+		mount_point = os.fsdecode(re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8)]), fields[1]))
+		if mount_point.startswith('/'):
+			mount_points.append(os.path.normpath(mount_point))
+	return mount_points
+
+def fstab_mount_points() -> list:
+	'''The mount points FSTAB_PATH names now; [] when it cannot be read.'''
+	try:
+		with open(FSTAB_PATH, 'rb') as f:
+			return parse_fstab(f.read())
+	except OSError:
+		return []
+
+def vault_disk_problem(path:str) -> 'str | None':
+	'''
+	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
+	point at or above the path is not mounted (a bare folder left under it is not that disk), when the mount table
+	cannot be read, or when a mergerfs pool holding the path has a disk missing (pool_problem()'s text). path need not
+	exist. An fstab mount point with a symlink in it never equals a resolved path, so it names nothing here.
+	'''
+	real = os.path.realpath(path)
+	above = [mount_point for mount_point in fstab_mount_points() if mount_point == '/' or real == mount_point or real.startswith(mount_point + '/')]
+	try:
+		mount_table = read_mount_table()
+	except OSError as e:
+		return f'the mount table cannot be read: {e.strerror or e}'
+	if above:
+		longest = max(above, key=len)
+		if not any(point == longest for point, _ in mount_table):
+			return f'{longest} is not mounted ({FSTAB_PATH} names it)'
+	return pool_problem(path, mount_table=mount_table)
 
 class PoolGuard:
 	'''
