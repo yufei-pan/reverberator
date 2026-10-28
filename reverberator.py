@@ -4197,7 +4197,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	# batch that runs delays the next one, as the interval is not checked until the batch has returned
 	last_full_comparison = time.monotonic()
 	def comparison_due():
-		# compared, never waited on: a huge interval (a rule cell of many weeks) is far above what a wait takes
+		# compared, never waited on: a rule cell can read as up to about 6e25 s, past threading.TIMEOUT_MAX, which a wait refuses
 		return full_comparison_interval > 0 and time.monotonic() - last_full_comparison >= full_comparison_interval
 	def batch_scopes(batch):
 		scopes = touched_scopes(batch, monitor_path)
@@ -4372,11 +4372,12 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				if not running():
 					break
 				with to_process_lock:
-					if comparison_due():
-						# also when the watcher has signalled already: a busy job's comparison is not starved
-						backuperTeeLogToTl(job_name,f'The full comparison interval ({full_comparison_interval:g} s) has passed since the last one: comparing the whole tree')
-						to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 					backuperTeeLogToTl(job_name,f'Backuper processing, {len(to_process)} events to process')
+					if comparison_due():
+						# also when the watcher has signalled already: a busy job's comparison is not starved. the full scan
+						# absorbs the events counted above
+						backuperTeeLogToTl(job_name,f'The full comparison interval ({full_comparison_interval:.15g} s) has passed since the last one: comparing the whole tree',ok=True)
+						to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 					to_process_temp = to_process.take()
 				to_process_flag.clear()
 				if to_process_temp.full_scan_requested:
@@ -5346,6 +5347,10 @@ def persist_pending_transactions(job_name:str, vault_path:str, to_process:'Chang
 	if not pending_rows:
 		return
 	job_vault = os.path.join(vault_path, job_name)
+	if not os.path.isdir(vault_path) and all(row[2] == 'full_scan' for row in pending_rows):
+		# a full scan request alone is what a start with no file does anyway: it does not create a vault that is not there
+		# (a stop while a scheduled comparison waits for the vault to come back)
+		return
 	pending_transactions_path = os.path.join(job_vault, PENDING_TRANSACTIONS_FILE_NAME)
 	try:
 		os.makedirs(job_vault, exist_ok=True)
