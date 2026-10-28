@@ -42,7 +42,7 @@ def test_read_only_parse_leaves_the_rule_file_unchanged(job):
 	row = rule_row(job, mon_fs_signature='auto', vault_fs_signature='auto', keep_n_versions='')[:-1]
 	row[2] = missing_vault
 	with open(job.rule_path, 'w', encoding='utf-8') as f:
-		f.write('\t'.join(rv.REVERB_RULE_TSV_HEADER[:-1]) + '\n' + '\t'.join(row) + '\n')
+		f.write('\t'.join(rv.REVERB_RULE_TSV_HEADER[:11]) + '\n' + '\t'.join(row) + '\n')
 	before = open(job.rule_path, 'rb').read()
 	rules = rv.parse_rules(job.rule_path, read_only=True)
 	assert open(job.rule_path, 'rb').read() == before

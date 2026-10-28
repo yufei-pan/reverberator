@@ -88,11 +88,11 @@ BACKUP_JOURNAL_HEADER = ['at_path','iso_time','event','source_path']
 REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Vault Path','Monitoring File System Signature', 
 		'Minium snapshot interval', 'Maximum snapshot interval','Keep 1 Compelete Backup', 
 		'Only Sync Attributes (permissions)', 'Keep N versions', 'Backup Size Limit', 
-		'Vault File System Signature', 'Skip List File']
+		'Vault File System Signature', 'Skip List File', 'Full Comparison Interval', 'Chain Length']
 REVERB_RULE_HEADER = ['job_name', 'mon_path','vault_path', 'mon_fs_signature', 
 		'min_shapshot_time','max_shapshot_time' , 'keep_one_complete_backup', 
 		'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
-		'vault_fs_signature', 'skip_list_file']
+		'vault_fs_signature', 'skip_list_file', 'full_comparison_interval', 'chain_length']
 SKIP_LIST_COLUMN_DESCRIPTIONS = ('A gitignore style list of paths not to back up, matched relative to the monitored path', 'Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything')
 VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
 VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes']
@@ -1087,7 +1087,8 @@ def nameless_start(rule_path:str, rule):
 		return []
 	return start
 
-ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER)
+# the last two columns are optional: 12 positional cells still make a rule
+ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER, defaults=('', ''))
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
 VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER)
 ManifestRecord = namedtuple('ManifestRecord', MANIFEST_RECORD_HEADER)
@@ -1103,6 +1104,9 @@ DEFAULT_KEEP_ONE_COMPLETE_BACKUP = True
 DEFAULT_ONLY_SYNC_ATTRIBUTES = True
 DEFAULT_KEEP_N_VERSIONS = 0
 DEFAULT_BACKUP_SIZE_LIMIT = '5%'
+# the most links a path into the vault may meet; the Chain Length column's blank, and its smallest limit
+DEFAULT_CHAIN_LENGTH = 40
+MIN_CHAIN_LENGTH = 3
 
 DEFAULT_POLL_WAIT_SECONDS = 3.0
 POLL_WAIT_SECONDS = DEFAULT_POLL_WAIT_SECONDS
@@ -1319,9 +1323,9 @@ COPY_SOURCE_REPLACED = 'replaced while being copied'
 DEBUG = False
 
 SAMPLE_REVERB_RULE_FILE = '''
-Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signature	Minium snapshot interval	Maximum snapshot interval	Keep 1 Compelete Backup	Only Sync Attributes (permissions) 	Keep N versions	Backup Size Limit	Vault File System Signature	Skip List File
-# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	When vault is empty, copy entire monitorig path to vault instead of using links	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Stricter (smaller) limits take precedence	The UUID > Label > path for the vault file system	A gitignore style list of paths not to back up, matched relative to the monitored path
-# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS	Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything
+Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signature	Minium snapshot interval	Maximum snapshot interval	Keep 1 Compelete Backup	Only Sync Attributes (permissions) 	Keep N versions	Backup Size Limit	Vault File System Signature	Skip List File	Full Comparison Interval	Chain Length
+# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	When vault is empty, copy entire monitorig path to vault instead of using links	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Stricter (smaller) limits take precedence	The UUID > Label > path for the vault file system	A gitignore style list of paths not to back up, matched relative to the monitored path	How often the whole tree is compared with the vault, as 1d, 12h, 30m or 45s (a plain number is seconds)	The most links a path into the vault may meet; files are copied again before their chains reach it
+# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS	Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything	Blank or 0 for never. Catches writes no event reports, such as through mmap	Blank for 40. About 20 if tools read the vault through the kernel; 0 for no limit
 # Incomplete V* directories (no .modified_contents.nsv) are removed on startup.
 # If you need data from a partial backup after a crash/stop, copy it out before restarting.
 #_defaults_#		/var/reverbs/	auto	60	86400	True	True	0	5%,i5%	auto	
@@ -1450,13 +1454,14 @@ class MonitorGate:
 		self.flag, self.signature, self.resolved = new_flag, signature, True
 		return True
 
-def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, backuper_args:tuple, monitor_gate:MonitorGate = None, monitor_signature:str = None):
+def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, backuper_args:tuple, monitor_gate:MonitorGate = None, monitor_signature:str = None, backuper_kwargs:dict = None):
 	'''
 	A start_attempt for run_job: each attempt starts the job's watcher and backuper, sharing a fresh JobStartup.
 	startup_args are JobStartup's, watcher_args and backuper_args their function's positional arguments before startup.
 	With a monitor_gate, nothing starts until it has resolved the monitored filesystem's signature, and its flag is
 	the monitored filesystem flag from then on (watcher_args[0] and backuper_args[7] are the ungated one).
 	monitor_signature is the rule's, which the watcher hands to the filesystem monitor when its root disappears.
+	backuper_kwargs are the backuper's keyword arguments (the rule's full_comparison_interval and chain_length).
 	'''
 	def start_attempt(job:JobControl, attempt:int) -> list:
 		w_args, b_args, signature = watcher_args, backuper_args, monitor_signature
@@ -1469,7 +1474,7 @@ def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, ba
 		startup = JobStartup(*startup_args)
 		threads = [
 			threading.Thread(target=watcher, args=(*w_args, startup, job, signature), name=f'{job_name} watcher', daemon=True),
-			threading.Thread(target=backuper, args=(*b_args, startup, job), name=f'{job_name} backuper', daemon=True),
+			threading.Thread(target=backuper, args=(*b_args, startup, job), kwargs=backuper_kwargs or {}, name=f'{job_name} backuper', daemon=True),
 		]
 		started = []
 		try:
@@ -1625,6 +1630,8 @@ def run_daemon():
 		except Exception as _:
 			tl.teeerror(log_text(f'Error: Rule {job_name} has invalid keep_n_versions value: {reverb_rule.keep_n_versions}'))
 			tl.teeprint(log_text(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}"))
+		full_comparison_interval = read_full_comparison_interval(reverb_rule.full_comparison_interval, job_name)
+		chain_length = read_chain_length(reverb_rule.chain_length, job_name)
 		backup_size_limit = reverb_rule.backup_size_limit
 		vault_path_signature = reverb_rule.vault_fs_signature
 		# kept across the job's attempts, so a retry loses nothing queued
@@ -1639,9 +1646,10 @@ def run_daemon():
 		gate = None
 		if not os.path.exists(monitor_path) and monitor_path_signature.strip().lower() in ('', 'auto'):
 			gate = MonitorGate(monitor_path, monitor_fs_flag, monitor_path_signature)
-		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate, monitor_path_signature)
+		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate, monitor_path_signature,
+			dict(full_comparison_interval=full_comparison_interval, chain_length=chain_length))
 		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
-		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}'))
+		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {full_comparison_interval}s, chain length: {chain_length}'))
 		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
 		supervisor.start()
 		supervisors.append(supervisor)
@@ -1774,8 +1782,9 @@ def get_args(args = None):
 
 def upgrade_rule_file_header(rule_file:str) -> bool:
 	'''
-	Upgrade an old 11 column rule file in place by adding the Skip List File column to the header
-	and to the stock comment rows. Every other byte, including line endings, is kept.
+	The 11 to 12 column upgrade: an old 11 column rule file gets the Skip List File column added in place, to the header
+	and to the stock comment rows of 11 cells. A 12 column file is left as it is (the two columns after it are optional
+	and never written). Every other byte, including line endings, is kept.
 
 	Args:
 		rule_file (str): The rule file
@@ -1789,15 +1798,15 @@ def upgrade_rule_file_header(rule_file:str) -> bool:
 	lines = text.split('\n')
 	def cells_of(line:str) -> list:
 		return line.rstrip('\r').split('\t')
-	if [cell.strip() for cell in cells_of(lines[0])] != REVERB_RULE_TSV_HEADER[:-1]:
+	if [cell.strip() for cell in cells_of(lines[0])] != REVERB_RULE_TSV_HEADER[:11]:
 		return False
 	def with_suffix(line:str, suffix:str) -> str:
 		body = line.rstrip('\r')
 		return body + suffix + line[len(body):]
-	lines[0] = '\t'.join(REVERB_RULE_TSV_HEADER) + lines[0][len(lines[0].rstrip('\r')):]
+	lines[0] = '\t'.join(REVERB_RULE_TSV_HEADER[:12]) + lines[0][len(lines[0].rstrip('\r')):]
 	for i, line in enumerate(lines[1:], 1):
 		for index, prefix in enumerate(('# The name for the Job', '# need to be unique')):
-			if line.startswith(prefix) and len(cells_of(line)) == len(REVERB_RULE_TSV_HEADER) - 1:
+			if line.startswith(prefix) and len(cells_of(line)) == 11:
 				lines[i] = with_suffix(line, '\t' + SKIP_LIST_COLUMN_DESCRIPTIONS[index])
 	replace_file_text(rule_file, '\n'.join(lines))
 	return True
@@ -1949,6 +1958,8 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 	Replace rule rows in place. rows maps the job name cell as written in the file to its new full row.
 	For each key the last line whose first cell (stripped) equals it becomes the new row and earlier lines with that
 	key are removed (TSVZ already ignored them); every other line is kept byte for byte, line endings included.
+	The new row drops its trailing empty cells past the replaced line's own cell count, so a 12 cell row stays 12 cells;
+	a filled in cell beyond it is kept, as when a 5 cell row gets its defaults.
 
 	Args:
 		rule_file (str): The rule file
@@ -1970,7 +1981,11 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 		if key not in last_index:
 			result.append(line)
 		elif last_index[key] == i:
-			result.append('\t'.join(rows[key]) + line[len(line.rstrip('\r')):])
+			row = list(rows[key])
+			own = len(line.rstrip('\r').split('\t'))
+			while len(row) > own and row[-1] == '':
+				row.pop()
+			result.append('\t'.join(row) + line[len(line.rstrip('\r')):])
 	replace_file_text(rule_file, '\n'.join(result))
 
 def resolve_skip_list_path(cell:str, rule_file:str) -> 'str | None':
@@ -1990,6 +2005,83 @@ def resolve_skip_list_path(cell:str, rule_file:str) -> 'str | None':
 	if cell.lower() in ('', 'auto', 'none'):
 		return None
 	return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(rule_file)), cell))
+
+def parse_duration(text:str) -> float:
+	'''
+	A duration in seconds: a plain number (seconds) or one or more <number><unit> groups, units d, h, m and s.
+	Case and spaces are ignored; a sign, an empty text or anything else raises ValueError.
+
+	>>> parse_duration('1d'), parse_duration('1h30m'), parse_duration('90'), parse_duration('1.5h')
+	(86400.0, 5400.0, 90.0, 5400.0)
+	>>> parse_duration('-5')
+	Traceback (most recent call last):
+	ValueError: not a duration: '-5'
+	'''
+	cleaned = ''.join(text.lower().split())
+	number = r'(?:\d+(?:\.\d*)?|\.\d+)'
+	if re.fullmatch(number, cleaned):
+		return float(cleaned)
+	if not re.fullmatch(f'(?:{number}[dhms])+', cleaned):
+		raise ValueError(f'not a duration: {text!r}')
+	units = {'d':86400, 'h':3600, 'm':60, 's':1}
+	return float(sum(float(amount) * units[unit] for amount, unit in re.findall(f'({number})([dhms])', cleaned)))
+
+def read_full_comparison_interval(cell:str, job_name:str) -> float:
+	'''
+	The Full Comparison Interval cell in seconds, 0 for none. Blank, 0, none, off and auto give 0. A cell that is not a
+	duration gives 0 too, after one error line.
+
+	>>> read_full_comparison_interval(' 12H ', 'j'), read_full_comparison_interval('off', 'j'), read_full_comparison_interval('', 'j')
+	(43200.0, 0, 0)
+	'''
+	if ''.join(cell.lower().split()) in ('', '0', 'none', 'off', 'auto'):
+		return 0
+	try:
+		return parse_duration(cell)
+	except ValueError:
+		tl.teeerror(log_text(f'Error: Rule {job_name} has invalid Full Comparison Interval value: {cell}; use a duration like 1d, 12h, 30m or 45s (a plain number is seconds), or 0 for none. Running without scheduled full comparisons'))
+		return 0
+
+def read_chain_length(cell:str, job_name:str) -> int:
+	'''
+	The Chain Length cell as a number of links, 0 for no limit. Blank and auto give DEFAULT_CHAIN_LENGTH, none and 0 give 0,
+	a whole number of MIN_CHAIN_LENGTH or more gives itself. A smaller whole number gives MIN_CHAIN_LENGTH and anything else
+	DEFAULT_CHAIN_LENGTH, each after one error line.
+
+	>>> read_chain_length('', 'j'), read_chain_length('None', 'j'), read_chain_length(' 20 ', 'j')
+	(40, 0, 20)
+	'''
+	text = cell.strip().lower()
+	if text in ('', 'auto'):
+		return DEFAULT_CHAIN_LENGTH
+	if text in ('none', '0'):
+		return 0
+	try:
+		links = int(text)
+		if links >= MIN_CHAIN_LENGTH:
+			return links
+		value = MIN_CHAIN_LENGTH
+	except ValueError:
+		value = DEFAULT_CHAIN_LENGTH
+	tl.teeerror(log_text(f'Error: Rule {job_name} has invalid Chain Length value: {cell}; use a whole number of links, {MIN_CHAIN_LENGTH} or more, or 0 for no limit. Using {value}'))
+	return value
+
+def rule_file_header(rule_file:str) -> list:
+	'''
+	The header to hand TSVZ for rule_file: the rule file's own first line when it holds the first 12, 13 or 14 names of
+	REVERB_RULE_TSV_HEADER by TSVZ's rule (the same cell count, each name inside its right-stripped cell), so TSVZ finds no
+	mismatch in a 12 column file. Otherwise, or when the file cannot be read, the whole REVERB_RULE_TSV_HEADER.
+	'''
+	try:
+		with TSVZ.openFileAsCompressed(rule_file, mode='rb') as f:
+			cells = [cell.rstrip() for cell in f.readline().decode('utf-8', errors='replace').split('\t')]
+	except Exception:
+		return REVERB_RULE_TSV_HEADER
+	for n in range(12, len(REVERB_RULE_TSV_HEADER) + 1):
+		header = REVERB_RULE_TSV_HEADER[:n]
+		if len(cells) == n and all(name in cell for name, cell in zip(header, cells)):
+			return header
+	return REVERB_RULE_TSV_HEADER
 
 def parse_rules(rule_file:str, read_only:bool = False):
 	'''
@@ -2032,7 +2124,7 @@ def parse_rules(rule_file:str, read_only:bool = False):
 		# ValueError: a compressed or non UTF-8 rule file, which TSVZ still reads
 		tl.teelog(log_text(f'Warning: Cannot upgrade rule file {rule_file} ({e}). The Skip List File column cannot be used until the header is upgraded.'),level='warning')
 
-	rules = TSVZ.readTabularFile(rule_file,header=REVERB_RULE_TSV_HEADER,verifyHeader=True,strict=False,verbose=False)
+	rules = TSVZ.readTabularFile(rule_file,header=rule_file_header(rule_file),verifyHeader=True,strict=False,verbose=False,correctColumnNum=len(REVERB_RULE_TSV_HEADER))
 	if DEBUG:
 		tl.teeprint(log_text(f'Parsed rules: \n{rules}'))
 	else:
@@ -4045,7 +4137,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			 to_process_flag:threading.Event,monitor_fs_flag:threading.Event=None,
 			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
-			 backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False, startup:JobStartup = None, job:JobControl = None):
+			 backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False, startup:JobStartup = None, job:JobControl = None,
+			 full_comparison_interval:float = 0, chain_length:int = None):
+	# full_comparison_interval: seconds between whole-tree comparisons, 0 for none (the rule's Full Comparison Interval).
+	# chain_length: the most links a path into the vault may meet, 0 for no limit, None for DEFAULT_CHAIN_LENGTH (the rule's Chain Length).
 	global BACKUP_SEMAPHORE
 	global BACKUP_ENTRY_VALUES_HEADER
 	global GREEN_LIGHT
