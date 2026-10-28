@@ -2042,7 +2042,7 @@ def check_vault_sync(job_vault:str, job_name:str) -> list:
 					job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); its copies stay unchecked until a reboot')
 			except OSError as marker_error:
 				UNRECORDED_FAILED_DISKS.add(disk)
-				job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); cannot record it until a reboot ({marker_error}), so it is remembered only until reverberator stops')
+				job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); its marker cannot be written ({marker_error}), so its copies stay unchecked only until reverberator stops, not until a reboot')
 		return sorted(set(failed) | ((failed_sync_disks() | UNRECORDED_FAILED_DISKS) & set(results)))
 
 # the private folder prepare_change_list() writes a change list in before place_change_list() renames it into place: made
@@ -9067,7 +9067,7 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 							bad_disks = check_vault_sync(os.path.dirname(os.path.abspath(version_path)), job_name)
 							if bad_disks:
 								sync_failed = True
-								backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed on {", ".join(bad_disks)} since boot (since reverberator started, for a disk whose marker could not be written), so this comparison\'s copies read back stay unchecked')
+								backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed on {", ".join(disk + (" (remembered only until reverberator stops: its marker could not be written)" if disk in UNRECORDED_FAILED_DISKS else "") for disk in bad_disks)} since boot, so this comparison\'s copies read back stay unchecked')
 						except Exception as e:
 							sync_failed = True
 							backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed ({e}), so this comparison\'s copies read back stay unchecked')
