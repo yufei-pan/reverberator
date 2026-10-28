@@ -1280,13 +1280,6 @@ COMPARE_THREADS = 32
 # from a coarser clock, and chrony has stepped the wall clock by 1-2 s right after boot. a full comparison takes it off
 # its version's time too ( full_comparison_since() )
 VERIFY_CTIME_MARGIN_SECONDS = 10
-# the kernel also gives up resolving a path after 40 links
-MAX_CHAINED_LINKS = 40
-# a new version copies a file again from the vault rather than link it through more links than its name's threshold,
-# from RECOPY_MIN_HOPS to RECOPY_MAX_HOPS (see recopy_threshold()): two below the kernel's 40, which counts every link on
-# a path, such as a user's symlink at the end of a chain or the current_version link at its start
-RECOPY_MIN_HOPS = 32
-RECOPY_MAX_HOPS = 38
 # vault folders known to be real, kept so the many links through one folder look at it once
 REAL_VAULT_FOLDERS_KEPT = 16384
 # manifest rows written or read per statement: enough to amortise sqlite calls, little to hold
@@ -4469,7 +4462,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
-					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since)
+					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since,chain_length=chain_length)
 				if not committed:
 					# the batch goes back to the queue on the way out
 					if GREEN_LIGHT.is_set():
@@ -5095,7 +5088,7 @@ def do_backup(backup_entries:dict,
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
 			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,
-			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None):
+			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None,chain_length:int = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
 	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
 	# reported: the unreadable paths already logged for this batch, so each is logged once
@@ -5108,6 +5101,7 @@ def do_backup(backup_entries:dict,
 	# never mounted again since: PoolNotReady fails the attempt
 	# matched_since: the wall clock time, in ns, from which this attempt sees the whole tree ( a full comparison, or a fresh
 	# batch's read time ), None when it does not. the commit records it as the vault's matched time ( VaultManifest.matched )
+	# chain_length: the job's Chain Length, 0 for no limit, None for DEFAULT_CHAIN_LENGTH; it sets when a file is copied again ( recopy_hops() )
 	# only when no inner mount was paused, nothing was logged unreadable and every metadata copy worked; else it carries
 	# the old time forward
 	global DEBUG
@@ -5279,7 +5273,7 @@ def do_backup(backup_entries:dict,
 				oldest_kept = next(iter(vault_info_dict))
 				# a pass each time: the chains are walked again after each removal
 				moves = VaultMoves(job_vault,monitor_path,monitor_paths)
-				rels = recopy_rels(manifest,this_version_number,oldest_kept,job_vault,latest_version_info.path,moves)
+				rels = recopy_rels(manifest,this_version_number,oldest_kept,job_vault,latest_version_info.path,moves,chain_length)
 				rewritten, deleted = batch_rewrites(backup_entries,monitor_path,only_sync_attributes,rels,attrib_copies) if rels else (set(), set())
 				rels = [rel for rel in rels if rel not in deleted]
 				counted = [rel for rel in rels if rel not in rewritten]
@@ -8372,29 +8366,51 @@ def learn_copy_version(job_vault:str, version_path:str, rel:str, moves:'VaultMov
 			return None
 	return end.number
 
-def recopy_threshold(rel:str) -> int:
+def recopy_hops(chain_length:int = None) -> 'tuple | None':
 	'''
-	The most links a new version may chain to the copy of the file rel before it copies it again, from RECOPY_MIN_HOPS to
-	RECOPY_MAX_HOPS by a hash of its name: files unchanged since the same version are not all copied again in one
-	version, and each keeps its threshold across runs and versions.
+	The range (low, high) of links a chain may have before a new version copies the file again from the vault, for a
+	chain length (the most links a path into the vault may meet; None for DEFAULT_CHAIN_LENGTH, read when called): from
+	8 below it to 2 below it, inclusive, and at least 1. Two links are kept for the kernel's own count, which meets
+	every link on a path, not only a chain's: the current_version link at its start and a user's own symlink at its end.
+	The default 40, the kernel's limit, gives 32 to 38. None for 0, no limit: nothing is copied again.
+
+	Examples:
+		>>> recopy_hops(40), recopy_hops(20), recopy_hops(10), recopy_hops(3), recopy_hops(0)
+		((32, 38), (12, 18), (2, 8), (1, 1), None)
+	'''
+	if chain_length is None:
+		chain_length = DEFAULT_CHAIN_LENGTH
+	return (max(1, chain_length - 8), chain_length - 2) if chain_length else None
+
+def recopy_threshold(rel:str, chain_length:int = None) -> int:
+	'''
+	The most links a new version may chain to the copy of the file rel before it copies it again, from the low to the
+	high of recopy_hops(chain_length) by a hash of its name: files unchanged since the same version are not all copied
+	again in one version, and each keeps its threshold across runs and versions. Needs a chain length other than 0.
 
 	Examples:
 		>>> recopy_threshold('a.txt'), recopy_threshold('bad\\udcff.txt')
 		(38, 37)
+		>>> recopy_threshold('a.txt', 3)
+		1
 	'''
-	return RECOPY_MIN_HOPS + xxhash.xxh32(storable_name(rel).encode('utf-8')).intdigest() % (RECOPY_MAX_HOPS - RECOPY_MIN_HOPS + 1)
+	low, high = recopy_hops(chain_length)
+	return low + xxhash.xxh32(storable_name(rel).encode('utf-8')).intdigest() % (high - low + 1)
 
-def recopy_rels(manifest:VaultManifest, new_version:int, oldest_kept:int, job_vault:str, latest_version_path:str, moves:'VaultMoves' = None) -> list:
+def recopy_rels(manifest:VaultManifest, new_version:int, oldest_kept:int, job_vault:str, latest_version_path:str, moves:'VaultMoves' = None,
+		chain_length:int = None) -> list:
 	'''
 	The files new_version is to copy again from the vault, sorted: those whose link chain would pass their
-	recopy_threshold(), as new_version - effective_copy_version() says. While new_version is no more than RECOPY_MIN_HOPS
-	above oldest_kept no chain can, so nothing is read at all: a job keeping 32 versions or fewer never pays for it.
+	recopy_threshold(), as new_version - effective_copy_version() says. While new_version is no more than the job's minimum
+	(the low of recopy_hops(chain_length)) above oldest_kept no chain can, so nothing is read at all: a job keeping 32
+	versions or fewer, at the default chain length, never pays for it. With no limit (chain_length 0) none is due.
 	Otherwise a file whose copy version is not known (upgraded from schema '1') learns it from its chain in the latest
 	version, read on a compare pool, and the vault database records it, committed unless a transaction was open already,
 	as what is read from the vault holds whether or not a new version follows. One whose chain cannot be followed stays
 	unknown, and is linked as ever. moves tells the links on the chains (chain_end()).
 	'''
-	if new_version - oldest_kept <= RECOPY_MIN_HOPS:
+	hops = recopy_hops(chain_length)
+	if hops is None or new_version - oldest_kept <= hops[0]:
 		return []
 	own_transaction = not manifest.in_transaction
 	manifest.begin()
@@ -8407,7 +8423,7 @@ def recopy_rels(manifest:VaultManifest, new_version:int, oldest_kept:int, job_va
 	for rel, recorded in manifest.iter_files_with_copy_version():
 		if recorded is None:
 			unknown.append(rel)
-		elif new_version - effective_copy_version(recorded, oldest_kept) > recopy_threshold(rel):
+		elif new_version - effective_copy_version(recorded, oldest_kept) > recopy_threshold(rel, chain_length):
 			due.append(rel)
 	learned = 0
 	if unknown:
@@ -8422,7 +8438,7 @@ def recopy_rels(manifest:VaultManifest, new_version:int, oldest_kept:int, job_va
 					if version is None:
 						continue
 					by_version.setdefault(version, []).append(rel)
-					if new_version - effective_copy_version(version, oldest_kept) > recopy_threshold(rel):
+					if new_version - effective_copy_version(version, oldest_kept) > recopy_threshold(rel, chain_length):
 						due.append(rel)
 				for version, rels in by_version.items():
 					manifest.set_copy_version(rels, version)
@@ -8615,7 +8631,9 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 		number = vault_version_number(os.path.basename(os.path.normpath(version_path)))
 		if number is None:
 			copy_version = None
-		for _ in range(MAX_CHAINED_LINKS):
+		# each hop names the version one below (parse_chain_text()), or ends the walk, so it ends within the version
+		# count, as chain_end()'s does: no limit on the links is needed
+		while True:
 			st = os.lstat(entry)
 			if not stat.S_ISLNK(st.st_mode):
 				break
@@ -8637,8 +8655,6 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 				# a symlink that was backed up as one
 				return ManifestRecord('l', None, None, st.st_mode, st.st_uid, st.st_gid, None, target, 0)
 			entry = resolved
-		else:
-			return None
 		kind = entry_kind(st.st_mode)
 		file_hash = hash_file(entry, st.st_size) if kind == 'f' else None
 		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 0)
@@ -8725,18 +8741,58 @@ def compare_monitor_entry(monitor_entry:str, monitor_stat:os.stat_result, record
 		return 'modify'
 	return 'attrib' if attrs_differ else None
 
+def link_chain_end(path:str) -> str:
+	'''
+	The path of the first entry that is not a link on the chain of links starting at path. Each link is followed by its
+	text, with lstat, so no path resolution meets more than one link and the kernel's limit of 40 never applies. The
+	first hop resolves the folder of path with os.path.realpath; each later hop joins the text to the folder of its link
+	with os.path.normpath, as the vault's folders are real. Raises OSError (ELOOP) for a path met twice, FileNotFoundError
+	or NotADirectoryError for a hop that names nothing, and any other error lstat or readlink gives.
+
+	Examples:
+		>>> import tempfile
+		>>> folder = os.path.realpath(tempfile.mkdtemp())
+		>>> open(os.path.join(folder, 'a'), 'w').close()
+		>>> os.symlink('a', os.path.join(folder, 'b'))
+		>>> os.symlink('b', os.path.join(folder, 'c'))
+		>>> link_chain_end(os.path.join(folder, 'c')) == os.path.join(folder, 'a')
+		True
+		>>> os.symlink('d', os.path.join(folder, 'd'))
+		>>> link_chain_end(os.path.join(folder, 'd'))  # doctest: +IGNORE_EXCEPTION_DETAIL
+		Traceback (most recent call last):
+		OSError: too many levels of symbolic links
+	'''
+	path = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+	seen = set()
+	while True:
+		if path in seen:
+			raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), path)
+		seen.add(path)
+		if not stat.S_ISLNK(os.lstat(path).st_mode):
+			return path
+		path = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+
 def kernel_cannot_follow(version_path:str, rel:str, record:ManifestRecord) -> bool:
 	'''
 	Whether version_path holds at rel a chain of links to the file record was read from that the kernel cannot follow.
 	Daemons before 0.39 kept a link's text when a move took it to another folder depth, so it no longer reaches the
 	copy: read_vault_record() still finds the copy by vault_chain_hop(), but browsing the vault does not, nor does
-	copy_file_meta() syncing attributes through the link.
+	copy_file_meta() syncing attributes through the link. A chain of any length is followed, hop by hop
+	(link_chain_end()), so only a link that names nothing counts: one met twice, or that cannot be looked at, does not.
 	'''
 	if record.kind not in ('f', 'o'):
 		# a folder is never a link, and a user's symlink or a referenced backup's link is not followed
 		return False
 	entry = os.path.join(version_path, rel)
-	return os.path.islink(entry) and not os.path.exists(entry)
+	if not os.path.islink(entry):
+		return False
+	try:
+		link_chain_end(entry)
+	except (FileNotFoundError, NotADirectoryError):
+		return True
+	except OSError:
+		return False
+	return False
 
 def read_version_record(version_path:str, rel:str, monitor_path:str, fresh:bool = False, moves:'VaultMoves' = None, copy_version:int = None):
 	'''
@@ -8798,9 +8854,9 @@ def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_pat
 
 def xattrs_differ(monitor_entry:str, vault_entry:str) -> bool:
 	'''
-	Whether the extended attributes of monitor_entry, never followed, and those of vault_entry, followed as its chain
-	links lead to the copy, differ in a name or a value. One whose filesystem keeps none (ENOTSUP, ENOSYS) differs from
-	nothing: copy_file_meta() could not make the two agree. A name listed whose value reads as ENODATA (gone since the
+	Whether the extended attributes of monitor_entry, never followed, and those of vault_entry, followed hop by hop as its
+	chain links lead to the copy (link_chain_end(), a chain of any length), differ in a name or a value. One whose
+	filesystem keeps none (ENOTSUP, ENOSYS) differs from nothing: copy_file_meta() could not make the two agree. A name listed whose value reads as ENODATA (gone since the
 	listing, or mergerfs with security_capability=false, which lists security.capability and gives no value) is left out,
 	as copystat() leaves it. Raises OSError.
 	'''
@@ -8823,7 +8879,7 @@ def xattrs_differ(monitor_entry:str, vault_entry:str) -> bool:
 	live = attributes(monitor_entry, False)
 	if live is None:
 		return False
-	kept = attributes(vault_entry, True)
+	kept = attributes(link_chain_end(vault_entry.rstrip('/') or vault_entry), False)
 	return kept is not None and live != kept
 
 def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list = None):

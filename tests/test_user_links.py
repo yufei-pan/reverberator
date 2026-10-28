@@ -433,8 +433,7 @@ def test_pruning_forgets_the_moves_of_the_version_it_removes(tmp_path):
 
 def test_the_recopy_keeps_a_user_link_a_link(tmp_path, monkeypatch):
 	# repro test_r8_recopy: the re-copy followed the link on to D/secret and copied its bytes in the link's place
-	monkeypatch.setattr(rv, 'RECOPY_MIN_HOPS', 1)
-	monkeypatch.setattr(rv, 'RECOPY_MAX_HOPS', 1)
+	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
 	job = fresh_job(tmp_path)
 	text = chain_text(latest(job).name, 'D/secret')
 	add_user_link(job, 'a/U', text)
@@ -654,8 +653,7 @@ def test_the_daemon_reads_the_record_from_its_own_manifest(tmp_path, monkeypatch
 		return real(path, monitor)
 	monkeypatch.setattr(rv, 'read_change_list_moves', counting)
 	rv.VERSION_MOVES.clear()
-	monkeypatch.setattr(rv, 'RECOPY_MIN_HOPS', 1)
-	monkeypatch.setattr(rv, 'RECOPY_MAX_HOPS', 1)
+	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
 	pruning_keeps(job, {})
 	bump(job, 2, keep_n_versions=2)
 	assert read == []
@@ -2472,8 +2470,7 @@ def test_copy_version_is_authoritative_for_the_latest_version(tmp_path, monkeypa
 		assert os.lstat(copy).st_uid == 4242 and os.lstat(copy).st_ino == copy_st.st_ino
 		assert os.readlink(os.path.join(v1.path, 'E/secret')) == f'../../{v0.name}/D/secret'
 	else:
-		monkeypatch.setattr(rv, 'RECOPY_MIN_HOPS', 1)
-		monkeypatch.setattr(rv, 'RECOPY_MAX_HOPS', 1)
+		monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
 		if reader == 'learned':
 			manifest = rv.VaultManifest(job.job_vault)
 			manifest.begin()
@@ -2518,8 +2515,7 @@ def test_a_setuid_file_keeps_its_bits_through_an_attribute_sync(tmp_path):
 
 def test_a_fresh_copy_of_a_setuid_file_keeps_its_bits(tmp_path, monkeypatch):
 	# the re-copy makes a copy of its own, which the batch then moves: the move syncs the file's attributes onto it
-	monkeypatch.setattr(rv, 'RECOPY_MIN_HOPS', 1)
-	monkeypatch.setattr(rv, 'RECOPY_MAX_HOPS', 1)
+	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
 	job = create_job(str(tmp_path))
 	seed_monitor(job, {'bin/tool': 'x', 'keep': 'k'})
 	tool = os.path.join(job.monitor, 'bin/tool')
@@ -2605,8 +2601,7 @@ def test_recopy_size_counts_the_copy_its_copy_version_names(tmp_path, monkeypatc
 	assert rv.recopy_size(['E/secret'], job.job_vault, v1.path, moves, {'E/secret': copy_version_of(job, 'E/secret')}) == len('secret')
 	assert rv.recopy_size(['E/secret'], job.job_vault, v1.path, rv.VaultMoves(job.job_vault, job.monitor)) == 0
 	# and do_backup's size limit counts it so
-	monkeypatch.setattr(rv, 'RECOPY_MIN_HOPS', 1)
-	monkeypatch.setattr(rv, 'RECOPY_MAX_HOPS', 1)
+	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
 	counted = []
 	real = rv.recopy_size
 	def counting(rels, *args, **kwargs):

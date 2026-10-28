@@ -9,6 +9,7 @@ import pytest
 import reverberator as rv
 from tests.harness import seed_monitor, run_backup, event_entry, write_committed_version, latest_version
 from tests.test_names import write_schema_1, contents as database_contents
+from tests.test_moves_then_changes import user_xattrs_or_skip
 
 pytestmark = pytest.mark.unit
 
@@ -196,7 +197,7 @@ def as_schema_1(job):
 
 def test_no_chain_passes_38_hops(job):
 	# a name for each threshold, at the top and a folder down
-	names = [name_with_threshold(threshold, stem) for threshold in range(rv.RECOPY_MIN_HOPS, rv.RECOPY_MAX_HOPS + 1) for stem in ('f', 'd/f')]
+	names = [name_with_threshold(threshold, stem) for threshold in range(rv.recopy_hops()[0], rv.recopy_hops()[1] + 1) for stem in ('f', 'd/f')]
 	seed_monitor(job, {**{name: name for name in names}, 'c.txt': 'c'})
 	backup(job)
 	for _ in range(45):
@@ -209,6 +210,54 @@ def test_no_chain_passes_38_hops(job):
 			assert f.read() == name
 	# each was copied again in the version its chain would have passed its threshold in, and only then
 	assert copy_versions(job) == {**{name: rv.recopy_threshold(name) + 1 for name in names}, 'c.txt': 45}
+
+
+def test_recopy_hops_reads_the_chain_length(monkeypatch):
+	assert [rv.recopy_hops(n) for n in (40, 20, 10, 3)] == [(32, 38), (12, 18), (2, 8), (1, 1)]
+	assert rv.recopy_hops(0) is None and rv.recopy_hops() == (32, 38)
+	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 20)
+	assert rv.recopy_hops() == (12, 18)
+
+
+def test_a_chain_length_of_20_keeps_every_chain_within_18_links(job):
+	names = [next(f'{stem}{n}.txt' for n in itertools.count() if rv.recopy_threshold(f'{stem}{n}.txt', 20) == threshold)
+		for threshold in range(12, 19) for stem in ('f', 'd/f')]
+	seed_monitor(job, {**{name: name for name in names}, 'c.txt': 'c'})
+	backup(job, chain_length=20)
+	for _ in range(25):
+		version = backup(job, 'c.txt', chain_length=20)
+		for name in names:
+			assert chain_length(os.path.join(version.path, name)) <= rv.recopy_threshold(name, 20) <= 18
+	assert copy_versions(job) == {**{name: rv.recopy_threshold(name, 20) + 1 for name in names}, 'c.txt': 25}
+
+
+def test_no_limit_keeps_chains_as_long_as_the_versions(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'kept', 'c.txt': 'c'})
+	backup(job, chain_length=0)
+	for _ in range(45):
+		version = backup(job, 'c.txt', chain_length=0)
+	assert version.number == 45 and chain_length(os.path.join(version.path, 'a.txt')) == 45
+	assert lookup(job, 'a.txt').unchecked == 1                     # V0's copy, never read back yet
+	lines = []
+	real = rv.backuperTeeLogToTl
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda path, message, **kw: lines.append(message) or real(path, message, **kw))
+	# a full comparison reads it back through 45 links and finds it whole: no version, no copy
+	assert backup(job, chain_length=0).number == 45
+	assert lookup(job, 'a.txt').unchecked == 0
+	assert not [line for line in lines if 'again from the vault' in line or 'Error comparing' in line]
+
+
+def test_an_xattr_change_reaches_a_copy_45_links_away(job):
+	seed_monitor(job, {'a.txt': 'kept', 'c.txt': 'c'})
+	user_xattrs_or_skip(os.path.join(job.monitor, 'a.txt'))
+	backup(job, chain_length=0)
+	for _ in range(45):
+		backup(job, 'c.txt', chain_length=0)
+	os.setxattr(os.path.join(job.monitor, 'a.txt'), 'user.k', b'v')
+	version = backup(job, chain_length=0)
+	assert version.number == 46 and changes(job, version) == [('a.txt', 'attrib')]
+	end = rv.resolve_version_entry(job.job_vault, version.path, 'a.txt', job.monitor).path
+	assert os.getxattr(end, 'user.k') == b'v'
 
 
 def test_recopy_at_its_own_threshold(job):
@@ -307,10 +356,10 @@ def test_short_jobs_never_recopy(job, monkeypatch):
 	monkeypatch.setattr(os, 'lstat', lambda *args, **kwargs: looked.append(args) or lstat(*args, **kwargs))
 	try:
 		assert rv.recopy_rels(manifest, 213, 209, job.job_vault, version.path) == []
-		assert rv.recopy_rels(manifest, 41, 41 - rv.RECOPY_MIN_HOPS, job.job_vault, version.path) == []
+		assert rv.recopy_rels(manifest, 41, 41 - rv.recopy_hops()[0], job.job_vault, version.path) == []
 		assert learned == [] and looked == []
 		# a version further, the copies are looked for
-		rv.recopy_rels(manifest, 41, 40 - rv.RECOPY_MIN_HOPS, job.job_vault, version.path)
+		rv.recopy_rels(manifest, 41, 40 - rv.recopy_hops()[0], job.job_vault, version.path)
 	finally:
 		manifest.close()
 	assert sorted(args[2] for args in learned) == ['a.txt', 'c.txt'] and looked
@@ -354,9 +403,9 @@ def test_size_estimate_counts_recopies(job, monkeypatch):
 	version = backup(job, 'c.txt', backup_size_limit=str(limit))
 	# removing V0 to V3 moved big's copy up to V4, so its chain no longer passes its threshold: big is linked, and
 	# no more versions are removed than that took
-	assert version.number == 36 and rv.list_versions(job.job_vault)[0].number == 36 - rv.RECOPY_MIN_HOPS
+	assert version.number == 36 and rv.list_versions(job.job_vault)[0].number == 36 - rv.recopy_hops()[0]
 	assert rv.get_vault_info(job.job_vault).vault_size <= limit
-	assert chain_length(os.path.join(version.path, big)) == rv.RECOPY_MIN_HOPS and changes(job, version) == [('c.txt', 'modify')]
+	assert chain_length(os.path.join(version.path, big)) == rv.recopy_hops()[0] and changes(job, version) == [('c.txt', 'modify')]
 
 
 def test_history_and_picker_skip_recopies(job):

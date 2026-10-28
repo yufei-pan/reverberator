@@ -4,6 +4,7 @@ from collections import OrderedDict
 import pytest
 import reverberator as rv
 from tests.harness import seed_monitor, write_tree, write_committed_version, run_backup, latest_version, event_entry
+from tests.test_moves_then_changes import user_xattrs_or_skip
 
 pytestmark = pytest.mark.unit
 
@@ -437,6 +438,7 @@ def test_a_two_hop_read_passes_a_link_an_old_move_broke_in_the_middle(job):
 	os.symlink(f'../../V0--{T}/a/x', f'{v1}/deep/er/x')
 	os.symlink(f'../../../V1--{T}/deep/er/x', f'{v2}/deep/er/x')
 	assert not os.path.exists(f'{v2}/deep/er/x')
+	assert rv.kernel_cannot_follow(v2, 'deep/er/x', rv.ManifestRecord('f', 1, 0, 0o100644, 0, 0, None, None, 0))
 	record = rv.read_vault_record(v2, 'deep/er/x', job.monitor)
 	assert (record.kind, record.size) == ('f', os.path.getsize(os.path.join(v0, 'a/x')))
 	got = rv.resolve_version_entry(job.job_vault, v2, 'deep/er/x', job.monitor)
@@ -465,3 +467,54 @@ def test_a_referenced_link_after_a_move_still_leads_to_the_live_file(job):
 	assert os.readlink(moved) == os.path.relpath(os.path.join(v0, 'a/x.txt'), os.path.join(v1, 'deep/er'))
 	got = rv.resolve_version_entry(job.job_vault, v1, 'deep/er/x.txt', job.monitor)
 	assert got.kind == 'referenced' and got.detail == os.path.join(job.monitor, 'a/x.txt')
+
+
+def write_45_versions(job):
+	"""V0 holds a/x; each later version links it to the one below. V44 also holds a/gone (naming nothing) and a/loop (naming itself)."""
+	versions = [write_committed_version(job, number, {'a/x': 'x'} if number == 0 else {}, timestamp=T) for number in range(45)]
+	for number in range(1, 45):
+		os.makedirs(f'{versions[number]}/a')
+		os.symlink(f'../../V{number - 1}--{T}/a/x', f'{versions[number]}/a/x')
+	os.symlink(f'../../V43--{T}/a/gone', f'{versions[44]}/a/gone')
+	os.symlink('loop', f'{versions[44]}/a/loop')
+	return versions
+
+
+def test_kernel_cannot_follow_only_a_broken_link(job):
+	v44 = write_45_versions(job)[44]
+	record = rv.ManifestRecord('f', 1, 0, 0o100644, 0, 0, None, None, 0)
+	with pytest.raises(OSError) as raised:
+		open(f'{v44}/a/x')
+	assert raised.value.errno == errno.ELOOP
+	assert not rv.kernel_cannot_follow(v44, 'a/x', record)
+	assert rv.kernel_cannot_follow(v44, 'a/gone', record)
+	assert not rv.kernel_cannot_follow(v44, 'a/loop', record)
+
+
+def test_read_vault_record_follows_a_chain_past_40_links(job):
+	versions = write_45_versions(job)
+	record = rv.read_vault_record(versions[44], 'a/x', job.monitor)
+	assert (record.kind, record.size) == ('f', os.path.getsize(f'{versions[0]}/a/x'))
+
+
+def test_xattrs_differ_follows_a_chain_past_40_links(job):
+	versions = write_45_versions(job)
+	live = os.path.join(job.monitor, 'live')
+	seed_monitor(job, {'live': 'x'})
+	user_xattrs_or_skip(live)
+	os.setxattr(f'{versions[0]}/a/x', 'user.k', b'v')
+	os.setxattr(live, 'user.k', b'v')
+	assert not rv.xattrs_differ(live, f'{versions[44]}/a/x')
+	os.setxattr(live, 'user.k', b'other')
+	assert rv.xattrs_differ(live, f'{versions[44]}/a/x')
+
+
+def test_link_chain_end_walks_hop_by_hop(job):
+	versions = write_45_versions(job)
+	assert rv.link_chain_end(f'{versions[44]}/a/x') == os.path.join(os.path.realpath(versions[0]), 'a/x')
+	assert rv.link_chain_end(f'{versions[0]}/a/x') == f'{versions[0]}/a/x'
+	with pytest.raises(FileNotFoundError):
+		rv.link_chain_end(f'{versions[44]}/a/gone')
+	with pytest.raises(OSError) as raised:
+		rv.link_chain_end(f'{versions[44]}/a/loop')
+	assert raised.value.errno == errno.ELOOP
