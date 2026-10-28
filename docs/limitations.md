@@ -334,12 +334,16 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** with the vault's pool unmounted, a reverberator start creates the Vault Path folder (when
   it is missing) under the bare mount point on the root disk, and a stop with queued changes creates the job's vault
   folder there and writes its pending file. Both are hidden once the pool mounts; nothing is lost, as the next start
-  compares the whole tree.
+  compares the whole tree. A new rule row whose Vault File System Signature is auto, added while its pool is unmounted,
+  records the root disk's signature: once the pool mounts, that job waits on the wrong disk (the FAILED: waiting alert
+  repeats) until the cell is set back to auto.
 - **Why:** the start creates a missing vault path, and the stop persists pending changes, without checking that the
   vault's pool or signature is there.
 - **Revisit when:** round 12: never create or write into a vault path whose pool or signature is not ready; keep queued
-  changes as a full-comparison request instead.
-- **Approved:** 2026-10-28, the user's choice "Defer to round 12 (Recommended)".
+  changes as a full-comparison request instead; fill an auto signature only when the vault path is on a mounted pool or
+  disk, never from a folder just created.
+- **Approved:** 2026-10-28, the user's choice "Defer to round 12 (Recommended)", and the same for the auto signature
+  ("Defer to round 12 (Recommended)").
 
 ### A chmod reads each file's vault copy once at commit
 
