@@ -97,12 +97,13 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** a write through mmap raises no inotify event, so 0.47 relies on the mtime it moves: an
   attribute-only change whose mtime moved copies the file, and a full comparison (a restart, or the job's Full
-  Comparison Interval when set) copies a file whose mtime moved. What is left: (1) a second store into a page still
-  dirty from an earlier one moves no mtime, so a copy taken between them misses the later store until the mtime next
-  moves; (2) an mmap write followed by setting the mtime back is not seen; (3) a copy that a 0.46 or older daemon synced
-  after an mmap write (old bytes under the new mtime) stays wrong until the file is written again; (4) a file written
-  only through mmap (mein's QQ MMKV files) is backed up only at a restart, or at the Full Comparison Interval if one is
-  set.
+  Comparison Interval when set) copies a file whose mtime moved. Every comparison also hashes a file's last 64 KiB, so
+  what is left concerns stores before that tail (none, for a file of 64 KiB or less): (1) a second store into a page
+  still dirty from an earlier one moves no mtime, so a copy taken between them misses the later store until the mtime
+  next moves; (2) an mmap write followed by setting the mtime back is not seen; (3) a copy that a 0.46 or older daemon
+  synced after an mmap write (old bytes under the new mtime) stays wrong until the file is written again. And (4) a file
+  written only through mmap (mein's QQ MMKV files) is backed up only at its next normal write, a restart, or the job's
+  Full Comparison Interval if one is set.
 - **Why:** no inotify or fanotify flag reports mmap stores (round 10's research: scratchpad r10/mmap/report.md); the
   kernel moves the mtime only on the first store into a clean page.
 - **Revisit when:** a kernel interface reports mmap stores, or a job's files are seen stale this way.
@@ -155,13 +156,14 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a vault's limit is tight enough for it to matter.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
 
-### A vault keeping one version can pass its size limit
+### A vault down to its only version can pass its size limit
 
-- **Kind:** known limitation.
-- **What the operator sees:** a vault keeping a single version can pass its Backup Size Limit by the size of a change,
-  as its only version is never removed; it comes back under once a second version exists and the old one can be pruned.
+- **Kind:** known limitation, already before 0.47.
+- **What the operator sees:** a vault that pruning has brought down to its only version (a new vault, or a size limit
+  near the tree's own size) can pass its Backup Size Limit by the size of the next change, as its only version is never
+  removed: the backup adds a second version, and the next backup's prune removes the older one.
 - **Why:** removing the only version would leave no backup.
-- **Revisit when:** a single-version job with a tight limit is used.
+- **Revisit when:** a job's size limit is close to its tree's size.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
 ### Changes made outside the watched folder
@@ -275,11 +277,12 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### A failed sync that cannot be recorded, after a restart
 
 - **Kind:** known limitation.
-- **What the operator sees:** when a vault disk's failed sync cannot be recorded (the state folder is broken or full),
-  the alert still goes out and the disk is remembered in memory; if reverberator restarts before the next reboot, that
+- **What the operator sees:** when a vault disk's failed sync cannot be recorded (a broken or full state folder, an
+  unreadable boot id, or a disk path too long for a marker's name), the alert still goes out and the disk is remembered
+  in memory; if reverberator restarts before the next reboot, that
   memory is gone, and copies on that disk read back from the page cache can be recorded checked, though after the reboot
   they may be bad.
-- **Why:** it needs a disk write error and a broken state folder at once, and the alert has told the operator.
+- **Why:** it needs a disk write error while its marker cannot be written, and the alert has told the operator.
 - **Revisit when:** it is met.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
@@ -287,10 +290,10 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** markers are kept per mount point, so a vault reached through a bind mount of another
-  vault's disk, or btrfs subvolumes of one filesystem, get separate markers, and a write error one job's sync sees can
-  be missed by the other job.
-- **Why:** the kernel keeps the error per filesystem, which userspace sees only by mount point or device number; neither
-  layout is used on this host.
+  vault's disk, or btrfs subvolumes of one filesystem mounted at separate mount points, get separate markers, and a
+  write error one job's sync sees can be missed by the other job.
+- **Why:** the kernel keeps the error per filesystem; keying markers by mountinfo's device number would probably group
+  both layouts, an extra part for layouts not used on this host.
 - **Revisit when:** such a layout is used.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
@@ -298,8 +301,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation, already before 0.47.
 - **What the operator sees:** when reverberator fills a rule row's auto cells, it writes that row's resolved columns 1-12
-  back, values taken from the #_defaults_# row included, so a later edit of the defaults row no longer reaches that job.
-  Columns 13 and 14 are never written.
+  back, values taken from the #_defaults_# row included (a cleaned-up Job Name or monitored path rewrites the row too),
+  so a later edit of the defaults row no longer reaches that job: edit the job's own row, or clear its cells, to follow
+  a changed default. Columns 13 and 14 are never written.
 - **Why:** filling in defaults and auto fields is how the rule file records what each job runs with.
 - **Revisit when:** a host relies on editing the defaults row for jobs already started.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
@@ -327,9 +331,10 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### Writes under a vault that is not mounted
 
 - **Kind:** deferred (round 12), already before 0.47.
-- **What the operator sees:** with the vault's pool unmounted, a reverberator start creates the job's vault folder under
-  the bare mount point on the root disk, and a stop with queued changes writes its pending file there too. Both are
-  hidden once the pool mounts; nothing is lost, as the next start compares the whole tree.
+- **What the operator sees:** with the vault's pool unmounted, a reverberator start creates the Vault Path folder (when
+  it is missing) under the bare mount point on the root disk, and a stop with queued changes creates the job's vault
+  folder there and writes its pending file. Both are hidden once the pool mounts; nothing is lost, as the next start
+  compares the whole tree.
 - **Why:** the start creates a missing vault path, and the stop persists pending changes, without checking that the
   vault's pool or signature is there.
 - **Revisit when:** round 12: never create or write into a vault path whose pool or signature is not ready; keep queued
