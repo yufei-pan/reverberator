@@ -3820,22 +3820,25 @@ def parse_fstab(content:bytes) -> list:
 		fields = line.split()
 		if len(fields) < 2 or fields[0].startswith(b'#'):
 			continue
-		mount_point = os.fsdecode(unescape_octal(fields[1]))
+		# libmount cuts a field at a NUL
+		mount_point = os.fsdecode(unescape_octal(fields[1]).split(b'\0', 1)[0])
 		if mount_point.startswith('/'):
 			# normpath keeps a leading '//', which the kernel reads as '/'
 			mount_points.append(os.path.normpath('/' + mount_point.lstrip('/')))
 	return mount_points
 
-def fstab_mount_points() -> list:
+def fstab_mount_points(mount_table:list) -> list:
 	'''
-	The mount points FSTAB_PATH names now, resolved as the mount table lists them (a symlink in one is followed, and
-	nothing is triggered by that); [] when it cannot be read.
+	The mount points FSTAB_PATH names now, resolved as the mount table lists them; [] when it cannot be read. One the
+	table lists is resolved already, so no mounted filesystem is asked (a hung one would block, an automount fire).
 	'''
 	try:
 		with open(FSTAB_PATH, 'rb') as f:
-			return [os.path.realpath(mount_point) for mount_point in parse_fstab(f.read())]
+			points = parse_fstab(f.read())
 	except OSError:
 		return []
+	mounted = {point for point, _ in mount_table}
+	return [point if point in mounted else os.path.realpath(point) for point in points]
 
 def vault_disk_problem(path:str) -> 'str | None':
 	'''
@@ -3844,12 +3847,12 @@ def vault_disk_problem(path:str) -> 'str | None':
 	cannot be read, or when a mergerfs pool holding the path has a disk missing (pool_problem()'s text). path need not
 	exist.
 	'''
-	real = os.path.realpath(path)
-	above = [mount_point for mount_point in fstab_mount_points() if real == mount_point or real.startswith(mount_point + '/')]
 	try:
 		mount_table = read_mount_table()
 	except OSError as e:
 		return f'the mount table cannot be read: {e.strerror or e}'
+	real = os.path.realpath(path)
+	above = [mount_point for mount_point in fstab_mount_points(mount_table) if real == mount_point or real.startswith(mount_point + '/')]
 	if above:
 		longest = max(above, key=len)
 		if not any(point == longest for point, _ in mount_table):
