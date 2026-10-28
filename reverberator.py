@@ -4192,6 +4192,13 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	full_comparison = False
 	# whether the batch is one handed back or resumed, whose events are only its collapsed entries
 	round_tripped = False
+	# when the last full comparison of any kind (the start's, a follow-up, a scans escalation, a lost-events full scan or the
+	# interval's own) committed, counted from its end. it is in memory: a restart begins with a full comparison anyway. a
+	# batch that runs delays the next one, as the interval is not checked until the batch has returned
+	last_full_comparison = time.monotonic()
+	def comparison_due():
+		# compared, never waited on: a huge interval (a rule cell of many weeks) is far above what a wait takes
+		return full_comparison_interval > 0 and time.monotonic() - last_full_comparison >= full_comparison_interval
 	def batch_scopes(batch):
 		scopes = touched_scopes(batch, monitor_path)
 		return scopes if scopes.subtrees or scopes.paths else None
@@ -4334,6 +4341,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 							backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running',error=True)
 							job.fail('backup did not commit')
 					break
+				if full_comparison:
+					last_full_comparison = time.monotonic()
 				if job is not None:
 					job.mark_committed()
 			if round_tripped and not full_comparison:
@@ -4352,7 +4361,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			round_tripped = False
 			# a batch whose events collapsed to no entry is backed up too, as what they touched can differ from the vault
 			while not backupEntries and not full_comparison and not scan_folders and touched is None and running():
-				while running() and not to_process_flag.is_set():
+				while running() and not to_process_flag.is_set() and not comparison_due():
 					# an idle job waits, with its marker, while a filesystem it needs is not ready, as a pool missing a disk
 					if not vault_fs_flag.is_set():
 						wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
@@ -4363,6 +4372,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				if not running():
 					break
 				with to_process_lock:
+					if comparison_due():
+						# also when the watcher has signalled already: a busy job's comparison is not starved
+						backuperTeeLogToTl(job_name,f'The full comparison interval ({full_comparison_interval:g} s) has passed since the last one: comparing the whole tree')
+						to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 					backuperTeeLogToTl(job_name,f'Backuper processing, {len(to_process)} events to process')
 					to_process_temp = to_process.take()
 				to_process_flag.clear()
