@@ -1,4 +1,5 @@
 import errno
+import mmap
 import threading
 import os
 import stat
@@ -735,19 +736,74 @@ def test_the_estimate_leaves_a_move_inside_another_out_once(job):
 	assert (size, inodes) == (os.lstat(f'{m}/n/own').st_blocks * 512 + os.lstat(f'{m}/n').st_blocks * 512, 2)
 
 
-def test_touching_a_file_syncs_its_times_onto_the_copy(job, logged, monkeypatch):
-	# touch -m, three times: the row's record vouches for the copy's contents, so nothing is copied
+def test_touching_a_file_copies_it(job, logged, monkeypatch):
+	# touch -m, three times: the mtime moved, as an mmap write moves it, so the file is copied each time, and the older
+	# versions keep their copy's mtime
 	seed_monitor(job, {'big': 'x' * 300000, 'keep': 'k'})
 	v0 = run_backup(job)[0]
 	run_backup(job)
 	m = job.monitor
+	kept = os.lstat(os.path.join(v0, 'big')).st_mtime_ns
 	copies = copies_made(monkeypatch)
 	for n in range(1, 4):
 		os.utime(f'{m}/big', ns=(n * 10 ** 18, n * 10 ** 18))
 		version = verified(job, (False, 'attrib', 'big', None))
-		end = resolved(job, version, 'big')
-		assert copies == [] and end == os.path.join(v0, 'big') and os.lstat(end).st_mtime_ns == n * 10 ** 18
+		entry = os.path.join(version, 'big')
+		assert len(copies) == n and not os.path.islink(entry) and os.lstat(entry).st_mtime_ns == n * 10 ** 18
+	assert os.lstat(os.path.join(v0, 'big')).st_mtime_ns == kept
 	assert_moved_cleanly(logged)
+
+
+def test_bytes_written_through_mmap_then_a_chmod_reach_the_version(job, logged):
+	seed_monitor(job, {'mm': 'a' * 200000, 'keep': 'k'})          # bigger than the hashed tail, so the head's bytes are unseen by it
+	m = job.monitor
+	os.utime(f'{m}/mm', ns=(10 ** 18, 10 ** 18))
+	run_backup(job)
+	run_backup(job)
+	with open(f'{m}/mm', 'r+b') as f, mmap.mmap(f.fileno(), 0) as mapped:
+		mapped[:4] = b'MMAP'
+		mapped.flush()
+	assert os.lstat(f'{m}/mm').st_mtime_ns != 10 ** 18          # an mmap store moves the mtime, and raises no event
+	os.chmod(f'{m}/mm', 0o600)
+	version = verified(job, (False, 'attrib', 'mm', None))
+	end = resolved(job, version, 'mm')
+	assert open(end).read(4) == 'MMAP' and mode(end) == 0o600
+	count = len(committed_versions(job))
+	assert len(run_backup(job)) == count                          # the next full comparison finds nothing more
+
+
+def test_a_record_vouches_only_while_the_mtime_is_the_recorded_one(job):
+	seed_monitor(job, {'x': 'x' * 1000})
+	v0 = run_backup(job)[0]
+	run_backup(job)
+	m = job.monitor
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		record = manifest.lookup('x')
+		os.chmod(f'{m}/x', 0o600)
+		assert rv.record_vouches(record, f'{m}/x') and rv.record_vouches(record, f'{m}/x', os.path.join(v0, 'x'))
+		os.utime(f'{m}/x', ns=(10 ** 18, 10 ** 18))
+		assert not rv.record_vouches(record, f'{m}/x') and not rv.record_vouches(record, f'{m}/x', os.path.join(v0, 'x'))
+	finally:
+		manifest.close()
+
+
+def test_a_touch_is_counted_by_the_estimate(job):
+	seed_monitor(job, {'big': 'b' * 300000, 'keep': 'k'})
+	run_backup(job)
+	run_backup(job)
+	m = job.monitor
+	os.utime(f'{m}/big', ns=(10 ** 18, 10 ** 18))
+	entries = batch(job, (False, 'attrib', 'big', None))
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		latest = rv.list_versions(job.job_vault)[-1].path
+		copied = rv.attribs_to_copy(entries, manifest, m, job.job_vault, latest)
+		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
+	finally:
+		manifest.close()
+	assert copied == {f'{m}/big'} and size >= 300000
+	assert rv.batch_rewrites(entries, m, True, ['big'], copied)[0] == {'big'}
 
 
 def test_an_attrib_that_copies_is_counted_by_the_estimate(job, logged):

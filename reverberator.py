@@ -8295,14 +8295,17 @@ def same_contents(source_path:str, path:str) -> bool:
 def record_vouches(record:'ManifestRecord', source_path:str, path:str = None) -> bool:
 	'''
 	Whether a row's record (checked or unchecked) says the copy at path, the end of the row's chain, holds the monitored
-	file at source_path though their times differ (touch -m): the record has the copy's size and mtime (not checked when
-	path is None), and the monitored file's size and tail. A moved row is unverified, so a link a swap left at another
-	file's copy never vouches. One that cannot be looked at does not.
+	file at source_path: the monitored file has the recorded size, mtime and tail, and the chain end (not checked when
+	path is None) still has the recorded size and mtime. A moved mtime never vouches, as a write through a mapping moves
+	only the mtime and raises no event, and a moved row is unverified, so a link a swap left at another file's copy never
+	vouches. One that cannot be looked at does not.
 	'''
 	if record is None or record.kind != 'f':
 		return False
 	try:
 		source = os.lstat(source_path)
+		if source.st_mtime_ns != record.mtime_ns:
+			return False
 		if path is not None:
 			end = os.lstat(path)
 			if (record.size, record.mtime_ns) != (end.st_size, end.st_mtime_ns):
@@ -10484,7 +10487,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				else:
 					end = attribute_end(event_source_real_path,event_relative_path) if only_sync_attributes else None
 					# the row's record first, which reads the monitored file only: the copy's tail, on the vault's disks, is
-					# read only for a record that does not vouch ( a moved row never does )
+					# read only for a record that does not vouch ( a moved row never does, nor a file whose mtime moved from
+					# the recorded one: an mmap write moves only the mtime, so the file is copied and not synced )
 					if isinstance(end,str) and (record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end) or same_contents(event_source_real_path,end)):
 						# we just copy the file metadata
 						copy_file_meta(event_source_real_path,end,unsynced)
