@@ -115,6 +115,25 @@ def test_a_leading_double_slash_in_an_fstab_mount_point_reads_as_one(tmp_path):
 	assert rv.parse_fstab(b'/dev/a //mnt/a xfs defaults\n/dev/b ///mnt/b/ xfs defaults\n') == ['/mnt/a', '/mnt/b']
 
 
+def test_a_listed_fstab_mount_point_is_never_resolved(tmp_path, fake_pool, monkeypatch):
+	# resolving one would ask the mounted filesystem, which blocks when it hangs
+	jank, other = str(tmp_path / 'jank'), str(tmp_path / 'other')
+	write_fstab(jank, other)
+	fake_pool.add_mount(jank)
+	asked = []
+	real_realpath = os.path.realpath
+	monkeypatch.setattr(os.path, 'realpath', lambda p, *a, **k: asked.append(os.fspath(p)) or real_realpath(p, *a, **k))
+	assert rv.vault_disk_problem(os.path.join(jank, 'v')) is None
+	assert jank not in asked and other in asked
+
+
+def test_an_fstab_nul_escape_cuts_the_mount_point_there(tmp_path):
+	assert rv.parse_fstab(b'/dev/a /mnt/n\\000ul xfs defaults\n') == ['/mnt/n']
+	with open(rv.FSTAB_PATH, 'wb') as f:
+		f.write(b'/dev/a /mnt/n\\000ul xfs defaults\n')
+	assert rv.vault_disk_problem(str(tmp_path / 'v')) is None
+
+
 def test_a_pool_missing_a_disk_is_not_there(tmp_path, fake_pool):
 	pool = str(tmp_path / 'pool')
 	a, _ = fake_pool.add(pool, ['a', 'b'])
