@@ -3519,6 +3519,17 @@ def get_fs_signatures(path:str) -> list:
 	fields = [bytes(f, 'utf-8').decode('unicode_escape') for f in fields if f]
 	return fields
 
+def unescape_octal(field:bytes) -> bytes:
+	r'''
+	A mountinfo or fstab field with its \NNN octal escapes (space, tab, newline, backslash) decoded. An escape above
+	\377 is masked to a byte, as libmount reads it.
+
+	Examples:
+		>>> unescape_octal(b'/mnt/my\\040disk\\134\\500')
+		b'/mnt/my disk\\@'
+	'''
+	return re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8) & 0xff]), field)
+
 def parse_mount_table(mountinfo:bytes) -> list:
 	r'''
 	Parse /proc/self/mountinfo content into (mount_point, fingerprint) pairs in kernel order.
@@ -3548,8 +3559,7 @@ def parse_mount_table(mountinfo:bytes) -> list:
 		except (ValueError, IndexError):
 			fstype = source = b''
 		# mountinfo octal-escapes space, tab, newline and backslash
-		mount_point = re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8)]), fields[4])
-		mount_table.append((os.fsdecode(mount_point), (fields[0], fields[2], fields[3], source, fstype)))
+		mount_table.append((os.fsdecode(unescape_octal(fields[4])), (fields[0], fields[2], fields[3], source, fstype)))
 	return mount_table
 
 def mount_fingerprint(mount_table:list, path:str):
@@ -3799,7 +3809,7 @@ def parse_fstab(content:bytes) -> list:
 	r'''
 	The mount points (field 2) of /etc/fstab content, in file order. Blank and comment lines, lines with fewer than 2
 	fields, and fields that are not absolute paths (none, swap) are skipped; fstab's octal escapes are decoded and the
-	path normalised.
+	path normalised, a leading run of slashes reading as one.
 
 	Examples:
 		>>> parse_fstab(b'# /dev/old /mnt/old xfs 0 0\n\nUUID=1 /mnt/my\\040disk/ xfs defaults 0 0\nnone swap sw 0 0\nlonely\n')
@@ -3810,16 +3820,20 @@ def parse_fstab(content:bytes) -> list:
 		fields = line.split()
 		if len(fields) < 2 or fields[0].startswith(b'#'):
 			continue
-		mount_point = os.fsdecode(re.sub(rb'\\([0-7]{3})', lambda m: bytes([int(m.group(1), 8)]), fields[1]))
+		mount_point = os.fsdecode(unescape_octal(fields[1]))
 		if mount_point.startswith('/'):
-			mount_points.append(os.path.normpath(mount_point))
+			# normpath keeps a leading '//', which the kernel reads as '/'
+			mount_points.append(os.path.normpath('/' + mount_point.lstrip('/')))
 	return mount_points
 
 def fstab_mount_points() -> list:
-	'''The mount points FSTAB_PATH names now; [] when it cannot be read.'''
+	'''
+	The mount points FSTAB_PATH names now, resolved as the mount table lists them (a symlink in one is followed, and
+	nothing is triggered by that); [] when it cannot be read.
+	'''
 	try:
 		with open(FSTAB_PATH, 'rb') as f:
-			return parse_fstab(f.read())
+			return [os.path.realpath(mount_point) for mount_point in parse_fstab(f.read())]
 	except OSError:
 		return []
 
@@ -3828,10 +3842,10 @@ def vault_disk_problem(path:str) -> 'str | None':
 	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
 	point at or above the path is not mounted (a bare folder left under it is not that disk), when the mount table
 	cannot be read, or when a mergerfs pool holding the path has a disk missing (pool_problem()'s text). path need not
-	exist. An fstab mount point with a symlink in it never equals a resolved path, so it names nothing here.
+	exist.
 	'''
 	real = os.path.realpath(path)
-	above = [mount_point for mount_point in fstab_mount_points() if mount_point == '/' or real == mount_point or real.startswith(mount_point + '/')]
+	above = [mount_point for mount_point in fstab_mount_points() if real == mount_point or real.startswith(mount_point + '/')]
 	try:
 		mount_table = read_mount_table()
 	except OSError as e:
