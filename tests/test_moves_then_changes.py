@@ -2,6 +2,8 @@ import errno
 import mmap
 import threading
 import os
+import shutil
+import sqlite3
 import stat
 import struct
 import sys
@@ -1513,3 +1515,66 @@ def test_an_attrib_whose_record_vouches_reads_no_vault_copy(job, logged, monkeyp
 	assert read == []
 	assert mode(resolved(job, version, 'x')) == 0o600 and os.path.islink(os.path.join(version, 'x'))
 	assert_moved_cleanly(logged)
+
+
+def test_a_batch_of_deletes_the_vault_does_not_track_makes_no_version(job, logged):
+	# the carried move-out: its delete names a path no version holds
+	seed_monitor(job, {'a.txt': 'a'})
+	count = len(run_backup(job))
+	verified(job, (False, 'delete', 'gone.txt', None), (True, 'delete', 'never', None))
+	assert len(committed_versions(job)) == count
+	assert any('Dropped 2 delete entries' in line for line in logged) and any('No differences' in line for line in logged)
+
+
+def test_untracked_deletes_beside_a_change_leave_only_the_change(job, logged):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	seed_monitor(job, {'a.txt': 'a2'})
+	version = verified(job, (False, 'delete', 'gone.txt', None), (False, 'modify', 'a.txt', None))
+	rows = [(os.path.relpath(row.path, job.monitor), row.event) for row in rv.iter_change_list(rv.list_versions(job.job_vault)[-1].change_list)]
+	assert rows == [('a.txt', 'modify')] and open(os.path.join(version, 'a.txt')).read() == 'a2'
+
+
+def test_a_delete_of_a_folder_tracked_only_by_its_children_is_kept(job, logged):
+	seed_monitor(job, {'d/x': 'x', 'keep': 'k'})
+	run_backup(job)
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	manifest.discard('d/')
+	manifest.commit()
+	manifest.close()
+	shutil.rmtree(os.path.join(job.monitor, 'd'))
+	version = verified(job, (True, 'delete', 'd', None))
+	assert not os.path.lexists(os.path.join(version, 'd/x'))
+
+
+def test_a_stale_manifest_keeps_untracked_deletes(job):
+	seed_monitor(job, {'a.txt': 'a'})
+	count = len(run_backup(job))
+	conn = sqlite3.connect(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), isolation_level=None)
+	try:
+		conn.execute("UPDATE meta SET value = 'V99--stale' WHERE key = 'version'")
+	finally:
+		conn.close()
+	verified(job, (False, 'delete', 'gone.txt', None))
+	assert len(committed_versions(job)) == count + 1
+
+
+def test_a_delete_of_a_tracked_symlink_is_kept(job, logged):
+	seed_monitor(job, {'a.txt': 'a'})
+	os.symlink('a.txt', os.path.join(job.monitor, 'ln'))
+	run_backup(job)
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.lookup('ln').kind == 'l'
+	manifest.close()
+	os.unlink(os.path.join(job.monitor, 'ln'))
+	version = verified(job, (False, 'delete', 'ln', None))
+	assert not os.path.lexists(os.path.join(version, 'ln')) and not any('Dropped' in line for line in logged)
+
+
+def test_a_file_made_and_deleted_in_one_batch_makes_no_version(job, logged):
+	# the collapse leaves a delete of the made file, or nothing: either way the vault holds no path of it
+	seed_monitor(job, {'a.txt': 'a'})
+	count = len(run_backup(job))
+	verified(job, (False, 'create', 'tmp', None), (False, 'modify', 'tmp', None), (False, 'delete', 'tmp', None))
+	assert len(committed_versions(job)) == count
