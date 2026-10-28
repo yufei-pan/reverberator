@@ -333,7 +333,7 @@ def test_parse_rules_never_rewrites_a_row_whose_name_collides(job):
 def test_rewrite_rule_rows_keeps_other_lines_byte_for_byte(tmp_path):
 	path = tmp_path / 'rule.tsv'
 	path.write_bytes(b'head\tx\r\n# comment\t\r\nA\t1\r\n\r\nB\t2\r\nA\t3\r\nlast\t9')
-	rv.rewrite_rule_rows(str(path), {'A': {0: 'a', 1: '7'}})
+	rv.rewrite_rule_rows(str(path), {'A': ['a', '7']})
 	assert path.read_bytes() == b'head\tx\r\n# comment\t\r\n\r\nB\t2\r\na\t7\r\nlast\t9'
 
 
@@ -457,7 +457,7 @@ def _defaults_file(job, header, defaults, *rows):
 	_rule_file(job, header, '\t'.join(defaults), *rows)
 
 
-def test_a_row_written_back_does_not_freeze_the_defaults_rows_new_columns(job):
+def test_a_row_written_back_never_writes_the_defaults_rows_new_columns(job):
 	_defaults_file(job, HEADER_14, ['#_defaults_#'] + [''] * 11 + ['1d', '20'], rule_row(job, min_snapshot='auto'))
 	rule, = rv.parse_rules(job.rule_path)
 	assert (rule.full_comparison_interval, rule.chain_length) == ('1d', '20')
@@ -469,14 +469,38 @@ def test_a_row_written_back_does_not_freeze_the_defaults_rows_new_columns(job):
 	assert (rule.full_comparison_interval, rule.chain_length) == ('2d', '30')
 
 
-def test_a_row_written_back_does_not_freeze_the_defaults_rows_vault_path(job):
-	row = rule_row(job, min_snapshot='auto')
+def test_a_row_written_back_gets_the_defaults_rows_vault_path_and_signature_together(job):
+	row = rule_row(job, min_snapshot='auto', vault_fs_signature='')
 	row[2] = ''
-	_defaults_file(job, HEADER_12, ['#_defaults_#', '', job.vault], '\t'.join(row))
+	_defaults_file(job, HEADER_12, ['#_defaults_#', '', job.vault] + [''] * 7 + ['auto'], '\t'.join(row))
 	rule, = rv.parse_rules(job.rule_path)
-	assert rule.vault_path == job.vault
 	written = open(job.rule_path).read().splitlines()[2].split('\t')
-	assert written[2] == '' and written[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
+	assert rule.vault_path == job.vault and len(written) == 12
+	assert written[2] == job.vault and written[10] == rule.vault_fs_signature != ''
+	assert written[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
+
+
+def test_a_stub_line_whose_name_differs_by_a_leading_space_does_not_cost_the_job_its_row(job):
+	_rule_file(job, HEADER_12, rule_row(job, min_snapshot='auto'), ' ' + job.job_name + '\t' * 9 + 'note')
+	first, = rv.parse_rules(job.rule_path)
+	lines = open(job.rule_path).read().splitlines()
+	assert lines[1].split('\t')[:3] == [job.job_name, job.monitor, job.vault] and lines[2].endswith('\tnote')
+	again, = rv.parse_rules(job.rule_path)
+	assert again == first
+
+
+def test_a_valid_leading_space_row_is_not_overwritten_by_a_later_stub_line(job):
+	row = rule_row(job, min_snapshot='auto')
+	row[0] = ' ' + job.job_name
+	_rule_file(job, HEADER_12, row, job.job_name + '\t' * 9 + 'note')
+	rules = rv.parse_rules(job.rule_path)
+	lines = open(job.rule_path).read().splitlines()
+	assert [rule.job_name for rule in rules] == [job.job_name]
+	# the cleaned name is not written over the cell: the stub line already carries it
+	assert lines[1].split('\t')[:3] == [' ' + job.job_name, job.monitor, job.vault] and lines[2].endswith('\tnote')
+	assert lines[1].split('\t')[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
+	again = rv.parse_rules(job.rule_path)
+	assert again == rules
 
 
 def test_a_row_longer_than_14_cells_keeps_its_extra_cells_when_written_back(job):

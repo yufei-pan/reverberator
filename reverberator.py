@@ -1105,10 +1105,10 @@ DEFAULT_KEEP_ONE_COMPLETE_BACKUP = True
 DEFAULT_ONLY_SYNC_ATTRIBUTES = True
 DEFAULT_KEEP_N_VERSIONS = 0
 DEFAULT_BACKUP_SIZE_LIMIT = '5%'
-# the most links a path into the vault may meet; the Chain Length column's blank, and its smallest limit
 # parse_duration's units, in seconds
 DURATION_UNITS = {unit:seconds for seconds, units in ((604800, 'w week weeks'), (86400, 'd day days'), (3600, 'h hr hrs hour hours'),
 	(60, 'm min mins minute minutes'), (1, 's sec secs second seconds')) for unit in units.split()}
+# the most links a path into the vault may meet; the Chain Length column's blank, and its smallest limit
 DEFAULT_CHAIN_LENGTH = 40
 MIN_CHAIN_LENGTH = 3
 
@@ -1653,7 +1653,9 @@ def run_daemon():
 		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate, monitor_path_signature,
 			dict(full_comparison_interval=full_comparison_interval, chain_length=chain_length))
 		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
-		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {f'{full_comparison_interval:g}s' if full_comparison_interval else 'off'}, chain length: {chain_length or 'no limit'}'))
+		interval_text = f'{full_comparison_interval:.15g}s' if full_comparison_interval else 'off'
+		chain_text = chain_length or 'no limit'
+		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {interval_text}, chain length: {chain_text}'))
 		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
 		supervisor.start()
 		supervisors.append(supervisor)
@@ -1959,39 +1961,40 @@ def discard_change_list(temp_path:str) -> None:
 
 def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 	'''
-	Change cells of rule rows in place. rows maps the job name cell as written in the file to {cell index: new value}.
-	For each key (compared stripped on both sides) the last line whose first cell (stripped) equals it is split into its own
-	cells, extended with empty cells only as far as the highest changed index needs, and has just those cells set; earlier
-	lines with that key are removed (TSVZ already ignored them). Every other cell of that line stays as written, so a blank
-	cell the defaults row fills on read stays blank, and cells past the 14th are kept. Every other line is kept byte for byte,
-	line endings included.
+	Replace the leading cells of rule rows in place. rows maps the job name cell as written in the file to the row's new
+	leading cells (the 12 columns the daemon fills in, resolved and merged with the defaults row as read).
+	For each key the last line whose first cell, right-stripped as TSVZ keys it, equals it has its first len(new row) cells
+	replaced, padded with empty cells when it is shorter; the cells after them (the optional columns 13 and 14, and any
+	past the 14th) stay exactly as the line has them, blank or absent included, so the daemon never writes them. Earlier
+	lines with that key are removed (TSVZ already ignored them). A new job name cell that another line already carries is not
+	written (the row keeps the name it has), as the two would be one row on the next read. Every other line is kept byte for
+	byte, line endings included.
 
 	Args:
 		rule_file (str): The rule file
-		rows (dict): Written job name cell -> {cell index: new value}
+		rows (dict): Written job name cell -> the new leading cells (list)
 	'''
 	if not rows:
 		return
-	rows = {key.strip():changes for key, changes in rows.items()}
 	rule_file = os.path.realpath(rule_file)
 	with open(rule_file, 'r', newline='', encoding='utf-8') as f:
 		lines = f.read().split('\n')
 	last_index = {}
 	for i, line in enumerate(lines):
-		key = line.split('\t', 1)[0].strip()
+		key = line.split('\t', 1)[0].rstrip()
 		if key in rows and not key.startswith('#'):
 			last_index[key] = i
+	taken = {line.split('\t', 1)[0].rstrip() for line in lines}
 	result = []
 	for i, line in enumerate(lines):
-		key = line.split('\t', 1)[0].strip()
+		key = line.split('\t', 1)[0].rstrip()
 		if key not in last_index:
 			result.append(line)
 		elif last_index[key] == i:
-			cells = line.rstrip('\r').split('\t')
-			changes = rows[key]
-			cells += [''] * (max(changes) + 1 - len(cells))
-			for index, value in changes.items():
-				cells[index] = value
+			row = list(rows[key])
+			if row[0].rstrip() != key and row[0].rstrip() in taken:
+				row[0] = line.split('\t', 1)[0]
+			cells = row + line.rstrip('\r').split('\t')[len(row):]
 			result.append('\t'.join(cells) + line[len(line.rstrip('\r')):])
 	replace_file_text(rule_file, '\n'.join(result))
 
@@ -2277,13 +2280,13 @@ def parse_rules(rule_file:str, read_only:bool = False):
 		# check if the rule is explicit
 		if ruleUpdated:
 			tl.info(log_text(f'Updating rule {ruleName}: {inRule}'))
-			# only the cells this changed are written back: the others stay as the file has them, blank ones the defaults row fills included
-			rulesToUpdate[ruleName] = (inRule['job_name'], {i:value for i, (value, before) in enumerate(zip(inRule.values(), ruleList)) if value != before})
+			# columns 1-12 are written back resolved; the optional columns 13 and 14 never are
+			rulesToUpdate[ruleName] = (inRule['job_name'], list(inRule.values())[:12])
 		returnReverbRules.append(ReverbRule(**inRule))
 	# rewrite the updated rows in place once; a row whose cleaned name collides with another's is left as written,
 	# as renaming it would merge the two rows in the file; a row whose name cleaned to nothing is left as written too
 	colliding = colliding_job_names(returnReverbRules)
-	rulesToUpdate = {name:changes for name,(job_name,changes) in rulesToUpdate.items() if job_name not in colliding and job_name != '' and changes}
+	rulesToUpdate = {name:changes for name,(job_name,changes) in rulesToUpdate.items() if job_name not in colliding and job_name != ''}
 	if rulesToUpdate and not read_only:
 		try:
 			rewrite_rule_rows(rule_file,rulesToUpdate)
