@@ -86,25 +86,37 @@ def recording_syncfs(monkeypatch, failing=()):
 def test_the_vault_sync_on_a_pool_reaches_each_branch_holding_it(tmp_path, fake_pool, monkeypatch):
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
 	calls = recording_syncfs(monkeypatch)
-	REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path)
 	assert calls == [os.path.join(a, 'job'), os.path.join(c, 'job')]
+	assert results == {a: None, c: None}
 
 
-def test_the_vault_sync_on_a_pool_tries_every_branch_before_it_raises(tmp_path, fake_pool, monkeypatch):
+def test_the_vault_sync_on_a_pool_gives_each_branch_its_result(tmp_path, fake_pool, monkeypatch):
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
 	calls = recording_syncfs(monkeypatch, failing=[os.path.join(a, 'job')])
-	with pytest.raises(OSError) as failure:
-		REAL_SYNC_VAULT_FILESYSTEMS(job_path)
-	assert failure.value.errno == errno.EIO
+	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path)
 	assert calls == [os.path.join(a, 'job'), os.path.join(c, 'job')]
+	assert results[c] is None and results[a].errno == errno.EIO and set(results) == {a, c}
 
 
 def test_the_vault_sync_off_any_pool_reaches_the_vault_itself(tmp_path, monkeypatch):
 	path = str(tmp_path / 'job')
 	os.makedirs(path)
 	calls = recording_syncfs(monkeypatch)
-	REAL_SYNC_VAULT_FILESYSTEMS(path)
+	results = REAL_SYNC_VAULT_FILESYSTEMS(path)
 	assert calls == [path]
+	assert results == {rv.mount_holding(rv.read_mount_table(), os.path.realpath(path))[0]: None}
+
+
+def test_the_vault_sync_raises_when_the_branch_list_cannot_be_read(tmp_path, fake_pool, monkeypatch):
+	job_path, _ = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
+	def unreadable(mount_point):
+		raise OSError(errno.ENODATA, os.strerror(errno.ENODATA))
+	monkeypatch.setattr(rv, 'read_pool_branches', unreadable)
+	calls = recording_syncfs(monkeypatch)
+	with pytest.raises(OSError):
+		REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+	assert calls == []
 
 
 def test_the_commit_flushes_the_job_vault_after_the_swap(job, monkeypatch):

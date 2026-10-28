@@ -822,6 +822,7 @@ def test_firewatcher_patterns_match_every_alerting_marker_and_not_recovered(pref
 		rv.job_log('my_job-2', 'FAILED: waiting 15 min for /mnt/x: vault filesystem not ready'),
 		rv.job_log('j', 'UNREADABLE: /m/a: [Errno 5] Input/output error; keeping its last backed-up copy'),
 		rv.job_log('j', 'STOPPED: bad pattern'),
+		rv.job_log('j', 'VAULT WRITE ERROR: disk /mnt/jank_data/a58 failed a sync ([Errno 5] Input/output error); its copies stay unchecked until a reboot'),
 		rv.daemon_error_log('every job is stopped'),
 	]
 	for line in alerting:

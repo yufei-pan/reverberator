@@ -41,7 +41,7 @@ def isolated_runtime(tmp_path, monkeypatch):
 	monkeypatch.setattr(rv.multiCMD, 'run_command', refuse_sudo_sysctl(rv.multiCMD.run_command))
 	# a real syncfs would flush the whole (ext4) filesystem under /tmp for every comparison that checks a copy; tests that count
 	# or fail syncs patch it themselves
-	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: None)
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: {})
 	yield
 	rv.STATUS_BOARD = None
 	rv.POLL_WAIT_SECONDS = old_poll
