@@ -45,14 +45,16 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a vault's size limit needs to be met exactly.
 - **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
 
-### User symlinks past 40 hops when keep-N is 41 or more
+### User symlinks past 40 hops when keep-N is 40 or more
 
 - **Kind:** known limitation, already in 0.43.
-- **What the operator sees:** with keep-N at 41 or more, an unchanged user symlink is chained through more than 40 links,
-  so browsing the vault by hand through the kernel gives "too many levels of symbolic links" for it. Restore gives it back
-  correctly. The live jobs keep 3 to 5 versions.
-- **Why:** the re-copies every 32-38 hops that keep files under the kernel's limit apply to files only.
-- **Revisit when:** a job keeps 41 or more versions and its vault is browsed by hand.
+- **What the operator sees:** with keep-N at 40 or more, an unchanged user symlink is chained through more than 40 links
+  by way of `current_version/` (at 41 or more, through its own version folder too), so browsing the vault by hand through
+  the kernel gives "too many levels of symbolic links" for it. Restore gives it back correctly. The live jobs keep 3 to
+  5 versions.
+- **Why:** the re-copies every 32-38 hops at the default Chain Length of 40 that keep files under the kernel's limit apply
+  to files only.
+- **Revisit when:** a job keeps 40 or more versions and its vault is browsed by hand.
 - **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
 
 ### A SnapRAID fix while reverberator runs

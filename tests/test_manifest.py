@@ -179,17 +179,24 @@ def test_a_sync_that_raises_leaves_no_marker(job, monkeypatch, boot):
 	assert set(unchecked_flags(job).values()) == {1} and markers() == [] and rv.UNRECORDED_FAILED_DISKS == set()
 
 
-def test_a_long_disk_path_is_named_by_its_hash_and_marked(boot):
-	error = OSError(errno.EIO, 'Input/output error')
-	long_disks = ['/' + 'x' * 300, '/' + 'x' * 299 + 'y']
-	for disk in long_disks:
-		assert rv.mark_failed_sync(disk, error) is True
-		assert rv.mark_failed_sync(disk, error) is False
-	assert rv.failed_sync_disks() == set(long_disks) and len(markers()) == 2
-	assert all(len(name) <= 250 and name.startswith(rv.VAULT_SYNC_MARKER_PREFIX) for name in markers())
+def test_a_disk_path_too_long_for_a_marker_name_is_remembered_in_memory_with_its_alert(job, monkeypatch, boot, capsys):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	long_disk = '/' + 'x' * 300
+	with pytest.raises(OSError):
+		rv.mark_failed_sync(long_disk, OSError(errno.EIO, 'Input/output error'))
+	assert markers() == []
 	# the longest name that still fits is the readable one
-	fits = os.path.basename(rv.vault_sync_marker_path('/' + 'x' * 180))
-	assert fits == rv.VAULT_SYNC_MARKER_PREFIX + '%2F' + 'x' * 180
+	assert os.path.basename(rv.vault_sync_marker_path('/' + 'x' * 180)) == rv.VAULT_SYNC_MARKER_PREFIX + '%2F' + 'x' * 180
+	disk_sync(monkeypatch, {long_disk: errno.EIO})
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {1}
+	out = capsys.readouterr().out
+	assert 'VAULT WRITE ERROR' in out and 'cannot record it until a reboot' in out
+	assert markers() == [] and rv.UNRECORDED_FAILED_DISKS == {long_disk}
+	disk_sync(monkeypatch, {long_disk: None})              # the error was reported once: the next sync gets 0
+	run_backup(job)
+	assert set(unchecked_flags(job).values()) == {1} and 'VAULT WRITE ERROR' not in capsys.readouterr().out
 
 
 def test_a_second_job_syncing_the_disk_after_the_failed_sync_waits_for_its_marker(tmp_path, monkeypatch, boot):
@@ -228,6 +235,31 @@ def test_a_second_job_syncing_the_disk_after_the_failed_sync_waits_for_its_marke
 	assert not thread_a.is_alive() and not thread_b.is_alive()
 	assert set(unchecked_flags(a).values()) == {1} and set(unchecked_flags(b).values()) == {1}
 	assert rv.failed_sync_disks() == {'/fake/X'}
+
+
+def test_a_pool_job_and_an_off_pool_job_on_one_filesystem_share_the_marker(tmp_path, fake_pool, monkeypatch, boot, capsys):
+	# the kernel reports the filesystem's error once: the pool's job meets it, the other job's sync gets 0 and must still find the marker
+	b = create_job(str(tmp_path / 'rb'), 'job_b')
+	seed_monitor(b, {'b.txt': 'b'})
+	run_backup(b)
+	pool = str(tmp_path / 'pool')
+	os.makedirs(pool)
+	fake_pool.add(pool, ['d'])
+	branch = str(tmp_path / 'plain' / 'x')           # a folder of the root filesystem, where job b's vault is too
+	os.makedirs(os.path.join(branch, 'job_a'))
+	monkeypatch.setattr(rv, 'read_pool_branches', lambda mount_point: [branch])
+	os.makedirs(os.path.join(pool, 'job_a'))
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', REAL_SYNC_VAULT_FILESYSTEMS)
+	unseen = [True]
+	def syncfs(folder):
+		if unseen:
+			unseen.pop()
+			raise OSError(errno.EIO, os.strerror(errno.EIO), folder)
+	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
+	assert rv.check_vault_sync(os.path.join(pool, 'job_a'), 'job_a') == ['/']
+	assert rv.failed_sync_disks() == {'/'} and capsys.readouterr().out.count('VAULT WRITE ERROR') == 1
+	run_backup(b)
+	assert set(unchecked_flags(b).values()) == {1}
 
 
 def test_a_marker_is_written_once_per_boot(boot):

@@ -76,22 +76,6 @@ def test_a_job_without_an_interval_never_compares_on_its_own(job, monkeypatch):
 	assert [kind for kind, _, _ in calls] == ['whole']
 
 
-@pytest.mark.parametrize('interval', [1e25])
-def test_a_huge_interval_neither_raises_nor_compares_early(job, monkeypatch, interval):
-	# a rule cell such as 99999999999999999999w reads as about 6e25 s, far above threading.TIMEOUT_MAX
-	seed_monitor(job, {'a.txt': 'a'})
-	run_backup(job)
-	calls = recorded_backups(monkeypatch)
-	thread, *_ = start_backuper(job, interval)
-	try:
-		wait_until(lambda: len(calls) == 1, message='no start comparison')
-		time.sleep(0.5)
-		assert thread.is_alive()
-	finally:
-		stop_backuper(thread)
-	assert [kind for kind, _, _ in calls] == ['whole']
-
-
 def test_a_due_comparison_is_not_held_back_by_a_signalled_batch(job, monkeypatch):
 	# a busy job: the watcher has signalled again by the time each batch ends, so the idle wait never waits
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
@@ -123,7 +107,8 @@ def test_a_due_comparison_is_not_held_back_by_a_signalled_batch(job, monkeypatch
 
 
 def test_a_huge_interval_is_never_passed_to_a_wait(job, monkeypatch):
-	# every Event.wait timeout of the backuper's thread stays small: 6.048e25 s is what a cell of 99999999999999999999w reads as
+	# every Event.wait timeout of the backuper's thread stays small, and the job neither raises nor compares early: 6.048e25 s
+	# is what a cell of 99999999999999999999w reads as, far above threading.TIMEOUT_MAX
 	seen = []
 	real_wait = threading.Event.wait
 	def wait(self, timeout=None):
@@ -142,6 +127,7 @@ def test_a_huge_interval_is_never_passed_to_a_wait(job, monkeypatch):
 		assert thread.is_alive()
 	finally:
 		stop_backuper(thread)
+	assert [kind for kind, _, _ in calls] == ['whole']
 	assert seen and max(t for t in seen if t is not None) <= 1, sorted(set(seen))[-5:]
 
 
@@ -205,9 +191,10 @@ def test_a_stop_while_a_due_comparison_waits_for_a_missing_vault_writes_nothing_
 		assert len(calls) == 1, calls
 	finally:
 		stop_backuper(thread)
-		# the vault back as it was, for the fixture's teardown
-		restored = os.path.isdir(job.vault)
-		if restored:
-			shutil.rmtree(job.vault)
-		os.rename(away, job.vault)
+		# the vault back as it was, for the fixture's teardown, when the take moved it
+		restored = taken.is_set() and os.path.isdir(job.vault)
+		if taken.is_set():
+			if restored:
+				shutil.rmtree(job.vault)
+			os.rename(away, job.vault)
 	assert not restored, 'the stop created the job folder in the missing vault'

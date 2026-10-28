@@ -99,6 +99,49 @@ def test_the_vault_sync_on_a_pool_gives_each_branch_its_result(tmp_path, fake_po
 	assert results[c] is None and results[a].errno == errno.EIO and set(results) == {a, c}
 
 
+def pool_over_one_filesystem(tmp_path, fake_pool, monkeypatch, holding):
+	'''
+	A pool at tmp_path/pool whose two branches are the folders x and y of one filesystem (disk, a mount of the fake table), with
+	job/ made on the branches in holding: the job's path, the filesystem's mount point, the folders x/job and y/job.
+	'''
+	pool = str(tmp_path / 'pool')
+	os.makedirs(pool)
+	disk, = fake_pool.add(pool, ['d'])
+	branches = [os.path.join(disk, 'x'), os.path.join(disk, 'y')]
+	for name, branch in zip('xy', branches):
+		os.makedirs(os.path.join(branch, 'job') if name in holding else branch)
+	monkeypatch.setattr(rv, 'read_pool_branches', lambda mount_point: branches)
+	os.makedirs(os.path.join(pool, 'job'), exist_ok=True)
+	return os.path.join(pool, 'job'), disk, [os.path.join(branch, 'job') for branch in branches]
+
+
+def test_two_branch_folders_on_one_filesystem_are_one_disk(tmp_path, fake_pool, monkeypatch):
+	job_path, disk, (x, y) = pool_over_one_filesystem(tmp_path, fake_pool, monkeypatch, 'xy')
+	assert rv.vault_disks(job_path) == (True, [(disk, x), (disk, y)])
+	calls = recording_syncfs(monkeypatch)
+	assert REAL_SYNC_VAULT_FILESYSTEMS(job_path) == {disk: None} and len(calls) == 1
+	# the folders are still each flushed
+	flushed = recording_fsync(monkeypatch)
+	rv.fsync_vault_folder(job_path)
+	assert flushed == [(x, True), (y, True)]
+
+
+@pytest.mark.parametrize('holding', ['x', 'y', 'xy'])
+def test_an_error_met_through_either_branch_folder_is_its_filesystems_result(tmp_path, fake_pool, monkeypatch, holding):
+	job_path, disk, folders = pool_over_one_filesystem(tmp_path, fake_pool, monkeypatch, holding)
+	# the kernel reports a filesystem's error once, through whichever folder's sync meets it first
+	calls = []
+	def syncfs(path):
+		if not os.path.isdir(path):
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		calls.append(path)
+		if len(calls) == 1:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
+	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+	assert list(results) == [disk] and results[disk].errno == errno.EIO and len(calls) == 1
+
+
 def test_the_vault_sync_off_any_pool_reaches_the_vault_itself(tmp_path, monkeypatch):
 	path = str(tmp_path / 'job')
 	os.makedirs(path)

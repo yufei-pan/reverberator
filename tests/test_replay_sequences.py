@@ -308,8 +308,10 @@ def test_sequence_late_delete(tmp_path):
 		assert version.number == 1
 		assert_version_matches_tree(job, version)
 		# the first batch's version dropped the phantom, so the late delete names a path the vault no longer tracks: no version of its own
-		version = backup_batch(backuper, job, second)
-		assert version.number == 1
+		_, _, committed = backuper.back_up(list(second))
+		version = rv.list_versions(job.job_vault)[-1]
+		# the second batch ran to its end (a comparison that finds no difference commits the manifest) and made no version
+		assert committed and version.number == 1
 		assert_version_matches_tree(job, version)
 	finally:
 		backuper.stop()

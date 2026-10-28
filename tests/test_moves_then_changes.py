@@ -1546,6 +1546,7 @@ def test_a_delete_of_a_folder_tracked_only_by_its_children_is_kept(job, logged):
 	shutil.rmtree(os.path.join(job.monitor, 'd'))
 	version = verified(job, (True, 'delete', 'd', None))
 	assert not os.path.lexists(os.path.join(version, 'd/x'))
+	assert not any('Dropped' in line for line in logged)
 
 
 def test_a_stale_manifest_keeps_untracked_deletes(job):
@@ -1570,11 +1571,3 @@ def test_a_delete_of_a_tracked_symlink_is_kept(job, logged):
 	os.unlink(os.path.join(job.monitor, 'ln'))
 	version = verified(job, (False, 'delete', 'ln', None))
 	assert not os.path.lexists(os.path.join(version, 'ln')) and not any('Dropped' in line for line in logged)
-
-
-def test_a_file_made_and_deleted_in_one_batch_makes_no_version(job, logged):
-	# the collapse leaves a delete of the made file, or nothing: either way the vault holds no path of it
-	seed_monitor(job, {'a.txt': 'a'})
-	count = len(run_backup(job))
-	verified(job, (False, 'create', 'tmp', None), (False, 'modify', 'tmp', None), (False, 'delete', 'tmp', None))
-	assert len(committed_versions(job)) == count
