@@ -17,51 +17,91 @@ user chose.
 - The failed rm: "Defer to round 12 (Recommended)", on "Check each rm's result and fail the batch (handed back and
   retried) when one fails."
 - Round 12: "yes start now".
+- After the spec check (2026-10-28): a stop that drops queued changes while an older pending file stays in the vault:
+  "Known limitation (Recommended)".
 - Standing: nothing is merged, pushed or restarted without the user; known limitations and deferrals need the user's OK.
 
 ## Goal 1: never create or write into a vault that is not there
 
-**The check.** A vault path's disk counts as there unless /etc/fstab names a mount point that is the path or a folder
-above it (the longest such one) and that mount point is not mounted now (the live mount table, as the daemon already
-reads it). A path under no fstab mount point counts as there, as today (a vault on the root disk, or on a disk mounted
-some other way). The fstab is read when needed (it is small); a missing or unreadable fstab names nothing. Mount points
-are compared as fstab writes them (fstab escapes such as `\040` decoded), after realpath of the vault path's existing
-part.
+**The check (`vault_disk_problem(path) -> str or None`, None when the disk is there).** A vault path's disk is not there
+when:
+- /etc/fstab (`FSTAB_PATH`, a module constant tests patch, like `MOUNTINFO_PATH`) names a mount point that is the path
+  or a folder above it, and the longest such one is not mounted now; or
+- the path is on a mergerfs pool with a missing or failed branch (round 9's `pool_problem()`, which works on a path that
+  does not exist yet and also covers a dead mergerfs).
+
+A path under no fstab mount point counts as there, as today (a vault on a disk mounted some other way). fstab parsing:
+skip blank and `#` lines, take field 2, decode `\040` `\011` `\012` `\134`, skip mount points that are not absolute
+(`none`, swap), normpath the rest; every entry counts alike (mergerfs, bind, `noauto`, `nofail`, automount), only the
+mount point matters. "Mounted" means a mount point of the live mount table (`parse_mount_table()`, as decoded there)
+equals the normalised fstab mount point; the vault path goes through non-strict realpath and is matched by path
+component (`p == mp or p.startswith(mp + '/')`, never a plain prefix: /mnt/jank must not match /mnt/jank_data/...). A
+missing or unreadable fstab names nothing; a mount table that cannot be read means not there (wait), as `pool_state()`
+does. An fstab mount point that contains a symlink never matches (fails open, as today). The fstab is read at each check
+(about 10 KB).
+
+The signature (the user's "pool or signature") is checked as today, by the vault wait once the path exists; before the
+path exists, the check above decides.
 
 **Where it applies:**
-- **The backuper's start** creates a missing Vault Path only when its disk is there. Otherwise it waits, as it waits for
-  a vault filesystem that is not ready, with the FAILED: waiting marker naming the unmounted mount point, and creates the
-  path once the mount is there (then the existing signature wait follows).
-- **parse_rules** no longer creates a missing Vault Path. It fills an auto Vault File System Signature only when the
-  vault path exists and its disk is there; otherwise the cell stays auto (the backuper creates the path when the disk is
-  there, and the next start fills the signature from it). It still writes the row back for the cells it does fill.
-- **A stop** (the backuper's hand-back, and a failed job's queue) writes no pending file when the job's vault path, or
-  its disk, is not there: the queued changes are dropped with one log line, as the next start compares the whole tree
-  anyway ("keep queued changes as a full-comparison request instead"). Round 11's narrower guard (a full_scan-only queue
-  with the vault path absent) becomes part of this rule.
+- **Every vault wait** (the backuper's start and its per-batch wait, both `wait_for_path()` on the vault) also requires
+  the disk check: while it fails, the job waits with the FAILED: waiting marker naming the unmounted mount point or the
+  pool's missing disk, re-checking every poll. So a bare folder already left under an unmounted mount point (0.47 made
+  such folders) is never backed up into, at the start or mid-run, whatever the signature cell holds. The start creates a
+  missing Vault Path inside that wait, once the disk is there; the signature monitor learns of the new folder at once
+  (register after creating, or invalidate it), not after `FS_RECHECK_SECONDS`.
+- **parse_rules** no longer creates a missing Vault Path (a row whose path cannot be created is then a job that fails and
+  retries, not a rule ignored at parse: the main session's call). It fills an auto Vault File System Signature only when
+  the vault path exists and its disk is there; otherwise the cell stays auto, and the job runs without signature gating
+  until the next start fills it from the path the backuper created (the main session's call: the disk check above gates
+  fstab disks meanwhile). It still writes the row back for the cells it does fill.
+- **A stop** (the backuper's hand-back, and a failed job's queue, both through `persist_pending_transactions()`) writes
+  no pending file when the job's vault path is not a folder, or its disk is not there (a live check, not the vault flag,
+  which the backuper unregisters before it persists): the queued changes are dropped with one log line, as a start with
+  no pending file compares the whole tree ("keep queued changes as a full-comparison request instead"). Round 11's
+  narrower guard (a full_scan-only queue with the vault path absent) becomes part of this rule.
+- **Known limitation (the user's, 2026-10-28):** an older pending file already in the vault (saved by a stop while the
+  vault was there, and not yet loaded because the next start never got past the vault wait) stays; a later start may
+  replay it, and the dropped changes are missed until the next full comparison, as changes made while the daemon is down
+  would be when the quick resume check passes.
 
 ## Goal 2: a vouched attribute change reads nothing from the vault
 
 Under Only Sync Attributes, when the replay syncs an attribute-only change onto a chain end whose record vouches for it
 (`record_vouches()` with the chain end: the live file has the recorded size, mtime and tail, and the chain end has the
 recorded size and mtime), the row is recorded at commit from that record's hash and the chain end's new metadata,
-without hashing the copy again. Today the commit (`record_dirty_entries()` → `read_copied_record()` →
-`read_vault_record()`) hashes every dirty row's chain end. The row keeps the record's unchecked flag. Rows not synced
-this way are recorded as today.
+without hashing the copy again: the commit reads no file data for it (it still walks the chain with lstat). Today the
+commit (`record_dirty_entries()` → `read_copied_record()` → `read_vault_record()`) hashes every dirty row's chain end.
+The row keeps the record's unchecked flag. Rows not synced this way are recorded as today.
+
+How (the spec check's answer, the builder may refine): a manifest method that sets dirty and keeps the row's record
+(`VaultManifest.add()` is INSERT OR REPLACE and wipes it), so "dirty with a record" means vouched and any later `add()`
+for that rel (a fix, a move, a copy) wipes it by itself; `record_dirty_entries()` reuses the record's hash only when the
+chain end's (size, mtime_ns) still equal the record's, else hashes as today. No schema change.
 
 ## Goal 3: a delete whose removal fails fails the batch
 
-The replay's delete (`delete_path()`) checks that each removal worked. A removal that fails (the entry is still there
-afterwards, or the remover reports an error) fails the batch, as a failed copy does today: no version is committed, the
-batch is handed back and retried. A removal of an entry that is already gone is not a failure.
+The replay's delete (`delete_path()`) checks that each removal worked. Today the `rm` tasks' results are dropped
+(`mcae.run_command()`'s return value is ignored). The removal stays `rm` through the AsyncExecutor (its parallelism on
+the HDD pool is kept); each task and its path is kept, and checked when the replay's async commands are waited for: a
+task that reports failure (a non-zero exit, multiCMD's own -1, or a stopped task) and whose entry is still there fails
+the batch, as a vault-side copy failure does today (a JobFailure: rollback, no version committed, the batch handed back
+and retried), with rm's own message in the log. A removal of an entry that is already gone is not a failure. An entry of
+another kind in a file row's place (a folder where a file row was, which `rm -f` refuses) is another row's entry: the
+row is dropped, as the folder branch's `replaced_folder()` does, not a failure.
+
+What the operator sees on a lasting failure: the job's FAILED: ...; retrying lines with the growing delay, each retry
+rebuilding the batch.
 
 ## Goal 4: version 0.48, docs
 
 - `__version__ = 0.48`, pyproject `version = "0.48"`.
 - docs/limitations.md: remove the three deferred entries this round closes ("Writes under a vault that is not mounted",
   "A chmod reads each file's vault copy once at commit", "A delete whose rm fails leaves the entry in the version"), and
-  their README Known-limits lines; README design lines for the fstab check, the stop rule, the commit-time record and
-  the checked delete.
+  their README Known-limits lines; add the known limitation above ("An older pending file replayed after a stop dropped
+  changes", approved 2026-10-28, "Known limitation (Recommended)") with a README line; README design lines for the disk
+  check, the stop rule, the commit-time record and the checked delete. Examples use a test fstab, never /var (on this
+  host /var is an fstab mount).
 
 ## Non-goals
 
@@ -77,6 +117,5 @@ batch is handed back and retried. A removal of an entry that is already gone is 
 
 ## Left to the builder
 
-How the fstab is parsed and cached, the exact log and marker wording, how a stop learns the vault is not there, how the
-vouched record reaches the commit, and how a removal's result is checked (the remover may change, within the standard
-library).
+The exact log and marker wording, and refinements of the "how" notes above that keep their behaviour. Tests use a fake
+fstab and mount table (`FSTAB_PATH`, `MOUNTINFO_PATH`): /tmp and /root are fstab bind mounts on this host.
