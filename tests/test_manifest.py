@@ -157,6 +157,22 @@ def test_a_marker_that_cannot_be_written_is_alerted_and_remembered_until_reverbe
 	assert set(unchecked_flags(job).values()) == {0}
 
 
+def test_a_disk_remembered_in_memory_leaves_memory_once_its_marker_is_written(job, monkeypatch, boot, tmp_path):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	os.makedirs(rv.vault_sync_marker_path('/mnt/d1'))      # a folder at the marker path: the marker cannot be written
+	disk_sync(monkeypatch, {'/mnt/d1': errno.EIO})
+	run_backup(job)
+	assert rv.UNRECORDED_FAILED_DISKS == {'/mnt/d1'}
+	os.rmdir(rv.vault_sync_marker_path('/mnt/d1'))         # the state folder is fixed, and the disk fails again
+	lines = warning_lines(monkeypatch)
+	run_backup(job)
+	assert rv.UNRECORDED_FAILED_DISKS == set() and rv.failed_sync_disks() == {'/mnt/d1'}
+	warnings = [message for message, warning in lines if warning and 'sync of the vault failed' in message]
+	assert warnings and not any('remembered only until reverberator stops' in message for message in warnings)
+	assert set(unchecked_flags(job).values()) == {1}
+
+
 def test_an_unreadable_boot_id_keeps_the_copies_unchecked_with_one_warning(job, monkeypatch, boot, capsys):
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
 	run_backup(job)
