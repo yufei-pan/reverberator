@@ -10486,9 +10486,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					manifest.add(as_folder_entry(event_relative_path),dirty=True)
 				else:
 					end = attribute_end(event_source_real_path,event_relative_path) if only_sync_attributes else None
-					# the row's record first, which reads the monitored file only: the copy's tail, on the vault's disks, is
-					# read only for a record that does not vouch ( a moved row never does, nor a file whose mtime moved from
-					# the recorded one: an mmap write moves only the mtime, so the file is copied and not synced )
+					# the row's record first, which reads the monitored file only: the replay reads the copy's tail, on the
+					# vault's disks, only for a record that does not vouch ( a moved row never does, nor a file whose mtime
+					# moved from the recorded one: an mmap write moves only the mtime, so the file is copied and not synced )
 					if isinstance(end,str) and (record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end) or same_contents(event_source_real_path,end)):
 						# we just copy the file metadata
 						copy_file_meta(event_source_real_path,end,unsynced)
@@ -10570,7 +10570,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 								cp_af_copy_path(source_path=event_source_real_path,dest_path=link_target_backup_real_path,mcae=mcae,pending=pending)
 							# recorded again, as an attrib's replay is
 							manifest.add(link_target_relative_path,dirty=True)
-					else:
+					elif isDir or os.path.islink(link_target_backup_real_path) or same_contents(event_source_real_path,link_target_backup_real_path):
+						# a real file gets the metadata only when it holds the file's contents: a file re-copied into this version
+						# holds the old copy's bytes, and the file's moved mtime on them ( an mmap write ) would hide the write.
+						# one with other contents is left as it is, and the verification copies it
 						copy_file_meta(event_source_real_path,link_target_backup_real_path,unsynced)
 				except NotARealFolder as e:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: {e}; doing delete & copy instead')

@@ -772,6 +772,32 @@ def test_bytes_written_through_mmap_then_a_chmod_reach_the_version(job, logged):
 	assert len(run_backup(job)) == count                          # the next full comparison finds nothing more
 
 
+def test_a_recopied_file_written_through_mmap_then_moved_reaches_the_version(job, logged, monkeypatch):
+	# the chain-length rule re-copies mm into this version as a real file holding the old bytes and mtime: the move step
+	# must not put the moved mtime on them, as the verification would then find them matching from then on
+	monkeypatch.setattr(rv, 'RECOPY_MIN_HOPS', 1)
+	monkeypatch.setattr(rv, 'RECOPY_MAX_HOPS', 1)
+	seed_monitor(job, {'mm': 'a' * 200000, 'keep': 'k'})
+	m = job.monitor
+	os.utime(f'{m}/mm', ns=(10 ** 18, 10 ** 18))
+	v0 = run_backup(job)[0]
+	run_backup(job)
+	with open(f'{m}/keep', 'w') as f:
+		f.write('k2')
+	verified(job, (False, 'modify', 'keep', None))
+	with open(f'{m}/mm', 'r+b') as f, mmap.mmap(f.fileno(), 0) as mapped:
+		mapped[:4] = b'MMAP'
+		mapped.flush()
+	os.rename(f'{m}/mm', f'{m}/mm2')
+	version = verified(job, (False, 'move', 'mm2', 'mm'))
+	assert open(resolved(job, version, 'mm2')).read(4) == 'MMAP'
+	count = len(committed_versions(job))
+	run_backup(job)
+	assert len(committed_versions(job)) == count                  # a full comparison finds nothing more
+	assert open(resolved(job, committed_versions(job)[-1], 'mm2')).read(4) == 'MMAP'
+	assert open(os.path.join(v0, 'mm')).read(4) == 'aaaa'
+
+
 def test_a_record_vouches_only_while_the_mtime_is_the_recorded_one(job):
 	seed_monitor(job, {'x': 'x' * 1000})
 	v0 = run_backup(job)[0]
