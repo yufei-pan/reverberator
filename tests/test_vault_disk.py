@@ -79,11 +79,40 @@ def test_a_mount_table_that_cannot_be_read_means_not_there(tmp_path, monkeypatch
 	assert rv.vault_disk_problem(str(tmp_path / 'v')).startswith('the mount table cannot be read: ')
 
 
-def test_an_fstab_mount_point_through_a_symlink_never_matches(tmp_path, fake_pool):
+def test_an_fstab_mount_point_under_a_symlinked_folder_is_checked_by_its_real_path(tmp_path, fake_pool):
 	os.makedirs(tmp_path / 'real' / 'jank')
 	os.symlink(tmp_path / 'real', tmp_path / 'link')
+	real_jank = str(tmp_path / 'real' / 'jank')
 	write_fstab(str(tmp_path / 'link' / 'jank'))
-	assert rv.vault_disk_problem(str(tmp_path / 'link' / 'jank' / 'v')) is None
+	for vault in (tmp_path / 'link' / 'jank' / 'v', tmp_path / 'real' / 'jank' / 'v'):
+		assert rv.vault_disk_problem(str(vault)) == not_mounted(real_jank)
+	fake_pool.add_mount(real_jank)
+	for vault in (tmp_path / 'link' / 'jank' / 'v', tmp_path / 'real' / 'jank' / 'v'):
+		assert rv.vault_disk_problem(str(vault)) is None
+
+
+def test_an_fstab_mount_point_that_is_a_symlink_is_checked_by_its_real_path(tmp_path, fake_pool):
+	os.makedirs(tmp_path / 'disk')
+	os.symlink(tmp_path / 'disk', tmp_path / 'jank')
+	disk = str(tmp_path / 'disk')
+	write_fstab(str(tmp_path / 'jank'))
+	assert rv.vault_disk_problem(str(tmp_path / 'jank' / 'v')) == not_mounted(disk)
+	assert rv.vault_disk_problem(str(tmp_path / 'disk' / 'v')) == not_mounted(disk)
+	fake_pool.add_mount(disk)
+	assert rv.vault_disk_problem(str(tmp_path / 'jank' / 'v')) is None
+	assert rv.vault_disk_problem(str(tmp_path / 'disk' / 'v')) is None
+
+
+def test_an_fstab_escape_above_octal_377_is_masked_to_a_byte():
+	# libmount reads \500 as '@' (0x140 & 0xff); one such line must not break the others
+	assert rv.parse_fstab(b'/dev/a /mnt/a\\500b xfs defaults\n/dev/b /mnt/c\\777d xfs defaults\n/dev/c /mnt/ok xfs defaults\n') \
+		== ['/mnt/a@b', os.fsdecode(b'/mnt/c\xffd'), '/mnt/ok']
+	table = rv.parse_mount_table(b'22 1 8:1 / /mnt/x\\500y rw - ext4 /dev/sda1 rw\n')
+	assert table[0][0] == '/mnt/x@y'
+
+
+def test_a_leading_double_slash_in_an_fstab_mount_point_reads_as_one(tmp_path):
+	assert rv.parse_fstab(b'/dev/a //mnt/a xfs defaults\n/dev/b ///mnt/b/ xfs defaults\n') == ['/mnt/a', '/mnt/b']
 
 
 def test_a_pool_missing_a_disk_is_not_there(tmp_path, fake_pool):
