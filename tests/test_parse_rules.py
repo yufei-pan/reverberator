@@ -333,7 +333,7 @@ def test_parse_rules_never_rewrites_a_row_whose_name_collides(job):
 def test_rewrite_rule_rows_keeps_other_lines_byte_for_byte(tmp_path):
 	path = tmp_path / 'rule.tsv'
 	path.write_bytes(b'head\tx\r\n# comment\t\r\nA\t1\r\n\r\nB\t2\r\nA\t3\r\nlast\t9')
-	rv.rewrite_rule_rows(str(path), {'A': ['a', '7']})
+	rv.rewrite_rule_rows(str(path), {'A': {0: 'a', 1: '7'}})
 	assert path.read_bytes() == b'head\tx\r\n# comment\t\r\n\r\nB\t2\r\na\t7\r\nlast\t9'
 
 
@@ -417,25 +417,28 @@ def test_rule_file_header_is_the_whole_header_when_the_file_has_no_known_prefix(
 	assert rv.rule_file_header(str(tmp_path / 'missing.tsv')) == rv.REVERB_RULE_TSV_HEADER
 
 
-@pytest.mark.parametrize('text, seconds', [('1d', 86400), ('1h30m', 5400), ('90', 90), ('1.5h', 5400), (' 2M 5S ', 125)])
+@pytest.mark.parametrize('text, seconds', [('1d', 86400), ('1h30m', 5400), ('90', 90), ('1.5h', 5400), (' 2m 5S ', 125),
+	('1w', 604800), ('2 weeks', 1209600), ('30min', 1800), ('2 hours', 7200), ('1 day', 86400), ('5sec', 5), ('1hr', 3600),
+	('1H30Min', 5400), ('1 h 30 min', 5400), ('3 DAYS', 259200), ('1 minute 1 second', 61), ('2hrs', 7200), ('4 mins', 240)])
 def test_parse_duration(text, seconds):
 	assert rv.parse_duration(text) == seconds
 
 
-@pytest.mark.parametrize('text', ['', ' ', '-5', '+5', 'h', '1w', '12hh', '1d-2h', 'soon', '1e3'])
+@pytest.mark.parametrize('text', ['', ' ', '-5', '+5', 'h', '12hh', '1d-2h', 'soon', '1e3', '1M', '1h30M', '1 30m', '1\u00a02h',
+	'1 5', '1d 2', '1hm', '9' * 400 + 'd', '9' * 400, '1 w d'])
 def test_parse_duration_rejects(text):
 	with pytest.raises(ValueError):
 		rv.parse_duration(text)
 
 
 @pytest.mark.parametrize('cell, seconds', [('', 0), ('0', 0), (' none ', 0), ('OFF', 0), ('auto', 0), ('1d', 86400),
-	('12h', 43200), ('30m', 1800), ('45s', 45), (' 1D ', 86400), ('90', 90), ('1h 30m', 5400), ('1.5h', 5400)])
+	('12h', 43200), ('30m', 1800), ('45s', 45), ('1w', 604800), ('2 hours', 7200), (' 1D ', 86400), ('90', 90), ('1h 30m', 5400), ('1.5h', 5400)])
 def test_full_comparison_interval_cells(cell, seconds, capsys):
 	assert rv.read_full_comparison_interval(cell, 'j') == seconds
 	assert 'Full Comparison Interval' not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize('cell', ['1w', 'soon', '-5', '12hh', 'h', '1d-2h'])
+@pytest.mark.parametrize('cell', ['1M', 'soon', '-5', '12hh', 'h', '1d-2h', '1 30m'])
 def test_a_bad_full_comparison_interval_is_off_with_an_error(cell, capsys):
 	assert rv.read_full_comparison_interval(cell, 'j') == 0
 	out = capsys.readouterr().out
@@ -443,8 +446,53 @@ def test_a_bad_full_comparison_interval_is_off_with_an_error(cell, capsys):
 
 
 @pytest.mark.parametrize('cell, links, error', [('', 40, False), ('auto', 40, False), ('40', 40, False), (' 20 ', 20, False),
-	('0', 0, False), ('None', 0, False), ('3', 3, False), ('2', 3, True), ('1', 3, True), ('-4', 3, True), ('x', 40, True),
+	('0', 0, False), ('00', 0, False), (' 00 ', 0, False), ('-0', 0, False), ('None', 0, False), ('3', 3, False), ('2', 3, True), ('1', 3, True), ('-4', 3, True), ('x', 40, True),
 	('20.5', 40, True)])
 def test_chain_length_cells(cell, links, error, capsys):
 	assert rv.read_chain_length(cell, 'j') == links
 	assert ('Chain Length' in capsys.readouterr().out) == error
+
+
+def _defaults_file(job, header, defaults, *rows):
+	_rule_file(job, header, '\t'.join(defaults), *rows)
+
+
+def test_a_row_written_back_does_not_freeze_the_defaults_rows_new_columns(job):
+	_defaults_file(job, HEADER_14, ['#_defaults_#'] + [''] * 11 + ['1d', '20'], rule_row(job, min_snapshot='auto'))
+	rule, = rv.parse_rules(job.rule_path)
+	assert (rule.full_comparison_interval, rule.chain_length) == ('1d', '20')
+	row = open(job.rule_path).read().splitlines()[2].split('\t')
+	assert row[4] == str(rv.DEFAULT_SNAPSHOT_DELAY) and len(row) == 12
+	# the defaults row changes, and the job follows it
+	_defaults_file(job, HEADER_14, ['#_defaults_#'] + [''] * 11 + ['2d', '30'], *open(job.rule_path).read().splitlines()[2:])
+	rule, = rv.parse_rules(job.rule_path)
+	assert (rule.full_comparison_interval, rule.chain_length) == ('2d', '30')
+
+
+def test_a_row_written_back_does_not_freeze_the_defaults_rows_vault_path(job):
+	row = rule_row(job, min_snapshot='auto')
+	row[2] = ''
+	_defaults_file(job, HEADER_12, ['#_defaults_#', '', job.vault], '\t'.join(row))
+	rule, = rv.parse_rules(job.rule_path)
+	assert rule.vault_path == job.vault
+	written = open(job.rule_path).read().splitlines()[2].split('\t')
+	assert written[2] == '' and written[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
+
+
+def test_a_row_longer_than_14_cells_keeps_its_extra_cells_when_written_back(job):
+	_rule_file(job, HEADER_14, rule_row(job, min_snapshot='auto') + ['', '', 'note one', 'note two'])
+	rv.parse_rules(job.rule_path)
+	row = open(job.rule_path).read().splitlines()[1].split('\t')
+	assert len(row) == 16 and row[4] == str(rv.DEFAULT_SNAPSHOT_DELAY) and row[14:] == ['note one', 'note two']
+
+
+def test_a_job_name_written_with_a_leading_space_is_matched_when_written_back(job, capsys):
+	row = rule_row(job, min_snapshot='auto')
+	row[0] = ' ' + row[0]
+	_rule_file(job, HEADER_12, row)
+	rv.parse_rules(job.rule_path)
+	written = open(job.rule_path).read().splitlines()[1].split('\t')
+	assert written[0] == job.job_name and written[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
+	capsys.readouterr()
+	rv.parse_rules(job.rule_path)
+	assert 'dirty Job Name' not in capsys.readouterr().out
