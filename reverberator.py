@@ -7396,6 +7396,16 @@ class VaultManifest:
 		self.conn.execute('INSERT OR REPLACE INTO entries(path, dirty, copy_version) VALUES (?, ?, (SELECT copy_version FROM entries WHERE path = ?))',
 			(path, int(dirty), path))
 
+	def mark_vouched(self, rel:str):
+		'''
+		Mark the file row rel dirty and keep its record: the replay synced an attribute change onto the end of its chain, and
+		the record vouches for what is there, so the commit takes its hash and unchecked flag from the record
+		(take_dirty_records()) and reads only the new metadata. A dirty row that has a record is one the replay vouched
+		for: any later add(), move_file() or move_tree() for rel wipes the record by itself. A folder, or an untracked rel,
+		is left alone.
+		'''
+		self.conn.execute("UPDATE entries SET dirty = 1 WHERE path = ? AND kind = 'f'", (storable_name(rel),))
+
 	def discard(self, rel:str):
 		self.conn.execute('DELETE FROM entries WHERE path = ?', (storable_name(rel),))
 
@@ -7469,9 +7479,15 @@ class VaultManifest:
 	def take_dirty(self, limit:int) -> list:
 		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty LIMIT ?', (limit,))]
 
-	def take_dirty_copy_versions(self, limit:int) -> list:
-		'''take_dirty(), each rel with its copy version, as (rel, copy version or None).'''
-		return [(stored_name(rel), copy_version) for rel, copy_version in self.conn.execute('SELECT path, copy_version FROM entries WHERE dirty LIMIT ?', (limit,))]
+	def take_dirty_records(self, limit:int) -> list:
+		'''take_dirty(), each rel with its copy version and record, as (rel, copy version or None, record or None): the record is kept only for a row mark_vouched() marked.'''
+		rows = []
+		for rel, copy_version, *fields in self.conn.execute('SELECT path, copy_version, kind, size, mtime_ns, mode, uid, gid, hash, link, unchecked FROM entries WHERE dirty LIMIT ?', (limit,)):
+			record = None if fields[0] is None else ManifestRecord(*fields)
+			if record is not None and record.link is not None:
+				record = record._replace(link=stored_name(record.link))
+			rows.append((stored_name(rel), copy_version, record))
+		return rows
 
 	def copy_version(self, rel:str):
 		'''The number of the version that holds the copy of the file rel (set_copy_version()), None when not known or not tracked.'''
@@ -8738,15 +8754,17 @@ def recopy_size(rels:list, job_vault:str, latest_version_path:str, moves:'VaultM
 			total += end.st.st_size
 	return total
 
-def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None):
+def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None, known:'ManifestRecord' = None):
 	'''
 	Record what version_path holds at rel, following the links that chain an unchanged entry back to its copy, each
 	told by the moves of its version (moves, a VaultMoves for the pass; one reading the manifest's record when None).
 	copy_version, for the version the manifest describes, is the number its row gives for the version holding the copy
 	(VaultManifest.copy_version()): the links above that version are followed by their text, whatever the moves say,
 	and the entry there is the end, as chain_end() has it; so an entry this version copied (copy_version its own
-	number) is read as it is, a user's link as the link. Returns None when there is nothing readable there, or a link
-	there cannot be looked at (UncheckedVaultLink).
+	number) is read as it is, a user's link as the link. known, the row's record when the replay vouched for it, spares
+	the read of the data: a file at the end of the chain with known's size and mtime is recorded with known's hash and
+	unchecked flag, and its new mode and owner. Returns None when there is nothing readable there, or a link there
+	cannot be looked at (UncheckedVaultLink).
 	'''
 	entry = os.path.abspath(os.path.join(version_path, rel))
 	try:
@@ -8787,19 +8805,26 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 				return ManifestRecord('l', None, None, st.st_mode, st.st_uid, st.st_gid, None, target, 0)
 			entry = resolved
 		kind = entry_kind(st.st_mode)
+		if kind == 'f' and known is not None and known.kind == 'f' and (st.st_size, st.st_mtime_ns) == (known.size, known.mtime_ns):
+			return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, known.hash, None, known.unchecked)
 		file_hash = hash_file(entry, st.st_size) if kind == 'f' else None
 		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 0)
 	except (OSError, UncheckedVaultLink):
 		return None
 
-def read_copied_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None):
+def read_copied_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None, known:'ManifestRecord' = None):
 	'''
 	read_vault_record() for an entry a backup just wrote: its file is still unchecked, as it was read from memory. One
 	whose copy_version is this version's own number, a copy this backup made, is read as it is, never followed: a
-	user's link copied is recorded as the link, with its text.
+	user's link copied is recorded as the link, with its text. A file read from known (read_vault_record()) keeps the
+	record as read: it is the copy known describes, which is checked or not as known says.
 	'''
-	record = read_vault_record(version_path, rel, monitor_path, moves, copy_version)
-	return record._replace(unchecked=1) if record is not None and record.kind == 'f' else record
+	record = read_vault_record(version_path, rel, monitor_path, moves, copy_version, known)
+	if record is None or record.kind != 'f':
+		return record
+	if known is not None and known.kind == 'f' and (record.size, record.mtime_ns) == (known.size, known.mtime_ns):
+		return record
+	return record._replace(unchecked=1)
 
 def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:str, applied:VersionMoves = None):
 	'''
@@ -8811,10 +8836,10 @@ def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:
 		applied=applied)
 	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
 		while GREEN_LIGHT.is_set():
-			rows = manifest.take_dirty_copy_versions(MANIFEST_BATCH_SIZE)
+			rows = manifest.take_dirty_records(MANIFEST_BATCH_SIZE)
 			if not rows:
 				return
-			manifest.set_records(zip((rel for rel, _ in rows), pool.map(lambda row: read_copied_record(version_path, row[0], monitor_path, moves, row[1]), rows)))
+			manifest.set_records(zip((rel for rel, _, _ in rows), pool.map(lambda row: read_copied_record(version_path, row[0], monitor_path, moves, row[1], row[2]), rows)))
 
 def count_batch(pool, batch:list, allocated, total_bytes:int, inodes:int) -> tuple:
 	for blocks in pool.map(allocated, batch):
@@ -10840,7 +10865,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					# the row's record first, which reads the monitored file only: the replay reads the copy's tail, on the
 					# vault's disks, only for a record that does not vouch ( a moved row never does, nor a file whose mtime
 					# moved from the recorded one: an mmap write moves only the mtime, so the file is copied and not synced )
-					if isinstance(end,str) and (record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end) or same_contents(event_source_real_path,end)):
+					vouched = isinstance(end,str) and record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end)
+					if vouched or isinstance(end,str) and same_contents(event_source_real_path,end):
 						# we just copy the file metadata
 						copy_file_meta(event_source_real_path,end,unsynced)
 					elif only_sync_attributes and not isinstance(end,str):
@@ -10850,7 +10876,11 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						# with other contents at the end of the chain ( a swap the collapse could not replay left the link
 						# there ), the metadata would be another file's: the file is copied as it is, as without only_sync_attributes
 						cp_af_copy_path(source_path=event_source_real_path,dest_path=file_vault_target_path,mcae=mcae,pending=pending)
-					manifest.add(event_relative_path,dirty=True)
+					if vouched:
+						# the commit records it from the record's hash, reading no data from the vault
+						manifest.mark_vouched(event_relative_path)
+					else:
+						manifest.add(event_relative_path,dirty=True)
 			elif event_values.event == 'move':
 				link_source_relative_path = os.path.relpath(event_values.source_path,monitor_path)
 				link_target_relative_path = event_relative_path
