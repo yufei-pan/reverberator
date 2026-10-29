@@ -72,7 +72,10 @@ deletes: it replays right after the last move (in the collapse's order, which is
 under it, and before any later move or create whose destination lies at or under it; every other delete keeps today's
 place at the front. The replay waits for that delete's `rm` before the next entry that touches its path (as the delete
 barrier does today for the front group). Where a later entry must come before it and an earlier move must come after it
-(no such order exists), today's order stands and Goal 2's warning covers the rename. Tests: the case above (a file, a
+(no such order exists), today's order stands and Goal 2's warning covers the rename. That includes a move made after
+the delete that lands on, or leaves, a folder above the delete's path and replays at or before its anchor: it changes
+what the delete's path names (`rm -r d; mv x d; mv d/s/g y`, the deploy shape `rm -rf site; mv site.new site; mv
+site/assets/x elsewhere`), so the delete stays at the front (found by Task 1b's review). Tests: the case above (a file, a
 folder moved out, several files moved out, the folder remade and refilled after), each with and without the
 verification, asserting no fallback line, the version equals the tree and the moved-out files keep their links; the
 existing ordering tests and doctests keep passing; the review's random replay set (scratchpad r13/review-t1) shows no
