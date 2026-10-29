@@ -154,7 +154,7 @@ def test_a_stop_with_the_vault_path_not_a_folder_writes_nothing_and_says_so(job,
 def test_a_stop_with_the_vault_under_an_unmounted_fstab_mount_writes_no_pending_file(job, fake_pool, lines):
 	write_fstab(job.vault)
 	rv.persist_pending_transactions(job.job_name, job.vault, _queue(job))
-	assert not os.path.lexists(job.job_vault) and any('is not ready' in line for line in lines)
+	assert not os.path.lexists(job.job_vault) and any('is not ready: ' in line for line in lines)
 	fake_pool.add_mount(job.vault)
 	rv.persist_pending_transactions(job.job_name, job.vault, _queue(job))
 	assert os.path.isfile(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
@@ -173,9 +173,13 @@ def test_a_stop_with_the_vault_pool_dead_writes_no_pending_file(job, fake_pool, 
 	fake_pool.unreadable(job.vault, errno.ENOTCONN)
 	rv.persist_pending_transactions(job.job_name, job.vault, _queue(job))
 	assert not os.path.lexists(job.job_vault)
+	assert [line for line in lines if 'is not ready: ' in line and 'Transport endpoint is not connected' in line]
 
 
-def test_a_failed_jobs_queue_follows_the_same_rule(job, lines):
-	vault = os.path.join(job.root, 'gone')
-	rv.persist_failed_job_queue(job.job_name, job.monitor, vault, _queue(job), threading.Lock())
-	assert not os.path.lexists(vault)
+def test_a_failed_jobs_queue_follows_the_same_rule(job, fake_pool, lines):
+	# a bare vault folder under an unmounted fstab mount: a failed job's queue is a full scan request alone
+	os.makedirs(job.vault, exist_ok=True)
+	write_fstab(job.vault)
+	rv.persist_failed_job_queue(job.job_name, job.monitor, job.vault, _queue(job), threading.Lock())
+	assert not os.path.lexists(job.job_vault)
+	assert [line for line in lines if line.startswith(f'Not saving a full comparison request: vault path {job.vault} is not ready: ')]
