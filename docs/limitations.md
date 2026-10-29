@@ -328,40 +328,31 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** such restarts are frequent.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
-### Writes under a vault that is not mounted
+### An older pending file replayed after a stop dropped changes
 
-- **Kind:** deferred (round 12), already before 0.47.
-- **What the operator sees:** with the vault's pool unmounted, a reverberator start creates the Vault Path folder (when
-  it is missing) under the bare mount point on the root disk, and a stop with queued changes creates the job's vault
-  folder there and writes its pending file. Both are hidden once the pool mounts; nothing is lost, as the next start
-  compares the whole tree. A new rule row whose Vault File System Signature is auto, added while its pool is unmounted,
-  records the root disk's signature: once the pool mounts, that job waits on the wrong disk (the FAILED: waiting alert
-  repeats) until the cell is set back to auto.
-- **Why:** the start creates a missing vault path, and the stop persists pending changes, without checking that the
-  vault's pool or signature is there.
-- **Revisit when:** round 12: never create or write into a vault path whose pool or signature is not ready; keep queued
-  changes as a full-comparison request instead; fill an auto signature only when the vault path is on a mounted pool or
-  disk, never from a folder just created.
-- **Approved:** 2026-10-28, the user's choice "Defer to round 12 (Recommended)", and the same for the auto signature
-  ("Defer to round 12 (Recommended)").
+- **Kind:** known limitation.
+- **What the operator sees:** a stop while the job's vault path is not a folder, or its disk is not there, writes no
+  pending file: the queued changes are dropped with one warning line, as the next start compares the whole tree. A
+  pending file already in the job vault, saved by an earlier stop while the vault was there and not loaded since because
+  no start got past the vault wait, stays. A later start may replay it (its resume check passes when nothing in the
+  monitored tree has an mtime newer than the file), and the dropped changes are then missed until the next full
+  comparison, as changes made while the daemon is down would be. A replayed batch is followed by a whole-tree
+  comparison, which caught them in testing.
+- **Why:** the stop cannot remove the old file from a vault that is not there, and the start that finds it cannot tell it
+  from a current one; the case needs a stop with changes queued while the vault was there, a start that never got past
+  the vault wait, and a second stop with changes queued.
+- **Revisit when:** missed changes are seen after such stops.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
-### A chmod reads each file's vault copy once at commit
+### A vouched chmod keeps a checked copy checked
 
-- **Kind:** deferred (round 12), already before 0.47.
-- **What the operator sees:** a chmod or chown that keeps the mtime reads each file's last 64 KiB from the vault disks
-  once when the batch commits, even when its record already vouches for the copy: a chmod -R or chown -R over panruixin
-  (~223k files) costs ~223k random reads on the HDD pool, minutes to tens of minutes.
-- **Why:** the commit records each changed row by hashing its chain end.
-- **Revisit when:** round 12: keep the record's hash when it vouches for the copy, so an attribute-only change reads
-  nothing from the vault.
-- **Approved:** 2026-10-28, the user's choice "Defer to round 12 (Recommended)".
-
-### A delete whose rm fails leaves the entry in the version
-
-- **Kind:** deferred (round 12), already before 0.47.
-- **What the operator sees:** if removing an entry from a new version fails without failing the disk (EACCES, EBUSY),
-  that version keeps a file its database no longer lists: no comparison can see it, a later delete of it is ignored,
-  and restoring that version brings the deleted file back.
-- **Why:** the replay's delete does not check its rm's result.
-- **Revisit when:** round 12: check each rm's result and fail the batch (handed back and retried) when one fails.
-- **Approved:** 2026-10-28, the user's choice "Defer to round 12 (Recommended)".
+- **Kind:** known limitation.
+- **What the operator sees:** under Only Sync Attributes, after a chmod or chown whose record vouches for the vault copy,
+  the copy stays recorded checked, and no comparison syncs or reads it back. If a power loss or a metadata write error
+  loses the copy's new mode or owner in the seconds after the commit, the vault keeps the old mode or owner while its
+  record says the new one, until the file next changes, and restores give the old mode or owner. The data is
+  unaffected; folders and symlinks already worked this way.
+- **Why:** marking such copies unchecked would make the next full comparison read each one back, the vault reads this round
+  removed for a chmod or chown over a large tree, for a loss confined to a few seconds after a commit.
+- **Revisit when:** a restore is seen giving an old mode or owner after a power loss or a write error.
+- **Approved:** 2026-10-28, the user's choice "Keep checked, known limitation (Recommended)".
