@@ -1,5 +1,6 @@
 import errno
 import os
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -478,3 +479,54 @@ def test_stopped_copies_lose_their_partial_files_by_default(job):
 	mcae = rv.multiCMD.AsyncExecutor(semaphore=rv.BACKUP_SEMAPHORE, quiet=True)
 	rv.stop_copies(mcae, pending, version)
 	assert pending == [] and not os.path.lexists(temp)
+
+
+def _failing_rm(monkeypatch, job, rel, remove=False):
+	'''The rm of the version's rel runs a stand-in that fails as rm does (after removing the entry, with remove).'''
+	real = rv.multiCMD.AsyncExecutor.run_command
+	script = ('rm -rf -- "$1"; ' if remove else '') + 'echo "rm: cannot remove \'$1\': Operation not permitted" >&2; exit 1'
+	def run_command(self, command, *args, **kwargs):
+		if list(command[:1]) == ['rm'] and command[-1].startswith(job.job_vault + '/') and command[-1].endswith('/' + rel):
+			command = ['sh', '-c', script, 'sh', command[-1]]
+		return real(self, command, *args, **kwargs)
+	monkeypatch.setattr(rv.multiCMD.AsyncExecutor, 'run_command', run_command)
+
+
+@pytest.mark.parametrize('rel, tree', [('b.txt', {'b.txt': 'b'}), ('d', {'d/x': 'x'})])
+def test_a_delete_whose_rm_fails_fails_the_batch_and_commits_nothing(job, poll_fast, monkeypatch, rel, tree):
+	seed_monitor(job, {'a.txt': 'a', **tree})
+	_backup(job)[1].close()
+	v0 = committed_versions(job)[0]
+	path = os.path.join(job.monitor, rel)
+	shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+	_failing_rm(monkeypatch, job, rel)
+	entry = path + ('/' if rel == 'd' else '')
+	with pytest.raises(rv.JobFailure) as exc:
+		_backup(job, OrderedDict({entry: rv.BackupEntryValues('t', 'delete', None)}))
+	assert 'Operation not permitted' in exc.value.reason and rel in exc.value.reason and not exc.value.permanent
+	assert committed_versions(job) == [v0]
+	monkeypatch.undo()
+	_backup(job)[1].close()                    # the next attempt compares the whole tree
+	assert not os.path.lexists(os.path.join(committed_versions(job)[-1], rel))
+
+
+def test_a_failed_rm_whose_entry_went_is_no_failure(job, poll_fast, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	_backup(job)[1].close()
+	os.remove(os.path.join(job.monitor, 'b.txt'))
+	_failing_rm(monkeypatch, job, 'b.txt', remove=True)
+	_, manifest, committed = _backup(job, OrderedDict({os.path.join(job.monitor, 'b.txt'): rv.BackupEntryValues('t', 'delete', None)}))
+	manifest.close()
+	assert committed and not os.path.lexists(os.path.join(committed_versions(job)[-1], 'b.txt'))
+
+
+def test_failed_removal_reads_each_rm_task(tmp_path):
+	there = str(tmp_path / 'there')
+	open(there, 'w').write('x')
+	gone = str(tmp_path / 'gone')
+	assert rv.failed_removal([(FakeTask(0), there), (FakeTask(1, ['rm: x']), gone)]) is None
+	removals = [(FakeTask(1, ['  ', "rm: cannot remove 'there': Device or resource busy"]), there)]
+	assert rv.failed_removal(removals) == f"removing {there} from the version failed: rm: cannot remove 'there': Device or resource busy"
+	assert removals == []
+	assert rv.failed_removal([(FakeTask(-1), there)]) == f'removing {there} from the version failed: rm exited with -1'
+	assert rv.failed_removal([(FakeTask(None), there)]) == f'removing {there} from the version failed: rm was stopped before it ran'

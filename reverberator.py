@@ -6652,6 +6652,25 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 		raise failure
 	return copied
 
+def failed_removal(removals:list) -> 'str | None':
+	'''
+	The reason of the first rm of removals, a list of (task, path) pairs of finished tasks, that failed while something
+	is still at its path; None when there is none. A failed rm whose entry is gone is no failure. Empties removals.
+	'''
+	reason = None
+	for task, path in removals:
+		if reason is None and task.returncode != 0 and os.path.lexists(path):
+			lines = [line.strip() for line in task.stderr if line.strip()]
+			if lines:
+				cause = '; '.join(lines)
+			elif task.returncode is None:
+				cause = 'rm was stopped before it ran'
+			else:
+				cause = f'rm exited with {task.returncode}'
+			reason = f'removing {path} from the version failed: {cause}'
+	removals.clear()
+	return reason
+
 def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, discard:bool = True):
 	'''
 	Stop what still runs on mcae, then discard the copies of pending, which will not be finished.
@@ -10685,14 +10704,18 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				backuperTeeLogToTl(path=vault_real_path,error=True,message='Attempting to remove root, skipping')
 			elif os.path.isdir(vault_real_path) and not os.path.islink(vault_real_path):
 				# an entry of another kind in its place is another row's ( a link that replaced the folder ), and stays
-				mcae.run_command(['rm','-rf',vault_real_path])
+				removals.append((mcae.run_command(['rm','-rf',vault_real_path]),vault_real_path))
 			elif os.path.lexists(vault_real_path) and not os.path.islink(vault_real_path):
 				replaced_folder(as_folder_entry(relative_path))
 			# also stops tracking all the files and subfolders in the folder
 			manifest.remove_tree(as_folder_entry(relative_path))
 		else:
-			# we just remove the file
-			mcae.run_command(['rm','-f',vault_real_path])
+			if os.path.isdir(vault_real_path) and not os.path.islink(vault_real_path):
+				# a folder in its place is another row's entry, which rm -f would refuse: only this row goes
+				backuperTeeLogToTl(path=monitor_path,message=f'Dropping the row of {vault_real_path}: a folder is in its place in the version')
+			else:
+				# we just remove the file
+				removals.append((mcae.run_command(['rm','-f',vault_real_path]),vault_real_path))
 			manifest.discard(relative_path)
 	def delete_and_copy(isDir,source_real_path,relative_path,vault_real_path,moved_from_vault_path,moved_from_relative_path,mcae):
 		# a move that cannot be renamed in the version: what its source holds there goes, then the monitored entry is
@@ -10786,8 +10809,12 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			mcae.wait(timeout=POLL_WAIT_SECONDS)
 		if not GREEN_LIGHT.is_set():
 			return []
+		reason = failed_removal(removals)
 		# what was copied takes its place before anything renames, removes or records it
-		return finish_copies(pending,manifest,backup_folder,monitor_path if job_name is None else job_name,reported,unsynced)
+		copied = finish_copies(pending,manifest,backup_folder,monitor_path if job_name is None else job_name,reported,unsynced)
+		if reason is not None:
+			raise JobFailure(reason)
+		return copied
 	def recheck_moved_folder(folder_rel,mcae):
 		# a location-dependent pattern may judge the moved contents differently at the new place
 		under = list(manifest.iter_under(folder_rel))
@@ -11028,6 +11055,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	mcae = None
 	# copies queued on mcae, put in place by each wait for it
 	pending = []
+	# the removals ( task, path ) queued on mcae, checked by each wait for it
+	removals = []
 	try:
 		manifest.begin()
 		if not manifest.describes(latest_version_info.path):
