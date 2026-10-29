@@ -301,8 +301,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation, already before 0.47.
 - **What the operator sees:** when reverberator fills a rule row's auto cells, it writes that row's resolved columns 1-12
-  back, values taken from the #_defaults_# row included (a cleaned-up Job Name or monitored path rewrites the row too),
-  so a later edit of the defaults row no longer reaches that job: edit the job's own row, or clear its cells, to follow
+  back: a blank cell takes its #_defaults_# row value and an auto cell reverberator's own default (a cleaned-up Job Name
+  or monitored path rewrites the row too), so a later edit of the defaults row no longer reaches that job: edit the job's own row, or clear its cells, to follow
   a changed default. Columns 13 and 14 are never written.
 - **Why:** filling in defaults and auto fields is how the rule file records what each job runs with.
 - **Revisit when:** a host relies on editing the defaults row for jobs already started.
@@ -334,15 +334,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** a stop while the job's vault path is not a folder, or its disk is not there, writes no
   pending file: the queued changes are dropped with one warning line, as the next start compares the whole tree. A
   pending file already in the job vault, saved by an earlier stop while the vault was there and not loaded since because
-  no start got past the vault wait, stays. A later start may replay it (its resume check passes when nothing in the
-  monitored tree has an mtime newer than the file), and the dropped changes are then missed until the next full
-  comparison, as changes made while the daemon is down would be. A replayed batch is followed by a whole-tree
-  comparison, which caught them in testing.
+  no start got past the vault wait, stays. A later start replays it only when its resume check passes: the newest mtime
+  in the monitored tree is at least 1 s older than the file, so a dropped content change, create or delete (each moves
+  an mtime) fails the check and the tree is compared in full. What can be missed is an attribute-only change (chmod,
+  chown, an xattr) or one that kept its mtime, and only in the replayed batch's version: the whole-tree comparison that
+  follows every replayed batch, in the same start and from a matched time the replay did not move, puts them in the
+  next version.
 - **Why:** the stop cannot remove the old file from a vault that is not there, and the start that finds it cannot tell it
   from a current one; the case needs a stop with changes queued while the vault was there, a start that never got past
   the vault wait, and a second stop with changes queued.
 - **Revisit when:** missed changes are seen after such stops.
-- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)"; 2026-10-28, on the smaller impact: "Keep
+  it, reworded (Recommended)".
 
 ### A vouched chmod keeps a checked copy checked
 
