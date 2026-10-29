@@ -565,3 +565,65 @@ def test_parse_rules_fills_no_vault_signature_on_a_pool_missing_a_disk(job, fake
 	asked = _asking(monkeypatch)
 	rule, = rv.parse_rules(job.rule_path)
 	assert rule.vault_fs_signature == 'auto' and job.vault not in asked
+
+
+def _write_auto_monitor(job, monitor):
+	row = rule_row(job, mon_fs_signature='auto')
+	row[1] = monitor
+	with open(job.rule_path, 'w') as f:
+		f.write('\t'.join(rv.REVERB_RULE_TSV_HEADER) + '\n' + '\t'.join(row) + '\n')
+
+
+def test_parse_rules_fills_the_monitoring_signature_only_once_its_fstab_mount_is_mounted(job, fake_pool, monkeypatch, capsys):
+	# a bare folder under an unmounted mount point is the root disk's: its signature would never match the disk
+	write_fstab(job.monitor)
+	write_rule(job, mon_fs_signature='auto')
+	asked = _asking(monkeypatch)
+	capsys.readouterr()
+	rule, = rv.parse_rules(job.rule_path)
+	out = capsys.readouterr()
+	text = out.out + out.err
+	assert rule.mon_fs_signature == 'auto' and job.monitor not in asked
+	assert open(job.rule_path).read().splitlines()[1].split('\t')[3] == 'auto'
+	assert text.count(f'Path Monitoring {job.monitor} which is on a disk that is not there') == 1
+	fake_pool.add_mount(job.monitor)
+	rule, = rv.parse_rules(job.rule_path)
+	assert rule.mon_fs_signature == 'fake-uuid'
+
+
+def test_parse_rules_fills_no_monitoring_signature_on_a_pool_missing_a_disk(job, fake_pool, monkeypatch):
+	a, _ = fake_pool.add(job.monitor, ['a', 'b'])
+	fake_pool.drop(a)
+	write_rule(job, mon_fs_signature='auto')
+	asked = _asking(monkeypatch)
+	rule, = rv.parse_rules(job.rule_path)
+	assert rule.mon_fs_signature == 'auto' and job.monitor not in asked
+
+
+def test_parse_rules_keeps_a_file_monitored_path_auto_and_says_the_job_waits(job, monkeypatch, capsys):
+	monitor = os.path.join(job.root, 'a_file')
+	open(monitor, 'w').write('x')
+	_write_auto_monitor(job, monitor)
+	asked = _asking(monkeypatch)
+	capsys.readouterr()
+	rule, = rv.parse_rules(job.rule_path)
+	out = capsys.readouterr()
+	assert rule.mon_fs_signature == 'auto' and monitor not in asked
+	text = out.out + out.err
+	assert 'which is not a folder' in text and 'a folder is there, which the job waits for' in text
+
+
+def test_parse_rules_vault_file_warning_promises_no_folder_made(job, monkeypatch, capsys):
+	vault = os.path.join(job.root, 'a_file')
+	open(vault, 'w').write('x')
+	row = rule_row(job, vault_fs_signature='auto')
+	row[2] = vault
+	with open(job.rule_path, 'w') as f:
+		f.write('\t'.join(rv.REVERB_RULE_TSV_HEADER) + '\n' + '\t'.join(row) + '\n')
+	_asking(monkeypatch)
+	capsys.readouterr()
+	rv.parse_rules(job.rule_path)
+	out = capsys.readouterr()
+	text = out.out + out.err
+	assert f'Vault Path {vault} which is not a folder' in text and 'a folder is there, which the job waits for' in text
+	assert 'has made the folder' not in text
