@@ -6662,9 +6662,10 @@ def failed_removal(removals:list) -> 'str | None':
 		if reason is None and task.returncode != 0 and os.path.lexists(path):
 			lines = [line.strip() for line in task.stderr if line.strip()]
 			if lines:
-				cause = '; '.join(lines)
+				# an rm -rf failing on many entries says so for each: the first is the cause shown
+				cause = lines[0] + (f' (and {len(lines) - 1} more)' if len(lines) > 1 else '')
 			elif task.returncode is None:
-				cause = 'rm was stopped before it ran'
+				cause = 'rm did not run'
 			else:
 				cause = f'rm exited with {task.returncode}'
 			reason = f'removing {path} from the version failed: {cause}'
@@ -9329,6 +9330,7 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 	entry, is not a real folder) cannot be held there: its row is dropped and it is counted as removed, never as missing,
 	as copying it would write through the link.
 	Only what lies in version_path through real folders is looked at or removed, and never version_path itself.
+	An entry that cannot be removed raises JobFailure, as the version would be committed holding what no row names.
 	'''
 	removed = []
 	missing = []
@@ -9399,7 +9401,7 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_dir:bool, found:set, removed:list) -> list:
 	'''
 	sweep_version_folder() for the entry at path, rel in version_path: kept and added to found when it is tracked,
-	removed and appended to removed when not. Returns [(path, rel)] for a folder to look into, else [].
+	removed and appended to removed when not. Returns [(path, rel)] for a folder to look into, else []. Raises JobFailure when the removal fails.
 	'''
 	if manifest.lookup(rel) is not None:
 		found.add(rel)
@@ -9420,7 +9422,8 @@ def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_
 		remove_entry(path)
 	except OSError as e:
 		backuperTeeLogToTl(path=version_path,error=True,message=f'Cannot remove {path}, which the version does not track: {e}')
-		return []
+		# committed, the version would hold what no row names: the batch fails, rolls back and is retried
+		raise JobFailure(f'removing {path} from the version failed: {e}')
 	backuperTeeLogToTl(path=version_path,message=f'Removed {path}, which the version does not track')
 	removed.append(rel)
 	return []
@@ -10702,7 +10705,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			if os.path.abspath(vault_real_path) == '/':
 				# we cannot remove root
 				backuperTeeLogToTl(path=vault_real_path,error=True,message='Attempting to remove root, skipping')
-			elif os.path.isdir(vault_real_path) and not os.path.islink(vault_real_path):
+			elif not os.path.islink(vault_real_path) and os.path.isdir(vault_real_path):
 				# an entry of another kind in its place is another row's ( a link that replaced the folder ), and stays
 				removals.append((mcae.run_command(['rm','-rf',vault_real_path]),vault_real_path))
 			elif os.path.lexists(vault_real_path) and not os.path.islink(vault_real_path):
@@ -10710,9 +10713,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# also stops tracking all the files and subfolders in the folder
 			manifest.remove_tree(as_folder_entry(relative_path))
 		else:
-			if os.path.isdir(vault_real_path) and not os.path.islink(vault_real_path):
-				# a folder in its place is another row's entry, which rm -f would refuse: only this row goes
-				backuperTeeLogToTl(path=monitor_path,message=f'Dropping the row of {vault_real_path}: a folder is in its place in the version')
+			if not os.path.islink(vault_real_path) and os.path.isdir(vault_real_path):
+				# a folder in its place is another row's entry, which rm -f would refuse: only this row goes ( a link is
+				# one lstat, never followed down its chain )
+				backuperTeeLogToTl(path=monitor_path,message=f'Leaving {vault_real_path}: a folder, another row\'s entry, is in its place in the version')
 			else:
 				# we just remove the file
 				removals.append((mcae.run_command(['rm','-f',vault_real_path]),vault_real_path))

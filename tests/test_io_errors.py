@@ -529,4 +529,10 @@ def test_failed_removal_reads_each_rm_task(tmp_path):
 	assert rv.failed_removal(removals) == f"removing {there} from the version failed: rm: cannot remove 'there': Device or resource busy"
 	assert removals == []
 	assert rv.failed_removal([(FakeTask(-1), there)]) == f'removing {there} from the version failed: rm exited with -1'
-	assert rv.failed_removal([(FakeTask(None), there)]) == f'removing {there} from the version failed: rm was stopped before it ran'
+	assert rv.failed_removal([(FakeTask(None), there)]) == f'removing {there} from the version failed: rm did not run'
+
+
+def test_failed_removal_shows_the_first_line_and_counts_the_rest():
+	there = '/'
+	lines = [f"rm: cannot remove 'f{i}': Operation not permitted" for i in range(1000)]
+	assert rv.failed_removal([(FakeTask(1, lines), there)]) == f"removing {there} from the version failed: {lines[0]} (and 999 more)"

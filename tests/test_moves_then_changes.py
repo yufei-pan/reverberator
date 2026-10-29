@@ -1666,9 +1666,26 @@ def test_a_folder_in_a_file_rows_place_drops_the_row_and_commits(job, logged, mo
 		return done
 	monkeypatch.setattr(rv, 'do_referenced_copy', with_a_folder_at_x)
 	verified(job, (False, 'delete', 'x', None))                 # commits: run_backup asserts it
-	assert any('a folder is in its place in the version' in line for line in logged)
+	assert any("a folder, another row's entry, is in its place in the version" in line for line in logged)
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		assert manifest.lookup('x') is None and manifest.lookup('x/') is None
 	finally:
 		manifest.close()
+	# the version and the verification agree: nothing of x is left in the committed version
+	assert not os.path.lexists(os.path.join(latest_version(job).path, 'x'))
+
+
+def test_a_deleted_files_chain_link_is_never_followed_by_the_folder_check(job, logged, monkeypatch):
+	seed_monitor(job, {'x': 'x', 'keep': 'k'})
+	run_backup(job)
+	os.remove(f'{job.monitor}/x')
+	followed = []
+	real_isdir, real_stat = os.path.isdir, os.stat
+	def isdir(path):
+		if str(path).endswith('/x') and os.path.islink(path):
+			followed.append(path)
+		return real_isdir(path)
+	monkeypatch.setattr(os.path, 'isdir', isdir)
+	verified(job, (False, 'delete', 'x', None))
+	assert followed == []
