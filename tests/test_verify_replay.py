@@ -1711,3 +1711,39 @@ def test_a_version_folder_already_there_fails_the_attempt(job, monkeypatch, firs
 def event_entry_for(job, rel, event):
 	from tests.harness import event_entry
 	return event_entry(job, rel, event)
+
+
+
+def test_a_sweep_removal_that_fails_fails_the_batch_and_the_retry_commits(job, monkeypatch):
+	import errno
+	from tests.test_io_errors import committed_versions
+	seed_monitor(job, {'keep.txt': 'k', 'b.txt': 'b'})
+	run_backup(job)
+	v0 = committed_versions(job)[0]
+	os.remove(os.path.join(job.monitor, 'b.txt'))
+	spec = [('delete', 'b.txt', None, False)]
+	def entries():
+		events = raw_events(job, spec)
+		return rv.change_events_to_backup_entries(deque(events), job.monitor), rv.touched_scopes(events, job.monitor)
+	real_run, real_remove = rv.multiCMD.AsyncExecutor.run_command, rv.remove_entry
+	def run_command(self, command, *args, **kwargs):
+		if list(command[:1]) == ['rm'] and command[-1].endswith('/b.txt'):
+			command = ['true']      # the rm succeeds and leaves the entry: only the sweep finds it
+		return real_run(self, command, *args, **kwargs)
+	def remove_entry(path):
+		if path.endswith('/b.txt'):
+			raise PermissionError(errno.EPERM, os.strerror(errno.EPERM), path)
+		return real_remove(path)
+	with monkeypatch.context() as m:
+		m.setattr(rv.multiCMD.AsyncExecutor, 'run_command', run_command)
+		m.setattr(rv, 'remove_entry', remove_entry)
+		batch, touched = entries()
+		with pytest.raises(rv.JobFailure) as exc:
+			run_backup(job, batch, touched=touched)
+	assert 'b.txt' in exc.value.reason and 'Operation not permitted' in exc.value.reason
+	assert committed_versions(job) == [v0]
+	with monkeypatch.context() as m:
+		m.setattr(rv.multiCMD.AsyncExecutor, 'run_command', run_command)
+		batch, touched = entries()
+		run_backup(job, batch, touched=touched)
+	assert not os.path.lexists(os.path.join(committed_versions(job)[-1], 'b.txt'))
