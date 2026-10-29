@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -317,7 +318,7 @@ def test_a_vault_wait_waits_for_its_fstab_mount_with_the_marker(job, fake_pool, 
 	flag.set()
 	results = []
 	thread = threading.Thread(target=lambda: results.append(rv.wait_for_path(control, flag, job.vault,
-		'vault filesystem not ready', vault=True)), daemon=True)
+		'vault filesystem not ready')), daemon=True)
 	thread.start()
 	try:
 		wait_until(lambda: _marker(job.vault, _not_mounted(job.vault)) in output(), timeout=5, message='no waiting marker')
@@ -329,12 +330,77 @@ def test_a_vault_wait_waits_for_its_fstab_mount_with_the_marker(job, fake_pool, 
 		_stop(control, thread)
 
 
-def test_a_monitored_path_wait_does_not_read_fstab(job, fake_pool, poll_fast):
+def test_a_monitored_path_wait_waits_for_its_fstab_mount_with_the_marker(job, fake_pool, grace, output):
+	# 0.47 and the first 0.48 build pinned the opposite: a monitored wait read no fstab
 	write_fstab(job.monitor)
 	control = _control(job)
 	flag = threading.Event()
 	flag.set()
-	assert rv.wait_for_path(control, flag, job.monitor, 'monitored filesystem not ready') is True
+	results = []
+	thread = threading.Thread(target=lambda: results.append(rv.wait_for_path(control, flag, job.monitor,
+		'monitored filesystem not ready')), daemon=True)
+	thread.start()
+	try:
+		wait_until(lambda: _marker(job.monitor, _not_mounted(job.monitor)) in output(), timeout=5, message='no waiting marker')
+		assert thread.is_alive()
+		fake_pool.add_mount(job.monitor)
+		thread.join(timeout=5)
+		assert results == [True] and _goes_on(job.monitor) in output()
+	finally:
+		_stop(control, thread)
+
+
+def test_a_file_at_the_waited_path_is_named_in_the_marker(job, fake_pool, grace, output):
+	path = os.path.join(job.root, 'a_file')
+	open(path, 'w').write('x')
+	control = _control(job)
+	flag = threading.Event()
+	flag.set()
+	thread = threading.Thread(target=rv.wait_for_path, args=(control, flag, path, 'vault filesystem not ready'), daemon=True)
+	thread.start()
+	try:
+		wait_until(lambda: _marker(path, f'{path} is not a folder') in output(), timeout=5, message='no waiting marker')
+	finally:
+		_stop(control, thread)
+	assert open(path).read() == 'x'
+
+
+def test_a_monitored_path_under_an_unmounted_fstab_mount_commits_nothing_until_mounted(job, fake_pool, grace, output):
+	# the unmounted disk's bare folder is empty: backing it up would commit every file deleted
+	write_fstab(job.monitor)
+	seed_monitor(job, {'a.txt': 'a'})
+	control = _control(job)
+	thread = _run_backuper(job, control)
+	try:
+		wait_until(lambda: _marker(job.monitor, _not_mounted(job.monitor)) in output(), timeout=5, message='no waiting marker')
+		time.sleep(0.3)
+		assert committed_versions(job) == []
+		fake_pool.add_mount(job.monitor)
+		wait_for_committed_count(job, 1)
+		assert os.path.exists(os.path.join(latest_version(job).path, 'a.txt'))
+	finally:
+		_stop(control, thread)
+
+
+def test_a_bare_vault_folder_hidden_by_its_mount_is_replaced_by_one_made_on_the_disk(job, tmp_path, fake_pool, grace, output):
+	# a 0.47 leftover (or mkdir -p before mounting) shows the vault path, while the disk mounted over it has no such folder
+	jank = str(tmp_path / 'jank')
+	vault = os.path.join(jank, 'reverbs')
+	os.makedirs(vault)
+	job = job._replace(vault=vault, job_vault=os.path.join(vault, job.job_name))
+	write_fstab(jank)
+	seed_monitor(job, {'a.txt': 'a'})
+	control = _control(job)
+	thread = _run_backuper(job, control)
+	try:
+		wait_until(lambda: _marker(vault, _not_mounted(jank)) in output(), timeout=5, message='no waiting marker')
+		# the mount hides the bare folder; the disk holds no reverbs
+		shutil.rmtree(vault)
+		fake_pool.add_mount(jank)
+		wait_for_committed_count(job, 1, timeout=10)
+		assert os.path.isdir(vault)
+	finally:
+		_stop(control, thread)
 
 
 def test_the_start_makes_a_missing_vault_path_once_its_fstab_mount_is_mounted(job, tmp_path, fake_pool, grace, output, monkeypatch):

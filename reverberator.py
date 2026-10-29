@@ -1221,14 +1221,14 @@ COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir','wds'],defaults=((
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
 
-def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic, vault:bool = False, create:bool = False) -> bool:
+def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic, create:bool = False) -> bool:
 	'''
 	Wait until the disk holding path is there, flag is set and path is a directory. Returns False when the job (with
 	job None, GREEN_LIGHT) says stop. The disk is checked live on every poll, as the flag can lag behind it, and the
-	wait's reason is its problem while there is one, else what. A monitored path's wait (vault False) needs no disk of
-	a mergerfs pool holding it missing (pool_problem()); a vault wait needs its fstab mount mounted too
-	(vault_disk_problem()). flag None: no signature flag, the wait ends once the disk is there and path is a folder.
-	create (with vault): once the disk is there and nothing is at path, it is made (os.makedirs), so never under a bare
+	wait's reason is its problem while there is one, else what. Every wait, a monitored path's as well as the vault's,
+	needs the disk holding path there (vault_disk_problem()): no fstab mount at or above path unmounted, no disk of a
+	mergerfs pool holding it missing. flag None: no signature flag, the wait ends once the disk is there and path is a
+	folder. create: once the disk is there and nothing is at path, it is made (os.makedirs), so never under a bare
 	mount point; a path that cannot be made raises JobFailure.
 	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS, and once the wait
 	it alerted for ends, one line saying the job goes on. Of the job's waits for one path, only the oldest alerts
@@ -1241,7 +1241,7 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 	alerted = False
 	try:
 		while running():
-			reason = vault_disk_problem(path) if vault else pool_problem(path)
+			reason = vault_disk_problem(path)
 			if reason is None and create and not os.path.lexists(path):
 				try:
 					os.makedirs(path, exist_ok=True)
@@ -1252,7 +1252,8 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 					if alerted:
 						tl.teeok(cut_line(shown(f'reverberator job {job.job_name} goes on: {path} is ready again after {int((clock() - started) // 60)} min')))
 					return True
-				reason = what
+				# a file (anything not a folder) at path is not waited out by the flag: say what it is
+				reason = f'{path} is not a folder' if os.path.lexists(path) and not os.path.isdir(path) else what
 			if job is not None:
 				if token is None:
 					token = job.begin_wait(path, reason)
@@ -1266,8 +1267,8 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 					alerted = True
 					next_alert = now + DISK_WAIT_REPEAT_SECONDS
 			if flag is None or flag.is_set():
-				# the filesystem is ready but the path is not there yet, or a disk of its pool is out, so the flag cannot
-				# end the wait
+				# no flag, or the flag is set while the wait goes on: the path is not a folder yet, an fstab mount at or
+				# above it is not mounted, or a disk of its pool is out, so the flag cannot end the wait
 				time.sleep(POLL_WAIT_SECONDS)
 			else:
 				flag.wait(POLL_WAIT_SECONDS)
@@ -2255,6 +2256,19 @@ def rule_file_header(rule_file:str) -> list:
 			return header
 	return REVERB_RULE_TSV_HEADER
 
+def signature_folder_problem(path:str) -> 'tuple | None':
+	'''
+	Why an auto file system signature cannot be looked up from path yet, as (what is wrong, what a start waits for), None
+	when path is a folder whose disk is there. The signature of a bare folder under an unmounted mount point would be the
+	root disk's.
+	'''
+	if not os.path.lexists(path):
+		return 'does not exist yet', 'the folder is there'
+	if not os.path.isdir(path):
+		return 'is not a folder', 'a folder is there, which the job waits for'
+	problem = vault_disk_problem(path)
+	return None if problem is None else (f'is on a disk that is not there: {problem}', 'the disk is there')
+
 def parse_rules(rule_file:str, read_only:bool = False):
 	'''
 	Parse the rule file using TSVZ and fill in the defaults and auto fields
@@ -2353,14 +2367,20 @@ def parse_rules(rule_file:str, read_only:bool = False):
 		if not mon_path_exists or read_only:
 			pass
 		elif not inRule["mon_fs_signature"] or inRule["mon_fs_signature"].lower() == 'auto':
-			signatures = get_fs_signatures(inRule["mon_path"])
-			if signatures and signatures[0]:
-				inRule["mon_fs_signature"] = signatures[0]
-				tl.teelog(log_text(f'Auto filled Monitoring File System Signature for {ruleName}: {inRule["mon_fs_signature"]}'),level='info')
-				ruleUpdated = True
-			else:
-				tl.teelog(log_text(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...'),level='warning')
+			# only from a folder whose disk is there: a bare folder under an unmounted mount point is the root disk's
+			why = signature_folder_problem(inRule["mon_path"])
+			if why is not None:
+				tl.teelog(log_text(f'Warning: Rule {ruleName} has Path Monitoring {inRule["mon_path"]} which {why[0]}: its Monitoring File System Signature stays auto until a start after {why[1]}'),level='warning')
 				inRule["mon_fs_signature"] = 'auto'
+			else:
+				signatures = get_fs_signatures(inRule["mon_path"])
+				if signatures and signatures[0]:
+					inRule["mon_fs_signature"] = signatures[0]
+					tl.teelog(log_text(f'Auto filled Monitoring File System Signature for {ruleName}: {inRule["mon_fs_signature"]}'),level='info')
+					ruleUpdated = True
+				else:
+					tl.teelog(log_text(f'Warning: Rule {ruleName} failed to get the fs signature, disabling fs monitoring for this run...'),level='warning')
+					inRule["mon_fs_signature"] = 'auto'
 		# min_shapshot_time
 		if not inRule["min_shapshot_time"] or inRule["min_shapshot_time"].lower() == 'none':
 			inRule["min_shapshot_time"] = '0'
@@ -2409,15 +2429,9 @@ def parse_rules(rule_file:str, read_only:bool = False):
 		elif not inRule["vault_fs_signature"] or inRule["vault_fs_signature"].lower() == 'auto':
 			vault_path = inRule["vault_path"]
 			# no folder is made here: the job's start makes it once its disk is there
-			if not os.path.lexists(vault_path):
-				why = 'does not exist yet'
-			elif not os.path.isdir(vault_path):
-				why = 'is not a folder'
-			else:
-				problem = vault_disk_problem(vault_path)
-				why = None if problem is None else f'is on a disk that is not there: {problem}'
+			why = signature_folder_problem(vault_path)
 			if why is not None:
-				tl.teelog(log_text(f'Warning: Rule {ruleName} has Vault Path {vault_path} which {why}: its Vault File System Signature stays auto until a start after the job has made the folder'),level='warning')
+				tl.teelog(log_text(f'Warning: Rule {ruleName} has Vault Path {vault_path} which {why[0]}: its Vault File System Signature stays auto until a start after {why[1]}'),level='warning')
 				inRule["vault_fs_signature"] = 'auto'
 			else:
 				signatures = get_fs_signatures(vault_path)
@@ -4430,12 +4444,12 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		scopes = touched_scopes(batch, monitor_path)
 		return scopes if scopes.subtrees or scopes.paths else None
 	try:
-		if not os.path.lexists(vault_path):
-			# made once its disk is there, never under a bare mount point; registered after, so the signature monitor checks the new folder at once
-			if not wait_for_path(job, None, vault_path, 'vault path not made yet', vault=True, create=True):
-				return
+		# made once its disk is there, never under a bare mount point (a bare folder there is not the disk's, so this
+		# runs even for a path that shows); registered after, so the signature monitor checks the new folder at once
+		if not wait_for_path(job, None, vault_path, 'vault path not made yet', create=True):
+			return
 		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
-		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready', vault=True)
+		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
 		# the vault is scanned before the monitored path is waited for (the scan only reads the vault): what a killed
 		# copy left in it goes now, though the path may be long in coming back. a scan that fails fails the attempt
 		job_vault = os.path.join(vault_path,job_name)
@@ -4513,7 +4527,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		vaultInfo = None
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while running():
-			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready', vault=True)
+			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
 			if not running():
 				break
 			# a disk of the monitored pool out would show its files as deleted: the batch waits for it too
@@ -4584,7 +4598,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				while running() and not to_process_flag.is_set() and not comparison_due():
 					# an idle job waits, with its marker, while a filesystem it needs is not ready, as a pool missing a disk
 					if not vault_fs_flag.is_set():
-						wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready', vault=True)
+						wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
 					elif not monitor_fs_flag.is_set():
 						wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 					else:
