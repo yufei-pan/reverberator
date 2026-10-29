@@ -1651,3 +1651,24 @@ def test_a_delete_of_a_tracked_symlink_is_kept(job, logged):
 	os.unlink(os.path.join(job.monitor, 'ln'))
 	version = verified(job, (False, 'delete', 'ln', None))
 	assert not os.path.lexists(os.path.join(version, 'ln')) and not any('Dropped' in line for line in logged)
+
+
+def test_a_folder_in_a_file_rows_place_drops_the_row_and_commits(job, logged, monkeypatch):
+	seed_monitor(job, {'x': 'x', 'keep': 'k'})
+	run_backup(job)
+	os.remove(f'{job.monitor}/x')
+	real = rv.do_referenced_copy
+	def with_a_folder_at_x(*args, **kwargs):
+		done = real(*args, **kwargs)
+		place = os.path.join(kwargs['backup_folder'], 'x')
+		os.remove(place)
+		os.mkdir(place)
+		return done
+	monkeypatch.setattr(rv, 'do_referenced_copy', with_a_folder_at_x)
+	verified(job, (False, 'delete', 'x', None))                 # commits: run_backup asserts it
+	assert any('a folder is in its place in the version' in line for line in logged)
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		assert manifest.lookup('x') is None and manifest.lookup('x/') is None
+	finally:
+		manifest.close()
