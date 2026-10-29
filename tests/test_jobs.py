@@ -6,7 +6,7 @@ from collections import OrderedDict
 import pytest
 import reverberator as rv
 import signal
-from tests.harness import seed_monitor, wait_until, committed_versions, create_job, rule_row, write_rule, wait_for_committed_count
+from tests.harness import seed_monitor, wait_until, committed_versions, create_job, rule_row, write_rule, wait_for_committed_count, write_fstab
 from tests.test_log_text import alerting_lines
 
 pytestmark = pytest.mark.unit
@@ -594,6 +594,37 @@ def test_monitor_gate_looks_up_a_path_as_soon_as_it_appears(tmp_path, monkeypatc
 		control.fail('stop')
 		thread.join(timeout=1)
 		rv.FS_SIGNATURE_MONITOR.unregister(path, gate.signature, gate.flag)
+
+
+def test_monitor_gate_looks_up_no_signature_from_a_bare_folder_under_an_unmounted_fstab_mount(tmp_path, fake_pool, monkeypatch, poll_fast):
+	# an app writes into the bare mount point while the disk is out: that folder's signature is the root disk's
+	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.1)
+	disk = str(tmp_path / 'disk')
+	path = os.path.join(disk, 'data')
+	os.makedirs(disk)
+	write_fstab(disk)
+	asked = []
+	monkeypatch.setattr(rv, 'get_fs_signatures', lambda p: asked.append(p) or ['ROOT-UUID'])
+	gate = rv.MonitorGate(path, threading.Event(), 'auto')
+	control = rv.JobControl('j')
+	control.start_attempt()
+	result = []
+	thread = threading.Thread(target=lambda: result.append(gate.resolve(control)), daemon=True)
+	thread.start()
+	try:
+		time.sleep(0.2)
+		os.makedirs(path)
+		time.sleep(0.5)
+		assert thread.is_alive() and asked == [] and not gate.resolved
+		# mounted: the folder is the disk's (the mount shows its own data folder)
+		fake_pool.add_mount(disk)
+		thread.join(timeout=3)
+		assert result == [True] and asked == [path] and gate.signature == 'ROOT-UUID'
+	finally:
+		control.fail('stop')
+		thread.join(timeout=1)
+		if gate.resolved:
+			rv.FS_SIGNATURE_MONITOR.unregister(path, gate.signature, gate.flag)
 
 
 def test_invalidate_during_a_running_check_keeps_the_flag_clear(tmp_path, monkeypatch):

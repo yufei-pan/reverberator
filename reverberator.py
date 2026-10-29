@@ -1432,7 +1432,9 @@ class MonitorGate:
 		token = None
 		try:
 			while job.should_run():
-				present = os.path.isdir(self.path)
+				# a folder whose disk is there: a bare folder under an unmounted mount point would give the root disk's signature
+				problem = signature_folder_problem(self.path)
+				present = problem is None
 				if not present:
 					looked_up_at = None
 				elif looked_up_at is None or time.monotonic() - looked_up_at >= FS_RECHECK_SECONDS:
@@ -1441,7 +1443,12 @@ class MonitorGate:
 					if signatures and signatures[0]:
 						signature = signatures[0]
 						break
-				what = 'monitored filesystem signature unknown' if present else 'monitored path not there yet'
+				if present:
+					what = 'monitored filesystem signature unknown'
+				elif not os.path.lexists(self.path):
+					what = 'monitored path not there yet'
+				else:
+					what = f'{self.path} {problem[0]}'
 				if token is None:
 					token = job.begin_wait(self.path, what)
 				else:
@@ -4530,7 +4537,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
 			if not running():
 				break
-			# a disk of the monitored pool out would show its files as deleted: the batch waits for it too
+			# an unmounted fstab mount at or above the monitored path, or a disk of its pool out, would show its files as deleted: the batch waits for it too
 			wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 			if not running():
 				break
