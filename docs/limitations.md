@@ -373,9 +373,42 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   unmounted when reverberator stops gets the job's pending file on the bare mount point, and one that is unmounted when
   it starts gets its Vault Path made there. Both are hidden once the disk mounts, and nothing is lost: the next start
   compares the whole tree. But a start that made the folder there then waits with "vault filesystem not ready" until a
-  restart, when the disk mounts without that folder.
+  restart, when the disk mounts without that folder. With an N/A or auto Vault File System Signature and such a disk
+  unmounted at start, the job backs up into the bare folder on the disk below until the disk mounts: those versions are
+  hidden then and use that disk's space, and an auto signature filled from such a folder is the disk below's. This is
+  the same as in 0.47.
 - **Why:** such mounts are not known to reverberator without reading systemd units or autofs maps, and checking the
   signature at a stop runs df and lsblk, which can block on a hung disk.
 - **Revisit when:** a host keeps a vault on such a disk.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)"; then "Fold into that entry
-  (Recommended)" for the start.
+  (Recommended)" for the start; 2026-10-29, on the signature case: "Widen it (Recommended)".
+
+### A disk mounted by hand under an unmounted fstab mount point waits
+
+- **Kind:** known limitation.
+- **What the operator sees:** while an fstab mount point is not mounted, a disk mounted some other way below it (by hand,
+  by a systemd .mount unit) does not count as there. A vault or monitored path on it waits with the FAILED: waiting
+  marker naming the fstab point. Put the disk in /etc/fstab, or mount the fstab point first.
+- **Why:** the mount table cannot tell a disk from a bind mount of a root-disk folder or a tmpfs, and those must not
+  count: a vault could land on the root disk or in RAM.
+- **Revisit when:** a host mounts a vault or monitored disk that way.
+- **Approved:** 2026-10-29, the user's choice "Revert it, known limitation (Recommended)".
+
+### A rename in a rename-heavy batch can fail and log a traceback
+
+- **Kind:** deferred, to round 13.
+- **What the operator sees:** in a batch where a file is moved into a folder that is then renamed, and the file is moved
+  again, the replay's rename can fail with FileNotFoundError. It logs "Failed to move" with a traceback at error level,
+  falls back to delete and copy, and the versions come out right. It is the same in 0.47.
+- **Why:** the replay order loses the move's source; the fallback keeps the result right, so it is not fixed in this
+  round.
+- **Revisit when:** round 13: find the replay order that loses the move's source.
+- **Approved:** 2026-10-29, the user's choice "Defer to round 13 (Recommended)".
+
+### Repeated job names in the rule file
+
+- **Kind:** deferred, to round 13.
+- **What the operator sees:** a rule file may list a job name twice; the later row wins with no warning.
+- **Why:** the warning is a new check at the start that no round 12 change needs.
+- **Revisit when:** round 13: one warning per repeated name at start, naming the row that wins.
+- **Approved:** 2026-10-29, the user's choice "Warn in round 13 (Recommended)".
