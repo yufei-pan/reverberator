@@ -4904,17 +4904,23 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		# replaced ( rm e/*; mv d e ), and gives way
 		return entry_when[path] <= bound or backup_entries[path].event == 'move'
 	def moved_away(path, bound):
-		# whether a move out of path, or of a folder above it, came after the event at hand and before the move that
-		# brought an entry there when bound was ( echo new > f; mv d/g y; mv f d/g ): that move took what the version
-		# held there away
+		# whether a move the replay still makes took what the version holds at path away: the first of what the events
+		# after the event at hand and before the move that brought an entry to path when bound was did to path, or to a
+		# folder above it, is a move out, and it is still a move ( echo new > f; mv d/g y; mv f d/g ). a delete there
+		# would remove what it needs. a delete or a move onto it first ( mv g a; mv a D ), or a move made a copy, did not
+		first = None
 		key = path
 		while key and bound is not None:
-			entries = later.get(key) or []
-			if any(to is not None for _, to in entries[bisect.bisect_left(entries, (bound + 1,)):]):
-				return True
+			entries = later.get(key)
+			# appended as when grows: the last is the soonest after the event at hand
+			if entries and entries[-1][0] > bound and (first is None or entries[-1][0] > first[0]):
+				first = (entries[-1][0], entries[-1][1], key)
 			key = key.rstrip('/').rpartition('/')[0]
 			key = key and key + '/'
-		return False
+		if first is None or first[1] is None:
+			return False
+		dest = moveSourceToDestDict.get(first[2])
+		return dest in backup_entries and backup_entries[dest].event == 'move' and backup_entries[dest].source_path == first[2]
 	when = 0
 	for changeEvent in reversed(change_events):
 		# get the absolute path
@@ -5081,7 +5087,13 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					if now_at is None:
 						# removed after the moves carried it ( mv d e; rm -r e ): nothing of it is copied, and what the version
 						# holds at its key goes. the key stays taken, so no earlier event of the path is replayed either
-						backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,'delete',None)
+						if not moved_away(moveDest, entry_when.get(moveDest)):
+							backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,'delete',None)
+						else:
+							# unless a move the replay still makes took that away before the copy came ( mv d/g y; mv f d/g;
+							# mv d D; rm D/g ): its delete would remove what that move needs. what came to the path after
+							# that move is not in the version, and what was there before goes with it
+							del backup_entries[moveDest]
 					elif now_at != moveDest or dropped_own:
 						# it lands after the moves that carried it, even back at its own key ( mv f d/g; mv d D; mv D/g h; mv h D/g; mv D d )
 						escalated = backup_entries.pop(moveDest)

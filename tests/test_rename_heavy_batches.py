@@ -153,10 +153,37 @@ CASES = {
 	'back_to_first_destination_in_another_folder': ({'e/': None, 'E/D/': None},
 		[('w', 'e/g', 'new\n'), ('mv', 'e/g', 'e/d'), ('mv', 'e', 'E/g'), ('mv', 'E/g/d', 'E/D/d'), ('mv', 'E/D', 'e')],
 		[(False, 'create', 'e/g', None), (False, 'move', 'e/d', 'e/g'), (True, 'move', 'E/g', 'e'), (False, 'move', 'E/D/d', 'E/g/d'), (True, 'move', 'e', 'E/D')]),
+	# the same editor's save, then the copy removed after a folder move carried it; and with the older file's folder moved
+	# away before the copy came, and with the folder moved before the save
+	'backup_save_then_folder_moved_then_removed': ({'d/g': 'OLD\n'},
+		[('w', 'f', 'new\n'), ('mv', 'd/g', 'y'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('rm', 'D/g')],
+		[(False, 'create', 'f', None), (False, 'move', 'y', 'd/g'), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'delete', 'D/g', None)]),
+	'older_folder_out_then_removed': ({'d/g': 'OLD\n'},
+		[('w', 'f', 'new\n'), ('mv', 'd', 'e'), ('mkdir', 'd'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('rm', 'D/g')],
+		[(False, 'create', 'f', None), (True, 'move', 'e', 'd'), (True, 'create', 'd', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'delete', 'D/g', None)]),
+	'folder_moved_then_backup_save_then_removed': ({'d/g': 'OLD\n'},
+		[('mv', 'd', 'D'), ('w', 'f', 'new\n'), ('mv', 'D/g', 'y'), ('mv', 'f', 'D/g'), ('rm', 'D/g')],
+		[(True, 'move', 'D', 'd'), (False, 'create', 'f', None), (False, 'move', 'y', 'D/g'), (False, 'move', 'D/g', 'f'), (False, 'delete', 'D/g', None)]),
+	# the new file overwritten after the version's file at its first destination was replaced and then moved out ( mv g a;
+	# mv a D ), or moved out by a chain the save made a copy of: nothing renames the version's file, so its delete stays
+	'replaced_then_moved_out_then_overwritten': ({'g': 'seed g\n', 'a': 'seed a\n', 'b': 'seed b\n'},
+		[('w', 'g', 'save 1\n'), ('chmod', 'b'), ('mkdir', 'd'), ('w', 'h', 'new 5\n'), ('mv', 'g', 'a'), ('mv', 'a', 'D'), ('mv', 'h', 'a'), ('mv', 'D', 'a'),
+		('mv', 'a', 'g'), ('w', 'b', 'save 14\n'), ('mv', 'g', 'd/g')],
+		[(False, 'modify', 'g', None), (False, 'attrib', 'b', None), (True, 'create', 'd', None), (False, 'create', 'h', None), (False, 'move', 'a', 'g'),
+		(False, 'move', 'D', 'a'), (False, 'move', 'a', 'h'), (False, 'move', 'a', 'D'), (False, 'move', 'g', 'a'), (False, 'modify', 'b', None),
+		(False, 'move', 'd/g', 'g')]),
+	'saved_moved_out_then_overwritten': ({'g': 'seed g\n', 'h': 'seed h\n', 'a': 'seed a\n'},
+		[('w', 'd', 'new 2\n'), ('w', 'a', 'save 3\n'), ('mv', 'a', 'D'), ('rm', 'h'), ('chmod', 'g'), ('rm', 'g'), ('mv', 'd', 'a'), ('w', 'e', 'new 10\n'),
+		('mv', 'D', 'a'), ('mv', 'a', 'b'), ('mv', 'e', 'E')],
+		[(False, 'create', 'd', None), (False, 'modify', 'a', None), (False, 'move', 'D', 'a'), (False, 'delete', 'h', None), (False, 'attrib', 'g', None),
+		(False, 'delete', 'g', None), (False, 'move', 'a', 'd'), (False, 'create', 'e', None), (False, 'move', 'a', 'D'), (False, 'move', 'b', 'a'),
+		(False, 'move', 'E', 'e')]),
 }
 # where the older file of those cases is in the end: its own move keeps its chain link
 OLDER_MOVED_AWAY = {'backup_save_then_folder_moves': 'y', 'older_folder_out_after_create': 'e/g', 'older_out_between_chain': 'y',
-	'older_folder_out_between_chain': 'e/g'}
+	'older_folder_out_between_chain': 'e/g', 'backup_save_then_folder_moved_then_removed': 'y', 'older_folder_out_then_removed': 'e/g',
+	'folder_moved_then_backup_save_then_removed': 'y'}
 # without the verification these keep the version's older file under a move onto it then removed ( mv q a; rm a ), left open
 BARE_DIFFERS = {'move_onto_then_rm', 'moved_onto_first'}
 
