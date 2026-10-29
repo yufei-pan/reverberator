@@ -8830,7 +8830,9 @@ def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:
 	'''
 	Record what version_path, the version this backup is writing, holds for the rows it wrote, reading them on a
 	compare pool, each by its copy version (read_copied_record()): the links of the version by applied, the moves its
-	replay applied (by their text alone when None), those of the committed versions below by their moves.
+	replay applied (by their text alone when None), those of the committed versions below by their moves. A row the replay
+	vouched for (VaultManifest.mark_vouched()) is recorded from its kept record without reading the copy's data, and keeps
+	that record's unchecked flag, so a checked copy stays checked (its new metadata is read from the chain end).
 	'''
 	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path,
 		applied=applied)
@@ -10866,7 +10868,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					# vault's disks, only for a record that does not vouch ( a moved row never does, nor a file whose mtime
 					# moved from the recorded one: an mmap write moves only the mtime, so the file is copied and not synced )
 					vouched = isinstance(end,str) and record_vouches(manifest.lookup(event_relative_path),event_source_real_path,end)
-					if vouched or isinstance(end,str) and same_contents(event_source_real_path,end):
+					if vouched or (isinstance(end,str) and same_contents(event_source_real_path,end)):
 						# we just copy the file metadata
 						copy_file_meta(event_source_real_path,end,unsynced)
 					elif only_sync_attributes and not isinstance(end,str):
