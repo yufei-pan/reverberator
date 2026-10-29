@@ -3882,8 +3882,8 @@ def fstab_mount_points(mount_table:list) -> list:
 def vault_disk_problem(path:str) -> 'str | None':
 	'''
 	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
-	point at or above the path is not mounted (a bare folder left under it is not that disk) unless the mount table has
-	a mount point deeper than it, at or above the path (a disk mounted some other way), when the mount table cannot be
+	point at or above the path is not mounted (a bare folder left under it is not that disk, and neither is anything
+	mounted below it: the mount table cannot tell a disk from a bind mount or a tmpfs), when the mount table cannot be
 	read, or when a mergerfs pool holding the path has a disk missing (pool_problem()'s text). path need not exist.
 	'''
 	try:
@@ -3894,7 +3894,7 @@ def vault_disk_problem(path:str) -> 'str | None':
 	above = [mount_point for mount_point in fstab_mount_points(mount_table) if real == mount_point or real.startswith(mount_point + '/')]
 	if above:
 		longest = max(above, key=len)
-		if not any(point == longest or (point.startswith(longest + '/') and (real == point or real.startswith(point + '/'))) for point, _ in mount_table):
+		if not any(point == longest for point, _ in mount_table):
 			return f'{longest} is not mounted ({FSTAB_PATH} names it)'
 	return pool_problem(path, mount_table=mount_table)
 
