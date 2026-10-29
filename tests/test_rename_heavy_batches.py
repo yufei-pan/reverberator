@@ -1,7 +1,9 @@
 # Batches where a file made or saved in the batch is moved into a folder, the folder is moved, and the file is moved on
 # again: the collapse copies it where it ends, so the replay never renames a path the version does not hold.
+import errno
 import os
 import pytest
+import reverberator as rv
 from tests.harness import seed_monitor, run_backup
 from tests.test_moves_then_changes import BAD_LINES, batch, logged, verified, assert_version_is_the_tree  # noqa: F401
 
@@ -14,6 +16,11 @@ def fallbacks(lines:list) -> list:
 	'''The first line of each logged line of an error, a traceback, or a rename or copy that found nothing.'''
 	return [line.splitlines()[0] for line in lines if line.startswith('ERROR ') or
 		any(word in line for word in ('Traceback', NOT_IN_VERSION, 'Not tracking', 'Cannot read', *BAD_LINES))]
+
+
+def warned(lines:list) -> list:
+	'''The first line of each logged line of a rename that found nothing and was copied instead.'''
+	return [line.splitlines()[0] for line in lines if NOT_IN_VERSION in line]
 
 
 def apply(monitor:str, steps:list) -> None:
@@ -395,5 +402,86 @@ def test_a_delete_under_a_folder_moved_after_it_stays_at_the_front(job, logged, 
 	events = [(False, 'move', 't', 'd/s/g'), (False, 'delete', 'd/s/h', None), (True, 'delete', 'd/s', None), (True, 'move', 'D', 'd'),
 		(False, 'move', 'y', 't')]
 	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
+	assert len(warned(logged)) == 1 and fallbacks(logged) == warned(logged)       # the rename of the chain merge finds nothing
 	assert_version_is_the_tree(job, v)
 	assert os.path.islink(os.path.join(v, 'D/k'))
+
+
+@pytest.mark.parametrize('is_dir', [False, True], ids=['file', 'folder'])
+@pytest.mark.parametrize('moved_on', [False, True], ids=['stays', 'moved_on'])
+def test_a_move_whose_source_never_reached_the_version_is_copied(job, logged, is_dir, moved_on):
+	# a live race: batch 1's create of sub/x finds nothing, as x moved on before its copy ran; batch 2 moves it
+	seed_monitor(job, {'sub/': None, 'd/': None})
+	run_backup(job)
+	if is_dir:
+		apply(job.monitor, [('mkdir', 'sub/x'), ('w', 'sub/x/in', 'in\n')])
+	else:
+		apply(job.monitor, [('w', 'sub/x', 'new\n')])
+	apply(job.monitor, [('mv', 'sub/x', 'd/y')] + ([('mv', 'd', 'D')] if moved_on else []))
+	del logged[:]
+	verified(job, (is_dir, 'create', 'sub/x', None))
+	del logged[:]
+	v2 = verified(job, (is_dir, 'move', 'd/y', 'sub/x'), *([(True, 'move', 'D', 'd')] if moved_on else []))
+	assert len(warned(logged)) == 1
+	assert fallbacks(logged) == warned(logged)          # no traceback, no ERROR line: no Not tracking, no Cannot read
+	assert_version_is_the_tree(job, v2)
+
+
+WARNED_ONCE = {
+	# a move into, or out of, a folder the version holds elsewhere (a folder made in the batch, a chain merged across a
+	# folder move), and the approved entry of docs/limitations.md
+	'mkdir_then_mv_into_then_folder_moved': ({'old': 'old\n'}, [('mkdir', 'x'), ('mv', 'old', 'x/f'), ('mv', 'x', 'y')],
+		[(True, 'create', 'x', None), (False, 'move', 'x/f', 'old'), (True, 'move', 'y', 'x')]),
+	'chain_merge_across_a_folder_move': ({'a/f': 'f\n', 'a/k': 'k\n'}, [('mv', 'a/f', 'g'), ('mv', 'a', 'A'), ('mv', 'g', 'h')],
+		[(False, 'move', 'g', 'a/f'), (True, 'move', 'A', 'a'), (False, 'move', 'h', 'g')]),
+	'chain_merge_across_a_folder_move_then_moved_on_again': ({'a/f': 'f\n', 'a/k': 'k\n', 'e/': None},
+		[('mv', 'a/f', 'g'), ('mv', 'a', 'A'), ('mv', 'g', 'e/h'), ('mv', 'e', 'E')],
+		[(False, 'move', 'g', 'a/f'), (True, 'move', 'A', 'a'), (False, 'move', 'e/h', 'g'), (True, 'move', 'E', 'e')]),
+	'approved_entry_mv_d_e_mkdir_e_sub_mv_x_e_sub_x': ({'d/': None, 'x': 'x\n'},
+		[('mv', 'd', 'e'), ('mkdir', 'e/sub'), ('mv', 'x', 'e/sub/x')],
+		[(True, 'move', 'e', 'd'), (True, 'create', 'e/sub', None), (False, 'move', 'e/sub/x', 'x')]),
+}
+
+
+@pytest.mark.parametrize('name', sorted(WARNED_ONCE))
+def test_a_move_into_or_out_of_a_folder_the_version_has_elsewhere_is_copied_with_one_warning(job, logged, name):
+	seed, steps, events = WARNED_ONCE[name]
+	seed_monitor(job, seed)
+	run_backup(job)
+	apply(job.monitor, steps)
+	del logged[:]
+	v = verified(job, *events)
+	assert len(warned(logged)) == 1 and fallbacks(logged) == warned(logged)
+	assert_version_is_the_tree(job, v)
+
+
+def test_a_folder_made_in_the_batch_with_an_old_file_and_a_new_one(job, logged):
+	# the folder is copied whole (Task 1); the old file's move into it finds nothing, and warns once
+	seed_monitor(job, {'d/': None, 'old': 'old\n'})
+	run_backup(job)
+	apply(job.monitor, [('mkdir', 'x'), ('w', 'x/n', 'n\n'), ('mv', 'old', 'x/o'), ('mv', 'x', 'd/x'), ('mv', 'd', 'D'), ('mv', 'D/x', 'h')])
+	del logged[:]
+	v = verified(job, (True, 'create', 'x', None), (False, 'create', 'x/n', None), (False, 'move', 'x/o', 'old'), (True, 'move', 'd/x', 'x'),
+		(True, 'move', 'D', 'd'), (True, 'move', 'h', 'D/x'))
+	assert len(warned(logged)) == 1 and fallbacks(logged) == warned(logged)
+	assert_version_is_the_tree(job, v)
+
+
+@pytest.mark.parametrize('error', ['permission', 'not_the_renames'])
+def test_any_other_rename_error_keeps_the_traceback(job, logged, monkeypatch, error):
+	seed_monitor(job, {'f': 'f\n'})
+	run_backup(job)
+	apply(job.monitor, [('mv', 'f', 'h')])
+	real_rename = os.rename
+	def rename(src, dst, *args, **kwargs):
+		if str(dst).endswith(os.sep + 'h'):
+			if error == 'permission':
+				raise PermissionError(errno.EACCES, 'refused', src, None, dst)
+			raise FileNotFoundError(errno.ENOENT, 'gone')
+		return real_rename(src, dst, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'rename', rename)
+	del logged[:]
+	v = verified(job, (False, 'move', 'h', 'f'))
+	assert any(l.startswith('ERROR Failed to move') for l in logged) and any('Traceback' in l for l in logged)
+	assert 'Doing delete & copy instead' in logged and not warned(logged)
+	assert open(os.path.join(v, 'h')).read() == 'f\n'

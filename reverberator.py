@@ -11120,14 +11120,33 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					# its own target is copied now, by a folder above it too ( copy_untracked_folder() )
 					move_targets.discard(event_relative_path + ('/' if isDir else ''))
 					delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
-				except Exception as _:
-					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
-					import traceback
-					backuperTeeLogToTl(path=monitor_path,error=True,message=traceback.format_exc())
-					backuperTeeLogToTl(path=monitor_path,message='Doing delete & copy instead')
-					move_targets.discard(event_relative_path + ('/' if isDir else ''))
-					# if we fail to move, we just copy the file
-					delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
+				except Exception as e:
+					if isinstance(e,FileNotFoundError) and e.filename2 == link_target_backup_real_path:
+						# the rename's own error ( only os.rename sets filename2 ): its source or the folder it goes into is
+						# not in the version, as the batch's collapse cannot tell ( a copy a live move outran, or a folder
+						# the version holds elsewhere ). nothing is wrong, so no traceback
+						backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: '
+							'its source or the folder it goes into is not in the version; copying it instead')
+						move_targets.discard(event_relative_path + ('/' if isDir else ''))
+						if os.path.lexists(event_source_real_path):
+							delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
+						else:
+							# moved on again in the batch: the place the rename would have emptied is emptied, and the rows
+							# move_tree / move_file put at the target go, or a later folder move carries them and the
+							# verification cannot read them. a later entry, or the verification, copies it where it ends
+							delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,relative_path=link_source_relative_path,mcae=mcae)
+							if isDir:
+								manifest.remove_tree(as_folder_entry(link_target_relative_path))
+							else:
+								manifest.discard(link_target_relative_path)
+					else:
+						backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
+						import traceback
+						backuperTeeLogToTl(path=monitor_path,error=True,message=traceback.format_exc())
+						backuperTeeLogToTl(path=monitor_path,message='Doing delete & copy instead')
+						move_targets.discard(event_relative_path + ('/' if isDir else ''))
+						# if we fail to move, we just copy the file
+						delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
 				# the copy fallback keeps the rows move_tree moved too, so both ways need the re-check
 				if isDir and skip_list is not None and skip_list.location_dependent:
 					recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
