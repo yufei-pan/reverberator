@@ -132,7 +132,31 @@ CASES = {
 	'older_at_end_path': ({'d/': None, 'h': 'OLDH\n', 'k': 'K\n'},
 		[('w', 'f', 'new\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('mv', 'h', 'k'), ('mv', 'D/g', 'h')],
 		[(False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'k', 'h'), (False, 'move', 'h', 'D/g')]),
+	# the older file at d/g, or its folder, moved away after the new file was made and before it took the name: an
+	# editor's save with a backup, then the folder moved and the file out; and the same through a chain ( f -> x -> d/g )
+	'backup_save_then_folder_moves': ({'d/g': 'OLD\n'},
+		[('w', 'f', 'new\n'), ('mv', 'd/g', 'y'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('mv', 'D/g', 'h')],
+		[(False, 'create', 'f', None), (False, 'move', 'y', 'd/g'), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')]),
+	'older_folder_out_after_create': ({'d/g': 'OLD\n'},
+		[('w', 'f', 'new\n'), ('mv', 'd', 'e'), ('mkdir', 'd'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('mv', 'D/g', 'h')],
+		[(False, 'create', 'f', None), (True, 'move', 'e', 'd'), (True, 'create', 'd', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'move', 'h', 'D/g')]),
+	'older_out_between_chain': ({'d/g': 'OLD\n'},
+		[('w', 'f', 'new\n'), ('mv', 'f', 'x'), ('mv', 'd/g', 'y'), ('mv', 'x', 'd/g'), ('mv', 'd', 'D'), ('mv', 'D/g', 'h')],
+		[(False, 'create', 'f', None), (False, 'move', 'x', 'f'), (False, 'move', 'y', 'd/g'), (False, 'move', 'd/g', 'x'), (True, 'move', 'D', 'd'),
+		(False, 'move', 'h', 'D/g')]),
+	'older_folder_out_between_chain': ({'d/g': 'OLD\n'},
+		[('w', 'f', 'new\n'), ('mv', 'f', 'x'), ('mv', 'd', 'e'), ('mkdir', 'd'), ('mv', 'x', 'd/g'), ('mv', 'd', 'D'), ('mv', 'D/g', 'h')],
+		[(False, 'create', 'f', None), (False, 'move', 'x', 'f'), (True, 'move', 'e', 'd'), (True, 'create', 'd', None), (False, 'move', 'd/g', 'x'),
+		(True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')]),
+	# moved on and back to its first destination, which another folder took in the meantime
+	'back_to_first_destination_in_another_folder': ({'e/': None, 'E/D/': None},
+		[('w', 'e/g', 'new\n'), ('mv', 'e/g', 'e/d'), ('mv', 'e', 'E/g'), ('mv', 'E/g/d', 'E/D/d'), ('mv', 'E/D', 'e')],
+		[(False, 'create', 'e/g', None), (False, 'move', 'e/d', 'e/g'), (True, 'move', 'E/g', 'e'), (False, 'move', 'E/D/d', 'E/g/d'), (True, 'move', 'e', 'E/D')]),
 }
+# where the older file of those cases is in the end: its own move keeps its chain link
+OLDER_MOVED_AWAY = {'backup_save_then_folder_moves': 'y', 'older_folder_out_after_create': 'e/g', 'older_out_between_chain': 'y',
+	'older_folder_out_between_chain': 'e/g'}
 # without the verification these keep the version's older file under a move onto it then removed ( mv q a; rm a ), left open
 BARE_DIFFERS = {'move_onto_then_rm', 'moved_onto_first'}
 
@@ -149,6 +173,8 @@ def test_a_file_made_in_the_batch_moved_through_folder_moves_is_copied_where_it_
 	assert not fallbacks(logged), fallbacks(logged)
 	if with_verification or name not in BARE_DIFFERS:
 		assert_version_is_the_tree(job, v)
+	if name in OLDER_MOVED_AWAY:
+		assert os.path.islink(os.path.join(v, OLDER_MOVED_AWAY[name])) and open(os.path.join(v, OLDER_MOVED_AWAY[name])).read() == 'OLD\n'
 
 
 def test_the_minimal_batch_copies_h_and_leaves_nothing_at_D_g(job, logged):

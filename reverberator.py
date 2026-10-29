@@ -4903,6 +4903,18 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		# which the replay still needs ( mv q F/c0; mv F G; mv D F ). any other entry from before it is of what that move
 		# replaced ( rm e/*; mv d e ), and gives way
 		return entry_when[path] <= bound or backup_entries[path].event == 'move'
+	def moved_away(path, bound):
+		# whether a move out of path, or of a folder above it, came after the event at hand and before the move that
+		# brought an entry there when bound was ( echo new > f; mv d/g y; mv f d/g ): that move took what the version
+		# held there away
+		key = path
+		while key and bound is not None:
+			entries = later.get(key) or []
+			if any(to is not None for _, to in entries[bisect.bisect_left(entries, (bound + 1,)):]):
+				return True
+			key = key.rstrip('/').rpartition('/')[0]
+			key = key and key + '/'
+		return False
 	when = 0
 	for changeEvent in reversed(change_events):
 		# get the absolute path
@@ -4956,7 +4968,9 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 				pendingMoveSourceParents.add(abs_moved_from)
 				# an earlier move takes what the version holds there away ( mv d/g x; echo new > f; mv f d/g; mv d D;
 				# mv D/g h ), so the escalation's delete there would remove what this move still needs
-				for gone in [p for p in escalation_deletes if p == abs_moved_from or (abs_moved_from.endswith('/') and p.startswith(abs_moved_from))]:
+				gone_at = [p for p in escalation_deletes if p.startswith(abs_moved_from)] if abs_moved_from.endswith('/') else \
+					[abs_moved_from] if abs_moved_from in escalation_deletes else []
+				for gone in gone_at:
 					escalation_deletes.discard(gone)
 					if gone in backup_entries and backup_entries[gone].event == 'delete':
 						del backup_entries[gone]
@@ -5064,23 +5078,18 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 							del moveSourceToDestDict[now_at]
 						dropped_own = True
 						now_at, escalated_bound = carried(dest, entry_when.get(dest), True)
-					if now_at is not None and dropped_own:
-						# the copy lands where the entry ends. what the version holds at the first destination ( a file
-						# the move replaced ) goes, as the dropped moves would have taken it away
-						escalated = backup_entries.pop(moveDest)
-						backup_entries[moveDest] = BackupEntryValues(escalated.iso_time,'delete',None)
-						escalation_deletes.add(moveDest)
-						if now_at not in backup_entries or backup_entries[now_at].event == 'attrib' or not stands(now_at, escalated_bound):
-							backup_entries[now_at] = escalated
-							entry_when[now_at] = escalated_bound
-							backup_entries.move_to_end(now_at)
-						moveSourceToDestDict[source_key] = now_at
-					elif now_at is None:
+					if now_at is None:
 						# removed after the moves carried it ( mv d e; rm -r e ): nothing of it is copied, and what the version
 						# holds at its key goes. the key stays taken, so no earlier event of the path is replayed either
 						backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,'delete',None)
-					elif now_at != moveDest:
+					elif now_at != moveDest or dropped_own:
+						# it lands after the moves that carried it, even back at its own key ( mv f d/g; mv d D; mv D/g h; mv h D/g; mv D d )
 						escalated = backup_entries.pop(moveDest)
+						if dropped_own and now_at != moveDest and not moved_away(moveDest, entry_when.get(moveDest)):
+							# what the version holds at the first destination ( a file the move replaced ) goes, as the
+							# dropped moves would have taken it away
+							backup_entries[moveDest] = BackupEntryValues(escalated.iso_time,'delete',None)
+							escalation_deletes.add(moveDest)
 						if now_at not in backup_entries or backup_entries[now_at].event == 'attrib' or not stands(now_at, escalated_bound):
 							backup_entries[now_at] = escalated
 							entry_when[now_at] = escalated_bound
