@@ -322,3 +322,52 @@ def test_the_probe_batch_replays_without_a_rename_fallback(job, logged):
 	assert_version_is_the_tree(job, v)
 	assert open(os.path.join(v, 'empty/mv71.txt')).read() == 'create new49.txt\n'
 	assert not [l for l in logged if 'Failed to move' in l or 'Traceback' in l or NOT_IN_VERSION in l or 'Not tracking mvdir63/mv60.txt' in l]
+
+
+# a folder of the version that a file or folder is moved out of and that is then removed ( mv d/g y; rm -r d ): its
+# delete replays after the moves out of it, so they rename what the version holds there
+EMPTIED = {
+	# name: (seed, steps, the watcher's events of the steps, the moved-out entries that keep their links)
+	'file_out': ({'d/g': 'G\n', 'd/k': 'K\n'}, [('mv', 'd/g', 'y'), ('rm', 'd/k'), ('rmdir', 'd')],
+		[(False, 'move', 'y', 'd/g'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None)], ['y']),
+	'folder_out': ({'d/s/a': 'A\n', 'd/k': 'K\n'}, [('mv', 'd/s', 'z'), ('rm', 'd/k'), ('rmdir', 'd')],
+		[(True, 'move', 'z', 'd/s'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None)], ['z/a']),
+	'several_out': ({'d/g1': 'G1\n', 'd/g2': 'G2\n', 'd/s/a': 'A\n', 'd/k': 'K\n'},
+		[('mv', 'd/g1', 'y1'), ('mv', 'd/s', 'z'), ('mv', 'd/g2', 'y2'), ('rm', 'd/k'), ('rmdir', 'd')],
+		[(False, 'move', 'y1', 'd/g1'), (True, 'move', 'z', 'd/s'), (False, 'move', 'y2', 'd/g2'), (False, 'delete', 'd/k', None),
+		(True, 'delete', 'd', None)], ['y1', 'y2', 'z/a']),
+	'moved_in_then_carried_out': ({'d/s/a': 'A\n', 'd/k': 'K\n', 'e/f': 'F\n'},
+		[('mv', 'e', 'd/s/b'), ('mv', 'd/s', 'z'), ('rm', 'd/k'), ('rmdir', 'd')],
+		[(True, 'move', 'd/s/b', 'e'), (True, 'move', 'z', 'd/s'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None)], ['z/a', 'z/b/f']),
+	'out_of_a_subfolder': ({'d/e/g': 'G\n', 'd/e/k': 'K\n', 'd/k': 'K\n'},
+		[('mv', 'd/e/g', 'y'), ('rm', 'd/e/k'), ('rmdir', 'd/e'), ('rm', 'd/k'), ('rmdir', 'd')],
+		[(False, 'move', 'y', 'd/e/g'), (False, 'delete', 'd/e/k', None), (True, 'delete', 'd/e', None), (False, 'delete', 'd/k', None),
+		(True, 'delete', 'd', None)], ['y']),
+	# the folder remade after: the collapse folds its delete into the folder's create, which keeps these as they were
+	'remade_and_refilled': ({'d/g': 'G\n', 'd/k': 'K\n'},
+		[('mv', 'd/g', 'y'), ('rm', 'd/k'), ('rmdir', 'd'), ('mkdir', 'd'), ('w', 'd/n', 'x\n')],
+		[(False, 'move', 'y', 'd/g'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None), (True, 'create', 'd', None),
+		(False, 'create', 'd/n', None)], ['y']),
+	'moved_into_after': ({'d/g': 'G\n', 'd/k': 'K\n', 'q': 'Q\n'},
+		[('mv', 'd/g', 'y'), ('rm', 'd/k'), ('rmdir', 'd'), ('mkdir', 'd'), ('mv', 'q', 'd/q')],
+		[(False, 'move', 'y', 'd/g'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None), (True, 'create', 'd', None),
+		(False, 'move', 'd/q', 'q')], ['y', 'd/q']),
+	# a file made in the removed folder's place, which the collapse keeps beside the folder's delete
+	'file_in_its_place': ({'d/g': 'G\n', 'd/k': 'K\n'}, [('mv', 'd/g', 'y'), ('rm', 'd/k'), ('rmdir', 'd'), ('w', 'd', 'x\n')],
+		[(False, 'move', 'y', 'd/g'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None), (False, 'create', 'd', None)], ['y']),
+}
+
+
+@pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
+@pytest.mark.parametrize('name', sorted(EMPTIED))
+def test_a_folder_emptied_by_moves_then_removed_lets_them_rename(job, logged, name, with_verification):
+	seed, steps, events, linked = EMPTIED[name]
+	seed_monitor(job, seed)
+	run_backup(job)
+	apply(job.monitor, steps)
+	del logged[:]
+	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
+	assert not fallbacks(logged), fallbacks(logged)
+	assert_version_is_the_tree(job, v)
+	for rel in linked:
+		assert os.path.islink(os.path.join(v, rel)), rel

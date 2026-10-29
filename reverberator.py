@@ -6293,26 +6293,33 @@ def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 	   made before it, they would stand in its way ( mv d e; echo > e/new makes e/ before the rename onto it ), or be
 	   moved away with it ( mv f f~; echo new > f )
 
+	A delete at or above the source of a move is the exception ( mv d/g y; rm -r d ): it replays right after the last
+	such move, and the entries of 2. at or under it right after it, so the moves out of it rename what the version holds
+	there. One with a move onto a place in it, made after it, up to that move stays in 1., as no order replays both.
+
 	Examples:
 		>>> list(order_backup_entries_for_replay(OrderedDict([('/m/d/y', BackupEntryValues('t', 'attrib', None)),
 		...     ('/m/e/', BackupEntryValues('t', 'move', '/m/d/')), ('/m/e/new', BackupEntryValues('t', 'create', None)),
 		...     ('/m/x', BackupEntryValues('t', 'modify', None))])))
 		['/m/x', '/m/d/y', '/m/e/', '/m/e/new']
+		>>> list(order_backup_entries_for_replay(OrderedDict([('/m/y', BackupEntryValues('t', 'move', '/m/d/g')),
+		...     ('/m/d/k', BackupEntryValues('t', 'delete', None)), ('/m/d/', BackupEntryValues('t', 'delete', None)),
+		...     ('/m/d', BackupEntryValues('t', 'create', None)), ('/m/e', BackupEntryValues('t', 'move', '/m/q'))])))
+		['/m/d/k', '/m/y', '/m/d/', '/m/d', '/m/e']
 	'''
 	deletes = []
 	moves = []
 	rest = []
 	after = []
-	# where the moves seen so far landed and left, without a trailing /
-	landed = set()
-	def under_a_move(path):
-		# path and each folder above it, so it costs its depth, not the number of moves
+	def at_and_above(path):
+		# path without a trailing /, then each folder above it: what is looked up by them costs its depth, not the
+		# number of moves
 		path = path.rstrip('/')
 		while path:
-			if path in landed:
-				return True
+			yield path
 			path = path.rpartition('/')[0]
-		return False
+	# where the moves seen so far landed and left, without a trailing /
+	landed = set()
 	for path, values in backup_entries.items():
 		if values.event == 'delete':
 			deletes.append((path, values))
@@ -6320,7 +6327,7 @@ def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 			moves.append((path, values))
 			landed.add(path.rstrip('/'))
 			landed.add((values.source_path or '').rstrip('/'))
-		elif landed and under_a_move(path):
+		elif landed and any(folder in landed for folder in at_and_above(path)):
 			after.append((path, values))
 		else:
 			rest.append((path, values))
@@ -6328,10 +6335,45 @@ def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 	shallowest_first = lambda pv: (pv[0].rstrip('/').count(os.sep), len(pv[0]), pv[0])
 	rest.sort(key=shallowest_first)
 	after.sort(key=shallowest_first)
-	ordered = OrderedDict()
-	for path, values in deletes + rest + moves + after:
-		ordered[path] = values
-	return ordered
+	# a delete holding the source of a move replays right after the last move out of it ( mv d/g y; rm -r d ), so the
+	# moves rename what the version holds there; the rest of 2. at or under it stays after it, as at the front. a move
+	# onto a place in it made after it ( in backup_entries' order, which is time order ) that comes up to that last move
+	# leaves it at the front, as no order replays both
+	last_out = {}
+	for i, (path, values) in enumerate(moves):
+		for folder in at_and_above(values.source_path or ''):
+			last_out[folder] = i
+	moved_after = {path.rstrip('/'): last_out[path.rstrip('/')] for path, values in deletes if path.rstrip('/') in last_out}
+	position = {path: i for i, path in enumerate(backup_entries)}
+	# the first, of a file's and a folder's delete at one path
+	deleted_at = {}
+	for path, values in deletes:
+		deleted_at[path.rstrip('/')] = min(position[path], deleted_at.get(path.rstrip('/'), position[path]))
+	for i, (path, values) in enumerate(moves):
+		for folder in at_and_above(path):
+			if moved_after.get(folder, -1) >= i and position[path] > deleted_at[folder]:
+				del moved_after[folder]
+	# what replays right after each move ( by its index ): the deletes moved there, deepest first, then the entries of rest
+	# under them, which go after the last of the deletes above them: the shallowest's
+	behind = {}
+	front = []
+	for path, values in deletes:
+		if path.rstrip('/') in moved_after:
+			behind.setdefault(moved_after[path.rstrip('/')], []).append((path, values))
+		else:
+			front.append((path, values))
+	kept = []
+	for path, values in rest:
+		above = [moved_after[folder] for folder in at_and_above(path) if folder in moved_after]
+		if above:
+			behind[above[-1]].append((path, values))
+		else:
+			kept.append((path, values))
+	ordered = front + kept
+	for i, move in enumerate(moves):
+		ordered.append(move)
+		ordered += behind.get(i, ())
+	return OrderedDict(ordered + after)
 
 def prepare_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 	'''Prune redundant child ops under dir creates, then order for safe replay.'''

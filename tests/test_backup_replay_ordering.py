@@ -118,6 +118,49 @@ class TestOrderBackupEntriesForReplay(unittest.TestCase):
 		])
 		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/f~', '/m/f'])
 
+	def test_a_delete_holding_a_move_source_comes_right_after_the_last_move_out_of_it(self):
+		# mv d/g y; mv d/s z; rm -r d; echo > d; mv q e: the delete of d/ after the moves out of it, the file in its place
+		# after the delete, and the move that came later after them both; the other deletes stay at the front
+		entries = OrderedDict([
+			('/m/y', rv.BackupEntryValues('t1', 'move', '/m/d/g')),
+			('/m/z/', rv.BackupEntryValues('t2', 'move', '/m/d/s/')),
+			('/m/d/k', rv.BackupEntryValues('t3', 'delete', None)),
+			('/m/d/', rv.BackupEntryValues('t4', 'delete', None)),
+			('/m/d', rv.BackupEntryValues('t5', 'create', None)),
+			('/m/e', rv.BackupEntryValues('t6', 'move', '/m/q')),
+			('/m/x/', rv.BackupEntryValues('t7', 'delete', None)),
+		])
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()),
+			['/m/d/k', '/m/x/', '/m/y', '/m/z/', '/m/d/', '/m/d', '/m/e'])
+
+	def test_nested_deletes_holding_move_sources_come_deepest_first_after_their_moves(self):
+		entries = OrderedDict([
+			('/m/y', rv.BackupEntryValues('t1', 'move', '/m/d/e/g')),
+			('/m/d/e/', rv.BackupEntryValues('t2', 'delete', None)),
+			('/m/d/', rv.BackupEntryValues('t3', 'delete', None)),
+			('/m/w', rv.BackupEntryValues('t4', 'move', '/m/v')),
+		])
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/y', '/m/d/e/', '/m/d/', '/m/w'])
+
+	def test_a_delete_with_a_later_move_into_it_before_the_last_move_out_stays_at_the_front(self):
+		# rm -r d; mv q d/q; mv d/q y, as the collapse can keep them: the move into d/ has to come after the delete and
+		# the move out of it after that, so no order replays both and the delete stays where it was
+		entries = OrderedDict([
+			('/m/d/', rv.BackupEntryValues('t1', 'delete', None)),
+			('/m/d/q', rv.BackupEntryValues('t2', 'move', '/m/q')),
+			('/m/y', rv.BackupEntryValues('t3', 'move', '/m/d/q')),
+		])
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/d/', '/m/d/q', '/m/y'])
+
+	def test_a_move_into_it_before_the_delete_goes_before_it_too(self):
+		# mv e d/s/b; mv d/s z; rm -r d: the delete after both moves
+		entries = OrderedDict([
+			('/m/d/s/b/', rv.BackupEntryValues('t1', 'move', '/m/e/')),
+			('/m/z/', rv.BackupEntryValues('t2', 'move', '/m/d/s/')),
+			('/m/d/', rv.BackupEntryValues('t3', 'delete', None)),
+		])
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/d/s/b/', '/m/z/', '/m/d/'])
+
 
 class TestReverbBackupNewTreeFileBeforeParent(unittest.TestCase):
 	def test_new_tree_succeeds_when_entries_list_files_before_dirs(self):
