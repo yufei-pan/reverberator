@@ -144,3 +144,37 @@ def test_full_scan_replaces_queued_events_and_absorbs_later_ones():
 	assert list(queue) == [rv.ChangeEvent(2.0, False, 'full_scan', '/m', None)]
 	queue.prepend([rv.ChangeEvent(0.5, False, 'modify', '/m/c', None)])
 	assert list(queue) == [rv.ChangeEvent(2.0, False, 'full_scan', '/m', None)] and queue.full_scan_requested
+
+
+def collapsed(*events):
+	'''The collapse of events (is_dir, event, rel, moved_from rel or None) at times 1, 2, ..., as (rel, event, source rel).'''
+	entries = rv.change_events_to_backup_entries(deque(_ev(t, is_dir, event, f'{P}/{rel}', None if source is None else f'{P}/{source}')
+		for t, (is_dir, event, rel, source) in enumerate(events, 1)))
+	strip = lambda path: path and path.replace(f'{P}/', '', 1)
+	return [(strip(path), values.event, strip(values.source_path)) for path, values in entries.items()]
+
+
+def test_a_new_file_moved_through_a_folder_move_and_out_is_one_copy_where_it_ends():
+	# echo new > f; mv f d/g; mv d D; mv D/g h: nothing in the version is at D/g to rename
+	assert collapsed((False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')) == \
+		[('D/', 'move', 'd/'), ('d/g', 'delete', None), ('h', 'create', 'f')]
+
+
+def test_a_saved_file_moved_the_same_way_is_one_modify_where_it_ends():
+	assert collapsed((False, 'modify', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')) == \
+		[('f', 'delete', None), ('D/', 'move', 'd/'), ('d/g', 'delete', None), ('h', 'modify', 'f')]
+
+
+def test_the_copy_follows_a_chain_merged_move_on_to_its_end():
+	assert collapsed((False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g'),
+		(False, 'move', 'k', 'h')) == [('D/', 'move', 'd/'), ('d/g', 'delete', None), ('k', 'create', 'f')]
+
+
+def test_the_first_destinations_delete_goes_when_an_earlier_move_took_what_the_version_held_there():
+	assert collapsed((False, 'move', 'x', 'd/g'), (False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'move', 'h', 'D/g')) == [('x', 'move', 'd/g'), ('D/', 'move', 'd/'), ('h', 'create', 'f')]
+
+
+def test_a_file_the_version_holds_keeps_its_moves():
+	assert collapsed((False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')) == \
+		[('d/g', 'move', 'f'), ('D/', 'move', 'd/'), ('h', 'move', 'D/g')]
