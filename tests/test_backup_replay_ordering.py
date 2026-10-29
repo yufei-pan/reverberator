@@ -161,6 +161,19 @@ class TestOrderBackupEntriesForReplay(unittest.TestCase):
 		])
 		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/d/s/b/', '/m/z/', '/m/d/'])
 
+	def test_a_delete_with_a_later_move_onto_or_out_of_a_folder_above_it_stays_at_the_front(self):
+		# rm -r d/s; mv d D; mv x d; mv d/s/g y: after the moves of d, d/s names x's folder, not the removed one
+		entries = OrderedDict([
+			('/m/d/s/', rv.BackupEntryValues('t1', 'delete', None)),
+			('/m/D/', rv.BackupEntryValues('t2', 'move', '/m/d/')),
+			('/m/d/', rv.BackupEntryValues('t3', 'move', '/m/x/')),
+			('/m/y', rv.BackupEntryValues('t4', 'move', '/m/d/s/g')),
+		])
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/d/s/', '/m/D/', '/m/d/', '/m/y'])
+		# and only out of it ( mv d D, then a move out of the D/s the version still holds as d/s, as the collapse gives it )
+		del entries['/m/d/']
+		self.assertEqual(list(rv.order_backup_entries_for_replay(entries).keys()), ['/m/d/s/', '/m/D/', '/m/y'])
+
 
 class TestReverbBackupNewTreeFileBeforeParent(unittest.TestCase):
 	def test_new_tree_succeeds_when_entries_list_files_before_dirs(self):

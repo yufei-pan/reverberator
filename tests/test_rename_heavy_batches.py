@@ -352,6 +352,16 @@ EMPTIED = {
 		[('mv', 'd/g', 'y'), ('rm', 'd/k'), ('rmdir', 'd'), ('mkdir', 'd'), ('mv', 'q', 'd/q')],
 		[(False, 'move', 'y', 'd/g'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None), (True, 'create', 'd', None),
 		(False, 'move', 'd/q', 'q')], ['y', 'd/q']),
+	# a folder moved onto the removed one's parent after the delete, then a file moved out of the new folder at the
+	# removed one's path ( rm -rf site; mv site.new site; mv site/assets/x elsewhere ): the delete is the old folder's
+	'ancestor_moved_in_then_out': ({'d/s/g0': 'G0\n', 'x/s/g': 'XG\n', 'x/s/h': 'XH\n'},
+		[('rm', 'd/s/g0'), ('rmdir', 'd/s'), ('rmdir', 'd'), ('mv', 'x', 'd'), ('mv', 'd/s/g', 'y')],
+		[(False, 'delete', 'd/s/g0', None), (True, 'delete', 'd/s', None), (True, 'delete', 'd', None), (True, 'move', 'd', 'x'),
+		(False, 'move', 'y', 'd/s/g')], ['y', 'd/s/h']),
+	'ancestor_replaced_then_out': ({'d/s/g0': 'G0\n', 'd/k': 'K\n', 'x/s/g': 'XG\n', 'x/s/h': 'XH\n'},
+		[('rm', 'd/s/g0'), ('rmdir', 'd/s'), ('mv', 'd', 'D'), ('mv', 'x', 'd'), ('mv', 'd/s/g', 'y')],
+		[(False, 'delete', 'd/s/g0', None), (True, 'delete', 'd/s', None), (True, 'move', 'D', 'd'), (True, 'move', 'd', 'x'),
+		(False, 'move', 'y', 'd/s/g')], ['y', 'd/s/h', 'D/k']),
 	# a file made in the removed folder's place, which the collapse keeps beside the folder's delete
 	'file_in_its_place': ({'d/g': 'G\n', 'd/k': 'K\n'}, [('mv', 'd/g', 'y'), ('rm', 'd/k'), ('rmdir', 'd'), ('w', 'd', 'x\n')],
 		[(False, 'move', 'y', 'd/g'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None), (False, 'create', 'd', None)], ['y']),
@@ -371,3 +381,19 @@ def test_a_folder_emptied_by_moves_then_removed_lets_them_rename(job, logged, na
 	assert_version_is_the_tree(job, v)
 	for rel in linked:
 		assert os.path.islink(os.path.join(v, rel)), rel
+
+
+@pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
+def test_a_delete_under_a_folder_moved_after_it_stays_at_the_front(job, logged, with_verification):
+	# mv d/s/g t; rm -r d/s; mv d D; mv t y: the collapse merges the chain to y <- d/s/g across the move of d ( the
+	# rename finds nothing there, as 6fa2c69's does: the chain merge across a folder move ). The delete of d/s stays
+	# before the move of d, which would otherwise carry the version's d/s to D/s, out of its reach
+	seed_monitor(job, {'d/s/g': 'G\n', 'd/s/h': 'H\n', 'd/k': 'K\n'})
+	run_backup(job)
+	apply(job.monitor, [('mv', 'd/s/g', 't'), ('rm', 'd/s/h'), ('rmdir', 'd/s'), ('mv', 'd', 'D'), ('mv', 't', 'y')])
+	del logged[:]
+	events = [(False, 'move', 't', 'd/s/g'), (False, 'delete', 'd/s/h', None), (True, 'delete', 'd/s', None), (True, 'move', 'D', 'd'),
+		(False, 'move', 'y', 't')]
+	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
+	assert_version_is_the_tree(job, v)
+	assert os.path.islink(os.path.join(v, 'D/k'))
