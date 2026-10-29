@@ -1517,6 +1517,76 @@ def test_an_attrib_whose_record_vouches_reads_no_vault_copy(job, logged, monkeyp
 	assert_moved_cleanly(logged)
 
 
+def vault_hashes(job, monkeypatch):
+	'''The vault paths hash_file() reads from now on.'''
+	hashed = []
+	real = rv.hash_file
+	def spy(path, *args, **kwargs):
+		if os.path.abspath(path).startswith(job.vault + '/'):
+			hashed.append(path)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'hash_file', spy)
+	return hashed
+
+
+def record_of(job, rel):
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return manifest.lookup(rel)
+	finally:
+		manifest.close()
+
+
+def test_a_vouched_chmod_reads_no_vault_data_and_keeps_its_hash_and_unchecked_flag(job, logged, monkeypatch):
+	seed_monitor(job, {'x': 'x' * 100000, 'keep': 'k'})
+	run_backup(job)
+	run_backup(job)                            # the copy read back: checked
+	before = record_of(job, 'x')
+	assert before.unchecked == 0
+	os.chmod(f'{job.monitor}/x', 0o600)
+	hashed = vault_hashes(job, monkeypatch)
+	verified(job, (False, 'attrib', 'x', None))
+	after = record_of(job, 'x')
+	assert hashed == []
+	assert (after.kind, after.size, after.mtime_ns, after.hash, after.unchecked) == ('f', before.size, before.mtime_ns, before.hash, 0)
+	assert stat.S_IMODE(after.mode) == 0o600
+	assert_moved_cleanly(logged)
+
+
+def test_a_vouched_row_whose_chain_end_changed_before_the_commit_is_hashed(job, monkeypatch):
+	seed_monitor(job, {'x': 'x' * 100000, 'keep': 'k'})
+	run_backup(job)
+	run_backup(job)
+	os.chmod(f'{job.monitor}/x', 0o600)
+	real = rv.copy_file_meta
+	def and_then_touched(source, path, *args, **kwargs):
+		done = real(source, path, *args, **kwargs)
+		# x's chain end only, after the replay synced onto it: the referenced copy's folders are left alone
+		if path.startswith(job.vault + '/') and os.path.basename(path) == 'x' and stat.S_ISREG(os.lstat(path).st_mode):
+			os.utime(path, ns=(10 ** 18, 10 ** 18))
+		return done
+	monkeypatch.setattr(rv, 'copy_file_meta', and_then_touched)
+	hashed = vault_hashes(job, monkeypatch)
+	verified(job, (False, 'attrib', 'x', None))
+	after = record_of(job, 'x')
+	assert hashed and after.mtime_ns == 10 ** 18 and after.unchecked == 1
+
+
+def test_a_touch_then_a_chmod_in_one_batch_is_recorded_from_the_new_copy(job, monkeypatch):
+	seed_monitor(job, {'x': 'x' * 100000, 'keep': 'k'})
+	run_backup(job)
+	run_backup(job)
+	m = job.monitor
+	os.utime(f'{m}/x', ns=(10 ** 18, 10 ** 18))
+	os.chmod(f'{m}/x', 0o600)
+	hashed = vault_hashes(job, monkeypatch)
+	version = verified(job, (False, 'attrib', 'x', None), (False, 'attrib', 'x', None))
+	after = record_of(job, 'x')
+	assert not os.path.islink(os.path.join(version, 'x')) and hashed
+	assert (after.mtime_ns, stat.S_IMODE(after.mode), after.unchecked) == (10 ** 18, 0o600, 1)
+	assert after.hash == rv.hash_file(f'{m}/x', os.lstat(f'{m}/x').st_size)
+
+
 def test_a_batch_of_deletes_the_vault_does_not_track_makes_no_version(job, logged):
 	# the carried move-out: its delete names a path no version holds
 	seed_monitor(job, {'a.txt': 'a'})

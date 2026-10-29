@@ -51,6 +51,24 @@ def test_cold_start_reads_each_copy_back_once_then_only_the_monitored_side(job, 
 	assert reads == []
 
 
+def test_mark_vouched_keeps_the_record_until_an_add(job):
+	seed_monitor(job, {'a.txt': 'hello', 'd/b.txt': 'b'})
+	run_backup(job)
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		manifest.begin()
+		record, copy_version = manifest.lookup_with_copy_version('a.txt')
+		manifest.mark_vouched('a.txt')
+		manifest.mark_vouched('d/')            # a folder row is never vouched
+		manifest.mark_vouched('untracked')
+		assert manifest.take_dirty_records(10) == [('a.txt', copy_version, record)]
+		manifest.add('a.txt', dirty=True)
+		assert manifest.take_dirty_records(10) == [('a.txt', copy_version, None)]
+	finally:
+		manifest.rollback()
+		manifest.close()
+
+
 def recording_sync(monkeypatch, failing=False):
 	'''
 	rv.sync_vault_filesystems replaced by a recorder of the job vaults it is asked to sync, answering {} (no disk failed), and
