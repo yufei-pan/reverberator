@@ -52,6 +52,18 @@ def test_the_longest_fstab_mount_point_decides(tmp_path, fake_pool):
 	assert rv.vault_disk_problem(os.path.join(outer, 'v')) == not_mounted(outer)
 
 
+def test_a_disk_mounted_under_an_unmounted_fstab_point_counts_as_there(tmp_path, fake_pool):
+	# fstab names /data (not mounted), and a disk is mounted deeper, some other way: the path on it is there, a bare
+	# folder beside it is not
+	data, x = str(tmp_path / 'data'), str(tmp_path / 'data' / 'x')
+	write_fstab(data)
+	fake_pool.add_mount(x)
+	assert rv.vault_disk_problem(os.path.join(x, 'v')) is None and rv.vault_disk_problem(x) is None
+	assert rv.vault_disk_problem(str(tmp_path / 'data' / 'y')) == not_mounted(data)
+	assert rv.vault_disk_problem(str(tmp_path / 'data' / 'xy')) == not_mounted(data)
+	assert rv.vault_disk_problem(data) == not_mounted(data)
+
+
 def test_an_escaped_fstab_mount_point_matches_the_mount_table(tmp_path, fake_pool):
 	disk = str(tmp_path / 'my disk\tA')
 	write_fstab(disk)

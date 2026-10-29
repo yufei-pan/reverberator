@@ -1681,7 +1681,7 @@ def test_a_deleted_files_chain_link_is_never_followed_by_the_folder_check(job, l
 	run_backup(job)
 	os.remove(f'{job.monitor}/x')
 	followed = []
-	real_isdir, real_stat = os.path.isdir, os.stat
+	real_isdir = os.path.isdir
 	def isdir(path):
 		if str(path).endswith('/x') and os.path.islink(path):
 			followed.append(path)

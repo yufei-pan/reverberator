@@ -616,10 +616,12 @@ def test_monitor_gate_looks_up_no_signature_from_a_bare_folder_under_an_unmounte
 		os.makedirs(path)
 		time.sleep(0.5)
 		assert thread.is_alive() and asked == [] and not gate.resolved
+		# the wait says the disk's own text, once, as wait_for_path does
+		assert [wait[2] for wait in control._waits] == [f'{disk} is not mounted ({rv.FSTAB_PATH} names it)']
 		# mounted: the folder is the disk's (the mount shows its own data folder)
 		fake_pool.add_mount(disk)
 		thread.join(timeout=3)
-		assert result == [True] and asked == [path] and gate.signature == 'ROOT-UUID'
+		assert result == [True] and asked[:1] == [path] and gate.signature == 'ROOT-UUID'
 	finally:
 		control.fail('stop')
 		thread.join(timeout=1)

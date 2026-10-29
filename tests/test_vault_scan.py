@@ -360,10 +360,34 @@ def test_an_orphan_that_cannot_be_removed_fails_the_scan(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	orphan = write_incomplete_version(job, 3, {'x': 'y'})
 	real_run = rv.multiCMD.run_command
-	monkeypatch.setattr(rv.multiCMD, 'run_command', lambda command, *args, **kwargs: 1 if command[0] == 'rm' else real_run(command, *args, **kwargs))
+	monkeypatch.setattr(rv.multiCMD, 'run_command', lambda command, *args, **kwargs: real_run(['false'] if command[0] == 'rm' else command, *args, **kwargs))
 	with pytest.raises(rv.JobFailure):
 		rv.get_vault_info(job.job_vault)
 	assert os.path.isdir(orphan)
+	monkeypatch.undo()
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2] and not os.path.exists(orphan)
+
+
+def test_an_orphan_that_rm_cannot_remove_names_rms_message_on_every_attempt(tmp_path, monkeypatch, capsys):
+	# a stuck entry (the stand-in fails as rm does on an immutable one): each scan's reason and its log line carry rm's
+	# own first line, not only the first attempt's log
+	job = three_versions(tmp_path)
+	orphan = write_incomplete_version(job, 3, {'x': 'y'})
+	real_run = rv.multiCMD.run_command
+	script = 'echo "rm: cannot remove \'$1/x\': Operation not permitted" >&2; echo "rm: second line" >&2; exit 1'
+	def run(command, *args, **kwargs):
+		if command[:2] == ['rm', '-rf']:
+			command = ['sh', '-c', script, 'sh', command[-1]]
+		return real_run(command, *args, **kwargs)
+	monkeypatch.setattr(rv.multiCMD, 'run_command', run)
+	for attempt in range(2):
+		capsys.readouterr()
+		with pytest.raises(rv.VaultScanError) as failure:
+			rv.get_vault_info(job.job_vault)
+		assert orphan in failure.value.reason and 'Operation not permitted' in failure.value.reason, attempt
+		assert 'second line' not in failure.value.reason
+		logged = [line for line in capsys.readouterr().out.splitlines() if f'Failed to remove the orphan {orphan}' in line]
+		assert len(logged) == 1 and 'Operation not permitted' in logged[0], attempt
 	monkeypatch.undo()
 	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1, 2] and not os.path.exists(orphan)
 

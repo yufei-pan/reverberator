@@ -1447,8 +1447,11 @@ class MonitorGate:
 					what = 'monitored filesystem signature unknown'
 				elif not os.path.lexists(self.path):
 					what = 'monitored path not there yet'
-				else:
+				elif not os.path.isdir(self.path):
 					what = f'{self.path} {problem[0]}'
+				else:
+					# the disk's own text, as wait_for_path shows it
+					what = vault_disk_problem(self.path) or f'{self.path} {problem[0]}'
 				if token is None:
 					token = job.begin_wait(self.path, what)
 				else:
@@ -3879,9 +3882,9 @@ def fstab_mount_points(mount_table:list) -> list:
 def vault_disk_problem(path:str) -> 'str | None':
 	'''
 	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
-	point at or above the path is not mounted (a bare folder left under it is not that disk), when the mount table
-	cannot be read, or when a mergerfs pool holding the path has a disk missing (pool_problem()'s text). path need not
-	exist.
+	point at or above the path is not mounted (a bare folder left under it is not that disk) unless the mount table has
+	a mount point deeper than it, at or above the path (a disk mounted some other way), when the mount table cannot be
+	read, or when a mergerfs pool holding the path has a disk missing (pool_problem()'s text). path need not exist.
 	'''
 	try:
 		mount_table = read_mount_table()
@@ -3891,7 +3894,7 @@ def vault_disk_problem(path:str) -> 'str | None':
 	above = [mount_point for mount_point in fstab_mount_points(mount_table) if real == mount_point or real.startswith(mount_point + '/')]
 	if above:
 		longest = max(above, key=len)
-		if not any(point == longest for point, _ in mount_table):
+		if not any(point == longest or (point.startswith(longest + '/') and (real == point or real.startswith(point + '/'))) for point, _ in mount_table):
 			return f'{longest} is not mounted ({FSTAB_PATH} names it)'
 	return pool_problem(path, mount_table=mount_table)
 
@@ -5601,6 +5604,8 @@ def persist_pending_transactions(job_name:str, vault_path:str, to_process:'Chang
 	# the disk first: it names the cause (a dead pool fails isdir, an unmounted mount point is usually missing)
 	if (problem := vault_disk_problem(vault_path)) is not None:
 		why = f'is not ready: {problem}'
+	elif not os.path.lexists(vault_path):
+		why = 'does not exist'
 	elif not os.path.isdir(vault_path):
 		why = 'is not a folder'
 	else:
@@ -5933,22 +5938,29 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 		raise VaultScanError(f'cannot read the vault {job_vault_path}: {type(e).__name__}: {e}')
 	return VaultListing(versions, change_lists, [folders[name] for _, name in orphans], stale, sorted(kept), unfinished, cut_off)
 
-def remove_orphan(job_vault_path:str, path:str) -> bool:
-	'''rm -rf of path, a version folder without a change list in job_vault_path: whether it is gone.'''
+def remove_orphan(job_vault_path:str, path:str) -> 'str | None':
+	'''
+	rm -rf of path, a version folder without a change list in job_vault_path: None when it is gone, else why it is not
+	(rm's first stderr line when it failed, as failed_removal() reads it).
+	'''
 	backuperTeeLogToTl(job_vault_path, f'Removing incomplete orphan version (no content file): {path}', error=True)
+	cause = None
 	try:
-		multiCMD.run_command(['rm', '-rf', path], quiet=True, return_code_only=True)
+		task = multiCMD.run_command(['rm', '-rf', path], quiet=True, return_object=True)
+		if task.returncode != 0:
+			cause = rm_cause(task)
 	except Exception as e:
+		cause = str(e)
 		backuperTeeLogToTl(job_vault_path, f'Error removing orphan {path}: {e}', error=True)
 	try:
 		os.lstat(path)
 	except (FileNotFoundError, NotADirectoryError):
-		return True
+		return None
 	except OSError as e:
 		backuperTeeLogToTl(job_vault_path, f'Cannot tell whether the orphan {path} went: {e}', error=True)
-		return False
-	backuperTeeLogToTl(job_vault_path, f'Failed to remove the orphan {path}', error=True)
-	return False
+		return f'it cannot be looked at: {e}'
+	backuperTeeLogToTl(job_vault_path, f'Failed to remove the orphan {path}' + (f': {cause}' if cause else ''), error=True)
+	return cause or 'it is still there'
 
 def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 	'''
@@ -6123,9 +6135,9 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 			forget_manifest_meta(job_vault_path, version=False, gone={os.path.basename(path) for path in listing.orphans})
 		except (OSError, sqlite3.Error) as e:
 			backuperTeeLogToTl(job_vault_path, f'Cannot forget the matched time of a version being removed: {e}', error=True)
-	kept = [path for path in listing.orphans if not remove_orphan(job_vault_path, path)]
+	kept = [(path, why) for path in listing.orphans if (why := remove_orphan(job_vault_path, path)) is not None]
 	if kept:
-		raise VaultScanError(f'cannot remove the incomplete versions {", ".join(kept)}, and a backup would make a version of their number beside them')
+		raise VaultScanError(f'cannot remove the incomplete versions {", ".join(f"{path} ({why})" for path, why in kept)}, and a backup would make a version of their number beside them')
 	move_current_version_forward(job_vault_path, listing)
 	vault_info_dict = OrderedDict()
 	vault_size = 0
@@ -6652,6 +6664,16 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 		raise failure
 	return copied
 
+def rm_cause(task) -> str:
+	'''Why the finished rm task failed: its first stderr line, else that it did not run or its exit code.'''
+	lines = [line.strip() for line in task.stderr if line.strip()]
+	if lines:
+		# an rm -rf failing on many entries says so for each: the first is the cause shown
+		return lines[0] + (f' (and {len(lines) - 1} more)' if len(lines) > 1 else '')
+	if task.returncode is None:
+		return 'rm did not run'
+	return f'rm exited with {task.returncode}'
+
 def failed_removal(removals:list) -> 'str | None':
 	'''
 	The reason of the first rm of removals, a list of (task, path) pairs of finished tasks, that failed while something
@@ -6660,15 +6682,7 @@ def failed_removal(removals:list) -> 'str | None':
 	reason = None
 	for task, path in removals:
 		if reason is None and task.returncode != 0 and os.path.lexists(path):
-			lines = [line.strip() for line in task.stderr if line.strip()]
-			if lines:
-				# an rm -rf failing on many entries says so for each: the first is the cause shown
-				cause = lines[0] + (f' (and {len(lines) - 1} more)' if len(lines) > 1 else '')
-			elif task.returncode is None:
-				cause = 'rm did not run'
-			else:
-				cause = f'rm exited with {task.returncode}'
-			reason = f'removing {path} from the version failed: {cause}'
+			reason = f'removing {path} from the version failed: {rm_cause(task)}'
 	removals.clear()
 	return reason
 
@@ -7421,10 +7435,10 @@ class VaultManifest:
 		Mark the file row rel dirty and keep its record: the replay synced an attribute change onto the end of its chain, and
 		the record vouches for what is there, so the commit takes its hash and unchecked flag from the record
 		(take_dirty_records()) and reads only the new metadata. A dirty row that has a record is one the replay vouched
-		for: any later add(), move_file() or move_tree() for rel wipes the record by itself. A folder, or an untracked rel,
-		is left alone.
+		for: any later add(), move_file() or move_tree() for rel wipes the record by itself. An untracked rel is left alone.
+		Only a file row record_vouches() vouched for is passed (a folder's row never is).
 		'''
-		self.conn.execute("UPDATE entries SET dirty = 1 WHERE path = ? AND kind = 'f'", (storable_name(rel),))
+		self.conn.execute('UPDATE entries SET dirty = 1 WHERE path = ?', (storable_name(rel),))
 
 	def discard(self, rel:str):
 		self.conn.execute('DELETE FROM entries WHERE path = ?', (storable_name(rel),))
@@ -8774,7 +8788,7 @@ def recopy_size(rels:list, job_vault:str, latest_version_path:str, moves:'VaultM
 			total += end.st.st_size
 	return total
 
-def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None, known:'ManifestRecord' = None):
+def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None, known:'ManifestRecord' = None, unchecked:int = 0):
 	'''
 	Record what version_path holds at rel, following the links that chain an unchanged entry back to its copy, each
 	told by the moves of its version (moves, a VaultMoves for the pass; one reading the manifest's record when None).
@@ -8783,8 +8797,8 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 	and the entry there is the end, as chain_end() has it; so an entry this version copied (copy_version its own
 	number) is read as it is, a user's link as the link. known, the row's record when the replay vouched for it, spares
 	the read of the data: a file at the end of the chain with known's size and mtime is recorded with known's hash and
-	unchecked flag, and its new mode and owner. Returns None when there is nothing readable there, or a link there
-	cannot be looked at (UncheckedVaultLink).
+	unchecked flag, and its new mode and owner. A file it hashes itself gets the unchecked flag given. Returns None when
+	there is nothing readable there, or a link there cannot be looked at (UncheckedVaultLink).
 	'''
 	entry = os.path.abspath(os.path.join(version_path, rel))
 	try:
@@ -8828,7 +8842,7 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 		if kind == 'f' and known is not None and known.kind == 'f' and (st.st_size, st.st_mtime_ns) == (known.size, known.mtime_ns):
 			return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, known.hash, None, known.unchecked)
 		file_hash = hash_file(entry, st.st_size) if kind == 'f' else None
-		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 0)
+		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, unchecked if kind == 'f' else 0)
 	except (OSError, UncheckedVaultLink):
 		return None
 
@@ -8839,12 +8853,7 @@ def read_copied_record(version_path:str, rel:str, monitor_path:str, moves:'Vault
 	user's link copied is recorded as the link, with its text. A file read from known (read_vault_record()) keeps the
 	record as read: it is the copy known describes, which is checked or not as known says.
 	'''
-	record = read_vault_record(version_path, rel, monitor_path, moves, copy_version, known)
-	if record is None or record.kind != 'f':
-		return record
-	if known is not None and known.kind == 'f' and (record.size, record.mtime_ns) == (known.size, known.mtime_ns):
-		return record
-	return record._replace(unchecked=1)
+	return read_vault_record(version_path, rel, monitor_path, moves, copy_version, known, 1)
 
 def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:str, applied:VersionMoves = None):
 	'''
@@ -8852,7 +8861,8 @@ def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:
 	compare pool, each by its copy version (read_copied_record()): the links of the version by applied, the moves its
 	replay applied (by their text alone when None), those of the committed versions below by their moves. A row the replay
 	vouched for (VaultManifest.mark_vouched()) is recorded from its kept record without reading the copy's data, and keeps
-	that record's unchecked flag, so a checked copy stays checked (its new metadata is read from the chain end).
+	that record's unchecked flag, so a checked copy stays checked (its new metadata is read from the chain end), but only
+	while the chain end keeps the record's size and mtime: otherwise the row is hashed and recorded unchecked, as any other.
 	'''
 	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path,
 		applied=applied)
@@ -9401,7 +9411,8 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_dir:bool, found:set, removed:list) -> list:
 	'''
 	sweep_version_folder() for the entry at path, rel in version_path: kept and added to found when it is tracked,
-	removed and appended to removed when not. Returns [(path, rel)] for a folder to look into, else []. Raises JobFailure when the removal fails.
+	removed and appended to removed when not. Returns [(path, rel)] for a folder to look into, else []. Raises JobFailure
+	when the removal fails.
 	'''
 	if manifest.lookup(rel) is not None:
 		found.add(rel)
