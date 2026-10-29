@@ -3883,7 +3883,7 @@ def vault_disk_problem(path:str) -> 'str | None':
 	'''
 	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
 	point at or above the path is not mounted (a bare folder left under it is not that disk, and neither is anything
-	mounted below it: the mount table cannot tell a disk from a bind mount or a tmpfs), when the mount table cannot be
+	mounted below it: telling a disk from a bind mount or a tmpfs there needs rules this host has no use for), when the mount table cannot be
 	read, or when a mergerfs pool holding the path has a disk missing (pool_problem()'s text). path need not exist.
 	'''
 	try:
