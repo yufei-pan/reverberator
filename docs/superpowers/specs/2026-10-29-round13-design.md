@@ -33,42 +33,73 @@ them.
 ## Goal 1: the collapse carries an escalated copy to where the file ends
 
 In `change_events_to_backup_entries`' escalation (the block that turns a move of a file made or saved in the batch into
-a copy), every later move of that same entry goes with the copy, whether the path-exact chain merge linked it or a carry
-through a moved folder reached it: after `carried()` returns a path, while that path's own later move exists (a `move`
-entry whose source is that path), drop that move and carry on from its destination with its time; land the copy where
-the entry ends the batch (the existing `stands()` rule), and leave a `delete` at the first move's destination (it
-removes what the version held there, as the dropped rename would have). Moves of files the version holds are never
-escalated, so they keep their links. No committed version's content changes; the replay is right on its own, with no
-rename, no traceback and no "Not tracking … source no longer exists" line. (The investigation's prototype: about 20
-lines; 22 of 22 variant checks pass where today's code fails 16; the move-related suites pass. scratchpad
-r13/investigate/prototype.diff.)
+a copy), the copy goes with every later move of that same entry and lands where the entry ends the batch. The rule (the
+spec check's, tested in scratchpad r13/spec-check/fix, ~15 lines over the investigator's prototype; diff
+r13/spec-check/fix_vs_proto.diff):
 
-The user's words said "so the rename works": there is nothing in the version to rename in this case, so the right
+- After `carried(moveDest, entry_when[moveDest], True)` returns `now_at != moveDest`, take the move `carried()` stopped
+  at: in `later[now_at]`, the last entry below `escalated_bound`. If that entry ends the path there (None), stop.
+- Otherwise its destination is `dest`. If `backup_entries[dest]` is a `move` whose source is `now_at`, that is the
+  entry's own move; otherwise it was chain-merged on to its end: use `moveSourceToDestDict[now_at]`, but only when no
+  other event touched `now_at` between the bound and the event (`i == len(later[now_at])`). (Taking
+  `moveSourceToDestDict[path]` alone is wrong: it holds the earliest move out of the path after the event, which can be
+  an older file's move from before the copy got there.)
+- Drop that move, carry on with `carried(dest, entry_when[dest], True)`, and repeat. Land the copy with the existing
+  rule (it lands when the end path has no entry, has an attrib, or `not stands()`; otherwise the standing entry replays
+  and the copy is dropped). Folders made in the batch go the same way.
+- Leave a `delete` at the first move's destination only when the loop dropped at least one move, and drop that delete
+  again when the reverse walk later meets a move whose source is that path or a folder above it (that move takes what
+  the version held there away; deletes replay first, so the delete would remove a file another move still needs).
+
+Moves of files neither made nor saved in the batch are never escalated, so they keep their links. No committed version's
+content changes; the replay is right right after the verification (a pre-existing collapse of `mv q a; rm a` with `a` in
+the version leaves the old `a` until the verification removes it: outside this round, for the user). In the spec check's
+48 cases (with and without verification) the fixed rule logs no traceback, "Not tracking" or "Cannot read" line and
+loses no chain link.
+
+The user's words said "so the rename works": in Goal 1's case there is nothing in the version to rename, so the right
 result is the copy at the end path (the main session's call; the user's intent, no traceback and a right replay, holds).
 
-## Goal 2: a move whose source the version does not hold is copied, not renamed
+## Goal 2: a rename that finds nothing logs one warning, not a traceback
 
-In the replay's move step, before `manifest.move_file()` and the rename, a move whose source is not in the version being
-written (`os.path.lexists` false, through real folders) is replayed as a copy of its target: one warning line naming the
-move and that its source is not in the version, no traceback, and no manifest row moved for a file that is not there
-(today `move_file()` runs first and leaves a row the verification must repair). This covers causes 2 and 3 above, at the
-cost today's fallback already pays (a copy of the file). Tests keep asserting that the batches the collapse makes in
-Goal 1's cases never take this path. (The main session's call, within the user's "no traceback is logged".)
+In the replay's move step, a `FileNotFoundError` from the rename (`os.rename`) gets its own `except`: one warning line
+naming the move and that its source or its destination folder is not in the version, no traceback, then the existing
+delete-and-copy as today. This covers cause 2 (a file moved on before its create was copied), cause 3 (a chain merge
+across a folder move, and a move into a folder made in the batch that then moves, whose destination folder the version
+lacks) and the approved entry "A move into a folder made after an earlier move in one batch" (same mechanism). When the
+live target is gone too (moved on again in the batch), that delete-and-copy skips it quietly, as the attribute sync step
+already does ("moved on again in the batch"), instead of logging `ERROR Not tracking X: source no longer exists`; the
+later entry or the verification takes it. Other errors of the rename keep today's traceback. Tests keep asserting that
+Goal 1's batches never reach this branch. (The main session's call, within the user's "no traceback is logged".)
 
 ## Goal 3: one warning per repeated job name
 
-At each start, `parse_rules` counts the rule file's job-name cells as TSVZ keys them (first cell right-stripped; comment
-lines, the header and the `#_defaults_#` row excluded). For each name that appears more than once it logs one warning
-naming the name, the rows (line numbers) that repeat it and the row that wins (the last one, as TSVZ reads it). The file
-stays as it is. Cleaned-name collisions (two rows whose names become one job name) keep their existing STOPPED rule.
+At each daemon start, `parse_rules` counts the rule file's job-name cells as TSVZ 4.9's `_processLine` keys them: line 1
+is the header and is never counted; `\x00` and line ends stripped; a raw line starting with `#` (but not
+`#_defaults_#`) is a comment; the key is the first cell right-stripped; an empty key and `#_defaults_#` are skipped;
+line numbers are physical, from 1. For each name on more than one line it logs one warning (`tl.teelog`, level
+warning: journal and log folder; no alert pattern matches) naming the name, the lines and the line that wins (the last).
+A last row with no non-empty cell after the name deletes the key in TSVZ: then no row wins and the job is dropped, and
+the warning says so. Commands (`parse_rules(read_only=True)`) do not print it. It repeats at every start until the file
+is fixed. Cleaned-name collisions (two rows whose names become one job name) keep their existing STOPPED rule.
+
+The file stays as it is (the user's words): `rewrite_rule_rows()` today removes the earlier lines with the same key
+whenever the winning row is written back for filled-in cells; it keeps them now. On the live /etc/reverb_rule.tsv the
+first 0.49 start prints five warnings (work 5/10, kes_files 6/11, panruixin_files 7/12, shenshuhong_files 8/13,
+passwords 9/14; the later line wins each time), rewrites nothing, and the file stays byte for byte.
 
 ## Goal 4: version 0.49, docs
 
 - `__version__ = 0.49`, pyproject `version = "0.49"`.
 - docs/limitations.md: remove the two deferred entries this round closes ("A rename in a rename-heavy batch can fail and
   log a traceback", "Repeated job names in the rule file") and their README lines; README design lines for Goals 1-3.
-- Open for the user in the morning, not written down: causes 3 cost a copy of an unchanged file (its chain link to the
-  older copy is lost) — a known limitation, or a later collapse change that keeps the links.
+- The approved entry "A move into a folder made after an earlier move in one batch": its wording changes where Goal 2
+  removes its traceback (fact correction, in Calls to confirm).
+- Open for the user in the morning, not written down: (1) cause 3 costs a copy of an unchanged file (its chain link to
+  the older copy is lost): widen the approved entry "A move into a folder made after an earlier move in one batch" to
+  cover `mkdir x; mv old x/f; mv x y` and `mv a/f g; mv a A; mv g h`, or a later collapse change that keeps the links;
+  (2) the pre-existing collapse of `mv q a; rm a` (with `a` in the version) leaves the old `a` until the verification
+  removes it.
 
 ## Non-goals
 
