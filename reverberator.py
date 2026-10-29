@@ -4865,6 +4865,9 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 	backup_entries = OrderedDict()
 	pendingMoveSourceParents = set()
 	moveSourceToDestDict = {}
+	# the first destinations of the moves the escalation made copies of and carried on, where it left a delete of what
+	# the version holds there
+	escalation_deletes = set()
 	# what the events after the one at hand did to each path ( a folder's ending with / ), as (when, where to): a move
 	# out of the path, or None for what ended it there ( a delete, or a move onto it ). when counts down the batch, so the
 	# greatest is the soonest after the event at hand
@@ -4951,6 +4954,12 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		if event == 'move':
 			if abs_moved_from:
 				pendingMoveSourceParents.add(abs_moved_from)
+				# an earlier move takes what the version holds there away ( mv d/g x; echo new > f; mv f d/g; mv d D;
+				# mv D/g h ), so the escalation's delete there would remove what this move still needs
+				for gone in [p for p in escalation_deletes if p == abs_moved_from or (abs_moved_from.endswith('/') and p.startswith(abs_moved_from))]:
+					escalation_deletes.discard(gone)
+					if gone in backup_entries and backup_entries[gone].event == 'delete':
+						del backup_entries[gone]
 				if abs_path in moveSourceToDestDict:
 					# chain move, we will modify the chronologically later move event's source to this event's source
 					finialTarget = moveSourceToDestDict[abs_path]
@@ -5031,7 +5040,42 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					# no longer a move, it is replayed where the moves after the move it was carried it ( echo new > a;
 					# mv a d/a; mv d e is a modify of e/a ), once they are made
 					now_at, escalated_bound = carried(moveDest, entry_when.get(moveDest), True) if own else (moveDest, None)
-					if now_at is None:
+					# the entry's own later moves, which the carry reached through a moved folder above it ( mv f d/g;
+					# mv d D; mv D/g h ), go with it: this move is a copy now, so the version never holds their source.
+					# each is the move the carry stopped at, found by when, and dropped, and the carry goes on from it
+					dropped_own = False
+					while own and now_at is not None and now_at != moveDest:
+						stops = later.get(now_at) or []
+						i = len(stops) if escalated_bound is None else bisect.bisect_left(stops, (escalated_bound,))
+						if not i or stops[i - 1][1] is None:
+							# something ended the entry there: the copy lands as it would without its own moves
+							break
+						dest = stops[i - 1][1]
+						if not (dest in backup_entries and backup_entries[dest].event == 'move' and backup_entries[dest].source_path == now_at):
+							# chain merged on to its end ( mv D/g h; mv h k ): the dict's, only when nothing came to the
+							# path between them
+							if i != len(stops) or now_at not in moveSourceToDestDict:
+								break
+							dest = moveSourceToDestDict[now_at]
+							if dest not in backup_entries or backup_entries[dest].event != 'move' or backup_entries[dest].source_path != now_at:
+								break
+						del backup_entries[dest]
+						if moveSourceToDestDict.get(now_at) == dest:
+							del moveSourceToDestDict[now_at]
+						dropped_own = True
+						now_at, escalated_bound = carried(dest, entry_when.get(dest), True)
+					if now_at is not None and dropped_own:
+						# the copy lands where the entry ends. what the version holds at the first destination ( a file
+						# the move replaced ) goes, as the dropped moves would have taken it away
+						escalated = backup_entries.pop(moveDest)
+						backup_entries[moveDest] = BackupEntryValues(escalated.iso_time,'delete',None)
+						escalation_deletes.add(moveDest)
+						if now_at not in backup_entries or backup_entries[now_at].event == 'attrib' or not stands(now_at, escalated_bound):
+							backup_entries[now_at] = escalated
+							entry_when[now_at] = escalated_bound
+							backup_entries.move_to_end(now_at)
+						moveSourceToDestDict[source_key] = now_at
+					elif now_at is None:
 						# removed after the moves carried it ( mv d e; rm -r e ): nothing of it is copied, and what the version
 						# holds at its key goes. the key stays taken, so no earlier event of the path is replayed either
 						backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,'delete',None)
