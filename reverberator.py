@@ -5595,9 +5595,17 @@ def persist_pending_transactions(job_name:str, vault_path:str, to_process:'Chang
 	if not pending_rows:
 		return
 	job_vault = os.path.join(vault_path, job_name)
-	if not os.path.isdir(vault_path) and all(row[2] == 'full_scan' for row in pending_rows):
-		# a full scan request alone is what a start with no file does anyway: it does not create a vault that is not there
-		# (a stop while a scheduled comparison waits for the vault to come back)
+	# the vault is checked live (the backuper unregistered its flag before this): a stop while a change or a scheduled
+	# comparison waits for a vault that is not there must not make folders under its mount point. the queued changes are
+	# dropped, as the next start compares the whole tree anyway
+	if not os.path.isdir(vault_path):
+		why = 'is not a folder'
+	elif (problem := vault_disk_problem(vault_path)) is not None:
+		why = f'is not ready ({problem})'
+	else:
+		why = None
+	if why is not None:
+		backuperTeeLogToTl(job_name, f'Not saving {len(pending_rows)} pending transactions: vault path {vault_path} {why}; the next start compares the whole tree', warning=True)
 		return
 	pending_transactions_path = os.path.join(job_vault, PENDING_TRANSACTIONS_FILE_NAME)
 	try:
