@@ -60,6 +60,24 @@ loses no chain link.
 The user's words said "so the rename works": in Goal 1's case there is nothing in the version to rename, so the right
 result is the copy at the end path (the main session's call; the user's intent, no traceback and a right replay, holds).
 
+## Goal 1b: a delete that holds a move's source replays after that move (added during the build)
+
+Found by Task 1's review (the plainest form of the user's "the replay order that loses the move's source"): with a
+folder `d/` holding `g` in the version, `mv d/g y; rm -r d` collapses to `y <- d/g` and `delete d/`; the replay runs
+deletes first (`order_backup_entries_for_replay`, step 1), so `d/` and its `g` are gone before the rename: a traceback,
+a delete-and-copy, and `y` loses its chain link. On ecf386a and every round 13 tree.
+
+Rule: a delete whose path is the source of a move in the batch, or a folder above one, is not hoisted with the other
+deletes: it replays right after the last move (in the collapse's order, which is time order) whose source lies at or
+under it, and before any later move or create whose destination lies at or under it; every other delete keeps today's
+place at the front. The replay waits for that delete's `rm` before the next entry that touches its path (as the delete
+barrier does today for the front group). Where a later entry must come before it and an earlier move must come after it
+(no such order exists), today's order stands and Goal 2's warning covers the rename. Tests: the case above (a file, a
+folder moved out, several files moved out, the folder remade and refilled after), each with and without the
+verification, asserting no fallback line, the version equals the tree and the moved-out files keep their links; the
+existing ordering tests and doctests keep passing; the review's random replay set (scratchpad r13/review-t1) shows no
+batch worse with the verification. (The main session's call, within the user's item.)
+
 ## Goal 2: a rename that finds nothing logs one warning, not a traceback
 
 In the replay's move step, a `FileNotFoundError` from the rename (`os.rename`) gets its own `except`: one warning line
