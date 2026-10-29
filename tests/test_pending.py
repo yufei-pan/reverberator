@@ -142,13 +142,14 @@ def _queue(job):
 
 
 @pytest.mark.parametrize('kind', ['missing', 'a file'])
-def test_a_stop_with_the_vault_path_not_a_folder_writes_nothing_and_says_so(job, lines, kind):
+def test_a_stop_with_the_vault_path_missing_or_not_a_folder_writes_nothing_and_says_so(job, lines, kind):
 	vault = os.path.join(job.root, 'gone')
 	if kind == 'a file':
 		open(vault, 'w').write('x')
 	rv.persist_pending_transactions(job.job_name, vault, _queue(job))
 	assert (os.path.isfile(vault) if kind == 'a file' else not os.path.lexists(vault))
-	assert [line for line in lines if line.startswith(f'Not saving 1 pending transactions: vault path {vault} is not a folder')]
+	says = 'is not a folder' if kind == 'a file' else 'does not exist'
+	assert [line for line in lines if line.startswith(f'Not saving 1 pending transactions: vault path {vault} {says};')]
 
 
 def test_a_stop_with_the_vault_under_an_unmounted_fstab_mount_writes_no_pending_file(job, fake_pool, lines):

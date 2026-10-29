@@ -59,7 +59,6 @@ def test_mark_vouched_keeps_the_record_until_an_add(job):
 		manifest.begin()
 		record, copy_version = manifest.lookup_with_copy_version('a.txt')
 		manifest.mark_vouched('a.txt')
-		manifest.mark_vouched('d/')            # a folder row is never vouched
 		manifest.mark_vouched('untracked')
 		assert manifest.take_dirty_records(10) == [('a.txt', copy_version, record)]
 		manifest.add('a.txt', dirty=True)

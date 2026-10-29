@@ -1713,10 +1713,9 @@ def event_entry_for(job, rel, event):
 	return event_entry(job, rel, event)
 
 
-
 def test_a_sweep_removal_that_fails_fails_the_batch_and_the_retry_commits(job, monkeypatch):
 	import errno
-	from tests.test_io_errors import committed_versions
+	from tests.harness import committed_versions
 	seed_monitor(job, {'keep.txt': 'k', 'b.txt': 'b'})
 	run_backup(job)
 	v0 = committed_versions(job)[0]
