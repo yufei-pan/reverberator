@@ -1553,6 +1553,16 @@ def test_a_vouched_chmod_reads_no_vault_data_and_keeps_its_hash_and_unchecked_fl
 	assert_moved_cleanly(logged)
 
 
+def test_a_vouched_chmod_of_an_unchecked_copy_keeps_it_unchecked(job, monkeypatch):
+	seed_monitor(job, {'x': 'x' * 100000, 'keep': 'k'})
+	run_backup(job)                            # not read back yet: unchecked
+	assert record_of(job, 'x').unchecked == 1
+	os.chmod(f'{job.monitor}/x', 0o600)
+	hashed = vault_hashes(job, monkeypatch)
+	verified(job, (False, 'attrib', 'x', None))
+	assert hashed == [] and record_of(job, 'x').unchecked == 1
+
+
 def test_a_vouched_row_whose_chain_end_changed_before_the_commit_is_hashed(job, monkeypatch):
 	seed_monitor(job, {'x': 'x' * 100000, 'keep': 'k'})
 	run_backup(job)
