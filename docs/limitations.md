@@ -376,7 +376,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   restart, when the disk mounts without that folder. With an N/A or auto Vault File System Signature and such a disk
   unmounted at start, the job backs up into the bare folder on the disk below until the disk mounts: those versions are
   hidden then and use that disk's space, and an auto signature filled from such a folder is the disk below's. This is
-  the same as in 0.47.
+  the same as in 0.47; once the disk mounts, such a job waits on the wrong signature, with repeated FAILED alerts, until
+  the cell is set back to auto.
 - **Why:** such mounts are not known to reverberator without reading systemd units or autofs maps, and checking the
   signature at a stop runs df and lsblk, which can block on a hung disk.
 - **Revisit when:** a host keeps a vault on such a disk.
@@ -387,10 +388,11 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** while an fstab mount point is not mounted, a disk mounted some other way below it (by hand,
-  by a systemd .mount unit) does not count as there. A vault or monitored path on it waits with the FAILED: waiting
+  by a systemd .mount unit, by autofs) does not count as there. A vault or monitored path on it waits with the FAILED: waiting
   marker naming the fstab point. Put the disk in /etc/fstab, or mount the fstab point first.
-- **Why:** the mount table cannot tell a disk from a bind mount of a root-disk folder or a tmpfs, and those must not
-  count: a vault could land on the root disk or in RAM.
+- **Why:** a bind mount of a root-disk folder or a tmpfs mounted there must not count (a vault could land on the root
+  disk or in RAM), and telling them apart from a disk needs rules on a mount's type, source and root: extra parts for a
+  layout this host does not use.
 - **Revisit when:** a host mounts a vault or monitored disk that way.
 - **Approved:** 2026-10-29, the user's choice "Revert it, known limitation (Recommended)".
 
@@ -400,8 +402,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** in a batch where a file is moved into a folder that is then renamed, and the file is moved
   again, the replay's rename can fail with FileNotFoundError. It logs "Failed to move" with a traceback at error level,
   falls back to delete and copy, and the versions come out right. It is the same in 0.47.
-- **Why:** the replay order loses the move's source; the fallback keeps the result right, so it is not fixed in this
-  round.
+- **Why:** the cause was not found in round 12; the delete-and-copy fallback keeps the result right.
 - **Revisit when:** round 13: find the replay order that loses the move's source.
 - **Approved:** 2026-10-29, the user's choice "Defer to round 13 (Recommended)".
 
