@@ -19,6 +19,9 @@ user chose.
 - Round 12: "yes start now".
 - After the spec check (2026-10-28): a stop that drops queued changes while an older pending file stays in the vault:
   "Known limitation (Recommended)".
+- During the build (2026-10-28), on the monitored side: gating monitored waits by the same fstab check: "Add to round 12
+  (Recommended)"; filling an auto Monitoring File System Signature only from a folder whose disk is there: "Add to round
+  12 (Recommended)".
 - Standing: nothing is merged, pushed or restarted without the user; known limitations and deferrals need the user's OK.
 
 ## Goal 1: never create or write into a vault that is not there
@@ -64,6 +67,12 @@ path exists, the check above decides.
   vault was there, and not yet loaded because the next start never got past the vault wait) stays; a later start may
   replay it, and the dropped changes are missed until the next full comparison, as changes made while the daemon is down
   would be when the quick resume check passes.
+
+**The monitored side (added during the build).** The monitored-path waits (the watcher's and the backuper's) make the
+same disk check on the monitored path: while an fstab mount at or above it is not mounted, or its pool has a missing
+disk, the job waits with the FAILED: waiting marker, so an unmounted disk's empty bare folder is never backed up as
+every file deleted. parse_rules fills an auto Monitoring File System Signature only from a folder whose disk is there;
+otherwise the cell stays auto with one warning, as for the vault.
 
 ## Goal 2: a vouched attribute change reads nothing from the vault
 
