@@ -246,13 +246,16 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation, already in 0.45.
 - **What the operator sees:** a file rewritten in place while the daemon is down, at the same size and with its mtime set
-  back, changed only before its last 64 KiB, is missed at the restart and kept wrong until it changes again.
+  back, changed only before its last 64 KiB, is missed at the restart and kept wrong until it changes again. So is such
+  a rewrite made while the daemon ran, when a stop with the vault not there dropped its event: the start's full
+  comparison has the same blind spot.
 - **Why:** a full comparison checks size, mtime and the tail hash; utime cannot set ctime back, but ctime is not checked.
   Reading the whole file when its ctime is after the matched time would catch it, but making that check affordable
   needed three more parts, for a rare case.
 - **Revisit when:** such rewrites are seen in practice.
 - **Approved:** 2026-10-27, the user's choice "Defer to round 11 (Recommended)"; then 2026-10-27, on that whole-file
-  check: "why do we bother?", then "Drop it, known limitation (Recommended)".
+  check: "why do we bother?", then "Drop it, known limitation (Recommended)"; 2026-10-28, on widening it to a rewrite
+  made while running whose event a stop dropped: "Widen it (Recommended)".
 
 ### A write error in the middle of a copy after the reboot
 
@@ -336,10 +339,12 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   pending file already in the job vault, saved by an earlier stop while the vault was there and not loaded since because
   no start got past the vault wait, stays. A later start replays it only when its resume check passes: the newest mtime
   in the monitored tree is at least 1 s older than the file, so a dropped content change, create or delete (each moves
-  an mtime) fails the check and the tree is compared in full. What can be missed is an attribute-only change (chmod,
-  chown, an xattr) or one that kept its mtime, and only in the replayed batch's version: the whole-tree comparison that
-  follows every replayed batch, in the same start and from a matched time the replay did not move, puts them in the
-  next version.
+  an mtime, unless a tool such as rsync -a or tar x sets the mtimes back) fails the check and the tree is compared in
+  full. What can be missed is an attribute-only change (chmod, chown, an xattr) or one whose mtimes were kept or set
+  back, and only in the replayed batch's version: the whole-tree comparison that follows every replayed batch, in the
+  same start and from a matched time the replay did not move, puts them in the next version, as any full comparison
+  would; a same-size rewrite that kept its mtime and changed only before its last 64 KiB is missed by it too (see "A
+  rewrite made while down that keeps size and mtime").
 - **Why:** the stop cannot remove the old file from a vault that is not there, and the start that finds it cannot tell it
   from a current one; the case needs a stop with changes queued while the vault was there, a start that never got past
   the vault wait, and a second stop with changes queued.
@@ -359,3 +364,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   removed for a chmod or chown over a large tree, for a loss confined to a few seconds after a commit.
 - **Revisit when:** a restore is seen giving an old mode or owner after a power loss or a write error.
 - **Approved:** 2026-10-28, the user's choice "Keep checked, known limitation (Recommended)".
+
+### Vault disks mounted outside fstab
+
+- **Kind:** known limitation.
+- **What the operator sees:** the disk check reads /etc/fstab and mergerfs pools, and the stop checks the disk, not the
+  vault's signature. So a vault on a disk mounted outside fstab (by hand, by a systemd .mount unit, by autofs) that is
+  unmounted when reverberator stops gets the job's pending file on the bare mount point, and one that is unmounted when
+  it starts gets its Vault Path made there. Both are hidden once the disk mounts, and nothing is lost: the next start
+  compares the whole tree. But a start that made the folder there then waits with "vault filesystem not ready" until a
+  restart, when the disk mounts without that folder.
+- **Why:** such mounts are not known to reverberator without reading systemd units or autofs maps, and checking the
+  signature at a stop runs df and lsblk, which can block on a hung disk.
+- **Revisit when:** a host keeps a vault on such a disk.
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)"; then "Fold into that entry
+  (Recommended)" for the start.
