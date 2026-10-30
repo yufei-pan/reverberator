@@ -10,17 +10,18 @@ from tests.test_moves_then_changes import BAD_LINES, batch, logged, verified, as
 pytestmark = pytest.mark.unit
 
 NOT_IN_VERSION = 'is not in the version; copying it instead'
+INSIDE_OLD_PLACE = 'its new place is inside its old one in the version; copying it instead'
 
 
 def fallbacks(lines:list) -> list:
 	'''The first line of each logged line of an error, a traceback, or a rename or copy that found nothing.'''
 	return [line.splitlines()[0] for line in lines if line.startswith('ERROR ') or
-		any(word in line for word in ('Traceback', NOT_IN_VERSION, 'Not tracking', 'Cannot read', *BAD_LINES))]
+		any(word in line for word in ('Traceback', NOT_IN_VERSION, INSIDE_OLD_PLACE, 'Not tracking', 'Cannot read', *BAD_LINES))]
 
 
 def warned(lines:list) -> list:
 	'''The first line of each logged line of a rename that found nothing and was copied instead.'''
-	return [line.splitlines()[0] for line in lines if NOT_IN_VERSION in line]
+	return [line.splitlines()[0] for line in lines if NOT_IN_VERSION in line or INSIDE_OLD_PLACE in line]
 
 
 def apply(monitor:str, steps:list) -> None:
@@ -514,4 +515,35 @@ def test_file_source_remade_as_a_folder_after_a_moved_on_rename(job, logged):
 	v = verified(job, (True, 'create', 'x', None), (False, 'move', 'x/f', 'old'), (True, 'move', 'y', 'x'), (True, 'create', 'old', None),
 		(False, 'create', 'old/n', None))
 	assert len(warned(logged)) == 1 and fallbacks(logged) == warned(logged)
+	assert_version_is_the_tree(job, v)
+
+
+INSIDE_ITS_OLD_PLACE = {
+	# a move whose target lies under its own source: the version can never rename it ( EINVAL for a folder, NotARealFolder for a file )
+	'folder_into_a_new_folder_of_its_name': ({'D/': None, 'D/a': 'A\n', 'D/s/b': 'B\n'},
+		[('mv', 'D', 'x'), ('mkdir', 'D'), ('mv', 'x', 'D/D')],
+		[(True, 'move', 'x', 'D'), (True, 'create', 'D', None), (True, 'move', 'D/D', 'x')]),
+	'file_into_a_new_folder_of_its_name': ({'f': 'F\n'}, [('mv', 'f', 'x'), ('mkdir', 'f'), ('mv', 'x', 'f/f')],
+		[(False, 'move', 'x', 'f'), (True, 'create', 'f', None), (False, 'move', 'f/f', 'x')]),
+	'folder_swapped_into_its_replacement': ({'E/e/': None, 'E/e/a': 'A\n', 'd/': None, 'd/h': 'H\n'},
+		[('mv', 'E/e', 'b'), ('mv', 'd', 'E/e'), ('mv', 'b', 'E/e/E')],
+		[(True, 'move', 'b', 'E/e'), (True, 'move', 'E/e', 'd'), (True, 'move', 'E/e/E', 'b')]),
+	# the live entry gone again in the batch ( its new folder D moved to W, then D/D removed )
+	'folder_moved_on_again': ({'D/': None},
+		[('mv', 'D', 'x'), ('mkdir', 'D'), ('mv', 'x', 'D/D'), ('mv', 'D', 'W'), ('rmdir', 'W/D')],
+		[(True, 'move', 'x', 'D'), (True, 'create', 'D', None), (True, 'move', 'D/D', 'x'), (True, 'move', 'W', 'D'), (True, 'delete', 'W/D', None)]),
+}
+
+
+@pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
+@pytest.mark.parametrize('name', sorted(INSIDE_ITS_OLD_PLACE))
+def test_a_move_whose_target_lies_under_its_own_source_is_not_tried_but_warned_once(job, logged, name, with_verification):
+	seed, steps, events = INSIDE_ITS_OLD_PLACE[name]
+	seed_monitor(job, seed)
+	run_backup(job)
+	apply(job.monitor, steps)
+	del logged[:]
+	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
+	assert len(warned(logged)) == 1 and INSIDE_OLD_PLACE in warned(logged)[0]
+	assert fallbacks(logged) == warned(logged)          # no ERROR line, no traceback
 	assert_version_is_the_tree(job, v)
