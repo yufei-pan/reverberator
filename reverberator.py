@@ -2154,7 +2154,10 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 			result.append('\t'.join(cells) + line[len(line.rstrip('\r')):])
 		else:
 			result.append(line)
-	replace_file_text(rule_file, '\n'.join(result))
+	text = '\n'.join(result)
+	# a rewrite that changes nothing (a repeated name that stays dirty, every cell filled) leaves the file, its inode and mtime as they are
+	if text != '\n'.join(lines):
+		replace_file_text(rule_file, text)
 
 def repeated_job_names(content:bytes) -> OrderedDict:
 	'''
@@ -2350,9 +2353,10 @@ def parse_rules(rule_file:str, read_only:bool = False):
 	rules = TSVZ.readTabularFile(rule_file,header=rule_file_header(rule_file),verifyHeader=True,strict=False,verbose=False,correctColumnNum=len(REVERB_RULE_TSV_HEADER))
 	if not read_only:
 		try:
-			with open(rule_file, 'rb') as f:
+			with TSVZ.openFileAsCompressed(rule_file, mode='rb') as f:
 				repeated = repeated_job_names(f.read())
-		except OSError:
+		except Exception:
+			# a file TSVZ read but cannot be read again whole (a truncated .gz raises EOFError) gets no warning
 			repeated = {}
 		for name, where in repeated.items():
 			lines = ', '.join(str(number) for number, _ in where)

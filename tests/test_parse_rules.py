@@ -669,3 +669,28 @@ def test_a_repeated_dirty_name_stays_one_job_at_the_next_start(job):
 	assert [line.split('\t')[0] for line in lines[1:]] == ['My Job', 'My Job'] and lines[2].split('\t')[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
 	rules = rv.parse_rules(job.rule_path)
 	assert [rule.job_name for rule in rules] == ['my-job'] and rv.colliding_job_names(rules) == {}
+
+
+def test_a_compressed_rule_file_with_a_repeated_name_is_warned(job, capsys):
+	import gzip
+	stub = '\t'.join([job.job_name, job.monitor, job.vault])
+	_rule_file(job, HEADER_14, stub, rule_row(job))
+	rule_path = job.rule_path + '.gz'
+	with gzip.open(rule_path, 'wb') as f:
+		f.write(open(job.rule_path, 'rb').read())
+	os.remove(job.rule_path)
+	assert [rule.job_name for rule in rv.parse_rules(rule_path)] == [job.job_name]
+	assert f'Warning: Job name {job.job_name} is on lines 2, 3 of {rule_path}: line 3 is used and the others are ignored.' in capsys.readouterr().out
+
+def test_a_repeated_dirty_name_leaves_the_rule_file_alone_at_the_second_start(job):
+	row = rule_row(job, min_snapshot='auto')
+	row[0] = 'My Job'
+	_rule_file(job, HEADER_12, row, row)
+	rv.parse_rules(job.rule_path)
+	os.utime(job.rule_path, ns=(1_000_000_000, 1_000_000_000))
+	before = os.stat(job.rule_path)
+	content = open(job.rule_path, 'rb').read()
+	rv.parse_rules(job.rule_path)
+	after = os.stat(job.rule_path)
+	assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+	assert open(job.rule_path, 'rb').read() == content
