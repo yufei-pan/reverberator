@@ -128,20 +128,25 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)"; corrected 2026-10-29, "Correct the entry
   (Recommended)".
 
-### A move after another move of the batch took its source or folder is copied
+### A move that another change of the batch outran is copied
 
 - **Kind:** known limitation.
-- **What the operator sees:** a move whose source, or the folder it goes into, the version holds elsewhere when the move
-  replays, because another move of the same batch took it, logs one warning, `Not renaming … to …: its source or the
-  folder it goes into is not in the version; copying it instead`, with no traceback (firewatcher does not alert on it),
-  and the entry is copied once more, losing its chain links: its files are written to the vault again in full. Shapes:
-  `mv d e; mkdir e/sub; mv x e/sub/x` (x copied), `mv a/f g; mv a A; mv g h` (h copied), `mkdir x; mv old x/f; mv x y`
-  (y/f copied) and `mv D/sub t; rm -r D; mv t D` (D's files copied). The result is right.
+- **What the operator sees:** a move whose source, or the folder it goes into, is not in its place in the version when
+  the move replays, because another change of the same batch (a move, a delete, or a folder made after it) replays in
+  another order, logs one warning, `Not renaming … to …: its source or the folder it goes into is not in the version;
+  copying it instead`, with no traceback (firewatcher does not alert on it), and the entry is copied once more: its files
+  are written to the vault again in full, losing their chain links. Some of these shapes also log a warning `Not tracking
+  <path>: source no longer exists` for a copy the batch left behind. Examples: `mv d e; mkdir e/sub; mv x e/sub/x` (x
+  copied), `mv a/f g; mv a A; mv g h` (h copied), `mkdir x; mv old x/f; mv x y` (y/f copied), `mv D/sub t; rm -r D; mv t
+  D` (D's files copied), `mv d D; mv D/k z; rm -r D` (z copied), and, with a new file f, `echo new > f; mv f d/g; mv d D;
+  mv D/g h; mkdir d; mv q d/g` (q copied). One shape logs nothing: `mv d e; mkdir d; touch f; mv f d/g; mv d D; rm D/g`
+  with an empty new file, where the comparison after the batch copies e/g again. The result is right.
 - **Why:** replaying such moves so the version follows them is a larger change to the batch's collapse and replay, for
   one extra copy in a rare order.
 - **Revisit when:** the warning shows up often in the live logs.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)"; widened 2026-10-29, "Widen the known
-  limitation (Recommended)".
+  limitation (Recommended)", then for the older collapse shapes "Widen the known limitation (Recommended)" and for the
+  silent one "Fold into the widened entry (Recommended)".
 
 ### One folder renamed back and forth thousands of times in one batch
 
