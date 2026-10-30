@@ -13,6 +13,11 @@ slept: "if there are things you can do in round 13 you can start it after you ar
   "One warning, copy (Recommended)", on "A move whose target is under its own source in the version is not tried: one
   warning line, no ERROR, no traceback, then the copy as today"; and for the copy's cost (the moved folder's files written
   again, their chain links lost): "Known limitation (Recommended)".
+- After Task 4's review (2026-10-29): the approved entry "Swaps in one batch are repaired by copies" says two folders are
+  copied whole and a file swapped with a folder logs one ERROR line: "Correct the entry (Recommended)"; the copy of an
+  unchanged entry in `mv a/f g; mv a A; mv g h`, `mkdir x; mv old x/f; mv x y` and `mv D/sub t; rm -r D; mv t D` (one
+  warning each in 0.49): "Widen the known limitation (Recommended)", the approved entry "A move into a folder made after
+  an earlier move in one batch".
 - Standing: nothing is merged, pushed or restarted without the user; known limitations and deferrals need the user's OK.
 
 ## What the investigation found (round 13 scratch, before this design)
