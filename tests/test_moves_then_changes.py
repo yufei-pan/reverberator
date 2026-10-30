@@ -17,7 +17,8 @@ from tests.harness import seed_monitor, run_backup, wait_for_committed_count, la
 pytestmark = pytest.mark.unit
 
 root_only = pytest.mark.skipif(os.geteuid() != 0, reason='chown needs root')
-BAD_LINES = ('IsADirectoryError', 'Failed to move', 'Doing delete & copy instead')
+# a copy that found nothing is a warning line ( Not tracking ... ), still one these batches must not log
+BAD_LINES = ('IsADirectoryError', 'Failed to move', 'Doing delete & copy instead', ': source no longer exists')
 
 
 @pytest.fixture(autouse=True)

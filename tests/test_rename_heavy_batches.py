@@ -5,7 +5,7 @@ import os
 import pytest
 import reverberator as rv
 from tests.harness import seed_monitor, run_backup
-from tests.test_moves_then_changes import BAD_LINES, batch, logged, verified, assert_version_is_the_tree  # noqa: F401
+from tests.test_moves_then_changes import BAD_LINES, batch, logged, tracked, verified, assert_version_is_the_tree  # noqa: F401
 
 pytestmark = pytest.mark.unit
 
@@ -45,6 +45,17 @@ def apply(monitor:str, steps:list) -> None:
 			raise AssertionError(kind)
 
 
+def watched(events:list, form:str) -> list:
+	'''events as the watcher queues them: create alone (form 'create', as for an empty file), or ('create_modify')
+	a modify after each create of a file, as for a file written with text.'''
+	if form == 'create':
+		return list(events)
+	return [e for event in events for e in ([event, (False, 'modify', event[2], None)] if event[:2] == (False, 'create') else [event])]
+
+
+FORMS = ['create', 'create_modify']
+
+
 CASES = {
 	# name: (seed, steps, the watcher's events of the steps)
 	'new_file': ({'d/': None}, [('w', 'f', 'new\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('mv', 'D/g', 'h')],
@@ -63,6 +74,8 @@ CASES = {
 	'moved_out_then_its_folder_moved': ({'d/': None, 'e/': None},
 		[('w', 'f', 'new\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('mv', 'D/g', 'e/h'), ('mv', 'e', 'E')],
 		[(False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'e/h', 'D/g'), (True, 'move', 'E', 'e')]),
+	'removed_after_the_folder_move': ({'d/': None, 'd/k': 'K\n'}, [('w', 'f', 'new\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('rm', 'D/g')],
+		[(False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'delete', 'D/g', None)]),
 	'moved_out_then_removed': ({'d/': None}, [('w', 'f', 'new\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('mv', 'D/g', 'h'), ('rm', 'h')],
 		[(False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g'), (False, 'delete', 'h', None)]),
 	'chmod_between': ({'d/': None}, [('w', 'f', 'new\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('chmod', 'D/g'), ('mv', 'D/g', 'h')],
@@ -170,6 +183,16 @@ CASES = {
 		[('w', 'f', 'new\n'), ('mv', 'd', 'e'), ('mkdir', 'd'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('rm', 'D/g')],
 		[(False, 'create', 'f', None), (True, 'move', 'e', 'd'), (True, 'create', 'd', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
 		(False, 'delete', 'D/g', None)]),
+	# the folder moved away and made again before the copy came, which is then removed: the version's older file
+	# moves with the folder, so nothing removes it first
+	'folder_moved_away_and_remade_then_removed': ({'d/g': 'OLD\n'},
+		[('mv', 'd', 'e'), ('mkdir', 'd'), ('w', 'f', 'new\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('rm', 'D/g')],
+		[(True, 'move', 'e', 'd'), (True, 'create', 'd', None), (False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'delete', 'D/g', None)]),
+	'saved_file_into_a_folder_moved_away_and_remade_then_removed': ({'d/g': 'OLD\n', 'f': 'F\n'},
+		[('mv', 'd', 'e'), ('mkdir', 'd'), ('w', 'f', 'saved\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('rm', 'D/g')],
+		[(True, 'move', 'e', 'd'), (True, 'create', 'd', None), (False, 'modify', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'delete', 'D/g', None)]),
 	'folder_moved_then_backup_save_then_removed': ({'d/g': 'OLD\n'},
 		[('mv', 'd', 'D'), ('w', 'f', 'new\n'), ('mv', 'D/g', 'y'), ('mv', 'f', 'D/g'), ('rm', 'D/g')],
 		[(True, 'move', 'D', 'd'), (False, 'create', 'f', None), (False, 'move', 'y', 'D/g'), (False, 'move', 'D/g', 'f'), (False, 'delete', 'D/g', None)]),
@@ -191,15 +214,18 @@ CASES = {
 # where the older file of those cases is in the end: its own move keeps its chain link
 OLDER_MOVED_AWAY = {'backup_save_then_folder_moves': 'y', 'older_folder_out_after_create': 'e/g', 'older_out_between_chain': 'y',
 	'older_folder_out_between_chain': 'e/g', 'backup_save_then_folder_moved_then_removed': 'y', 'older_folder_out_then_removed': 'e/g',
-	'folder_moved_then_backup_save_then_removed': 'y'}
+	'folder_moved_then_backup_save_then_removed': 'y', 'folder_moved_away_and_remade_then_removed': 'e/g',
+	'saved_file_into_a_folder_moved_away_and_remade_then_removed': 'e/g'}
 # without the verification these keep the version's older file under a move onto it then removed ( mv q a; rm a ), left open
 BARE_DIFFERS = {'move_onto_then_rm', 'moved_onto_first'}
 
 
+@pytest.mark.parametrize('form', FORMS)
 @pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
 @pytest.mark.parametrize('name', sorted(CASES))
-def test_a_file_made_in_the_batch_moved_through_folder_moves_is_copied_where_it_ends(job, logged, name, with_verification):
+def test_a_file_made_in_the_batch_moved_through_folder_moves_is_copied_where_it_ends(job, logged, name, with_verification, form):
 	seed, steps, events = CASES[name]
+	events = watched(events, form)
 	seed_monitor(job, seed)
 	run_backup(job)
 	apply(job.monitor, steps)
@@ -222,6 +248,25 @@ def test_the_minimal_batch_copies_h_and_leaves_nothing_at_D_g(job, logged):
 	assert open(os.path.join(v, 'h')).read() == 'new\n'
 	assert not os.path.lexists(os.path.join(v, 'D/g')) and os.path.isdir(os.path.join(v, 'D'))
 	assert not fallbacks(logged), fallbacks(logged)
+
+
+@pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
+@pytest.mark.parametrize('then', ['moved_out', 'removed'])
+def test_a_file_the_version_holds_saved_twice_then_moved_through_a_moved_folder(job, logged, then, with_verification):
+	# an editor's two saves before the move: the move is escalated to one copy, once
+	seed_monitor(job, {'d/': None, 'd/k': 'K\n', 'f': 'old\n'})
+	run_backup(job)
+	last = ('mv', 'D/g', 'h') if then == 'moved_out' else ('rm', 'D/g')
+	apply(job.monitor, [('w', 'f', 'save 1\n'), ('w', 'f', 'save 2\n'), ('mv', 'f', 'd/g'), ('mv', 'd', 'D'), last])
+	del logged[:]
+	events = [(False, 'modify', 'f', None), (False, 'modify', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'move', 'h', 'D/g') if then == 'moved_out' else (False, 'delete', 'D/g', None)]
+	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
+	assert not fallbacks(logged), fallbacks(logged)
+	assert_version_is_the_tree(job, v)
+	assert os.path.islink(os.path.join(v, 'D/k'))
+	if then == 'moved_out':
+		assert open(os.path.join(v, 'h')).read() == 'save 2\n'
 
 
 @pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
@@ -376,10 +421,12 @@ EMPTIED = {
 }
 
 
+@pytest.mark.parametrize('form', FORMS)
 @pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
 @pytest.mark.parametrize('name', sorted(EMPTIED))
-def test_a_folder_emptied_by_moves_then_removed_lets_them_rename(job, logged, name, with_verification):
+def test_a_folder_emptied_by_moves_then_removed_lets_them_rename(job, logged, name, with_verification, form):
 	seed, steps, events, linked = EMPTIED[name]
+	events = watched(events, form)
 	seed_monitor(job, seed)
 	run_backup(job)
 	apply(job.monitor, steps)
@@ -428,6 +475,35 @@ def test_a_move_whose_source_never_reached_the_version_is_copied(job, logged, is
 	assert_version_is_the_tree(job, v2)
 
 
+@pytest.mark.parametrize('where', ['entry', 'in_its_folder'])
+def test_the_copy_of_an_entry_gone_from_the_live_tree_logs_a_warning(job, monkeypatch, where):
+	# the ordinary race of an entry removed before its copy ran: the vault is right, so the line is no ERROR line
+	seed_monitor(job, {'d/': None})
+	run_backup(job)
+	lines = []
+	real = rv.backuperTeeLogToTl
+	def record(*args, **kwargs):
+		lines.append(kwargs)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', record)
+	if where == 'entry':
+		events, gone = [(False, 'create', 'gone', None)], 'gone'
+	else:
+		# gone from the folder while its copy walks it
+		apply(job.monitor, [('mkdir', 'n'), ('w', 'n/keep', 'k\n'), ('w', 'n/gone', 'g\n')])
+		real_walk = rv.iter_tree_entries
+		def walk(*args, **kwargs):
+			for entry in real_walk(*args, **kwargs):
+				if entry[1] == 'n/gone' and os.path.lexists(entry[0]):
+					os.remove(entry[0])
+				yield entry
+		monkeypatch.setattr(rv, 'iter_tree_entries', walk)
+		events, gone = [(True, 'create', 'n', None)], 'n/gone'
+	run_backup(job, batch(job, *events))
+	assert [kwargs for kwargs in lines if 'Not tracking' in kwargs.get('message', '')] == \
+		[{'path': job.monitor, 'warning': True, 'message': f'Not tracking {gone}: source no longer exists'}]
+
+
 WARNED_ONCE = {
 	# a move into, or out of, a folder the version holds elsewhere (a folder made in the batch, a chain merged across a
 	# folder move), and the approved entry of docs/limitations.md
@@ -454,6 +530,38 @@ def test_a_move_into_or_out_of_a_folder_the_version_has_elsewhere_is_copied_with
 	v = verified(job, *events)
 	assert len(warned(logged)) == 1 and fallbacks(logged) == warned(logged)
 	assert_version_is_the_tree(job, v)
+
+
+@pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
+def test_a_copy_for_a_rename_whose_entry_went_before_it_ran_leaves_no_row(job, logged, monkeypatch, with_verification):
+	# the live entry goes after the copy instead of the rename saw it there, and before the copy ran: the rows the
+	# rename's move_file put at the target go with it, as the vault holds nothing there
+	seed, steps, events = WARNED_ONCE['chain_merge_across_a_folder_move']
+	seed_monitor(job, seed)
+	run_backup(job)
+	apply(job.monitor, steps)
+	live = os.path.join(job.monitor, 'h')
+	armed = []
+	recorder = rv.backuperTeeLogToTl
+	def arm(*args, **kwargs):
+		if NOT_IN_VERSION in kwargs.get('message', ''):
+			armed.append(True)
+		return recorder(*args, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', arm)
+	real_lexists = os.path.lexists
+	def lexists(path):
+		there = real_lexists(path)
+		if armed and there and os.fspath(path) == live:
+			os.remove(live)
+		return there
+	monkeypatch.setattr(rv.os.path, 'lexists', lexists)
+	del logged[:]
+	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
+	assert armed and not real_lexists(live)
+	assert not tracked(job, 'h') and not real_lexists(os.path.join(v, 'h'))
+	assert [line for line in logged if 'Not tracking' in line] == ['Not tracking h: source no longer exists']
+	if with_verification:
+		assert_version_is_the_tree(job, v)
 
 
 def test_a_folder_made_in_the_batch_with_an_old_file_and_a_new_one(job, logged):

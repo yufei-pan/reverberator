@@ -2134,13 +2134,10 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 		return
 	rule_file = os.path.realpath(rule_file)
 	with open(rule_file, 'r', newline='', encoding='utf-8') as f:
-		lines = f.read().split('\n')
-	last_index = {}
-	for i, line in enumerate(lines):
-		key = line.split('\t', 1)[0].rstrip()
-		if key in rows and not key.startswith('#'):
-			last_index[key] = i
+		read = f.read()
+	lines = read.split('\n')
 	keys = [line.split('\t', 1)[0].rstrip() for line in lines]
+	last_index = {key: i for i, key in enumerate(keys) if key in rows and not key.startswith('#')}
 	taken = set(keys)
 	result = []
 	for i, line in enumerate(lines):
@@ -2156,7 +2153,7 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 			result.append(line)
 	text = '\n'.join(result)
 	# a rewrite that changes nothing (a repeated name that stays dirty, every cell filled) leaves the file, its inode and mtime as they are
-	if text != '\n'.join(lines):
+	if text != read:
 		replace_file_text(rule_file, text)
 
 def repeated_job_names(content:bytes) -> OrderedDict:
@@ -4909,9 +4906,12 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 	backup_entries = OrderedDict()
 	pendingMoveSourceParents = set()
 	moveSourceToDestDict = {}
-	# the first destinations of the moves the escalation made copies of and carried on, where it left a delete of what
-	# the version holds there
+	# the first destinations of the moves the escalation made copies of and carried on, or of copies removed after the
+	# moves carried them, where it left a delete of what the version holds there
 	escalation_deletes = set()
+	# the sources of the moves the escalation made copies of: a move is escalated once, by the latest content event of its
+	# source before it ( the watcher's modify after a create, or a later save ). a move out of the path is another move
+	escalated_sources = set()
 	# what the events after the one at hand did to each path ( a folder's ending with / ), as (when, where to): a move
 	# out of the path, or None for what ended it there ( a delete, or a move onto it ). when counts down the batch, so the
 	# greatest is the soonest after the event at hand
@@ -4954,7 +4954,7 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		# would remove what it needs. a delete or a move onto it first ( mv g a; mv a D ), or a move made a copy, did not
 		first = None
 		key = path
-		while key and bound is not None:
+		while key:
 			entries = later.get(key)
 			# appended as when grows: the last is the soonest after the event at hand
 			if entries and entries[-1][0] > bound and (first is None or entries[-1][0] > first[0]):
@@ -5016,6 +5016,7 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		if event == 'move':
 			if abs_moved_from:
 				pendingMoveSourceParents.add(abs_moved_from)
+				escalated_sources.discard(abs_moved_from)
 				# an earlier move takes what the version holds there away ( mv d/g x; echo new > f; mv f d/g; mv d D;
 				# mv D/g h ), so the escalation's delete there would remove what this move still needs
 				gone_at = [p for p in escalation_deletes if p.startswith(abs_moved_from)] if abs_moved_from.endswith('/') else \
@@ -5085,9 +5086,20 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					backuperTeeLogToTl(abs_path,f'  Leaving the attributes of {abs_path} to its move to {moveDest}')
 				continue
 			else:
-				if DEBUG:
-					backuperTeeLogToTl(abs_path,f'  Seperating move event from {abs_path} to {moveDest}')
-				if moveDest in backup_entries:
+				if source_key in escalated_sources:
+					# its move is a copy already, which takes what the file holds when it is replayed: an earlier content
+					# event leaves it as it is ( echo new > f is a create and a modify; mv f d/g; mv d D; rm D/g ). a save
+					# before a folder move above it still has its source's link go, where it still is
+					if DEBUG:
+						backuperTeeLogToTl(abs_path,f'  Leaving the escalated move of {abs_path} to {moveDest} as it is')
+					if event == 'create':
+						continue
+					event = 'delete'
+					abs_path, carried_on = event_path, False
+				elif moveDest in backup_entries:
+					if DEBUG:
+						backuperTeeLogToTl(abs_path,f'  Seperating move event from {abs_path} to {moveDest}')
+					escalated_sources.add(source_key)
 					if event == 'create':
 						to_add = False
 						escalated_event = 'create'
@@ -5110,7 +5122,7 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					dropped_own = False
 					while own and now_at is not None and now_at != moveDest:
 						stops = later.get(now_at) or []
-						i = len(stops) if escalated_bound is None else bisect.bisect_left(stops, (escalated_bound,))
+						i = bisect.bisect_left(stops, (escalated_bound,))
 						if not i or stops[i - 1][1] is None:
 							# something ended the entry there: the copy lands as it would without its own moves
 							break
@@ -5133,6 +5145,9 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 						# holds at its key goes. the key stays taken, so no earlier event of the path is replayed either
 						if not moved_away(moveDest, entry_when.get(moveDest)):
 							backup_entries[moveDest] = BackupEntryValues(backup_entries[moveDest].iso_time,'delete',None)
+							# an earlier move out of it, or of a folder above it, takes that delete back ( mv d e; mkdir d;
+							# echo new > f; mv f d/g; mv d D; rm D/g ), as it does the one below
+							escalation_deletes.add(moveDest)
 						else:
 							# unless a move the replay still makes took that away before the copy came ( mv d/g y; mv f d/g;
 							# mv d D; rm D/g ): its delete would remove what that move needs. what came to the path after
@@ -6382,7 +6397,8 @@ def order_backup_entries_for_replay(backup_entries:dict) -> OrderedDict:
 	after.sort(key=shallowest_first)
 	# a delete holding the source of a move replays right after the last move out of it ( mv d/g y; rm -r d ), so the
 	# moves rename what the version holds there; the rest of 2. at or under it stays after it, as at the front. a move
-	# onto a place in it made after it ( in backup_entries' order, which is time order ) that comes up to that last move
+	# onto a place in it made after it ( in backup_entries' order, where the moves and deletes are in time order, but for
+	# the escalation's delete at a copied move's first destination, which comes last ) that comes up to that last move
 	# leaves it at the front, as no order replays both
 	last_out = {}
 	for i, (path, values) in enumerate(moves):
@@ -10797,7 +10813,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			# recording a path we cannot copy makes the tracked list lie about this
 			# version, and the next referenced copy turns every such entry into a
 			# dangling link that all later versions inherit. skip it instead.
-			backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not tracking {source_relative_path}: source no longer exists')
+			backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not tracking {source_relative_path}: source no longer exists')
 			return False
 		source_relative_path = source_relative_path.rstrip('/')
 		file_vault_real_path = file_vault_real_path.rstrip('/')
@@ -10835,7 +10851,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					copy_file_meta(source_file=subRealPath,backup_file_path=subVaultPath,failed=unsynced)
 					continue
 				if not os.path.lexists(subRealPath):
-					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not tracking {subRelativePath}: source no longer exists')
+					backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not tracking {subRelativePath}: source no longer exists')
 					continue
 				manifest.add(subRelativePath,dirty=True)
 				cp_af_copy_path(source_path=subRealPath,dest_path=subVaultPath,mcae=mcae,pending=pending)
@@ -10895,20 +10911,20 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# a move that cannot be renamed in the version: what its source holds there goes, then the monitored entry is
 		# copied to its place. the delete is waited for first, as the place can lie under the source ( mv P x/Q; mv x/Q
 		# x/Q/s/f in one batch: the version's x/Q is P by then, to be moved into itself ), and a delete running beside
-		# the copy would remove it under its feet
+		# the copy would remove it under its feet. whether the entry is tracked and copied, as copy_path() says
 		delete_path(isDir=isDir,vault_real_path=moved_from_vault_path,relative_path=moved_from_relative_path,mcae=mcae)
 		wait_for_async_commands(mcae)
-		copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=source_real_path,source_relative_path=relative_path,
+		copied = copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=source_real_path,source_relative_path=relative_path,
 			file_vault_real_path=vault_real_path,backup_folder=backup_folder,mcae=mcae)
 		wait_for_async_commands(mcae)
+		return copied
 	def copy_instead_of_move(isDir,source_real_path,relative_path,vault_real_path,moved_from_vault_path,moved_from_relative_path,mcae):
 		# a move not renamed in the version, its monitored entry copied to its place: with delete_and_copy(), or, when the
 		# entry moved on again in the batch ( mv d/a d/b; mv d e ), only what its source holds goes, and a later entry or the
-		# verification copies it where it ends. whether the entry was copied
+		# verification copies it where it ends. whether the entry was copied ( not when it went before its copy ran )
 		move_targets.discard(relative_path + ('/' if isDir else ''))
 		if os.path.lexists(source_real_path):
-			delete_and_copy(isDir,source_real_path,relative_path,vault_real_path,moved_from_vault_path,moved_from_relative_path,mcae)
-			return True
+			return delete_and_copy(isDir,source_real_path,relative_path,vault_real_path,moved_from_vault_path,moved_from_relative_path,mcae)
 		delete_path(isDir=isDir,vault_real_path=moved_from_vault_path,relative_path=moved_from_relative_path,mcae=mcae)
 		# waited for, as delete_and_copy() does: a folder made again at the source in this batch is copied into the place,
 		# and a removal running beside it would remove it under its feet
