@@ -9,6 +9,10 @@ slept: "if there are things you can do in round 13 you can start it after you ar
   works and no traceback is logged."
 - Repeated job names: "Warn in round 13 (Recommended)", on "One warning per repeated job name at start, naming the row
   that wins; your file stays as it is."
+- During the build (2026-10-29), on a move into a new folder made at its own old place (`mv D x; mkdir D; mv x D/D`):
+  "One warning, copy (Recommended)", on "A move whose target is under its own source in the version is not tried: one
+  warning line, no ERROR, no traceback, then the copy as today"; and for the copy's cost (the moved folder's files written
+  again, their chain links lost): "Known limitation (Recommended)".
 - Standing: nothing is merged, pushed or restarted without the user; known limitations and deferrals need the user's OK.
 
 ## What the investigation found (round 13 scratch, before this design)
@@ -93,6 +97,14 @@ already does ("moved on again in the batch"), instead of logging `ERROR Not trac
 later entry or the verification takes it. Other errors of the rename keep today's traceback. Tests keep asserting that
 Goal 1's batches never reach this branch. (The main session's call, within the user's "no traceback is logged".)
 
+**A move into its own old place (the user's choice during the build).** When a move's target lies under its source
+(`link_target_relative_path` starts with the source's relative path plus `/`), the version can never rename it: a folder
+would go into itself (`EINVAL`), a file under itself (`NotARealFolder`). Shapes: `mv D x; mkdir D; mv x D/D`, `mv f x;
+mkdir f; mv x f/f`, and the swap `mv E/e b; mv d E/e; mv b E/e/E` (the collapse gives `E/e/E <- E/e`). Such a move is not
+tried: one warning naming the move and that its new place is inside its old one in the version, no ERROR line and no
+traceback, then the same copy as the branch above (delete-and-copy, or the moved-on handling when the live entry is gone).
+The moved entry's files are copied whole (known limitation, the user's, 2026-10-29). The version is right as today.
+
 ## Goal 3: one warning per repeated job name
 
 At each daemon start, `parse_rules` counts the rule file's job-name cells as TSVZ 4.9's `_processLine` keys them: line 1
@@ -116,6 +128,12 @@ passwords 9/14; the later line wins each time), rewrites nothing, and the file s
   log a traceback", "Repeated job names in the rule file") and their README lines; README design lines for Goals 1-3.
 - The approved entry "A move into a folder made after an earlier move in one batch": its wording changes where Goal 2
   removes its traceback (fact correction, in Calls to confirm).
+- New known limitation (approved 2026-10-29, "Known limitation (Recommended)"): "A move into its own old place is copied
+  whole": an entry moved into a new folder made at its own old place in one batch (`mv D x; mkdir D; mv x D/D`, `mv site
+  site.old; mv site.new site; mv site.old site/old`) gets one warning and is copied, so the next version holds full copies
+  of its files, not links; a big folder costs its size once. Why: the version can never rename an entry into itself, and
+  keeping the links needs a replay that parks the entry under a temporary name and places it after the entries that make
+  its new folder. Revisit when: the warning shows up in the live logs. README Known-limits line.
 - Open for the user in the morning, not written down: (1) cause 3 costs a copy of an unchanged file (its chain link to
   the older copy is lost): widen the approved entry "A move into a folder made after an earlier move in one batch" to
   cover `mkdir x; mv old x/f; mv x y` and `mv a/f g; mv a A; mv g h`, or a later collapse change that keeps the links;
