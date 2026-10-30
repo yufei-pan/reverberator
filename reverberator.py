@@ -2122,9 +2122,9 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 	For each key the last line whose first cell, right-stripped as TSVZ keys it, equals it has its first len(new row) cells
 	replaced, padded with empty cells when it is shorter; the cells after them (the optional columns 13 and 14, and any
 	past the 14th) stay exactly as the line has them, blank or absent included, so the daemon never writes them. Earlier
-	lines with that key are removed (TSVZ already ignored them). A new job name cell that another line already carries is not
-	written (the row keeps the name it has), as the two would be one row on the next read. Every other line is kept byte for
-	byte, line endings included.
+	lines with that key are kept (TSVZ ignores them; parse_rules warns of them). A new job name cell that another line
+	already carries, or a key on more than one line, is not written (the row keeps the name it has), as the lines would be
+	rows of one job on the next read. Every other line is kept byte for byte, line endings included.
 
 	Args:
 		rule_file (str): The rule file
@@ -2140,19 +2140,46 @@ def rewrite_rule_rows(rule_file:str, rows:dict) -> None:
 		key = line.split('\t', 1)[0].rstrip()
 		if key in rows and not key.startswith('#'):
 			last_index[key] = i
-	taken = {line.split('\t', 1)[0].rstrip() for line in lines}
+	keys = [line.split('\t', 1)[0].rstrip() for line in lines]
+	taken = set(keys)
 	result = []
 	for i, line in enumerate(lines):
-		key = line.split('\t', 1)[0].rstrip()
-		if key not in last_index:
-			result.append(line)
-		elif last_index[key] == i:
+		key = keys[i]
+		if key in last_index and last_index[key] == i:
 			row = list(rows[key])
-			if row[0].rstrip() != key and row[0].rstrip() in taken:
+			# a key on more than one line keeps its name cell: the cleaned name would make the kept earlier line a second row
+			if row[0].rstrip() != key and (row[0].rstrip() in taken or sum(1 for k in keys if k == key) > 1):
 				row[0] = line.split('\t', 1)[0]
 			cells = row + line.rstrip('\r').split('\t')[len(row):]
 			result.append('\t'.join(cells) + line[len(line.rstrip('\r')):])
+		else:
+			result.append(line)
 	replace_file_text(rule_file, '\n'.join(result))
+
+def repeated_job_names(content:bytes) -> OrderedDict:
+	'''
+	The job name cells that key more than one line of a rule file, as TSVZ keys them: line 1 is the header and is never
+	counted; a line is read with its \\x00 and line end stripped; an empty line or one starting with # (but not #_defaults_#)
+	is a comment; the key is the first cell right-stripped, and an empty key or #_defaults_# is skipped. Maps each such name,
+	in first-seen order, to [(line number from 1, whether a cell after the name has text), ...] in file order. TSVZ keeps
+	the last line, and deletes the key when that line has no text after the name.
+
+	>>> list(repeated_job_names(b'head\\nA\\tx\\n# A\\ty\\nB\\t1\\nA \\t\\n#_defaults_#\\tz\\n\\tq\\nB\\t2').items())
+	[('A', [(2, True), (5, False)]), ('B', [(4, True), (8, True)])]
+	'''
+	seen = OrderedDict()
+	for number, line in enumerate(content.split(b'\n'), 1):
+		if number == 1:
+			continue
+		line = line.decode('utf-8', errors='replace').strip('\x00').rstrip('\r\n')
+		if not line or (line.startswith('#') and not line.startswith('#_defaults_#')):
+			continue
+		cells = line.split('\t')
+		name = cells[0].rstrip()
+		if not name or name == '#_defaults_#':
+			continue
+		seen.setdefault(name, []).append((number, any(cell.rstrip() for cell in cells[1:])))
+	return OrderedDict((name, where) for name, where in seen.items() if len(where) > 1)
 
 def resolve_skip_list_path(cell:str, rule_file:str) -> 'str | None':
 	'''
@@ -2321,6 +2348,19 @@ def parse_rules(rule_file:str, read_only:bool = False):
 		tl.teelog(log_text(f'Warning: Cannot upgrade rule file {rule_file} ({e}). The Skip List File column cannot be used until the header is upgraded.'),level='warning')
 
 	rules = TSVZ.readTabularFile(rule_file,header=rule_file_header(rule_file),verifyHeader=True,strict=False,verbose=False,correctColumnNum=len(REVERB_RULE_TSV_HEADER))
+	if not read_only:
+		try:
+			with open(rule_file, 'rb') as f:
+				repeated = repeated_job_names(f.read())
+		except OSError:
+			repeated = {}
+		for name, where in repeated.items():
+			lines = ', '.join(str(number) for number, _ in where)
+			last, filled = where[-1]
+			if filled:
+				tl.teelog(log_text(f'Warning: Job name {name} is on lines {lines} of {rule_file}: line {last} is used and the others are ignored.'),level='warning')
+			else:
+				tl.teelog(log_text(f'Warning: Job name {name} is on lines {lines} of {rule_file}: line {last} has no cell after the name, so no line is used and the job does not run.'),level='warning')
 	if DEBUG:
 		tl.teeprint(log_text(f'Parsed rules: \n{rules}'))
 	else:
