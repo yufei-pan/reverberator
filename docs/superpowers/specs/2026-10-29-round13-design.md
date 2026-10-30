@@ -131,7 +131,9 @@ passwords 9/14; the later line wins each time), rewrites nothing, and the file s
 - New known limitation (approved 2026-10-29, "Known limitation (Recommended)"): "A move into its own old place is copied
   whole": an entry moved into a new folder made at its own old place in one batch (`mv D x; mkdir D; mv x D/D`, `mv site
   site.old; mv site.new site; mv site.old site/old`) gets one warning and is copied, so the next version holds full copies
-  of its files, not links; a big folder costs its size once. Why: the version can never rename an entry into itself, and
+  of its files, not links; a big folder costs its size once; in the swap shape the folder that took its old place is
+  copied whole too, unless it was made in that batch (the user, 2026-10-29: "Correct the wording (Recommended)"). Why:
+  the version can never rename an entry into itself, and
   keeping the links needs a replay that parks the entry under a temporary name and places it after the entries that make
   its new folder. Revisit when: the warning shows up in the live logs. README Known-limits line.
 - Open for the user in the morning, not written down: (1) cause 3 costs a copy of an unchanged file (its chain link to
