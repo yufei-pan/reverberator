@@ -438,6 +438,50 @@ def test_a_folder_emptied_by_moves_then_removed_lets_them_rename(job, logged, na
 		assert os.path.islink(os.path.join(v, rel)), rel
 
 
+# a folder moved aside and made again, then a new file written in it at the old file's path and moved on: the old
+# file goes with its folder, so the new file's escalation removes nothing first
+ASIDE = {
+	# name: (seed, steps, the watcher's events of the steps, (the old file where the folder move takes it, its text))
+	'build_aside': ({'build/app': 'APP\n', 'dist/': None},
+		[('mv', 'build', 'build.old'), ('mkdir', 'build'), ('w', 'build/app', 'NEW\n'), ('mv', 'build/app', 'dist/app')],
+		[(True, 'move', 'build.old', 'build'), (True, 'create', 'build', None), (False, 'create', 'build/app', None),
+		(False, 'move', 'dist/app', 'build/app')], ('build.old/app', 'APP\n')),
+	'log_rotation': ({'logs/app.log': 'L1\n'},
+		[('mv', 'logs', 'logs.1'), ('mkdir', 'logs'), ('w', 'logs/app.log', 'L2\n'), ('mv', 'logs/app.log', 'logs/app.log.1')],
+		[(True, 'move', 'logs.1', 'logs'), (True, 'create', 'logs', None), (False, 'create', 'logs/app.log', None),
+		(False, 'move', 'logs/app.log.1', 'logs/app.log')], ('logs.1/app.log', 'L1\n')),
+	'written_twice': ({'build/app': 'APP\n', 'dist/': None},
+		[('mv', 'build', 'build.old'), ('mkdir', 'build'), ('w', 'build/app', 'NEW 1\n'), ('w', 'build/app', 'NEW 2\n'), ('mv', 'build/app', 'dist/app')],
+		[(True, 'move', 'build.old', 'build'), (True, 'create', 'build', None), (False, 'create', 'build/app', None),
+		(False, 'modify', 'build/app', None), (False, 'move', 'dist/app', 'build/app')], ('build.old/app', 'APP\n')),
+	'then_a_folder_move': ({'d/f': 'OLD\n', 'e/': None},
+		[('mv', 'd', 'd.old'), ('mkdir', 'd'), ('w', 'd/f', 'new\n'), ('mv', 'd/f', 'e/f'), ('mv', 'e', 'E')],
+		[(True, 'move', 'd.old', 'd'), (True, 'create', 'd', None), (False, 'create', 'd/f', None), (False, 'move', 'e/f', 'd/f'),
+		(True, 'move', 'E', 'e')], ('d.old/f', 'OLD\n')),
+	# saved again after a folder move carried the new file: the earliest save's delete is the one at the old file's path
+	'saved_again_after_a_folder_move': ({'d/f': 'OLD\n'},
+		[('mv', 'd', 'd.old'), ('mkdir', 'd'), ('w', 'd/f', 'new\n'), ('mv', 'd', 'D'), ('w', 'D/f', 'again\n'), ('mv', 'D/f', 'x')],
+		[(True, 'move', 'd.old', 'd'), (True, 'create', 'd', None), (False, 'create', 'd/f', None), (True, 'move', 'D', 'd'),
+		(False, 'modify', 'D/f', None), (False, 'move', 'x', 'D/f')], ('d.old/f', 'OLD\n')),
+}
+
+
+@pytest.mark.parametrize('form', FORMS)
+@pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
+@pytest.mark.parametrize('name', sorted(ASIDE))
+def test_a_new_file_at_the_path_of_an_old_one_its_folder_move_took_keeps_that_ones_link(job, logged, name, with_verification, form):
+	seed, steps, events, (old, text) = ASIDE[name]
+	events = watched(events, form)
+	seed_monitor(job, seed)
+	run_backup(job)
+	apply(job.monitor, steps)
+	del logged[:]
+	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
+	assert not fallbacks(logged), fallbacks(logged)
+	assert_version_is_the_tree(job, v)
+	assert os.path.islink(os.path.join(v, old)) and open(os.path.join(v, old)).read() == text
+
+
 @pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
 def test_a_delete_under_a_folder_moved_after_it_stays_at_the_front(job, logged, with_verification):
 	# mv d/s/g t; rm -r d/s; mv d D; mv t y: the collapse merges the chain to y <- d/s/g across the move of d ( the

@@ -4909,9 +4909,10 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 	# the first destinations of the moves the escalation made copies of and carried on, or of copies removed after the
 	# moves carried them, where it left a delete of what the version holds there
 	escalation_deletes = set()
-	# the sources of the moves the escalation made copies of: a move is escalated once, by the latest content event of its
-	# source before it ( the watcher's modify after a create, or a later save ). a move out of the path is another move
-	escalated_sources = set()
+	# the sources of the moves the escalation made copies of, each with where a save's escalation left its source's delete
+	# ( None for a create's ): a move is escalated once, by the latest content event of its source before it ( the
+	# watcher's modify after a create, or a later save ). a move out of the path is another move
+	escalated_sources = {}
 	# what the events after the one at hand did to each path ( a folder's ending with / ), as (when, where to): a move
 	# out of the path, or None for what ended it there ( a delete, or a move onto it ). when counts down the batch, so the
 	# greatest is the soonest after the event at hand
@@ -5016,10 +5017,12 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 		if event == 'move':
 			if abs_moved_from:
 				pendingMoveSourceParents.add(abs_moved_from)
-				escalated_sources.discard(abs_moved_from)
+				escalated_sources.pop(abs_moved_from, None)
 				# an earlier move takes what the version holds there away ( mv d/g x; echo new > f; mv f d/g; mv d D;
-				# mv D/g h ), so the escalation's delete there would remove what this move still needs
-				gone_at = [p for p in escalation_deletes if p.startswith(abs_moved_from)] if abs_moved_from.endswith('/') else \
+				# mv D/g h ), so the escalation's delete there would remove what this move still needs. not one whose
+				# chain comes back to its source ( mv d e; mv e d ), which takes nothing away
+				gone_at = [] if moveSourceToDestDict.get(abs_path) == abs_moved_from else \
+					[p for p in escalation_deletes if p.startswith(abs_moved_from)] if abs_moved_from.endswith('/') else \
 					[abs_moved_from] if abs_moved_from in escalation_deletes else []
 				for gone in gone_at:
 					escalation_deletes.discard(gone)
@@ -5093,13 +5096,21 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 					if DEBUG:
 						backuperTeeLogToTl(abs_path,f'  Leaving the escalated move of {abs_path} to {moveDest} as it is')
 					if event == 'create':
+						# a new file: what the version holds where a save's escalation left its source's delete is another
+						# entry's, which an earlier move out of it, or of a folder above it, takes ( mv d d.old; mkdir d;
+						# echo new > d/f; mv d/f x )
+						left = escalated_sources[source_key]
+						if left is not None and left in backup_entries and backup_entries[left].event == 'delete':
+							escalation_deletes.add(left)
 						continue
 					event = 'delete'
 					abs_path, carried_on = event_path, False
+					# the earliest save's, where an earlier create finds it
+					escalated_sources[source_key] = event_path
 				elif moveDest in backup_entries:
 					if DEBUG:
 						backuperTeeLogToTl(abs_path,f'  Seperating move event from {abs_path} to {moveDest}')
-					escalated_sources.add(source_key)
+					escalated_sources[source_key] = None if event == 'create' else event_path
 					if event == 'create':
 						to_add = False
 						escalated_event = 'create'
