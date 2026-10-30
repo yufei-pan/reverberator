@@ -18,6 +18,12 @@ slept: "if there are things you can do in round 13 you can start it after you ar
   unchanged entry in `mv a/f g; mv a A; mv g h`, `mkdir x; mv old x/f; mv x y` and `mv D/sub t; rm -r D; mv t D` (one
   warning each in 0.49): "Widen the known limitation (Recommended)", the approved entry "A move into a folder made after
   an earlier move in one batch".
+- After the final review (2026-10-29): `Not tracking <path>: source no longer exists` (the copy of an entry gone from the
+  live tree, 2,820 in the live journal since 10-15): "Warning level (Recommended)"; the collapse escalating one move twice
+  when the watcher sends create + modify (`echo new > f; mv f d/g; mv d D; rm D/g` leaves a stray copy and a Not tracking
+  line): "Fix in round 13 (Recommended)"; the older collapse shapes of the Task 1 review (Minors 3 and 4): "Widen the
+  known limitation (Recommended)"; the silent one (`mv d e; mkdir d; touch f; mv f d/g; mv d D; rm D/g`, e/g copied
+  again by the comparison): "Fold into the widened entry (Recommended)".
 - Standing: nothing is merged, pushed or restarted without the user; known limitations and deferrals need the user's OK.
 
 ## What the investigation found (round 13 scratch, before this design)
@@ -69,6 +75,15 @@ loses no chain link.
 The user's words said "so the rename works": in Goal 1's case there is nothing in the version to rename, so the right
 result is the copy at the end path (the main session's call; the user's intent, no traceback and a right replay, holds).
 
+**One escalation per move (the user's choice after the final review).** The watcher sends `create` then `modify` for a
+written file, and an editor's save sends `modify` alone or several. Every content event of a path before its move is
+"made or saved in the batch", so the reverse walk met the move once per event and escalated it each time: the second pass
+overwrote the first's result (a delete at the first destination became a create there), leaving a copy of a path the
+live tree no longer has (`echo new > f; mv f d/g; mv d D; rm D/g`: `Not tracking d/g`). A move is escalated once, by the
+first content event the walk meets (the latest); earlier content events of the same path before that move add nothing,
+as the escalated copy takes the file's content at replay time anyway. Goal 1's tests run in both event forms (create
+alone, as for an empty file, and create + modify), and none logs a fallback or Not tracking line.
+
 ## Goal 1b: a delete that holds a move's source replays after that move (added during the build)
 
 Found by Task 1's review (the plainest form of the user's "the replay order that loses the move's source"): with a
@@ -109,6 +124,10 @@ mkdir f; mv x f/f`, and the swap `mv E/e b; mv d E/e; mv b E/e/E` (the collapse 
 tried: one warning naming the move and that its new place is inside its old one in the version, no ERROR line and no
 traceback, then the same copy as the branch above (delete-and-copy, or the moved-on handling when the live entry is gone).
 The moved entry's files are copied whole (known limitation, the user's, 2026-10-29). The version is right as today.
+
+**`Not tracking` is a warning (the user's choice after the final review).** `Not tracking <path>: source no longer exists`
+(the replay's copy of an entry the live tree no longer has, in `copy_path` and its folder walk) is logged at warning
+level, same text: it is the ordinary race of a file removed before its copy ran, and the vault is right.
 
 ## Goal 3: one warning per repeated job name
 
