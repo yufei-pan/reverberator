@@ -5019,10 +5019,8 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 				pendingMoveSourceParents.add(abs_moved_from)
 				escalated_sources.pop(abs_moved_from, None)
 				# an earlier move takes what the version holds there away ( mv d/g x; echo new > f; mv f d/g; mv d D;
-				# mv D/g h ), so the escalation's delete there would remove what this move still needs. not one whose
-				# chain comes back to its source ( mv d e; mv e d ), which takes nothing away
-				gone_at = [] if moveSourceToDestDict.get(abs_path) == abs_moved_from else \
-					[p for p in escalation_deletes if p.startswith(abs_moved_from)] if abs_moved_from.endswith('/') else \
+				# mv D/g h ), so the escalation's delete there would remove what this move still needs
+				gone_at = [p for p in escalation_deletes if p.startswith(abs_moved_from)] if abs_moved_from.endswith('/') else \
 					[abs_moved_from] if abs_moved_from in escalation_deletes else []
 				for gone in gone_at:
 					escalation_deletes.discard(gone)

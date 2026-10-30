@@ -463,6 +463,12 @@ ASIDE = {
 		[('mv', 'd', 'd.old'), ('mkdir', 'd'), ('w', 'd/f', 'new\n'), ('mv', 'd', 'D'), ('w', 'D/f', 'again\n'), ('mv', 'D/f', 'x')],
 		[(True, 'move', 'd.old', 'd'), (True, 'create', 'd', None), (False, 'create', 'd/f', None), (True, 'move', 'D', 'd'),
 		(False, 'modify', 'D/f', None), (False, 'move', 'x', 'D/f')], ('d.old/f', 'OLD\n')),
+	# and the folder moved back over the emptied new one: the old file is where it was
+	'aside_and_back': ({'build/app': 'APP\n', 'build/k': 'K\n', 'dist/': None},
+		[('mv', 'build', 'build.old'), ('mkdir', 'build'), ('w', 'build/app', 'NEW\n'), ('mv', 'build/app', 'dist/app'), ('rmdir', 'build'),
+		('mv', 'build.old', 'build')],
+		[(True, 'move', 'build.old', 'build'), (True, 'create', 'build', None), (False, 'create', 'build/app', None),
+		(False, 'move', 'dist/app', 'build/app'), (True, 'delete', 'build', None), (True, 'move', 'build', 'build.old')], ('build/app', 'APP\n')),
 }
 
 
