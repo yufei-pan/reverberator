@@ -303,15 +303,6 @@ def test_parse_rules_write_back_rewrites_the_row_in_place(job):
 	assert after[1].split('\t')[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
 
 
-def test_parse_rules_drops_old_appended_copies(job):
-	write_rule(job)
-	with open(job.rule_path, 'a') as f:
-		f.write('\t'.join(rule_row(job, min_snapshot='auto')) + '\n')
-	rv.parse_rules(job.rule_path)
-	rows = [line for line in open(job.rule_path).read().splitlines() if line.startswith(job.job_name + '\t')]
-	assert len(rows) == 1
-
-
 def test_parse_rules_slugified_name_does_not_spawn_a_second_job(job):
 	row = rule_row(job)
 	row[0] = 'My Job'
@@ -334,7 +325,7 @@ def test_rewrite_rule_rows_keeps_other_lines_byte_for_byte(tmp_path):
 	path = tmp_path / 'rule.tsv'
 	path.write_bytes(b'head\tx\r\n# comment\t\r\nA\t1\r\n\r\nB\t2\r\nA\t3\r\nlast\t9')
 	rv.rewrite_rule_rows(str(path), {'A': ['a', '7']})
-	assert path.read_bytes() == b'head\tx\r\n# comment\t\r\n\r\nB\t2\r\na\t7\r\nlast\t9'
+	assert path.read_bytes() == b'head\tx\r\n# comment\t\r\nA\t1\r\n\r\nB\t2\r\nA\t7\r\nlast\t9'
 
 
 def test_parse_rules_missing_file_leaves_a_marker_line(tmp_path, capsys):
@@ -627,3 +618,54 @@ def test_parse_rules_vault_file_warning_promises_no_folder_made(job, monkeypatch
 	text = out.out + out.err
 	assert f'Vault Path {vault} which is not a folder' in text and 'a folder is there, which the job waits for' in text
 	assert 'has made the folder' not in text
+
+
+def test_repeated_job_names_keys_lines_as_tsvz_does():
+	content = (b'work\tx\n' b'work\ta\n' b'# work\tb\n' b'#work\tc\n' b'work \td\r\n' b'\x00work\te\x00\n' b' work\tf\n'
+		b'#_defaults_#\tg\n' b'#_defaults_#\th\n' b'\tz\n' b'\tz\n' b'gone\ta\n' b'gone\t \t\n' b'kept\n' b'kept\tb')
+	assert rv.repeated_job_names(content) == {'work': [(2, True), (5, True), (6, True)], 'gone': [(12, True), (13, False)],
+		'kept': [(14, False), (15, True)]}
+
+def test_each_start_warns_once_per_repeated_name_and_changes_nothing(job, capsys):
+	# the live file's shape: comment lines, a defaults row, short lines first, the full rows later; and one name whose last
+	# line has nothing after it
+	stub = lambda name: '\t'.join([name, job.monitor, job.vault])
+	full = lambda name: '\t'.join([name] + rule_row(job)[1:])
+	_rule_file(job, HEADER_14, '# a comment', '#_defaults_#\t' + '\t' * 10, stub('a'), stub('b'), full('a'), full('b'), full('c'), 'c')
+	before = open(job.rule_path, 'rb').read()
+	assert [rule.job_name for rule in rv.parse_rules(job.rule_path, read_only=True)] == ['a', 'b']
+	assert 'is on lines' not in capsys.readouterr().out
+	assert [rule.job_name for rule in rv.parse_rules(job.rule_path)] == ['a', 'b']
+	out = capsys.readouterr().out
+	assert f'Warning: Job name a is on lines 4, 6 of {job.rule_path}: line 6 is used and the others are ignored.' in out
+	assert f'Warning: Job name b is on lines 5, 7 of {job.rule_path}: line 7 is used and the others are ignored.' in out
+	assert (f'Warning: Job name c is on lines 8, 9 of {job.rule_path}: line 9 has no cell after the name, so no line is used '
+		'and the job does not run.') in out
+	assert out.count('is on lines') == 3
+	assert open(job.rule_path, 'rb').read() == before
+
+def test_a_job_whose_only_rows_end_empty_is_warned_before_the_empty_file_exit(job, capsys):
+	_rule_file(job, HEADER_14, rule_row(job), job.job_name)
+	with pytest.raises(SystemExit):
+		rv.parse_rules(job.rule_path)
+	assert 'line 3 has no cell after the name' in capsys.readouterr().out
+
+def test_parse_rules_keeps_earlier_lines_with_the_same_name(job):
+	write_rule(job)
+	with open(job.rule_path, 'a') as f:
+		f.write('\t'.join(rule_row(job, min_snapshot='auto')) + '\n')
+	before = open(job.rule_path).read().splitlines()
+	rv.parse_rules(job.rule_path)
+	after = open(job.rule_path).read().splitlines()
+	assert after[:2] == before[:2] and len(after) == 3
+	assert after[2].split('\t')[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
+
+def test_a_repeated_dirty_name_stays_one_job_at_the_next_start(job):
+	row = rule_row(job, min_snapshot='auto')
+	row[0] = 'My Job'
+	_rule_file(job, HEADER_12, row, row)
+	assert [rule.job_name for rule in rv.parse_rules(job.rule_path)] == ['my-job']
+	lines = open(job.rule_path).read().splitlines()
+	assert [line.split('\t')[0] for line in lines[1:]] == ['My Job', 'My Job'] and lines[2].split('\t')[4] == str(rv.DEFAULT_SNAPSHOT_DELAY)
+	rules = rv.parse_rules(job.rule_path)
+	assert [rule.job_name for rule in rules] == ['my-job'] and rv.colliding_job_names(rules) == {}
