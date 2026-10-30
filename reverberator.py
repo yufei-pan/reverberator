@@ -10857,6 +10857,19 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=source_real_path,source_relative_path=relative_path,
 			file_vault_real_path=vault_real_path,backup_folder=backup_folder,mcae=mcae)
 		wait_for_async_commands(mcae)
+	def copy_instead_of_move(isDir,source_real_path,relative_path,vault_real_path,moved_from_vault_path,moved_from_relative_path,mcae):
+		# a move not renamed in the version, its monitored entry copied to its place: with delete_and_copy(), or, when the
+		# entry moved on again in the batch ( mv d/a d/b; mv d e ), only what its source holds goes, and a later entry or the
+		# verification copies it where it ends. whether the entry was copied
+		move_targets.discard(relative_path + ('/' if isDir else ''))
+		if os.path.lexists(source_real_path):
+			delete_and_copy(isDir,source_real_path,relative_path,vault_real_path,moved_from_vault_path,moved_from_relative_path,mcae)
+			return True
+		delete_path(isDir=isDir,vault_real_path=moved_from_vault_path,relative_path=moved_from_relative_path,mcae=mcae)
+		# waited for, as delete_and_copy() does: a folder made again at the source in this batch is copied into the place,
+		# and a removal running beside it would remove it under its feet
+		wait_for_async_commands(mcae)
+		return False
 	def attribute_end(source_real_path,relative_path):
 		# the path the attributes of a file go onto ( an attrib's replay ): True when it has none of its own to get, False
 		# after an error line saying why they go nowhere.
@@ -11050,14 +11063,21 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				# we need to wait for copy threads to finish to allow rename, and the copies they made are recorded under
 				# the names they were made for before those rows move
 				wait_for_async_commands(mcae)
+				link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
+				link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
+				if link_target_relative_path.startswith(link_source_relative_path.rstrip('/') + '/'):
+					# a new place inside the old one ( mv D x; mkdir D; mv x D/D ): the version can never rename an entry
+					# into itself, so it is not tried, and no rows move
+					backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: '
+						'its new place is inside its old one in the version; copying it instead')
+					copy_instead_of_move(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
+					continue
 				if isDir:
 					# also moves all the files and subfolders in the folder
 					manifest.move_tree(as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path))
 					manifest.add(as_folder_entry(link_target_relative_path))
 				else:
 					manifest.move_file(link_source_relative_path,link_target_relative_path)
-				link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
-				link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
 				try:
 					if not real_folders_to(backup_folder,link_source_relative_path,missing_ok=True) or not real_folders_to(backup_folder,link_target_relative_path,missing_ok=True):
 						# renaming would reach through the link, out of the version
@@ -11127,17 +11147,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 						# the version holds elsewhere ). nothing is wrong, so no traceback
 						backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: '
 							'its source or the folder it goes into is not in the version; copying it instead')
-						move_targets.discard(event_relative_path + ('/' if isDir else ''))
-						if os.path.lexists(event_source_real_path):
-							delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
-						else:
-							# moved on again in the batch: the place the rename would have emptied is emptied, and the rows
-							# move_tree / move_file put at the target go, or a later folder move carries them and the
-							# verification cannot read them. a later entry, or the verification, copies it where it ends
-							delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,relative_path=link_source_relative_path,mcae=mcae)
-							# waited for, as delete_and_copy() does: a folder made again at the source in this batch is copied
-							# into the place, and a removal running beside it would remove it under its feet
-							wait_for_async_commands(mcae)
+						if not copy_instead_of_move(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae):
+							# the rows move_tree / move_file put at the target go, or a later folder move carries them and the
+							# verification cannot read them
 							if isDir:
 								manifest.remove_tree(as_folder_entry(link_target_relative_path))
 							else:
