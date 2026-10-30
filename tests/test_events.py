@@ -154,25 +154,53 @@ def collapsed(*events):
 	return [(strip(path), values.event, strip(values.source_path)) for path, values in entries.items()]
 
 
-def test_a_new_file_moved_through_a_folder_move_and_out_is_one_copy_where_it_ends():
+def watched(form, *events):
+	'''events with a modify after each create of a file in form 'create_modify', as the watcher queues them for a file
+	written with text; 'create' leaves them as they are, as for an empty file.'''
+	if form == 'create':
+		return events
+	return tuple(e for event in events for e in ([event, (False, 'modify', event[2], None)] if event[:2] == (False, 'create') else [event]))
+
+
+# the escalated move of a file written in the batch: create alone gives a create where it ends; with the watcher's
+# modify after it, the move is escalated once, by the modify, and comes out as the saved file's does
+ESCALATED = {
 	# echo new > f; mv f d/g; mv d D; mv D/g h: nothing in the version is at D/g to rename
-	assert collapsed((False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')) == \
-		[('D/', 'move', 'd/'), ('d/g', 'delete', None), ('h', 'create', 'f')]
+	'moved_through_a_folder_move_and_out': ([(False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'move', 'h', 'D/g')],
+		[('D/', 'move', 'd/'), ('d/g', 'delete', None), ('h', 'create', 'f')],
+		[('f', 'delete', None), ('D/', 'move', 'd/'), ('d/g', 'delete', None), ('h', 'modify', 'f')]),
+	'follows_a_chain_merged_move_on_to_its_end': ([(False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'move', 'h', 'D/g'), (False, 'move', 'k', 'h')],
+		[('D/', 'move', 'd/'), ('d/g', 'delete', None), ('k', 'create', 'f')],
+		[('f', 'delete', None), ('D/', 'move', 'd/'), ('d/g', 'delete', None), ('k', 'modify', 'f')]),
+	# the first destination's delete goes when an earlier move took what the version held there
+	'after_an_earlier_move_out_of_its_first_destination': ([(False, 'move', 'x', 'd/g'), (False, 'create', 'f', None),
+		(False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')],
+		[('x', 'move', 'd/g'), ('D/', 'move', 'd/'), ('h', 'create', 'f')],
+		[('x', 'move', 'd/g'), ('f', 'delete', None), ('D/', 'move', 'd/'), ('h', 'modify', 'f')]),
+	# echo new > f; mv f d/g; mv d D; rm D/g: nothing of it is copied, whichever content event escalates the move
+	'removed_after_the_folder_move': ([(False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'delete', 'D/g', None)],
+		[('d/g', 'delete', None), ('D/', 'move', 'd/'), ('D/g', 'delete', None)],
+		[('f', 'delete', None), ('d/g', 'delete', None), ('D/', 'move', 'd/'), ('D/g', 'delete', None)]),
+}
 
 
-def test_a_saved_file_moved_the_same_way_is_one_modify_where_it_ends():
-	assert collapsed((False, 'modify', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')) == \
-		[('f', 'delete', None), ('D/', 'move', 'd/'), ('d/g', 'delete', None), ('h', 'modify', 'f')]
+@pytest.mark.parametrize('form', ['create', 'create_modify'])
+@pytest.mark.parametrize('name', sorted(ESCALATED))
+def test_a_file_made_in_the_batch_and_moved_on_is_escalated_once(name, form):
+	events, made, written = ESCALATED[name]
+	assert collapsed(*watched(form, *events)) == (made if form == 'create' else written)
+	if form == 'create_modify':
+		# the create before the modify adds nothing: as for a file the version holds, saved once
+		saved = [(False, 'modify', *e[2:]) if e[:2] == (False, 'create') else e for e in events]
+		assert collapsed(*saved) == written
 
 
-def test_the_copy_follows_a_chain_merged_move_on_to_its_end():
-	assert collapsed((False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g'),
-		(False, 'move', 'k', 'h')) == [('D/', 'move', 'd/'), ('d/g', 'delete', None), ('k', 'create', 'f')]
-
-
-def test_the_first_destinations_delete_goes_when_an_earlier_move_took_what_the_version_held_there():
-	assert collapsed((False, 'move', 'x', 'd/g'), (False, 'create', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
-		(False, 'move', 'h', 'D/g')) == [('x', 'move', 'd/g'), ('D/', 'move', 'd/'), ('h', 'create', 'f')]
+def test_a_file_saved_twice_then_moved_through_a_folder_move_and_removed_leaves_no_copy():
+	assert collapsed((False, 'modify', 'f', None), (False, 'modify', 'f', None), (False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'),
+		(False, 'delete', 'D/g', None)) == [('f', 'delete', None), ('d/g', 'delete', None), ('D/', 'move', 'd/'), ('D/g', 'delete', None)]
 
 
 def test_a_file_the_version_holds_keeps_its_moves():
