@@ -118,20 +118,30 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** a swap collapsed in one batch (`mv a t; mv b a; mv t b`) copies both files again instead of
-  renaming them: the comparison after the batch copies them, and no `Failed to move` line is logged. The result is right.
+  renaming them, and two folders whole: the replay renames each onto the other's old place, the comparison after the
+  batch finds both different and copies them, and nothing is logged at warning or error level. A file swapped with a
+  folder keeps one renamed and copies the other, logging `Not renaming … to …: … is a folder in the version, as an earlier
+  move of the batch left it; doing delete & copy instead` (or `is not a folder`) at ERROR level, with no traceback
+  (firewatcher does not alert on it). The result is right.
 - **Why:** renaming them in one step would need a change-list format change.
 - **Revisit when:** the change list's format changes for another reason.
-- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)"; corrected 2026-10-29, "Correct the entry
+  (Recommended)".
 
-### A move into a folder made after an earlier move in one batch
+### A move after another move of the batch took its source or folder is copied
 
 - **Kind:** known limitation.
-- **What the operator sees:** `mv d e; mkdir e/sub; mv x e/sub/x` in one batch falls back to delete & copy for x. The
-  replay logs one warning, `Not renaming … to …: its source or the folder it goes into is not in the version; copying it
-  instead`, with no traceback (firewatcher does not alert on it), and x is copied once more. The result is right.
-- **Why:** replaying such moves in batch order is a larger change to the replay for one extra copy in a rare order.
-- **Revisit when:** it is seen often.
-- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+- **What the operator sees:** a move whose source, or the folder it goes into, the version holds elsewhere when the move
+  replays, because another move of the same batch took it, logs one warning, `Not renaming … to …: its source or the
+  folder it goes into is not in the version; copying it instead`, with no traceback (firewatcher does not alert on it),
+  and the entry is copied once more, losing its chain links: its files are written to the vault again in full. Shapes:
+  `mv d e; mkdir e/sub; mv x e/sub/x` (x copied), `mv a/f g; mv a A; mv g h` (h copied), `mkdir x; mv old x/f; mv x y`
+  (y/f copied) and `mv D/sub t; rm -r D; mv t D` (D's files copied). The result is right.
+- **Why:** replaying such moves so the version follows them is a larger change to the batch's collapse and replay, for
+  one extra copy in a rare order.
+- **Revisit when:** the warning shows up often in the live logs.
+- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)"; widened 2026-10-29, "Widen the known
+  limitation (Recommended)".
 
 ### One folder renamed back and forth thousands of times in one batch
 
