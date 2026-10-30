@@ -118,8 +118,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** a swap collapsed in one batch (`mv a t; mv b a; mv t b`) copies both files again instead of
-  renaming them, and logs `Failed to move … delete & copy instead` at ERROR level (firewatcher does not alert on it). The
-  result is right.
+  renaming them: the comparison after the batch copies them, and no `Failed to move` line is logged. The result is right.
 - **Why:** renaming them in one step would need a change-list format change.
 - **Revisit when:** the change list's format changes for another reason.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
@@ -127,9 +126,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### A move into a folder made after an earlier move in one batch
 
 - **Kind:** known limitation.
-- **What the operator sees:** `mv d e; mkdir e/sub; mv x e/sub/x` in one batch falls back to delete & copy for x, logging
-  `Failed to move … delete & copy instead` at ERROR level (firewatcher does not alert on it), and x is copied once more.
-  The result is right.
+- **What the operator sees:** `mv d e; mkdir e/sub; mv x e/sub/x` in one batch falls back to delete & copy for x. The
+  replay logs one warning, `Not renaming … to …: its source or the folder it goes into is not in the version; copying it
+  instead`, with no traceback (firewatcher does not alert on it), and x is copied once more. The result is right.
 - **Why:** replaying such moves in batch order is a larger change to the replay for one extra copy in a rare order.
 - **Revisit when:** it is seen often.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
@@ -396,20 +395,19 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a host mounts a vault or monitored disk that way.
 - **Approved:** 2026-10-29, the user's choice "Revert it, known limitation (Recommended)".
 
-### A rename in a rename-heavy batch can fail and log a traceback
+### A move into its own old place is copied whole
 
-- **Kind:** deferred, to round 13.
-- **What the operator sees:** in a batch where a file is moved into a folder that is then renamed, and the file is moved
-  again, the replay's rename can fail with FileNotFoundError. It logs "Failed to move" with a traceback at error level,
-  falls back to delete and copy, and the versions come out right. It is the same in 0.47.
-- **Why:** the cause was not found in round 12; the delete-and-copy fallback keeps the result right.
-- **Revisit when:** round 13: find the replay order that loses the move's source.
-- **Approved:** 2026-10-29, the user's choice "Defer to round 13 (Recommended)".
-
-### Repeated job names in the rule file
-
-- **Kind:** deferred, to round 13.
-- **What the operator sees:** a rule file may list a job name twice; the later row wins with no warning.
-- **Why:** the warning is a new check at the start that no round 12 change needs.
-- **Revisit when:** round 13: one warning per repeated name at start, naming the row that wins.
-- **Approved:** 2026-10-29, the user's choice "Warn in round 13 (Recommended)".
+- **Kind:** known limitation.
+- **What the operator sees:** an entry moved into a new folder made at its own old place in one batch (`mv D x; mkdir D;
+  mv x D/D`, or `mv site site.old; mv site.new site; mv site.old site/old`) logs one warning, `Not renaming … to …: its new
+  place is inside its old one in the version; copying it instead`, and is copied: the next version holds full copies of
+  its files, not links to the older version, so a big folder costs its full size in the vault once. In the swap shape the
+  folder that took its old place (site.new) is copied whole too, as the copy replaces all of the version's `site`: both
+  folders cost their size once, unless the replacing one was made in that batch (then it is copied anyway). The result is
+  right.
+- **Why:** the version can never rename an entry into itself; keeping the links needs a replay that parks the entry under
+  a temporary name and places it after the entries that make its new folder, a larger change for a shape never seen in
+  the live logs.
+- **Revisit when:** the warning shows up in the live logs.
+- **Approved:** 2026-10-29, the user's choice "Known limitation (Recommended)" (with "One warning, copy (Recommended)"
+  for the warning); the swap shape's cost: "Correct the wording (Recommended)".
