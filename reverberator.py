@@ -11135,6 +11135,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 							# move_tree / move_file put at the target go, or a later folder move carries them and the
 							# verification cannot read them. a later entry, or the verification, copies it where it ends
 							delete_path(isDir=isDir,vault_real_path=link_source_backup_real_path,relative_path=link_source_relative_path,mcae=mcae)
+							# waited for, as delete_and_copy() does: a folder made again at the source in this batch is copied
+							# into the place, and a removal running beside it would remove it under its feet
+							wait_for_async_commands(mcae)
 							if isDir:
 								manifest.remove_tree(as_folder_entry(link_target_relative_path))
 							else:

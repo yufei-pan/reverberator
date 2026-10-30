@@ -485,3 +485,33 @@ def test_any_other_rename_error_keeps_the_traceback(job, logged, monkeypatch, er
 	assert any(l.startswith('ERROR Failed to move') for l in logged) and any('Traceback' in l for l in logged)
 	assert 'Doing delete & copy instead' in logged and not warned(logged)
 	assert open(os.path.join(v, 'h')).read() == 'f\n'
+
+
+@pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
+def test_folder_remade_at_the_source_of_a_moved_on_rename(job, logged, with_verification):
+	# mkdir x; mv S x/f; mv x y; mkdir S; echo n > S/n: the rename of S to x/f finds nothing, and x/f moved on to y/f.
+	# the removal of the version's S must be done before the folder made again at S is replayed, or it removes under it
+	seed_monitor(job, {'S/': None, **{f'S/k{i}': f'k{i}\n' for i in range(300)}})
+	run_backup(job)
+	apply(job.monitor, [('mkdir', 'x'), ('mv', 'S', 'x/f'), ('mv', 'x', 'y'), ('mkdir', 'S'), ('w', 'S/n', 'n\n')])
+	del logged[:]
+	events = [(True, 'create', 'x', None), (True, 'move', 'x/f', 'S'), (True, 'move', 'y', 'x'), (True, 'create', 'S', None),
+		(False, 'create', 'S/n', None)]
+	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
+	assert len(warned(logged)) == 1 and fallbacks(logged) == warned(logged)
+	if with_verification:
+		assert_version_is_the_tree(job, v)
+	assert open(os.path.join(v, 'S/n')).read() == 'n\n'
+
+
+def test_file_source_remade_as_a_folder_after_a_moved_on_rename(job, logged):
+	# mkdir x; mv old x/f; mv x y; mkdir old; echo n > old/n: the removal of the version's file old must be done before
+	# the folder made at old is replayed
+	seed_monitor(job, {'old': 'old\n'})
+	run_backup(job)
+	apply(job.monitor, [('mkdir', 'x'), ('mv', 'old', 'x/f'), ('mv', 'x', 'y'), ('mkdir', 'old'), ('w', 'old/n', 'n\n')])
+	del logged[:]
+	v = verified(job, (True, 'create', 'x', None), (False, 'move', 'x/f', 'old'), (True, 'move', 'y', 'x'), (True, 'create', 'old', None),
+		(False, 'create', 'old/n', None))
+	assert len(warned(logged)) == 1 and fallbacks(logged) == warned(logged)
+	assert_version_is_the_tree(job, v)
