@@ -1,11 +1,11 @@
 '''
-do_referenced_copy() looks at the previous version by one listing per folder and makes the folders and links on a few
-threads (round 14). Its results stay those of the per-entry version it replaced, kept here as the oracle: the same
+do_referenced_copy() looks at the previous version, and makes the folders and links, on a few threads (round 14). Its results stay those of the per-entry version it replaced, kept here as the oracle: the same
 links and folders, the same rows dropped with the same lines in the same order, unsynced filled the same way, and a
 stop or a dropped disk still stops it.
 '''
 import errno
 import os
+import re
 import shutil
 import stat
 import threading
@@ -177,7 +177,9 @@ def run_both(job, monkeypatch, logged, prepare=None):
 		unsynced = []
 		rv.GREEN_LIGHT.set()
 		result = copy(v0, v1, manifest, relative=True, unsynced=unsynced)
-		outcomes.append((result, tree_of(v1), (manifest.folders, manifest.files), list(logged), unsynced))
+		# the time line is the new copy's alone
+		lines = [line for line in logged if not line[1].startswith('Made the referenced copy of ')]
+		outcomes.append((result, tree_of(v1), (manifest.folders, manifest.files), lines, unsynced))
 		manifest.close()
 	return v0, outcomes
 
@@ -225,26 +227,20 @@ def eio(path):
 
 @pytest.mark.parametrize('what', ['folder', 'file'])
 def test_an_entry_that_cannot_be_looked_at_is_kept_with_its_line(job, monkeypatch, logged, small_chunks, what):
-	# its folder cannot be listed, so each of its entries is looked at alone, and this one cannot be
-	# for the folder, a file row of its name too: linked as ever, it finds the folder made, and is dropped with a line a
-	# thread reports, which comes before the lines of the rows after it
+	# its lstat fails: it stays tracked and is made or linked as ever. for the folder, a file row of its name too: linked
+	# as ever, it finds the folder made, and is dropped with a line a thread reports, which comes before the lines of the
+	# rows after it
 	failing_entry = 'd/sub' if what == 'folder' else 'd/x'
 	monkeypatch.setattr(rv, 'REFERENCED_COPY_CHUNK', 8)
 	extra.extend(['d/sub', 'd/subx', 'd/x2'] if what == 'folder' else ['d/x2'])
-	real_scandir, real_lstat = os.scandir, os.lstat
+	real_lstat = os.lstat
 	failing = {}
-	def scandir(path='.'):
-		if not isinstance(path, int) and os.fspath(path).rstrip('/') == failing.get('folder'):
-			raise eio(path)
-		return real_scandir(path)
 	def lstat(path, *args, **kwargs):
 		if os.fspath(path).rstrip('/') == failing.get('entry'):
 			raise eio(path)
 		return real_lstat(path, *args, **kwargs)
 	def prepare(v0):
-		failing['folder'] = os.path.join(v0, 'd')
 		failing['entry'] = os.path.join(v0, failing_entry)
-	monkeypatch.setattr(os, 'scandir', scandir)
 	monkeypatch.setattr(os, 'lstat', lstat)
 	v0, (old, new) = run_both(job, monkeypatch, logged, prepare)
 	failing.clear()
@@ -259,31 +255,6 @@ def test_an_entry_that_cannot_be_looked_at_is_kept_with_its_line(job, monkeypatc
 		taken = messages.index(f'Dropping tracked file d/sub: {job.job_vault}/{V1}/d/sub is taken in the new version')
 		assert messages.index(f'Cannot look at tracked file d/sub in {v0}, keeping it: {eio(os.path.join(v0, "d/sub"))}') < taken
 		assert taken < messages.index(f'Dropping tracked file missing from {v0}: d/subx')
-
-
-def test_an_entry_whose_listing_gives_no_kind_is_looked_at_alone(job, monkeypatch, logged, small_chunks):
-	# a DirEntry whose d_type tells nothing and whose own lstat fails: the lstat of the entry decides, as before
-	real_scandir = os.scandir
-	class Entry:
-		def __init__(self, entry):
-			self.name = entry.name
-		def is_dir(self, follow_symlinks=True):
-			raise eio(self.name)
-	class Listing:
-		def __init__(self, path):
-			self.it = real_scandir(path)
-		def __enter__(self):
-			return (Entry(entry) for entry in self.it)
-		def __exit__(self, *exc):
-			self.it.close()
-	inside = []
-	def scandir(path='.'):
-		if not isinstance(path, int) and inside and os.fspath(path).startswith(inside[0]):
-			return Listing(path)
-		return real_scandir(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
-	_, (old, new) = run_both(job, monkeypatch, logged, inside.append)
-	assert new == old
 
 
 def links_counted(monkeypatch, after, action):
@@ -382,4 +353,53 @@ def test_an_absolute_copy_links_each_file_to_its_source(job):
 	tree = tree_of(v1)
 	assert tree['f/01/0060'] == ('link', os.path.join(v0, 'f/01/0060'))
 	assert sum(1 for kind in tree.values() if kind == 'folder') == 4
+	manifest.close()
+
+
+@pytest.mark.parametrize('exc', [PermissionError(errno.EACCES, 'EACCES'), OSError(errno.ENOSPC, 'ENOSPC')])
+@pytest.mark.parametrize('where', ['symlink', 'makedirs'])
+def test_what_a_thread_raises_comes_out_and_no_thread_is_left(job, monkeypatch, logged, exc, where):
+	v0, manifest = big_version(job)
+	v1 = os.path.join(job.job_vault, V1)
+	calls = []
+	lock = threading.Lock()
+	real = getattr(os, where)
+	def failing(*args, **kwargs):
+		with lock:
+			calls.append(args)
+			hit = len(calls) == 5
+		if hit:
+			raise exc
+		return real(*args, **kwargs)
+	monkeypatch.setattr(os, where, failing)
+	before = threading.active_count()
+	with pytest.raises(type(exc)):
+		rv.do_referenced_copy(v0, v1, manifest, relative=True)
+	assert threading.active_count() == before
+	# no row dropped for it
+	assert len(manifest.files) == 400
+	manifest.close()
+
+
+def test_one_line_tells_how_long_the_copy_took(job, logged):
+	v0, manifest = big_version(job, 120)
+	v1 = os.path.join(job.job_vault, V1)
+	assert rv.do_referenced_copy(v0, v1, manifest, relative=True) is True
+	line = [(kind, message) for kind, message in logged if message.startswith('Made the referenced copy of ')]
+	assert len(line) == 1 and line[0][0] == 'info'
+	line = [message for _, message in line]
+	assert re.fullmatch(re.escape(f'Made the referenced copy of {v0} in ') + rf'\d+\.\d s: 120 files, 3 folders, {rv.REFERENCED_COPY_THREADS} threads', line[0])
+	manifest.close()
+
+
+def test_a_stopped_copy_says_it_stopped(job, monkeypatch, logged):
+	v0, manifest = big_version(job)
+	v1 = os.path.join(job.job_vault, V1)
+	links_counted(monkeypatch, 50, rv.GREEN_LIGHT.clear)
+	try:
+		assert rv.do_referenced_copy(v0, v1, manifest, relative=True) is False
+	finally:
+		rv.GREEN_LIGHT.set()
+	line = [message for kind, message in logged if message.startswith('Stopped making the referenced copy of ')]
+	assert len(line) == 1 and line[0].endswith(f' threads') and not any(message.startswith('Made the referenced copy of ') for _, message in logged)
 	manifest.close()

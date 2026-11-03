@@ -2,6 +2,8 @@ import ctypes
 import errno
 import os
 import sys
+import threading
+import time
 import pytest
 import reverberator as rv
 
@@ -293,6 +295,43 @@ def test_poll_checks_at_most_once_a_period(monkeypatch, fake_pool, pool):
 	with pytest.raises(rv.PoolNotReady):
 		guard.poll()
 	assert fake_pool.reads == after_init + 2
+
+
+@pytest.mark.unit
+def test_threads_polling_at_once_check_once(monkeypatch, fake_pool, pool):
+	# a referenced copy polls from each of its threads: one of those that come at once checks, the others go on
+	vault, _, _ = pool
+	monkeypatch.setattr(rv, 'POOL_CHECK_SECONDS', 10)
+	class Slow(rv.PoolGuard):
+		# long enough for another thread to read next_check between a thread's read and its write
+		@property
+		def next_check(self):
+			value = self.__dict__.get('next')
+			time.sleep(0.002)
+			return value
+		@next_check.setter
+		def next_check(self, value):
+			self.__dict__['next'] = value
+	guard = Slow([vault], clock=lambda: 0)
+	threads = 16
+	start = threading.Barrier(threads)
+	checks = []
+	def slow_require():
+		checks.append(1)
+		time.sleep(0.2)
+	guard.require = slow_require
+	def poll():
+		start.wait()
+		guard.poll()
+	workers = [threading.Thread(target=poll) for _ in range(threads)]
+	began = time.monotonic()
+	for worker in workers:
+		worker.start()
+	for worker in workers:
+		worker.join()
+	assert len(checks) == 1
+	# the others did not wait for it
+	assert time.monotonic() - began < 0.2 * 2
 
 
 @pytest.mark.unit

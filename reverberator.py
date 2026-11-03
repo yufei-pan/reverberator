@@ -3955,6 +3955,7 @@ class PoolGuard:
 		self.states = [(path, state) for path, state in ((path, pool_state(path)) for path in paths) if state is not None]
 		self.clock = clock
 		self.next_check = None
+		self.lock = threading.Lock()
 
 	def problem(self) -> 'str | None':
 		for path, since in self.states:
@@ -3969,10 +3970,12 @@ class PoolGuard:
 			raise PoolNotReady(problem)
 
 	def poll(self) -> None:
-		now = self.clock()
-		if self.next_check is not None and now < self.next_check:
-			return
-		self.next_check = now + POOL_CHECK_SECONDS
+		# threads poll too: of those that come at once, one checks and the others go on
+		with self.lock:
+			now = self.clock()
+			if self.next_check is not None and now < self.next_check:
+				return
+			self.next_check = now + POOL_CHECK_SECONDS
 		self.require()
 
 def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList' = None) -> dict:
@@ -6904,191 +6907,15 @@ def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, dis
 	else:
 		pending.clear()
 
-def folder_within(folder:str, outer:str) -> bool:
-	'''
-	Whether the folder rel folder (no trailing /, '' for the top) is outer or inside it.
-
-	Examples:
-		>>> [folder_within(folder, outer) for folder, outer in (('a/b', ''), ('a/b', 'a'), ('a', 'a'), ('ab', 'a'), ('', 'a'))]
-		[True, True, True, False, False]
-	'''
-	return outer == '' or folder == outer or folder.startswith(outer + '/')
-
-class SourceKinds:
-	'''
-	What each entry of the folder at source_path is, looked up for rels (no trailing /) in sorted order, as the manifest
-	gives them: one listing of each folder holding them ( os.scandir(), by its d_type, or an lstat where it gives none )
-	in place of one lstat each. kind(rel) gives None when the entry is not there ( not in its folder's listing, or that
-	folder is not there or no folder ), 'folder' for a real folder, 'other' for anything else, a link to a folder too,
-	and False when it cannot be looked at, with an error line: the lstat of each entry of a folder that cannot be listed
-	tells. Only the listings of the folders above the last rel are held, as sorted rels never come back to a folder once
-	past its own. With pool, the listings are made on its threads, ahead of their use by up to ahead: rels, the same rels
-	kind() is asked, in order, tell which folders are listed when. report(message), when given, writes the error line
-	in place of the backuper's log.
-	'''
-	def __init__(self, source_path:str, pool:ThreadPoolExecutor = None, rels = (), ahead:int = 0, report = None):
-		self.source_path = source_path
-		self.report = report or (lambda message: backuperTeeLogToTl(path=source_path,error=True,message=message))
-		# (folder rel with no trailing /, '' for source_path itself; {name: True for a real folder, False for anything
-		# else, None when it cannot be told}, or None when the folder cannot be listed)
-		self.held = []
-		self.pool, self.ahead = pool, ahead
-		self.coming = self.listed(rels)
-		# (folder, the future of its listing), in the order kind() asks for them
-		self.pending = deque()
-
-	@staticmethod
-	def listed(rels):
-		# the folders kind() lists for rels, in order
-		held = []
-		for rel in rels:
-			folder = rel.rpartition('/')[0]
-			while held and not folder_within(folder, held[-1]):
-				held.pop()
-			if not held or held[-1] != folder:
-				held.append(folder)
-				yield folder
-
-	def listing(self, folder:str):
-		path = os.path.join(self.source_path, folder) if folder else self.source_path
-		try:
-			found = {}
-			with os.scandir(path) as entries:
-				for entry in entries:
-					try:
-						found[entry.name] = entry.is_dir(follow_symlinks=False)
-					except OSError:
-						found[entry.name] = None
-			return found
-		except (FileNotFoundError, NotADirectoryError):
-			# as the lstat of an entry below a name that is not there, or is a file there now
-			return {}
-		except OSError:
-			return None
-
-	def take(self, folder:str):
-		while self.pool is not None and len(self.pending) < self.ahead:
-			coming = next(self.coming, None)
-			if coming is None:
-				break
-			self.pending.append((coming, self.pool.submit(self.listing, coming)))
-		if self.pending and self.pending[0][0] == folder:
-			return self.pending.popleft()[1].result()
-		return self.listing(folder)
-
-	def close(self):
-		# the listings not started are not made
-		for _, future in self.pending:
-			future.cancel()
-		self.pending.clear()
-
-	def kind(self, rel:str, what:str, shown:str):
-		'''The kind of rel (no trailing /), a tracked what (file or folder) the error line names shown.'''
-		folder, _, name = rel.rpartition('/')
-		while self.held and not folder_within(folder, self.held[-1][0]):
-			self.held.pop()
-		if not self.held or self.held[-1][0] != folder:
-			self.held.append((folder, self.take(folder)))
-		listing = self.held[-1][1]
-		is_folder = None if listing is None else listing.get(name, 'missing')
-		if is_folder == 'missing':
-			return None
-		if is_folder is not None:
-			return 'folder' if is_folder else 'other'
-		# the lstat of the entry itself, never followed, as when it was looked at alone
-		path = os.path.join(self.source_path, rel)
-		try:
-			return 'folder' if stat.S_ISDIR(os.lstat(path).st_mode) else 'other'
-		except (FileNotFoundError, NotADirectoryError):
-			return None
-		except OSError as e:
-			self.report(f'Cannot look at tracked {what} {shown} in {self.source_path}, keeping it: {e}')
-			return False
-
 class CopyInterrupted(Exception):
 	'''GREEN_LIGHT went out while a referenced copy made its entries.'''
 
-class OrderedTasks:
-	'''
-	Work run on a pool's threads in chunks, its outcomes handled on the calling thread in the order it was queued, so
-	what it writes and logs is what running it inline did. add(item, work) queues work(item); note(outcome) queues an
-	outcome, called in its place among them; handle(item, error) is called for each item run, with the exception of
-	catch that work raised for it, or None. check() runs after each item, on its thread: what it raises, or what work
-	raises past catch, stops every chunk at its next item, and the handling raises it once the items before it are
-	handled. drain() handles everything queued; close() drops what has not started.
-	'''
-	def __init__(self, pool:ThreadPoolExecutor, handle, catch:tuple, check, chunk:int, window:int):
-		self.pool, self.handle, self.catch, self.check, self.chunk, self.window = pool, handle, catch, check, chunk, window
-		self.stop = threading.Event()
-		self.batch = []
-		self.queue = deque()
-
-	def run(self, batch:list) -> tuple:
-		# (the outcome of each item run, what stopped the chunk or None)
-		errors = []
-		try:
-			for item, work in batch:
-				if self.stop.is_set():
-					break
-				try:
-					work(item)
-					errors.append(None)
-				except self.catch as e:
-					errors.append(e)
-				self.check()
-		except BaseException as e:
-			self.stop.set()
-			return errors, e
-		return errors, None
-
-	def submit(self):
-		if self.batch:
-			batch, self.batch = self.batch, []
-			self.queue.append((batch, self.pool.submit(self.run, batch)))
-		while len(self.queue) > self.window or (self.stop.is_set() and self.queue):
-			self.handle_next()
-
-	def add(self, item, work):
-		self.batch.append((item, work))
-		if len(self.batch) >= self.chunk or self.stop.is_set():
-			self.submit()
-
-	def note(self, outcome):
-		if not self.batch and not self.queue:
-			outcome()
-			return
-		self.submit()
-		self.queue.append((outcome, None))
-
-	def handle_next(self):
-		what, future = self.queue.popleft()
-		if future is None:
-			what()
-			return
-		errors, raised = future.result()
-		for (item, _), error in zip(what, errors):
-			self.handle(item, error)
-		if raised is not None:
-			raise raised
-
-	def drain(self):
-		self.submit()
-		while self.queue:
-			self.handle_next()
-
-	def close(self):
-		self.stop.set()
-		for _, future in self.queue:
-			if future is not None:
-				future.cancel()
-		self.queue.clear()
-		self.batch = []
-
-# threads making a referenced copy's folders and links: a mergerfs pool serves many requests at once
-REFERENCED_COPY_THREADS = 16
+# threads making a referenced copy's folders and links: a mergerfs pool serves many requests at once. the pool of each
+# copy is made from this alone
+REFERENCED_COPY_THREADS = 8
 # entries a thread takes at once, and the chunks queued ahead of the one handled
 REFERENCED_COPY_CHUNK = 64
-REFERENCED_COPY_WINDOW = 2 * REFERENCED_COPY_THREADS
+REFERENCED_COPY_WINDOW = 32
 
 def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None,unsynced:list = None) -> bool:
 	'''
@@ -7102,142 +6929,188 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	which is a new folder: a lookup that finds nothing is not cached on a mergerfs vault. Returns False when the backup
 	was interrupted. pool_guard, when given, is polled for each entry: a disk of its pools that drops stops the copy
 	with PoolNotReady. A folder whose metadata could not be copied is appended to unsynced ( copy_file_meta()'s failed ).
-	source_path is looked at by one listing of each folder holding rows ( SourceKinds ), and the folders, then the
-	links, are made on REFERENCED_COPY_THREADS threads ( OrderedTasks ): the rows dropped, their lines and unsynced
-	come in row order, on the calling thread, which alone reads and changes manifest. A file whose folder this copy did
-	not make (no row tracks it, or it is a link) is linked on its own once everything before it is, as a link made
-	before it may be on its way. A stop or a pool that drops can leave up to a thread's entry made past it on each other
-	thread, in the version that is not committed.
+	Each entry is looked at, and made or linked, on one of REFERENCED_COPY_THREADS threads, REFERENCED_COPY_CHUNK rows at
+	a time: a mergerfs vault answers many requests at once, and one at a time is what made the copy slow. What each
+	row came to is handled on the calling thread, in row order: the rows dropped, their lines and unsynced come as
+	when one thread went through them, and it alone reads and changes manifest. The folders are made before any link.
+	A file whose folder this copy did not make (no row tracks it, or it is a link) is linked on its own once everything
+	before it is, as a link made before it may be on its way. A stop or a pool that drops can leave up to a thread's
+	entry made past it on each other thread, in the version that is not committed. One line says how long it took.
 	'''
 	global BACKUP_SEMAPHORE
 	global GREEN_LIGHT
+	started = time.monotonic()
 	backuperTeeLogToTl(path=source_path,message=f'Creating a referenced copy of {source_path} to {backup_folder}')
 	# rows are read as they are linked and dropped afterwards: changing a table while reading it is undefined in sqlite
 	missing = []
-	# the folders made, by rel with no trailing /: a link in one needs nothing made before it but the folder
+	# the folders made, by rel with no trailing /
 	made = set()
+	count = {'files': 0, 'folders': 0}
+	stop = threading.Event()
 	def check():
-		# after each entry made
+		# after each entry, on its thread
 		if pool_guard is not None:
 			pool_guard.poll()
 		if not GREEN_LIGHT.is_set():
 			raise CopyInterrupted()
-	def drop(rel:str, message:str, warning:bool = False):
-		# a row dropped, its line written in its place among the others
-		def dropped():
+	def look(rel:str, kind:str):
+		# the lstat of a tracked entry in source_path, never followed, and the line it gives: (None, None) when it is not
+		# there ( ENOTDIR says so too, for one below a name that is a file there now ), (False, a line) when it cannot be
+		# looked at
+		try:
+			return os.lstat(os.path.join(source_path,rel.rstrip('/'))), None
+		except (FileNotFoundError, NotADirectoryError):
+			return None, None
+		except OSError as e:
+			return False, f'Cannot look at tracked {kind} {rel} in {source_path}, keeping it: {e}'
+	def copy_folder(folder:str):
+		# on a thread: (the lines to write as (warning, message), whether it was made, unsynced's share of it)
+		if not is_entry_rel(folder):
+			# such as './', which daemons before 0.43 wrote for the attrib event of the monitored root
+			return [(True, f'Dropping a tracked row that names no folder below the version: {folder!r}')], False, None
+		st, line = look(folder, 'folder')
+		lines = [(False, line)] if line else []
+		source_folder = os.path.join(source_path,folder)
+		if st is None:
+			return lines + [(False, f'Dropping tracked folder missing from {source_path}: {folder}')], False, None
+		if st and not stat.S_ISDIR(st.st_mode):
+			# a file or a link there, a user's link to a folder too: its file row, when it has one, makes it
+			return lines + [(False, f'Dropping tracked folder {folder}: {source_folder.rstrip("/")} is no folder')], False, None
+		failed = []
+		backup_folder_path = os.path.join(backup_folder,folder)
+		os.makedirs(backup_folder_path,exist_ok=True)
+		copy_file_meta(source_folder,backup_folder_path,failed)
+		return lines, True, failed
+	def referenced_link(source_file:str, backup_file_path:str):
+		# use ln -fsrLT to do a relative symlink
+		# ln --symbolic --logical --force --no-target-directory
+		# note: no longer using --logical as we are moving to use chained symlinks to reduce run time disk IO
+		os.symlink(source_file, backup_file_path)
+	def copy_file(file:str):
+		# on a thread, or inline: (the lines to write, 'linked' / 'dropped' / 'taken' / 'no folder', the link made or not)
+		if not is_entry_rel(file):
+			return [(True, f'Dropping a tracked row that names no file below the version: {file!r}')], 'dropped', None
+		st, line = look(file, 'file')
+		lines = [(False, line)] if line else []
+		if st is None:
+			# the tracked list claims a file this version does not have. linking it
+			# anyway produces a dangling link that every later version inherits and
+			# chains onto, so drop the entry here and let the list self heal.
+			return lines + [(False, f'Dropping tracked file missing from {source_path}: {file}')], 'dropped', None
+		if st and stat.S_ISDIR(st.st_mode):
+			# a link to it would let the rows under it ( a folder row of the same name made the folder already ) reach
+			# through it into source_path. the folder keeps what its rows hold, and a comparison of that place copies the
+			# file if the tree holds it
+			return lines + [(False, f'Dropping tracked file {file}: it is a folder in {source_path}')], 'dropped', None
+		source_file_real = os.path.join(source_path,file)
+		backup_file_path = os.path.join(backup_folder,file)
+		if relative:
+			source_file = os.path.relpath(source_file_real,os.path.dirname(backup_file_path))
+		else:
+			source_file = os.path.abspath(source_file_real)
+		try:
+			referenced_link(source_file, backup_file_path)
+			return lines, 'linked', None
+		except FileExistsError:
+			# a new version holds nothing there, unless a link above it ( a file row linked where rows of both kinds share
+			# a name ) leads elsewhere, which is never written through
+			return lines + [(False, f'Dropping tracked file {file}: {backup_file_path} is taken in the new version')], 'taken', None
+		except FileNotFoundError:
+			return lines, 'no folder', (source_file, backup_file_path)
+	def write(lines:list):
+		for warning, message in lines:
 			if warning:
 				backuperTeeLogToTl(path=source_path,warning=True,message=message)
 			else:
 				backuperTeeLogToTl(path=source_path,error=True,message=message)
-			if rel is not None:
-				missing.append(rel)
-		return dropped
-	def report(message:str):
-		# the line of an entry that cannot be looked at, which stays tracked, in its place among the others
-		tasks.note(drop(None, message))
-	def make_folder(item):
-		source_folder, backup_folder_path, failed = item
-		os.makedirs(backup_folder_path,exist_ok=True)
-		copy_file_meta(source_folder,backup_folder_path,failed)
-	def folder_made(item, error):
-		# each folder's own list, so unsynced is filled in row order
-		if unsynced is not None:
-			unsynced.extend(item[2])
-	def link_file(item):
-		file, source_file, backup_file_path = item
-		os.symlink(source_file, backup_file_path)
-	def file_linked(item, error):
-		file, source_file, backup_file_path = item
-		if isinstance(error, FileExistsError):
-			# a new version holds nothing there, unless a link above it ( a file row linked where rows of both kinds share
-			# a name ) leads elsewhere, which is never written through
-			backuperTeeLogToTl(path=source_path,error=True,message=f'Dropping tracked file {file}: {backup_file_path} is taken in the new version')
-			missing.append(file)
-		elif isinstance(error, FileNotFoundError):
+	def folder_handled(folder:str, outcome:tuple):
+		lines, was_made, failed = outcome
+		write(lines)
+		if was_made:
+			made.add(folder.rstrip('/'))
+			count['folders'] += 1
+			if unsynced is not None:
+				unsynced.extend(failed)
+		else:
+			missing.append(folder)
+	def file_handled(file:str, outcome:tuple):
+		lines, state, retry = outcome
+		write(lines)
+		if state == 'linked':
+			count['files'] += 1
+		elif state == 'no folder':
 			# a folder above it has no row ( an older daemon made it bare for a file under it ): made, so every backup does
 			# not fail here. the next change under it copies the whole folder ( do_reverb_backup() )
+			source_file, backup_file_path = retry
 			parent = os.path.dirname(backup_file_path)
 			if not os.path.lexists(parent):
 				backuperTeeLogToTl(path=source_path,warning=True,message=f'Making {parent}, which no row tracks, for the tracked {file}')
 			os.makedirs(parent, exist_ok=True)
-			os.symlink(source_file, backup_file_path)
-	pool = ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS)
-	kinds = tasks = None
-	try:
-		tasks = OrderedTasks(pool, folder_made, (), check, REFERENCED_COPY_CHUNK, REFERENCED_COPY_WINDOW)
-		kinds = SourceKinds(source_path, pool, (folder.rstrip('/') for folder in manifest.iter_folders() if is_entry_rel(folder)), REFERENCED_COPY_WINDOW, report)
-		for folder in manifest.iter_folders():
-			source_folder = os.path.join(source_path,folder)
-			backup_folder_path = os.path.join(backup_folder,folder)
-			if not is_entry_rel(folder):
-				# such as './', which daemons before 0.43 wrote for the attrib event of the monitored root
-				tasks.note(drop(folder, f'Dropping a tracked row that names no folder below the version: {folder!r}', warning=True))
-				continue
-			kind = kinds.kind(folder.rstrip('/'), 'folder', folder)
-			if kind is None:
-				tasks.note(drop(folder, f'Dropping tracked folder missing from {source_path}: {folder}'))
-				continue
-			if kind == 'other':
-				# a file or a link there, a user's link to a folder too: its file row, when it has one, makes it
-				tasks.note(drop(folder, f'Dropping tracked folder {folder}: {source_folder.rstrip("/")} is no folder'))
-				continue
-			made.add(folder.rstrip('/'))
-			tasks.add((source_folder, backup_folder_path, []), make_folder)
-		# every folder is there before any link in it
-		tasks.drain()
-		kinds.close()
-		tasks = OrderedTasks(pool, file_linked, (FileExistsError, FileNotFoundError), check, REFERENCED_COPY_CHUNK, REFERENCED_COPY_WINDOW)
-		kinds = SourceKinds(source_path, pool, (file for file in manifest.iter_files() if is_entry_rel(file)), REFERENCED_COPY_WINDOW, report)
-		for file in manifest.iter_files():
-			# use ln -fsrLT to do a relative symlink
-			# ln --symbolic --logical --force --no-target-directory
-			source_file_real = os.path.join(source_path,file)
-			backup_file_path = os.path.join(backup_folder,file)
-			if not is_entry_rel(file):
-				tasks.note(drop(file, f'Dropping a tracked row that names no file below the version: {file!r}', warning=True))
-				continue
-			kind = kinds.kind(file, 'file', file)
-			if kind is None:
-				# the tracked list claims a file this version does not have. linking it
-				# anyway produces a dangling link that every later version inherits and
-				# chains onto, so drop the entry here and let the list self heal.
-				tasks.note(drop(file, f'Dropping tracked file missing from {source_path}: {file}'))
-				continue
-			if kind == 'folder':
-				# a link to it would let the rows under it ( a folder row of the same name made the folder already ) reach
-				# through it into source_path. the folder keeps what its rows hold, and a comparison of that place copies the
-				# file if the tree holds it
-				tasks.note(drop(file, f'Dropping tracked file {file}: it is a folder in {source_path}'))
-				continue
-			if relative:
-				source_file = os.path.relpath(source_file_real,os.path.dirname(backup_file_path))
-			else:
-				source_file = os.path.abspath(source_file_real)
-			# note: no longer using --logical as we are moving to use chained symlinks to reduce run time disk IO
-			item = (file, source_file, backup_file_path)
-			parent = file.rpartition('/')[0]
-			if parent and parent not in made:
-				# its folder may come of a link made before it ( a file row of the folder's name ), or not be there yet
-				tasks.drain()
-				try:
-					link_file(item)
-					error = None
-				except (FileExistsError, FileNotFoundError) as e:
-					error = e
-				file_linked(item, error)
+			referenced_link(source_file, backup_file_path)
+			count['files'] += 1
+		else:
+			missing.append(file)
+	def run(work, rows:list) -> tuple:
+		# on a thread: (the outcome of each row run, what stopped it or None)
+		outcomes = []
+		try:
+			for row in rows:
+				if stop.is_set():
+					break
+				outcomes.append(work(row))
 				check()
-			else:
-				tasks.add(item, link_file)
-		tasks.drain()
+		except BaseException as e:
+			stop.set()
+			return outcomes, e
+		return outcomes, None
+	def ordered(rows, work, handled, alone = lambda row: False):
+		# work(row) for each row on the pool, handled(row, outcome) for each on this thread in row order, at most
+		# REFERENCED_COPY_WINDOW chunks ahead. what work raises is raised once the rows before it are handled
+		queue = deque()
+		def handle(keep:int):
+			while len(queue) > keep:
+				chunk, future = queue.popleft()
+				outcomes, raised = future.result()
+				for row, outcome in zip(chunk, outcomes):
+					handled(row, outcome)
+				if raised is not None:
+					raise raised
+		def submit(chunk:list):
+			queue.append((chunk, pool.submit(run, work, chunk)))
+		chunk = []
+		for row in rows:
+			if alone(row):
+				# everything before it is done first
+				if chunk:
+					submit(chunk)
+					chunk = []
+				handle(0)
+				handled(row, work(row))
+				check()
+				continue
+			chunk.append(row)
+			if len(chunk) >= REFERENCED_COPY_CHUNK:
+				submit(chunk)
+				chunk = []
+				handle(REFERENCED_COPY_WINDOW)
+		if chunk:
+			submit(chunk)
+		handle(0)
+	pool = ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS)
+	finished = False
+	try:
+		ordered(manifest.iter_folders(), copy_folder, folder_handled)
+		# a link in a folder made needs nothing before it. in one not made, a link may be what makes it
+		ordered(manifest.iter_files(), copy_file, file_handled, lambda file: '/' in file and file.rpartition('/')[0] not in made)
+		finished = True
 	except CopyInterrupted:
 		backuperTeeLogToTl(path=source_path,error=True,message='Backup process interrupted, stopping')
 		return False
 	finally:
-		# a stop or an error leaves nothing queued running on
-		for queued in (kinds, tasks):
-			if queued is not None:
-				queued.close()
+		# a stop or an error ends the chunks still queued at their first entry
+		stop.set()
 		pool.shutdown(wait=True)
+		backuperTeeLogToTl(path=source_path,message=f'{"Made" if finished else "Stopped making"} the referenced copy of {source_path} in {time.monotonic() - started:.1f} s: {count["files"]} files, {count["folders"]} folders, {REFERENCED_COPY_THREADS} threads')
 	manifest.discard_many(missing)
 	return True
 
