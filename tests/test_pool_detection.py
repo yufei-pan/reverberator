@@ -316,22 +316,29 @@ def test_threads_polling_at_once_check_once(monkeypatch, fake_pool, pool):
 	threads = 16
 	start = threading.Barrier(threads)
 	checks = []
+	released = threading.Event()
+	returned = []
 	def slow_require():
 		checks.append(1)
-		time.sleep(0.2)
+		# the one check stays here until the other polls have returned (or 2 s, so a broken poll fails, not hangs)
+		released.wait(2)
 	guard.require = slow_require
 	def poll():
 		start.wait()
 		guard.poll()
+		returned.append(released.is_set())
 	workers = [threading.Thread(target=poll) for _ in range(threads)]
-	began = time.monotonic()
 	for worker in workers:
 		worker.start()
+	deadline = time.monotonic() + 1
+	while len(returned) < threads - 1 and time.monotonic() < deadline:
+		time.sleep(0.01)
+	released.set()
 	for worker in workers:
 		worker.join()
 	assert len(checks) == 1
-	# the others did not wait for it
-	assert time.monotonic() - began < 0.2 * 2
+	# the others returned while the check still ran: they did not wait for it
+	assert returned.count(False) == threads - 1
 
 
 @pytest.mark.unit

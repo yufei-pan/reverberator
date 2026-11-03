@@ -6937,8 +6937,6 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	before it is, as a link made before it may be on its way. A stop or a pool that drops can leave up to a thread's
 	entry made past it on each other thread, in the version that is not committed. One line says how long it took.
 	'''
-	global BACKUP_SEMAPHORE
-	global GREEN_LIGHT
 	started = time.monotonic()
 	backuperTeeLogToTl(path=source_path,message=f'Creating a referenced copy of {source_path} to {backup_folder}')
 	# rows are read as they are linked and dropped afterwards: changing a table while reading it is undefined in sqlite
@@ -6982,12 +6980,9 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		copy_file_meta(source_folder,backup_folder_path,failed)
 		return lines, True, failed
 	def referenced_link(source_file:str, backup_file_path:str):
-		# use ln -fsrLT to do a relative symlink
-		# ln --symbolic --logical --force --no-target-directory
-		# note: no longer using --logical as we are moving to use chained symlinks to reduce run time disk IO
 		os.symlink(source_file, backup_file_path)
 	def copy_file(file:str):
-		# on a thread, or inline: (the lines to write, 'linked' / 'dropped' / 'taken' / 'no folder', the link made or not)
+		# on a thread, or inline: (the lines to write, 'linked' / 'dropped' / 'no folder', the link made or not)
 		if not is_entry_rel(file):
 			return [(True, f'Dropping a tracked row that names no file below the version: {file!r}')], 'dropped', None
 		st, line = look(file, 'file')
@@ -7014,7 +7009,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		except FileExistsError:
 			# a new version holds nothing there, unless a link above it ( a file row linked where rows of both kinds share
 			# a name ) leads elsewhere, which is never written through
-			return lines + [(False, f'Dropping tracked file {file}: {backup_file_path} is taken in the new version')], 'taken', None
+			return lines + [(False, f'Dropping tracked file {file}: {backup_file_path} is taken in the new version')], 'dropped', None
 		except FileNotFoundError:
 			return lines, 'no folder', (source_file, backup_file_path)
 	def write(lines:list):
