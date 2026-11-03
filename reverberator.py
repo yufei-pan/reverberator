@@ -10424,9 +10424,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	its rerun for the other is booked twice, and the next version's record then holds one copy more than it does.
 	The links are looked at and hard linked on REFERENCED_COPY_THREADS threads, as the referenced copy makes them, each
 	entry's books, failures and lines handled on the calling thread in walk order; once a copy has to be moved, the rest
-	of the walk is the calling thread's alone, and an entry a thread looked at before then is looked at again, unless it
-	was hard linked. The folders at the oldest version's top are removed each by an rm -rf of its own on as many
-	threads, then the whole by one more, which alone says whether it went. One line says how long it took.
+	of the walk is the calling thread's alone, and an entry a thread looked at before then is looked at again if the copy
+	it found has been moved since, unless the thread hard linked it. The folders at the oldest version's top are removed
+	each by an rm -rf of its own on as many threads (none when the oldest version's folder is not a real folder, a link
+	for one: the whole rm -rf then removes only that link), then the whole by one more, which alone says whether it went.
+	One line says how long it took.
 
 	Examples:
 		>>> decrement_stepper(OrderedDict([(0, VaultEntry(0, '/tmp/x', 0, 0, 0))]), 'job', '/m')
@@ -10466,8 +10468,10 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		books[0] += st.st_blocks * 512
 		books[1] += 1
 	# the copies hard linked into the next version this run, by inode, so two links naming one copy (one of them a user's
-	# link the rows could not tell) book it once. one moved needs no note: another link naming it finds it gone, and
-	# gets a copy of its own (copied), so the move path, which notes every copy it moves already, holds no more
+	# link the rows could not tell) book it once. one moved is not noted: another link naming it finds it gone, and gets
+	# a copy of its own (copied). a copy a thread hard linked before an earlier entry moved it is booked once as well,
+	# by whichever of the two is handled first: the move books the copy unless the link did, and the link, handled after
+	# the move, books only the link it replaces
 	booked = PathHashes()
 	if prune_salt is None and job_name not in PRUNE_SALT_MISSING:
 		PRUNE_SALT_MISSING.add(job_name)
@@ -10829,10 +10833,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		# on this thread, in walk order: the books, the lines and what is left to do for the entry at file
 		nonlocal moving
 		lines, left, found, pooled = outcome
-		if moving and pooled and left != 'linked' and not (any(is_failure for is_failure, _ in lines) and (found is None or moved_to(found[1]) is None)):
-			# worked on a thread before the walk went on alone: a copy it found may have been moved since. a copy hard
-			# linked stays so, and so does a failure that no move can have caused (one on an entry whose copy was not
-			# moved), which this walk would have met as well
+		if moving and pooled and left != 'linked' and found is not None and moved_to(found[1]) is not None:
+			# worked on a thread before the walk went on alone, on a copy an earlier entry has moved since: looked at
+			# again. a copy hard linked stays so, and anything else stands, as no move touched it
 			lines, left, found, pooled = materialize(file)
 		for is_failure, message in lines:
 			if is_failure:
@@ -10851,7 +10854,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			if not move_copy(file, file_st, linkTarget, target_st):
 				return
 		elif moving and moved_to(linkTarget) is not None:
-			# a thread hard linked it before an earlier entry moved it: one copy, which that move booked
+			# a thread hard linked it before an earlier entry moved it: one copy, booked once by that move or by an
+			# earlier link (whichever came first), so this entry books only the link it replaces
 			book(unlinked, file_st)
 			return
 		# the copy is the next version's now, in place of the link
