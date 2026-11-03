@@ -99,6 +99,10 @@ def test_stepper_memory_does_not_grow_with_the_version(job, monkeypatch, how):
 	# a big job's next version links 500k+ files: listing them all before moving any cost hundreds of MB per backup.
 	# on a filesystem that cannot hard link, each copy is moved, and the walk notes every one (review7 P5: a set of
 	# their hashes went past the bound)
+	# the walk holds up to REFERENCED_COPY_WINDOW chunks of its entries at once (round 15), a bound of its own: kept below
+	# the trees measured here
+	monkeypatch.setattr(rv, 'REFERENCED_COPY_CHUNK', 8)
+	monkeypatch.setattr(rv, 'REFERENCED_COPY_WINDOW', 4)
 	if how == 'move':
 		def link(source, dest, *args, **kwargs):
 			raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), source)

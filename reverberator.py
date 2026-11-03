@@ -6910,12 +6910,67 @@ def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, dis
 class CopyInterrupted(Exception):
 	'''GREEN_LIGHT went out while a referenced copy made its entries.'''
 
-# threads making a referenced copy's folders and links: a mergerfs pool serves many requests at once. the pool of each
-# copy is made from this alone
+# threads making a referenced copy's folders and links, and replacing a prune's links: a mergerfs pool serves many
+# requests at once. the pool of each copy and prune is made from this alone
 REFERENCED_COPY_THREADS = 8
 # entries a thread takes at once, and the chunks queued ahead of the one handled
 REFERENCED_COPY_CHUNK = 64
 REFERENCED_COPY_WINDOW = 32
+
+def in_row_order(pool:ThreadPoolExecutor, rows, work, handled, stop:threading.Event, check = None, alone = None) -> None:
+	'''
+	work(row) for each of rows on pool, REFERENCED_COPY_CHUNK rows a task, and handled(row, outcome) for each on the
+	calling thread in row order, at most REFERENCED_COPY_WINDOW chunks ahead of it; check(), when given, after each
+	row's work, on the thread that did it. A row alone(row) is true for, asked as it is taken from rows, is worked on the
+	calling thread once every row before it is handled. What work or check raises sets stop, which ends every chunk at
+	its next row, and is raised once the rows before it are handled. The caller sets stop and shuts pool down once done,
+	so no chunk is left running when this raises.
+	'''
+	def run(chunk:list) -> tuple:
+		# on a thread: (the outcome of each row run, what stopped it or None)
+		outcomes = []
+		try:
+			for row in chunk:
+				if stop.is_set():
+					break
+				outcomes.append(work(row))
+				if check is not None:
+					check()
+		except BaseException as e:
+			stop.set()
+			return outcomes, e
+		return outcomes, None
+	queue = deque()
+	def handle(keep:int):
+		while len(queue) > keep:
+			chunk, future = queue.popleft()
+			outcomes, raised = future.result()
+			for row, outcome in zip(chunk, outcomes):
+				handled(row, outcome)
+			if raised is not None:
+				raise raised
+	def submit(chunk:list):
+		queue.append((chunk, pool.submit(run, chunk)))
+	chunk = []
+	for row in rows:
+		if alone is not None and alone(row):
+			# everything before it is done first
+			if chunk:
+				submit(chunk)
+				chunk = []
+			handle(0)
+			handled(row, work(row))
+			if check is not None:
+				check()
+			continue
+		chunk.append(row)
+		if len(chunk) >= REFERENCED_COPY_CHUNK:
+			submit(chunk)
+			chunk = []
+			handle(REFERENCED_COPY_WINDOW)
+	if chunk:
+		submit(chunk)
+	handle(0)
 
 def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None,unsynced:list = None) -> bool:
 	'''
@@ -7045,58 +7100,12 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			count['files'] += 1
 		else:
 			missing.append(file)
-	def run(work, rows:list) -> tuple:
-		# on a thread: (the outcome of each row run, what stopped it or None)
-		outcomes = []
-		try:
-			for row in rows:
-				if stop.is_set():
-					break
-				outcomes.append(work(row))
-				check()
-		except BaseException as e:
-			stop.set()
-			return outcomes, e
-		return outcomes, None
-	def ordered(rows, work, handled, alone = lambda row: False):
-		# work(row) for each row on the pool, handled(row, outcome) for each on this thread in row order, at most
-		# REFERENCED_COPY_WINDOW chunks ahead. what work raises is raised once the rows before it are handled
-		queue = deque()
-		def handle(keep:int):
-			while len(queue) > keep:
-				chunk, future = queue.popleft()
-				outcomes, raised = future.result()
-				for row, outcome in zip(chunk, outcomes):
-					handled(row, outcome)
-				if raised is not None:
-					raise raised
-		def submit(chunk:list):
-			queue.append((chunk, pool.submit(run, work, chunk)))
-		chunk = []
-		for row in rows:
-			if alone(row):
-				# everything before it is done first
-				if chunk:
-					submit(chunk)
-					chunk = []
-				handle(0)
-				handled(row, work(row))
-				check()
-				continue
-			chunk.append(row)
-			if len(chunk) >= REFERENCED_COPY_CHUNK:
-				submit(chunk)
-				chunk = []
-				handle(REFERENCED_COPY_WINDOW)
-		if chunk:
-			submit(chunk)
-		handle(0)
 	pool = ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS)
 	finished = False
 	try:
-		ordered(manifest.iter_folders(), copy_folder, folder_handled)
+		in_row_order(pool, manifest.iter_folders(), copy_folder, folder_handled, stop, check)
 		# a link in a folder made needs nothing before it. in one not made, a link may be what makes it
-		ordered(manifest.iter_files(), copy_file, file_handled, lambda file: '/' in file and file.rpartition('/')[0] not in made)
+		in_row_order(pool, manifest.iter_files(), copy_file, file_handled, stop, check, lambda file: '/' in file and file.rpartition('/')[0] not in made)
 		finished = True
 	except CopyInterrupted:
 		backuperTeeLogToTl(path=source_path,error=True,message='Backup process interrupted, stopping')
@@ -8072,12 +8081,14 @@ VERSION_MOVES_ROWS_KEPT = 200000
 VERSION_MOVES_KEPT = 1024
 VERSION_MOVES_LOCK = threading.Lock()
 
-def remember_version_moves(table:OrderedDict, key:tuple, value) -> None:
+def remember_version_moves(table:OrderedDict, key:tuple, value) -> bool:
 	'''
 	Keep value for key in table, one of VERSION_MOVES (bounded by VERSION_MOVES_ROWS_KEPT rows in all) and
 	VERSION_MOVES_WARNED (bounded by VERSION_MOVES_KEPT entries), dropping the least recently used past the bound.
+	Returns whether key was not in table, told under the lock, so of threads keeping one key one alone is first.
 	'''
 	with VERSION_MOVES_LOCK:
+		new = key not in table
 		table[key] = value
 		table.move_to_end(key)
 		if table is VERSION_MOVES:
@@ -8086,6 +8097,7 @@ def remember_version_moves(table:OrderedDict, key:tuple, value) -> None:
 				held -= table.popitem(last=False)[1].rows
 		while len(table) > VERSION_MOVES_KEPT:
 			table.popitem(last=False)
+	return new
 
 def forget_version_moves(version_path:str) -> None:
 	'''Drop what VERSION_MOVES and VERSION_MOVES_WARNED hold for the version at version_path, as pruning removed it.'''
@@ -8565,8 +8577,8 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 	if named == rel and ups == rel.count('/') + 1:
 		return target
 	if not moves.usable:
-		if moves.key is not None and moves.key not in VERSION_MOVES_WARNED:
-			remember_version_moves(VERSION_MOVES_WARNED, moves.key, None)
+		# a prune asks on several threads at once: one alone logs it
+		if moves.key is not None and moves.key not in VERSION_MOVES_WARNED and remember_version_moves(VERSION_MOVES_WARNED, moves.key, None):
 			backuperTeeLogToTl(path=moves.key[0],warning=True,message=f'Telling the moved links of {version_name} by their text alone, as its moves cannot be used: {moves.why}')
 		return target
 	verdict, why = moves.tells(named, rel, version_name)
@@ -10410,6 +10422,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	not the oldest version went: the oldest version's record and what the next one lost, when it went; never less than
 	nothing, so no prune raises the caller's sums, though a copy two links name that an aborted run booked for one and
 	its rerun for the other is booked twice, and the next version's record then holds one copy more than it does.
+	The links are looked at and hard linked on REFERENCED_COPY_THREADS threads, as the referenced copy makes them, each
+	entry's books, failures and lines handled on the calling thread in walk order; once a copy has to be moved, the rest
+	of the walk is the calling thread's alone, and an entry a thread looked at before then is looked at again, unless it
+	was hard linked. The folders at the oldest version's top are removed each by an rm -rf of its own on as many
+	threads, then the whole by one more, which alone says whether it went. One line says how long it took.
 
 	Examples:
 		>>> decrement_stepper(OrderedDict([(0, VaultEntry(0, '/tmp/x', 0, 0, 0))]), 'job', '/m')
@@ -10434,6 +10451,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		vault_info_dict.move_to_end(referenceVersionNumber, last=False)
 		return 0 , 0
 	backuperTeeLogToTl(path=referenceVaultPath,message=f'Recursively removing V{referenceVersionNumber}: {referenceVaultPath}')
+	started = time.monotonic()
+	# how long the walk and the removal took, None for one not run
+	timing = {'walk': None, 'removal': None}
 	vaultInfoIter = iter(vault_info_dict)
 	applyingVersionNumber = next(vaultInfoIter)
 	applyingVaultEntry = vault_info_dict[applyingVersionNumber]
@@ -10543,7 +10563,16 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		new_dict.update(vault_info_dict)
 		vault_info_dict.clear()
 		vault_info_dict.update(new_dict)
+		log_time(True)
 		return went_down(True)
+	def log_time(kept:bool) -> None:
+		# one line a prune: how long it took, and its walk and removal
+		parts = [f'{unlinked[1]} links replaced' + ('' if timing['walk'] is None else f' in {timing["walk"]:.1f} s')]
+		if timing['removal'] is not None:
+			parts.append(f'{"removal tried" if kept else "removed"} in {timing["removal"]:.1f} s')
+		took = time.monotonic() - started
+		backuperTeeLogToTl(path=referenceVaultPath,message=(f'Kept {referenceVaultPath}, as its prune stopped after {took:.1f} s: ' if kept else
+			f'Pruned {referenceVaultPath} in {took:.1f} s: ') + ', '.join(parts) + f', {REFERENCED_COPY_THREADS} threads')
 	def folder_gone() -> None:
 		# the reference vault's folder went: nothing is kept of it in memory
 		forget_real_vault_folders(referenceVaultPath)
@@ -10599,6 +10628,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		folder_gone()
 		if not remove_lists(lists):
 			return keep_oldest('what was left of it cannot be removed')
+		log_time(False)
 		return went_down(False)
 	except OSError as e:
 		return keep_oldest(f'it cannot be looked at: {e}')
@@ -10700,9 +10730,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			backuperTeeLogToTl(path=referenceVaultPath,message=f'Moving {linkTarget} to {file} reported {e}, but the copy is in place')
 		note_moved(linkTarget, file)
 		return True
-	def link_copy(file:str, file_st:os.stat_result, linkTarget:str, target_st:os.stat_result):
+	def link_copy(file:str, file_st:os.stat_result, linkTarget:str, target_st:os.stat_result, lines:list):
 		# the copy hard linked in place of the link: True when it is there, False when it failed and the walk aborts, None
-		# when the filesystem cannot hard link it
+		# when the filesystem cannot hard link it. on a thread: its lines are appended to lines as (failed, message)
 		temp_path = prune_link_path(file, target_st, prune_salt)
 		try:
 			# the link itself when the copy is a user's symlink stored in the version
@@ -10712,21 +10742,21 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			try:
 				left_by_a_run = same_inode(os.lstat(temp_path), target_st)
 			except OSError as e:
-				failed(f'Error looking at {temp_path}: {e}')
+				lines.append((True, f'Error looking at {temp_path}: {e}'))
 				return False
 			if not left_by_a_run:
-				failed(f'Not linking {linkTarget} to {file}: {temp_path} is there already, and is not its copy')
+				lines.append((True, f'Not linking {linkTarget} to {file}: {temp_path} is there already, and is not its copy'))
 				return False
-			backuperTeeLogToTl(path=referenceVaultPath,message=f'Linking {linkTarget} to {file} again from {temp_path}, which an earlier run left')
+			lines.append((False, f'Linking {linkTarget} to {file} again from {temp_path}, which an earlier run left'))
 		except OSError as e:
 			if e.errno in NO_HARD_LINK_ERRNOS:
 				return None
-			failed(f'Error linking {linkTarget} to {temp_path}: {e}')
+			lines.append((True, f'Error linking {linkTarget} to {temp_path}: {e}'))
 			return False
 		try:
 			if not same_inode(os.lstat(file), file_st):
 				remove_if_target(temp_path, target_st)
-				failed(f'Not linking {linkTarget} to {file}: it is no longer the link')
+				lines.append((True, f'Not linking {linkTarget} to {file}: it is no longer the link'))
 				return False
 			os.rename(temp_path,file)
 		except Exception as e:
@@ -10736,33 +10766,33 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				landed = False
 			if not landed:
 				remove_if_target(temp_path, target_st)
-				failed(f'Error linking {linkTarget} to {file}: {e}')
+				lines.append((True, f'Error linking {linkTarget} to {file}: {e}'))
 				return False
-			backuperTeeLogToTl(path=referenceVaultPath,message=f'Linking {linkTarget} to {file} reported {e}, but the copy is in place')
+			lines.append((False, f'Linking {linkTarget} to {file} reported {e}, but the copy is in place'))
 		return True
 	# the next version's rows, read once for the whole walk
 	moves = VaultMoves(job_vault,monitor_path,monitor_paths).of(applyingVaultEntry.path)
-	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs).
-	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another.
-	# a folder that cannot be listed, or an entry that cannot be looked at, may hold this version's only way to a copy
-	# in the reference vault, so the reference vault is kept
-	walk_errors = []
-	for file, _, is_dir in iter_tree_entries(applyingVaultEntry.path, list_folders_first=True, errors=walk_errors):
-		if is_dir:
-			continue
+	caller = threading.get_ident()
+	def materialize(file:str) -> tuple:
+		# what the walk does for the entry at file, on a thread or on this one: (its lines as (failed, message), what is
+		# left to do on this thread: None, 'dangling', 'linked' or 'move', the stats and target for it, whether it was
+		# worked on a thread)
+		lines = []
+		pooled = threading.get_ident() != caller
+		def failing(message:str) -> tuple:
+			lines.append((True, message))
+			return lines, None, None, pooled
 		try:
 			file_st = os.lstat(file)
 		except FileNotFoundError as e:
 			if PARTIAL_COPY_NAME.fullmatch(os.path.basename(file)):
 				# a name a cut off run linked a copy under, listed with its folder before this walk renamed it over its link
-				continue
-			failed(f'Error looking at {file}: {e}')
-			continue
+				return lines, None, None, pooled
+			return failing(f'Error looking at {file}: {e}')
 		except OSError as e:
-			failed(f'Error looking at {file}: {e}')
-			continue
+			return failing(f'Error looking at {file}: {e}')
 		if not stat.S_ISLNK(file_st.st_mode):
-			continue
+			return lines, None, None, pooled
 		# a link an older daemon moved to another folder depth still names its version, though its text no longer reaches it.
 		# a user's symlink is left as it is, however it is shaped, and so is a link naming a folder: the daemon links
 		# files only, so no folder is ever put in place of a link
@@ -10773,37 +10803,78 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			linkTarget = e.target
 		except (UncheckedVaultLink, OSError) as e:
 			# it may be this version's only way to a file in the reference vault, so keep that
-			failed(f'Error checking whether {file} links into {referenceVaultPath}: {e}')
-			continue
+			return failing(f'Error checking whether {file} links into {referenceVaultPath}: {e}')
 		if linkTarget is None or not linkTarget.startswith(referenceVaultPath + '/'):
 			if DEBUG:
-				backuperTeeLogToTl(path=referenceVaultPath,message=f'Not materialising {file}: not a chain link into {referenceVaultPath}')
-			continue
+				lines.append((False, f'Not materialising {file}: not a chain link into {referenceVaultPath}'))
+			return lines, None, None, pooled
 		try:
 			target_st = os.lstat(linkTarget)
 		except (FileNotFoundError, NotADirectoryError):
 			# ENOTDIR: a name on the way to it is a file in the reference vault, so it is not there either
-			meet_dangling(file, file_st, linkTarget)
-			continue
+			return lines, 'dangling', (file_st, linkTarget, None), pooled
 		except OSError as e:
-			failed(f'Error looking at {linkTarget}: {e}')
-			continue
+			return failing(f'Error looking at {linkTarget}: {e}')
 		if stat.S_ISDIR(target_st.st_mode):
 			# never so for a link vault_chain_hop() takes: no folder is put in place of a link
-			continue
+			return lines, None, None, pooled
 		if DEBUG:
-			backuperTeeLogToTl(path=referenceVaultPath,message=f'Materialising {linkTarget} at {file}')
-		linked = link_copy(file, file_st, linkTarget, target_st)
-		moved = linked is None
+			lines.append((False, f'Materialising {linkTarget} at {file}'))
+		linked = link_copy(file, file_st, linkTarget, target_st, lines)
+		return lines, 'move' if linked is None else 'linked' if linked else None, (file_st, linkTarget, target_st), pooled
+	# set once the filesystem could not hard link a copy: from then on each entry is materialised on this thread alone, as
+	# a copy moved out of the reference vault is gone for the links after it that name it
+	moving = False
+	def materialized(file:str, outcome:tuple) -> None:
+		# on this thread, in walk order: the books, the lines and what is left to do for the entry at file
+		nonlocal moving
+		lines, left, found, pooled = outcome
+		if moving and pooled and left != 'linked':
+			# worked on a thread before the walk went on alone: a copy it found may have been moved since. a copy hard
+			# linked stays so
+			lines, left, found, pooled = materialize(file)
+		for is_failure, message in lines:
+			if is_failure:
+				failed(message)
+			else:
+				backuperTeeLogToTl(path=referenceVaultPath,message=message)
+		if left is None:
+			return
+		file_st, linkTarget, target_st = found
+		if left == 'dangling':
+			meet_dangling(file, file_st, linkTarget)
+			return
+		moved = left == 'move'
 		if moved:
-			linked = move_copy(file, file_st, linkTarget, target_st)
-		if linked:
-			# the copy is the next version's now, in place of the link
-			if (target_st.st_dev, target_st.st_ino) not in booked:
-				if not moved:
-					booked.add((target_st.st_dev, target_st.st_ino))
-				book(transferred, target_st)
-			book(unlinked, file_st)
+			moving = True
+			if not move_copy(file, file_st, linkTarget, target_st):
+				return
+		# the copy is the next version's now, in place of the link
+		if (target_st.st_dev, target_st.st_ino) not in booked:
+			if not moved:
+				booked.add((target_st.st_dev, target_st.st_ino))
+			book(transferred, target_st)
+		book(unlinked, file_st)
+	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs), its entries
+	# materialised on REFERENCED_COPY_THREADS threads, as the referenced copy makes its links, and handled here in walk
+	# order, so its lines, books and failures come as when one thread went through them.
+	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another: its
+	# entries are handed out only once it is read. an entry named as a temp (a cut off run's, renamed over its link by the
+	# entry it was made for) is looked at once every entry before it is done, and before any after it: whole or gone,
+	# never going while it is looked at
+	# a folder that cannot be listed, or an entry that cannot be looked at, may hold this version's only way to a copy
+	# in the reference vault, so the reference vault is kept
+	walk_errors = []
+	walk_started = time.monotonic()
+	stop = threading.Event()
+	pool = ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS)
+	try:
+		in_row_order(pool, (file for file, _, is_dir in iter_tree_entries(applyingVaultEntry.path, list_folders_first=True, errors=walk_errors) if not is_dir),
+			materialize, materialized, stop, alone=lambda file: moving or PARTIAL_COPY_NAME.fullmatch(os.path.basename(file)) is not None)
+	finally:
+		stop.set()
+		pool.shutdown(wait=True)
+	timing['walk'] = time.monotonic() - walk_started
 	for rel, error in walk_errors:
 		failed(f'Error listing {unreadable_path(applyingVaultEntry.path, rel)}: {error}')
 	if materialize_failed:
@@ -10822,7 +10893,21 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	# stale list below the oldest, which the scan deletes) or the version committed, never a folder without a list,
 	# which the scan could not tell from a version whose list a listing left out
 	require_pools()
+	removal_started = time.monotonic()
+	# its folders at the top first, each by an rm -rf of its own on REFERENCED_COPY_THREADS threads, as a mergerfs pool
+	# removes many entries at once; then the rm -rf of the whole, which removes what is left and alone tells whether it
+	# went. a top that cannot be listed leaves it all to that one
+	try:
+		with os.scandir(own_folder) as entries:
+			tops = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+	except OSError:
+		tops = []
+	if len(tops) > 1:
+		with ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS) as pool:
+			for _ in pool.map(lambda top: multiCMD.run_command(['rm','-rf',top],quiet=True,return_code_only=True), tops):
+				pass
 	removed = not multiCMD.run_command(['rm','-rf',own_folder],quiet=True,return_code_only=True)
+	timing['removal'] = time.monotonic() - removal_started
 	# a disk that dropped while it ran hides what is left of the folder on it, which a list must still name when it is back
 	require_pools()
 	gone = there(referenceVaultPath) is False
@@ -10836,6 +10921,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		return keep_oldest('its folder is still there after rm -rf')
 	if not remove_lists(lists):
 		return keep_oldest('its change list cannot be removed')
+	log_time(False)
 	return went_down(False)
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,

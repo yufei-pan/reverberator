@@ -1854,7 +1854,8 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 	else:
 		real_run = rv.multiCMD.run_command
 		def run(command, *args, **kwargs):
-			if command[0] == 'rm':
+			# the rm -rf of the whole folder, after the ones of its folders at the top (round 15)
+			if command[0] == 'rm' and command[-1] == v0.path:
 				# the folder went, its change list did not
 				shutil.rmtree(v0.path)
 				return 1
