@@ -424,3 +424,24 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the warning shows up in the live logs.
 - **Approved:** 2026-10-29, the user's choice "Known limitation (Recommended)" (with "One warning, copy (Recommended)"
   for the warning); the swap shape's cost: "Correct the wording (Recommended)".
+
+### A live database's files are copied one at a time
+
+- **Kind:** known limitation.
+- **What the operator sees:** a database an application keeps writing (a SQLite file with its `-wal` and `-shm`, a
+  PostgreSQL or MySQL data folder) is copied file by file, each when its turn comes, while the application goes on
+  writing. A version can then hold the database and its write-ahead log from different moments, or a file copied
+  in the middle of a write. Restored, such a copy may lack the newest changes or not open at all. On 2026-11-02
+  two hourly versions of snowluma's `messages.db` (93 MiB) and its `-wal`, copied up to 20 minutes apart, both
+  opened and passed SQLite's integrity check, so the risk is real but small in practice.
+- **Why:** a consistent copy of files that change together needs one instant for all of them: a filesystem snapshot
+  (the sources here are ext4 and mergerfs, which have none) or the database's own copy. A copy made through the
+  database (SQLite's backup function) is not byte for byte the source, so the comparison after each batch would
+  see a difference and copy it again every time, and it would cover one database kind only. Every file-level
+  backup (restic, rsync, borg) has the same limit; the usual answer is to back up a dump.
+- **Revisit when:** a monitored folder lives on a filesystem with snapshots, or someone needs a live database backed
+  up that cannot be dumped.
+- **Approved:** 2026-11-02, "Known limitation + README line (Recommended)", after the user asked "for general user's
+  use case, should we accept as limitation? or should we plan / rig something up?". The same day the user chose
+  "Skip messages.db" for docker_volumes (in /etc/reverb_skip_docker_volumes.txt, with its -wal and -shm; restic's own
+  copies still hold it) and "Leave restic as it is (Recommended)".
