@@ -89,8 +89,8 @@ def recording_symlink(src, dst, *args, **kwargs):
 	text = os.fsdecode(src)
 	if frame is None:
 		made = 'test'
-	elif frame.f_code.co_name == 'do_referenced_copy':
-		# a referenced backup's link is absolute, and no chain link
+	elif frame.f_code.co_name == 'do_referenced_copy' or getattr(frame.f_code, 'co_qualname', '').startswith('do_referenced_copy.'):
+		# made by its own functions, on its threads. a referenced backup's link is absolute, and no chain link
 		made = 'user' if os.path.isabs(text) else 'chain'
 	elif frame.f_code.co_name == 'retarget_chain_link':
 		# what the link it is about to replace was, not the daemon's own verdict on it

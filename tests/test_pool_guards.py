@@ -206,7 +206,8 @@ def test_the_referenced_copy_stops_when_a_vault_disk_drops(job, fake_pool, monke
 	links = []
 	dropped = []
 	def linking(*args, **kwargs):
-		in_referenced_copy = sys._getframe(1).f_code.co_name == 'do_referenced_copy'
+		# made by its own functions, on its threads
+		in_referenced_copy = getattr(sys._getframe(1).f_code, 'co_qualname', '').startswith('do_referenced_copy.')
 		current(*args, **kwargs)
 		if in_referenced_copy:
 			links.append(args[1])
