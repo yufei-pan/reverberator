@@ -383,3 +383,32 @@ def test_a_folder_made_while_a_moved_folders_walk_reads_its_parent_is_watched(jo
 		wait_until(lambda: any(e.path == x for e in _events(to_process, lock)), timeout=3, message='the folder made during the walk is not watched')
 	finally:
 		_stop(thread)
+
+
+def test_many_events_in_a_new_folder_log_one_discard_line(job, poll_fast, monkeypatch):
+	# a busy new folder (a test run's traces) wrote one line per event; now one per folder until a take
+	lines = []
+	real = rv.watcherTeeLogToTl
+	def capture(monitor_path, message, **kwargs):
+		lines.append(message)
+		return real(monitor_path, message, **kwargs)
+	monkeypatch.setattr(rv, 'watcherTeeLogToTl', capture)
+	to_process_flag = threading.Event()
+	thread, to_process, lock = _start(job, [], to_process_flag=to_process_flag)
+	try:
+		new = os.path.join(job.monitor, 'traces')
+		os.makedirs(os.path.join(new, 'sub'))
+		wait_until(lambda: _paths(to_process, lock, '/traces'), message='new folder not seen')
+		for i in range(200):
+			open(os.path.join(new, f'f{i}'), 'w').write('x')
+			open(os.path.join(new, 'sub', f'g{i}'), 'w').write('x')
+		_probe(job, to_process, lock)
+		prefix = 'Discarding events for new recursive folder '
+		discards = [line for line in lines if line.startswith(prefix)]
+		assert all(line.endswith(' until its copy runs') for line in discards)
+		# one line per folder (the watcher writes a walked folder's path with a slash)
+		assert sorted(line[len(prefix):-len(' until its copy runs')].rstrip('/') for line in discards) == [new, f'{new}/sub']
+		# nothing in it was recorded: the folder's copy holds it
+		assert [event.path for event in _paths(to_process, lock, '/traces')] == [new]
+	finally:
+		_stop(thread)

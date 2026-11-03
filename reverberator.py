@@ -2854,6 +2854,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			forget_moved_away(cookie_value)
 		append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	newDirWDs = set()
+	# the folders of newDirWDs whose discarded events were logged: one line per folder until a take clears both, as one
+	# busy new folder (a test run's traces) wrote hundreds of thousands of lines
+	discardLoggedWDs = set()
 	# the folders that exist and that this watcher should watch but does not (unreadable, or their watch failed): no event
 	# reports a change in them, so while it holds one, for its whole life, it publishes no read time
 	unwatched = set()
@@ -2902,6 +2905,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				# the read: an event read before the take happened before it, and the copy holds it; one read after it
 				# may come after the copy passed its entry, and is kept (a kept duplicate costs nothing)
 				newDirWDs.clear()
+				discardLoggedWDs.clear()
 				lastProcessTime = time.monotonic()
 			with mount_table_lock:
 				mount_table, latest_mount_table[0] = latest_mount_table[0], None
@@ -2986,7 +2990,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				eventPath = os.path.join(wdDic[event.wd],event.name)
 				skipped = skip_list is not None and skip_list.skips_path(eventPath,isDir)
 				if discard_new_recursive_folder_events_until_read and event.wd in newDirWDs:
-					watcherTeeLogToTl(monitor_path,f'Discarding event for new recursive folder {wdDic[event.wd]}')
+					if event.wd not in discardLoggedWDs:
+						discardLoggedWDs.add(event.wd)
+						watcherTeeLogToTl(monitor_path,f'Discarding events for new recursive folder {wdDic[event.wd]} until its copy runs')
 					if isDir and not skipped and event.mask & (flags.CREATE | flags.MOVED_TO):
 						# the recursive copy holds this folder, but it still needs watches for later changes,
 						# and a folder moved in keeps its watches under its old path until they are added again here
