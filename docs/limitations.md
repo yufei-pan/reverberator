@@ -432,8 +432,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   PostgreSQL or MySQL data folder) is copied file by file, each when its turn comes, while the application goes on
   writing. A version can then hold the database and its write-ahead log from different moments, or a file copied
   in the middle of a write. Restored, such a copy may lack the newest changes or not open at all. On 2026-11-02
-  two hourly versions of snowluma's `messages.db` (93 MiB) and its `-wal`, copied up to 20 minutes apart, both
-  opened and passed SQLite's integrity check, so the risk is real but small in practice.
+  two hourly versions of snowluma's `messages.db` (93 MiB) were checked: in each of them the database and its
+  `-wal` were copied up to 20 minutes apart, and both opened and passed SQLite's integrity check, so the risk is
+  real but small in practice.
 - **Why:** a consistent copy of files that change together needs one instant for all of them: a filesystem snapshot
   (the sources here are ext4 and mergerfs, which have none) or the database's own copy. A copy made through the
   database (SQLite's backup function) is not byte for byte the source, so the comparison after each batch would
