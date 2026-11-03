@@ -10829,9 +10829,10 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		# on this thread, in walk order: the books, the lines and what is left to do for the entry at file
 		nonlocal moving
 		lines, left, found, pooled = outcome
-		if moving and pooled and left != 'linked':
+		if moving and pooled and left != 'linked' and not (any(is_failure for is_failure, _ in lines) and (found is None or moved_to(found[1]) is None)):
 			# worked on a thread before the walk went on alone: a copy it found may have been moved since. a copy hard
-			# linked stays so
+			# linked stays so, and so does a failure that no move can have caused (one on an entry whose copy was not
+			# moved), which this walk would have met as well
 			lines, left, found, pooled = materialize(file)
 		for is_failure, message in lines:
 			if is_failure:
@@ -10849,6 +10850,10 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			moving = True
 			if not move_copy(file, file_st, linkTarget, target_st):
 				return
+		elif moving and moved_to(linkTarget) is not None:
+			# a thread hard linked it before an earlier entry moved it: one copy, which that move booked
+			book(unlinked, file_st)
+			return
 		# the copy is the next version's now, in place of the link
 		if (target_st.st_dev, target_st.st_ino) not in booked:
 			if not moved:
@@ -10898,6 +10903,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	# removes many entries at once; then the rm -rf of the whole, which removes what is left and alone tells whether it
 	# went. a top that cannot be listed leaves it all to that one
 	try:
+		# never through a link in its place, which scandir would follow out of the vault: the whole rm -rf removes the link
+		if not stat.S_ISDIR(os.lstat(own_folder).st_mode):
+			raise NotADirectoryError(own_folder)
 		with os.scandir(own_folder) as entries:
 			tops = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
 	except OSError:

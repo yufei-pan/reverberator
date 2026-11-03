@@ -416,3 +416,159 @@ def test_the_folders_at_the_top_are_removed_on_threads_then_the_whole_one_decide
 	assert sorted(command for _, command in commands[:-1]) == [['rm', '-rf', os.path.join(v0, f'd{i}')] for i in range(3)]
 	assert commands[-1] == (threading.get_ident(), ['rm', '-rf', v0])
 	assert all(thread != threading.get_ident() for thread, _ in commands[:-1])
+
+
+@pytest.mark.parametrize('links', [2, 3])
+def test_a_copy_a_thread_hard_linked_before_an_earlier_entry_moved_it_is_booked_once(tmp_path, monkeypatch, links):
+	# a filesystem that hard links one link's copy and not another's: two or three links name one copy, the first in walk
+	# order gets EXDEV (once the others' renames have landed), so the copy is moved for it after threads hard linked it for
+	# the others. one copy in the vault, which the move booked: the record takes one copy and one inode, not one for each
+	monkeypatch.setattr(rv, 'REFERENCED_COPY_CHUNK', 1)
+	monkeypatch.setattr(rv, 'REFERENCED_COPY_WINDOW', 4)
+	job = create_job(str(tmp_path / 'vault'))
+	v0, v1 = os.path.join(job.job_vault, V0), os.path.join(job.job_vault, V1)
+	os.makedirs(v0)
+	os.makedirs(v1)
+	with open(os.path.join(v0, 'a'), 'w') as f:
+		f.write('x' * 20000)
+	with open(os.path.join(v1, 'c'), 'w') as f:
+		f.write('new')
+	os.symlink(chain_text('a'), os.path.join(v1, 'a'))
+	for name in 'bd'[:links - 1]:
+		os.symlink(chain_text(name, 'a'), os.path.join(v1, name))
+	# the walk's order is the folder's
+	first, *others = (os.path.join(v1, name) for name in os.listdir(v1) if name in 'abd')
+	assert len(others) == links - 1
+	record0, record1 = (100000, 10), (100000, 10)
+	write_change_list(rv.change_list_path(v0, *record0), job.monitor, [])
+	write_change_list(rv.change_list_path(v1, *record1), job.monitor, [('c', 'create', None)])
+	copy_blocks = os.lstat(os.path.join(v0, 'a')).st_blocks * 512
+	link_blocks = sum(os.lstat(path).st_blocks * 512 for path in (first, *others))
+	first_temp = rv.prune_link_path(first, os.lstat(os.path.join(v0, 'a')), SALT)
+	renamed = []
+	others_linked = threading.Event()
+	real_link, real_rename = os.link, os.rename
+	def link(src, dst, *args, **kwargs):
+		if os.fspath(dst) == first_temp:
+			assert others_linked.wait(10)
+			raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src)
+		return real_link(src, dst, *args, **kwargs)
+	def rename(src, dst, *args, **kwargs):
+		real_rename(src, dst, *args, **kwargs)
+		if os.fspath(dst) in others:
+			renamed.append(dst)
+			if len(renamed) == len(others):
+				others_linked.set()
+	monkeypatch.setattr(os, 'link', link)
+	monkeypatch.setattr(os, 'rename', rename)
+	info = OrderedDict((number, rv.VaultEntry(number, version, 0, *record)) for number, (version, record) in enumerate(((v0, record0), (v1, record1))))
+	rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=SALT)
+	assert others_linked.is_set()
+	for path in (first, *others):
+		assert open(path).read() == 'x' * 20000 and not os.path.islink(path)
+	assert not os.path.exists(v0)
+	assert (info[1].size, info[1].inode) == (record1[0] - link_blocks + copy_blocks, record1[1] - links + 1)
+
+
+def test_a_version_folder_swapped_for_a_link_before_its_removal_loses_only_the_link(tmp_path, monkeypatch):
+	# the folders at the top are listed through scandir, which follows a link to a folder: the version folder must be a
+	# real one for that, or the removals would reach the folders the link names, outside the vault
+	job, info, rels = simple_vault(str(tmp_path / 'vault'))
+	v0 = info[0].path
+	outside = str(tmp_path / 'outside')
+	real_log = rv.backuperTeeLogToTl
+	def log(*args, **kwargs):
+		if str(kwargs.get('message', '')).startswith('Removing '):
+			os.rename(v0, outside)
+			os.symlink(outside, v0)
+		return real_log(*args, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', log)
+	removed = []
+	real_run = rv.multiCMD.run_command
+	def run(command, *args, **kwargs):
+		removed.append(command)
+		return real_run(command, *args, **kwargs)
+	monkeypatch.setattr(rv.multiCMD, 'run_command', run)
+	rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=SALT)
+	assert not os.path.lexists(v0)
+	assert sorted(os.listdir(outside)) == ['d0', 'd1', 'd2']
+	assert all(os.path.isfile(os.path.join(outside, rel)) for rel in rels)
+	assert [command for command in removed if command[:2] == ['rm', '-rf']] == [['rm', '-rf', v0]]
+
+
+def test_a_failure_on_a_thread_stands_when_the_copy_it_named_was_not_moved(tmp_path, monkeypatch):
+	# the first link's copy cannot be hard linked (EXDEV), so the walk goes on alone from it; the second link's copy, which
+	# another thread had a link to, failed with an EIO meanwhile. the copy was not moved, so that is a failure of its own,
+	# which the walk on one thread would have met too: the version is kept, not pruned as if it had not happened
+	monkeypatch.setattr(rv, 'REFERENCED_COPY_CHUNK', 1)
+	monkeypatch.setattr(rv, 'REFERENCED_COPY_WINDOW', 4)
+	job = create_job(str(tmp_path / 'vault'))
+	v0, v1 = os.path.join(job.job_vault, V0), os.path.join(job.job_vault, V1)
+	os.makedirs(v0)
+	os.makedirs(v1)
+	for name in 'ab':
+		with open(os.path.join(v0, name), 'w') as f:
+			f.write(name * 100)
+		os.symlink(chain_text(name), os.path.join(v1, name))
+	record0, record1 = (100000, 10), (100000, 10)
+	write_change_list(rv.change_list_path(v0, *record0), job.monitor, [])
+	write_change_list(rv.change_list_path(v1, *record1), job.monitor, [])
+	first, second = (os.path.join(v1, name) for name in os.listdir(v1) if name in 'ab')
+	temp = lambda link: rv.prune_link_path(link, os.lstat(os.path.join(v0, os.path.basename(link))), SALT)
+	first_temp, second_temp = temp(first), temp(second)
+	failed_once = threading.Event()
+	real_link = os.link
+	def link(src, dst, *args, **kwargs):
+		if os.fspath(dst) == first_temp:
+			assert failed_once.wait(10)
+			raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src)
+		if os.fspath(dst) == second_temp and not failed_once.is_set():
+			failed_once.set()
+			raise OSError(errno.EIO, os.strerror(errno.EIO), src)
+		return real_link(src, dst, *args, **kwargs)
+	monkeypatch.setattr(os, 'link', link)
+	info = OrderedDict((number, rv.VaultEntry(number, version, 0, *record)) for number, (version, record) in enumerate(((v0, record0), (v1, record1))))
+	rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=SALT)
+	assert failed_once.is_set()
+	assert os.path.isdir(v0) and os.path.islink(second)
+
+
+def test_a_failure_on_a_thread_caused_by_a_move_is_looked_at_again(tmp_path, monkeypatch):
+	# two links name one copy; the first's link gets EXDEV and the copy is moved for it while a thread is about to link it
+	# for the second, which then finds it gone (ENOENT). the walk on one thread would have met the second after the move
+	# and given it a copy, so that failure is no failure
+	monkeypatch.setattr(rv, 'REFERENCED_COPY_CHUNK', 1)
+	monkeypatch.setattr(rv, 'REFERENCED_COPY_WINDOW', 4)
+	job = create_job(str(tmp_path / 'vault'))
+	v0, v1 = os.path.join(job.job_vault, V0), os.path.join(job.job_vault, V1)
+	os.makedirs(v0)
+	os.makedirs(v1)
+	with open(os.path.join(v0, 'a'), 'w') as f:
+		f.write('x' * 20000)
+	os.symlink(chain_text('a'), os.path.join(v1, 'a'))
+	os.symlink(chain_text('b', 'a'), os.path.join(v1, 'b'))
+	record0, record1 = (100000, 10), (100000, 10)
+	write_change_list(rv.change_list_path(v0, *record0), job.monitor, [])
+	write_change_list(rv.change_list_path(v1, *record1), job.monitor, [])
+	first, second = (os.path.join(v1, name) for name in os.listdir(v1) if name in 'ab')
+	first_temp = rv.prune_link_path(first, os.lstat(os.path.join(v0, 'a')), SALT)
+	second_entered, moved = threading.Event(), threading.Event()
+	real_link, real_rename = os.link, os.rename
+	def link(src, dst, *args, **kwargs):
+		if os.fspath(dst) == first_temp:
+			assert second_entered.wait(10)
+			raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src)
+		second_entered.set()
+		assert moved.wait(10)
+		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), src)
+	def rename(src, dst, *args, **kwargs):
+		real_rename(src, dst, *args, **kwargs)
+		if os.fspath(dst) == first:
+			moved.set()
+	monkeypatch.setattr(os, 'link', link)
+	monkeypatch.setattr(os, 'rename', rename)
+	info = OrderedDict((number, rv.VaultEntry(number, version, 0, *record)) for number, (version, record) in enumerate(((v0, record0), (v1, record1))))
+	rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=SALT)
+	assert moved.is_set() and not os.path.exists(v0)
+	for path in (first, second):
+		assert open(path).read() == 'x' * 20000 and not os.path.islink(path)
