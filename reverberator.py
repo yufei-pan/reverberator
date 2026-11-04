@@ -89,11 +89,11 @@ BACKUP_JOURNAL_HEADER = ['at_path','iso_time','event','source_path']
 REVERB_RULE_TSV_HEADER = ['Job Name (Unique Key)', 'Path Monitoring', 'Vault Path','Monitoring File System Signature', 
 		'Minium snapshot interval', 'Maximum snapshot interval','Keep 1 Compelete Backup', 
 		'Only Sync Attributes (permissions)', 'Keep N versions', 'Backup Size Limit', 
-		'Vault File System Signature', 'Skip List File', 'Full Comparison Interval', 'Chain Length']
+		'Vault File System Signature', 'Skip List File', 'Full Comparison Interval', 'Chain Length', 'Copy threads']
 REVERB_RULE_HEADER = ['job_name', 'mon_path','vault_path', 'mon_fs_signature', 
 		'min_shapshot_time','max_shapshot_time' , 'keep_one_complete_backup', 
 		'only_sync_attributes', 'keep_n_versions', 'backup_size_limit',
-		'vault_fs_signature', 'skip_list_file', 'full_comparison_interval', 'chain_length']
+		'vault_fs_signature', 'skip_list_file', 'full_comparison_interval', 'chain_length', 'copy_threads']
 SKIP_LIST_COLUMN_DESCRIPTIONS = ('A gitignore style list of paths not to back up, matched relative to the monitored path', 'Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything')
 VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
 VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes']
@@ -1089,7 +1089,7 @@ def nameless_start(rule_path:str, rule):
 	return start
 
 # the last two columns are optional: 12 positional cells still make a rule
-ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER, defaults=('', ''))
+ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER, defaults=('', '', ''))
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
 VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER)
 ManifestRecord = namedtuple('ManifestRecord', MANIFEST_RECORD_HEADER)
@@ -1332,9 +1332,9 @@ COPY_SOURCE_REPLACED = 'replaced while being copied'
 DEBUG = False
 
 SAMPLE_REVERB_RULE_FILE = '''
-Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signature	Minium snapshot interval	Maximum snapshot interval	Keep 1 Compelete Backup	Only Sync Attributes (permissions) 	Keep N versions	Backup Size Limit	Vault File System Signature	Skip List File	Full Comparison Interval	Chain Length
-# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	When vault is empty, copy entire monitorig path to vault instead of using links	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Stricter (smaller) limits take precedence	The UUID > Label > path for the vault file system	A gitignore style list of paths not to back up, matched relative to the monitored path	How often the whole tree is compared with the vault, as 1d, 12h, 30m or 45s (a plain number is seconds)	The most links a path into the vault may meet; files are copied again before their chains reach it
-# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS	Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything	Blank or 0 for never. Catches writes no event reports, such as through mmap	Blank for 40. About 20 if tools read the vault through the kernel; 0 for no limit
+Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signature	Minium snapshot interval	Maximum snapshot interval	Keep 1 Compelete Backup	Only Sync Attributes (permissions) 	Keep N versions	Backup Size Limit	Vault File System Signature	Skip List File	Full Comparison Interval	Chain Length	Copy threads
+# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	When vault is empty, copy entire monitorig path to vault instead of using links	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Stricter (smaller) limits take precedence	The UUID > Label > path for the vault file system	A gitignore style list of paths not to back up, matched relative to the monitored path	How often the whole tree is compared with the vault, as 1d, 12h, 30m or 45s (a plain number is seconds)	The most links a path into the vault may meet; files are copied again before their chains reach it	Threads for the referenced copy and the prune
+# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS	Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything	Blank or 0 for never. Catches writes no event reports, such as through mmap	Blank for 40. About 20 if tools read the vault through the kernel; 0 for no limit	Blank or auto: 2 on SSDs, 8 when the vault has a hard disk; 1 runs them on the job's own thread
 # Incomplete V* directories (no .modified_contents.nsv) are removed on startup.
 # If you need data from a partial backup after a crash/stop, copy it out before restarting.
 #_defaults_#		/var/reverbs/	auto	60	86400	True	True	0	5%,i5%	auto	
@@ -1480,7 +1480,7 @@ def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, ba
 	With a monitor_gate, nothing starts until it has resolved the monitored filesystem's signature, and its flag is
 	the monitored filesystem flag from then on (watcher_args[0] and backuper_args[7] are the ungated one).
 	monitor_signature is the rule's, which the watcher hands to the filesystem monitor when its root disappears.
-	backuper_kwargs are the backuper's keyword arguments (the rule's full_comparison_interval and chain_length).
+	backuper_kwargs are the backuper's keyword arguments (the rule's full_comparison_interval, chain_length and copy_threads).
 	'''
 	def start_attempt(job:JobControl, attempt:int) -> list:
 		w_args, b_args, signature = watcher_args, backuper_args, monitor_signature
@@ -1651,6 +1651,7 @@ def run_daemon():
 			tl.teeprint(log_text(f"Reverting to default value: {DEFAULT_KEEP_N_VERSIONS}"))
 		full_comparison_interval = read_full_comparison_interval(reverb_rule.full_comparison_interval, job_name)
 		chain_length = read_chain_length(reverb_rule.chain_length, job_name)
+		copy_threads, copy_threads_why = read_copy_threads(reverb_rule.copy_threads, job_name, reverb_rule.vault_path)
 		backup_size_limit = reverb_rule.backup_size_limit
 		vault_path_signature = reverb_rule.vault_fs_signature
 		# kept across the job's attempts, so a retry loses nothing queued
@@ -1666,11 +1667,11 @@ def run_daemon():
 		if not os.path.exists(monitor_path) and monitor_path_signature.strip().lower() in ('', 'auto'):
 			gate = MonitorGate(monitor_path, monitor_fs_flag, monitor_path_signature)
 		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate, monitor_path_signature,
-			dict(full_comparison_interval=full_comparison_interval, chain_length=chain_length))
+			dict(full_comparison_interval=full_comparison_interval, chain_length=chain_length, copy_threads=copy_threads))
 		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
 		interval_text = f'{full_comparison_interval:.15g}s' if full_comparison_interval else 'off'
 		chain_text = chain_length or 'no limit'
-		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {interval_text}, chain length: {chain_text}'))
+		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {interval_text}, chain length: {chain_text}, copy threads: {copy_threads or "auto"} ({copy_threads_why})'))
 		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
 		supervisor.start()
 		supervisors.append(supervisor)
@@ -2305,9 +2306,36 @@ def read_chain_length(cell:str, job_name:str) -> int:
 	tl.teeerror(log_text(f'Error: Rule {job_name} has invalid Chain Length value: {cell}; use a whole number of links, {MIN_CHAIN_LENGTH} or more, or 0 for no limit. Using {value}'))
 	return value
 
+def read_copy_threads(cell:str, job_name:str, vault_path:str) -> tuple:
+	'''
+	The Copy threads cell as (threads, why): a whole number of 1 or more gives itself; blank and auto (any case, spaces
+	trimmed) go by the disks of vault_path (copy_threads_auto()), or give 0 while that disk is not there
+	(vault_disk_problem()), for the backuper to tell once it is. Anything else is taken for auto after one warning naming
+	the job and the value.
+
+	>>> read_copy_threads(' 3 ', 'j', '/'), read_copy_threads('1', 'j', '/')
+	((3, 'Copy threads column'), (1, 'Copy threads column'))
+	'''
+	text = cell.strip().lower()
+	if text not in ('', 'auto'):
+		try:
+			threads = int(text)
+		except ValueError:
+			threads = 0
+		if threads >= 1:
+			return threads, 'Copy threads column'
+	problem = vault_disk_problem(vault_path)
+	if problem is not None:
+		found = (0, f'auto, told once the vault is there: {problem}')
+	else:
+		found = copy_threads_auto(vault_path)
+	if text not in ('', 'auto'):
+		tl.teelog(log_text(f'Warning: Rule {job_name} has invalid Copy threads value: {cell}; use a whole number, 1 or more, or auto. Using auto: {found[0] or "told once the vault is there"} ({found[1]})'),level='warning')
+	return found
+
 def rule_file_header(rule_file:str) -> list:
 	'''
-	The header to hand TSVZ for rule_file: the rule file's own first line when it holds the first 12, 13 or 14 names of
+	The header to hand TSVZ for rule_file: the rule file's own first line when it holds the first 12 to 15 names of
 	REVERB_RULE_TSV_HEADER by TSVZ's rule (the same cell count, each name inside its right-stripped cell), so TSVZ finds no
 	mismatch in a 12 column file. Otherwise, or when the file cannot be read, the whole REVERB_RULE_TSV_HEADER.
 	'''
@@ -4013,6 +4041,71 @@ def plain_disk_problem(path:str, mount_table:list) -> 'str | None':
 		return f'disk {disk} cannot be read: {e.strerror or e}'
 	return None
 
+def block_device_rotational(major_minor:str, depth:int = 0) -> bool:
+	'''
+	Whether the block device major_minor (as mountinfo gives it, 8:1) is on a hard disk: its disk's queue/rotational in
+	sysfs, found by SYS_DEV_BLOCK_PATH/<major:minor> as f2fs_failed() finds a device. A partition is its disk's; a dm or md
+	device (slaves/) is on a hard disk when any device under it is. Raises OSError when it cannot be told: no such device,
+	a filesystem on no block device (major 0: a network, FUSE or memory filesystem), or sysfs unreadable.
+	'''
+	if major_minor.partition(':')[0] == '0':
+		raise OSError(errno.ENODEV, f'{major_minor} is on no disk (a network, FUSE or memory filesystem)')
+	return sysfs_device_rotational(os.path.realpath(os.path.join(SYS_DEV_BLOCK_PATH, major_minor)), depth)
+
+def sysfs_device_rotational(device:str, depth:int = 0) -> bool:
+	'''block_device_rotational() of a device's sysfs folder.'''
+	if depth > 8:
+		raise OSError(errno.ELOOP, f'devices stacked too deep at {device}')
+	try:
+		under = sorted(os.listdir(os.path.join(device, 'slaves')))
+	except FileNotFoundError:
+		under = []
+	if under:
+		return any([sysfs_device_rotational(os.path.realpath(os.path.join(device, 'slaves', name)), depth + 1) for name in under])
+	if os.path.exists(os.path.join(device, 'partition')):
+		device = os.path.dirname(device)
+	with open(os.path.join(device, 'queue', 'rotational'), 'rb') as f:
+		return f.read().strip() == b'1'
+
+def copy_threads_auto(vault_path:str) -> tuple:
+	'''
+	The Copy threads count for blank or auto, by the disks holding vault_path, as (threads, why): HDD_COPY_THREADS when any
+	is a hard disk (for a mergerfs pool, any of its branches' disks), SSD_COPY_THREADS when every one is an SSD, and
+	SSD_COPY_THREADS when that cannot be told (no mount table, a pool whose disks cannot be listed, a network or FUSE
+	filesystem, no sysfs), why then saying so. vault_path need not exist.
+	'''
+	def unknown(reason:str) -> tuple:
+		return SSD_COPY_THREADS, f'auto: cannot tell the disks of {vault_path}: {reason}'
+	try:
+		mount_table = read_mount_table()
+	except OSError as e:
+		return unknown(f'the mount table cannot be read: {e.strerror or e}')
+	pool = mergerfs_mount(mount_table, vault_path)
+	if pool is None:
+		branches = [os.path.realpath(vault_path)]
+	else:
+		try:
+			branches = [os.path.realpath(branch) for branch in read_pool_branches(pool)]
+		except OSError as e:
+			return unknown(f'the disks of pool {pool} cannot be listed: {e.strerror or e}')
+	spinning = []
+	for branch in branches:
+		fingerprint = mount_fingerprint(mount_table, branch)
+		if fingerprint is None or len(fingerprint) < 5:
+			return unknown(f'no mount holds {branch}')
+		if fingerprint[4] == MERGERFS_FSTYPE:
+			return unknown(f'{branch} is on another mergerfs pool')
+		try:
+			if block_device_rotational(os.fsdecode(fingerprint[1])):
+				spinning.append(branch)
+		except OSError as e:
+			return unknown(f'{branch}: {e.strerror or e}')
+	if pool is None:
+		return (HDD_COPY_THREADS, f'auto: {vault_path} is on a hard disk') if spinning else (SSD_COPY_THREADS, f'auto: {vault_path} is on an SSD')
+	if spinning:
+		return HDD_COPY_THREADS, f'auto: {", ".join(spinning)} of pool {pool} {"is a hard disk" if len(spinning) == 1 else "are hard disks"}'
+	return SSD_COPY_THREADS, f'auto: every disk of pool {pool} is an SSD'
+
 class PoolGuard:
 	'''
 	The mergerfs pools holding paths, as they were when a step began. require() fails the step with PoolNotReady once a
@@ -4542,8 +4635,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
 			 backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False, startup:JobStartup = None, job:JobControl = None,
-			 full_comparison_interval:float = 0, chain_length:int = None):
+			 full_comparison_interval:float = 0, chain_length:int = None, copy_threads:int = None):
 	# full_comparison_interval: seconds between whole-tree comparisons, 0 for none (the rule's Full Comparison Interval).
+	# copy_threads: the threads of the referenced copy and the prune, None for REFERENCED_COPY_THREADS, 0 for auto once the
+	# vault's disk is there (the rule's Copy threads, read_copy_threads()).
 	# chain_length: the most links a path into the vault may meet, 0 for no limit, None for DEFAULT_CHAIN_LENGTH (the rule's Chain Length).
 	global BACKUP_SEMAPHORE
 	global BACKUP_ENTRY_VALUES_HEADER
@@ -4584,6 +4679,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			return
 		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
 		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+		if copy_threads == 0 and running():
+			# auto, for a vault whose disk was not there when the job started: told by its disks now
+			copy_threads, why = copy_threads_auto(vault_path)
+			backuperTeeLogToTl(job_name, f'Copy threads: {copy_threads} ({why})')
 		# the vault is scanned before the monitored path is waited for (the scan only reads the vault): what a killed
 		# copy left in it goes now, though the path may be long in coming back. a scan that fails fails the attempt
 		job_vault = os.path.join(vault_path,job_name)
@@ -4698,7 +4797,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
-					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since,chain_length=chain_length)
+					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since,chain_length=chain_length,
+					  copy_threads=copy_threads)
 				if not committed:
 					# the batch goes back to the queue on the way out
 					if GREEN_LIGHT.is_set():
@@ -5426,7 +5526,7 @@ def do_backup(backup_entries:dict,
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
 			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,
-			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None,chain_length:int = None):
+			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None,chain_length:int = None,copy_threads:int = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
 	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
 	# reported: the unreadable paths already logged for this batch, so each is logged once
@@ -5442,6 +5542,7 @@ def do_backup(backup_entries:dict,
 	# only when no inner mount was paused, nothing was logged unreadable and every metadata copy worked; else it carries
 	# the old time forward
 	# chain_length: the job's Chain Length, 0 for no limit, None for DEFAULT_CHAIN_LENGTH; it sets when a file is copied again ( recopy_hops() )
+	# copy_threads: the job's Copy threads, the threads of the referenced copy and the prune, None for REFERENCED_COPY_THREADS
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -5558,7 +5659,7 @@ def do_backup(backup_entries:dict,
 				# would at a copy ( a re-copy copies such a link as it is ), so they count as copied in V0
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors,copy_version=this_version_number)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
-				do_referenced_copy(monitor_path,backup_folder,manifest,pool_guard=pool_guard,unsynced=unsynced,sizes=copied)
+				do_referenced_copy(monitor_path,backup_folder,manifest,pool_guard=pool_guard,unsynced=unsynced,sizes=copied,threads=copy_threads)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
@@ -5575,7 +5676,7 @@ def do_backup(backup_entries:dict,
 				if not prune_salt:
 					prune_salt.append(vault_prune_salt(job_vault, job_name))
 				oldest = next(iter(vault_info_dict))
-				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths,prune_salt=prune_salt[0])
+				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths,prune_salt=prune_salt[0],threads=copy_threads)
 				vault_size -= removed_size
 				vault_inodes -= removed_inodes
 				return next(iter(vault_info_dict), None) != oldest
@@ -5701,7 +5802,7 @@ def do_backup(backup_entries:dict,
 				paused = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported,
 				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,
-				pool_guard=pool_guard,unsynced=unsynced,sizes=copied)
+				pool_guard=pool_guard,unsynced=unsynced,sizes=copied,threads=copy_threads)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -7032,10 +7133,16 @@ def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, dis
 class CopyInterrupted(Exception):
 	'''GREEN_LIGHT went out while a referenced copy made its entries.'''
 
-# threads making a referenced copy's folders and links, and replacing a prune's links: a mergerfs pool serves many
-# requests at once. the pool of each copy and prune is made from this alone. 4: 8 cost twice the CPU, the pool's as well,
-# for a little more speed, as their hand-offs of the GIL grow faster than the requests served at once
-REFERENCED_COPY_THREADS = 4
+# threads making a referenced copy's folders and links, replacing a prune's links and removing its top folders: a disk,
+# or a mergerfs pool of them, serves many requests at once. each job takes its count from its Copy threads column
+# (read_copy_threads()), whose blank or auto goes by the vault's disks (copy_threads_auto()).
+# an SSD: on the live single f2fs SSD (170K files) copy + prune took ~13-15 s at 1 to 8 threads, 2 the lightest of the
+# fast ones: ~13.4 s wall and ~7.4 s CPU, against ~14.0 s / ~9.9 s at 4 and ~14.7 s / ~5.4 s at 1
+SSD_COPY_THREADS = 2
+# a pool of hard disks, whose queues reorder many requests at once: 23 s at 1 thread against 6.5 s at 8, warm
+HDD_COPY_THREADS = 8
+# the count of a caller that names none, and auto's for a vault whose disks cannot be told
+REFERENCED_COPY_THREADS = SSD_COPY_THREADS
 # entries a thread takes at once, and the chunks queued ahead of the one handled
 REFERENCED_COPY_CHUNK = 64
 REFERENCED_COPY_WINDOW = 32
@@ -7047,8 +7154,15 @@ def in_row_order(pool:ThreadPoolExecutor, rows, work, handled, stop:threading.Ev
 	row's work, on the thread that did it. A row alone(row) is true for, asked as it is taken from rows, is worked on the
 	calling thread once every row before it is handled. What work or check raises sets stop, which ends every chunk at
 	its next row, and is raised once the rows before it are handled. The caller sets stop and shuts pool down once done,
-	so no chunk is left running when this raises.
+	so no chunk is left running when this raises. With no pool (one thread), each row is worked and handled in turn on
+	the calling thread.
 	'''
+	if pool is None:
+		for row in rows:
+			handled(row, work(row))
+			if check is not None:
+				check()
+		return
 	def run(chunk:list) -> tuple:
 		# on a thread: (the outcome of each row run, what stopped it or None)
 		outcomes = []
@@ -7156,7 +7270,7 @@ def referenced_link_text(source_path:str, backup_folder:str, relative:bool):
 	return lambda file: '../' * file.count('/') + between + file
 
 def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None,unsynced:list = None,
-		sizes:CopiedSizes = None) -> bool:
+		sizes:CopiedSizes = None,threads:int = None) -> bool:
 	'''
 	Recreate the folders tracked in manifest under backup_folder and link each tracked file to its copy under source_path.
 
@@ -7168,7 +7282,8 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	before its link is made, as it is a new folder: a lookup that finds nothing is not cached on a mergerfs vault. Returns False when the backup
 	was interrupted. pool_guard, when given, is polled for each entry: a disk of its pools that drops stops the copy
 	with PoolNotReady. A folder whose metadata could not be copied is appended to unsynced ( copy_file_meta()'s failed ).
-	Each entry is looked at, and made or linked, on one of REFERENCED_COPY_THREADS threads, REFERENCED_COPY_CHUNK rows at
+	Each entry is looked at, and made or linked, on one of threads threads (REFERENCED_COPY_THREADS when None; 1 works on
+	the calling thread alone, with no pool), REFERENCED_COPY_CHUNK rows at
 	a time: a mergerfs vault answers many requests at once, and one at a time is what made the copy slow. What each
 	row came to is handled on the calling thread, in row order: the rows dropped, their lines and unsynced come as
 	when one thread went through them, and it alone reads and changes manifest. The folders are made before any link,
@@ -7314,7 +7429,8 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			count['files'] += 1
 		else:
 			missing.append(file)
-	pool = ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS)
+	threads = threads or REFERENCED_COPY_THREADS
+	pool = ThreadPoolExecutor(max_workers=threads) if threads > 1 else None
 	finished = False
 	try:
 		in_row_order(pool, manifest.iter_folders(), copy_folder, folder_handled, stop, check)
@@ -7329,8 +7445,9 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	finally:
 		# a stop or an error ends the chunks still queued at their first entry
 		stop.set()
-		pool.shutdown(wait=True)
-		backuperTeeLogToTl(path=source_path,message=f'{"Made" if finished else "Stopped making"} the referenced copy of {source_path} in {time.monotonic() - started:.1f} s: {count["files"]} files, {count["folders"]} folders, {REFERENCED_COPY_THREADS} threads')
+		if pool is not None:
+			pool.shutdown(wait=True)
+		backuperTeeLogToTl(path=source_path,message=f'{"Made" if finished else "Stopped making"} the referenced copy of {source_path} in {time.monotonic() - started:.1f} s: {count["files"]} files, {count["folders"]} folders, {threads} thread{"s" if threads > 1 else ""}')
 	manifest.discard_many(missing)
 	if sizes is not None:
 		manifest.track_changes()
@@ -10642,14 +10759,14 @@ PRUNE_ABORTED = {}
 PRUNE_SALT_MISSING = set()
 
 def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, postponed:list = None, clock = time.monotonic, monitor_paths:list = None,
-		prune_salt:bytes = None) -> tuple:
+		prune_salt:bytes = None, threads:int = None) -> tuple:
 	'''
 	decrement_stepper while no restore holds the job's lock; when one does, postpone and return (0, 0) so the retention
 	loops stop. Without a state folder nothing can hold the lock, so it prunes; any other failure to lock postpones too.
 	A lock that cannot be checked (opened, or tried) for DISK_WAIT_GRACE_SECONDS gets a FAILED marker, repeated every
 	DISK_WAIT_REPEAT_SECONDS while it lasts, as no version is removed meanwhile and the vault keeps growing.
 	postponed is a list a backup hands each of its calls: a call that postpones appends why, and only the first of them
-	logs it, so a backup says it once. monitor_path, monitor_paths, clock and prune_salt go to decrement_stepper.
+	logs it, so a backup says it once. monitor_path, monitor_paths, clock, prune_salt and threads go to decrement_stepper.
 	'''
 	lock_path = restore_lock_path(job_name)
 	def postpone(reason:str, cannot_check:OSError = None) -> tuple:
@@ -10671,7 +10788,7 @@ def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, po
 	except (FileNotFoundError, NotADirectoryError):
 		# no state folder, so no restore can be holding a lock
 		RESTORE_LOCK_UNCHECKED.pop(job_name, None)
-		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt)
+		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt, threads)
 	except OSError as e:
 		# the lock may be held right now: a check that failed is never taken as permission to remove
 		return postpone(f'cannot open the restore lock: {e}', e)
@@ -10683,7 +10800,7 @@ def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, po
 		except OSError as e:
 			return postpone(f'cannot take the restore lock: {e}', e)
 		RESTORE_LOCK_UNCHECKED.pop(job_name, None)
-		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt)
+		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt, threads)
 	finally:
 		os.close(fd)
 
@@ -10934,7 +11051,7 @@ class PathHashes:
 		return self._count
 
 def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, monitor_paths:list = None, clock = time.monotonic,
-		prune_salt:bytes = None) -> tuple:
+		prune_salt:bytes = None, threads:int = None) -> tuple:
 	'''
 	Remove the oldest vault version and materialize the next version's symlinks: each of the next version's chain
 	links into the oldest one is replaced by a hard link to the copy it names (prune_link_path() with prune_salt, the
@@ -10964,7 +11081,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	not the oldest version went: the oldest version's record and what the next one lost, when it went; never less than
 	nothing, so no prune raises the caller's sums, though a copy two links name that an aborted run booked for one and
 	its rerun for the other is booked twice, and the next version's record then holds one copy more than it does.
-	The links are looked at and hard linked on REFERENCED_COPY_THREADS threads, as the referenced copy makes them, each
+	The links are looked at and hard linked on threads threads (REFERENCED_COPY_THREADS when None; 1 on the calling
+	thread alone), as the referenced copy makes them, each
 	entry's books, failures and lines handled on the calling thread in walk order; once a copy has to be moved, the rest
 	of the walk is the calling thread's alone, and an entry a thread looked at before then is looked at again if the copy
 	it found has been moved since, unless the thread hard linked it. The folders at the oldest version's top are removed
@@ -10992,6 +11110,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	'''
 	global DEBUG
 	global CONTENT_FILE_EXTENSION_NAME
+	threads = threads or REFERENCED_COPY_THREADS
 	# this function remove the oldest reverb from path
 	if len(vault_info_dict) < 2:
 		# we cannot step as there is less than 2 availble reverbs
@@ -11134,7 +11253,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			parts.append(f'{"removal tried" if kept else "removed"} in {timing["removal"]:.1f} s')
 		took = time.monotonic() - started
 		backuperTeeLogToTl(path=referenceVaultPath,message=(f'Kept {referenceVaultPath}, as its prune stopped after {took:.1f} s: ' if kept else
-			f'Pruned {referenceVaultPath} in {took:.1f} s: ') + ', '.join(parts) + f', {REFERENCED_COPY_THREADS} threads')
+			f'Pruned {referenceVaultPath} in {took:.1f} s: ') + ', '.join(parts) + f', {threads} thread{"s" if threads > 1 else ""}')
 	def folder_gone() -> None:
 		# the reference vault's folder went: nothing is kept of it in memory
 		forget_real_vault_folders(referenceVaultPath)
@@ -11250,7 +11369,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				except OSError:
 					folder_times[folder] = None
 	def give_back_times() -> None:
-		# one request a folder, on REFERENCED_COPY_THREADS threads as the walk's own. one that fails is only an error line:
+		# one request a folder, on the walk's threads. one that fails is only an error line:
 		# the folder keeps its entries, and only its times are the prune's
 		def give_back(item:tuple):
 			folder, times = item
@@ -11263,10 +11382,15 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			return None
 		if not folder_times:
 			return
-		with ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS) as pool:
-			for line in pool.map(give_back, list(folder_times.items())):
-				if line is not None:
-					backuperTeeLogToTl(path=referenceVaultPath,error=True,message=line)
+		items = list(folder_times.items())
+		if threads > 1:
+			with ThreadPoolExecutor(max_workers=threads) as pool:
+				lines = list(pool.map(give_back, items))
+		else:
+			lines = [give_back(item) for item in items]
+		for line in lines:
+			if line is not None:
+				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=line)
 		folder_times.clear()
 	def remove_if_target(path:str, target_st:os.stat_result) -> None:
 		# a name pruning linked to the copy, removed only while it is still the copy's
@@ -11556,7 +11680,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			book(transferred, target_st)
 		book(unlinked, file_st)
 	# walked instead of listed up front, as the next version links every tracked file (500k+ for big jobs), its entries
-	# materialised on REFERENCED_COPY_THREADS threads, as the referenced copy makes its links, and handled here in walk
+	# materialised on its threads, as the referenced copy makes its links, and handled here in walk
 	# order, so its lines, books and failures come as when one thread went through them.
 	# each folder is read in full before its links are replaced, so a replaced link cannot make the walk skip another: its
 	# entries are handed out only once it is read. an entry named as a temp (a cut off run's, renamed over its link by the
@@ -11581,13 +11705,14 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	walk_errors = []
 	walk_started = time.monotonic()
 	stop = threading.Event()
-	pool = ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS)
+	pool = ThreadPoolExecutor(max_workers=threads) if threads > 1 else None
 	try:
 		in_row_order(pool, (file for file, _, is_dir in iter_tree_entries(applyingVaultEntry.path, list_folders_first=True, errors=walk_errors) if not is_dir),
 			materialize, materialized, stop, alone=lambda file: moving or PARTIAL_COPY_NAME.fullmatch(os.path.basename(file)) is not None)
 	finally:
 		stop.set()
-		pool.shutdown(wait=True)
+		if pool is not None:
+			pool.shutdown(wait=True)
 	timing['walk'] = time.monotonic() - walk_started
 	for rel, error in walk_errors:
 		failed(f'Error listing {unreadable_path(applyingVaultEntry.path, rel)}: {error}')
@@ -11624,7 +11749,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	# which the scan could not tell from a version whose list a listing left out
 	require_pools()
 	removal_started = time.monotonic()
-	# its folders at the top first, each by an rm -rf of its own on REFERENCED_COPY_THREADS threads, as a mergerfs pool
+	# its folders at the top first, each by an rm -rf of its own on its threads, as a mergerfs pool
 	# removes many entries at once; then the rm -rf of the whole, which removes what is left and alone tells whether it
 	# went. a top that cannot be listed leaves it all to that one
 	try:
@@ -11635,8 +11760,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 			tops = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
 	except OSError:
 		tops = []
-	if len(tops) > 1:
-		with ThreadPoolExecutor(max_workers=REFERENCED_COPY_THREADS) as pool:
+	if len(tops) > 1 and threads > 1:
+		with ThreadPoolExecutor(max_workers=threads) as pool:
 			for _ in pool.map(lambda top: multiCMD.run_command(['rm','-rf',top],quiet=True,return_code_only=True), tops):
 				pass
 	removed = not multiCMD.run_command(['rm','-rf',own_folder],quiet=True,return_code_only=True)
@@ -11749,7 +11874,7 @@ class WrittenFolders:
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
 					 recopy:list = (),recopied:list = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
-					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,sizes:CopiedSizes = None) -> VaultManifest:
+					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,sizes:CopiedSizes = None,threads:int = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
@@ -11773,7 +11898,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	Each entry whose metadata could not be copied, which may lack its extended attributes, is appended to unsynced
 	( copy_file_meta()'s failed ).
 	sizes, when given, keeps what the links of the referenced copy take (do_referenced_copy()'s sizes), and the manifest
-	notes the rows changed after it, the places each entry replayed or copied again names too (note_changed()).
+	notes the rows changed after it, the places each entry replayed or copied again names too (note_changed()). threads
+	are the referenced copy's (do_referenced_copy()).
 	Once nothing more is written into backup_folder, each folder of it the replay, the re-copy or the verification made,
 	removed or renamed an entry in, and each one touched.folders names, gets the monitored folder's times, and each one
 	they made or synced the attributes of, or the referenced copy could not copy the metadata of from the latest version,
@@ -12337,7 +12463,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# as one that keeps what it has would pass it on to every later version
 		copy_unsynced = []
 		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard,unsynced=copy_unsynced,
-				sizes=sizes):
+				sizes=sizes,threads=threads):
 			return manifest
 		for path in copy_unsynced:
 			written.add(os.path.relpath(path,latest_version_info.path),whole=True)

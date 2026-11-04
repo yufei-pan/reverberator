@@ -242,12 +242,12 @@ def test_resolve_skip_list_path(tmp_path):
 		assert rv.resolve_skip_list_path(cell, rule) is None
 
 
-def test_sample_rule_file_has_all_14_columns(tmp_path):
+def test_sample_rule_file_has_all_15_columns(tmp_path):
 	path = tmp_path / 'sample.tsv'
 	path.write_text(rv.SAMPLE_REVERB_RULE_FILE.strip() + '\n')
 	lines = path.read_text().splitlines()
 	assert [cell.strip() for cell in lines[0].split('\t')] == rv.REVERB_RULE_TSV_HEADER
-	assert [len(line.split('\t')) for line in lines[1:3]] == [14, 14]
+	assert [len(line.split('\t')) for line in lines[1:3]] == [15, 15]
 	assert rv.upgrade_rule_file_header(str(path)) is False
 
 
