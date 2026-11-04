@@ -60,8 +60,8 @@ _real_measure = rv.measure_version_usage
 def checking_measure(manifest, version_path, copied=None):
 	if tracemalloc.is_tracing():
 		return _real_measure(manifest, version_path, copied)
+	by_the_copy = copied is not None and copied.usable and manifest.changes() is not None
 	expected = oracle_measure_version_usage(manifest, version_path)
-	by_the_copy = copied is not None and copied.tracking and copied.usable
 	got = _real_measure(manifest, version_path, copied)
 	TOTALS['measured'] += 1
 	TOTALS['by_the_copy'] += by_the_copy

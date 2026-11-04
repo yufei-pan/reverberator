@@ -107,9 +107,10 @@ def test_random_batches_keep_the_full_measure(tmp_path, monkeypatch):
 	measured = {'by_the_copy': 0, 'in_all': 0}
 	real = rv.measure_version_usage
 	def checking(manifest, version_path, copied=None):
+		by_the_copy = copied is not None and copied.usable and manifest.changes() is not None
 		expected = oracle_measure_version_usage(manifest, version_path)
 		measured['in_all'] += 1
-		measured['by_the_copy'] += copied is not None and copied.tracking and copied.usable
+		measured['by_the_copy'] += by_the_copy
 		got = real(manifest, version_path, copied)
 		assert got == expected, (seed, version_path)
 		return got

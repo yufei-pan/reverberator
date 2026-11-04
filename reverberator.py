@@ -5599,7 +5599,7 @@ def do_backup(backup_entries:dict,
 				paused = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported,
 				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,
-				pool_guard=pool_guard,unsynced=unsynced,copied=copied)
+				pool_guard=pool_guard,unsynced=unsynced,sizes=copied)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -6982,8 +6982,8 @@ class CopiedSizes:
 	length of its text, the one thing about a link a filesystem allots by. by_length holds that, linked how many links
 	were made and bytes what they take in all. text is the copy's referenced_link_text(), so the bytes of any of its
 	links come from its rel alone. usable is False once two links of one length took different bytes (disks of a pool
-	of different filesystems, say), or one could not be looked at: the version is then measured row by row. tracking
-	is True once the copy is made and the manifest notes what changes from then on (VaultManifest.track_changes()).
+	of different filesystems, say), or one could not be looked at: the version is then measured row by row. Once the
+	copy is made the manifest notes what changes from then on (VaultManifest.track_changes()), which changes() tells.
 	'''
 	def __init__(self):
 		self.by_length = {}
@@ -6991,7 +6991,6 @@ class CopiedSizes:
 		self.bytes = 0
 		self.text = None
 		self.usable = True
-		self.tracking = False
 
 	@staticmethod
 	def length(text:str) -> int:
@@ -7205,7 +7204,6 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	manifest.discard_many(missing)
 	if sizes is not None:
 		manifest.track_changes()
-		sizes.tracking = True
 	return True
 
 def entry_metadata(path:str) -> tuple:
@@ -9397,7 +9395,7 @@ def measure_version_usage(manifest:VaultManifest, version_path:str, copied:Copie
 	copy's links not of one size a length, or the changes not noted, as after a rollback), every row is. Either way the
 	manifest notes no more changes.
 	'''
-	changes = manifest.changes() if copied is not None and copied.tracking and copied.usable else None
+	changes = manifest.changes() if copied is not None and copied.usable else None
 	changed = None if changes is None else manifest.changed_files()
 	manifest.stop_tracking()
 	def allocated(rel:str):
@@ -11166,7 +11164,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
 					 recopy:list = (),recopied:list = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
-					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,copied:CopiedSizes = None) -> VaultManifest:
+					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,sizes:CopiedSizes = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
@@ -11189,7 +11187,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	with PoolNotReady, so nothing more is written into the version.
 	Each entry whose metadata could not be copied, which may lack its extended attributes, is appended to unsynced
 	( copy_file_meta()'s failed ).
-	copied, when given, keeps what the links of the referenced copy take (do_referenced_copy()'s sizes), and the manifest
+	sizes, when given, keeps what the links of the referenced copy take (do_referenced_copy()'s sizes), and the manifest
 	notes the rows changed after it, the places each entry replayed or copied again names too (note_changed()).
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
@@ -11730,7 +11728,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {latest_version_info.path}, listing it')
 			manifest.rebuild(latest_version_info.path)
 		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard,unsynced=unsynced,
-				sizes=copied):
+				sizes=sizes):
 			return manifest
 		backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
 		mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
