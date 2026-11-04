@@ -85,9 +85,8 @@ def snapshot(root):
 			st = os.lstat(path)
 			link = stat.S_ISLNK(st.st_mode)
 			xattrs = () if link else tuple(sorted((key, GETXATTR(path, key, follow_symlinks=False)) for key in LISTXATTR(path, follow_symlinks=False)))
-			# a link's times are when it was made, and so is the mtime of a folder links were made in after its own
-			emptied = stat.S_ISDIR(st.st_mode) and not os.listdir(path)
-			times = None if link else (st.st_atime_ns, st.st_mtime_ns if emptied or not stat.S_ISDIR(st.st_mode) else None)
+			# a link's times are when it was made. a folder's are its source's, set once its links are made (round 18)
+			times = None if link else (st.st_atime_ns, st.st_mtime_ns)
 			if 'noxa' in name or 'nogx' in name:
 				# its attributes may not be read: the copy of its metadata then stops before its times, made now
 				times = None

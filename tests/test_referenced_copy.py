@@ -19,7 +19,7 @@ V1 = 'V1--2021-01-02_00-00-00_-0800'
 
 
 def oracle_referenced_copy(source_path, backup_folder, manifest, relative=False, pool_guard=None, unsynced=None):
-	'''do_referenced_copy() as 0781f67 had it, one lstat and one call per entry, on the calling thread.'''
+	'''do_referenced_copy() as 0781f67 had it, one lstat and one call per entry, on the calling thread, with each folder's metadata set after the links (round 18).'''
 	def source_entry(path, kind, rel):
 		try:
 			return os.lstat(path)
@@ -30,6 +30,8 @@ def oracle_referenced_copy(source_path, backup_folder, manifest, relative=False,
 			return False
 	rv.backuperTeeLogToTl(path=source_path,message=f'Creating a referenced copy of {source_path} to {backup_folder}')
 	missing = []
+	# round 18: the folders get their metadata once every link is made
+	made = []
 	for folder in manifest.iter_folders():
 		source_folder = os.path.join(source_path,folder)
 		backup_folder_path = os.path.join(backup_folder,folder)
@@ -47,7 +49,7 @@ def oracle_referenced_copy(source_path, backup_folder, manifest, relative=False,
 			missing.append(folder)
 			continue
 		os.makedirs(backup_folder_path,exist_ok=True)
-		rv.copy_file_meta(source_folder,backup_folder_path,unsynced)
+		made.append((source_folder,backup_folder_path))
 		if pool_guard is not None:
 			pool_guard.poll()
 		if not rv.GREEN_LIGHT.is_set():
@@ -90,6 +92,8 @@ def oracle_referenced_copy(source_path, backup_folder, manifest, relative=False,
 		if not rv.GREEN_LIGHT.is_set():
 			rv.backuperTeeLogToTl(path=source_path,error=True,message='Backup process interrupted, stopping')
 			return False
+	for source_folder, backup_folder_path in made:
+		rv.copy_file_meta(source_folder,backup_folder_path,unsynced)
 	manifest.discard_many(missing)
 	return True
 
@@ -307,20 +311,14 @@ def test_a_stop_while_the_folders_are_made_makes_no_link(job, monkeypatch, logge
 	v0, manifest = big_version(job)
 	v1 = os.path.join(job.job_vault, V1)
 	made = []
-	real = rv.copy_file_meta
-	def meta(*args, **kwargs):
-		made.append(args[1])
-		if len(made) == 2:
-			rv.GREEN_LIGHT.clear()
-		return real(*args, **kwargs)
-	monkeypatch.setattr(rv, 'copy_file_meta', meta)
-	real_new = rv.copy_new_folder_meta
-	def new_meta(*args, **kwargs):
-		made.append(args[1])
-		if len(made) == 2:
-			rv.GREEN_LIGHT.clear()
-		return real_new(*args, **kwargs)
-	monkeypatch.setattr(rv, 'copy_new_folder_meta', new_meta)
+	real = os.mkdir
+	def mkdir(path, *args, **kwargs):
+		if str(path).startswith(v1 + '/'):
+			made.append(path)
+			if len(made) == 2:
+				rv.GREEN_LIGHT.clear()
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'mkdir', mkdir)
 	try:
 		assert rv.do_referenced_copy(v0, v1, manifest, relative=True) is False
 	finally:

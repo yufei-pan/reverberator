@@ -319,8 +319,11 @@ def test_touched_scopes(job):
 	# each touched name in both its forms, as a file and as a folder
 	# with the time of the first event, from which the extended attributes of what changed are compared
 	assert rv.touched_scopes(events, job.monitor) == rv.TouchedScopes(['A/g.txt/', 'M/', 'N/', 'S/', 'a.txt/', 'b.txt/', 'in/'],
-		['A', 'A/', 'A/g.txt', 'M', 'N', 'S', 'a.txt', 'b.txt', 'in'], 0.0)
+		['A', 'A/', 'A/g.txt', 'M', 'N', 'S', 'a.txt', 'b.txt', 'in'], 0.0, folders=('N',))
 	assert rv.touched_scopes([], job.monitor) == rv.TouchedScopes([], [])
+	# the folders whose times the events moved, where the folder moves after them leave them (round 18)
+	assert rv.touched_scopes(raw_events(job, [('create', 'd/e/f', None, False), ('delete', 'd/x', None, False), ('move', 'D', 'd', True),
+		('attrib', 'k/l', None, False)]), job.monitor).folders == ('D', 'D/e')
 	# a job monitoring the root of the filesystem
 	assert rv.touched_scopes([rv.ChangeEvent(1.0, False, 'modify', '/etc/x', None), rv.ChangeEvent(2.0, True, 'create', '/srv', None),
 		rv.ChangeEvent(3.0, True, 'attrib', '/', None)], '/') == rv.TouchedScopes(['etc/x/', 'srv/'], ['etc/x', 'srv'], 1.0)
