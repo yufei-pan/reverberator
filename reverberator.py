@@ -3931,7 +3931,8 @@ def vault_disk_problem(path:str) -> 'str | None':
 	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
 	point at or above the path is not mounted (a bare folder left under it is not that disk, and neither is anything
 	mounted below it: telling a disk from a bind mount or a tmpfs there needs rules this host has no use for), when the mount table cannot be
-	read, or when a mergerfs pool holding the path has a disk missing (pool_problem()'s text). path need not exist.
+	read, when a mergerfs pool holding the path has a disk missing (pool_problem()'s text), or when the disk holding it
+	off a pool has failed as a pool's disk can (plain_disk_problem()). path need not exist.
 	'''
 	try:
 		mount_table = read_mount_table()
@@ -3943,7 +3944,25 @@ def vault_disk_problem(path:str) -> 'str | None':
 		longest = max(above, key=len)
 		if not any(point == longest for point, _ in mount_table):
 			return f'{longest} is not mounted ({FSTAB_PATH} names it)'
-	return pool_problem(path, mount_table=mount_table)
+	return pool_problem(path, mount_table=mount_table) or plain_disk_problem(path, mount_table)
+
+def plain_disk_problem(path:str, mount_table:list) -> 'str | None':
+	'''
+	What is wrong with the disk holding path when it is on no mergerfs pool, as pool_state() tells it of a pool's disk:
+	its statx fails, as for a shut-down XFS that is still mounted, or it is an f2fs whose checkpoint reports an error.
+	None when nothing is, when path is on a pool (pool_state() checks its disks), or when the table has no mount for it.
+	'''
+	fingerprint = mount_fingerprint(mount_table, os.path.realpath(path))
+	if fingerprint is None or fingerprint[4:5] == (MERGERFS_FSTYPE,):
+		return None
+	disk = next(point for point, mount in mount_table if mount == fingerprint)
+	try:
+		mount_id_at(mount_table, disk)
+		if f2fs_failed(mount_table, disk):
+			return f'disk {disk} has failed: its f2fs checkpoint reports an error'
+	except OSError as e:
+		return f'disk {disk} cannot be read: {e.strerror or e}'
+	return None
 
 class PoolGuard:
 	'''
@@ -4343,13 +4362,15 @@ class fs_signature_monitor:
 			real = os.path.realpath(path)
 			# a pool's branches are mounts of their own: one dropping or coming back changes the fingerprint too
 			state = pool_state(real, mount_table)
-			fingerprint = (mount_fingerprint(mount_table, real), state)
+			# off a pool, its own disk failing as a pool's can: what pausing says, as a pool's problem
+			problem = plain_disk_problem(real, mount_table) if state is None else state.problem
+			fingerprint = (mount_fingerprint(mount_table, real), state, problem)
 			with self.lock:
 				if self.fingerprints.get(key, ...) == fingerprint and (self.states.get(key) or not recheck_failed):
 					continue
 				generation = self.generations.get(key, 0)
-			# df and lsblk run only on a whole pool
-			fs_ok = (state is None or state.problem is None) and check_fs_signature(path, signature)
+			# df and lsblk run only on a whole disk or pool
+			fs_ok = problem is None and check_fs_signature(path, signature)
 			with self.lock:
 				if key not in self.flags or self.generations.get(key, 0) != generation:
 					continue
@@ -4361,8 +4382,8 @@ class fs_signature_monitor:
 						fs_event.set()
 					else:
 						fs_event.clear()
-			if changed and state is not None and state.problem is not None:
-				watcherTeeLogToTl(path, f'{path}: {state.problem}, pausing.')
+			if changed and problem is not None:
+				watcherTeeLogToTl(path, f'{path}: {problem}, pausing.')
 			elif changed:
 				watcherTeeLogToTl(path, f'FS signature {signature} for {path} ' + ('verified.' if fs_ok else 'does not match, pausing.'))
 

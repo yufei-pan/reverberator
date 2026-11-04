@@ -306,10 +306,10 @@ class FakePool:
 		return real
 
 	def add_mount(self, mount_point:str, fstype:str = 'xfs') -> str:
-		'''A plain mount (source /dev/fake) at mount_point, made when missing; its real path.'''
+		'''A plain mount (source /dev/fake, or an f2fs one's as add() makes it) at mount_point, made when missing; its real path.'''
 		os.makedirs(mount_point, exist_ok=True)
 		real = os.path.realpath(mount_point)
-		self.lines.append(self.line(real, fstype, '/dev/fake'))
+		self.lines.append(self.line(real, fstype, self.f2fs_source(real) if fstype == 'f2fs' else '/dev/fake'))
 		self.write()
 		return real
 

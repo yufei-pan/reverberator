@@ -136,6 +136,10 @@ def test_a_listed_fstab_mount_point_is_never_resolved(tmp_path, fake_pool, monke
 	asked = []
 	real_realpath = os.path.realpath
 	monkeypatch.setattr(os.path, 'realpath', lambda p, *a, **k: asked.append(os.fspath(p)) or real_realpath(p, *a, **k))
+	# the disk check's statx of the mount (plain_disk_problem()) asks it, as a pool's check asks each disk; the fake's own
+	# realpath is not the fstab's
+	fake_statx = rv.statx_mount
+	monkeypatch.setattr(rv, 'statx_mount', lambda path: (1000, True) if path == vaults else fake_statx(path))
 	assert rv.vault_disk_problem(os.path.join(vaults, 'v')) is None
 	assert vaults not in asked and other in asked
 
@@ -161,3 +165,46 @@ def test_a_dead_mergerfs_in_fstab_is_not_there(tmp_path, fake_pool):
 	fake_pool.unreadable(pool, errno.ENOTCONN)
 	assert rv.vault_disk_problem(os.path.join(pool, 'reverbs')) == \
 		f'the disks of pool {os.path.realpath(pool)} cannot be listed: {os.strerror(errno.ENOTCONN)}'
+
+
+@pytest.mark.parametrize('fstype', ['f2fs', 'xfs'])
+def test_a_plain_disk_that_failed_is_not_there_as_a_pool_disk_is_not(tmp_path, fake_pool, fstype):
+	# a vault on one disk, no pool: an f2fs whose checkpoint reports an error, or a shut-down XFS whose statx fails, is
+	# the same problem a pool's disk has, and the job waits for it the same way
+	disk = fake_pool.add_mount(str(tmp_path / 'ssd'), fstype)
+	vault = os.path.join(disk, 'backup', 'reverb')
+	assert rv.vault_disk_problem(vault) is None
+	fake_pool.fail_disk(disk)
+	expected = (f'disk {disk} has failed: its f2fs checkpoint reports an error' if fstype == 'f2fs'
+		else f'disk {disk} cannot be read: {os.strerror(errno.EIO)}')
+	assert rv.vault_disk_problem(vault) == expected
+	assert rv.signature_folder_problem(disk) == (f'is on a disk that is not there: {expected}', 'the disk is there')
+	fake_pool.recover(disk)
+	assert rv.vault_disk_problem(vault) is None
+
+
+def test_the_monitor_pauses_a_plain_disk_that_failed(tmp_path, monkeypatch, fake_pool):
+	disk = fake_pool.add_mount(str(tmp_path / 'ssd'), 'f2fs')
+	vault = os.path.join(disk, 'reverb')
+	os.makedirs(vault)
+	lines = []
+	monkeypatch.setattr(rv, 'watcherTeeLogToTl', lambda path, message, **kwargs: lines.append(message))
+	monkeypatch.setattr(fake_pool.monitor, 'start', lambda: None)
+	flag = fake_pool.monitor.register(vault, 'N/A')
+	fake_pool.monitor.check_changed()
+	assert flag.is_set()
+	fake_pool.fail_disk(disk)
+	fake_pool.monitor.check_changed()
+	assert not flag.is_set()
+	assert lines[-1] == f'{vault}: disk {disk} has failed: its f2fs checkpoint reports an error, pausing.'
+	fake_pool.recover(disk)
+	fake_pool.monitor.check_changed()
+	assert flag.is_set()
+
+
+def test_a_disk_of_a_pool_is_checked_by_the_pool_alone(tmp_path, fake_pool):
+	# a pool's own mount is never taken for the plain disk: its branches are checked, each once
+	pool = str(tmp_path / 'pool')
+	a, _ = fake_pool.add(pool, ['a', 'b'], fstype='f2fs')
+	fake_pool.fail_disk(a)
+	assert rv.vault_disk_problem(os.path.join(pool, 'v')) == f'disk {a} of pool {os.path.realpath(pool)} has failed: its f2fs checkpoint reports an error'
