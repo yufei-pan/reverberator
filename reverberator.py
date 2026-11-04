@@ -11921,7 +11921,8 @@ class WrittenFolders:
 		return failed
 
 # the monitored root's own metadata as of a version, on that version's folder ( record_root_meta() ): trusted.*, which only
-# root can read or write, so no user's attribute can pass for it. no name under ROOT_META_PREFIX is ever restored
+# root can read or write, so no user's attribute can pass for it. no name under ROOT_META_PREFIX is restored to a whole job's
+# top folder, which gets the record instead; any other folder keeps all its names ( restore_folder_meta() )
 ROOT_META_XATTR = 'trusted.reverberator.root'
 ROOT_META_PREFIX = 'trusted.reverberator.'
 
@@ -11973,8 +11974,9 @@ def read_root_meta(version_path:str):
 		# none written ( a version before 0.54, a failed write ), no xattrs on that filesystem, no right to trusted.*, or a bad value
 		return None
 
-# the monitored paths whose last record_root_meta() did not keep all: path -> 'failed' or 'trimmed', so batch after batch that
-# cannot keep it logs the first and nothing more, and one line says when it works again
+# the jobs whose last record_root_meta() did not keep all: (monitored path, the job's vault folder) -> 'failed' or 'trimmed', so
+# batch after batch that cannot keep it logs the first and nothing more, and one line says when it works again. Two rows
+# backing up one folder to two vaults are two jobs
 ROOT_META_TROUBLE = {}
 
 def record_root_meta(monitor_path:str, version_path:str) -> bool:
@@ -11988,8 +11990,9 @@ def record_root_meta(monitor_path:str, version_path:str) -> bool:
 	on the first batch of a monitored path that has it, not again while it lasts, and an info line says when it works
 	again. Returns whether a record was written.
 	'''
+	job = (monitor_path, os.path.dirname(version_path))
 	def tell(state:str, message:str, **kind):
-		if ROOT_META_TROUBLE.get(monitor_path) != state:
+		if ROOT_META_TROUBLE.get(job) != state:
 			backuperTeeLogToTl(path=monitor_path,message=message,**kind)
 	state = None
 	try:
@@ -12012,16 +12015,17 @@ def record_root_meta(monitor_path:str, version_path:str) -> bool:
 			if not xattrs or e.errno not in (errno.ENOSPC, errno.E2BIG, errno.ERANGE):
 				raise
 			# the owner, mode and times still fit
+			os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(meta._replace(xattrs={})), follow_symlinks=False)
+			# said only now: a trimmed write that fails too is the 'failed' error below, not this
 			state = 'trimmed'
 			tell(state, f'The extended attributes of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes')
-			os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(meta._replace(xattrs={})), follow_symlinks=False)
 	except OSError as e:
 		tell('failed', f'Cannot keep the metadata of {monitor_path} on {version_path}, so a whole-job restore of it gives the top folder the version folder\'s: {e}', error=True)
-		ROOT_META_TROUBLE[monitor_path] = 'failed'
+		ROOT_META_TROUBLE[job] = 'failed'
 		return False
 	if state is not None:
-		ROOT_META_TROUBLE[monitor_path] = state
-	elif ROOT_META_TROUBLE.pop(monitor_path, None) is not None:
+		ROOT_META_TROUBLE[job] = state
+	elif ROOT_META_TROUBLE.pop(job, None) is not None:
 		backuperTeeLogToTl(path=monitor_path,message=f'The metadata of {monitor_path} is kept on {version_path} again')
 	return True
 

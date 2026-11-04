@@ -1313,7 +1313,7 @@ def test_a_record_that_cannot_be_written_logs_once_per_job_and_says_when_it_work
 	failing[0] = True
 	assert not rv.record_root_meta(job.monitor, version)
 	assert len(text()) == 3 and 'Cannot keep the metadata' in text()[2]
-	rv.ROOT_META_TROUBLE.pop(job.monitor, None)
+	rv.ROOT_META_TROUBLE.clear()
 
 
 @root_only
@@ -1337,4 +1337,49 @@ def test_a_root_whose_attributes_do_not_fit_gets_a_record_without_them_and_one_l
 	assert got.xattrs == {} and got.mode == 0o750
 	said = [kwargs for args, kwargs in lines if 'do not fit' in kwargs.get('message', '')]
 	assert len(said) == 1 and not said[0].get('error') and 'without them' in said[0]['message']
-	rv.ROOT_META_TROUBLE.pop(job.monitor, None)
+	rv.ROOT_META_TROUBLE.clear()
+
+
+@root_only
+def test_a_trimmed_record_that_cannot_be_written_either_logs_one_error_and_no_false_line(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	os.setxattr(job.monitor, 'user.small', b'1')
+	real = os.setxattr
+	def full(path, name, *args, **kwargs):
+		if name == rv.ROOT_META_XATTR:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		return real(path, name, *args, **kwargs)
+	monkeypatch.setattr(os, 'setxattr', full)
+	lines = logged(monkeypatch)
+	for i in range(3):
+		version = os.path.join(job.root, f'V{i}')
+		os.mkdir(version)
+		assert not rv.record_root_meta(job.monitor, version)
+	messages = [kwargs for args, kwargs in lines]
+	assert len(messages) == 1 and messages[0].get('error') and 'Cannot keep the metadata' in messages[0]['message']
+	assert not [m for m in messages if 'do not fit' in m['message']]
+	rv.ROOT_META_TROUBLE.clear()
+
+
+@root_only
+def test_two_vaults_backing_up_one_root_are_told_apart_when_one_cannot_keep_the_record(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	real = os.setxattr
+	bad = os.path.join(job.root, 'vault_bad')
+	good = os.path.join(job.root, 'vault_good')
+	os.mkdir(bad); os.mkdir(good)
+	def bad_fails(path, name, *args, **kwargs):
+		if name == rv.ROOT_META_XATTR and str(path).startswith(bad):
+			raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP))
+		return real(path, name, *args, **kwargs)
+	monkeypatch.setattr(os, 'setxattr', bad_fails)
+	lines = logged(monkeypatch)
+	for i in range(3):
+		for vault, ok in ((bad, False), (good, True)):
+			version = os.path.join(vault, f'V{i}')
+			os.mkdir(version)
+			assert rv.record_root_meta(job.monitor, version) is ok
+	messages = [kwargs for args, kwargs in lines]
+	assert len(messages) == 1 and messages[0].get('error') and 'Cannot keep the metadata' in messages[0]['message']
+	assert not [m for m in messages if 'again' in m['message']]
+	rv.ROOT_META_TROUBLE.clear()
