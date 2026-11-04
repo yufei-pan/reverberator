@@ -30,6 +30,7 @@ import ctypes
 import inspect
 import sqlite3
 import json
+import base64
 import tempfile
 import stat
 import array
@@ -5639,7 +5640,7 @@ def do_backup(backup_entries:dict,
 						finish_copies(pending,manifest,backup_folder,job_name,reported,unsynced)
 						for monitorEntry, backupEntryPath in folders:
 							copy_file_meta(monitorEntry,backupEntryPath,unsynced)
-						copy_version_folder_meta(monitor_path,backup_folder,unsynced)
+						record_root_meta(monitor_path,backup_folder)
 				finally:
 					# however the backup ends, no copy is left writing into this version. a copy finish_copies did not reach
 					# means this V0 is not committed: the whole folder is removed as an orphan ( by the job's next vault scan ), so unlinking each
@@ -5658,7 +5659,7 @@ def do_backup(backup_entries:dict,
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors,copy_version=this_version_number)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
 				if do_referenced_copy(monitor_path,backup_folder,manifest,pool_guard=pool_guard,unsynced=unsynced,sizes=copied,threads=copy_threads):
-					copy_version_folder_meta(monitor_path,backup_folder,unsynced)
+					record_root_meta(monitor_path,backup_folder)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
@@ -11818,8 +11819,8 @@ class WrittenFolders:
 	rel with no trailing /: all of it for one the replay made or synced the attributes of, else only its times, for one
 	it made, removed or renamed an entry in, which moves a folder's mtime and ctime and nothing else of it. A rel
 	follows each folder move the replay makes after it (moved()), so it names the folder's place as the batch leaves the
-	version, the monitored folder's own. The version folder itself ('' or '.') is never one: it gets the monitored
-	root's metadata by a step of its own, at every batch (copy_version_folder_meta()).
+	version, the monitored folder's own. The version folder itself ('' or '.') is never one: it keeps the daemon's own,
+	and the monitored root's metadata is kept on it by a step of its own, at every batch (record_root_meta()).
 
 	Examples:
 		>>> folders = WrittenFolders()
@@ -11916,23 +11917,82 @@ class WrittenFolders:
 				backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to copy the times of {source} onto {dest}: {e}')
 		return failed
 
-def copy_version_folder_meta(monitor_path:str, version_path:str, unsynced:list = None) -> bool:
+# the monitored root's own metadata as of a version, on that version's folder ( record_root_meta() ): trusted.*, which only
+# root can read or write, so no user's attribute can pass for it. no name under ROOT_META_PREFIX is ever restored
+ROOT_META_XATTR = 'trusted.reverberator.root'
+ROOT_META_PREFIX = 'trusted.reverberator.'
+
+# what read_root_meta() gives: the root's owner, mode ( permission bits ), times and extended attributes ( name -> bytes )
+RootMeta = namedtuple('RootMeta', ['uid', 'gid', 'mode', 'atime_ns', 'mtime_ns', 'xattrs'])
+
+def encode_root_meta(meta:RootMeta) -> bytes:
 	'''
-	Give version_path, the folder of a version being written, the monitored root's owner, mode, times and extended
-	attributes (copy_new_folder_meta()), once nothing more is written into it, so a whole job restored in place gets
-	its top folder's own back. Its failure appends monitor_path to unsynced, when given, with an error line, as
-	copy_file_meta() writes it. Returns whether it worked.
+	The value of ROOT_META_XATTR: one line of JSON, ASCII, {"v": 1, "uid", "gid", "mode", "atime_ns", "mtime_ns" (whole
+	numbers), "xattrs": {name: base64 of the value}}. A name that is not UTF-8 is written as Python's surrogateescape
+	reads it (a \\udcXX escape). Fields may be added under "v": 1; "v" changes only when a reader of 1 would misread it.
+
+	Examples:
+		>>> meta = RootMeta(1, 2, 0o2750, 3, 4, {'user.a': b'\\x00b'})
+		>>> encode_root_meta(meta)
+		b'{"v":1,"uid":1,"gid":2,"mode":1512,"atime_ns":3,"mtime_ns":4,"xattrs":{"user.a":"AGI="}}'
+		>>> decode_root_meta(encode_root_meta(meta)) == meta
+		True
+	'''
+	return json.dumps({'v': 1, 'uid': meta.uid, 'gid': meta.gid, 'mode': meta.mode, 'atime_ns': meta.atime_ns, 'mtime_ns': meta.mtime_ns,
+		'xattrs': {name: base64.b64encode(value).decode('ascii') for name, value in meta.xattrs.items()}}, separators=(',', ':')).encode('ascii')
+
+def decode_root_meta(data:bytes) -> RootMeta:
+	'''The RootMeta a ROOT_META_XATTR value holds (encode_root_meta()); ValueError when it is not one of version 1.'''
+	record = json.loads(data.decode('ascii'))
+	if not isinstance(record, dict) or record.get('v') != 1:
+		raise ValueError('not a version 1 record')
+	numbers = [record.get(key) for key in ('uid', 'gid', 'mode', 'atime_ns', 'mtime_ns')]
+	if not all(type(number) is int and number >= 0 for number in numbers):
+		raise ValueError('an owner, mode or time is not a whole number')
+	xattrs = record.get('xattrs')
+	if not isinstance(xattrs, dict) or not all(isinstance(value, str) for value in xattrs.values()):
+		raise ValueError('its extended attributes are not names and values')
+	return RootMeta(*numbers, {name: base64.b64decode(value, validate=True) for name, value in xattrs.items()})
+
+def read_root_meta(version_path:str):
+	'''The monitored root's metadata version_path holds (record_root_meta()), None when it holds none this user can read.'''
+	try:
+		data = os.getxattr(version_path, ROOT_META_XATTR, follow_symlinks=False)
+	except OSError:
+		# none written ( a version before 0.54, a failed write ), no xattrs on that filesystem, or no right to trusted.*
+		return None
+	try:
+		return decode_root_meta(data)
+	except (ValueError, UnicodeDecodeError):
+		return None
+
+def record_root_meta(monitor_path:str, version_path:str) -> bool:
+	'''
+	Keep on version_path, the folder of a version being written, the monitored root's owner, mode, times and extended
+	attributes as of now (ROOT_META_XATTR, encode_root_meta()), read from the folder monitor_path names (a link to it
+	is followed), so a whole job restored gets its top folder's own back (restore_folder_meta()). version_path itself
+	keeps the daemon's owner, mode and times. One that cannot be read or written logs an error line, and that version's
+	whole-job restore gives the top folder the version folder's own. Returns whether it worked.
 	'''
 	try:
-		# the monitored path may be a link: the folder it names, whose owner, mode, times and xattrs these are
-		monitor_path_real = os.path.realpath(monitor_path)
-		st = os.lstat(monitor_path_real)
+		real = os.path.realpath(monitor_path)
+		st = os.lstat(real)
+		xattrs = {}
+		for name in xattr_names(real):
+			if name.startswith(ROOT_META_PREFIX):
+				continue
+			try:
+				xattrs[name] = os.getxattr(real, name, follow_symlinks=False)
+			except OSError as e:
+				# removed since it was listed
+				if e.errno != errno.ENODATA:
+					raise
+		meta = RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs)
+		os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(meta), follow_symlinks=False)
+		return True
 	except OSError as e:
-		backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot copy the metadata of {monitor_path} onto {version_path}: {e}')
-		if unsynced is not None:
-			unsynced.append(monitor_path)
+		backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot keep the metadata of {monitor_path} on {version_path}, so a whole-job restore of it gives the top folder the version folder\'s: {e}')
 		return False
-	return copy_new_folder_meta(monitor_path_real, version_path, st, unsynced)
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
@@ -11968,7 +12028,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	they made or synced the attributes of, or the referenced copy could not copy the metadata of from the latest version,
 	all of the monitored folder's metadata (WrittenFolders), and the rows of those given its times record its mtime; every
 	other folder keeps the latest version's, which its batch left right. A folder whose whole copy fails is recorded from
-	what the version holds. backup_folder itself then gets all of the monitored root's (copy_version_folder_meta()).
+	what the version holds. backup_folder itself keeps its own, and then holds the monitored root's (record_root_meta()).
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
@@ -12615,8 +12675,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	for rel in written.settle(backup_folder,monitor_path,unsynced,paused,poll_pools):
 		if manifest.lookup(as_folder_entry(rel)) is not None:
 			manifest.add(as_folder_entry(rel),dirty=True)
-	# the version folder last: the monitored root's, at every batch
-	copy_version_folder_meta(monitor_path,backup_folder,unsynced)
+	# the version folder keeps its own, and holds the monitored root's as of this batch
+	record_root_meta(monitor_path,backup_folder)
 	record_dirty_entries(manifest,backup_folder,monitor_path,writing_moves)
 	# the rows of the folders given the monitored ones' times record the monitored mtime, read from the vault or not, for
 	# full comparisons ( compare_monitor_entry() ): a vault whose filesystem keeps coarser times holds another
@@ -13940,10 +14000,11 @@ def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
 def restore_folder_meta(source:str, dest:str):
 	'''
 	Give dest, a folder a restore made, the vault folder source's extended attributes, mode and times, then its owner
-	as the very last step. All of it is done on dest as opened, not followed if it is a symlink: once another user owns
-	the folder they could rename it and put a symlink in its place, and nothing may reach through that. None once all
-	of it is done, else the error that stopped it, for the warning. (copy_file_meta() works by path, as the daemon's
-	vault is no other user's to change.)
+	as the very last step: those of the monitored root that source, a version folder, holds (read_root_meta()), else
+	source's own. No name under ROOT_META_PREFIX is ever given. All of it is done on dest as opened, not followed if it
+	is a symlink: once another user owns the folder they could rename it and put a symlink in its place, and nothing may
+	reach through that. None once all of it is done, else the error that stopped it, for the warning. (copy_file_meta()
+	works by path, as the daemon's vault is no other user's to change.)
 	'''
 	try:
 		held = os.lstat(source)
@@ -13957,16 +14018,22 @@ def restore_folder_meta(source:str, dest:str):
 			if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
 				raise
 			names = []
-		for name in names:
+		# only a version folder holds it, and only root can read it
+		meta = read_root_meta(source) if ROOT_META_XATTR in names else None
+		if meta is None:
+			meta = RootMeta(held.st_uid, held.st_gid, stat.S_IMODE(held.st_mode), held.st_atime_ns, held.st_mtime_ns, None)
+		for name in names if meta.xattrs is None else meta.xattrs:
+			if name.startswith(ROOT_META_PREFIX):
+				continue
 			try:
-				os.setxattr(fd, name, os.getxattr(source, name, follow_symlinks=False))
+				os.setxattr(fd, name, os.getxattr(source, name, follow_symlinks=False) if meta.xattrs is None else meta.xattrs[name])
 			except OSError as e:
 				# what copystat() lets go too: an attribute this filesystem or user cannot set
 				if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
 					raise
-		os.chmod(fd, stat.S_IMODE(held.st_mode))
-		os.utime(fd, ns=(held.st_atime_ns, held.st_mtime_ns))
-		os.chown(fd, held.st_uid, held.st_gid)
+		os.chmod(fd, meta.mode)
+		os.utime(fd, ns=(meta.atime_ns, meta.mtime_ns))
+		os.chown(fd, meta.uid, meta.gid)
 		return None
 	except OSError as e:
 		return str(e)

@@ -35,6 +35,12 @@ def metadata(path):
 	return st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns
 
 
+def kept_root_metadata(version):
+	'''metadata() of the monitored root as version's folder keeps it (trusted.reverberator.root).'''
+	root = rv.read_root_meta(version)
+	return stat.S_IFDIR | root.mode, root.uid, root.gid, root.mtime_ns
+
+
 def inodes(top):
 	return {rel: os.lstat(os.path.join(top, rel)).st_ino for rel, text in tree(top).items() if text is not None and rel != rv.RESTORE_MARKER_NAME}
 
@@ -213,9 +219,9 @@ def test_in_place_root_needs_an_empty_root(job, frozen_disk, tmp_path, capsys):
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
 	assert code == 0 and err.startswith('Restoring the whole job into ')
 	assert tree(job.monitor) == {'a.txt': 'a', 'd/': None, 'd/b.txt': 'b', 'lost+found/': None}
-	# the root and lost+found, the new disk's own, with the version's metadata
+	# the root and lost+found, the new disk's own, with the version's metadata: the root's as its version folder keeps it
 	assert (err, stdout) == (f'{shown_disk}\n', f'Restored 5 entries ({rv.show_size(2)}) from V0 to {job.monitor}\n')
-	assert metadata(job.monitor) == metadata(version_path(job, 0))
+	assert metadata(job.monitor) == kept_root_metadata(version_path(job, 0))
 	assert metadata(f'{job.monitor}/lost+found') == metadata(os.path.join(version_path(job, 0), 'lost+found'))
 
 
@@ -629,9 +635,10 @@ def test_in_place_root_is_private_while_restoring(job, tmp_path, capsys, monkeyp
 	monkeypatch.setattr(rv, 'cp_af_copy_path', watching)
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
 	assert code == 0 and err.startswith('Restoring the whole job into ')
-	# private while it fills, marked before the first copy; the version's own once complete
+	# private while it fills, marked before the first copy; the monitored root's of the version once complete
 	assert seen and set(seen) == {(0o700, 0o600)}
-	assert metadata(job.monitor) == metadata(held)
+	assert metadata(job.monitor) == kept_root_metadata(held)
+	assert stat.S_IMODE(os.lstat(job.monitor).st_mode) == 0o751 and (not ROOT or os.lstat(job.monitor).st_uid == OTHER)
 	assert tree(job.monitor) == {'a.txt': 'a', 'd/': None, 'd/b.txt': 'b', 'd/c.txt': 'c'}
 	# when anything fails it stays private, and says so
 	monkeypatch.setattr(rv, 'cp_af_copy_path', cp_af_copy_path)
@@ -653,7 +660,7 @@ def test_in_place_root_is_private_while_restoring(job, tmp_path, capsys, monkeyp
 	assert code == 0 and err.startswith('Restoring the whole job into ')
 	assert stdout == f'Restored 3 entries ({rv.show_size(1)}) from V0 to {job.monitor}, keeping 2 already there\n'
 	assert tree(job.monitor) == {'a.txt': 'a', 'd/': None, 'd/b.txt': 'b', 'd/c.txt': 'c'}
-	assert metadata(job.monitor) == metadata(held)
+	assert metadata(job.monitor) == kept_root_metadata(held)
 
 
 def test_one_run_of_a_restore_at_a_time(job, tmp_path, capsys, monkeypatch):
@@ -1060,24 +1067,119 @@ def test_a_marker_that_would_not_go_is_not_rewritten_into_a_folder_being_handed_
 	assert len(written) == 1
 
 
+def xattrs(path):
+	return {name: os.getxattr(path, name, follow_symlinks=False) for name in os.listxattr(path, follow_symlinks=False)}
+
+
+def own_xattrs_in(top):
+	'''The trusted.reverberator.* names on top and every entry under it, by rel.'''
+	found = {}
+	for path, rel in [(top, '')] + [(path, rel) for path, rel, _ in rv.iter_tree_entries(top)]:
+		names = [name for name in os.listxattr(path, follow_symlinks=False) if name.startswith('trusted.reverberator.')]
+		if names:
+			found[rel] = names
+	return found
+
+
 def test_a_whole_job_restored_in_place_gets_its_top_folders_own_metadata(job, tmp_path, capsys):
-	# the version folder takes the monitored root's owner, mode and times at every batch, so the job's top folder comes
-	# back as it was, not as root's 0755 folder of the version's commit time
+	# each version folder stays root's 0755 folder of its own times, and keeps the monitored root's owner, mode, times
+	# and xattrs of its batch (trusted.reverberator.root), so the job's top folder comes back as it was
 	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	os.setxattr(job.monitor, 'user.top', b'v0')
 	run_backup(job)
+	v0_want = metadata(job.monitor), xattrs(job.monitor)
 	write(job, 'n.txt', 'n')
 	os.chmod(job.monitor, 0o750)
 	if ROOT:
 		os.chown(job.monitor, OTHER, OTHER)
+	os.setxattr(job.monitor, 'user.top', b'v1')
 	old = 1_000_000_000 * 10 ** 9
 	os.utime(job.monitor, ns=(old, old))
 	run_backup(job, rv.change_events_to_backup_entries(deque([rv.ChangeEvent(1.0, False, 'create', f'{job.monitor}/n.txt', None)]), job.monitor))
 	write_rule(job)
-	want = metadata(job.monitor)
-	assert metadata(version_path(job, 1)) == want
+	want = metadata(job.monitor), xattrs(job.monitor)
+	assert want[1] == {'user.top': b'v1'}
+	for number in (0, 1):
+		st = os.lstat(version_path(job, number))
+		assert (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid) == (0o755, os.geteuid(), os.getegid()) and st.st_mtime_ns != old
+		assert list(xattrs(version_path(job, number))) == [rv.ROOT_META_XATTR]
 	shutil.rmtree(job.monitor)
 	os.mkdir(job.monitor, 0o755)
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1', '--yes')
 	assert code == 0 and err.startswith('Restoring the whole job into ')
 	assert tree(job.monitor) == {'a.txt': 'a', 'd/': None, 'd/b.txt': 'b', 'n.txt': 'n'}
-	assert metadata(job.monitor) == want and (not ROOT or os.lstat(job.monitor).st_uid == OTHER)
+	assert (metadata(job.monitor), xattrs(job.monitor)) == want and (not ROOT or os.lstat(job.monitor).st_uid == OTHER)
+	assert stat.S_IMODE(os.lstat(job.monitor).st_mode) == 0o750 and os.lstat(job.monitor).st_mtime_ns == old
+	assert own_xattrs_in(job.monitor) == {}
+	# an older version gives the root's as of that version
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor + '/', out, '--version', '0')
+	assert code == 0, err
+	top = os.path.join(out, os.path.basename(job.monitor))
+	assert (metadata(top), xattrs(top)) == v0_want
+	assert own_xattrs_in(top) == {}
+
+
+def test_a_version_without_the_roots_metadata_restores_its_top_folder_as_0_53_did(job, tmp_path, capsys):
+	# a version made before the root's metadata was kept on it (or where it could not be written): the job's top folder
+	# gets the version folder's own owner, mode and times
+	seed_monitor(job, {'a.txt': 'a'})
+	os.chmod(job.monitor, 0o750)
+	if ROOT:
+		os.chown(job.monitor, OTHER, OTHER)
+	run_backup(job)
+	write_rule(job)
+	version = version_path(job, 0)
+	os.removexattr(version, rv.ROOT_META_XATTR)
+	os.utime(version, ns=(10 ** 18, 10 ** 18))
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor + '/', out, '--version', '0')
+	assert code == 0, err
+	top = os.path.join(out, os.path.basename(job.monitor))
+	assert metadata(top) == metadata(version) and xattrs(top) == {}
+	assert stat.S_IMODE(os.lstat(top).st_mode) == 0o755 and os.lstat(top).st_uid == os.geteuid()
+
+
+def test_a_root_metadata_that_cannot_be_kept_is_one_error_and_the_version_falls_back(job, tmp_path, capsys, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	os.chmod(job.monitor, 0o750)
+	real = os.setxattr
+	def no_room(path, name, *args, **kwargs):
+		if name == rv.ROOT_META_XATTR:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		return real(path, name, *args, **kwargs)
+	monkeypatch.setattr(os, 'setxattr', no_room)
+	lines = []
+	logger = rv.backuperTeeLogToTl
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda *args, **kwargs: (lines.append((args, kwargs)), logger(*args, **kwargs))[1])
+	run_backup(job)
+	monkeypatch.setattr(os, 'setxattr', real)
+	errors = [kwargs['message'] for args, kwargs in lines if kwargs.get('error') and 'Cannot keep the metadata' in kwargs.get('message', '')]
+	assert len(errors) == 1 and 'No space left' in errors[0]
+	version = version_path(job, 0)
+	assert rv.read_root_meta(version) is None and xattrs(version) == {}
+	write_rule(job)
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor + '/', out, '--version', '0')
+	assert code == 0, err
+	assert metadata(os.path.join(out, os.path.basename(job.monitor))) == metadata(version)
+
+
+def test_a_vault_folder_holding_the_daemons_own_names_never_gives_them_to_a_restored_entry(tmp_path):
+	# a copy of a vault (rsync -aX) keeps trusted.reverberator.root; restore_folder_meta() gives it to no folder, the
+	# top folder's own record's names included
+	source, dest = tmp_path / 'held', tmp_path / 'made'
+	source.mkdir()
+	dest.mkdir()
+	os.setxattr(source, 'user.k', b'1')
+	os.setxattr(source, 'trusted.reverberator.other', b'x')
+	assert rv.restore_folder_meta(str(source), str(dest)) is None
+	assert xattrs(dest) == {'user.k': b'1'}
+	# a record whose xattrs name one of the daemon's own
+	dest2 = tmp_path / 'made2'
+	dest2.mkdir()
+	os.setxattr(source, rv.ROOT_META_XATTR, rv.encode_root_meta(rv.RootMeta(os.geteuid(), os.getegid(), 0o700, 5, 6, {'user.r': b'2', 'trusted.reverberator.root': b'no'})))
+	assert rv.restore_folder_meta(str(source), str(dest2)) is None
+	assert xattrs(dest2) == {'user.r': b'2'}
+	st = os.lstat(dest2)
+	assert (stat.S_IMODE(st.st_mode), st.st_mtime_ns) == (0o700, 6)

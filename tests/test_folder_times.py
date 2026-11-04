@@ -171,10 +171,24 @@ def seed_tree(rng, job):
 			os.utime(path, ns=(OLD + rng.randint(0, 10 ** 12), OLD + rng.randint(0, 10 ** 12)))
 
 
+def version_folders_of(version):
+	'''
+	folders_of() a version, its top folder's being the monitored root's it keeps (rv.read_root_meta()): the version folder
+	itself stays the daemon's, root's 0755 folder.
+	'''
+	found = folders_of(version)
+	st = os.lstat(version)
+	assert (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid) == (0o755, os.geteuid(), os.getegid())
+	assert [name for name in os.listxattr(version) if name.startswith('trusted.reverberator.')] == [rv.ROOT_META_XATTR]
+	root = rv.read_root_meta(version)
+	found[''] = (root.mtime_ns, root.mode, root.uid, root.gid, tuple(sorted(root.xattrs.items())))
+	return found
+
+
 def check(job, expected, why=''):
 	'''Every kept version's folders are the monitored ones of its batch (expected: version path -> folders_of()).'''
 	for version in committed_versions(job):
-		assert folders_of(version) == expected[version], (os.path.basename(version), why)
+		assert version_folders_of(version) == expected[version], (os.path.basename(version), why)
 
 
 @pytest.mark.parametrize('complete', [True, False])
@@ -355,7 +369,7 @@ def test_written_folders_follow_the_folder_moves():
 
 def test_a_move_to_the_top_never_names_the_version_folder_a_written_folder(tmp_path, monkeypatch):
 	# a file moved to the top re-targets its link there, in the version folder: retarget_moved_links() names it as '.',
-	# which is no written folder ( the version folder gets the monitored root's by its own step )
+	# which is no written folder ( the version folder keeps the monitored root's by its own step )
 	job = create_job(str(tmp_path))
 	seed_monitor(job, {'a/f': '1', 'keep': 'k'})
 	run_backup(job)
@@ -371,7 +385,7 @@ def test_a_move_to_the_top_never_names_the_version_folder_a_written_folder(tmp_p
 	evs = deque([rv.ChangeEvent(2.0, False, 'move', m('f'), m('a/f'))])
 	v = run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), touched=rv.touched_scopes(evs, job.monitor))[-1]
 	assert seen and '.' not in seen[0] and '' not in seen[0]
-	assert meta(v) == meta(job.monitor)
+	assert version_folders_of(v)[''] == meta(job.monitor)
 
 
 def test_settle_leaves_paused_inner_mounts_and_polls_each_folder(tmp_path):
@@ -417,7 +431,7 @@ def test_the_referenced_copy_keeps_a_few_numbers_a_folder(tmp_path, monkeypatch)
 		f.write('v1')
 	v1 = run_backup(job, OrderedDict([event_entry(job, 'keep', 'modify')]))[-1]
 	assert held and all(type(st) is rv.FolderMeta for st in held[:2])
-	assert folders_of(v1) == folders_of(job.monitor)
+	assert version_folders_of(v1) == folders_of(job.monitor)
 
 
 def test_copy_new_folder_meta_never_follows_a_link_in_the_folders_place(tmp_path):
@@ -514,7 +528,7 @@ def test_a_full_comparison_gives_a_folder_whose_mtime_alone_moved_its_times(tmp_
 	assert len(versions) == 2
 	# its times only, and nothing sized or copied for it
 	assert settled == [{'D': False}] and sized == []
-	assert folders_of(versions[-1]) == folders_of(job.monitor)
+	assert version_folders_of(versions[-1]) == folders_of(job.monitor)
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		assert manifest.lookup('D/').mtime_ns == OLD + 9
@@ -540,7 +554,7 @@ def test_the_first_full_comparison_repairs_folders_whose_records_hold_no_mtime(t
 	manifest.commit()
 	manifest.close()
 	versions = run_backup(job)
-	assert len(versions) == 2 and folders_of(versions[-1]) == folders_of(job.monitor)
+	assert len(versions) == 2 and version_folders_of(versions[-1]) == folders_of(job.monitor)
 	assert run_backup(job) == versions
 
 
@@ -578,20 +592,23 @@ def test_a_folder_moved_to_another_parent_and_on_again_gets_its_times_at_its_fin
 	os.rename(m('r'), m('w/r2'))
 	evs = deque([rv.ChangeEvent(1.0, True, 'move', m('r/t'), m('q/s')), rv.ChangeEvent(2.0, True, 'move', m('w/r2'), m('r'))])
 	v1 = run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), touched=rv.touched_scopes(evs, job.monitor))[-1]
-	assert folders_of(v1) == folders_of(job.monitor)
+	assert version_folders_of(v1) == folders_of(job.monitor)
 
 
-def test_a_symlinked_monitored_root_gives_the_version_folder_the_folders_own_metadata(tmp_path):
+def test_a_symlinked_monitored_root_keeps_the_folders_own_metadata_on_the_version(tmp_path):
 	real = tmp_path / 'real'
 	real.mkdir()
 	os.chmod(real, 0o750)
 	os.utime(real, ns=(OLD, OLD + 9))
+	os.setxattr(real, 'user.k', b'v')
 	link = tmp_path / 'link'
 	os.symlink(real, link)
 	version = tmp_path / 'V1'
-	version.mkdir()
-	unsynced = []
-	assert rv.copy_version_folder_meta(str(link), str(version), unsynced)
-	assert unsynced == []
-	assert meta(str(version)) == meta(str(real))
-	assert stat.S_IMODE(os.lstat(version).st_mode) == 0o750
+	version.mkdir(0o755)
+	before = os.lstat(version)
+	assert rv.record_root_meta(str(link), str(version))
+	assert rv.read_root_meta(str(version)) == rv.RootMeta(os.geteuid(), os.getegid(), 0o750, OLD, OLD + 9, {'user.k': b'v'})
+	after = os.lstat(version)
+	# the version folder keeps its own
+	assert (after.st_mode, after.st_uid, after.st_gid, after.st_mtime_ns) == (before.st_mode, before.st_uid, before.st_gid, before.st_mtime_ns)
+	assert os.listxattr(version) == [rv.ROOT_META_XATTR]
