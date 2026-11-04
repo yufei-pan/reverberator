@@ -11950,24 +11950,32 @@ def decode_root_meta(data:bytes) -> RootMeta:
 	if not isinstance(record, dict) or record.get('v') != 1:
 		raise ValueError('not a version 1 record')
 	numbers = [record.get(key) for key in ('uid', 'gid', 'mode', 'atime_ns', 'mtime_ns')]
-	if not all(type(number) is int and number >= 0 for number in numbers):
+	if not all(type(number) is int for number in numbers):
 		raise ValueError('an owner, mode or time is not a whole number')
+	# what chown(), chmod() and utime() take; a time before 1970 is negative
+	bounds = ((0, 2 ** 32 - 2), (0, 2 ** 32 - 2), (0, 0o7777), (-2 ** 63, 2 ** 63 - 1), (-2 ** 63, 2 ** 63 - 1))
+	if not all(low <= number <= high for number, (low, high) in zip(numbers, bounds)):
+		raise ValueError('an owner, mode or time is out of range')
 	xattrs = record.get('xattrs')
 	if not isinstance(xattrs, dict) or not all(isinstance(value, str) for value in xattrs.values()):
 		raise ValueError('its extended attributes are not names and values')
 	return RootMeta(*numbers, {name: base64.b64decode(value, validate=True) for name, value in xattrs.items()})
 
+def load_root_meta(version_path:str) -> RootMeta:
+	'''The monitored root's metadata version_path holds (record_root_meta()); OSError when it cannot be read, ValueError (or UnicodeDecodeError) when it is not a record.'''
+	return decode_root_meta(os.getxattr(version_path, ROOT_META_XATTR, follow_symlinks=False))
+
 def read_root_meta(version_path:str):
-	'''The monitored root's metadata version_path holds (record_root_meta()), None when it holds none this user can read.'''
+	'''The monitored root's metadata version_path holds (record_root_meta()), None when it holds none this user can read or decode.'''
 	try:
-		data = os.getxattr(version_path, ROOT_META_XATTR, follow_symlinks=False)
-	except OSError:
-		# none written ( a version before 0.54, a failed write ), no xattrs on that filesystem, or no right to trusted.*
+		return load_root_meta(version_path)
+	except (OSError, ValueError):
+		# none written ( a version before 0.54, a failed write ), no xattrs on that filesystem, no right to trusted.*, or a bad value
 		return None
-	try:
-		return decode_root_meta(data)
-	except (ValueError, UnicodeDecodeError):
-		return None
+
+# the monitored paths whose last record_root_meta() did not keep all: path -> 'failed' or 'trimmed', so batch after batch that
+# cannot keep it logs the first and nothing more, and one line says when it works again
+ROOT_META_TROUBLE = {}
 
 def record_root_meta(monitor_path:str, version_path:str) -> bool:
 	'''
@@ -11975,8 +11983,15 @@ def record_root_meta(monitor_path:str, version_path:str) -> bool:
 	attributes as of now (ROOT_META_XATTR, encode_root_meta()), read from the folder monitor_path names (a link to it
 	is followed), so a whole job restored gets its top folder's own back (restore_folder_meta()). version_path itself
 	keeps the daemon's owner, mode and times. One that cannot be read or written logs an error line, and that version's
-	whole-job restore gives the top folder the version folder's own. Returns whether it worked.
+	whole-job restore gives the top folder the version folder's own. A record too big for one attribute of a folder
+	(the root's attributes take about 1.4 times their size in it) is written without them, saying so. Either is logged
+	on the first batch of a monitored path that has it, not again while it lasts, and an info line says when it works
+	again. Returns whether a record was written.
 	'''
+	def tell(state:str, message:str, **kind):
+		if ROOT_META_TROUBLE.get(monitor_path) != state:
+			backuperTeeLogToTl(path=monitor_path,message=message,**kind)
+	state = None
 	try:
 		real = os.path.realpath(monitor_path)
 		st = os.lstat(real)
@@ -11991,11 +12006,24 @@ def record_root_meta(monitor_path:str, version_path:str) -> bool:
 				if e.errno != errno.ENODATA:
 					raise
 		meta = RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs)
-		os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(meta), follow_symlinks=False)
-		return True
+		try:
+			os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(meta), follow_symlinks=False)
+		except OSError as e:
+			if not xattrs or e.errno not in (errno.ENOSPC, errno.E2BIG, errno.ERANGE):
+				raise
+			# the owner, mode and times still fit
+			state = 'trimmed'
+			tell(state, f'The extended attributes of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes')
+			os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(meta._replace(xattrs={})), follow_symlinks=False)
 	except OSError as e:
-		backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot keep the metadata of {monitor_path} on {version_path}, so a whole-job restore of it gives the top folder the version folder\'s: {e}')
+		tell('failed', f'Cannot keep the metadata of {monitor_path} on {version_path}, so a whole-job restore of it gives the top folder the version folder\'s: {e}', error=True)
+		ROOT_META_TROUBLE[monitor_path] = 'failed'
 		return False
+	if state is not None:
+		ROOT_META_TROUBLE[monitor_path] = state
+	elif ROOT_META_TROUBLE.pop(monitor_path, None) is not None:
+		backuperTeeLogToTl(path=monitor_path,message=f'The metadata of {monitor_path} is kept on {version_path} again')
+	return True
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
@@ -14000,14 +14028,17 @@ def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
 	# a folder where the walk found a link
 	return f'a vault link to a folder: {resolved.path}'
 
-def restore_folder_meta(source:str, dest:str):
+def restore_folder_meta(source:str, dest:str, top:bool = False, warn = None):
 	'''
 	Give dest, a folder a restore made, the vault folder source's extended attributes, mode and times, then its owner
-	as the very last step: those of the monitored root that source, a version folder, holds (read_root_meta()), else
-	source's own. No name under ROOT_META_PREFIX is ever given. All of it is done on dest as opened, not followed if it
-	is a symlink: once another user owns the folder they could rename it and put a symlink in its place, and nothing may
-	reach through that. None once all of it is done, else the error that stopped it, for the warning. (copy_file_meta()
-	works by path, as the daemon's vault is no other user's to change.)
+	as the very last step: its own, all of them as it holds them. With top, dest is a whole job's top folder and source
+	its version folder, which holds the monitored root's metadata (read_root_meta()): that is given instead, and none of
+	the daemon's trusted.reverberator.* names; source's own when it holds no record. A record that is listed and cannot be
+	read or decoded is told to warn(why), once, before that fallback. Any other folder of a restore is a monitored
+	folder's own and gets all its names, a copy of a vault inside the monitored tree included. All of it is done on dest as
+	opened, not followed if it is a symlink: once another user owns the folder they could rename it and put a symlink in
+	its place, and nothing may reach through that. None once all of it is done, else the error that stopped it, for the
+	warning. (copy_file_meta() works by path, as the daemon's vault is no other user's to change.)
 	'''
 	try:
 		held = os.lstat(source)
@@ -14021,12 +14052,18 @@ def restore_folder_meta(source:str, dest:str):
 			if e.errno not in (errno.ENOTSUP, errno.ENODATA, errno.EINVAL):
 				raise
 			names = []
-		# only a version folder holds it, and only root can read it
-		meta = read_root_meta(source) if ROOT_META_XATTR in names else None
+		meta = None
+		# only root lists trusted.* names
+		if top and ROOT_META_XATTR in names:
+			try:
+				meta = load_root_meta(source)
+			except (OSError, ValueError) as e:
+				if warn is not None:
+					warn(f"its version folder's record of the monitored root cannot be read: {e}; it gets the version folder's own")
 		if meta is None:
 			meta = RootMeta(held.st_uid, held.st_gid, stat.S_IMODE(held.st_mode), held.st_atime_ns, held.st_mtime_ns, None)
 		for name in names if meta.xattrs is None else meta.xattrs:
-			if name.startswith(ROOT_META_PREFIX):
+			if top and name.startswith(ROOT_META_PREFIX):
 				continue
 			try:
 				os.setxattr(fd, name, os.getxattr(source, name, follow_symlinks=False) if meta.xattrs is None else meta.xattrs[name])
@@ -14504,7 +14541,8 @@ def hand_over_folders(folders:list, report:RestoreReport, check_stop = None) -> 
 		report.handing_over = True
 		if dest == report.target:
 			report.target_handing_over = True
-		error = restore_folder_meta(source, dest)
+		# only the top folder of a whole job holds the monitored root's record: any other folder is a monitored folder's own
+		error = restore_folder_meta(source, dest, top=entry_rel == '', warn=lambda why, entry_rel=entry_rel: report.warn(entry_rel, why))
 		if error is None:
 			report.handed_over += 1
 		else:

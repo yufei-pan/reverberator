@@ -176,6 +176,8 @@ def version_folders_of(version):
 	folders_of() a version, its top folder's being the monitored root's it keeps (rv.read_root_meta()): the version folder
 	itself stays the daemon's, root's 0755 folder.
 	'''
+	if os.geteuid() != 0:
+		pytest.skip('trusted.* extended attributes need root')
 	found = folders_of(version)
 	st = os.lstat(version)
 	assert (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid) == (0o755, os.geteuid(), os.getegid())
@@ -595,6 +597,7 @@ def test_a_folder_moved_to_another_parent_and_on_again_gets_its_times_at_its_fin
 	assert version_folders_of(v1) == folders_of(job.monitor)
 
 
+@pytest.mark.skipif(os.geteuid() != 0, reason='trusted.* extended attributes need root')
 def test_a_symlinked_monitored_root_keeps_the_folders_own_metadata_on_the_version(tmp_path):
 	real = tmp_path / 'real'
 	real.mkdir()

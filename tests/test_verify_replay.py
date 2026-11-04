@@ -1595,6 +1595,7 @@ def test_a_partial_file_behind_a_link_is_logged_and_left(job, monkeypatch):
 	assert [message for message, _, _ in lines if 'Leaving the partial copy' in message]
 
 
+@pytest.mark.skipif(os.geteuid() != 0, reason='chown and trusted.* extended attributes need root')
 def test_version_folders_stay_the_daemons_and_keep_the_monitored_roots_metadata_of_their_batch(job):
 	# the user's choice of 2026-10-22, kept on 2026-11-04 ("A: root-owned + saved metadata"): the monitored root's owner
 	# (www-data for a Nextcloud folder) must not be able to change the top level of committed versions, so each version

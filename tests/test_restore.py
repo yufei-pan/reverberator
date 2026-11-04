@@ -796,11 +796,11 @@ def test_a_stop_during_the_metadata_pass_is_noticed(job, tmp_path, capsys, monke
 	restore_folder_meta = rv.restore_folder_meta
 	handed = []
 
-	def stopping(source, dest):
+	def stopping(source, dest, **kwargs):
 		handed.append(dest)
 		# a signal arrives while the folders are being given their metadata
 		rv.RESTORE_STOP.set()
-		return restore_folder_meta(source, dest)
+		return restore_folder_meta(source, dest, **kwargs)
 	monkeypatch.setattr(rv, 'restore_folder_meta', stopping)
 	out = destination(tmp_path)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
@@ -847,7 +847,7 @@ def test_a_folder_that_could_not_get_its_metadata_says_why(job, tmp_path, capsys
 	seed_monitor(job, {'proj/a.txt': 'a'})
 	run_backup(job)
 	write_rule(job)
-	monkeypatch.setattr(rv, 'restore_folder_meta', lambda source, dest: '[Errno 1] Operation not permitted')
+	monkeypatch.setattr(rv, 'restore_folder_meta', lambda source, dest, **kwargs: '[Errno 1] Operation not permitted')
 	out = destination(tmp_path)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == 0

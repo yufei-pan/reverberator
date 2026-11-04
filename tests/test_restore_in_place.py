@@ -18,6 +18,8 @@ pytestmark = pytest.mark.unit
 ROOT = os.geteuid() == 0
 # another user's id, for what root can hand to someone else
 OTHER = 65534
+# trusted.* names, which only root can list, read or write
+root_only = pytest.mark.skipif(not ROOT, reason='trusted.* extended attributes need root')
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +39,8 @@ def metadata(path):
 
 def kept_root_metadata(version):
 	'''metadata() of the monitored root as version's folder keeps it (trusted.reverberator.root).'''
+	if not ROOT:
+		pytest.skip('trusted.* extended attributes need root')
 	root = rv.read_root_meta(version)
 	return stat.S_IFDIR | root.mode, root.uid, root.gid, root.mtime_ns
 
@@ -317,9 +321,9 @@ def watch_folder_meta(monkeypatch, marker):
 	handed = []
 	restore_folder_meta = rv.restore_folder_meta
 
-	def watching(source, dest):
+	def watching(source, dest, **kwargs):
 		handed.append((dest, os.path.lexists(marker)))
-		return restore_folder_meta(source, dest)
+		return restore_folder_meta(source, dest, **kwargs)
 	monkeypatch.setattr(rv, 'restore_folder_meta', watching)
 	return handed
 
@@ -1023,9 +1027,9 @@ def test_a_stop_while_handing_folders_over_points_at_accept(job, tmp_path, capsy
 	write_rule(job)
 	restore_folder_meta = rv.restore_folder_meta
 
-	def stopping(source, dest):
+	def stopping(source, dest, **kwargs):
 		rv.RESTORE_STOP.set()
-		return restore_folder_meta(source, dest)
+		return restore_folder_meta(source, dest, **kwargs)
 	monkeypatch.setattr(rv, 'restore_folder_meta', stopping)
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
@@ -1055,10 +1059,10 @@ def test_a_marker_that_would_not_go_is_not_rewritten_into_a_folder_being_handed_
 		if os.fspath(path) == marker:
 			raise PermissionError(errno.EPERM, 'Operation not permitted', path)
 		return unlink(path, *args, **kwargs)
-	def stopped(source, dest):
+	def stopped(source, dest, **kwargs):
 		if dest == target:
 			raise KeyboardInterrupt
-		return restore_folder_meta(source, dest)
+		return restore_folder_meta(source, dest, **kwargs)
 	monkeypatch.setattr(os, 'unlink', stuck)
 	monkeypatch.setattr(rv, 'restore_folder_meta', stopped)
 	monkeypatch.setattr(rv, 'write_restore_marker', lambda *args, **kwargs: written.append(args[4:]) or write_restore_marker(*args, **kwargs))
@@ -1081,6 +1085,7 @@ def own_xattrs_in(top):
 	return found
 
 
+@root_only
 def test_a_whole_job_restored_in_place_gets_its_top_folders_own_metadata(job, tmp_path, capsys):
 	# each version folder stays root's 0755 folder of its own times, and keeps the monitored root's owner, mode, times
 	# and xattrs of its batch (trusted.reverberator.root), so the job's top folder comes back as it was
@@ -1120,6 +1125,7 @@ def test_a_whole_job_restored_in_place_gets_its_top_folders_own_metadata(job, tm
 	assert own_xattrs_in(top) == {}
 
 
+@root_only
 def test_a_version_without_the_roots_metadata_restores_its_top_folder_as_0_53_did(job, tmp_path, capsys):
 	# a version made before the root's metadata was kept on it (or where it could not be written): the job's top folder
 	# gets the version folder's own owner, mode and times
@@ -1140,6 +1146,7 @@ def test_a_version_without_the_roots_metadata_restores_its_top_folder_as_0_53_di
 	assert stat.S_IMODE(os.lstat(top).st_mode) == 0o755 and os.lstat(top).st_uid == os.geteuid()
 
 
+@root_only
 def test_a_root_metadata_that_cannot_be_kept_is_one_error_and_the_version_falls_back(job, tmp_path, capsys, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	os.chmod(job.monitor, 0o750)
@@ -1165,21 +1172,169 @@ def test_a_root_metadata_that_cannot_be_kept_is_one_error_and_the_version_falls_
 	assert metadata(os.path.join(out, os.path.basename(job.monitor))) == metadata(version)
 
 
-def test_a_vault_folder_holding_the_daemons_own_names_never_gives_them_to_a_restored_entry(tmp_path):
-	# a copy of a vault (rsync -aX) keeps trusted.reverberator.root; restore_folder_meta() gives it to no folder, the
-	# top folder's own record's names included
+@root_only
+def test_a_vault_folder_holding_the_daemons_own_names_gives_them_only_as_a_monitored_folders_own(tmp_path):
+	# a copy of a vault (rsync -aX) inside a monitored tree keeps trusted.reverberator.root: restored as a monitored folder
+	# it is that folder's own, all its names; only a whole job's top folder is given the record and none of those names
 	source, dest = tmp_path / 'held', tmp_path / 'made'
 	source.mkdir()
 	dest.mkdir()
 	os.setxattr(source, 'user.k', b'1')
 	os.setxattr(source, 'trusted.reverberator.other', b'x')
+	record = rv.encode_root_meta(rv.RootMeta(os.geteuid(), os.getegid(), 0o700, 5, 6, {'user.r': b'2', 'trusted.reverberator.root': b'no'}))
+	os.setxattr(source, rv.ROOT_META_XATTR, record)
+	os.chmod(source, 0o755)
 	assert rv.restore_folder_meta(str(source), str(dest)) is None
-	assert xattrs(dest) == {'user.k': b'1'}
-	# a record whose xattrs name one of the daemon's own
+	assert xattrs(dest) == {'user.k': b'1', 'trusted.reverberator.other': b'x', rv.ROOT_META_XATTR: record}
+	assert stat.S_IMODE(os.lstat(dest).st_mode) == 0o755
+	# the top folder of a whole job: the record's metadata, the record's names but the daemon's
 	dest2 = tmp_path / 'made2'
 	dest2.mkdir()
-	os.setxattr(source, rv.ROOT_META_XATTR, rv.encode_root_meta(rv.RootMeta(os.geteuid(), os.getegid(), 0o700, 5, 6, {'user.r': b'2', 'trusted.reverberator.root': b'no'})))
-	assert rv.restore_folder_meta(str(source), str(dest2)) is None
+	assert rv.restore_folder_meta(str(source), str(dest2), top=True) is None
 	assert xattrs(dest2) == {'user.r': b'2'}
 	st = os.lstat(dest2)
 	assert (stat.S_IMODE(st.st_mode), st.st_mtime_ns) == (0o700, 6)
+
+
+@root_only
+def test_a_monitored_folder_holding_a_record_gets_it_back_as_its_own_on_restore(job, tmp_path, capsys):
+	# job A monitors a tree that holds a copy of another job's vault: its version folder V5 keeps B's record
+	seed_monitor(job, {'vaults/B/V5/f': 'x', 'keep': 'k'})
+	v5 = os.path.join(job.monitor, 'vaults/B/V5')
+	os.chmod(v5, 0o755)
+	record = rv.encode_root_meta(rv.RootMeta(OTHER, OTHER, 0o700, 5, 6, {'user.r': b'2'}))
+	os.setxattr(v5, rv.ROOT_META_XATTR, record)
+	os.utime(v5, ns=(10 ** 18, 10 ** 18))
+	own = metadata(v5), xattrs(v5)
+	run_backup(job)
+	write_rule(job)
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, os.path.join(job.monitor, 'vaults'), out, '--version', '0')
+	assert code == 0, err
+	assert (metadata(os.path.join(out, 'vaults/B/V5')), xattrs(os.path.join(out, 'vaults/B/V5'))) == own
+	# and a whole job restored in place
+	shutil.rmtree(job.monitor)
+	os.mkdir(job.monitor, 0o755)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
+	assert code == 0, err
+	assert (metadata(v5), xattrs(v5)) == own
+
+
+@root_only
+@pytest.mark.parametrize('record', [b'{"v":1,"uid":0', b'\xff\xfe', b'{"v":1,"uid":99999999999,"gid":0,"mode":493,"atime_ns":1,"mtime_ns":1,"xattrs":{}}',
+	b'{"v":1,"uid":0,"gid":0,"mode":493,"atime_ns":1,"mtime_ns":99999999999999999999,"xattrs":{}}', b'{"v":1,"uid":0,"gid":0,"mode":99999,"atime_ns":1,"mtime_ns":1,"xattrs":{}}'])
+def test_a_record_that_cannot_be_decoded_warns_once_and_the_top_folder_gets_the_version_folders_own(job, tmp_path, capsys, record):
+	seed_monitor(job, {'a': 'a'})
+	os.chmod(job.monitor, 0o750)
+	run_backup(job)
+	write_rule(job)
+	version = version_path(job, 0)
+	os.setxattr(version, rv.ROOT_META_XATTR, record)
+	out = destination(tmp_path)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor + '/', out, '--version', '0')
+	top = os.path.join(out, os.path.basename(job.monitor))
+	assert code == 0, err
+	assert err.count("its version folder's record of the monitored root cannot be read") == 1 and "it gets the version folder's own" in err
+	assert metadata(top) == metadata(version) and 'Traceback' not in err
+
+
+@root_only
+def test_a_record_that_cannot_be_read_warns(tmp_path, monkeypatch):
+	source, dest = tmp_path / 'held', tmp_path / 'made'
+	source.mkdir()
+	dest.mkdir()
+	os.setxattr(source, rv.ROOT_META_XATTR, rv.encode_root_meta(rv.RootMeta(1, 2, 0o700, 5, 6, {})))
+	getxattr = os.getxattr
+	def refusing(path, name, *args, **kwargs):
+		if name == rv.ROOT_META_XATTR:
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		return getxattr(path, name, *args, **kwargs)
+	monkeypatch.setattr(os, 'getxattr', refusing)
+	why = []
+	assert rv.restore_folder_meta(str(source), str(dest), top=True, warn=why.append) is None
+	assert len(why) == 1 and 'cannot be read' in why[0] and 'Input/output error' in why[0]
+	assert os.lstat(dest).st_uid == os.lstat(source).st_uid
+
+
+def test_a_record_of_a_root_dated_before_1970_encodes_and_decodes(tmp_path):
+	meta = rv.RootMeta(1, 2, 0o750, -315619200 * 10 ** 9, -315619200 * 10 ** 9 + 7, {'user.a': b'b'})
+	assert rv.decode_root_meta(rv.encode_root_meta(meta)) == meta
+	root, version = tmp_path / 'root', tmp_path / 'V0'
+	root.mkdir()
+	version.mkdir()
+	os.utime(root, ns=(meta.atime_ns, meta.mtime_ns))
+	if ROOT:
+		assert rv.record_root_meta(str(root), str(version))
+		got = rv.read_root_meta(str(version))
+		assert got is not None and got.mtime_ns == meta.mtime_ns
+		dest = tmp_path / 'made'
+		dest.mkdir()
+		assert rv.restore_folder_meta(str(version), str(dest), top=True) is None
+		assert os.lstat(dest).st_mtime_ns == meta.mtime_ns
+
+
+@pytest.mark.parametrize('field,value', [('uid', 2 ** 32), ('gid', -1), ('mode', 0o10000), ('atime_ns', 2 ** 63), ('mtime_ns', -2 ** 63 - 1), ('uid', True), ('mtime_ns', 1.5)])
+def test_a_record_with_a_number_out_of_range_is_not_one(field, value):
+	record = {'v': 1, 'uid': 0, 'gid': 0, 'mode': 0o755, 'atime_ns': 1, 'mtime_ns': 1, 'xattrs': {}}
+	record[field] = value
+	with pytest.raises(ValueError):
+		rv.decode_root_meta(json.dumps(record).encode())
+
+
+def logged(monkeypatch):
+	lines = []
+	logger = rv.backuperTeeLogToTl
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda *args, **kwargs: (lines.append((args, kwargs)), logger(*args, **kwargs))[1])
+	return lines
+
+
+@root_only
+def test_a_record_that_cannot_be_written_logs_once_per_job_and_says_when_it_works_again(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	real = os.setxattr
+	failing = [True]
+	def no_room(path, name, *args, **kwargs):
+		if name == rv.ROOT_META_XATTR and failing[0]:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		return real(path, name, *args, **kwargs)
+	monkeypatch.setattr(os, 'setxattr', no_room)
+	lines = logged(monkeypatch)
+	text = lambda: [kwargs['message'] for args, kwargs in lines if 'metadata of' in kwargs.get('message', '')]
+	version = os.path.join(job.root, 'V')
+	os.mkdir(version)
+	for _ in range(3):
+		assert not rv.record_root_meta(job.monitor, version)
+	assert len(text()) == 1 and 'Cannot keep the metadata' in text()[0]
+	assert [kwargs.get('error') for args, kwargs in lines][-1] is True
+	failing[0] = False
+	assert rv.record_root_meta(job.monitor, version) and rv.record_root_meta(job.monitor, version)
+	assert len(text()) == 2 and 'again' in text()[1] and not lines[-1][1].get('error')
+	# failing again is news again
+	failing[0] = True
+	assert not rv.record_root_meta(job.monitor, version)
+	assert len(text()) == 3 and 'Cannot keep the metadata' in text()[2]
+	rv.ROOT_META_TROUBLE.pop(job.monitor, None)
+
+
+@root_only
+def test_a_root_whose_attributes_do_not_fit_gets_a_record_without_them_and_one_line(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'a'})
+	os.chmod(job.monitor, 0o750)
+	os.setxattr(job.monitor, 'user.big', b'x' * 3000)
+	real = os.setxattr
+	def small(path, name, value, *args, **kwargs):
+		if name == rv.ROOT_META_XATTR and len(value) > 3500:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		return real(path, name, value, *args, **kwargs)
+	monkeypatch.setattr(os, 'setxattr', small)
+	lines = logged(monkeypatch)
+	version = os.path.join(job.root, 'V')
+	os.mkdir(version)
+	assert len(rv.encode_root_meta(rv.RootMeta(0, 0, 0, 0, 0, {'user.big': b'x' * 3000}))) > 3500
+	for _ in range(3):
+		assert rv.record_root_meta(job.monitor, version)
+	got = rv.read_root_meta(version)
+	assert got.xattrs == {} and got.mode == 0o750
+	said = [kwargs for args, kwargs in lines if 'do not fit' in kwargs.get('message', '')]
+	assert len(said) == 1 and not said[0].get('error') and 'without them' in said[0]['message']
+	rv.ROOT_META_TROUBLE.pop(job.monitor, None)
