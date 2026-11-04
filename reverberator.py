@@ -6911,8 +6911,9 @@ class CopyInterrupted(Exception):
 	'''GREEN_LIGHT went out while a referenced copy made its entries.'''
 
 # threads making a referenced copy's folders and links, and replacing a prune's links: a mergerfs pool serves many
-# requests at once. the pool of each copy and prune is made from this alone
-REFERENCED_COPY_THREADS = 8
+# requests at once. the pool of each copy and prune is made from this alone. 4: 8 cost twice the CPU, the pool's as well,
+# for a little more speed, as their hand-offs of the GIL grow faster than the requests served at once
+REFERENCED_COPY_THREADS = 4
 # entries a thread takes at once, and the chunks queued ahead of the one handled
 REFERENCED_COPY_CHUNK = 64
 REFERENCED_COPY_WINDOW = 32
