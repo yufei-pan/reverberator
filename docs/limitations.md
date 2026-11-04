@@ -272,12 +272,14 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### One lock for every comparison's vault sync
 
 - **Kind:** known limitation.
-- **What the operator sees:** all comparisons' vault syncs take one lock, so a write error is marked before another job
-  syncs that disk; a vault disk that hangs in a sync (SCSI timeouts, a link-reset loop) stalls every job's checked
-  records, on any pool, not only the jobs on that disk.
+- **What the operator sees:** all comparisons' vault syncs take one lock, and so do the two flushes of a prune on a
+  mergerfs pool (since 0.53), so a write error is marked before another job syncs that disk; a vault disk that hangs in a
+  sync (SCSI timeouts, a link-reset loop) stalls every job's checked records and every prune on a pool, on any pool, not
+  only the jobs on that disk.
 - **Why:** a lock per disk needs a lock table; on this host every vault is on /mnt/vaults.
 - **Revisit when:** a host keeps vaults on several pools.
-- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
+- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)". Widened to the prune's flushes on
+  2026-11-03, the user's choice "Widen the wording (Recommended)".
 
 ### A failed sync that cannot be recorded, after a restart
 
@@ -436,3 +438,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   use case, should we accept as limitation? or should we plan / rig something up?". The same day the user chose
   "Skip messages.db" for docker_volumes (in /etc/reverb_skip_docker_volumes.txt, with its -wal and -shm; restic's own
   copies still hold it) and "Leave restic as it is (Recommended)".
+
+### A prune cut off on a pool can bring back a file the next version had dropped
+
+- **Kind:** known limitation.
+- **What the operator sees:** after a power loss, a dropped disk or a stop in the middle of a prune on a mergerfs pool,
+  the next prune links back from the oldest version what the next version lost. In one rare batch shape (a file moved
+  onto a new name, then that name moved out of the watched tree while its move waited for its pair, so the batch's
+  verification deleted it) the repair also puts the moved file back at the new name, so a restore of that version shows
+  one file the tree did not have at that time. No copy is lost.
+- **Why:** the version's change list holds the move and then a delete at the same path, the same rows a batch without a
+  verification writes for a file it really dropped and one it kept; telling them apart would make the repair miss real
+  files after a resumed batch, which loses copies. An extra file is the safer side.
+- **Revisit when:** such an extra file is seen after a repair, or the change list records which rows the verification
+  wrote.
+- **Approved:** 2026-11-03, the user's choice "Known limitation (Recommended)".
