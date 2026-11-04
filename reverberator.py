@@ -1940,24 +1940,34 @@ def sync_vault_filesystems(job_vault:str) -> dict:
 	read back as checked (compare_scopes()), once syncfs_folder() was tried on every one of them (vault_disks()): on a
 	mergerfs pool, whose sync does not reach the disks, each branch holding the job vault; off a pool, the job vault's own
 	filesystem. Each disk is synced once, through the first folder that holds the job vault: branches that are folders of one
-	filesystem share its one sync and its one error. Returns {disk: None, or the OSError its sync raised}. On a pool a branch
-	without the job vault is left out; a branch list that cannot be read raises its OSError, and so does a job vault gone
-	off a pool (its disk may be gone too, and that says nothing of a write error).
+	filesystem share its one sync and its one error. The disks are synced at once, each on a thread of its own, as a pool's
+	disks write out side by side. Returns {disk: None, or the OSError its sync raised}, in the disks' order. On a pool a
+	branch without the job vault is left out; a branch list that cannot be read raises its OSError, and so does a job vault
+	gone off a pool (its disk may be gone too, and that says nothing of a write error).
 	'''
 	pooled, disks = vault_disks(job_vault)
-	results = {}
+	# the first folder of each disk that holds the job vault: a branch without it is passed over for the next one of its disk
+	folders = {}
 	for disk, folder in disks:
-		if disk in results:
-			continue
-		try:
-			syncfs_folder(folder)
-			results[disk] = None
-		except (FileNotFoundError, NotADirectoryError):
-			if not pooled:
-				raise
-		except OSError as e:
-			results[disk] = e
-	return results
+		folders.setdefault(disk, []).append(folder)
+	def sync(disk:str):
+		# (disk, None or the OSError), or (disk, ...) when no folder of it holds the job vault
+		for folder in folders[disk]:
+			try:
+				syncfs_folder(folder)
+				return disk, None
+			except (FileNotFoundError, NotADirectoryError):
+				if not pooled:
+					raise
+			except OSError as e:
+				return disk, e
+		return disk, ...
+	if len(folders) > 1:
+		with ThreadPoolExecutor(max_workers=len(folders)) as pool:
+			synced = list(pool.map(sync, folders))
+	else:
+		synced = [sync(disk) for disk in folders]
+	return {disk: result for disk, result in synced if result is not ...}
 
 # the boot id the kernel makes anew at each boot, and the start of the name of a disk's marker in the state folder
 BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
@@ -2057,17 +2067,36 @@ def check_vault_sync(job_vault:str, job_name:str) -> list:
 	'''
 	with VAULT_SYNC_LOCK:
 		results = sync_vault_filesystems(job_vault)
-		failed = {disk: e for disk, e in results.items() if e is not None}
-		for disk, e in failed.items():
-			try:
-				if mark_failed_sync(disk, e):
-					job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); its copies stay unchecked until a reboot')
-				# its marker stands now, so it is no longer remembered only in memory
-				UNRECORDED_FAILED_DISKS.discard(disk)
-			except OSError as marker_error:
-				UNRECORDED_FAILED_DISKS.add(disk)
-				job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); its marker cannot be written ({marker_error}), so its copies stay unchecked only until reverberator stops, not until a reboot')
+		failed = mark_failed_syncs(results, job_name)
 		return sorted(set(failed) | ((failed_sync_disks() | UNRECORDED_FAILED_DISKS) & set(results)))
+
+def flush_vault_disks(job_vault:str, job_name:str) -> list:
+	'''
+	Every disk holding the job vault written out (sync_vault_filesystems()), as a prune needs before it destroys the old
+	state: the sorted disks whose sync failed now, each marked and alerted as check_vault_sync() does it. A disk that failed
+	a sync before and syncs now is not among them: what this sync wrote is on it. Raises OSError as
+	sync_vault_filesystems() does. Holds VAULT_SYNC_LOCK.
+	'''
+	with VAULT_SYNC_LOCK:
+		return sorted(mark_failed_syncs(sync_vault_filesystems(job_vault), job_name))
+
+def mark_failed_syncs(results:dict, job_name:str) -> dict:
+	'''
+	The disks of results (sync_vault_filesystems()'s) whose sync failed, {disk: error}: each marked (mark_failed_sync())
+	and alerted once with the VAULT WRITE ERROR line; when its marker cannot be written the alert says so, and the disk is
+	remembered in UNRECORDED_FAILED_DISKS. The caller holds VAULT_SYNC_LOCK.
+	'''
+	failed = {disk: e for disk, e in results.items() if e is not None}
+	for disk, e in failed.items():
+		try:
+			if mark_failed_sync(disk, e):
+				job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); its copies stay unchecked until a reboot')
+			# its marker stands now, so it is no longer remembered only in memory
+			UNRECORDED_FAILED_DISKS.discard(disk)
+		except OSError as marker_error:
+			UNRECORDED_FAILED_DISKS.add(disk)
+			job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}); its marker cannot be written ({marker_error}), so its copies stay unchecked only until reverberator stops, not until a reboot')
+	return failed
 
 # the private folder prepare_change_list() writes a change list in before place_change_list() renames it into place: made
 # by mkdtemp() in the job vault, which no reader takes for a version or a change list, and removed by get_vault_info()
@@ -3988,6 +4017,10 @@ class PoolGuard:
 		if problem:
 			raise PoolNotReady(problem)
 
+	def covers(self, path:str) -> bool:
+		'''Whether path, one of the paths, was on a pool when the step began (or the mount table could not be read).'''
+		return any(held == path for held, _ in self.states)
+
 	def poll(self) -> None:
 		# threads poll too: of those that come at once, one checks and the others go on
 		with self.lock:
@@ -5494,6 +5527,36 @@ def do_backup(backup_entries:dict,
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
+			# why the prunes below postponed removing a version: each loop tries again, but only the first says so
+			postponed = []
+			# the vault's secret for the names pruning links copies under, read from its file (made, the first time) when a
+			# removal is first tried
+			prune_salt = []
+			def remove_oldest() -> bool:
+				# prune_oldest(), vault_size and vault_inodes kept the sums of the versions' records: whether the oldest version
+				# went, the only sign of progress, as finishing a removal cut short frees nothing more, and a removal kept
+				# can change the records too, by the links it replaced first
+				nonlocal vault_size, vault_inodes
+				if not prune_salt:
+					prune_salt.append(vault_prune_salt(job_vault, job_name))
+				oldest = next(iter(vault_info_dict))
+				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths,prune_salt=prune_salt[0])
+				vault_size -= removed_size
+				vault_inodes -= removed_inodes
+				return next(iter(vault_info_dict), None) != oldest
+			# a prune of the oldest version cut off before its first flush of the pool's disks (its marker names it) is
+			# finished first, even when no limit asks for it: it links back what the next version lost before this backup
+			# compares with the vault or links a new version to it
+			if len(vault_info_dict) > 1 and pool_guard.covers(vault_path):
+				try:
+					cut_prune = read_prune_marker(job_vault) == os.path.basename(vault_info_dict[next(iter(vault_info_dict))].path)
+				except UnreadablePruneMarker:
+					# the prune itself checks the next version for one it cannot read, when a limit next asks for it
+					cut_prune = False
+				if cut_prune:
+					backuperTeeLogToTl(job_name,f'Finishing the prune of {vault_info_dict[next(iter(vault_info_dict))].path}, which was cut off before its flush, before backing up')
+					monitor_paths = manifest_monitor_paths(manifest)
+					remove_oldest()
 			if backup_entries and manifest.describes(latest_version_info.path):
 				# a delete of what the vault holds no path of would make a version with no change. dropping it is safe: deletes
 				# replay first, onto a version that holds only the tracked rows, so such a delete would remove nothing
@@ -5571,23 +5634,6 @@ def do_backup(backup_entries:dict,
 			backup_limit_size, backup_limit_inode = get_backup_limits_from_str(backup_size_limit=backup_size_limit,vault_fs_size=vault_fs_size,vault_fs_inode=vault_fs_inode)
 			backuperTeeLogToTl(job_name,f'Calculated backup size limit {backup_limit_size} and backup inode limit {backup_limit_inode}')
 			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
-			# why the loops below postponed removing a version: each loop tries again, but only the first says so
-			postponed = []
-			# the vault's secret for the names pruning links copies under, read from its file (made, the first time) when a
-			# removal is first tried
-			prune_salt = []
-			def remove_oldest() -> bool:
-				# prune_oldest(), vault_size and vault_inodes kept the sums of the versions' records: whether the oldest version
-				# went, the only sign of progress, as finishing a removal cut short frees nothing more, and a removal kept
-				# can change the records too, by the links it replaced first
-				nonlocal vault_size, vault_inodes
-				if not prune_salt:
-					prune_salt.append(vault_prune_salt(job_vault, job_name))
-				oldest = next(iter(vault_info_dict))
-				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths,prune_salt=prune_salt[0])
-				vault_size -= removed_size
-				vault_inodes -= removed_inodes
-				return next(iter(vault_info_dict), None) != oldest
 			if backup_limit_size:
 				while vault_size + estimated_backup_size + recopies_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size + recopies_size} exceeds backup size limit {backup_limit_size}')
@@ -6076,9 +6122,9 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 						cut_off = folders[name]
 						continue
 					if versions and number < min(versions):
-						hint = 'a removal cut short by a daemon before 0.44 left it (an oldest version whose list went first: once that is sure, remove it by hand)'
+						hint = 'a removal cut short left it (an oldest version whose list went first, which may hold the only copies of files of later versions: move it out of the job vault, keeping it, and the job goes on)'
 					elif number == record.number:
-						hint = 'its list may not have been listed, or a commit cut off before its list was placed left it (if it is still refused once every disk of the vault is there, remove it by hand and the job goes on)'
+						hint = 'its list may not have been listed, or a commit cut off before its list was placed left it (if it is still refused once every disk of the vault is there, move it out of the job vault, keeping it, and the job goes on)'
 					else:
 						hint = 'its list may not have been listed (check that every disk of the vault is there)'
 					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and is not the one after the latest recorded version, {record.number}: {hint}')
@@ -6285,7 +6331,25 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 	if listing.cut_off is not None:
 		# the guard above found every disk of the vault there all along
 		undo_cut_off_commit(job_vault_path, listing)
-	for path in listing.stale:
+	stale = listing.stale
+	if stale and guard.covers(job_vault_path):
+		# on a pool the folder's removal may not be on every disk yet: one that comes back from a cut with a part of it
+		# would hold a version folder no list names, which no scan takes. every disk is flushed first, and a list stays
+		# while that fails
+		try:
+			failed_disks = flush_vault_disks(job_vault_path, os.path.basename(job_vault_path))
+		except OSError as e:
+			failed_disks = [f'({e})']
+		if failed_disks:
+			backuperTeeLogToTl(job_vault_path, f'Keeping {", ".join(os.path.basename(path) for path in stale)}, whose folders are gone, for now: the disks of the vault cannot all be flushed ({", ".join(failed_disks)})', error=True)
+			stale = []
+		else:
+			try:
+				guard.require()
+			except PoolNotReady as e:
+				backuperTeeLogToTl(job_vault_path, f'Cannot finish the vault scan, no list or folder in it is removed: {e.reason}', error=True)
+				raise
+	for path in stale:
 		backuperTeeLogToTl(job_vault_path, f'Vault path {path.rpartition("--")[0]} for content {os.path.basename(path)} does not exist, deleting content file...', error=True)
 		try:
 			os.remove(path)
@@ -8589,6 +8653,25 @@ class VersionMoves:
 			source, dest, is_folder = moves[at]
 			path = dest + path[len(source):] if is_folder else dest
 
+	def place(self, rel:str) -> tuple:
+		'''
+		(where the moves, applied in order, take rel, whether any did): rel itself and False when none applies. A move
+		row without a source moves nothing.
+
+		Examples:
+			>>> moves = VersionMoves.applied([('d/x', 'e/x', False), ('d/', 'f/', True), ('f/y', 'y', False)])
+			>>> moves.place('d/x'), moves.place('d/y'), moves.place('d/z/w'), moves.place('a')
+			(('e/x', True), ('y', True), ('f/z/w', True), ('a', False))
+		'''
+		moves = self._index()
+		path, at = rel, self._next_move(rel, -1)
+		touched = at is not None
+		while at is not None:
+			source, dest, is_folder = moves[at]
+			path = dest + path[len(source):] if is_folder else dest
+			at = self._next_move(path, at)
+		return path, touched
+
 	def touches(self, rel:str) -> bool:
 		'''Whether any move applies to rel, itself or a folder above it: the first one to do so meets rel unmoved.'''
 		self._index()
@@ -8681,6 +8764,54 @@ def read_change_list_moves(change_list:str, monitor:str) -> tuple:
 	if not rows:
 		return None, frozenset(), 'its change list has no rows', True, False
 	return moves, frozenset(landed), '', True, True
+
+def rows_dropping(change_list:str, monitor:str) -> tuple:
+	r"""
+	(deleted, landed) of the change list at change_list, read under monitor, the monitored path its version was written
+	under (absolute and normalised), as rels for the check of a prune cut off before its flush (decrement_stepper()):
+	deleted, the paths of its deletes that its replay runs before its moves (every delete but one whose path held the
+	source of a move listed before it, which the replay runs after that move), a folder's ending with /; landed, the
+	files its create, modify, move and recopy rows land on. A file of the version below is gone from this version only
+	through one of those: a delete of it or of a folder above it, or, when no move took it, a row landing on it. Raises
+	ValueError for a row outside monitor, OSError when the list cannot be read.
+
+	Examples:
+		>>> folder = tempfile.mkdtemp(prefix='reverb_doctest_')
+		>>> change_list = os.path.join(folder, 'list')
+		>>> rows = [['/m/y', '', 'move', '/m/d/g'], ['/m/d/', '', 'delete', ''], ['/m/e', '', 'delete', ''], ['/m/f', '', 'modify', ''], ['/m/n/', '', 'create', '']]
+		>>> _ = open(change_list, 'w').write('header\n' + ''.join('\0'.join(row) + '\n' for row in rows))
+		>>> deleted, landed = rows_dropping(change_list, '/m')
+		>>> sorted(deleted), sorted(landed)
+		(['e'], ['f', 'y'])
+		>>> shutil.rmtree(folder)
+	"""
+	prefix = monitor if monitor.endswith('/') else monitor + '/'
+	def rel_of(path:str) -> str:
+		folder = path.endswith('/')
+		path = os.path.normpath(path)
+		if path == monitor:
+			return ''
+		if not path.startswith(prefix):
+			raise ValueError(f'a row outside {monitor} ({path}), which it was backed up from')
+		return path[len(prefix):] + ('/' if folder else '')
+	deleted, landed = set(), set()
+	# the sources of the moves listed so far, and every folder at or above one of them, ending with /
+	sources, above_sources = set(), set()
+	for row in iter_change_list(change_list):
+		rel = rel_of(row.path)
+		if row.event == 'move' and row.source_path is not None:
+			source = rel_of(row.source_path)
+			sources.add(source)
+			at = source.find('/')
+			while at != -1:
+				above_sources.add(source[:at + 1])
+				at = source.find('/', at + 1)
+		if row.event == 'delete':
+			if rel and rel not in sources and rel.rstrip('/') + '/' not in above_sources:
+				deleted.add(rel)
+		elif row.event in ('create', 'modify', 'move', 'recopy') and rel and not rel.endswith('/'):
+			landed.add(rel)
+	return deleted, landed
 
 def read_version_moves(job_vault:str, version_path:str, monitor:str) -> tuple:
 	'''
@@ -10469,6 +10600,73 @@ PRUNE_SALT_FILE_NAME = '.reverberator_prune_salt'
 # removes one a kill left (read_job_vault())
 PRUNE_SALT_TEMP_INFIX = '.tmp-'
 
+# the file in a job vault on a mergerfs pool that says which version a prune is replacing the links into, before its
+# first flush of every disk: one line of JSON, {"walking": "<folder name>"} from before its walk until that flush, then
+# {"walking": null}. made once (with a flush of the job vault folder) and kept, as a name made and removed per prune would
+# need a folder flush each time; written in place and fsynced. A prune that finds it naming its oldest version, or
+# cannot read it, was cut off before its flush, and checks the oldest version against the next (decrement_stepper())
+PRUNE_MARKER_FILE_NAME = '.reverberator_pruning'
+
+class UnreadablePruneMarker(Exception):
+	"""The job vault's PRUNE_MARKER_FILE_NAME is there but cannot be read, or holds no {"walking": name or null} line."""
+
+def read_prune_marker(job_vault:str) -> 'str | None':
+	"""
+	The version folder name the job vault's PRUNE_MARKER_FILE_NAME says a prune is walking, None when it says none or is
+	not there. Raises UnreadablePruneMarker, saying why, when it cannot be read or holds anything else, as a write cut
+	off by a power loss can leave it.
+	"""
+	path = os.path.join(job_vault, PRUNE_MARKER_FILE_NAME)
+	try:
+		fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+	except FileNotFoundError:
+		return None
+	except OSError as e:
+		raise UnreadablePruneMarker(f'{path} cannot be read: {e}')
+	try:
+		content = os.read(fd, 4096)
+	except OSError as e:
+		raise UnreadablePruneMarker(f'{path} cannot be read: {e}')
+	finally:
+		os.close(fd)
+	try:
+		walking = json.loads(content)['walking']
+	except (ValueError, TypeError, KeyError) as e:
+		raise UnreadablePruneMarker(f'{path} holds no prune marker ({type(e).__name__}: {e})')
+	if walking is not None and not isinstance(walking, str):
+		raise UnreadablePruneMarker(f'{path} holds no prune marker (walking is {walking!r})')
+	return walking
+
+def write_prune_marker(job_vault:str, walking:'str | None') -> None:
+	"""
+	PRUNE_MARKER_FILE_NAME in the job vault written to say the prune walks the version folder walking (None: none), in
+	place and fsynced, so it is on the disk when this returns. Made when it is not there, then the job vault folder
+	flushed on every disk (fsync_vault_folder()), so its name lasts too; one that cannot be flushed is removed again, so
+	the next prune makes it anew. Raises OSError.
+	"""
+	path = os.path.join(job_vault, PRUNE_MARKER_FILE_NAME)
+	data = (json.dumps({'walking': walking}) + '\n').encode()
+	try:
+		fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+		made = True
+	except FileExistsError:
+		fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+		made = False
+	try:
+		try:
+			os.pwrite(fd, data, 0)
+			os.ftruncate(fd, len(data))
+			os.fsync(fd)
+		finally:
+			os.close(fd)
+		if made:
+			fsync_vault_folder(job_vault)
+	except OSError:
+		if made:
+			with contextlib.suppress(OSError):
+				os.remove(path)
+		raise
+
 def vault_prune_salt(job_vault:str, job_name:str):
 	'''
 	The job vault's secret for the names pruning hard links copies under (prune_link_path()): PRUNE_SALT_BYTES random
@@ -10674,7 +10872,16 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	it found has been moved since, unless the thread hard linked it. The folders at the oldest version's top are removed
 	each by an rm -rf of its own on as many threads (none when the oldest version's folder is not a real folder, a link
 	for one: the whole rm -rf then removes only that link), then the whole by one more, which alone says whether it went.
-	One line says how long it took.
+	On a mergerfs pool, where one request can change two disks and each comes back from a power loss at its own last
+	checkpoint, PRUNE_MARKER_FILE_NAME names the oldest version, fsynced, before the walk changes anything; after the walk
+	and the records every disk of the job vault is flushed (flush_vault_disks(); a disk whose sync fails keeps the oldest
+	version, with its marker and alert) and the pools required whole, then the marker names none, and the change lists go
+	only after a second flush, once the folder is gone. A prune that finds the marker naming its oldest version, or
+	cannot read it, follows one cut off before its first flush: after the walk it links back each file of the oldest
+	version that the next one should hold but lacks (rows_dropping()'s rule, its place by VersionMoves.place(); at its own
+	path, with an error line, when the next version's rows cannot be used), and a temp whose rename found the copy in
+	place is removed. A single filesystem keeps its own order, and gets none of this.
+	One line says how long it took, the flushes too.
 
 	Examples:
 		>>> decrement_stepper(OrderedDict([(0, VaultEntry(0, '/tmp/x', 0, 0, 0))]), 'job', '/m')
@@ -10700,8 +10907,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		return 0 , 0
 	backuperTeeLogToTl(path=referenceVaultPath,message=f'Recursively removing V{referenceVersionNumber}: {referenceVaultPath}')
 	started = time.monotonic()
-	# how long the walk and the removal took, None for one not run
-	timing = {'walk': None, 'removal': None}
+	# how long the walk, the removal and the flushes of the pool's disks took, None for one not run
+	timing = {'walk': None, 'removal': None, 'flush': None}
 	vaultInfoIter = iter(vault_info_dict)
 	applyingVersionNumber = next(vaultInfoIter)
 	applyingVaultEntry = vault_info_dict[applyingVersionNumber]
@@ -10818,6 +11025,10 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	def log_time(kept:bool) -> None:
 		# one line a prune: how long it took, and its walk and removal
 		parts = [f'{unlinked[1]} links replaced' + ('' if timing['walk'] is None else f' in {timing["walk"]:.1f} s')]
+		if relinked:
+			parts.append(f'{relinked} copies linked back from it')
+		if timing['flush'] is not None:
+			parts.append(f'disks flushed in {timing["flush"]:.1f} s')
 		if timing['removal'] is not None:
 			parts.append(f'{"removal tried" if kept else "removed"} in {timing["removal"]:.1f} s')
 		took = time.monotonic() - started
@@ -10827,8 +11038,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		# the reference vault's folder went: nothing is kept of it in memory
 		forget_real_vault_folders(referenceVaultPath)
 		forget_version_moves(referenceVaultPath)
-	def remove_lists(lists:list) -> bool:
-		# the reference vault's change lists, once its folder went: whether they went too
+	def remove_lists(lists:list) -> 'str | None':
+		# the reference vault's change lists, once its folder went: None when they went too, else why not. on a pool, every
+		# disk is flushed first, so no disk can come back after a cut with a part of the folder and no list naming it
+		if pooled and (why := flush_disks()) is not None:
+			return why
 		for path in lists:
 			try:
 				os.remove(path)
@@ -10836,9 +11050,9 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				pass
 			except OSError as e:
 				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Error removing {path}: {e}')
-				return False
+				return 'its change list cannot be removed'
 		PRUNE_ABORTED.pop(job_name, None)
-		return True
+		return None
 	# a disk of either pool missing, or mounted again since here, can hide the reference vault, a link of the next
 	# version into it (during the walk), or what is left of it (during its removal): nothing is taken for gone then
 	guard = PoolGuard([job_vault, monitor_path])
@@ -10849,6 +11063,28 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		if problem:
 			keep_oldest(problem)
 			raise PoolNotReady(problem)
+	# on a mergerfs pool one request can change two disks (a rename lands on one and unlinks on another), and each comes
+	# back from a power loss at its own last checkpoint: the walk's links are flushed on every disk before the oldest
+	# version goes, and its removal before its change lists go. a single filesystem keeps its own order
+	pooled = guard.covers(job_vault)
+	def flush_disks() -> 'str | None':
+		# every disk of the job vault's pool written out (flush_vault_disks()), then the pools required whole: None, or why
+		# the reference vault is kept (a disk whose sync failed now is marked, with its alert)
+		flush_started = time.monotonic()
+		try:
+			failed_disks = flush_vault_disks(job_vault, job_name)
+		except OSError as e:
+			return f'the disks of {job_vault} cannot be flushed: {e}'
+		finally:
+			timing['flush'] = (timing['flush'] or 0) + time.monotonic() - flush_started
+		if failed_disks:
+			return f'{"disks" if len(failed_disks) > 1 else "disk"} {", ".join(failed_disks)} of {job_vault} failed a sync'
+		require_pools()
+		return None
+	# how many of the reference vault's copies a check after a cut linked back into the next version, and whether this
+	# prune follows one of it cut off before its first flush (the marker says so, before the walk)
+	relinked = 0
+	cut = False
 	folder_name = os.path.basename(referenceVaultPath)
 	own_folder = os.path.join(job_vault, folder_name)
 	def own_paths() -> tuple:
@@ -10876,8 +11112,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		require_pools()
 		backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{referenceVaultPath} is already gone: removing what is left of it')
 		folder_gone()
-		if not remove_lists(lists):
-			return keep_oldest('what was left of it cannot be removed')
+		if (why := remove_lists(lists)) is not None:
+			return keep_oldest(f'what was left of it cannot be removed: {why}')
 		log_time(False)
 		return went_down(False)
 	except OSError as e:
@@ -11019,7 +11255,82 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				lines.append((True, f'Error linking {linkTarget} to {file}: {e}'))
 				return False
 			lines.append((False, f'Linking {linkTarget} to {file} reported {e}, but the copy is in place'))
+		if cut:
+			# after a cut on a pool the link's name can already be the copy on the disk the rename lands on, which makes
+			# the rename do nothing there: the temp stays, and a folder restore would write it out
+			remove_if_target(temp_path, target_st)
 		return True
+	def remove_stray_temp(temp:str, temp_st:os.stat_result, lines:list) -> None:
+		# a temp a cut left beside the copy it was made for, once that copy is in its link's place (its rename landed on one
+		# disk and the cut kept the temp on another): removed, as nothing renames it now and a folder restore would write
+		# it out. told by a regular file beside it of its inode whose temp name (prune_link_path()) is its own
+		folder = os.path.dirname(temp)
+		try:
+			with os.scandir(folder) as entries:
+				for entry in entries:
+					if entry.path == temp or not entry.is_file(follow_symlinks=False):
+						continue
+					entry_st = entry.stat(follow_symlinks=False)
+					if same_inode(entry_st, temp_st) and prune_link_path(entry.path, entry_st, prune_salt) == temp:
+						os.remove(temp)
+						lines.append((False, f'Removing {temp}: a cut prune left it, and {entry.path} is its copy already'))
+						return
+		except OSError as e:
+			# a stray only: it holds no copy that is not in place
+			lines.append((False, f'Leaving {temp} as it is: {folder} cannot be looked at ({e})'))
+	def link_back() -> None:
+		# after a cut before the first flush, each file of the reference vault that the next version should hold but lacks
+		# (its place there by the next version's moves applied in order, rows_dropping()'s rule) is linked there again
+		nonlocal relinked
+		usable, why = moves.usable, moves.why
+		deleted = landed = frozenset()
+		if usable:
+			try:
+				deleted, landed = rows_dropping(applying_list, moves.key[1])
+			except (OSError, ValueError) as e:
+				usable, why = False, str(e)
+		if not usable:
+			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'The rows of {applyingVaultEntry.path} cannot be used ({why}): each file of {referenceVaultPath} missing from it is linked back at its own path')
+		def deleted_early(rel:str) -> bool:
+			if rel in deleted:
+				return True
+			at = rel.find('/')
+			while at != -1:
+				if rel[:at + 1] in deleted:
+					return True
+				at = rel.find('/', at + 1)
+			return False
+		errors = []
+		for path, rel, is_dir in iter_tree_entries(referenceVaultPath, errors=errors):
+			if is_dir or PARTIAL_COPY_NAME.fullmatch(os.path.basename(rel)):
+				continue
+			place = rel
+			if usable:
+				if deleted_early(rel):
+					continue
+				place, touched = moves.place(rel)
+				if not touched and rel in landed:
+					continue
+			dest = os.path.join(applyingVaultEntry.path, place)
+			try:
+				copy_st = os.lstat(path)
+				os.link(path, dest, follow_symlinks=False)
+			except (FileExistsError, FileNotFoundError, NotADirectoryError):
+				# held there already, or its folder is not in the next version
+				continue
+			except OSError as e:
+				failed(f'Error linking {path} back to {dest}: {e}')
+				continue
+			if DEBUG:
+				backuperTeeLogToTl(path=referenceVaultPath,message=f'Linked {path} back to {dest}')
+			relinked += 1
+			if (copy_st.st_dev, copy_st.st_ino) not in booked:
+				booked.add((copy_st.st_dev, copy_st.st_ino))
+				book(transferred, copy_st)
+		for rel, error in errors:
+			failed(f'Error listing {unreadable_path(referenceVaultPath, rel)}: {error}')
+		if relinked:
+			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'Linked {relinked} copies of {referenceVaultPath} back into {applyingVaultEntry.path}: a prune cut off before its flush had lost them')
 	# the next version's rows, read once for the whole walk
 	moves = VaultMoves(job_vault,monitor_path,monitor_paths).of(applyingVaultEntry.path)
 	caller = threading.get_ident()
@@ -11042,6 +11353,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		except OSError as e:
 			return failing(f'Error looking at {file}: {e}')
 		if not stat.S_ISLNK(file_st.st_mode):
+			if cut and stat.S_ISREG(file_st.st_mode) and PARTIAL_COPY_NAME.fullmatch(os.path.basename(file)):
+				remove_stray_temp(file, file_st, lines)
 			return lines, None, None, pooled
 		# a link an older daemon moved to another folder depth still names its version, though its text no longer reaches it.
 		# a user's symlink is left as it is, however it is shaped, and so is a link naming a folder: the daemon links
@@ -11119,6 +11432,20 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	# never going while it is looked at
 	# a folder that cannot be listed, or an entry that cannot be looked at, may hold this version's only way to a copy
 	# in the reference vault, so the reference vault is kept
+	if pooled:
+		# the marker says which version this prune walks before the walk changes anything: one that names it (or cannot be
+		# read) is a prune of it cut off before its first flush, whose links may have come back in any mix of states
+		try:
+			cut = read_prune_marker(job_vault) == folder_name
+			if cut:
+				backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'A prune of {referenceVaultPath} was cut off before its flush: {applyingVaultEntry.path} is checked against it')
+		except UnreadablePruneMarker as e:
+			cut = True
+			backuperTeeLogToTl(path=referenceVaultPath,error=True,message=f'{e}: {applyingVaultEntry.path} is checked against {referenceVaultPath}, as after a prune cut off before its flush')
+		try:
+			write_prune_marker(job_vault, folder_name)
+		except OSError as e:
+			return keep_oldest(f'its prune marker {os.path.join(job_vault, PRUNE_MARKER_FILE_NAME)} cannot be written: {e}')
 	walk_errors = []
 	walk_started = time.monotonic()
 	stop = threading.Event()
@@ -11134,9 +11461,22 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		failed(f'Error listing {unreadable_path(applyingVaultEntry.path, rel)}: {error}')
 	if materialize_failed:
 		return keep_oldest(f'materializing the links of {applyingVaultEntry.path} into it failed')
+	if cut:
+		link_back()
+		if materialize_failed:
+			return keep_oldest(f'linking its copies back into {applyingVaultEntry.path} after a cut failed')
 	# before the removal, so a run cut off from here on leaves records a restart reads true
 	if not write_records():
 		return keep_oldest(f'the change list of {applyingVaultEntry.path} cannot be renamed for what it now holds')
+	if pooled:
+		# the links and the records on every disk before anything of the reference vault goes; only then does the marker
+		# stop naming it
+		if (why := flush_disks()) is not None:
+			return keep_oldest(why)
+		try:
+			write_prune_marker(job_vault, None)
+		except OSError as e:
+			return keep_oldest(f'its prune marker {os.path.join(job_vault, PRUNE_MARKER_FILE_NAME)} cannot be cleared: {e}')
 	backuperTeeLogToTl(path=referenceVaultPath,message=f'Removing {referenceVaultPath}')
 	try:
 		listed, lists = own_paths()
@@ -11177,8 +11517,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		return keep_oldest('rm -rf of its folder failed')
 	if not gone:
 		return keep_oldest('its folder is still there after rm -rf')
-	if not remove_lists(lists):
-		return keep_oldest('its change list cannot be removed')
+	if (why := remove_lists(lists)) is not None:
+		return keep_oldest(why)
 	log_time(False)
 	return went_down(False)
 
@@ -13328,8 +13668,9 @@ def is_prune_temp(job_vault:str, version_path:str, rel:str, monitor_path:str, mo
 	'''
 	Whether rel in the version at version_path is the temporary a prune cut off between its hard link and its rename left
 	(prune_link_path()): its name is of the partial copy form, and it is the same file as the entry some symlink beside
-	it in the version leads to, which pruning was about to replace by it. A user's file of that name shares no inode with a
-	copy beside it. No salt is read, and any OSError gives False, so the entry is restored as any other.
+	it in the version leads to, which pruning was about to replace by it, or as a regular file beside it, the copy a cut
+	on a mergerfs pool put in the link's place while the temp stayed on another disk. A user's file of that name shares no
+	inode with a copy beside it. No salt is read, and any OSError gives False, so the entry is restored as any other.
 	'''
 	name = os.path.basename(rel)
 	if not PARTIAL_COPY_NAME.fullmatch(name):
@@ -13339,7 +13680,13 @@ def is_prune_temp(job_vault:str, version_path:str, rel:str, monitor_path:str, mo
 		temp_st = os.lstat(os.path.join(version_path, rel))
 		with os.scandir(os.path.join(version_path, folder_rel)) as entries:
 			for entry in entries:
-				if entry.name == name or not entry.is_symlink():
+				if entry.name == name:
+					continue
+				if entry.is_file(follow_symlinks=False):
+					if same_inode(temp_st, entry.stat(follow_symlinks=False)):
+						return True
+					continue
+				if not entry.is_symlink():
 					continue
 				found = resolve_version_entry(job_vault, version_path, os.path.join(folder_rel, entry.name), monitor_path, moves)
 				# a referenced first version's link into the monitored path is pruned as a copy is ( kind 'referenced' )

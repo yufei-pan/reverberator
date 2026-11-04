@@ -520,8 +520,8 @@ def test_a_removal_cut_short_between_folder_and_list_leaves_a_list_the_scan_dele
 
 
 @pytest.mark.parametrize('number, hint', [
-	(0, 'a removal cut short by a daemon before 0.44'),
-	(2, 'its list may not have been listed, or a commit cut off before its list was placed left it (if it is still refused once every disk of the vault is there, remove it by hand and the job goes on)'),
+	(0, 'a removal cut short left it (an oldest version whose list went first, which may hold the only copies of files of later versions: move it out of the job vault, keeping it, and the job goes on)'),
+	(2, 'its list may not have been listed, or a commit cut off before its list was placed left it (if it is still refused once every disk of the vault is there, move it out of the job vault, keeping it, and the job goes on)'),
 	(5, 'its list may not have been listed (check that every disk of the vault is there)'),
 ], ids=['below_the_oldest', 'the_one_the_link_names', 'past_the_one_after'])
 def test_an_orphans_refusal_says_what_may_have_left_it(tmp_path, number, hint):
