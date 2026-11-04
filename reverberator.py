@@ -7032,8 +7032,14 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			return lines + [(False, f'Dropping tracked folder {folder}: {source_folder.rstrip("/")} is no folder')], False, None
 		failed = []
 		backup_folder_path = os.path.join(backup_folder,folder)
-		os.makedirs(backup_folder_path,exist_ok=True)
-		copy_file_meta(source_folder,backup_folder_path,failed)
+		try:
+			os.mkdir(backup_folder_path)
+		except OSError:
+			# a folder above it is not made yet ( its row is on another thread ), or a folder under it made it
+			os.makedirs(backup_folder_path,exist_ok=True)
+			copy_file_meta(source_folder,backup_folder_path,failed)
+		else:
+			copy_new_folder_meta(source_folder,backup_folder_path,st,failed)
 		return lines, True, failed
 	def referenced_link(source_file:str, backup_file_path:str):
 		os.symlink(source_file, backup_file_path)
@@ -7179,6 +7185,25 @@ def drop_xattrs_missing_from(source:str, dest:str):
 		except OSError as e:
 			if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENODATA, errno.EINVAL, errno.EACCES):
 				raise
+
+def copy_new_folder_meta(source_folder:str, backup_folder_path:str, st, failed:list = None) -> bool:
+	'''
+	copy_file_meta() of the folder source_folder onto the folder this copy just made at backup_folder_path, st being
+	source_folder's lstat (False or None when there is none): its owner, mode and times by a request each, from st,
+	when neither has extended attributes, as copy_file_meta() would set them. Anything else (attributes on either side,
+	ACLs among them, a folder that cannot be listed, a request that fails, no st) goes to copy_file_meta() from the
+	start, which writes its own lines and appends to failed as ever.
+	'''
+	if st and os.name == 'posix':
+		try:
+			if not os.listxattr(source_folder, follow_symlinks=False) and not os.listxattr(backup_folder_path, follow_symlinks=False):
+				os.chown(backup_folder_path, st.st_uid, st.st_gid)
+				os.chmod(backup_folder_path, stat.S_IMODE(st.st_mode))
+				os.utime(backup_folder_path, ns=(st.st_atime_ns, st.st_mtime_ns))
+				return True
+		except OSError:
+			pass
+	return copy_file_meta(source_folder, backup_folder_path, failed)
 
 def copy_file_meta(source_file:str,backup_file_path:str,failed:list = None):
 	'''

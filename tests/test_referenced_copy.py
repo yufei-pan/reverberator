@@ -216,6 +216,14 @@ def test_unsynced_comes_in_row_order(job, monkeypatch, logged, small_chunks):
 			return False
 		return real(source, dest, failed)
 	monkeypatch.setattr(rv, 'copy_file_meta', failing)
+	# the folders the copy makes go to copy_new_folder_meta(), which fails them the same way
+	real_new = rv.copy_new_folder_meta
+	def failing_new(source, dest, st, failed=None):
+		if source.rstrip('/').endswith(('d', 'sub', 'b', 'c')):
+			failed.append(source)
+			return False
+		return real_new(source, dest, st, failed)
+	monkeypatch.setattr(rv, 'copy_new_folder_meta', failing_new)
 	_, (old, new) = run_both(job, monkeypatch, logged)
 	assert new == old
 	assert [os.path.basename(path.rstrip('/')) for path in new[4]] == ['d', 'sub', 'b', 'c']
@@ -306,6 +314,13 @@ def test_a_stop_while_the_folders_are_made_makes_no_link(job, monkeypatch, logge
 			rv.GREEN_LIGHT.clear()
 		return real(*args, **kwargs)
 	monkeypatch.setattr(rv, 'copy_file_meta', meta)
+	real_new = rv.copy_new_folder_meta
+	def new_meta(*args, **kwargs):
+		made.append(args[1])
+		if len(made) == 2:
+			rv.GREEN_LIGHT.clear()
+		return real_new(*args, **kwargs)
+	monkeypatch.setattr(rv, 'copy_new_folder_meta', new_meta)
 	try:
 		assert rv.do_referenced_copy(v0, v1, manifest, relative=True) is False
 	finally:
@@ -357,17 +372,21 @@ def test_an_absolute_copy_links_each_file_to_its_source(job):
 
 
 @pytest.mark.parametrize('exc', [PermissionError(errno.EACCES, 'EACCES'), OSError(errno.ENOSPC, 'ENOSPC')])
-@pytest.mark.parametrize('where', ['symlink', 'makedirs'])
+@pytest.mark.parametrize('where', ['symlink', 'mkdir'])
 def test_what_a_thread_raises_comes_out_and_no_thread_is_left(job, monkeypatch, logged, exc, where):
 	v0, manifest = big_version(job)
 	v1 = os.path.join(job.job_vault, V1)
 	calls = []
 	lock = threading.Lock()
 	real = getattr(os, where)
+	# the fifth entry fails each time it is tried: a mkdir that fails is tried again by os.makedirs()
+	failing_path = []
 	def failing(*args, **kwargs):
 		with lock:
 			calls.append(args)
-			hit = len(calls) == 5
+			if len(calls) == 5:
+				failing_path.append(os.fspath(args[-1] if where == 'symlink' else args[0]).rstrip('/'))
+			hit = bool(failing_path) and os.fspath(args[-1] if where == 'symlink' else args[0]).rstrip('/') == failing_path[0]
 		if hit:
 			raise exc
 		return real(*args, **kwargs)
