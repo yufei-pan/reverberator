@@ -197,6 +197,8 @@ def test_delta_generation_is_unchanged(job):
 	expected = {'a.txt': 'modify', 'gone.txt': 'delete', 'new.txt': 'create', 'D/new.txt': 'create', 'D/x.txt': 'attrib', 'D/old.txt': 'delete'}
 	assert compare(job, manifest, rv.TouchedScopes([''], [])) == expected
 	assert compare(job, manifest, rv.TouchedScopes(['D/'], [])) == {rel: event for rel, event in expected.items() if rel.startswith('D/')}
+	# a whole scope's comparison compares folders' mtimes too: D/, whose entries were made and removed, is an attrib
+	expected['D/'] = 'attrib'
 	scoped = OrderedDict()
 	assert rv.delta_generate_backup_entries(scoped, latest_version(job), job.monitor, manifest=manifest, scope_rel='D/') is manifest
 	assert events(job, scoped) == {rel: event for rel, event in expected.items() if rel.startswith('D/')}

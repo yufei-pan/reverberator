@@ -379,13 +379,15 @@ def test_delta_generation_with_bad_names(job, poll_fast):
 	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
 	assert schema(job) == '2'
 	assert {path: values.event for path, values in entries.items()} == {os.path.join(job.monitor, 'bad\udcff.txt'): 'create',
-		os.path.join(job.monitor, 'sub/x\udcfe'): 'create', os.path.join(job.monitor, 'd\udcff/'): 'create', os.path.join(job.monitor, 'd\udcff/y\udcfd'): 'create'}
+		os.path.join(job.monitor, 'sub/x\udcfe'): 'create', os.path.join(job.monitor, 'd\udcff/'): 'create', os.path.join(job.monitor, 'd\udcff/y\udcfd'): 'create',
+		# sub, which holds a new entry, has a new mtime: a full comparison compares it
+		os.path.join(job.monitor, 'sub/'): 'attrib'}
 	v1 = backup(job, log_journal=True)[-1]
 	assert listing(v1) == {b'a.txt': 'hello', b'sub/': None, b'sub/b.txt': 'world', b'bad\xff.txt': 'bad', b'sub/x\xfe': 'nested',
 		b'd\xff/': None, b'd\xff/y\xfd': 'deeper'}
 	# its change list records what the comparison found
 	assert sorted((path, event) for path, event, _ in change_rows(rv.list_versions(job.job_vault)[-1])) == sorted(
-		(os.path.join(job.monitor, rel), 'create') for rel in ('bad\udcff.txt', 'sub/x\udcfe', 'd\udcff/', 'd\udcff/y\udcfd'))
+		[(os.path.join(job.monitor, rel), 'create') for rel in ('bad\udcff.txt', 'sub/x\udcfe', 'd\udcff/', 'd\udcff/y\udcfd')] + [(os.path.join(job.monitor, 'sub/'), 'attrib')])
 	# and so does the journal, each name as it is stored
 	journal = [line.split(b'\t') for line in raw(os.path.join(job.job_vault, 'journal.tsv')).split(b'\n')[1:] if line]
 	assert sorted(row[0] for row in journal if row[2] == b'create') == sorted(stored(os.path.join(job.monitor, rel))

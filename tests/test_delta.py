@@ -45,6 +45,9 @@ def chained_versions(job, names):
 	v0 = os.path.join(job.job_vault, 'V0--2021-01-01_00-00-00_-0800')
 	for name in names:
 		rv.cp_af_copy_path(os.path.join(job.monitor, name), os.path.join(v0, name))
+	# its folders with the monitored ones' metadata, as a backup leaves them
+	for folder in {os.path.dirname(n) for n in names if '/' in n}:
+		rv.copy_file_meta(os.path.join(job.monitor, folder), os.path.join(v0, folder))
 	previous = v0
 	for version in (1, 2):
 		current = os.path.join(job.job_vault, f'V{version}--2021-01-0{version + 1}_00-00-00_-0800')

@@ -6,8 +6,9 @@ into gets the monitored folder's times, each they made or synced all of its meta
 the next version it wrote into its times back. A restore then gives each folder its own times.
 
 The oracle runs random batches (creates, deletes, renames, folder moves, chmod, chown, touch and xattrs of folders) as
-the watcher reports them, with their verification as the daemon runs a batch, and full comparisons, keeping a few versions so prunes
-run: after each backup every kept version's folders are as the monitored ones were at its batch.
+the watcher reports them, with their verification as the daemon runs a batch, and full comparisons (which compare
+folders' mtimes, so they find a folder whose times alone moved), keeping a few versions so prunes run: after each backup
+every kept version's folders, its own top folder among them, are as the monitored ones were at its batch.
 '''
 import errno
 import os
@@ -41,8 +42,8 @@ def meta(path):
 
 
 def folders_of(root):
-	'''{rel: meta()} of every real folder below root, no link followed.'''
-	found = {}
+	'''{rel: meta()} of root ('') and every real folder below it, no link followed.'''
+	found = {'': meta(root)}
 	for path, rel, is_dir in rv.iter_tree_entries(root):
 		if is_dir:
 			found[rel.rstrip('/')] = meta(path)
@@ -65,20 +66,20 @@ def random_ops(rng, monitor, full):
 			rel = f'{folder}/{name}' if folder else name
 			if not os.path.lexists(os.path.join(monitor, rel)):
 				return rel
-	kinds = ['write', 'write', 'modify', 'delete', 'mkdir', 'rmtree', 'mv_file', 'mv_folder', 'chmod', 'chown', 'xattr']
-	# a full comparison stands for events that were lost, and finds only what differs from the vault: a folder whose times
-	# alone changed is not one it finds, nor one an entry was made in and taken out of again. so with full, the entries
-	# made or moved in the batch stay where they are
+	kinds = ['write', 'write', 'modify', 'delete', 'mkdir', 'rmtree', 'mv_file', 'mv_folder', 'chmod', 'chown', 'xattr', 'touch']
+	# a full comparison stands for events that were lost: it compares folders' mtimes too, so it finds a folder whose
+	# times alone changed (touch), and one an entry was made in and taken out of again. full, the ops pick freely; a
+	# batch's verification compares no folder times, so there the entries made or moved in it stay where they are
 	fresh = set()
-	if not full:
-		kinds.append('touch')
+	if full:
+		kinds += ['touch', 'churn']
 	for _ in range(rng.randint(1, 8)):
 		files, folders = entries(monitor)
 		kind = rng.choice(kinds)
 		path = lambda rel: os.path.join(monitor, rel)
 		subfolders = [rel for rel in folders if rel]
-		movable_files = [rel for rel in files if rel not in fresh]
-		movable_folders = [rel for rel in subfolders if rel not in fresh]
+		movable_files = [rel for rel in files if full or rel not in fresh]
+		movable_folders = [rel for rel in subfolders if full or rel not in fresh]
 		if kind == 'write':
 			rel = new_name(rng.choice(folders))
 			with open(path(rel), 'w') as f:
@@ -128,6 +129,13 @@ def random_ops(rng, monitor, full):
 			os.rename(path(rel), path(dest))
 			fresh.add(dest)
 			events.append((True, 'move', dest, rel))
+		elif kind == 'churn':
+			# a file made and removed: its folder's times alone moved, the root's too
+			rel = new_name(rng.choice(folders))
+			with open(path(rel), 'w') as f:
+				f.write('t')
+			os.remove(path(rel))
+			events += [(False, 'create', rel, None), (False, 'delete', rel, None)]
 		elif kind in ('chmod', 'chown', 'xattr', 'touch') and subfolders:
 			rel = rng.choice(subfolders)
 			if kind == 'chmod':
@@ -170,8 +178,15 @@ def check(job, expected, why=''):
 
 
 @pytest.mark.parametrize('complete', [True, False])
-def test_every_version_keeps_the_folders_of_its_batch(tmp_path, complete):
+def test_every_version_keeps_the_folders_of_its_batch(tmp_path, monkeypatch, complete):
 	cases = {'verified': 0, 'full': 0, 'pruned': 0}
+	# the scope of each delta generation: a full mode's is the whole tree
+	compared = []
+	real = rv.delta_generate_backup_entries
+	def delta(*args, **kwargs):
+		compared.append(kwargs.get('scope_rel', ''))
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'delta_generate_backup_entries', delta)
 	for seed in range(SEEDS):
 		rng = random.Random(seed * 2 + complete)
 		job = create_job(str(tmp_path / f's{seed}'))
@@ -187,7 +202,10 @@ def test_every_version_keeps_the_folders_of_its_batch(tmp_path, complete):
 			time.sleep(0.005)
 			before = len(committed_versions(job))
 			if mode == 'full':
+				# no entries: the whole tree is compared with the latest version, and what differs makes a version
+				compared.clear()
 				run_backup(job, keep_one_complete_backup=complete, keep_n_versions=keep)
+				assert compared == [''], compared
 			else:
 				evs = raw(job.monitor, events)
 				run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), keep_one_complete_backup=complete, keep_n_versions=keep,
@@ -331,3 +349,209 @@ def test_written_folders_follow_the_folder_moves():
 	assert folders.rels == sorted(folders.whole)
 	folders.moved('x', 'z')
 	assert folders.rels == ['a/b!', 'a/bc', 'z', 'z/y', 'z/y/c', 'z/y/new']
+
+
+# --- the round 18 fix pass ---
+
+def test_a_move_to_the_top_never_names_the_version_folder_a_written_folder(tmp_path, monkeypatch):
+	# a file moved to the top re-targets its link there, in the version folder: retarget_moved_links() names it as '.',
+	# which is no written folder ( the version folder gets the monitored root's by its own step )
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'a/f': '1', 'keep': 'k'})
+	run_backup(job)
+	m = lambda rel: os.path.join(job.monitor, rel)
+	run_backup(job, rv.change_events_to_backup_entries(deque([rv.ChangeEvent(1.0, False, 'modify', m('keep'), None)]), job.monitor))
+	os.rename(m('a/f'), m('f'))
+	seen = []
+	real = rv.WrittenFolders.settle
+	def spy(self, *args, **kwargs):
+		seen.append(list(self.rels))
+		return real(self, *args, **kwargs)
+	monkeypatch.setattr(rv.WrittenFolders, 'settle', spy)
+	evs = deque([rv.ChangeEvent(2.0, False, 'move', m('f'), m('a/f'))])
+	v = run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), touched=rv.touched_scopes(evs, job.monitor))[-1]
+	assert seen and '.' not in seen[0] and '' not in seen[0]
+	assert meta(v) == meta(job.monitor)
+
+
+def test_settle_leaves_paused_inner_mounts_and_polls_each_folder(tmp_path):
+	version, monitor = tmp_path / 'v', tmp_path / 'm'
+	for root in (version, monitor):
+		for rel in ('mnt/in', 'd'):
+			(root / rel).mkdir(parents=True)
+	for rel in ('mnt', 'mnt/in', 'd'):
+		os.utime(monitor / rel, ns=(OLD, OLD))
+	folders = rv.WrittenFolders()
+	for rel in ('mnt', 'mnt/in', 'd'):
+		folders.add(rel)
+	polls = []
+	assert folders.settle(str(version), str(monitor), [], paused={'mnt/'}, poll=lambda: polls.append(1)) == []
+	assert len(polls) == 3
+	assert os.lstat(version / 'd').st_mtime_ns == OLD
+	assert os.lstat(version / 'mnt').st_mtime_ns != OLD and os.lstat(version / 'mnt/in').st_mtime_ns != OLD
+
+
+def test_settle_stops_when_the_pool_guard_says_a_disk_dropped(tmp_path):
+	version, monitor = tmp_path / 'v', tmp_path / 'm'
+	for root in (version, monitor):
+		(root / 'd').mkdir(parents=True)
+	folders = rv.WrittenFolders()
+	folders.add('d')
+	def dropped():
+		raise rv.PoolNotReady('a disk dropped')
+	with pytest.raises(rv.PoolNotReady):
+		folders.settle(str(version), str(monitor), [], poll=dropped)
+
+
+def test_the_referenced_copy_keeps_a_few_numbers_a_folder(tmp_path, monkeypatch):
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'d/e/f': 'x', 'keep': 'k'})
+	run_backup(job)
+	held = []
+	real = rv.copy_new_folder_meta
+	def spy(source, dest, st, failed=None):
+		held.append(st)
+		return real(source, dest, st, failed)
+	monkeypatch.setattr(rv, 'copy_new_folder_meta', spy)
+	with open(os.path.join(job.monitor, 'keep'), 'w') as f:
+		f.write('v1')
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'keep', 'modify')]))[-1]
+	assert held and all(type(st) is rv.FolderMeta for st in held[:2])
+	assert folders_of(v1) == folders_of(job.monitor)
+
+
+def test_copy_new_folder_meta_never_follows_a_link_in_the_folders_place(tmp_path):
+	source, target, link = tmp_path / 's', tmp_path / 't', tmp_path / 'l'
+	source.mkdir(mode=0o700)
+	target.mkdir(mode=0o755)
+	os.chmod(source, 0o700)
+	os.utime(source, ns=(OLD, OLD))
+	os.symlink(target, link)
+	rv.copy_new_folder_meta(str(source), str(link), os.lstat(source), [])
+	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o755 and os.lstat(target).st_mtime_ns != OLD
+
+
+def test_a_prune_that_fails_mid_walk_gives_the_folder_times_back(tmp_path, monkeypatch):
+	job = three_versions(tmp_path)
+	v1 = committed_versions(job)[1]
+	before = folders_of(v1)
+	real = rv.in_row_order
+	def walk_then_fail(pool, rows, work, handled, stop, check=None, alone=None):
+		real(pool, rows, work, handled, stop, check, alone)
+		raise RuntimeError('cut')
+	monkeypatch.setattr(rv, 'in_row_order', walk_then_fail)
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	with pytest.raises(RuntimeError):
+		rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=b's' * 16)
+	assert not os.path.islink(os.path.join(v1, 'D/E/c'))
+	assert folders_of(v1) == before
+
+
+def test_folders_the_replay_makes_above_an_entry_get_their_own_metadata(tmp_path, monkeypatch):
+	# the referenced copy could not make D and D/E (say ENOSPC), whose rows stay: the replay's file in D/E makes both
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/E/old': 'o', 'keep': 'k'})
+	for rel in ('D/E', 'D'):
+		os.chmod(os.path.join(job.monitor, rel), 0o750)
+		os.utime(os.path.join(job.monitor, rel), ns=(OLD, OLD + 3))
+	run_backup(job)
+	real = rv.do_referenced_copy
+	def lost_folders(source_path, backup_folder, *args, **kwargs):
+		# what the links take is measured in full, as the links under D go too
+		done = real(source_path, backup_folder, *args, **{**kwargs, 'sizes': None})
+		shutil.rmtree(os.path.join(backup_folder, 'D'))
+		return done
+	monkeypatch.setattr(rv, 'do_referenced_copy', lost_folders)
+	with open(os.path.join(job.monitor, 'D/E/new'), 'w') as f:
+		f.write('n')
+	os.utime(os.path.join(job.monitor, 'D/E'), ns=(OLD, OLD + 5))
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'D/E/new', 'create')]))[-1]
+	for rel in ('D', 'D/E'):
+		assert meta(os.path.join(v1, rel)) == meta(os.path.join(job.monitor, rel)), rel
+
+
+def test_a_retarget_that_writes_nothing_names_no_folder(tmp_path, monkeypatch):
+	folder = tmp_path / 'V1--x' / 'd'
+	folder.mkdir(parents=True)
+	link = folder / 'f'
+	os.symlink('../../V0--x/d/f', link)
+	def unreadable(*args):
+		raise OSError(errno.EIO, 'cannot tell')
+	monkeypatch.setattr(rv, 'vault_chain_hop', unreadable)
+	folders, errors = set(), []
+	rv.retarget_moved_links(str(tmp_path), str(link), rv.VersionMoves.applied([]), errors, folders)
+	assert errors and folders == set()
+	# one whose rename fails after its new link was made: the folder's times moved
+	monkeypatch.setattr(rv, 'vault_chain_hop', lambda *args: str(tmp_path / 'V0--x' / 'f'))
+	def no_replace(*args):
+		raise OSError(errno.EIO, 'cannot rename')
+	monkeypatch.setattr(os, 'replace', no_replace)
+	errors.clear()
+	rv.retarget_moved_links(str(tmp_path), str(link), rv.VersionMoves.applied([]), errors, folders)
+	assert errors and folders == {str(folder)}
+
+
+def test_a_full_comparison_gives_a_folder_whose_mtime_alone_moved_its_times(tmp_path, monkeypatch):
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/a': 'a', 'D/E/b': 'b', 'keep': 'k'})
+	run_backup(job)
+	# a file made and removed in D, whose events were lost: only D's mtime moved
+	with open(os.path.join(job.monitor, 'D/tmp'), 'w') as f:
+		f.write('t')
+	os.remove(os.path.join(job.monitor, 'D/tmp'))
+	os.utime(os.path.join(job.monitor, 'D'), ns=(OLD, OLD + 9))
+	settled = []
+	real = rv.WrittenFolders.settle
+	def spy(self, *args, **kwargs):
+		settled.append(dict(self.whole))
+		return real(self, *args, **kwargs)
+	monkeypatch.setattr(rv.WrittenFolders, 'settle', spy)
+	sized = []
+	real_size = rv.get_path_size
+	monkeypatch.setattr(rv, 'get_path_size', lambda *paths: sized.extend(paths) or real_size(*paths))
+	versions = run_backup(job)
+	sized = [path for path in sized if not os.path.basename(path).startswith('V')]
+	assert len(versions) == 2
+	# its times only, and nothing sized or copied for it
+	assert settled == [{'D': False}] and sized == []
+	assert folders_of(versions[-1]) == folders_of(job.monitor)
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		assert manifest.lookup('D/').mtime_ns == OLD + 9
+	finally:
+		manifest.close()
+	# the next full comparison finds nothing
+	assert run_backup(job) == versions
+
+
+def test_the_first_full_comparison_repairs_folders_whose_records_hold_no_mtime(tmp_path):
+	# records of a daemon before 0.54 hold no folder mtime, and the versions' folders the times their entries were
+	# written: the first full comparison gives every folder the monitored one's times, once
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/a': 'a', 'D/E/b': 'b', 'F/c': 'c'})
+	for rel in ('D/E', 'D', 'F'):
+		os.utime(os.path.join(job.monitor, rel), ns=(OLD, OLD + 1))
+	v0 = run_backup(job)[-1]
+	for rel in ('D/E', 'D', 'F'):
+		os.utime(os.path.join(v0, rel))
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	manifest.conn.execute("UPDATE entries SET mtime_ns = NULL WHERE kind = 'd'")
+	manifest.commit()
+	manifest.close()
+	versions = run_backup(job)
+	assert len(versions) == 2 and folders_of(versions[-1]) == folders_of(job.monitor)
+	assert run_backup(job) == versions
+
+
+def test_a_batch_that_collapses_to_nothing_makes_no_version_for_its_folders_times(tmp_path):
+	# a file made and removed, as editors and lock files do all day: the batch's comparison compares no folder times
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/a': 'a'})
+	versions = run_backup(job)
+	m = lambda rel: os.path.join(job.monitor, rel)
+	with open(m('D/lock'), 'w') as f:
+		f.write('l')
+	os.remove(m('D/lock'))
+	evs = deque([rv.ChangeEvent(1.0, False, 'create', m('D/lock'), None), rv.ChangeEvent(2.0, False, 'delete', m('D/lock'), None)])
+	assert run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), touched=rv.touched_scopes(evs, job.monitor)) == versions

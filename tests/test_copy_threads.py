@@ -1,7 +1,7 @@
 '''
 Round 18: the rule file's column 15, Copy threads, sets the threads of a job's referenced copy and prune. A whole number
 of 1 or more is itself (1 runs them with no thread pool); blank or auto goes by the vault's disks in sysfs (8 when any is
-a hard disk, else 2, and 2 when that cannot be told); anything else is auto after one warning. A 14 column rule file is
+a hard disk, else 2, and 2 when that cannot be told), told by the job's backup thread once the vault is there; anything else is auto after one warning. A 14 column rule file is
 read as before.
 '''
 import os
@@ -26,29 +26,47 @@ def warnings(monkeypatch):
 
 
 @pytest.mark.parametrize('cell, threads, warned', [
-	('', 5, False), ('auto', 5, False), ('AUTO', 5, False), (' Auto ', 5, False), (' 3 ', 3, False), ('1', 1, False),
-	('0', 5, True), ('-2', 5, True), ('x', 5, True), ('2.5', 5, True)])
+	('', 0, False), ('auto', 0, False), ('AUTO', 0, False), (' Auto ', 0, False), (' 3 ', 3, False), ('1', 1, False),
+	('0', 0, True), ('-2', 0, True), ('x', 0, True), ('2.5', 0, True)])
 def test_copy_threads_cells(monkeypatch, warnings, cell, threads, warned):
-	monkeypatch.setattr(rv, 'vault_disk_problem', lambda path: None)
-	monkeypatch.setattr(rv, 'copy_threads_auto', lambda path: (5, 'auto: told'))
-	assert rv.read_copy_threads(cell, 'j', '/v')[0] == threads
+	# auto is told by the backup thread alone, never at the job's start
+	def never(path):
+		raise AssertionError('the disks were looked up')
+	monkeypatch.setattr(rv, 'copy_threads_auto', never)
+	monkeypatch.setattr(rv, 'vault_disk_problem', never)
+	assert rv.read_copy_threads(cell, 'j')[0] == threads
 	said = [line for line in warnings if 'Copy threads' in line]
 	assert bool(said) == warned
 	if warned:
 		assert len(said) == 1 and 'Rule j ' in said[0] and cell in said[0]
 
 
-def test_a_number_wins_over_auto(monkeypatch):
-	def never(path):
-		raise AssertionError('auto was asked')
-	monkeypatch.setattr(rv, 'copy_threads_auto', never)
-	monkeypatch.setattr(rv, 'vault_disk_problem', never)
-	assert rv.read_copy_threads('4', 'j', '/v') == (4, 'Copy threads column')
+def test_a_number_wins_over_auto():
+	assert rv.read_copy_threads('4', 'j') == (4, 'Copy threads column')
 
 
-def test_auto_waits_for_a_vault_disk_that_is_not_there(monkeypatch):
-	monkeypatch.setattr(rv, 'vault_disk_problem', lambda path: '/mnt/x is not mounted')
-	assert rv.read_copy_threads('', 'j', '/mnt/x/v') == (0, 'auto, told once the vault is there: /mnt/x is not mounted')
+def test_auto_is_told_by_the_backup_thread_once_the_vault_is_there(tmp_path, monkeypatch, logged):
+	# the backuper tells auto after its wait for the vault, from the disks then, and hands the count to every backup
+	import threading
+	asked, handed = [], []
+	monkeypatch.setattr(rv, 'copy_threads_auto', lambda path: asked.append(path) or (7, 'auto: told'))
+	def do_backup(*args, **kwargs):
+		handed.append(kwargs.get('copy_threads'))
+		return None, None, False
+	monkeypatch.setattr(rv, 'do_backup', do_backup)
+	monitor = tmp_path / 'monitor'
+	monitor.mkdir()
+	flag = threading.Event()
+	flag.set()
+	queue = rv.ChangeEventQueue(str(monitor))
+	queue.append(rv.ChangeEvent(1, False, 'modify', str(monitor / 'f'), None))
+	try:
+		rv.backuper('job', queue, threading.Lock(), str(monitor), str(tmp_path / 'vault'),
+			'N/A', threading.Event(), flag, copy_threads=0)
+	finally:
+		rv.GREEN_LIGHT.set()
+	assert asked == [str(tmp_path / 'vault')] and handed == [7]
+	assert 'Copy threads: 7 (auto: told)' in logged
 
 
 def test_a_14_column_rule_file_reads_no_copy_threads(job):
@@ -117,15 +135,19 @@ def test_auto_goes_by_the_vaults_disks(tmp_path, monkeypatch, vault, threads, wh
 	('/rct/nfs/v', 'is on no disk'),
 	('/rct/gone/v', 'No such file'),
 	('/rct/pool/v', 'cannot be listed'),
+	('/rct/btrfs/v', 'cannot tell (btrfs/ZFS): /rct/btrfs/v is on btrfs'),
+	('/rct/zfs/v', 'cannot tell (btrfs/ZFS): /rct/zfs/v is on zfs'),
 ])
 def test_auto_that_cannot_tell_takes_two_and_says_why(tmp_path, monkeypatch, vault, reason):
 	fake_sysfs(tmp_path, monkeypatch)
-	mounts(monkeypatch, [('/rct/nfs', '0:60', b'nfs4'), ('/rct/gone', '8:99', b'xfs'), ('/rct/pool', '0:50', rv.MERGERFS_FSTYPE)], {})
+	mounts(monkeypatch, [('/rct/nfs', '0:60', b'nfs4'), ('/rct/gone', '8:99', b'xfs'), ('/rct/pool', '0:50', rv.MERGERFS_FSTYPE),
+		('/rct/btrfs', '0:61', b'btrfs'), ('/rct/zfs', '0:62', b'zfs')], {})
 	def unlisted(pool):
 		raise OSError(5, 'Input/output error')
 	monkeypatch.setattr(rv, 'read_pool_branches', unlisted)
 	threads, why = rv.copy_threads_auto(vault)
-	assert threads == rv.SSD_COPY_THREADS == 2 and why.startswith(f'auto: cannot tell the disks of {vault}: ') and reason in why
+	assert threads == rv.SSD_COPY_THREADS == 2 and reason in why
+	assert why.startswith('auto: cannot tell (btrfs/ZFS): ') if 'btrfs' in vault or 'zfs' in vault else why.startswith(f'auto: cannot tell the disks of {vault}: ')
 
 
 def test_auto_without_a_mount_table_takes_two(monkeypatch):

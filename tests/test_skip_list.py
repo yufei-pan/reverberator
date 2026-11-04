@@ -406,10 +406,11 @@ def test_size_estimate_walks_around_skipped_content(job):
 	assert inodes == 2
 	assert 0 < size < 1 << 20
 	assert size == sum(os.lstat(path).st_blocks * 512 for path in (proj, os.path.join(proj, 'src.c')))
-	# a folder modify or attrib is sized by the same walk
-	for event in ('modify', 'attrib'):
+	# a folder modify is sized by the same walk; a folder attrib copies nothing, so it is not sized
+	for event, sized in (('modify', size), ('attrib', 0)):
 		entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', event, None)})
-		assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/'])) == (size, 0)
+		assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/'])) == (sized, 0)
+	entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'modify', None)})
 	# no patterns keeps du
 	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, [])) == (full_size, 0)
 
@@ -472,9 +473,10 @@ def test_size_estimate_counts_nested_folder_attribs_once(job):
 	proj = os.path.join(job.monitor, 'proj')
 	_nested_tree(proj)
 	sl = rv.SkipList(job.monitor, ['node_modules/'])
-	# chmod -R: an attrib for every folder and file, sized when attributes are not only synced
+	# chmod -R: an attrib for every folder and file, each file sized when attributes are not only synced (a folder's
+	# attrib copies nothing)
 	entries = _tree_entries(proj, sl, 'attrib')
-	expected_size = _usage([proj] + [path for path, _, _ in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips)])[0]
+	expected_size = _usage([path for path, _, is_dir in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips) if not is_dir])[0]
 	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == (expected_size, 0)
 	# without patterns du gets the same size: it counts nested arguments once
 	no_cache = OrderedDict((path, values) for path, values in entries.items() if 'node_modules' not in path)
@@ -492,8 +494,8 @@ def test_size_estimate_counts_creates_inside_a_sized_folder(job):
 		(os.path.join(proj, 'new') + '/', rv.BackupEntryValues('t', 'create', None)),
 		(os.path.join(proj, 'new', 'f.txt'), rv.BackupEntryValues('t', 'create', None)),
 	])
-	# the folder walk holds the bytes of what is new below it, but the new folder and its file are still new inodes
-	size = _usage([proj, os.path.join(proj, 'old.txt'), os.path.join(proj, 'new'), os.path.join(proj, 'new', 'f.txt')])[0]
+	# the folder's attrib copies nothing: the new folder and its file are its bytes and its new inodes
+	size = _usage([os.path.join(proj, 'new'), os.path.join(proj, 'new', 'f.txt')])[0]
 	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == (size, 2)
 
 

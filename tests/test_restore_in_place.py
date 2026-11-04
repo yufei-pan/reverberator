@@ -6,6 +6,7 @@ import re
 import shutil
 import stat
 import sys
+from collections import deque
 import pytest
 import reverberator as rv
 from tests.harness import seed_monitor, run_backup, write_rule, rule_row
@@ -1057,3 +1058,26 @@ def test_a_marker_that_would_not_go_is_not_rewritten_into_a_folder_being_handed_
 	restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	# only the claim wrote it, before anything was handed over
 	assert len(written) == 1
+
+
+def test_a_whole_job_restored_in_place_gets_its_top_folders_own_metadata(job, tmp_path, capsys):
+	# the version folder takes the monitored root's owner, mode and times at every batch, so the job's top folder comes
+	# back as it was, not as root's 0755 folder of the version's commit time
+	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	run_backup(job)
+	write(job, 'n.txt', 'n')
+	os.chmod(job.monitor, 0o750)
+	if ROOT:
+		os.chown(job.monitor, OTHER, OTHER)
+	old = 1_000_000_000 * 10 ** 9
+	os.utime(job.monitor, ns=(old, old))
+	run_backup(job, rv.change_events_to_backup_entries(deque([rv.ChangeEvent(1.0, False, 'create', f'{job.monitor}/n.txt', None)]), job.monitor))
+	write_rule(job)
+	want = metadata(job.monitor)
+	assert metadata(version_path(job, 1)) == want
+	shutil.rmtree(job.monitor)
+	os.mkdir(job.monitor, 0o755)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1', '--yes')
+	assert code == 0 and err.startswith('Restoring the whole job into ')
+	assert tree(job.monitor) == {'a.txt': 'a', 'd/': None, 'd/b.txt': 'b', 'n.txt': 'n'}
+	assert metadata(job.monitor) == want and (not ROOT or os.lstat(job.monitor).st_uid == OTHER)
