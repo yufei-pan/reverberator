@@ -555,3 +555,43 @@ def test_a_batch_that_collapses_to_nothing_makes_no_version_for_its_folders_time
 	os.remove(m('D/lock'))
 	evs = deque([rv.ChangeEvent(1.0, False, 'create', m('D/lock'), None), rv.ChangeEvent(2.0, False, 'delete', m('D/lock'), None)])
 	assert run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), touched=rv.touched_scopes(evs, job.monitor)) == versions
+
+
+def test_a_folder_moved_to_another_parent_and_on_again_gets_its_times_at_its_final_place(tmp_path, monkeypatch):
+	# f2fs bumps the mtime of a folder renamed into another parent (ext4 does not). the replay's rename does so to the
+	# version's folder; its attribute sync is skipped when the batch moves it on again, so it is timed as written. the
+	# folders are empty, so no link is re-targeted and no other step times them
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'q/s/': None, 'r/z/': None, 'w/': None, 'keep': 'k'})
+	for path, rel, is_dir in rv.iter_tree_entries(job.monitor):
+		if is_dir:
+			os.utime(path, ns=(OLD, OLD + 5))
+	run_backup(job)
+	real = os.rename
+	def f2fs_rename(source, dest, *args, **kwargs):
+		real(source, dest, *args, **kwargs)
+		if os.path.isdir(dest) and not os.path.islink(dest) and os.path.dirname(os.path.abspath(source)) != os.path.dirname(os.path.abspath(dest)):
+			os.utime(dest, ns=(OLD, time.time_ns()), follow_symlinks=False)
+	monkeypatch.setattr(os, 'rename', f2fs_rename)
+	m = lambda rel: os.path.join(job.monitor, rel)
+	os.rename(m('q/s'), m('r/t'))
+	os.rename(m('r'), m('w/r2'))
+	evs = deque([rv.ChangeEvent(1.0, True, 'move', m('r/t'), m('q/s')), rv.ChangeEvent(2.0, True, 'move', m('w/r2'), m('r'))])
+	v1 = run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), touched=rv.touched_scopes(evs, job.monitor))[-1]
+	assert folders_of(v1) == folders_of(job.monitor)
+
+
+def test_a_symlinked_monitored_root_gives_the_version_folder_the_folders_own_metadata(tmp_path):
+	real = tmp_path / 'real'
+	real.mkdir()
+	os.chmod(real, 0o750)
+	os.utime(real, ns=(OLD, OLD + 9))
+	link = tmp_path / 'link'
+	os.symlink(real, link)
+	version = tmp_path / 'V1'
+	version.mkdir()
+	unsynced = []
+	assert rv.copy_version_folder_meta(str(link), str(version), unsynced)
+	assert unsynced == []
+	assert meta(str(version)) == meta(str(real))
+	assert stat.S_IMODE(os.lstat(version).st_mode) == 0o750

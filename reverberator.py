@@ -10552,7 +10552,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	if walk_folders:
 		# du counts an argument inside another only once, and so must the walks: a full comparison queues an entry for
 		# every folder and file of a new tree. a folder create holds the bytes and inodes below it, a sized folder
-		# modify or attrib only the bytes
+		# modify only the bytes
 		sized_folders = set()
 		created_folders = set()
 		for entry, values in backup_entries.items():
@@ -11924,13 +11924,15 @@ def copy_version_folder_meta(monitor_path:str, version_path:str, unsynced:list =
 	copy_file_meta() writes it. Returns whether it worked.
 	'''
 	try:
-		st = os.lstat(monitor_path)
+		# the monitored path may be a link: the folder it names, whose owner, mode, times and xattrs these are
+		monitor_path_real = os.path.realpath(monitor_path)
+		st = os.lstat(monitor_path_real)
 	except OSError as e:
 		backuperTeeLogToTl(path=monitor_path,error=True,message=f'Cannot copy the metadata of {monitor_path} onto {version_path}: {e}')
 		if unsynced is not None:
 			unsynced.append(monitor_path)
 		return False
-	return copy_new_folder_meta(monitor_path, version_path, st, unsynced)
+	return copy_new_folder_meta(monitor_path_real, version_path, st, unsynced)
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
@@ -12411,6 +12413,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					written.wrote_in(link_target_relative_path)
 					if isDir:
 						written.moved(link_source_relative_path,link_target_relative_path)
+						# f2fs bumps the mtime of a folder renamed into another parent (ext4 does not), and the attribute sync
+						# below is skipped when the batch moves it on again: its times, at its final place
+						written.add(link_target_relative_path)
 					# the links it renamed are told by it from here on, its own retarget first
 					applied_moves.append((as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path),True) if isDir else
 						(link_source_relative_path,link_target_relative_path,False))
