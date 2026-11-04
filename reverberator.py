@@ -8512,6 +8512,9 @@ class VersionMoves:
 		self._indexed = 0
 		self._file_sources = {}
 		self._folder_sources = {}
+		# the same for the dests of the moves with a source: a file move's dest, a folder move's dest (ending with /)
+		self._file_dests = {}
+		self._folder_dests = {}
 		self._sourceless = set()
 
 	@classmethod
@@ -8597,14 +8600,15 @@ class VersionMoves:
 				if source is None:
 					self._sourceless.add(dest.rstrip('/'))
 					continue
-				table = self._folder_sources if is_folder else self._file_sources
-				held = table.get(source)
-				if held is None:
-					table[source] = at
-				elif isinstance(held, int):
-					table[source] = [held, at]
-				else:
-					held.append(at)
+				for table, key in ((self._folder_sources if is_folder else self._file_sources, source),
+						(self._folder_dests if is_folder else self._file_dests, dest)):
+					held = table.get(key)
+					if held is None:
+						table[key] = at
+					elif isinstance(held, int):
+						table[key] = [held, at]
+					else:
+						held.append(at)
 			self._indexed = len(moves)
 		return moves
 
@@ -8628,6 +8632,21 @@ class VersionMoves:
 			at = path.find('/')
 			while at != -1:
 				candidate = self._first_after(self._folder_sources.get(path[:at + 1]), after)
+				if candidate is not None and (found is None or candidate < found):
+					found = candidate
+				at = path.find('/', at + 1)
+		return found
+
+	def _next_landing(self, path:str, after:int):
+		'''
+		The position of the first move after position after that lands on path: a file move whose dest is path, or a
+		folder move whose dest is a folder above it (ending with /); None when none does.
+		'''
+		found = self._first_after(self._file_dests.get(path), after)
+		if self._folder_dests:
+			at = path.find('/')
+			while at != -1:
+				candidate = self._first_after(self._folder_dests.get(path[:at + 1]), after)
 				if candidate is not None and (found is None or candidate < found):
 					found = candidate
 				at = path.find('/', at + 1)
@@ -8667,22 +8686,31 @@ class VersionMoves:
 
 	def place(self, rel:str) -> tuple:
 		'''
-		(where the moves, applied in order, take rel, whether any did): rel itself and False when none applies. A move
+		(where the moves, applied in order, take rel, whether any did): rel itself and False when none applies. where is
+		None when a move lands on the path rel has at that point, or on a folder above it, without taking it (a move
+		over it, or a folder moved onto it): rel is gone from the version, whichever way the files are visited. A move
 		row without a source moves nothing.
 
 		Examples:
 			>>> moves = VersionMoves.applied([('d/x', 'e/x', False), ('d/', 'f/', True), ('f/y', 'y', False)])
 			>>> moves.place('d/x'), moves.place('d/y'), moves.place('d/z/w'), moves.place('a')
 			(('e/x', True), ('y', True), ('f/z/w', True), ('a', False))
+			>>> moves = VersionMoves.applied([('d/g', 'd/h', False), ('d/', 'e/', True), ('c', 'e/h', False)])
+			>>> moves.place('d/g'), moves.place('d/h'), moves.place('d/k'), moves.place('c')
+			((None, True), (None, True), ('e/k', True), ('e/h', True))
 		'''
 		moves = self._index()
-		path, at = rel, self._next_move(rel, -1)
-		touched = at is not None
-		while at is not None:
-			source, dest, is_folder = moves[at]
+		path, at = rel, -1
+		touched = False
+		while True:
+			taking, landing = self._next_move(path, at), self._next_landing(path, at)
+			if landing is not None and (taking is None or landing < taking):
+				return None, True
+			if taking is None:
+				return path, touched
+			source, dest, is_folder = moves[taking]
 			path = dest + path[len(source):] if is_folder else dest
-			at = self._next_move(path, at)
-		return path, touched
+			touched, at = True, taking
 
 	def touches(self, rel:str) -> bool:
 		'''Whether any move applies to rel, itself or a folder above it: the first one to do so meets rel unmoved.'''
@@ -8782,7 +8810,8 @@ def rows_dropping(change_list:str, monitor:str) -> tuple:
 	(deleted, landed) of the change list at change_list, read under monitor, the monitored path its version was written
 	under (absolute and normalised), as rels for the check of a prune cut off before its flush (decrement_stepper()):
 	deleted, the paths of its deletes that its replay runs before its moves (every delete but one whose path held the
-	source of a move listed before it, which the replay runs after that move), a folder's ending with /; landed, the
+	source of a move listed before it, or lies under a folder that one moved, which the replay runs after that move,
+	and so names what is there then, not the file of the version below), a folder's ending with /; landed, the
 	files its create, modify, move and recopy rows land on. A file of the version below is gone from this version only
 	through one of those: a delete of it or of a folder above it, or, when no move took it, a row landing on it. Raises
 	ValueError for a row outside monitor, OSError when the list cannot be read.
@@ -8790,7 +8819,8 @@ def rows_dropping(change_list:str, monitor:str) -> tuple:
 	Examples:
 		>>> folder = tempfile.mkdtemp(prefix='reverb_doctest_')
 		>>> change_list = os.path.join(folder, 'list')
-		>>> rows = [['/m/y', '', 'move', '/m/d/g'], ['/m/d/', '', 'delete', ''], ['/m/e', '', 'delete', ''], ['/m/f', '', 'modify', ''], ['/m/n/', '', 'create', '']]
+		>>> rows = [['/m/y', '', 'move', '/m/d/g'], ['/m/d/', '', 'delete', ''], ['/m/e', '', 'delete', ''], ['/m/f', '', 'modify', ''], ['/m/n/', '', 'create', ''],
+		... ['/m/q/', '', 'move', '/m/p/'], ['/m/p/', '', 'create', ''], ['/m/p/x', '', 'delete', '']]
 		>>> _ = open(change_list, 'w').write('header\n' + ''.join('\0'.join(row) + '\n' for row in rows))
 		>>> deleted, landed = rows_dropping(change_list, '/m')
 		>>> sorted(deleted), sorted(landed)
@@ -8806,20 +8836,31 @@ def rows_dropping(change_list:str, monitor:str) -> tuple:
 		if not path.startswith(prefix):
 			raise ValueError(f'a row outside {monitor} ({path}), which it was backed up from')
 		return path[len(prefix):] + ('/' if folder else '')
+	def under_moved_folder(rel:str) -> bool:
+		# whether rel lies strictly under a folder a move listed so far took away
+		at = rel.find('/')
+		while at != -1 and at + 1 < len(rel):
+			if rel[:at + 1] in folder_sources:
+				return True
+			at = rel.find('/', at + 1)
+		return False
 	deleted, landed = set(), set()
-	# the sources of the moves listed so far, and every folder at or above one of them, ending with /
-	sources, above_sources = set(), set()
+	# the sources of the moves listed so far, and every folder at or above one of them, ending with /; the sources of the
+	# folder moves
+	sources, above_sources, folder_sources = set(), set(), set()
 	for row in iter_change_list(change_list):
 		rel = rel_of(row.path)
 		if row.event == 'move' and row.source_path is not None:
 			source = rel_of(row.source_path)
 			sources.add(source)
+			if rel.endswith('/'):
+				folder_sources.add(source.rstrip('/') + '/')
 			at = source.find('/')
 			while at != -1:
 				above_sources.add(source[:at + 1])
 				at = source.find('/', at + 1)
 		if row.event == 'delete':
-			if rel and rel not in sources and rel.rstrip('/') + '/' not in above_sources:
+			if rel and rel not in sources and rel.rstrip('/') + '/' not in above_sources and not under_moved_folder(rel):
 				deleted.add(rel)
 		elif row.event in ('create', 'modify', 'move', 'recopy') and rel and not rel.endswith('/'):
 			landed.add(rel)
@@ -11267,29 +11308,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				lines.append((True, f'Error linking {linkTarget} to {file}: {e}'))
 				return False
 			lines.append((False, f'Linking {linkTarget} to {file} reported {e}, but the copy is in place'))
-		if cut:
-			# after a cut on a pool the link's name can already be the copy on the disk the rename lands on, which makes
-			# the rename do nothing there: the temp stays, and a folder restore would write it out
-			remove_if_target(temp_path, target_st)
 		return True
-	def remove_stray_temp(temp:str, temp_st:os.stat_result, lines:list) -> None:
-		# a temp a cut left beside the copy it was made for, once that copy is in its link's place (its rename landed on one
-		# disk and the cut kept the temp on another): removed, as nothing renames it now and a folder restore would write
-		# it out. told by a regular file beside it of its inode whose temp name (prune_link_path()) is its own
-		folder = os.path.dirname(temp)
-		try:
-			with os.scandir(folder) as entries:
-				for entry in entries:
-					if entry.path == temp or not entry.is_file(follow_symlinks=False):
-						continue
-					entry_st = entry.stat(follow_symlinks=False)
-					if same_inode(entry_st, temp_st) and prune_link_path(entry.path, entry_st, prune_salt) == temp:
-						os.remove(temp)
-						lines.append((False, f'Removing {temp}: a cut prune left it, and {entry.path} is its copy already'))
-						return
-		except OSError as e:
-			# a stray only: it holds no copy that is not in place
-			lines.append((False, f'Leaving {temp} as it is: {folder} cannot be looked at ({e})'))
 	def link_back() -> None:
 		# after a cut before the first flush, each file of the reference vault that the next version should hold but lacks
 		# (its place there by the next version's moves applied in order, rows_dropping()'s rule) is linked there again
@@ -11321,17 +11340,32 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 				if deleted_early(rel):
 					continue
 				place, touched = moves.place(rel)
-				if not touched and rel in landed:
+				if place is None or (not touched and rel in landed):
 					continue
 			dest = os.path.join(applyingVaultEntry.path, place)
 			try:
 				copy_st = os.lstat(path)
-				os.link(path, dest, follow_symlinks=False)
+				try:
+					held = os.lstat(dest)
+				except FileNotFoundError:
+					held = None
+				if held is None:
+					# missing: linked only inside the next version, never through a link of the user's in a folder's place
+					if not real_folders_to(applyingVaultEntry.path, place):
+						continue
+					os.link(path, dest, follow_symlinks=False)
+				elif not same_inode(held, copy_st):
+					continue
 			except (FileExistsError, FileNotFoundError, NotADirectoryError):
 				# held there already, or its folder is not in the next version
 				continue
 			except OSError as e:
 				failed(f'Error linking {path} back to {dest}: {e}')
+				continue
+			# the copy is in place, linked now or by the walk's rename on one disk: its temp, which a cut left on another,
+			# goes, as nothing renames it now and a folder restore would write it out
+			remove_if_target(prune_link_path(dest, copy_st, prune_salt), copy_st)
+			if held is not None:
 				continue
 			if DEBUG:
 				backuperTeeLogToTl(path=referenceVaultPath,message=f'Linked {path} back to {dest}')
@@ -11365,8 +11399,6 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 		except OSError as e:
 			return failing(f'Error looking at {file}: {e}')
 		if not stat.S_ISLNK(file_st.st_mode):
-			if cut and stat.S_ISREG(file_st.st_mode) and PARTIAL_COPY_NAME.fullmatch(os.path.basename(file)):
-				remove_stray_temp(file, file_st, lines)
 			return lines, None, None, pooled
 		# a link an older daemon moved to another folder depth still names its version, though its text no longer reaches it.
 		# a user's symlink is left as it is, however it is shaped, and so is a link naming a folder: the daemon links

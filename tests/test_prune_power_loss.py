@@ -464,8 +464,10 @@ def two_versions_of_tricky_batches(base):
 			manifest.add(rel)
 	commit(0, [rv.entry_row(os.path.join(mon, p) + '/', rv.BackupEntryValues(t, 'create', None)) for p in PATTERNS])
 	entries = OrderedDict()
+	events = []
 	def ev(rel, event, src=None):
 		entries[os.path.join(mon, rel)] = rv.BackupEntryValues(t, event, None if src is None else os.path.join(mon, src))
+		events.append(rv.ChangeEvent(1.0 + len(events), rel.endswith('/'), event, os.path.join(mon, rel), None if src is None else os.path.join(mon, src)))
 	J = lambda *parts: os.path.join(mon, *parts)
 	os.rename(J('p1/d/g'), J('p1/y')); shutil.rmtree(J('p1/d')); ev('p1/y', 'move', 'p1/d/g'); ev('p1/d/', 'delete')
 	os.remove(J('p2/d/g')); os.rename(J('p2/d'), J('p2/e')); ev('p2/d/g', 'delete'); ev('p2/e/', 'move', 'p2/d/')
@@ -479,8 +481,11 @@ def two_versions_of_tricky_batches(base):
 	os.rename(J('p10/d/g'), J('p10/d/h')); os.rename(J('p10/d'), J('p10/e')); ev('p10/d/h', 'move', 'p10/d/g'); ev('p10/e/', 'move', 'p10/d/')
 	os.remove(J('p11/d/g')); ev('p11/d/g', 'delete')
 	manifest.begin()
-	rv.do_reverb_backup(OrderedDict(entries), v1, rv.VaultEntry(0, v0, 0, 0, 0), False, manifest, mon, job_name='job')
-	commit(1, [rv.entry_row(path, values) for path, values in entries.items()])
+	# with touched scopes, as a daemon's batch has them: the verification after the replay writes its rows too
+	verified = []
+	rv.do_reverb_backup(OrderedDict(entries), v1, rv.VaultEntry(0, v0, 0, 0, 0), False, manifest, mon, job_name='job',
+		touched=rv.touched_scopes(events, mon), verified=verified)
+	commit(1, [rv.entry_row(path, values) for path, values in entries.items()] + [rv.entry_row(path, values) for path, values in verified])
 	manifest.close()
 	return job_vault, v0, v1, mon
 
@@ -507,10 +512,159 @@ def test_after_the_worst_cut_every_lost_copy_is_linked_back_and_nothing_else(tmp
 	rv.decrement_stepper(info, 'job', mon, prune_salt=b's' * 16)
 	assert list(info) == [1] and not os.path.exists(v0)
 	after = {rel for path, rel, is_dir in rv.iter_tree_entries(v1) if not is_dir}
-	assert len(links) == 99
+	assert len(links) == 98          # 99 before the verification deleted p7/f/b, which the folder create left
 	assert sorted(set(links) - after) == []          # none missed
 	assert sorted(after - held) == []                # nothing V1 had dropped shown again
 	assert [rel for rel, inode in links.items() if os.lstat(os.path.join(v1, rel)).st_ino != inode] == []
+
+
+# --- the rule on replays of batches whose verification and moves interact (from the round 17 review) ---
+
+def change(job, t, is_dir, event, rel, src=None):
+	return rv.ChangeEvent(t, is_dir, event, os.path.join(job.monitor, rel), None if src is None else os.path.join(job.monitor, src))
+
+
+def replay(job, events, before_verification=None, monkeypatch=None):
+	'''A batch of raw events replayed and verified as the daemon does it; before_verification runs between the two.'''
+	entries = rv.change_events_to_backup_entries(events, job.monitor)
+	if before_verification is not None:
+		real = rv.compare_scopes
+		def compare(*args, **kwargs):
+			before_verification()
+			return real(*args, **kwargs)
+		monkeypatch.setattr(rv, 'compare_scopes', compare)
+	run_backup(job, entries, touched=rv.touched_scopes(events, job.monitor))
+	if before_verification is not None:
+		monkeypatch.setattr(rv, 'compare_scopes', real)
+
+
+def worst_cut_prune(job, monkeypatch):
+	'''
+	The worst cut: every chain link of V1 into V0 removed, the marker naming V0, then the prune. (what V1 held, the links
+	it had into V0 as rel -> V0's inode, V1's files after the prune as rel -> inode)
+	'''
+	as_pool(monkeypatch)
+	v0, v1 = (version.path for version in rv.list_versions(job.job_vault)[:2])
+	moves = rv.VaultMoves(job.job_vault, job.monitor, None).of(v1)
+	held, links = set(), {}
+	for path, rel, is_dir in rv.iter_tree_entries(v1):
+		if is_dir:
+			continue
+		held.add(rel)
+		if os.path.islink(path):
+			target = rv.vault_chain_hop(job.job_vault, path, os.readlink(path), moves)
+			if target is not None and target.startswith(v0 + '/'):
+				links[rel] = os.lstat(target).st_ino
+	for rel in links:
+		os.unlink(os.path.join(v1, rel))
+	rv.write_prune_marker(job.job_vault, os.path.basename(v0))
+	rv.VERSION_MOVES.clear()
+	info = rv.get_vault_info(job.job_vault).vault_info_dict
+	rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=b's' * 16)
+	after = {rel: os.lstat(path).st_ino for path, rel, is_dir in rv.iter_tree_entries(v1) if not is_dir}
+	return held, links, after
+
+
+@pytest.mark.parametrize('order', ['g_first', 'h_first'])
+def test_a_move_over_a_file_then_a_folder_move_links_back_the_moved_file_whatever_the_walk_order(tmp_path, monkeypatch, order):
+	# mv d/g d/h (over d/h); mv d e: V0's d/h and d/g both place at e/h, and only d/g's copy belongs there
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'d/g': 'G' * 50, 'd/h': 'H' * 50, 'keep': 'k' * 50})
+	run_backup(job)
+	os.replace(os.path.join(job.monitor, 'd/g'), os.path.join(job.monitor, 'd/h'))
+	os.rename(os.path.join(job.monitor, 'd'), os.path.join(job.monitor, 'e'))
+	replay(job, [change(job, 1.0, False, 'move', 'd/h', 'd/g'), change(job, 2.0, True, 'move', 'e', 'd')])
+	v0, v1 = (version.path for version in rv.list_versions(job.job_vault)[:2])
+	g_inode = os.lstat(os.path.join(v0, 'd/g')).st_ino
+	real = rv.iter_tree_entries
+	def ordered(path, *args, **kwargs):
+		items = list(real(path, *args, **kwargs))
+		if os.path.abspath(path) == os.path.abspath(v0):
+			files = sorted((i for i in items if not i[2]), key=lambda i: i[1], reverse=(order == 'h_first'))
+			items = [i for i in items if i[2]] + files
+		return iter(items)
+	monkeypatch.setattr(rv, 'iter_tree_entries', ordered)
+	held, links, after = worst_cut_prune(job, monkeypatch)
+	monkeypatch.undo()
+	assert sorted(links) == ['e/h', 'keep'] and links['e/h'] == g_inode
+	assert after == links and open(os.path.join(v1, 'e/h')).read() == 'G' * 50
+
+
+def test_the_moves_of_a_version_tell_a_file_moved_over_from_one_moved_on():
+	moves = rv.VersionMoves.applied([('d/g', 'd/h', False), ('d/', 'e/', True), ('c', 'e/h', False), ('e/k', 'k', False)])
+	# d/h is overwritten by the first move; d/g is moved on to e/h, which c's move then overwrites; c is the one left there;
+	# e/k is under the folder the second move lands on
+	assert [moves.place(rel) for rel in ('d/h', 'd/g', 'c', 'd/k', 'e/k', 'a')] == [
+		(None, True), (None, True), ('e/h', True), ('k', True), (None, True), ('a', False)]
+
+
+def test_a_new_file_at_a_moved_folders_old_path_that_is_gone_before_the_verification_loses_no_copy(tmp_path, monkeypatch):
+	# mv D E; mkdir D; echo > D/x; D/x removed between the replay and its verification, whose delete row of D/x names the new
+	# file, not V0's D/x that went to E/x
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/x': 'x' * 50, 'D/z': 'z' * 50, 'keep': 'k' * 50})
+	run_backup(job)
+	os.rename(os.path.join(job.monitor, 'D'), os.path.join(job.monitor, 'E'))
+	os.mkdir(os.path.join(job.monitor, 'D'))
+	with open(os.path.join(job.monitor, 'D/x'), 'w') as f:
+		f.write('new x')
+	gone = lambda: os.path.lexists(os.path.join(job.monitor, 'D/x')) and os.remove(os.path.join(job.monitor, 'D/x'))
+	replay(job, [change(job, 1.0, True, 'move', 'E', 'D'), change(job, 2.0, True, 'create', 'D'), change(job, 3.0, False, 'create', 'D/x')],
+		before_verification=gone, monkeypatch=monkeypatch)
+	v0, v1 = (version.path for version in rv.list_versions(job.job_vault)[:2])
+	x_inode = os.lstat(os.path.join(v0, 'D/x')).st_ino
+	held, links, after = worst_cut_prune(job, monkeypatch)
+	assert 'E/x' in links and after['E/x'] == x_inode
+	assert sorted(set(links) - set(after)) == [] and sorted(set(after) - held) == []
+
+
+def test_a_delete_before_a_folder_move_still_drops_what_it_names(tmp_path, monkeypatch):
+	# rm D/x; mv D E: the delete runs before the move and names V0's D/x, so its copy is not linked back
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'D/x': 'x' * 50, 'D/z': 'z' * 50, 'keep': 'k' * 50})
+	run_backup(job)
+	os.remove(os.path.join(job.monitor, 'D/x'))
+	os.rename(os.path.join(job.monitor, 'D'), os.path.join(job.monitor, 'E'))
+	replay(job, [change(job, 1.0, False, 'delete', 'D/x'), change(job, 2.0, True, 'move', 'E', 'D')])
+	v1 = rv.list_versions(job.job_vault)[1].path
+	assert not os.path.lexists(os.path.join(v1, 'E/x'))
+	held, links, after = worst_cut_prune(job, monkeypatch)
+	assert sorted(links) == ['E/z', 'keep'] and sorted(after) == ['E/z', 'keep']
+
+
+def test_a_place_in_a_users_symlinked_folder_is_not_linked_into_after_a_cut(tmp_path, monkeypatch):
+	# V1 holds a user's symlink in the place of V0's folder d; rows that cannot be used link back at the file's own path,
+	# which must not follow that symlink out of the vault
+	job = create_job(str(tmp_path))
+	seed_monitor(job, {'d/f': 'f' * 50, 'keep': 'k' * 50})
+	run_backup(job)
+	outside = str(tmp_path / 'outside')
+	os.makedirs(outside)
+	shutil.rmtree(os.path.join(job.monitor, 'd'))
+	os.symlink(outside, os.path.join(job.monitor, 'd'))
+	replay(job, [change(job, 1.0, True, 'delete', 'd'), change(job, 2.0, False, 'create', 'd')])
+	assert os.path.islink(os.path.join(rv.list_versions(job.job_vault)[1].path, 'd'))
+	monkeypatch.setattr(rv, 'rows_dropping', lambda *args: (_ for _ in ()).throw(ValueError('a row outside /elsewhere')))
+	worst_cut_prune(job, monkeypatch)
+	assert os.listdir(outside) == []
+
+
+def test_a_temp_whose_link_was_unlinked_on_one_disk_and_not_renamed_on_the_other_goes_with_the_relink(tmp_path, monkeypatch):
+	# the copy's disk has the temp's link but not its rename, the link's disk has the link's unlink: link_back() links the
+	# copy in the link's place, and the temp is the one name left of it
+	job = three_versions(tmp_path)
+	as_pool(monkeypatch)
+	v0, v1 = (version.path for version in rv.list_versions(job.job_vault)[:2])
+	salt = b's' * 16
+	link = os.path.join(v1, 'a')
+	copy_st = os.lstat(os.path.join(v0, 'a'))
+	temp = rv.prune_link_path(link, copy_st, salt)
+	os.link(os.path.join(v0, 'a'), temp)
+	os.unlink(link)
+	rv.write_prune_marker(job.job_vault, os.path.basename(v0))
+	prune(job)
+	assert open(link).read() == 'a' and os.lstat(link).st_ino == copy_st.st_ino
+	assert not os.path.lexists(temp)
 
 
 # --- every cut state on a real mergerfs pool of three folders ---
