@@ -6973,6 +6973,34 @@ def in_row_order(pool:ThreadPoolExecutor, rows, work, handled, stop:threading.Ev
 		submit(chunk)
 	handle(0)
 
+def referenced_link_text(source_path:str, backup_folder:str, relative:bool):
+	'''
+	The function giving the text of the link do_referenced_copy() makes at backup_folder/<file> to source_path/<file>,
+	for a file row (is_entry_rel(), and no trailing /): with relative, os.path.relpath() of source_path/<file> from the
+	link's folder, else os.path.abspath() of it. Both are put together as text: the ../ for each folder of file, then
+	the path from backup_folder to source_path (or source_path itself), then file. When one of the two folders holds
+	the other, a path from one to the other can share its parts with file, so each text is os.path.relpath()'s own.
+
+	Examples:
+		>>> text = referenced_link_text('/v/job/V2--x', '/v/job/V3--y', True)
+		>>> [text(file) for file in ('a', 'd/e/f', '..a', 'a b/c d')]
+		['../V2--x/a', '../../../V2--x/d/e/f', '../V2--x/..a', '../../V2--x/a b/c d']
+		>>> referenced_link_text('/m/', '/v//job/V0--z', False)('d/f'), referenced_link_text('/', '/v', False)('f')
+		('/m/d/f', '/f')
+		>>> referenced_link_text('/v', '/v/d', True)('d/f') == os.path.relpath('/v/d/f', '/v/d/d')
+		True
+	'''
+	if not relative:
+		prefix = os.path.abspath(source_path)
+		prefix = prefix if prefix.endswith('/') else prefix + '/'
+		return lambda file: prefix + file
+	source_parts = [part for part in os.path.abspath(source_path).split('/') if part]
+	backup_parts = [part for part in os.path.abspath(backup_folder).split('/') if part]
+	if source_parts[:len(backup_parts)] == backup_parts or backup_parts[:len(source_parts)] == source_parts:
+		return lambda file: os.path.relpath(os.path.join(source_path, file), os.path.dirname(os.path.join(backup_folder, file)))
+	between = os.path.relpath(source_path, backup_folder) + '/'
+	return lambda file: '../' * file.count('/') + between + file
+
 def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None,unsynced:list = None) -> bool:
 	'''
 	Recreate the folders tracked in manifest under backup_folder and link each tracked file to its copy under source_path.
@@ -7001,6 +7029,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	made = set()
 	count = {'files': 0, 'folders': 0}
 	stop = threading.Event()
+	link_text = referenced_link_text(source_path, backup_folder, relative)
 	def check():
 		# after each entry, on its thread
 		if pool_guard is not None:
@@ -7059,12 +7088,8 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			# through it into source_path. the folder keeps what its rows hold, and a comparison of that place copies the
 			# file if the tree holds it
 			return lines + [(False, f'Dropping tracked file {file}: it is a folder in {source_path}')], 'dropped', None
-		source_file_real = os.path.join(source_path,file)
 		backup_file_path = os.path.join(backup_folder,file)
-		if relative:
-			source_file = os.path.relpath(source_file_real,os.path.dirname(backup_file_path))
-		else:
-			source_file = os.path.abspath(source_file_real)
+		source_file = link_text(file)
 		try:
 			referenced_link(source_file, backup_file_path)
 			return lines, 'linked', None
