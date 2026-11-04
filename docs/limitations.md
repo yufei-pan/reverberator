@@ -475,13 +475,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** a prune records the times of each folder of the next version before its first write
   there and gives them back after the walk, even when the walk fails. A prune killed or cut by a power loss before that
-  leaves those folders with the time of the prune's writes, and the rerun gives back the times it finds; a restore of
-  that version gives those folders that time until a full comparison sets the newest version's folders right again.
-  Files and their times are untouched.
+  leaves those folders with the time of the prune's writes, and the rerun gives back the times it finds, so a restore of
+  that version gives those folders that time. When that version is the newest (a vault kept to two versions, or one a
+  size limit brings down to one), later versions inherit it until a batch writes into or changes the folder; comparisons
+  do not see it, as records hold the monitored folders' times. Files and their times are untouched.
 - **Why:** keeping the old times through a kill would need them written to disk before the walk, for a rare case that
   affects folder times only.
 - **Revisit when:** such times are seen after a crash, or the prune gets a journal for another reason.
-- **Approved:** 2026-11-04, the user's choice "All three (Recommended)".
+- **Approved:** 2026-11-04, the user's choice "All three (Recommended)"; reworded the same day, the user's choice
+  "Reword it (Recommended)".
 
 ### A folder whose extended attributes alone fail to copy keeps the wrong ones
 
