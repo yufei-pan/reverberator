@@ -3836,19 +3836,27 @@ def mount_id_at(mount_table:list, mount_point:str):
 def f2fs_failed(mount_table:list, mount_point:str) -> bool:
 	'''
 	Whether the f2fs mounted at mount_point (the topmost mount there) has stopped on an error; False when it is not f2fs,
-	or when that cannot be told: a kernel without stat/cp_status, or a device sysfs does not know, is warned of once per
-	mount point and taken for whole, as nothing says it failed. Raises OSError when its checkpoint status cannot be read.
+	or when only its checkpoint status is missing from a sysfs folder that is there (an old kernel): warned of once per
+	mount point and taken for whole, as nothing says it failed. Raises OSError when it cannot be told: its device is gone
+	(ENODEV, as for a disk the kernel removed that stays mounted), its sysfs folder is not there, or its status cannot be read.
 	'''
 	fingerprints = [fingerprint for point, fingerprint in mount_table if point == mount_point]
 	if not fingerprints or fingerprints[-1][4:5] != (F2FS_FSTYPE,):
 		return False
 	# sysfs names it after its device, which mountinfo's major:minor finds whatever the source is called (/dev/root,
-	# /dev/mapper/x, UUID=...): /sys/dev/block/<major:minor> leads to sda1, dm-<n>, nvme0n1p1
-	device = os.path.basename(os.path.realpath(os.path.join(SYS_DEV_BLOCK_PATH, os.fsdecode(fingerprints[-1][1]))))
+	# /dev/mapper/x, UUID=...): /sys/dev/block/<major:minor> leads to sda1, dm-<n>, nvme0n1p1. It goes with the device
+	# when the kernel removes it, while /sys/fs/f2fs/<device> stays until umount, with the error flag set
+	major_minor = os.fsdecode(fingerprints[-1][1])
+	link = os.path.join(SYS_DEV_BLOCK_PATH, major_minor)
+	if not os.path.lexists(link):
+		raise OSError(errno.ENODEV, f'its device {major_minor} is gone')
+	device = os.path.basename(os.path.realpath(link))
 	try:
 		with open(os.path.join(F2FS_SYSFS_PATH, device, 'stat', 'cp_status'), 'rb') as f:
 			return bool(int(f.read(), 16) & F2FS_CP_ERROR_FLAG)
 	except FileNotFoundError:
+		if not os.path.isdir(os.path.join(F2FS_SYSFS_PATH, device)):
+			raise
 		if mount_point not in F2FS_UNTOLD:
 			F2FS_UNTOLD.add(mount_point)
 			backuperTeeLogToTl(mount_point, f'Cannot tell whether the f2fs disk {mount_point} has failed: {os.path.join(F2FS_SYSFS_PATH, device, "stat", "cp_status")} is not there. Taking it for whole', warning=True)
@@ -8809,9 +8817,10 @@ def rows_dropping(change_list:str, monitor:str) -> tuple:
 	r"""
 	(deleted, landed) of the change list at change_list, read under monitor, the monitored path its version was written
 	under (absolute and normalised), as rels for the check of a prune cut off before its flush (decrement_stepper()):
-	deleted, the paths of its deletes that its replay runs before its moves (every delete but one whose path held the
-	source of a move listed before it, or lies under a folder that one moved, which the replay runs after that move,
-	and so names what is there then, not the file of the version below), a folder's ending with /; landed, the
+	deleted, the paths of its deletes that its replay runs before its moves (every delete but one at or above the
+	source of a move listed before it, which the replay runs after that move, and one under a folder such a move took
+	away: listed after the move, it is a row of the verification, which comes after the moves, and names what was made
+	at that place since, not the file of the version below), a folder's ending with /; landed, the
 	files its create, modify, move and recopy rows land on. A file of the version below is gone from this version only
 	through one of those: a delete of it or of a folder above it, or, when no move took it, a row landing on it. Raises
 	ValueError for a row outside monitor, OSError when the list cannot be read.

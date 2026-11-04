@@ -1,5 +1,6 @@
 import errno
 import os
+import shutil
 import pytest
 import reverberator as rv
 from tests.harness import write_fstab
@@ -244,3 +245,21 @@ def test_an_f2fs_disk_without_a_checkpoint_status_is_taken_for_whole_and_warned_
 	assert rv.vault_disk_problem(vault) is None and rv.vault_disk_problem(vault) is None
 	assert len(warnings) == 1 and warnings[0][1] == {'warning': True}
 	assert 'Cannot tell whether the f2fs disk' in warnings[0][0] and status in warnings[0][0]
+
+
+def test_a_plain_f2fs_disk_whose_device_is_gone_is_named_even_with_its_error_flag_set(tmp_path, fake_pool):
+	# a SAS disk dropped off its HBA: /sys/fs/f2fs/sdn stays with CP_ERROR_FLAG, /sys/dev/block/<major:minor> goes
+	disk, status = f2fs_mount_named_by_its_device(tmp_path, fake_pool, '/dev/sdn', 'sdn')
+	vault = os.path.join(disk, 'reverb')
+	assert rv.vault_disk_problem(vault) is None
+	major_minor = f'0:{fake_pool.mounted_as[disk][2]}'
+	os.remove(os.path.join(fake_pool.sys_dev_block, major_minor))
+	with open(status, 'w') as f:
+		f.write(f'{fake_pool.F2FS_WHOLE | 0x8:x}\n')
+	assert rv.vault_disk_problem(vault) == f'disk {disk} cannot be read: its device {major_minor} is gone'
+
+
+def test_a_plain_f2fs_disk_with_no_sysfs_folder_cannot_be_read(tmp_path, fake_pool):
+	disk, status = f2fs_mount_named_by_its_device(tmp_path, fake_pool, '/dev/sda2', 'sda2')
+	shutil.rmtree(os.path.dirname(os.path.dirname(status)))
+	assert rv.vault_disk_problem(os.path.join(disk, 'reverb')) == f'disk {disk} cannot be read: {os.strerror(errno.ENOENT)}'

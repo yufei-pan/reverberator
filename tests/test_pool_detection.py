@@ -1,6 +1,7 @@
 import ctypes
 import errno
 import os
+import shutil
 import sys
 import threading
 import time
@@ -101,6 +102,50 @@ def test_an_f2fs_disk_without_its_checkpoint_status_cannot_be_told_and_is_taken_
 	os.remove(fake_pool.f2fs_status(c))
 	assert rv.pool_problem(pool2) is None
 	assert dict(rv.pool_state(pool2).ids)[c] is not None
+
+
+def remove_block_link(fake_pool, disk:str):
+	"""The kernel removing the device of an f2fs disk that stays mounted: its /sys/dev/block/<major:minor> link goes."""
+	major_minor = f'0:{fake_pool.mounted_as[disk][2]}'
+	os.remove(os.path.join(fake_pool.sys_dev_block, major_minor))
+	return major_minor
+
+
+@pytest.mark.unit
+def test_an_f2fs_disk_whose_device_is_gone_is_named_even_with_its_error_flag_set(fake_pool, f2fs_pool):
+	# a SAS disk dropped off its HBA: /sys/fs/f2fs/<device> stays with CP_ERROR_FLAG until umount, /sys/dev/block/<major:minor> goes
+	pool2, c, _ = f2fs_pool
+	assert rv.pool_problem(pool2) is None
+	major_minor = remove_block_link(fake_pool, c)
+	fake_pool.fail_disk(c)
+	assert rv.pool_problem(pool2) == f'disk {c} of pool {pool2} cannot be read: its device {major_minor} is gone'
+	assert dict(rv.pool_state(pool2).ids)[c] is None
+
+
+@pytest.mark.unit
+def test_an_f2fs_disk_whose_device_is_gone_is_named_without_the_flag_too(fake_pool, f2fs_pool):
+	pool2, c, _ = f2fs_pool
+	major_minor = remove_block_link(fake_pool, c)
+	assert rv.pool_problem(pool2) == f'disk {c} of pool {pool2} cannot be read: its device {major_minor} is gone'
+
+
+@pytest.mark.unit
+def test_an_f2fs_disk_with_no_sysfs_folder_cannot_be_read(fake_pool, f2fs_pool):
+	pool2, c, _ = f2fs_pool
+	shutil.rmtree(os.path.dirname(os.path.dirname(fake_pool.f2fs_status(c))))
+	assert rv.pool_problem(pool2) == f'disk {c} of pool {pool2} cannot be read: {os.strerror(errno.ENOENT)}'
+	assert dict(rv.pool_state(pool2).ids)[c] is None
+
+
+@pytest.mark.unit
+def test_an_f2fs_disk_without_its_checkpoint_status_is_warned_of_once_per_mount_point(fake_pool, f2fs_pool, monkeypatch):
+	pool2, c, d = f2fs_pool
+	os.remove(fake_pool.f2fs_status(c))
+	warnings = []
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda path, message, **kwargs: warnings.append((message, kwargs)))
+	assert rv.pool_problem(pool2) is None and rv.pool_problem(pool2) is None
+	assert len(warnings) == 1 and warnings[0][1] == {'warning': True}
+	assert 'Cannot tell whether the f2fs disk' in warnings[0][0] and c in warnings[0][0]
 
 
 @pytest.mark.unit
