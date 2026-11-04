@@ -7273,13 +7273,13 @@ def copy_new_folder_meta(source_folder:str, backup_folder_path:str, st, failed:l
 	'''
 	copy_file_meta() of the folder source_folder onto the folder this copy just made at backup_folder_path, st being
 	source_folder's lstat (False or None when there is none): its owner, mode and times by a request each, from st,
-	when neither has extended attributes, as copy_file_meta() would set them. Anything else (attributes on either side,
-	ACLs among them, a folder that cannot be listed, a request that fails, no st) goes to copy_file_meta() from the
-	start, which writes its own lines and appends to failed as ever.
+	when neither has extended attributes (a filesystem that keeps none has none: xattr_names()), as copy_file_meta()
+	would set them. Anything else (attributes on either side, ACLs among them, a folder that cannot be listed, a request
+	that fails, no st) goes to copy_file_meta() from the start, which writes its own lines and appends to failed as ever.
 	'''
 	if st and os.name == 'posix':
 		try:
-			if not os.listxattr(source_folder, follow_symlinks=False) and not os.listxattr(backup_folder_path, follow_symlinks=False):
+			if not xattr_names(source_folder) and not xattr_names(backup_folder_path):
 				os.chown(backup_folder_path, st.st_uid, st.st_gid)
 				os.chmod(backup_folder_path, stat.S_IMODE(st.st_mode))
 				os.utime(backup_folder_path, ns=(st.st_atime_ns, st.st_mtime_ns))

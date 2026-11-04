@@ -422,3 +422,38 @@ def test_a_stopped_copy_says_it_stopped(job, monkeypatch, logged):
 	line = [message for kind, message in logged if message.startswith('Stopped making the referenced copy of ')]
 	assert len(line) == 1 and line[0].endswith(f' threads') and not any(message.startswith('Made the referenced copy of ') for _, message in logged)
 	manifest.close()
+
+
+@pytest.mark.parametrize('code', [errno.ENOTSUP, errno.ENOSYS])
+def test_a_filesystem_without_attributes_takes_the_fast_path(tmp_path, monkeypatch, logged, code):
+	# a mergerfs pool switched to xattr=nosys lists no attributes, as xattr_names() has it: no folder goes to copy_file_meta()
+	source, by_meta, by_fast = (str(tmp_path / name) for name in ('s', 'm', 'f'))
+	for folder in (source, by_meta, by_fast):
+		os.mkdir(folder)
+	os.chmod(source, 0o705)
+	os.utime(source, ns=(1_000_000_000_123, 2_000_000_000_456))
+	def listxattr(path, *args, **kwargs):
+		raise OSError(code, os.strerror(code), path)
+	monkeypatch.setattr(os, 'listxattr', listxattr)
+	monkeypatch.setattr(rv, 'copy_file_meta', lambda *args, **kwargs: pytest.fail('the folder went to copy_file_meta()'))
+	assert rv.copy_new_folder_meta(source, by_fast, os.lstat(source)) is True
+	st = os.lstat(by_fast)
+	assert (stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns) == (0o705, 1_000_000_000_123, 2_000_000_000_456)
+	assert not [line for line in logged if line[0] == 'error']
+
+
+def test_a_filesystem_without_attributes_ends_as_copy_file_meta_has_it(tmp_path, monkeypatch, logged):
+	source, by_meta, by_fast = (str(tmp_path / name) for name in ('s', 'm', 'f'))
+	for folder in (source, by_meta, by_fast):
+		os.mkdir(folder)
+	os.chmod(source, 0o750)
+	os.utime(source, ns=(1_000_000_000_123, 2_000_000_000_456))
+	def listxattr(path, *args, **kwargs):
+		raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP), path)
+	monkeypatch.setattr(os, 'listxattr', listxattr)
+	failed = []
+	assert rv.copy_file_meta(source, by_meta, failed) is True
+	assert rv.copy_new_folder_meta(source, by_fast, os.lstat(source)) is True
+	look = lambda path: (lambda st: (st.st_mode, st.st_uid, st.st_gid, st.st_atime_ns, st.st_mtime_ns))(os.lstat(path))
+	assert look(by_fast) == look(by_meta)
+	assert not failed and not [line for line in logged if line[0] == 'error']

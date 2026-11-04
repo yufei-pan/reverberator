@@ -111,7 +111,10 @@ def logged(monkeypatch):
 
 def failing_requests(monkeypatch, rng):
 	'''Make listxattr, getxattr and chown fail for the names saying so, with an errno picked for this seed.'''
-	listing, reading, owning = (rng.choice([errno.EACCES, errno.EIO, errno.ENOTSUP, errno.ENOSYS, errno.ENODATA]) for _ in range(3))
+	# a listing's ENOSYS is left out: shutil.copystat() fails on it, as copy_file_meta() does, and the folder fast path takes it
+	# for a filesystem without attributes, as xattr_names() does (test_a_filesystem_without_attributes_takes_the_fast_path)
+	listing = rng.choice([errno.EACCES, errno.EIO, errno.ENOTSUP, errno.ENODATA])
+	reading, owning = (rng.choice([errno.EACCES, errno.EIO, errno.ENOTSUP, errno.ENOSYS, errno.ENODATA]) for _ in range(2))
 	real_list, real_get, real_chown = os.listxattr, os.getxattr, os.chown
 	def named(path, part):
 		return part in os.path.basename(os.fspath(path).rstrip('/'))
