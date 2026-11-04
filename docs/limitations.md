@@ -64,6 +64,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** reverberator runs on an older kernel.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
 
+### Kernels without f2fs's checkpoint status
+
+- **Kind:** known limitation.
+- **What the operator sees:** on a kernel whose f2fs has no `stat/cp_status` in sysfs (before about 6.1), a failed f2fs
+  disk (a vault on one SSD, or a pool's disk) is warned of once and taken for whole, so its jobs do not pause; they fail
+  on their writes and retry instead. A removed device or a missing f2fs sysfs folder still pauses them. This host runs
+  7.0, which has the file.
+- **Why:** that file is the only place f2fs reports a checkpoint error; without it a failed f2fs reads like a healthy
+  one, and taking a disk that cannot be told for failed would stop its jobs for good.
+- **Revisit when:** reverberator runs on such a kernel.
+- **Approved:** 2026-11-04, the user's choice "Both (Recommended)".
+
 ### A disk that is dying but not yet failed
 
 - **Kind:** known limitation.
@@ -274,12 +286,13 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** all comparisons' vault syncs take one lock, and so do the two flushes of a prune on a
   mergerfs pool (since 0.53), so a write error is marked before another job syncs that disk; a vault disk that hangs in a
-  sync (SCSI timeouts, a link-reset loop) stalls every job's checked records and every prune on a pool, on any pool, not
-  only the jobs on that disk.
+  sync (SCSI timeouts, a link-reset loop) stalls every job's checked records, every prune on a pool and the vault scan's
+  flush before it removes a stale change list on a pool, on any pool, not only the jobs on that disk.
 - **Why:** a lock per disk needs a lock table; on this host every vault is on /mnt/vaults.
 - **Revisit when:** a host keeps vaults on several pools.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)". Widened to the prune's flushes on
-  2026-11-03, the user's choice "Widen the wording (Recommended)".
+  2026-11-03, the user's choice "Widen the wording (Recommended)", and to the scan's flush on 2026-11-04, the user's
+  choice "Both (Recommended)".
 
 ### A failed sync that cannot be recorded, after a restart
 
@@ -443,13 +456,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** after a power loss, a dropped disk or a stop in the middle of a prune on a mergerfs pool,
-  the next prune links back from the oldest version what the next version lost. In one rare batch shape (a file moved
-  onto a new name, then that name moved out of the watched tree while its move waited for its pair, so the batch's
-  verification deleted it) the repair also puts the moved file back at the new name, so a restore of that version shows
-  one file the tree did not have at that time. No copy is lost.
-- **Why:** the version's change list holds the move and then a delete at the same path, the same rows a batch without a
-  verification writes for a file it really dropped and one it kept; telling them apart would make the repair miss real
-  files after a resumed batch, which loses copies. An extra file is the safer side.
+  the next prune links back from the oldest version what the next version lost. In two batch shapes it also brings back
+  a file that version had dropped, so a restore of that version shows one file the tree did not have at that time: a
+  file deleted in or under a folder the same batch renamed (`mv D E; rm E/x`, or a new `D/x` made and removed at the old
+  path), and a file moved onto a new name that then left the watched tree while its move waited for its pair (the
+  batch's verification deleted it). A deleted subfolder does not come back. No copy is lost.
+- **Why:** the version's change list holds the move and then a delete that names the moved layout, the same rows it
+  holds when the delete named the old layout; reading such a delete back through the moves would make the repair miss
+  real files when it is read wrong, which loses copies. An extra file is the safer side.
 - **Revisit when:** such an extra file is seen after a repair, or the change list records which rows the verification
   wrote.
-- **Approved:** 2026-11-03, the user's choice "Known limitation (Recommended)".
+- **Approved:** 2026-11-03, the user's choice "Known limitation (Recommended)"; widened to the renamed-folder shapes
+  on 2026-11-04, the user's choice "Widen it (Recommended)".
