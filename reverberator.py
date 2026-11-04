@@ -8819,8 +8819,10 @@ def rows_dropping(change_list:str, monitor:str) -> tuple:
 	under (absolute and normalised), as rels for the check of a prune cut off before its flush (decrement_stepper()):
 	deleted, the paths of its deletes that its replay runs before its moves (every delete but one at or above the
 	source of a move listed before it, which the replay runs after that move, and one under a folder such a move took
-	away: listed after the move, it is a row of the verification, which comes after the moves, and names what was made
-	at that place since, not the file of the version below), a folder's ending with /; landed, the
+	away: listed after the move, it is taken for a row naming what was made at that place since (the verification's, which
+	come after the moves), not the file of the version below; when it does name that file, as for a folder moved into
+	the old path and a file deleted there, the repair brings the file back, an extra file and never a lost copy, which
+	docs/limitations.md records), a folder's ending with /; landed, the
 	files its create, modify, move and recopy rows land on. A file of the version below is gone from this version only
 	through one of those: a delete of it or of a folder above it, or, when no move took it, a row landing on it. Raises
 	ValueError for a row outside monitor, OSError when the list cannot be read.

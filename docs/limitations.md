@@ -457,10 +457,11 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** after a power loss, a dropped disk or a stop in the middle of a prune on a mergerfs pool,
   the next prune links back from the oldest version what the next version lost. In two batch shapes it also brings back
-  a file that version had dropped, so a restore of that version shows one file the tree did not have at that time: a
-  file deleted in or under a folder the same batch renamed (`mv D E; rm E/x`, or a new `D/x` made and removed at the old
-  path), and a file moved onto a new name that then left the watched tree while its move waited for its pair (the
-  batch's verification deleted it). A deleted subfolder does not come back. No copy is lost.
+  files that version had dropped, so a restore of that version shows files the tree did not have at that time: a file
+  deleted in or under a folder the same batch renamed (`mv D E; rm E/x`, or a folder moved into the old path and a file
+  deleted there, `mv D E; mv F D; rm D/w`; with `mv D E; rm -r E/sub; mkdir E/sub` every file E/sub held comes back),
+  and a file moved onto a new name that then left the watched tree while its move waited for its pair (the batch's
+  verification deleted it). A subfolder deleted and not made again does not come back. No copy is lost.
 - **Why:** the version's change list holds the move and then a delete that names the moved layout, the same rows it
   holds when the delete named the old layout; reading such a delete back through the moves would make the repair miss
   real files when it is read wrong, which loses copies. An extra file is the safer side.
