@@ -95,10 +95,12 @@ def test_a_failed_f2fs_disk_is_told_by_its_checkpoint(fake_pool, f2fs_pool):
 
 
 @pytest.mark.unit
-def test_an_f2fs_disk_without_its_checkpoint_status_cannot_be_read(fake_pool, f2fs_pool):
+def test_an_f2fs_disk_without_its_checkpoint_status_cannot_be_told_and_is_taken_for_whole(fake_pool, f2fs_pool):
+	# a kernel without stat/cp_status says nothing of a failure: the pool does not wait for it (one warning, in the log)
 	pool2, c, _ = f2fs_pool
 	os.remove(fake_pool.f2fs_status(c))
-	assert rv.pool_problem(pool2) == f'disk {c} of pool {pool2} cannot be read: {os.strerror(errno.ENOENT)}'
+	assert rv.pool_problem(pool2) is None
+	assert dict(rv.pool_state(pool2).ids)[c] is not None
 
 
 @pytest.mark.unit

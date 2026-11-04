@@ -3755,6 +3755,10 @@ STATX_SIZE = 256
 F2FS_FSTYPE = b'f2fs'
 F2FS_SYSFS_PATH = '/sys/fs/f2fs'
 F2FS_CP_ERROR_FLAG = 0x8
+# the device of a mount by its major:minor, which names it in F2FS_SYSFS_PATH; and the f2fs mount points already warned of
+# for lacking a checkpoint status
+SYS_DEV_BLOCK_PATH = '/sys/dev/block'
+F2FS_UNTOLD = set()
 
 def load_statx():
 	'''libc's statx(), None when this libc has none.'''
@@ -3831,16 +3835,24 @@ def mount_id_at(mount_table:list, mount_point:str):
 
 def f2fs_failed(mount_table:list, mount_point:str) -> bool:
 	'''
-	Whether the f2fs mounted at mount_point (the topmost mount there) has stopped on an error; False when it is not f2fs.
-	Raises OSError when its checkpoint status cannot be read.
+	Whether the f2fs mounted at mount_point (the topmost mount there) has stopped on an error; False when it is not f2fs,
+	or when that cannot be told: a kernel without stat/cp_status, or a device sysfs does not know, is warned of once per
+	mount point and taken for whole, as nothing says it failed. Raises OSError when its checkpoint status cannot be read.
 	'''
 	fingerprints = [fingerprint for point, fingerprint in mount_table if point == mount_point]
 	if not fingerprints or fingerprints[-1][4:5] != (F2FS_FSTYPE,):
 		return False
-	# sysfs names it after the device its source resolves to: /dev/mapper/x is there as dm-<n>
-	device = os.path.basename(os.path.realpath(os.fsdecode(fingerprints[-1][3])))
-	with open(os.path.join(F2FS_SYSFS_PATH, device, 'stat', 'cp_status'), 'rb') as f:
-		return bool(int(f.read(), 16) & F2FS_CP_ERROR_FLAG)
+	# sysfs names it after its device, which mountinfo's major:minor finds whatever the source is called (/dev/root,
+	# /dev/mapper/x, UUID=...): /sys/dev/block/<major:minor> leads to sda1, dm-<n>, nvme0n1p1
+	device = os.path.basename(os.path.realpath(os.path.join(SYS_DEV_BLOCK_PATH, os.fsdecode(fingerprints[-1][1]))))
+	try:
+		with open(os.path.join(F2FS_SYSFS_PATH, device, 'stat', 'cp_status'), 'rb') as f:
+			return bool(int(f.read(), 16) & F2FS_CP_ERROR_FLAG)
+	except FileNotFoundError:
+		if mount_point not in F2FS_UNTOLD:
+			F2FS_UNTOLD.add(mount_point)
+			backuperTeeLogToTl(mount_point, f'Cannot tell whether the f2fs disk {mount_point} has failed: {os.path.join(F2FS_SYSFS_PATH, device, "stat", "cp_status")} is not there. Taking it for whole', warning=True)
+		return False
 
 # pool: the mergerfs mount point; ids: (branch realpath, mount id or None while it is missing) in branch order;
 # problem: what is wrong with the pool, or None; pool_id: the pool's own mount id.

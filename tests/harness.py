@@ -223,7 +223,7 @@ class FakePool:
 	mergerfs pools in a fake mount table file: a fuse.mergerfs line per pool and an xfs or f2fs line per branch, mount
 	ids counted up from 100. read() stands in for rv.read_pool_branches and statx_mount() for rv.statx_mount, whose
 	unique mount ids count up from 1000 on every mount. An f2fs branch's source is a /dev/mapper-like link to a dm-<n>
-	device in tmp_path/dev, with its cp_status in f2fs_sysfs. Every change rewrites the file and wakes the monitor.
+	device in tmp_path/dev, with its cp_status in f2fs_sysfs, found by its major:minor in sys_dev_block. Every change rewrites the file and wakes the monitor.
 	'''
 	ROOT_LINE = '22 1 8:1 / / rw - ext4 /dev/sda1 rw\n'
 	# ckpt_flags as the live f2fs disks show them: CP_CRC_RECOVERY_FLAG (0x40) | CP_COMPACT_SUM_FLAG (0x4)
@@ -235,6 +235,7 @@ class FakePool:
 		self.monitor = monitor
 		self.mountinfo_path = os.path.join(self.tmp_path, 'fake_mountinfo')
 		self.f2fs_sysfs = os.path.join(self.tmp_path, 'sys_fs_f2fs')
+		self.sys_dev_block = os.path.join(self.tmp_path, 'sys_dev_block')
 		self.next_id = 100
 		self.next_unique_id = 1000
 		# (real mount point, line, mountinfo id, unique id), in kernel order
@@ -277,7 +278,14 @@ class FakePool:
 		os.symlink(os.path.join('..', device), source)
 		os.makedirs(os.path.join(self.f2fs_sysfs, device, 'stat'))
 		self.set_f2fs_flags(source, self.F2FS_WHOLE)
+		self.add_block_device(f'0:{self.next_id}', device)
 		return source
+
+	def add_block_device(self, major_minor:str, device:str):
+		'''/sys/dev/block/<major:minor> leading to a device folder named device, as sysfs has it.'''
+		os.makedirs(self.sys_dev_block, exist_ok=True)
+		os.makedirs(os.path.join(self.tmp_path, 'sys_devices', device), exist_ok=True)
+		os.symlink(os.path.join('..', 'sys_devices', device), os.path.join(self.sys_dev_block, major_minor))
 
 	def f2fs_status(self, branch:str) -> str:
 		'''The cp_status file of an f2fs branch.'''

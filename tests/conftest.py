@@ -103,6 +103,8 @@ def fake_pool(tmp_path, monkeypatch):
 	monkeypatch.setattr(rv, 'read_pool_branches', pool.read)
 	monkeypatch.setattr(rv, 'statx_mount', pool.statx_mount)
 	monkeypatch.setattr(rv, 'F2FS_SYSFS_PATH', pool.f2fs_sysfs)
+	monkeypatch.setattr(rv, 'SYS_DEV_BLOCK_PATH', pool.sys_dev_block)
+	monkeypatch.setattr(rv, 'F2FS_UNTOLD', set())
 	monkeypatch.setattr(rv, 'POOL_CHECK_SECONDS', 0)
 	return pool
 

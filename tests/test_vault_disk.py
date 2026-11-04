@@ -208,3 +208,39 @@ def test_a_disk_of_a_pool_is_checked_by_the_pool_alone(tmp_path, fake_pool):
 	a, _ = fake_pool.add(pool, ['a', 'b'], fstype='f2fs')
 	fake_pool.fail_disk(a)
 	assert rv.vault_disk_problem(os.path.join(pool, 'v')) == f'disk {a} of pool {os.path.realpath(pool)} has failed: its f2fs checkpoint reports an error'
+
+
+def f2fs_mount_named_by_its_device(tmp_path, fake_pool, source, device):
+	'''An f2fs disk whose mount source is source, whatever its device is called: sysfs knows it as device, by its major:minor.'''
+	real = os.path.realpath(os.makedirs(str(tmp_path / 'ssd'), exist_ok=True) or str(tmp_path / 'ssd'))
+	line = fake_pool.line(real, 'f2fs', source)
+	fake_pool.lines.append(line)
+	fake_pool.add_block_device(f'0:{line[2]}', device)
+	os.makedirs(os.path.join(fake_pool.f2fs_sysfs, device, 'stat'))
+	status = os.path.join(fake_pool.f2fs_sysfs, device, 'stat', 'cp_status')
+	with open(status, 'w') as f:
+		f.write(f'{fake_pool.F2FS_WHOLE:x}\n')
+	fake_pool.write()
+	return real, status
+
+
+def test_an_f2fs_disk_is_found_in_sysfs_by_its_major_minor_not_by_its_source(tmp_path, fake_pool):
+	# a root f2fs shows /dev/root as its source, which is no name in /sys/fs/f2fs
+	disk, status = f2fs_mount_named_by_its_device(tmp_path, fake_pool, '/dev/root', 'sda2')
+	vault = os.path.join(disk, 'reverb')
+	assert rv.vault_disk_problem(vault) is None
+	with open(status, 'w') as f:
+		f.write(f'{fake_pool.F2FS_WHOLE | 0x8:x}\n')
+	assert rv.vault_disk_problem(vault) == f'disk {disk} has failed: its f2fs checkpoint reports an error'
+
+
+def test_an_f2fs_disk_without_a_checkpoint_status_is_taken_for_whole_and_warned_of_once(tmp_path, monkeypatch, fake_pool):
+	# a kernel without stat/cp_status: nothing says the disk failed, so its jobs do not wait for it
+	disk, status = f2fs_mount_named_by_its_device(tmp_path, fake_pool, '/dev/sda2', 'sda2')
+	os.remove(status)
+	warnings = []
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', lambda path, message, **kwargs: warnings.append((message, kwargs)))
+	vault = os.path.join(disk, 'reverb')
+	assert rv.vault_disk_problem(vault) is None and rv.vault_disk_problem(vault) is None
+	assert len(warnings) == 1 and warnings[0][1] == {'warning': True}
+	assert 'Cannot tell whether the f2fs disk' in warnings[0][0] and status in warnings[0][0]
