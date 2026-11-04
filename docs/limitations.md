@@ -323,7 +323,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** when reverberator fills a rule row's auto cells, it writes that row's resolved columns 1-12
   back: a blank cell takes its #_defaults_# row value and an auto cell reverberator's own default (a cleaned-up Job Name
   or monitored path rewrites the row too), so a later edit of the defaults row no longer reaches that job: edit the job's own row, or clear its cells, to follow
-  a changed default. Columns 13 and 14 are never written.
+  a changed default. Columns 13 to 15 are never written.
 - **Why:** filling in defaults and auto fields is how the rule file records what each job runs with.
 - **Revisit when:** a host relies on editing the defaults row for jobs already started.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
@@ -469,3 +469,51 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   wrote.
 - **Approved:** 2026-11-03, the user's choice "Known limitation (Recommended)"; widened to the renamed-folder shapes
   on 2026-11-04, the user's choice "Widen it (Recommended)".
+
+### A prune killed or cut by a power loss leaves bumped folder times
+
+- **Kind:** known limitation.
+- **What the operator sees:** a prune records the times of each folder of the next version before its first write
+  there and gives them back after the walk, even when the walk fails. A prune killed or cut by a power loss before that
+  leaves those folders with the time of the prune's writes, and the rerun gives back the times it finds; a restore of
+  that version gives those folders that time until a full comparison sets the newest version's folders right again.
+  Files and their times are untouched.
+- **Why:** keeping the old times through a kill would need them written to disk before the walk, for a rare case that
+  affects folder times only.
+- **Revisit when:** such times are seen after a crash, or the prune gets a journal for another reason.
+- **Approved:** 2026-11-04, the user's choice "All three (Recommended)".
+
+### A folder whose extended attributes alone fail to copy keeps the wrong ones
+
+- **Kind:** known limitation.
+- **What the operator sees:** when copying a folder's metadata into a version fails, the copy is tried again at the end
+  of the batch, and a folder that still fails has its record marked so the next comparison copies its owner and mode
+  again. A failure that only ever hits its extended attributes (ACLs among them) is logged with a traceback each time,
+  and the version keeps the folder's xattrs as they were, so a restore gives them back that way.
+- **Why:** records hold no xattrs, so no comparison can see that they differ; recording them would cost every entry.
+- **Revisit when:** such failures are seen in the log.
+- **Approved:** 2026-11-04, the user's choice "All three (Recommended)".
+
+### On a mergerfs pool, a folder cloned to another disk can lose setgid
+
+- **Kind:** known limitation.
+- **What the operator sees:** on a vault kept on a mergerfs pool, a folder that mergerfs clones onto another disk while
+  the replay or the prune writes into it can lose its setgid bit on that disk (a mergerfs bug: upstream
+  https://github.com/trapexit/mergerfs/issues/1689); the replay and the prune give such folders back their times only,
+  so the pool may show the folder without setgid, and a restore gives it back so. A version's folders the referenced
+  copy makes get their whole metadata after their entries, which repairs every clone.
+- **Why:** copying the whole metadata of every folder the replay or the prune writes into would cost requests on every
+  vault, for a bug of mergerfs that a vault on one disk never meets.
+- **Revisit when:** mergerfs fixes it, or a vault on a pool relies on setgid folders.
+- **Approved:** 2026-11-04, the user's choice "All three (Recommended)".
+
+### Copy threads auto cannot tell the disks under btrfs or ZFS
+
+- **Kind:** deferred.
+- **What the operator sees:** with Copy threads (rule column 15) blank or auto, a vault on btrfs or ZFS gets 2 threads
+  with the reason "cannot tell (btrfs/ZFS)", even on hard disks, where more threads help; set a number in the column for
+  such a vault.
+- **Why:** btrfs and ZFS show device 0 in mountinfo, so the disk lookup that tells SSDs from hard disks finds no disk;
+  the lookup through the mount's own devices is left for later.
+- **Revisit when:** a vault is kept on btrfs or ZFS.
+- **Approved:** 2026-11-04, the user's choice "Both (Recommended)".
