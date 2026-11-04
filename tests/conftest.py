@@ -7,8 +7,9 @@ import pytest
 import reverberator as rv
 from tests.harness import FakePool, create_job, reverberator_script
 
-# the chain-link ground truth over the whole suite (REVERB_CHAIN_GROUND_TRUTH=0 turns it off)
-pytest_plugins = ['tests.chain_ground_truth']
+# the chain-link ground truth over the whole suite (REVERB_CHAIN_GROUND_TRUTH=0 turns it off), and every version's size
+# record against a full measure (REVERB_USAGE_GROUND_TRUTH=0)
+pytest_plugins = ['tests.chain_ground_truth', 'tests.version_usage_ground_truth']
 
 # the real helper, for the one test that runs it: isolated_runtime() replaces it for every test
 REAL_SYNC_VAULT_FILESYSTEMS = rv.sync_vault_filesystems

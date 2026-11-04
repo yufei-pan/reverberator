@@ -1099,10 +1099,17 @@ def test_the_referenced_copy_looks_nothing_up_in_the_new_version_for_a_file(job,
 		if frame.f_globals.get('__name__') in ('genericpath', 'posixpath'):
 			frame = frame.f_back
 		return frame.f_code.co_filename == rv.__file__
+	made = set()
+	real_symlink = os.symlink
+	def symlink(text, path, *args, **kwargs):
+		real_symlink(text, path, *args, **kwargs)
+		made.add(os.fsdecode(path))
+	monkeypatch.setattr(os, 'symlink', symlink)
 	def spy(real):
 		def look(path, *args, **kwargs):
 			name = os.fsdecode(path) if isinstance(path, (str, bytes)) else ''
-			if inside and name.startswith(job.job_vault) and not name.startswith(v0) and by_the_daemon():
+			# a link looked at once it is made is found, its attributes at hand: what it takes is kept for the measure
+			if inside and name.startswith(job.job_vault) and not name.startswith(v0) and name not in made and by_the_daemon():
 				looked.append(name)
 			return real(path, *args, **kwargs)
 		return look

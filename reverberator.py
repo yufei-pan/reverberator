@@ -5383,6 +5383,8 @@ def do_backup(backup_entries:dict,
 		reported = set()
 	# the entries whose metadata could not be copied, which may lack their extended attributes in the new version
 	unsynced = []
+	# what the links of the new version's referenced copy take, so they are not looked at again to measure it
+	copied = CopiedSizes()
 	opened_manifest = manifest is None
 	if opened_manifest:
 		manifest = VaultManifest(job_vault)
@@ -5467,7 +5469,7 @@ def do_backup(backup_entries:dict,
 				# would at a copy ( a re-copy copies such a link as it is ), so they count as copied in V0
 				manifest.rebuild(backup_folder,tree_path=monitor_path,skip=walk_skip,errors=walk_errors,copy_version=this_version_number)
 				check_walk_errors(job_name,monitor_path,walk_errors,manifest,reported)
-				do_referenced_copy(monitor_path,backup_folder,manifest,pool_guard=pool_guard,unsynced=unsynced)
+				do_referenced_copy(monitor_path,backup_folder,manifest,pool_guard=pool_guard,unsynced=unsynced,sizes=copied)
 		else:
 			# Now we have made sure the vault is within the size limit, we can proceed to do the backup
 			latest_version_info = vault_info_dict[next(reversed(vault_info_dict))]
@@ -5597,7 +5599,7 @@ def do_backup(backup_entries:dict,
 				paused = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported,
 				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,
-				pool_guard=pool_guard,unsynced=unsynced)
+				pool_guard=pool_guard,unsynced=unsynced,copied=copied)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -5606,7 +5608,7 @@ def do_backup(backup_entries:dict,
 				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 			return vaultInfo, manifest, False
 		# check the size of the backup
-		this_size, this_inodes = measure_version_usage(manifest, backup_folder)
+		this_size, this_inodes = measure_version_usage(manifest, backup_folder, copied)
 		vault_size += this_size
 		vault_inodes += this_inodes
 		content_file_name = change_list_path(backup_folder,this_size,this_inodes)
@@ -6973,6 +6975,39 @@ def in_row_order(pool:ThreadPoolExecutor, rows, work, handled, stop:threading.Ev
 		submit(chunk)
 	handle(0)
 
+class CopiedSizes:
+	'''
+	What the links a referenced copy made take on disk, for measure_version_usage(): each link is looked at as it is
+	made, when a mergerfs pool still has its attributes at hand, and the bytes it takes (st_blocks * 512) kept by the
+	length of its text, the one thing about a link a filesystem allots by. by_length holds that, linked how many links
+	were made and bytes what they take in all. text is the copy's referenced_link_text(), so the bytes of any of its
+	links come from its rel alone. usable is False once two links of one length took different bytes (disks of a pool
+	of different filesystems, say), or one could not be looked at: the version is then measured row by row. tracking
+	is True once the copy is made and the manifest notes what changes from then on (VaultManifest.track_changes()).
+	'''
+	def __init__(self):
+		self.by_length = {}
+		self.linked = 0
+		self.bytes = 0
+		self.text = None
+		self.usable = True
+		self.tracking = False
+
+	@staticmethod
+	def length(text:str) -> int:
+		'''The bytes of a link's text, as the filesystem keeps them.'''
+		return len(text) if text.isascii() else len(os.fsencode(text))
+
+	def add(self, length:int, taken:int):
+		if self.by_length.setdefault(length, taken) != taken:
+			self.usable = False
+		self.linked += 1
+		self.bytes += taken
+
+	def of(self, rel:str):
+		'''The bytes the link the copy made at rel takes; None when no link of its text's length was made.'''
+		return self.by_length.get(self.length(self.text(rel)))
+
 def referenced_link_text(source_path:str, backup_folder:str, relative:bool):
 	'''
 	The function giving the text of the link do_referenced_copy() makes at backup_folder/<file> to source_path/<file>,
@@ -7001,7 +7036,8 @@ def referenced_link_text(source_path:str, backup_folder:str, relative:bool):
 	between = os.path.relpath(source_path, backup_folder) + '/'
 	return lambda file: '../' * file.count('/') + between + file
 
-def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None,unsynced:list = None) -> bool:
+def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest',relative=False,pool_guard:'PoolGuard' = None,unsynced:list = None,
+		sizes:CopiedSizes = None) -> bool:
 	'''
 	Recreate the folders tracked in manifest under backup_folder and link each tracked file to its copy under source_path.
 
@@ -7009,8 +7045,8 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	real folder, and a file row where it holds one: a version whose rows hold both a file and a folder of one name, as
 	a swap of the two the collapse could not order can leave, gets the kind source_path has, and nothing is linked
 	through a link to a folder. One that cannot be looked at stays tracked, and is made or linked as ever, with an
-	error line, as dropping it would leave it out of the new version. Nothing is looked up in backup_folder for a file,
-	which is a new folder: a lookup that finds nothing is not cached on a mergerfs vault. Returns False when the backup
+	error line, as dropping it would leave it out of the new version. Nothing is looked up in backup_folder for a file
+	before its link is made, as it is a new folder: a lookup that finds nothing is not cached on a mergerfs vault. Returns False when the backup
 	was interrupted. pool_guard, when given, is polled for each entry: a disk of its pools that drops stops the copy
 	with PoolNotReady. A folder whose metadata could not be copied is appended to unsynced ( copy_file_meta()'s failed ).
 	Each entry is looked at, and made or linked, on one of REFERENCED_COPY_THREADS threads, REFERENCED_COPY_CHUNK rows at
@@ -7020,6 +7056,8 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	A file whose folder this copy did not make (no row tracks it, or it is a link) is linked on its own once everything
 	before it is, as a link made before it may be on its way. A stop or a pool that drops can leave up to a thread's
 	entry made past it on each other thread, in the version that is not committed. One line says how long it took.
+	With sizes, each link is looked at once made, what it takes is kept there (CopiedSizes), and once the copy is made
+	the manifest notes every row changed from then on (VaultManifest.track_changes()), for measure_version_usage().
 	'''
 	started = time.monotonic()
 	backuperTeeLogToTl(path=source_path,message=f'Creating a referenced copy of {source_path} to {backup_folder}')
@@ -7030,6 +7068,8 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 	count = {'files': 0, 'folders': 0}
 	stop = threading.Event()
 	link_text = referenced_link_text(source_path, backup_folder, relative)
+	if sizes is not None:
+		sizes.text = link_text
 	def check():
 		# after each entry, on its thread
 		if pool_guard is not None:
@@ -7071,9 +7111,18 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			copy_new_folder_meta(source_folder,backup_folder_path,st,failed)
 		return lines, True, failed
 	def referenced_link(source_file:str, backup_file_path:str):
+		# (the length of its text, the bytes it takes) with sizes: looked at now, a mergerfs pool answers from what it
+		# told of the link as it made it
 		os.symlink(source_file, backup_file_path)
+		if sizes is None:
+			return None
+		try:
+			return CopiedSizes.length(source_file), os.lstat(backup_file_path).st_blocks * 512
+		except OSError:
+			return None
 	def copy_file(file:str):
-		# on a thread, or inline: (the lines to write, 'linked' / 'dropped' / 'no folder', the link made or not)
+		# on a thread, or inline: (the lines to write, 'linked' / 'dropped' / 'no folder', referenced_link()'s size for
+		# one linked, the link to make for one with no folder)
 		if not is_entry_rel(file):
 			return [(True, f'Dropping a tracked row that names no file below the version: {file!r}')], 'dropped', None
 		st, line = look(file, 'file')
@@ -7091,8 +7140,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		backup_file_path = os.path.join(backup_folder,file)
 		source_file = link_text(file)
 		try:
-			referenced_link(source_file, backup_file_path)
-			return lines, 'linked', None
+			return lines, 'linked', referenced_link(source_file, backup_file_path)
 		except FileExistsError:
 			# a new version holds nothing there, unless a link above it ( a file row linked where rows of both kinds share
 			# a name ) leads elsewhere, which is never written through
@@ -7115,11 +7163,18 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 				unsynced.extend(failed)
 		else:
 			missing.append(folder)
+	def took(size):
+		if sizes is not None:
+			if size is None:
+				sizes.usable = False
+			else:
+				sizes.add(*size)
 	def file_handled(file:str, outcome:tuple):
 		lines, state, retry = outcome
 		write(lines)
 		if state == 'linked':
 			count['files'] += 1
+			took(retry)
 		elif state == 'no folder':
 			# a folder above it has no row ( an older daemon made it bare for a file under it ): made, so every backup does
 			# not fail here. the next change under it copies the whole folder ( do_reverb_backup() )
@@ -7128,7 +7183,7 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 			if not os.path.lexists(parent):
 				backuperTeeLogToTl(path=source_path,warning=True,message=f'Making {parent}, which no row tracks, for the tracked {file}')
 			os.makedirs(parent, exist_ok=True)
-			referenced_link(source_file, backup_file_path)
+			took(referenced_link(source_file, backup_file_path))
 			count['files'] += 1
 		else:
 			missing.append(file)
@@ -7148,6 +7203,9 @@ def do_referenced_copy(source_path:str,backup_folder:str,manifest:'VaultManifest
 		pool.shutdown(wait=True)
 		backuperTeeLogToTl(path=source_path,message=f'{"Made" if finished else "Stopped making"} the referenced copy of {source_path} in {time.monotonic() - started:.1f} s: {count["files"]} files, {count["folders"]} folders, {REFERENCED_COPY_THREADS} threads')
 	manifest.discard_many(missing)
+	if sizes is not None:
+		manifest.track_changes()
+		sizes.tracking = True
 	return True
 
 def entry_metadata(path:str) -> tuple:
@@ -7555,6 +7613,7 @@ class VaultManifest:
 
 	def __init__(self, job_vault:str):
 		self.path = os.path.join(job_vault, MANIFEST_FILE_NAME)
+		self._tracking = False
 		try:
 			self._open()
 		except sqlite3.DatabaseError as e:
@@ -7584,6 +7643,8 @@ class VaultManifest:
 			self.conn.execute(f'CREATE TABLE IF NOT EXISTS entries({self.SCHEMA_1_COLUMNS}, copy_version INTEGER) WITHOUT ROWID')
 			self.conn.execute('CREATE INDEX IF NOT EXISTS dirty_entries ON entries(path) WHERE dirty')
 			self.conn.execute('CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY) WITHOUT ROWID')
+			# the rows changed since track_changes(), each with whether a row was at its path then
+			self.conn.execute('CREATE TEMP TABLE IF NOT EXISTS changed(path TEXT PRIMARY KEY, existed INTEGER NOT NULL) WITHOUT ROWID')
 			# the journal's name on every disk of the vault before any transaction: sqlite's own sync of the folder after it makes
 			# the journal reaches no disk of a mergerfs pool. a rollback or a kill leaves none, or one not flushed, so it is made
 			# empty when missing (sqlite keeps and uses it), and flushed at every open, once per attempt
@@ -7640,6 +7701,7 @@ class VaultManifest:
 
 	def commit(self, version_path:str = None):
 		'''Commit, recording that the rows now describe version_path when it is given.'''
+		self.stop_tracking()
 		if version_path is not None:
 			self._set_version(version_path)
 		if self.conn.in_transaction:
@@ -7648,6 +7710,68 @@ class VaultManifest:
 	def rollback(self):
 		if self.conn.in_transaction:
 			self.conn.execute('ROLLBACK')
+		self.stop_tracking()
+
+	# the triggers of track_changes(): the first change of each path is kept, with whether a row was there before it. a
+	# path noted already is left out by the statement itself, as the outer statement's OR REPLACE would replace it
+	CHANGE_NOTE = 'INSERT INTO changed SELECT {path}, {existed} WHERE NOT EXISTS (SELECT 1 FROM changed WHERE path = {path});'
+	CHANGE_TRIGGERS = {
+		'changed_insert': 'BEFORE INSERT ON main.entries BEGIN ' + CHANGE_NOTE.format(path='NEW.path', existed='EXISTS (SELECT 1 FROM entries WHERE path = NEW.path)') + ' END',
+		'changed_update': 'BEFORE UPDATE ON main.entries BEGIN ' + CHANGE_NOTE.format(path='OLD.path', existed='1')
+			+ ' ' + CHANGE_NOTE.format(path='NEW.path', existed='EXISTS (SELECT 1 FROM entries WHERE path = NEW.path)') + ' END',
+		'changed_delete': 'BEFORE DELETE ON main.entries BEGIN ' + CHANGE_NOTE.format(path='OLD.path', existed='1') + ' END',
+	}
+
+	def track_changes(self):
+		'''
+		Note, from now until the commit, the rollback or stop_tracking(), every path whose row is added, changed or
+		removed, and whether a row was at it before (changes()), in the transaction the caller holds: a rollback takes the
+		triggers back with it.
+		'''
+		self.conn.execute('DELETE FROM temp.changed')
+		for name, trigger in self.CHANGE_TRIGGERS.items():
+			self.conn.execute(f'CREATE TEMP TRIGGER IF NOT EXISTS {name} {trigger}')
+		self._tracking = True
+
+	def note_changed(self, rel:str):
+		'''
+		While track_changes() notes changes, note rel (its / stripped), every row under it as a folder, and each folder
+		above it as a file's rel, as changed: what a backup writes there may change entries whose rows it leaves as they
+		are (a recopy, a file in a folder's place made a folder).
+		'''
+		if not self._tracking:
+			return
+		if rel.rstrip('/') in ('', '.'):
+			# the monitored root: everything
+			self.conn.execute('INSERT OR IGNORE INTO temp.changed SELECT path, 1 FROM entries')
+			return
+		folder = storable_name(rel.rstrip('/') + '/')
+		parts = folder[:-1].split('/')
+		paths = ['/'.join(parts[:depth]) for depth in range(1, len(parts) + 1)]
+		self.conn.executemany('INSERT OR IGNORE INTO temp.changed VALUES (?, EXISTS (SELECT 1 FROM entries WHERE path = ?))', ((path, path) for path in paths))
+		self.conn.execute('INSERT OR IGNORE INTO temp.changed SELECT path, 1 FROM entries WHERE path >= ? AND path < ?', (folder, folder_range_end(folder)))
+
+	def changes(self):
+		'''
+		[(rel, whether a row was at rel when changes began to be noted)] of the paths noted changed since
+		track_changes(), or None when no change is being noted (none was asked, or a rollback ended it).
+		'''
+		if not self._tracking or self.conn.execute("SELECT count(*) FROM sqlite_temp_master WHERE type = 'trigger' AND name LIKE 'changed_%'").fetchone()[0] != len(self.CHANGE_TRIGGERS):
+			return None
+		return [(stored_name(path), bool(existed)) for path, existed in self.conn.execute('SELECT path, existed FROM temp.changed')]
+
+	def changed_files(self) -> list:
+		'''The file rows noted changed (changes()) that are tracked now.'''
+		return [stored_name(path) for (path,) in self.conn.execute("SELECT path FROM entries WHERE substr(path, -1) != '/' AND path IN (SELECT path FROM temp.changed)")]
+
+	def stop_tracking(self):
+		'''Note no more changes: track_changes() ends.'''
+		if not self._tracking:
+			return
+		self._tracking = False
+		for name in self.CHANGE_TRIGGERS:
+			self.conn.execute(f'DROP TRIGGER IF EXISTS temp.{name}')
+		self.conn.execute('DELETE FROM temp.changed')
 
 	@property
 	def in_transaction(self) -> bool:
@@ -9264,8 +9388,18 @@ def count_batch(pool, batch:list, allocated, total_bytes:int, inodes:int) -> tup
 			inodes += 1
 	return total_bytes, inodes
 
-def measure_version_usage(manifest:VaultManifest, version_path:str) -> tuple:
-	'''(bytes, inodes) a version holds, du style: allocated blocks of version_path and every row of manifest, lstat on a compare pool.'''
+def measure_version_usage(manifest:VaultManifest, version_path:str, copied:CopiedSizes = None) -> tuple:
+	'''
+	(bytes, inodes) a version holds, du style: allocated blocks of version_path and every row of manifest, lstat on a
+	compare pool. With copied, the sizes of the links the referenced copy of version_path made (CopiedSizes), a file
+	row the manifest notes no change of since (VaultManifest.changes()) is that link, as it was made: what it takes
+	comes from copied, and only the folders and the file rows changed are looked at. Without them (none given, the
+	copy's links not of one size a length, or the changes not noted, as after a rollback), every row is. Either way the
+	manifest notes no more changes.
+	'''
+	changes = manifest.changes() if copied is not None and copied.tracking and copied.usable else None
+	changed = None if changes is None else manifest.changed_files()
+	manifest.stop_tracking()
 	def allocated(rel:str):
 		try:
 			return os.lstat(os.path.join(version_path, rel)).st_blocks * 512
@@ -9277,9 +9411,17 @@ def measure_version_usage(manifest:VaultManifest, version_path:str) -> tuple:
 	except OSError:
 		return 0, 0
 	inodes = 1
+	if changes is not None:
+		# the links the copy made, less those of the rows changed since: a file row at their path then was one of them
+		taken = [copied.of(rel) for rel, existed in changes if existed and not rel.endswith('/')]
+		if None in taken:
+			changed = None
+		else:
+			total_bytes += copied.bytes - sum(taken)
+			inodes += copied.linked - len(taken)
 	def rows():
 		yield from manifest.iter_folders()
-		yield from manifest.iter_files()
+		yield from manifest.iter_files() if changed is None else changed
 	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
 		batch = []
 		for rel in rows():
@@ -11024,7 +11166,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
 					 recopy:list = (),recopied:list = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
-					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None) -> VaultManifest:
+					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,copied:CopiedSizes = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
 
@@ -11047,6 +11189,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	with PoolNotReady, so nothing more is written into the version.
 	Each entry whose metadata could not be copied, which may lack its extended attributes, is appended to unsynced
 	( copy_file_meta()'s failed ).
+	copied, when given, keeps what the links of the referenced copy take (do_referenced_copy()'s sizes), and the manifest
+	notes the rows changed after it, the places each entry replayed or copied again names too (note_changed()).
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
@@ -11349,6 +11493,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			applied[event_source_real_path] = True
 			backuperTeeLogToTl(path=monitor_path,message=f'Processing {event_source_real_path} {event_values}')
 			event_relative_path = os.path.relpath(path=event_source_real_path,start=monitor_path)
+			# what is written there, under it and in place of the folders above it, which a row may not say
+			manifest.note_changed(event_relative_path)
+			if event_values.source_path:
+				manifest.note_changed(os.path.relpath(event_values.source_path,monitor_path))
 			file_vault_target_path = os.path.join(backup_folder,event_relative_path)
 			isDir = event_source_real_path.endswith('/')
 			# create, modify, attrib, move, delete
@@ -11581,7 +11729,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		if not manifest.describes(latest_version_info.path):
 			backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {latest_version_info.path}, listing it')
 			manifest.rebuild(latest_version_info.path)
-		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard,unsynced=unsynced):
+		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard,unsynced=unsynced,
+				sizes=copied):
 			return manifest
 		backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
 		mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
@@ -11595,6 +11744,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 				if not real_folders_to(backup_folder,rel):
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not copying {rel} again from the vault: a folder above it in {backup_folder} is not a real folder')
 					continue
+				# its row may stay as it is
+				manifest.note_changed(rel)
 				# down to the version its row says holds the copy, as the size limit counted it ( recopy_size() )
 				end = chain_end(job_vault,latest_version_info.path,rel,committed_moves,manifest.copy_version(rel))
 				if end is None or stat.S_ISDIR(end.st.st_mode):
