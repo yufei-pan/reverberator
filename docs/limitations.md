@@ -24,16 +24,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a vault is shared with users who must not see other jobs' file names.
 - **Approved:** 2026-10-23, the user's choice "Known limitation".
 
-### No flush before a prune's removal
-
-- **Kind:** known limitation.
-- **What the operator sees:** after a power loss in the middle of a prune on mergerfs, a link that was being replaced may
-  come back in either form, old or new. No copy is lost, but a restore can show a dangling link for that file until the
-  next full comparison.
-- **Why:** flushing the whole pool before every prune would cost time on each backup, for a rare event that loses no copy.
-- **Revisit when:** power losses during prunes are seen in practice.
-- **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
-
 ### Size records rounded to 2 decimals
 
 - **Kind:** known limitation, already in 0.43.
