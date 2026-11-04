@@ -8120,6 +8120,22 @@ def parse_chain_text(job_vault:str, link_text:str, link_path:str):
 		return None
 	return name, rel, ups
 
+@functools.lru_cache(maxsize=1024)
+def is_previous_version_name(name:str, version_name:str) -> bool:
+	'''
+	Whether name is the whole name of a version folder numbered one below the version folder named version_name, as
+	parse_chain_text() asks it of a chain link's text. Few versions are named, so each pair is told once.
+
+	Examples:
+		>>> [is_previous_version_name(name, 'V4--2021-01-02_00-00-00_-0800') for name in ('V3--2021-01-01_00-00-00_-0800',
+		...     'V2--2021-01-01_00-00-00_-0800', 'V3--x', '..', 'V03--2021-01-01_00-00-00_-0800')]
+		[True, False, False, False, True]
+		>>> is_previous_version_name('V3--2021-01-01_00-00-00_-0800', 'current_version')
+		False
+	'''
+	number, own_number = vault_version_number(name), vault_version_number(version_name)
+	return number is not None and own_number is not None and number == own_number - 1 and is_version_folder_name(name)
+
 # the moves of committed versions, each read from its change list once: (version folder, the monitored path its rows
 # are read under), both absolute, -> VersionMoves. rows once written never change (pruning renames a change list, rows
 # and all), so an answer from a list that was read is kept; one that found no list, or could not read it, is not, as
@@ -8599,14 +8615,34 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 		cannot tell, by the text /V3--2021-01-01_00-00-00_-0800/b/u
 		>>> import shutil; shutil.rmtree(job_vault)
 	'''
-	# the text rule, keeping the parse: relative, the previous version's whole name, real folders on the way
-	parsed = None if os.path.isabs(link_text) else parse_chain_text(job_vault, link_text, link_path)
-	if parsed is None:
-		return None
-	name, named_parts, ups = parsed
-	vault = os.path.abspath(job_vault)
-	target = os.path.join(vault, name, *named_parts)
-	if not is_real_folder_under(os.path.join(vault, name), os.path.dirname(target)):
+	name = ''
+	if link_text.startswith('../') and link_path.startswith('/') and job_vault.startswith('/'):
+		# the text the referenced copy writes, told as text: the ../ of R's own depth + 1, the name of the version below,
+		# then R itself, whose parts abspath() left none of '', '.' or '..'. parse_chain_text() reads it as just that
+		vault, link_abs = os.path.abspath(job_vault), os.path.abspath(link_path)
+		version_name, _, rel = link_abs[len(vault) + 1:].partition('/')
+		ups = rel.count('/') + 1
+		if rel and len(vault) > 1 and link_abs.startswith(vault + '/'):
+			name = link_text[3 * ups:-len(rel) - 1]
+		if name and '/' not in name and link_text.startswith('../' * ups) and link_text.endswith('/' + rel) and is_previous_version_name(name, version_name):
+			named = rel
+			top = f'{vault}/{name}'
+			target = f'{top}/{rel}'
+			folder = f'{top}/{rel.rpartition("/")[0]}' if ups > 1 else top
+		else:
+			name = ''
+	if not name:
+		# the text rule, keeping the parse: relative, the previous version's whole name, real folders on the way
+		parsed = None if os.path.isabs(link_text) else parse_chain_text(job_vault, link_text, link_path)
+		if parsed is None:
+			return None
+		name, named_parts, ups = parsed
+		vault = os.path.abspath(job_vault)
+		target = os.path.join(vault, name, *named_parts)
+		version_name, _, rel = os.path.abspath(link_path)[len(vault) + 1:].partition('/')
+		named = '/'.join(named_parts)
+		top, folder = os.path.join(vault, name), os.path.dirname(target)
+	if not is_real_folder_under(top, folder):
 		return None
 	# told before any row, so no row can make pruning rename a folder onto a link
 	try:
@@ -8623,8 +8659,6 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 		raise UncheckedVaultLink(e) from e
 	except ValueError as e:
 		raise UncheckedVaultLink(e) from e
-	version_name, _, rel = os.path.abspath(link_path)[len(vault) + 1:].partition('/')
-	named = '/'.join(named_parts)
 	if named == rel and ups == rel.count('/') + 1:
 		return target
 	if not moves.usable:
