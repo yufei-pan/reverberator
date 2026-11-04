@@ -3252,10 +3252,13 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 		try:
 			wd = inotify_obj.add_watch(folder, watch_flags)
 		except Exception as e:
-			watcherTeeLogToTl(monitor_path,f'Failed to add watch for {folder}: {e}',error=True)
+			# a folder made and removed before its watch was added ( ENOENT, or ENOTDIR for one a file replaced ) is a
+			# normal race that misses nothing, as the folder is gone: an info line. any other failure leaves it unwatched
+			gone = getattr(e,'errno',None) in (errno.ENOENT, errno.ENOTDIR)
+			watcherTeeLogToTl(monitor_path,f'Failed to add watch for {folder}: {e}',error=not gone)
 			# counted above but never taken: an inner mount that keeps failing would add up over a long run
 			irm.decreaseUserWatches()
-			if unwatched is not None and getattr(e,'errno',None) not in (errno.ENOENT, errno.ENOTDIR):
+			if unwatched is not None and not gone:
 				unwatched.add(folder.rstrip('/') or '/')
 			return None
 		if wd in wdDic:

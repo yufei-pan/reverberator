@@ -872,3 +872,33 @@ def test_a_rewalk_that_cannot_read_a_held_folder_keeps_its_watch(job, poll_fast,
 		late = os.path.join(S, 'late.txt')
 		open(late, 'w').write('a later change in the held folder')
 		wait_until(lambda: _has_create(to_process, lock, late), timeout=3, message='the re-walk dropped a watch it did not add')
+
+
+@pytest.mark.parametrize('error, logged_as_error', [(errno.ENOENT, False), (errno.ENOTDIR, False), (errno.EACCES, True)])
+def test_a_watch_failing_for_a_folder_that_is_gone_logs_info(tmp_path, monkeypatch, error, logged_as_error):
+	# a folder made and removed before its watch is added (pytest-cache-files-* folders) is a normal race that misses
+	# nothing: an info line; any other failure stays an error
+	monitor = tmp_path / 'm'
+	(monitor / 'gone').mkdir(parents=True)
+	gone = str(monitor / 'gone')
+	class FakeINotify:
+		def __init__(self):
+			self.next = 1
+		def add_watch(self, path, mask):
+			if os.path.abspath(path).rstrip('/') == gone:
+				raise OSError(error, os.strerror(error))
+			self.next += 1
+			return self.next
+	class FakeIrm:
+		def increaseUserWatches(self):
+			pass
+		def decreaseUserWatches(self):
+			pass
+	lines = []
+	monkeypatch.setattr(rv, 'watcherTeeLogToTl', lambda monitor_path, message, error=False, ok=False: lines.append((message, error)))
+	unwatched = set()
+	rv.initializeFolderWatchers(FakeINotify(), str(monitor), rv.bidict(), FakeIrm(), 0, unwatched=unwatched)
+	failed = [(message, is_error) for message, is_error in lines if 'Failed to add watch' in message]
+	assert failed == [(f'Failed to add watch for {gone}/: [Errno {error}] {os.strerror(error)}', logged_as_error)] or \
+		failed == [(f'Failed to add watch for {gone}: [Errno {error}] {os.strerror(error)}', logged_as_error)], lines
+	assert unwatched == ({gone} if logged_as_error else set())
