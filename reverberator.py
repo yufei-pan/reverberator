@@ -4687,7 +4687,17 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		# the vault is scanned before the monitored path is waited for (the scan only reads the vault): what a killed
 		# copy left in it goes now, though the path may be long in coming back. a scan that fails fails the attempt
 		job_vault = os.path.join(vault_path,job_name)
-		scanned = get_vault_info(job_vault) if running() and os.path.isdir(job_vault) else None
+		def scan():
+			# the scan can change the vault: under the job's backup and restore locks, so no restore reads it meanwhile.
+			# None when the job stops while it waits for them
+			locks = BackupLocks(job_name)
+			if not locks.take(running):
+				return None
+			try:
+				return get_vault_info(job_vault)
+			finally:
+				locks.release()
+		scanned = scan() if running() and os.path.isdir(job_vault) else None
 		wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 		# batches are compared with the vault only while the monitored path shows the filesystem it shows now
 		root_mount = mount_fingerprint(current_mount_table(),os.path.realpath(monitor_path))
@@ -4700,7 +4710,9 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			trusted = True
 			if manifest is not None:
 				# a manifest that does not describe the latest version cannot vouch for the fingerprint it recorded
-				latest_version = (get_vault_info(job_vault) if scanned is None else scanned).vault_info_dict
+				if scanned is None:
+					scanned = scan()
+				latest_version = {} if scanned is None else scanned.vault_info_dict
 				trusted = not latest_version or manifest.describes(latest_version[next(reversed(latest_version))].path)
 			if not startup.load(recorded,trusted):
 				# only this job stops: its watcher sees the failure and exits too
@@ -4758,7 +4770,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				touched = batch_scopes(to_process_temp)
 				round_tripped = to_process_temp.round_tripped
 				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
-		vaultInfo = None
+		# the start's scan: the first batch does not scan again
+		vaultInfo = scanned
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while running():
 			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
@@ -5574,6 +5587,9 @@ def do_backup(backup_entries:dict,
 	opened_manifest = manifest is None
 	if opened_manifest:
 		manifest = VaultManifest(job_vault)
+	# the job's backup and restore locks, held from before anything in the vault is changed to the end of this backup,
+	# so no restore reads it meanwhile. the comparison runs without them
+	locks = BackupLocks(job_name)
 	try:
 		# inner mounts the backup has seen and that are unmounted now are paused: every walk below leaves them out, and
 		# they keep what the vault holds for them
@@ -5595,6 +5611,9 @@ def do_backup(backup_entries:dict,
 		# do the actual backup
 		# get the latest current version path
 		if not vaultInfo or not vaultInfo.vault_info_dict:
+			# the scan can change the vault: under the locks, which a vault with no version keeps for its first backup
+			if not locks.take():
+				return VaultInfo({}, 0, 0) if vaultInfo is None else vaultInfo, manifest, False
 			vaultInfo = get_vault_info(job_vault_path=job_vault)
 		vault_info_dict = vaultInfo.vault_info_dict
 		vault_size = vaultInfo.vault_size
@@ -5605,6 +5624,7 @@ def do_backup(backup_entries:dict,
 		# what the verification of the replay fixed, written after the batch's own rows
 		verified = []
 		if not vault_info_dict:
+			# the locks are held since the scan above
 			backuperTeeLogToTl(job_name,f'Failed to get any version for {job_vault}, treating the vault as new.',error=True)
 			this_version_number = 0
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
@@ -5693,6 +5713,8 @@ def do_backup(backup_entries:dict,
 					# the prune itself checks the next version for one it cannot read, when a limit next asks for it
 					cut_prune = False
 				if cut_prune:
+					if not locks.take():
+						return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 					backuperTeeLogToTl(job_name,f'Finishing the prune of {vault_info_dict[next(iter(vault_info_dict))].path}, which was cut off before its flush, before backing up')
 					monitor_paths = manifest_monitor_paths(manifest)
 					remove_oldest()
@@ -5773,6 +5795,9 @@ def do_backup(backup_entries:dict,
 			backup_limit_size, backup_limit_inode = get_backup_limits_from_str(backup_size_limit=backup_size_limit,vault_fs_size=vault_fs_size,vault_fs_inode=vault_fs_inode)
 			backuperTeeLogToTl(job_name,f'Calculated backup size limit {backup_limit_size} and backup inode limit {backup_limit_inode}')
 			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
+			# from the prunes on, the vault changes
+			if not locks.take():
+				return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 			if backup_limit_size:
 				while vault_size + estimated_backup_size + recopies_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size + recopies_size} exceeds backup size limit {backup_limit_size}')
@@ -5879,6 +5904,8 @@ def do_backup(backup_entries:dict,
 		if opened_manifest:
 			manifest.close()
 		raise
+	finally:
+		locks.release()
 
 def swap_current_version(job_vault:str, text:str) -> None:
 	'''Point job_vault's current_version link at text, swapped in under a temporary name, so the link is never missing.'''
@@ -10738,35 +10765,48 @@ def change_list_path(version_path:str, size:int, inodes:int) -> str:
 	inode_str = format_bytes(inodes,use_1024_bytes=False,to_str=True).replace(' ','')
 	return f'{version_path}--{size_str}B-{inode_str}_ino{CONTENT_FILE_EXTENSION_NAME}'
 
-def restore_lock_path(job_name:str, state_dir:str = None) -> str:
+def job_lock_path(job_name:str, kind:str, state_dir:str = None) -> str:
 	'''
-	The lock file a restore shares with the daemon's pruning of job_name.
-	>>> restore_lock_path('j', '/x')
+	The lock file of job_name in the state folder, of kind 'backup', 'restore' or 'history':
+	- restore: restores hold it shared while they copy; a batch, exclusive, from before it changes the vault to its end.
+	- backup: a batch holds it exclusive from when it starts waiting for the restore lock to its end, and a restore,
+	  shared, only for the moment it takes the restore lock: a restore starting while a batch waits waits for that batch,
+	  so a stream of restores cannot hold its backup off for ever.
+	- history: history and restores hold it shared all along, their pickers and prompts too; only the prune takes it,
+	  exclusive and without waiting, so pruning is postponed while they read and nothing else waits for them.
+	>>> job_lock_path('j', 'restore', '/x')
 	'/x/job-j.restore.lock'
 	'''
-	return os.path.join(state_dir_path(state_dir), f'job-{job_name}.restore.lock')
+	return os.path.join(state_dir_path(state_dir), f'job-{job_name}.{kind}.lock')
 
-class RestoreLock:
+def open_job_lock(path:str) -> int:
+	'''The lock file at path opened (made 0600), never through a symlink, which could lead to a file elsewhere when the state folder can be written by others.'''
+	return os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+
+# the waiting line of a command blocked on a lock of each kind, by the daemon's exclusive hold of it
+JOB_LOCK_WAITS = {'history': 'removing an old version', 'backup': 'a backup', 'restore': 'a backup'}
+
+class JobLock:
 	'''
-	Held while a command reads old versions of a job: the daemon keeps backing up but postpones removing the oldest
-	version meanwhile. A shared flock, so it goes with the process and a killed restore never leaves it behind.
+	A command's shared hold on one of a job's locks (job_lock_path()), waiting, with one line on stream (sys.stderr as it
+	is when the lock is taken when None), while the daemon holds it exclusive. A flock, so it goes with the process and
+	a killed command never leaves it behind.
 	'''
-	def __init__(self, job_name:str, state_dir:str = None, stream = None):
+	def __init__(self, job_name:str, kind:str = 'history', state_dir:str = None, stream = None):
 		self.job_name = job_name
+		self.kind = kind
 		self.state_dir = state_dir
-		# None: sys.stderr as it is when the lock is taken, not as it was at import
 		self.stream = stream
 		self.fd = None
 
 	def __enter__(self):
 		os.makedirs(state_dir_path(self.state_dir), exist_ok=True)
-		# never through a symlink, which could lead to a file elsewhere when the state folder can be written by others
-		self.fd = os.open(restore_lock_path(self.job_name, self.state_dir), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+		self.fd = open_job_lock(job_lock_path(self.job_name, self.kind, self.state_dir))
 		try:
 			try:
 				fcntl.flock(self.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
 			except BlockingIOError:
-				print(f'Waiting for reverberator to finish removing an old version of {self.job_name}', file=sys.stderr if self.stream is None else self.stream, flush=True)
+				print(f'Waiting for reverberator to finish {JOB_LOCK_WAITS[self.kind]} of {self.job_name}', file=sys.stderr if self.stream is None else self.stream, flush=True)
 				fcntl.flock(self.fd, fcntl.LOCK_SH)
 		except BaseException:
 			os.close(self.fd)
@@ -10780,9 +10820,97 @@ class RestoreLock:
 			self.fd = None
 		return False
 
-# job name -> when the FAILED marker saying its restore lock cannot be checked is next due, by the clock prune_oldest()
-# is given, while it cannot be. each job's backuper alone sets its own key
-RESTORE_LOCK_UNCHECKED = {}
+# lock path -> when the FAILED marker saying the daemon cannot check it is next due, by the clock its checker is given,
+# while it cannot be. each job's backuper alone sets its own jobs' paths
+JOB_LOCK_UNCHECKED = {}
+
+def job_lock_unchecked(job_name:str, kind:str, path:str, error:OSError, postponed:str, clock = time.monotonic) -> None:
+	'''
+	The lock of kind at path of job_name could not be checked (opened or tried), so what it guards is postponed: past
+	DISK_WAIT_GRACE_SECONDS of that, a FAILED marker saying so, repeated every DISK_WAIT_REPEAT_SECONDS while it lasts.
+	job_lock_checked() starts the grace over.
+	'''
+	now = clock()
+	if now >= JOB_LOCK_UNCHECKED.setdefault(path, now + DISK_WAIT_GRACE_SECONDS):
+		job_log(job_name, f'FAILED: cannot check the {kind} lock {path}: {error}; {postponed}')
+		JOB_LOCK_UNCHECKED[path] = now + DISK_WAIT_REPEAT_SECONDS
+
+def job_lock_checked(path:str) -> None:
+	'''The lock at path could be checked: a later failure starts a new grace (job_lock_unchecked()).'''
+	JOB_LOCK_UNCHECKED.pop(path, None)
+
+class BackupLocks:
+	'''
+	A batch's exclusive hold on its job's backup and restore locks (job_lock_path()), so no restore reads the vault while
+	the batch changes it. take() waits for them without ever blocking in flock, and release() lets them go; a missing
+	state folder means no restore can hold one, so the batch goes on without it.
+	'''
+	def __init__(self, job_name:str, clock = time.monotonic):
+		self.job_name = job_name
+		self.clock = clock
+		# the open lock files while held, None while not
+		self.fds = None
+
+	def take(self, running = None) -> bool:
+		'''
+		Hold both locks, trying every POLL_WAIT_SECONDS while a restore holds one or one cannot be checked (an error line
+		once, then job_lock_unchecked()'s marker), saying once that it waits. The backup lock, once held, is kept while it
+		waits for the restore lock, so restores starting meanwhile wait for this batch. True once both are held (at once
+		when held already), False when running() (GREEN_LIGHT.is_set by default) turns false first, holding neither.
+		'''
+		if self.fds is not None:
+			return True
+		running = GREEN_LIGHT.is_set if running is None else running
+		# kind -> its open lock file once held, None for one no state folder holds
+		held = {}
+		said = set()
+		try:
+			while running():
+				path = None
+				try:
+					for kind in ('backup', 'restore'):
+						if kind in held:
+							continue
+						path = job_lock_path(self.job_name, kind)
+						try:
+							fd = open_job_lock(path)
+						except (FileNotFoundError, NotADirectoryError):
+							# no state folder, so no restore can be holding it
+							fd = None
+						if fd is not None:
+							try:
+								fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+							except BaseException:
+								os.close(fd)
+								raise
+						held[kind] = fd
+						job_lock_checked(path)
+					self.fds = [fd for fd in held.values() if fd is not None]
+					return True
+				except BlockingIOError:
+					if 'waiting' not in said:
+						said.add('waiting')
+						backuperTeeLogToTl(self.job_name, f'Waiting for a restore of {self.job_name} to finish before backing up')
+				except OSError as e:
+					# the lock may be held right now: a check that failed is never taken as leave to change the vault
+					if path not in said:
+						said.add(path)
+						backuperTeeLogToTl(self.job_name, f'Backup postponed: cannot check the {kind} lock {path}: {e}', error=True)
+					job_lock_unchecked(self.job_name, kind, path, e, 'backup postponed', self.clock)
+				time.sleep(POLL_WAIT_SECONDS)
+			return False
+		finally:
+			if self.fds is None:
+				for fd in held.values():
+					if fd is not None:
+						os.close(fd)
+
+	def release(self) -> None:
+		if self.fds is not None:
+			for fd in self.fds:
+				os.close(fd)
+			self.fds = None
+
 # job name -> when the FAILED marker saying decrement_stepper() cannot remove its oldest version is next due, by the
 # clock it is given, while it cannot. each job's backuper alone sets its own key
 PRUNE_ABORTED = {}
@@ -10792,45 +10920,41 @@ PRUNE_SALT_MISSING = set()
 def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, postponed:list = None, clock = time.monotonic, monitor_paths:list = None,
 		prune_salt:bytes = None, threads:int = None) -> tuple:
 	'''
-	decrement_stepper while no restore holds the job's lock; when one does, postpone and return (0, 0) so the retention
-	loops stop. Without a state folder nothing can hold the lock, so it prunes; any other failure to lock postpones too.
-	A lock that cannot be checked (opened, or tried) for DISK_WAIT_GRACE_SECONDS gets a FAILED marker, repeated every
-	DISK_WAIT_REPEAT_SECONDS while it lasts, as no version is removed meanwhile and the vault keeps growing.
+	decrement_stepper while no history or restore command holds the job's history lock; when one does, postpone and
+	return (0, 0) so the retention loops stop. Its caller holds the backup and restore locks (BackupLocks). Without a
+	state folder nothing can hold the lock, so it prunes; any other failure to lock postpones too, with
+	job_lock_unchecked()'s marker, as no version is removed meanwhile and the vault keeps growing.
 	postponed is a list a backup hands each of its calls: a call that postpones appends why, and only the first of them
 	logs it, so a backup says it once. monitor_path, monitor_paths, clock, prune_salt and threads go to decrement_stepper.
 	'''
-	lock_path = restore_lock_path(job_name)
+	lock_path = job_lock_path(job_name, 'history')
 	def postpone(reason:str, cannot_check:OSError = None) -> tuple:
 		if cannot_check is None:
-			RESTORE_LOCK_UNCHECKED.pop(job_name, None)
+			job_lock_checked(lock_path)
 		else:
-			now = clock()
-			if now >= RESTORE_LOCK_UNCHECKED.setdefault(job_name, now + DISK_WAIT_GRACE_SECONDS):
-				job_log(job_name, f'FAILED: cannot check the restore lock {lock_path}: {cannot_check}; pruning postponed')
-				RESTORE_LOCK_UNCHECKED[job_name] = now + DISK_WAIT_REPEAT_SECONDS
+			job_lock_unchecked(job_name, 'history', lock_path, cannot_check, 'pruning postponed', clock)
 		if not postponed:
 			backuperTeeLogToTl(job_name,f'Postponing removal of the oldest version: {reason}',error=cannot_check is not None)
 		if postponed is not None:
 			postponed.append(reason)
 		return 0, 0
 	try:
-		# never through a symlink, which could lead to a file elsewhere when the state folder can be written by others
-		fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+		fd = open_job_lock(lock_path)
 	except (FileNotFoundError, NotADirectoryError):
-		# no state folder, so no restore can be holding a lock
-		RESTORE_LOCK_UNCHECKED.pop(job_name, None)
+		# no state folder, so no command can be holding a lock
+		job_lock_checked(lock_path)
 		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt, threads)
 	except OSError as e:
 		# the lock may be held right now: a check that failed is never taken as permission to remove
-		return postpone(f'cannot open the restore lock: {e}', e)
+		return postpone(f'cannot open the history lock: {e}', e)
 	try:
 		try:
 			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 		except BlockingIOError:
-			return postpone('a restore is reading the vault')
+			return postpone('history or a restore is reading the vault')
 		except OSError as e:
-			return postpone(f'cannot take the restore lock: {e}', e)
-		RESTORE_LOCK_UNCHECKED.pop(job_name, None)
+			return postpone(f'cannot take the history lock: {e}', e)
+		job_lock_checked(lock_path)
 		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt, threads)
 	finally:
 		os.close(fd)
@@ -13631,17 +13755,29 @@ def never_backed_up(rule:ReverbRule, rule_path:str, rel:str, typed_folder:bool =
 	return shown(message if pattern is None else f'{message}; it matches the skip pattern {pattern}')
 
 @contextlib.contextmanager
-def command_restore_lock(job_name:str, state_dir:str = None):
-	'''Hold job_name's RestoreLock for a command; a lock it cannot take is a CommandError, not a traceback.'''
-	lock = RestoreLock(job_name, state_dir)
+def command_lock(job_name:str, kind:str, state_dir:str = None):
+	'''Hold job_name's lock of kind (JobLock) for a command; a lock it cannot take is a CommandError, not a traceback.'''
+	lock = JobLock(job_name, kind, state_dir)
 	try:
 		lock.__enter__()
 	except OSError as e:
-		raise CommandError(f'Cannot take the restore lock of job {job_name}, which keeps its versions while they are read: {e}', EXIT_COMMAND_FAILED)
+		raise CommandError(f'Cannot take the {kind} lock of job {job_name}, which keeps its versions while they are read: {e}', EXIT_COMMAND_FAILED)
 	try:
 		yield lock
 	finally:
 		lock.__exit__(None, None, None)
+
+@contextlib.contextmanager
+def command_restore_locks(job_name:str, state_dir:str = None):
+	'''
+	Hold job_name's restore lock for a restore's copy, so the daemon backs the job up only once it ends: taken once a
+	running backup has ended, through the backup lock, which a waiting backup holds, so a restore starting while one waits
+	waits for it too. The backup lock is let go once the restore lock is held.
+	'''
+	with contextlib.ExitStack() as held:
+		with command_lock(job_name, 'backup', state_dir):
+			held.enter_context(command_lock(job_name, 'restore', state_dir))
+		yield
 
 def require_job_vault(job_vault:str):
 	'''
@@ -13672,9 +13808,10 @@ def history_command(args) -> int:
 	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
 	rule, rel = find_job(load_command_rules(rule_path), args.path, args.job)
 	job_vault = job_vault_path(rule)
-	# taken before the versions are listed, so the list is the one left by a removal of the oldest version under way
+	# taken before the versions are listed, so the list is the one left by a removal of the oldest version under way. it
+	# only postpones pruning: backups go on
 	output_closed = False
-	with command_restore_lock(rule.job_name, args.state_dir):
+	with command_lock(rule.job_name, 'history', args.state_dir):
 		warned = vault_pool_warning(job_vault)
 		try:
 			require_job_vault(job_vault)
@@ -14861,8 +14998,9 @@ def restore_command(args) -> int:
 	rules = load_command_rules(rule_path)
 	rule, rel = find_job(rules, args.path, args.job)
 	job_vault = job_vault_path(rule)
-	# taken before the versions are listed and held to the last copy, so the daemon removes none of them meanwhile
-	with command_restore_lock(rule.job_name, args.state_dir):
+	# taken before the versions are listed and held to the last copy, so the daemon removes none of them meanwhile; the
+	# picker and the prompt hold only this, so a restore left at its prompt never holds a backup off
+	with command_lock(rule.job_name, 'history', args.state_dir):
 		warned = vault_pool_warning(job_vault)
 		try:
 			require_job_vault(job_vault)
@@ -14888,32 +15026,44 @@ def restore_command(args) -> int:
 			# the daemon as it is now, not before the picking; asked before the monitored path is looked at for the last
 			# time, as an answer can take a while
 			confirm_whole_job_in_place(rule.job_name, version, versions, target, read_status(state_dir_path(args.state_dir)), args.yes, first == 'resume', sys.stdin, sys.stderr)
-		# with --accept, a marker there is one of this restore's or a CommandError
-		found = check_target(target, rule.job_name, rel, args.in_place, version, accept=args.accept)
-		aside = None
-		if found == 'move aside':
-			# the live entry is moved only for a version that can put something in its place
+		# the daemon backs the job up only once the copy ends. what the picking read is read again: a backup may have
+		# committed since
+		with command_restore_locks(rule.job_name, args.state_dir):
 			try:
-				entry = resolve_version_entry(job_vault, version.path, rel, rule.mon_path, moves)
-			except OSError:
-				entry = None
-			if entry is None or entry.kind == 'folder' or restore_failure(entry, version) is None:
-				aside = move_target_aside(target)
-		report = RestoreReport()
-		try:
-			if args.accept:
-				accept_restore(job_vault, version, rule.mon_path, rel, target, report, moves)
-			else:
-				restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report, resume=found in ('resume', 'into root'), aside=aside, marked=found == 'resume', moves=moves)
-		except KeyboardInterrupt:
-			if report.marker is None:
-				raise
-			if report.handing_over:
-				# the folders handed over are another user's now, which a run again refuses to write into
-				raise CommandError(f'Interrupted: the restore was stopped while giving its folders their owners; finish it by running the same restore again with --accept. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
-			raise CommandError(f'Interrupted: run the same restore again to pick it up, or again with --accept to keep what it restored as it is. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
-		finally:
-			report.progress(sys.stderr, done=True)
+				versions = list_versions(job_vault)
+				moves = VaultMoves(job_vault, rule.mon_path, read_record=command_monitor_paths)
+			except OSError as e:
+				raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
+			picked = version
+			version = next((kept for kept in versions if kept.name == picked.name), None)
+			if version is None:
+				raise CommandError(f'V{picked.number} ({picked.name}) is no longer kept in the vault {job_vault}: run the restore again to pick another version', EXIT_COMMAND_FAILED)
+			# with --accept, a marker there is one of this restore's or a CommandError
+			found = check_target(target, rule.job_name, rel, args.in_place, version, accept=args.accept)
+			aside = None
+			if found == 'move aside':
+				# the live entry is moved only for a version that can put something in its place
+				try:
+					entry = resolve_version_entry(job_vault, version.path, rel, rule.mon_path, moves)
+				except OSError:
+					entry = None
+				if entry is None or entry.kind == 'folder' or restore_failure(entry, version) is None:
+					aside = move_target_aside(target)
+			report = RestoreReport()
+			try:
+				if args.accept:
+					accept_restore(job_vault, version, rule.mon_path, rel, target, report, moves)
+				else:
+					restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report, resume=found in ('resume', 'into root'), aside=aside, marked=found == 'resume', moves=moves)
+			except KeyboardInterrupt:
+				if report.marker is None:
+					raise
+				if report.handing_over:
+					# the folders handed over are another user's now, which a run again refuses to write into
+					raise CommandError(f'Interrupted: the restore was stopped while giving its folders their owners; finish it by running the same restore again with --accept. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
+				raise CommandError(f'Interrupted: run the same restore again to pick it up, or again with --accept to keep what it restored as it is. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
+			finally:
+				report.progress(sys.stderr, done=True)
 	print(report.summary())
 	return EXIT_COMMAND_FAILED if report.failed or warned else 0
 

@@ -822,7 +822,9 @@ def test_the_history_and_restore_commands_read_each_change_list_once(tmp_path, c
 		code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'b/x'), str(dest), '--version', '3')
 		assert open(dest / 'x').read() == 'x'
 	assert code == 0, err
-	assert sorted(reads) == ['V1', 'V2']
+	# a restore reads them once to pick its version, and once more under the restore lock, as a backup may have
+	# committed between the two
+	assert sorted(reads) == (['V1', 'V2'] if which == 'history' else ['V1', 'V1', 'V2', 'V2'])
 
 
 # --- pruning keeps the oldest version when the next one cannot be looked at in full ---

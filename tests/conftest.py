@@ -37,6 +37,8 @@ def isolated_runtime(tmp_path, monkeypatch):
 	# and a test's disk whose failed sync could not be recorded must not keep a later test's copies unchecked
 	rv.UNRECORDED_FAILED_DISKS.clear()
 	rv.RESTORE_STOP.clear()
+	# and a test's lock that could not be checked must not hold back another's FAILED marker
+	rv.JOB_LOCK_UNCHECKED.clear()
 	# the daemon publishes status files: keep them out of /run/reverberator
 	monkeypatch.setenv('REVERB_STATE_DIR', str(tmp_path / 'state'))
 	# and never writes the host's sysctls: a sudo sysctl is answered as refused (a test that fakes run_command itself

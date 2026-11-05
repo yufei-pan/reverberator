@@ -357,7 +357,7 @@ def test_restore_never_writes_the_vault(job, tmp_path, capsys):
 	for name, path in (('root', job.monitor), ('folder', f'{job.monitor}/proj'), ('file', f'{job.monitor}/proj/sub/b.txt'), ('link', f'{job.monitor}/proj/link')):
 		assert restore(tmp_path, capsys, path, destination(tmp_path, name), '--version', '1')[0] == 0, name
 	assert snapshot(job.vault) == before
-	assert os.listdir(tmp_path / 'state') == [f'job-{job.job_name}.restore.lock']
+	assert sorted(os.listdir(tmp_path / 'state')) == [f'job-{job.job_name}.{kind}.lock' for kind in ('backup', 'history', 'restore')]
 
 
 def test_restore_names_with_spaces_and_unicode(job, tmp_path, capsys):

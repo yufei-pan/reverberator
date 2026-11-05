@@ -346,17 +346,17 @@ def test_history_writes_nothing(job, tmp_path, capsys):
 		assert history(tmp_path, capsys, path, *extra)[0] == 0
 	# no manifest opened (sqlite would leave files beside it), nothing in the vault or the rule file touched
 	assert (snapshot(job.vault), snapshot(job.monitor), open(job.rule_path, 'rb').read()) == before
-	assert os.listdir(state_dir(tmp_path)) == [f'job-{job.job_name}.restore.lock']
+	assert os.listdir(state_dir(tmp_path)) == [f'job-{job.job_name}.history.lock']
 
 
-def test_history_holds_the_restore_lock_while_reading(job, tmp_path, capsys, monkeypatch):
+def test_history_holds_the_history_lock_while_reading(job, tmp_path, capsys, monkeypatch):
 	a_txt_lifetime(job)
 	write_rule(job)
 	held = []
 	list_versions = rv.list_versions
 
 	def checking(job_vault):
-		fd = os.open(rv.restore_lock_path(job.job_name, state_dir(tmp_path)), os.O_RDWR)
+		fd = os.open(rv.job_lock_path(job.job_name, 'history', state_dir(tmp_path)), os.O_RDWR)
 		try:
 			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 			held.append(False)
@@ -375,11 +375,11 @@ def test_history_lock_it_cannot_take_is_an_error(job, tmp_path, capsys, monkeypa
 	write_rule(job)
 
 	def refuse(self):
-		raise PermissionError(13, 'Permission denied', rv.restore_lock_path(self.job_name, self.state_dir))
-	monkeypatch.setattr(rv.RestoreLock, '__enter__', refuse)
+		raise PermissionError(13, 'Permission denied', rv.job_lock_path(self.job_name, self.kind, self.state_dir))
+	monkeypatch.setattr(rv.JobLock, '__enter__', refuse)
 	code, out, err = history(tmp_path, capsys, f'{job.monitor}/a.txt')
 	assert (code, out) == (rv.EXIT_COMMAND_FAILED, '')
-	assert 'restore lock' in err and 'Permission denied' in err and 'Traceback' not in err
+	assert 'history lock' in err and 'Permission denied' in err and 'Traceback' not in err
 
 
 def test_history_vault_it_cannot_read_is_an_error(job, tmp_path, capsys, monkeypatch):
