@@ -24,6 +24,13 @@ pool support P2 as 0.55, released only once the pool cut test (section 5) passes
 - A cut backup after the hand-over is always finished and committed ("Always finish it").
 - The 0.54 prune and scan code stays one release for unmigrated vaults ("Keep it one release").
 - Build: "Locks first, then R".
+- 2026-11-05, on the round 20 plan's questions:
+  - The rehearsal includes the passwords vault's names and metadata ("Include it, no names shown (Recommended)").
+  - A real copy of each vault before the first start ("All four to /mnt/fast (Recommended)").
+  - §14's removals and rewordings ("Apply as drafted (Recommended)"): remove the pool prune, bumped times and Copy threads
+    auto entries; narrow "A user's link written as its own path's chain link" to the one-time conversion; reword the two
+    move entries and the size estimate entry.
+  - The setgid entry stays, reworded for 0.55 ("Keep as known limitation (Recommended)").
 
 Background: study `r19/design/report.md`, reviews `r19/opus-review.md` and `r19/step-review.md`, spec check
 `r19/spec-check.md` (session scratchpad; the numbers below are from them).
