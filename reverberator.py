@@ -13383,7 +13383,7 @@ def job_state_phrase(record, daemon_alive:bool, daemon_started) -> str:
 	state, detail = record['state'], record.get('detail') or ''
 	number = lambda key: record_number(record, key) or 0
 	if state == 'waiting':
-		phrase = f'waiting for disk since {show_time(number("since"), True)}: {detail}'
+		phrase = f'waiting since {show_time(number("since"), True)}: {detail}'
 	elif state == 'retrying':
 		phrase = f'retrying at {show_time(number("retry_at"), True)} after {int(number("failures"))} failed attempts: {detail}'
 	elif state == 'stopped':

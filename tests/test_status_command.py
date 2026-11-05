@@ -125,7 +125,7 @@ def test_status_state_phrases(job, tmp_path, capsys):
 	at = time.mktime((2026, 10, 19, 8, 40, 0, 0, 0, -1))
 	cases = [
 		(dict(state='retrying', detail='boom', failures=3, retry_at=at), 'retrying at 08:40 after 3 failed attempts: boom'),
-		(dict(state='waiting', detail='/mnt/x: not mounted', since=at), 'waiting for disk since 08:40: /mnt/x: not mounted'),
+		(dict(state='waiting', detail='/mnt/x: not mounted', since=at), 'waiting since 08:40: /mnt/x: not mounted'),
 		(dict(state='stopped', detail='skip list lost'), 'stopped: skip list lost'),
 		(dict(state='starting'), 'starting'),
 	]

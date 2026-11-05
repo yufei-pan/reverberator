@@ -627,7 +627,7 @@ def test_a_batch_waiting_for_a_copying_restore_shows_waiting_in_status(job, tmp_
 		wait_until(lambda: _record(tmp_path, job)['state'] == 'waiting', message='status never showed the job waiting')
 		assert _record(tmp_path, job)['detail'] == reason
 		code, out = _status_job(tmp_path, job, capsys)
-		assert code == 0 and f'waiting for disk since' in out and reason in out
+		assert code == 0 and 'waiting since' in out and reason in out
 		code, out = _status_job(tmp_path, job, capsys, '--json')
 		listed = json.loads(out)['jobs'][0]
 		assert listed['state'] == 'waiting' and listed['detail'] == reason
