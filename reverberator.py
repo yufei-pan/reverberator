@@ -703,8 +703,8 @@ class JobControl:
 			record = self._publish()
 		self._write(record)
 
-	def begin_wait(self, path:str, what:str) -> object:
-		'''Note the job waiting for path, and return the token update_wait, alerts and end_wait take.'''
+	def begin_wait(self, path:'str | None', what:str) -> object:
+		'''Note the job waiting for path (None for a wait on no path, shown as what alone), and return the token update_wait, alerts and end_wait take.'''
 		token = object()
 		with self._lock:
 			self._waits.append([token, path, what, time.time()])
@@ -746,7 +746,8 @@ class JobControl:
 		'''
 		state, detail, since = self._state, self._detail, self._since
 		if self._waits:
-			state, detail, since = 'waiting', f'{self._waits[0][1]}: {self._waits[0][2]}', self._waits[0][3]
+			path, what = self._waits[0][1:3]
+			state, detail, since = 'waiting', what if path is None else f'{path}: {what}', self._waits[0][3]
 		self._published += 1
 		return self._published, {'job': self.job_name, 'state': state, 'detail': detail, 'since': since,
 			'retry_at': self._retry_at, 'failures': self._failures, 'last_success': self.last_success, 'updated': time.time()}
@@ -10868,12 +10869,13 @@ class BackupLocks:
 		if running is None:
 			running = GREEN_LIGHT.is_set if self.job is None else self.job.should_run
 		token = None
-		def waiting(path, reason):
+		def waiting(reason):
+			# the reason alone: the lock file's path is no disk the job waits for, and status shows the detail as it is
 			nonlocal token
 			if self.job is None:
 				return
 			if token is None:
-				token = self.job.begin_wait(path, reason)
+				token = self.job.begin_wait(None, reason)
 			else:
 				self.job.update_wait(token, reason)
 		# kind -> its open lock file once held, None for one no state folder holds
@@ -10903,16 +10905,17 @@ class BackupLocks:
 					self.fds = [fd for fd in held.values() if fd is not None]
 					return True
 				except BlockingIOError:
-					waiting(path, f'a restore of {self.job_name} is copying')
+					waiting(f'a restore of {self.job_name} is copying')
 					if 'waiting' not in said:
 						said.add('waiting')
 						backuperTeeLogToTl(self.job_name, f'Waiting for a restore of {self.job_name} to finish before backing up')
 				except OSError as e:
 					# the lock may be held right now: a check that failed is never taken as leave to change the vault
-					waiting(path, f'cannot check the {kind} lock {path}: {e}')
+					why = f'cannot check the {kind} lock {path}: {e.strerror or e}'
+					waiting(why)
 					if path not in said:
 						said.add(path)
-						backuperTeeLogToTl(self.job_name, f'Backup postponed: cannot check the {kind} lock {path}: {e}', error=True)
+						backuperTeeLogToTl(self.job_name, f'Backup postponed: {why}', error=True)
 					job_lock_unchecked(self.job_name, kind, path, e, 'backup postponed', self.clock)
 				time.sleep(POLL_WAIT_SECONDS)
 			return False

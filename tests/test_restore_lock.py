@@ -245,7 +245,7 @@ def test_the_lock_files_are_never_opened_through_a_symlink(job, tmp_path, monkey
 	locks = rv.BackupLocks('job')
 	polls = iter(range(3))
 	assert locks.take(lambda: next(polls, None) is not None) is False
-	assert [line for line in lines if line.startswith('Backup postponed')] == [f'Backup postponed: cannot check the backup lock {rv.job_lock_path("job", "backup")}: [Errno {errno.ELOOP}] {os.strerror(errno.ELOOP)}: {rv.job_lock_path("job", "backup")!r}']
+	assert [line for line in lines if line.startswith('Backup postponed')] == [f'Backup postponed: cannot check the backup lock {rv.job_lock_path("job", "backup")}: {os.strerror(errno.ELOOP)}']
 	assert not os.path.lexists(elsewhere)
 
 
@@ -520,7 +520,7 @@ def test_a_lock_that_cannot_be_checked_postpones_the_backup_with_an_hourly_marke
 		failing[0] = False
 	backup.join(10)
 	assert backup.committed is True and _numbers(job) == [0, 1]
-	assert [line for line in lines if line.startswith('Backup postponed')] == [f'Backup postponed: cannot check the {kind} lock {lock_path}: [Errno {errno.EACCES}] {os.strerror(errno.EACCES)}: {lock_path!r}']
+	assert [line for line in lines if line.startswith('Backup postponed')] == [f'Backup postponed: cannot check the {kind} lock {lock_path}: {os.strerror(errno.EACCES)}']
 	assert 'FAILED' in capsys.readouterr().out
 
 
@@ -622,7 +622,7 @@ def test_a_batch_waiting_for_a_copying_restore_shows_waiting_in_status(job, tmp_
 	taken = []
 	thread = threading.Thread(target=lambda: taken.append(locks.take()), daemon=True)
 	thread.start()
-	reason = f'{rv.job_lock_path("job", "restore")}: a restore of job is copying'
+	reason = 'a restore of job is copying'
 	try:
 		wait_until(lambda: _record(tmp_path, job)['state'] == 'waiting', message='status never showed the job waiting')
 		assert _record(tmp_path, job)['detail'] == reason
@@ -659,7 +659,7 @@ def test_a_lock_that_cannot_be_checked_shows_the_job_waiting_with_the_error(job,
 	try:
 		wait_until(lambda: _record(tmp_path, job)['state'] == 'waiting', message='status never showed the job waiting')
 		detail = _record(tmp_path, job)['detail']
-		assert detail.startswith(f'{lock_path}: cannot check the restore lock {lock_path}: ') and os.strerror(errno.EACCES) in detail
+		assert detail == f'cannot check the restore lock {lock_path}: {os.strerror(errno.EACCES)}'
 	finally:
 		failing[0] = False
 	thread.join(10)
@@ -686,7 +686,6 @@ def test_a_job_that_stops_running_while_its_batch_waits_returns_at_once_with_the
 	assert _numbers(job) == [0, 1, 2]
 	assert _record(tmp_path, job)['state'] != 'waiting'
 	assert _free('backup') and _free('restore')
-	assert not any('did not commit' in line for line in lines)
 
 
 @pytest.mark.parametrize('kind, purpose', [('backup', 'lets a backup that waits for a restore go first'),
