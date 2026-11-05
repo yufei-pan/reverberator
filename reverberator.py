@@ -4690,7 +4690,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		def scan():
 			# the scan can change the vault: under the job's backup and restore locks, so no restore reads it meanwhile.
 			# None when the job stops while it waits for them
-			locks = BackupLocks(job_name)
+			locks = BackupLocks(job_name, job=job)
 			if not locks.take(running):
 				return None
 			try:
@@ -4812,10 +4812,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
 					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since,chain_length=chain_length,
-					  copy_threads=copy_threads)
+					  copy_threads=copy_threads,job=job)
 				if not committed:
-					# the batch goes back to the queue on the way out
-					if GREEN_LIGHT.is_set():
+					# the batch goes back to the queue on the way out. a stop, or the job's own failure, is no failure to commit
+					if running():
 						if job is None:
 							backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running; requesting shutdown',error=True)
 							GREEN_LIGHT.clear()
@@ -5540,7 +5540,7 @@ def do_backup(backup_entries:dict,
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
 			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,
-			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None,chain_length:int = None,copy_threads:int = None):
+			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None,chain_length:int = None,copy_threads:int = None,job:'JobControl' = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
 	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
 	# reported: the unreadable paths already logged for this batch, so each is logged once
@@ -5557,6 +5557,7 @@ def do_backup(backup_entries:dict,
 	# the old time forward
 	# chain_length: the job's Chain Length, 0 for no limit, None for DEFAULT_CHAIN_LENGTH; it sets when a file is copied again ( recopy_hops() )
 	# copy_threads: the job's Copy threads, the threads of the referenced copy and the prune, None for REFERENCED_COPY_THREADS
+	# job: the job's JobControl, None outside the daemon: the wait for the locks shows in its status and ends when it stops running
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -5589,7 +5590,7 @@ def do_backup(backup_entries:dict,
 		manifest = VaultManifest(job_vault)
 	# the job's backup and restore locks, held from before anything in the vault is changed to the end of this backup,
 	# so no restore reads it meanwhile. the comparison runs without them
-	locks = BackupLocks(job_name)
+	locks = BackupLocks(job_name, job=job)
 	try:
 		# inner mounts the backup has seen and that are unmounted now are paused: every walk below leaves them out, and
 		# they keep what the vault holds for them
@@ -10843,11 +10844,14 @@ class BackupLocks:
 	'''
 	A batch's exclusive hold on its job's backup and restore locks (job_lock_path()), so no restore reads the vault while
 	the batch changes it. take() waits for them without ever blocking in flock, and release() lets them go; a missing
-	state folder means no restore can hold one, so the batch goes on without it.
+	state folder means no restore can hold one, so the batch goes on without it. With job (a JobControl), the wait is the
+	job's own: it shows as waiting in status with its reason, and ends when the job stops running (should_run) as well as
+	on a daemon stop.
 	'''
-	def __init__(self, job_name:str, clock = time.monotonic):
+	def __init__(self, job_name:str, clock = time.monotonic, job:JobControl = None):
 		self.job_name = job_name
 		self.clock = clock
+		self.job = job
 		# the open lock files while held, None while not
 		self.fds = None
 
@@ -10856,11 +10860,22 @@ class BackupLocks:
 		Hold both locks, trying every POLL_WAIT_SECONDS while a restore holds one or one cannot be checked (an error line
 		once, then job_lock_unchecked()'s marker), saying once that it waits. The backup lock, once held, is kept while it
 		waits for the restore lock, so restores starting meanwhile wait for this batch. True once both are held (at once
-		when held already), False when running() (GREEN_LIGHT.is_set by default) turns false first, holding neither.
+		when held already), False when running() (the job's should_run, else GREEN_LIGHT.is_set, by default) turns false
+		first, holding neither. The job's status shows it waiting, with the reason, from the first failed try to the return.
 		'''
 		if self.fds is not None:
 			return True
-		running = GREEN_LIGHT.is_set if running is None else running
+		if running is None:
+			running = GREEN_LIGHT.is_set if self.job is None else self.job.should_run
+		token = None
+		def waiting(path, reason):
+			nonlocal token
+			if self.job is None:
+				return
+			if token is None:
+				token = self.job.begin_wait(path, reason)
+			else:
+				self.job.update_wait(token, reason)
 		# kind -> its open lock file once held, None for one no state folder holds
 		held = {}
 		said = set()
@@ -10888,11 +10903,13 @@ class BackupLocks:
 					self.fds = [fd for fd in held.values() if fd is not None]
 					return True
 				except BlockingIOError:
+					waiting(path, f'a restore of {self.job_name} is copying')
 					if 'waiting' not in said:
 						said.add('waiting')
 						backuperTeeLogToTl(self.job_name, f'Waiting for a restore of {self.job_name} to finish before backing up')
 				except OSError as e:
 					# the lock may be held right now: a check that failed is never taken as leave to change the vault
+					waiting(path, f'cannot check the {kind} lock {path}: {e}')
 					if path not in said:
 						said.add(path)
 						backuperTeeLogToTl(self.job_name, f'Backup postponed: cannot check the {kind} lock {path}: {e}', error=True)
@@ -10900,6 +10917,8 @@ class BackupLocks:
 				time.sleep(POLL_WAIT_SECONDS)
 			return False
 		finally:
+			if token is not None:
+				self.job.end_wait(token)
 			if self.fds is None:
 				for fd in held.values():
 					if fd is not None:
@@ -13754,6 +13773,10 @@ def never_backed_up(rule:ReverbRule, rule_path:str, rel:str, typed_folder:bool =
 	message = f'{path} was never backed up'
 	return shown(message if pattern is None else f'{message}; it matches the skip pattern {pattern}')
 
+# what each lock does, for the error of a command that cannot take it
+COMMAND_LOCK_PURPOSE = {'backup': 'lets a backup that waits for a restore go first', 'history': 'keeps its versions from being pruned while they are read',
+	'restore': 'keeps the vault unchanged while a restore copies'}
+
 @contextlib.contextmanager
 def command_lock(job_name:str, kind:str, state_dir:str = None):
 	'''Hold job_name's lock of kind (JobLock) for a command; a lock it cannot take is a CommandError, not a traceback.'''
@@ -13761,7 +13784,7 @@ def command_lock(job_name:str, kind:str, state_dir:str = None):
 	try:
 		lock.__enter__()
 	except OSError as e:
-		raise CommandError(f'Cannot take the {kind} lock of job {job_name}, which keeps its versions while they are read: {e}', EXIT_COMMAND_FAILED)
+		raise CommandError(f'Cannot take the {kind} lock of job {job_name}, which {COMMAND_LOCK_PURPOSE[kind]}: {e}', EXIT_COMMAND_FAILED)
 	try:
 		yield lock
 	finally:

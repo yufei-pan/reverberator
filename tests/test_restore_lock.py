@@ -102,6 +102,8 @@ class Backup(threading.Thread):
 	def run(self):
 		options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 		options.update(self.kwargs)
+		if 'control' in options:
+			options['job'] = options.pop('control')
 		try:
 			_, manifest, self.committed = rv.do_backup(self.entries, job_name=self.job.job_name, monitor_path=self.job.monitor, vault_path=self.job.vault, **options)
 			manifest.close()
@@ -589,3 +591,110 @@ def test_a_restore_reads_the_vault_again_once_it_holds_the_lock(job, tmp_path, c
 	assert code == rv.EXIT_COMMAND_FAILED and stdout == ''
 	assert f'V0 ({v0.name}) is no longer kept in the vault {job.job_vault}: run the restore again to pick another version' in err
 	assert os.listdir(out) == []
+
+
+def _status_job(tmp_path, job, capsys, *extra):
+	capsys.readouterr()
+	code = rv.run_command(['status', '--rule', job.rule_path, '--state_dir', str(tmp_path / 'state'), *extra])
+	return code, capsys.readouterr().out
+
+
+def _board(tmp_path, job):
+	write_rule(job)
+	rv.STATUS_BOARD = rv.StatusBoard(str(tmp_path / 'state'), job.rule_path)
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	control.set_state('running')
+	return control
+
+
+def _record(tmp_path, job):
+	import json
+	with open(tmp_path / 'state' / f'job-{job.job_name}.json') as f:
+		return json.load(f)
+
+
+def test_a_batch_waiting_for_a_copying_restore_shows_waiting_in_status(job, tmp_path, capsys):
+	import json
+	control = _board(tmp_path, job)
+	copying = Held('restore')
+	locks = rv.BackupLocks('job', job=control)
+	taken = []
+	thread = threading.Thread(target=lambda: taken.append(locks.take()), daemon=True)
+	thread.start()
+	reason = f'{rv.job_lock_path("job", "restore")}: a restore of job is copying'
+	try:
+		wait_until(lambda: _record(tmp_path, job)['state'] == 'waiting', message='status never showed the job waiting')
+		assert _record(tmp_path, job)['detail'] == reason
+		code, out = _status_job(tmp_path, job, capsys)
+		assert code == 0 and f'waiting for disk since' in out and reason in out
+		code, out = _status_job(tmp_path, job, capsys, '--json')
+		listed = json.loads(out)['jobs'][0]
+		assert listed['state'] == 'waiting' and listed['detail'] == reason
+	finally:
+		copying.release()
+	thread.join(10)
+	assert taken == [True]
+	locks.release()
+	assert _record(tmp_path, job)['state'] == 'running'
+	code, out = _status_job(tmp_path, job, capsys, '--json')
+	assert json.loads(out)['jobs'][0]['state'] == 'running'
+
+
+def test_a_lock_that_cannot_be_checked_shows_the_job_waiting_with_the_error(job, tmp_path, monkeypatch):
+	control = _board(tmp_path, job)
+	_state()
+	lock_path = rv.job_lock_path('job', 'restore')
+	failing = [True]
+	real_open = os.open
+	def fake_open(path, *args, **kwargs):
+		if path == lock_path and failing[0]:
+			raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+		return real_open(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', fake_open)
+	locks = rv.BackupLocks('job', job=control)
+	taken = []
+	thread = threading.Thread(target=lambda: taken.append(locks.take()), daemon=True)
+	thread.start()
+	try:
+		wait_until(lambda: _record(tmp_path, job)['state'] == 'waiting', message='status never showed the job waiting')
+		detail = _record(tmp_path, job)['detail']
+		assert detail.startswith(f'{lock_path}: cannot check the restore lock {lock_path}: ') and os.strerror(errno.EACCES) in detail
+	finally:
+		failing[0] = False
+	thread.join(10)
+	assert taken == [True]
+	locks.release()
+	assert _record(tmp_path, job)['state'] == 'running'
+
+
+def test_a_job_that_stops_running_while_its_batch_waits_returns_at_once_with_the_batch_queued(job, tmp_path, monkeypatch):
+	_three_versions(job)
+	control = _board(tmp_path, job)
+	lines = _logged_lines(monkeypatch)
+	copying = Held('restore')
+	# the daemon keeps running (GREEN_LIGHT): only the job's own watcher fails
+	backup = Backup(job, _change(job, 3), keep_n_versions=3, control=control)
+	try:
+		wait_until(lambda: WAITING in lines and _record(tmp_path, job)['state'] == 'waiting', message='the batch never waited')
+		control.fail('the watcher failed')
+		backup.join(5)
+		assert not backup.is_alive(), 'the wait went on past the job stopping'
+	finally:
+		copying.release()
+	assert backup.error is None and backup.committed is False
+	assert _numbers(job) == [0, 1, 2]
+	assert _record(tmp_path, job)['state'] != 'waiting'
+	assert _free('backup') and _free('restore')
+	assert not any('did not commit' in line for line in lines)
+
+
+@pytest.mark.parametrize('kind, purpose', [('backup', 'lets a backup that waits for a restore go first'),
+		('history', 'keeps its versions from being pruned while they are read'), ('restore', 'keeps the vault unchanged while a restore copies')])
+def test_a_command_that_cannot_take_a_lock_says_what_the_lock_is_for(tmp_path, monkeypatch, kind, purpose):
+	_state()
+	os.symlink(tmp_path / 'elsewhere', rv.job_lock_path('job', kind))
+	with pytest.raises(rv.CommandError) as raised:
+		with rv.command_lock('job', kind):
+			pass
+	assert str(raised.value).startswith(f'Cannot take the {kind} lock of job job, which {purpose}: ')
