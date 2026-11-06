@@ -64,7 +64,7 @@ Links point to the **next** version, not to the current one. A path that has not
 **Results:**
 - **Writes, work job:** today 2,678–2,711 MiB per cycle; R about 20–31 MiB.
 - **Crash test:** all 249 kill points pass, with every version exact, folder times included.
-- **Code:** about −450 lines in 0.55. About −2,400 once the 0.54 reader and scan go, in a later release (§8).
+- **Code:** planned at about −450 lines in 0.55; measured after the removal, the file is about 1,190 lines longer than at 8a8bcb9, as design R's own code came out larger than the estimate. About −2,400 once the 0.54 reader and scan go, in a later release (§8).
 
 ## 1. Vault layout (API change)
 - **Version folders.** Named `V<n>--<ts>/` as today.
@@ -336,7 +336,7 @@ Between steps 3 and 5, V<n> is missing: `current_version` and the older versions
 **Scan repairs, before staging is emptied:**
 - **A hand-over's tree still under its old name on a disk:** it gets the new name there, directly on that disk, then every disk is flushed.
 - **A skeleton in staging and V<N> with no list:** redo the rename V<n>→V<N>, flush, rename the skeleton in, flush.
-- **A cut conversion on two renames** (§7), on a vault not yet on design R, directly on each disk. The version is the manifest's newest not yet converted, as one tree is built at a time and a list with no folder no longer tells it. `staging/m` showing, or no folder under the version's name: `staging/old` goes back on each disk and the version is converted again. `staging/n` showing: it goes in on each disk.
+- **A cut conversion on two renames** (§7), on a vault not yet on design R, directly on each disk. The version is the manifest's newest not yet converted, as one tree is built at a time and a list with no folder no longer tells it. `staging/m` showing, or no folder under the version's name: `staging/old` goes back on each disk and the version is converted again. `staging/n` showing with `staging/old`, or with no folder under the version's name: it goes in on each disk. `staging/n` alone with the version there is what a removal of staging left, and goes with staging.
 - **After a change made directly on a disk,** the pool is told to forget what it holds (mergerfs's `invalidate-all-nodes` command), as it reads the old entry for about a second, and an entry of another kind reads as EIO. A mergerfs without the command only reads late, and the attempt goes on at the next.
 
 **Roll-forward repairs, per disk:**
@@ -375,7 +375,7 @@ At commit, the previous newest version's list is renamed. Removing the oldest ve
 
 **Per version, newest first, for each version holding any 0.54 chain link:**
 1. Build `staging/m`: folders with the version's metadata, and each non-folder hard-linked to its chain end. Chains are followed by their text (accepted by the user). A dangling chain becomes the link itself. A 0.54 prune temp (`is_prune_temp`) is left out.
-2. `RENAME_EXCHANGE` it with the version folder. On a pool or a filesystem with no exchange, three renames, each followed by a flush: the version to `staging/old`, `staging/m` to `staging/n`, `staging/n` to the version. The middle one is there because a cut can leave the version half out on one disk only, and the halves under its name look alike: `m` says the old tree may not be out of every disk yet, and `n` says it is (§5).
+2. `RENAME_EXCHANGE` it with the version folder. On a pool or a filesystem with no exchange, a flush, then three renames, each followed by a flush: the version to `staging/old`, `staging/m` to `staging/n`, `staging/n` to the version. The first flush puts the built tree on every disk before the version moves, so `old` anywhere means `m` or `n` shows until the tree is in; without it a disk can come back with `old` while the disk holding `m` comes back from before it was built, which reads as a tree already in, and the version's names on the first disk go with staging. The middle rename is there because a cut can leave the version half out on one disk only, and the halves under its name look alike: `m` says the old tree may not be out of every disk yet, and `n` says it is (§5).
 3. `rm -rf` the old tree.
 4. Add the version to `migrated`.
 
@@ -490,7 +490,7 @@ Line counts are measured with `ast` at HEAD 8a8bcb9, inclusive.
 | pools (pre-record passes, per-disk repair) | 80 |
 | Keep 1 Complete Backup / 'r' rows | 5 |
 
-**Net:** about −450 lines in 0.55, and about −2,400 once the kept parts go.
+**Net:** planned at about −450 lines in 0.55, and about −2,400 once the kept parts go. Measured with `ast` after the removal: 14,943 lines at 8a8bcb9, 16,128 now, +1,185, with 1,336 lines removed in that one step.
 
 **Tests:** 29 files (16,967 lines) touch these parts. The prune tests stay until the later release. The crash harness and the history recheck test become repo tests.
 
