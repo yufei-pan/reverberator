@@ -87,7 +87,7 @@ def recording_syncfs(monkeypatch, failing=()):
 def test_the_vault_sync_on_a_pool_reaches_each_branch_holding_it(tmp_path, fake_pool, monkeypatch):
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
 	calls = recording_syncfs(monkeypatch)
-	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
 	assert sorted(calls) == [os.path.join(a, 'job'), os.path.join(c, 'job')]
 	assert results == {a: None, c: None}
 
@@ -95,7 +95,7 @@ def test_the_vault_sync_on_a_pool_reaches_each_branch_holding_it(tmp_path, fake_
 def test_the_vault_sync_on_a_pool_gives_each_branch_its_result(tmp_path, fake_pool, monkeypatch):
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
 	calls = recording_syncfs(monkeypatch, failing=[os.path.join(a, 'job')])
-	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
 	assert sorted(calls) == [os.path.join(a, 'job'), os.path.join(c, 'job')]
 	assert results[c] is None and results[a].errno == errno.EIO and set(results) == {a, c}
 
@@ -120,7 +120,7 @@ def test_two_branch_folders_on_one_filesystem_are_one_disk(tmp_path, fake_pool, 
 	job_path, disk, (x, y) = pool_over_one_filesystem(tmp_path, fake_pool, monkeypatch, 'xy')
 	assert rv.vault_disks(job_path) == (True, [(disk, x), (disk, y)])
 	calls = recording_syncfs(monkeypatch)
-	assert REAL_SYNC_VAULT_FILESYSTEMS(job_path) == {disk: None} and len(calls) == 1
+	assert REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job') == {disk: None} and len(calls) == 1
 	# the folders are still each flushed
 	flushed = recording_fsync(monkeypatch)
 	rv.fsync_vault_folder(job_path)
@@ -139,7 +139,7 @@ def test_an_error_met_through_either_branch_folder_is_its_filesystems_result(tmp
 		if len(calls) == 1:
 			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
 	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
-	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
 	assert list(results) == [disk] and results[disk].errno == errno.EIO and len(calls) == 1
 
 
@@ -147,7 +147,7 @@ def test_the_vault_sync_off_any_pool_reaches_the_vault_itself(tmp_path, monkeypa
 	path = str(tmp_path / 'job')
 	os.makedirs(path)
 	calls = recording_syncfs(monkeypatch)
-	results = REAL_SYNC_VAULT_FILESYSTEMS(path)
+	results = REAL_SYNC_VAULT_FILESYSTEMS(path, 'job')
 	assert calls == [path]
 	assert results == {rv.mount_holding(rv.read_mount_table(), os.path.realpath(path))[0]: None}
 
@@ -156,14 +156,14 @@ def test_the_vault_sync_off_any_pool_gives_an_error_other_than_a_missing_folder_
 	path = str(tmp_path / 'job')
 	os.makedirs(path)
 	recording_syncfs(monkeypatch, failing=[path])
-	results = REAL_SYNC_VAULT_FILESYSTEMS(path)
+	results = REAL_SYNC_VAULT_FILESYSTEMS(path, 'job')
 	assert list(results.values())[0].errno == errno.EIO and list(results) == [rv.mount_holding(rv.read_mount_table(), os.path.realpath(path))[0]]
 
 
 def test_the_vault_sync_off_any_pool_raises_for_a_vault_that_is_gone(tmp_path, monkeypatch):
 	calls = recording_syncfs(monkeypatch)
 	with pytest.raises(FileNotFoundError):
-		REAL_SYNC_VAULT_FILESYSTEMS(str(tmp_path / 'gone'))
+		REAL_SYNC_VAULT_FILESYSTEMS(str(tmp_path / 'gone'), 'job')
 	assert calls == []
 
 
@@ -174,7 +174,7 @@ def test_the_vault_sync_raises_when_the_branch_list_cannot_be_read(tmp_path, fak
 	monkeypatch.setattr(rv, 'read_pool_branches', unreadable)
 	calls = recording_syncfs(monkeypatch)
 	with pytest.raises(OSError):
-		REAL_SYNC_VAULT_FILESYSTEMS(job_path)
+		REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
 	assert calls == []
 
 

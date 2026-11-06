@@ -35,7 +35,7 @@ IMAGE_MIB = 512
 
 def flushing_for_real(module):
 	'''The vault's comparisons flush the loop image, through the one helper: a stub would record copies checked that a power loss loses.'''
-	module.sync_vault_filesystems = lambda job_vault: (flush_scratch(job_vault), {})[1]
+	module.sync_vault_filesystems = lambda job_vault, *job_name: (flush_scratch(job_vault), {})[1]
 
 
 def recorded_version(job_vault):

@@ -870,7 +870,7 @@ def test_each_version_is_flushed_before_it_counts_as_done(small, monkeypatch):
 	monkeypatch.setattr(rv.VaultManifest, 'add_migrated', lambda self, name: (order.append(('done', name)), real_add(self, name))[1])
 	real_exchange = rv.rename_exchange
 	monkeypatch.setattr(rv, 'rename_exchange', lambda a, b: (order.append(('exchange', os.path.basename(b))), real_exchange(a, b))[1])
-	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: order.append('flush') or {})
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault, job_name: order.append('flush') or {})
 	assert migrate(small) is True
 	for number, name in folders_of(small).items():
 		if ('exchange', name) in order:
@@ -878,8 +878,7 @@ def test_each_version_is_flushed_before_it_counts_as_done(small, monkeypatch):
 
 
 def test_a_flush_that_fails_stops_the_conversion(small, monkeypatch):
-	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: {'/dev/fake': OSError(errno.EIO, 'input/output error')})
-	monkeypatch.setattr(rv, 'mark_failed_sync', lambda disk, error: False)
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault, job_name: {'/dev/fake': OSError(errno.EIO, 'input/output error')})
 	with pytest.raises(rv.JobFailure):
 		migrate(small)
 	assert layout_of(small) is None
@@ -918,7 +917,7 @@ def test_a_conversion_on_f2fs_uses_exchange_and_keeps_times(v054, monkeypatch):
 
 def flushing_for_real(module):
 	'''A conversion's flushes reach the loop image, through the one helper: a stub would count a version done that a power loss loses.'''
-	module.sync_vault_filesystems = lambda job_vault: (flush_scratch(job_vault), {})[1]
+	module.sync_vault_filesystems = lambda job_vault, *job_name: (flush_scratch(job_vault), {})[1]
 
 
 @needs_f2fs

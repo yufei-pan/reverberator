@@ -799,7 +799,7 @@ def commit_steps(monkeypatch):
 	monkeypatch.setattr(rv, 'prepare_change_list', prepare)
 	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
 	monkeypatch.setattr(rv, 'flush_copies', flush)
-	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: steps.append('flush' if flushing else 'sync') or {})
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault, job_name: steps.append('flush' if flushing else 'sync') or {})
 	return steps
 
 
@@ -868,9 +868,9 @@ def test_a_comparison_that_synced_after_the_last_copy_leaves_nothing_to_flush(r_
 def test_a_comparison_whose_sync_failed_leaves_the_flush(r_job, commit_steps, monkeypatch):
 	build_base(r_job, **KEPT)
 	counted = rv.sync_vault_filesystems
-	def sync(job_vault):
+	def sync(job_vault, job_name):
 		first = not commit_steps
-		counted(job_vault)
+		counted(job_vault, job_name)
 		return {'/dev/fake': OSError(errno.EIO, 'input/output error')} if first else {}
 	monkeypatch.setattr(rv, 'sync_vault_filesystems', sync)
 	backup_events(r_job, move_and_modify(r_job.monitor), **KEPT)
@@ -924,7 +924,7 @@ def newest_version(job):
 
 def failing_flush(failure):
 	'''A sync_vault_filesystems that fails as failure says: an OSError raised, or {disk: its OSError}.'''
-	def sync(job_vault):
+	def sync(job_vault, job_name):
 		if isinstance(failure, OSError):
 			raise failure
 		return failure
@@ -974,8 +974,8 @@ def test_a_roll_forward_that_copies_nothing_flushes_the_cut_batchs_copies_before
 			backup_events(r_job, events, **KEPT, **options)
 	assert version_number(os.path.basename(newest_version(r_job))) == 3
 	counted = rv.sync_vault_filesystems
-	def sync(job_vault):
-		counted(job_vault)
+	def sync(job_vault, job_name):
+		counted(job_vault, job_name)
 		return {'/dev/fake': OSError(errno.EIO, 'input/output error')} if commit_steps[-1] == 'sync' else {}
 	monkeypatch.setattr(rv, 'sync_vault_filesystems', sync)
 	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=r_job.job_name, monitor_path=r_job.monitor, vault_path=r_job.vault, matched_since=time.time_ns(), **{**OPTIONS, **KEPT, **options})

@@ -64,7 +64,7 @@ def isolated_runtime(tmp_path, monkeypatch):
 	monkeypatch.setattr(rv.multiCMD, 'run_command', refuse_sudo_sysctl(rv.multiCMD.run_command))
 	# a real syncfs would flush the whole (ext4) filesystem under /tmp for every comparison that checks a copy; tests that count
 	# or fail syncs patch it themselves
-	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: {})
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault, job_name: {})
 	# and never reads the host's fstab: a missing file, which a test writes with write_fstab() when it means to
 	monkeypatch.setattr(rv, 'FSTAB_PATH', str(tmp_path / 'fstab'))
 	yield

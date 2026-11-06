@@ -400,7 +400,7 @@ def test_the_disks_of_a_vault_sync_side_by_side(tmp_path, monkeypatch):
 		else:
 			raise OSError(errno.EIO, 'EIO', path)
 	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
-	results = REAL_SYNC_VAULT_FILESYSTEMS(str(tmp_path))
+	results = REAL_SYNC_VAULT_FILESYSTEMS(str(tmp_path), 'job')
 	assert list(results) == ['d1', 'd2', 'd3'] and results['d1'] is None and results['d2'] is None
 	assert results['d3'].errno == errno.EIO and sorted(synced) == sorted(folders[1:])
 

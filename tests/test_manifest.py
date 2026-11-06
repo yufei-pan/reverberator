@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
@@ -77,7 +78,7 @@ def recording_sync(monkeypatch, failing=False):
 	raising EIO when failing, as it does for a branch list it cannot read.
 	'''
 	calls = []
-	def sync(job_vault):
+	def sync(job_vault, job_name):
 		calls.append(job_vault)
 		if failing:
 			raise OSError(errno.EIO, os.strerror(errno.EIO), job_vault)
@@ -87,9 +88,14 @@ def recording_sync(monkeypatch, failing=False):
 
 
 def disk_sync(monkeypatch, results):
-	'''rv.sync_vault_filesystems answering results ({disk: None or an errno}) for any job vault.'''
-	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: {disk: None if code is None else OSError(code, os.strerror(code))
-		for disk, code in results.items()})
+	'''rv.sync_vault_filesystems answering results ({disk: None or an errno}) for any job vault, recording each failed disk as it does.'''
+	def sync(job_vault, job_name):
+		answer = {disk: None if code is None else OSError(code, os.strerror(code)) for disk, code in results.items()}
+		for disk, error in answer.items():
+			if error is not None:
+				rv.record_failed_sync(disk, error, job_name)
+		return answer
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', sync)
 
 
 @pytest.fixture
@@ -298,6 +304,122 @@ def test_a_pool_job_and_an_off_pool_job_on_one_filesystem_share_the_marker(tmp_p
 	assert set(unchecked_flags(b).values()) == {1}
 
 
+def fake_disks(monkeypatch, vaults, syncfs):
+	'''The real sync over fake disks: vaults is {job vault: its disks}, and the folder of a vault on a disk is 'disk:vault'.'''
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', REAL_SYNC_VAULT_FILESYSTEMS)
+	monkeypatch.setattr(rv, 'vault_disks', lambda path: (len(vaults[path]) > 1, [(disk, f'{disk}:{path}') for disk in vaults[path]]))
+	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
+
+
+def in_thread(target, *args):
+	thread = threading.Thread(target=target, args=args, daemon=True)
+	thread.start()
+	return thread
+
+
+@pytest.mark.parametrize('sync', ['check_vault_sync', 'flush_vault_disks'])
+def test_a_sync_of_one_disk_does_not_wait_for_a_slow_sync_of_another(monkeypatch, boot, sync):
+	in_slow = threading.Event()
+	release = threading.Event()
+	def syncfs(folder):
+		if folder.startswith('/fake/slow'):
+			in_slow.set()
+			assert release.wait(20)
+	fake_disks(monkeypatch, {'slow_vault': ['/fake/slow'], 'fast_vault': ['/fake/fast']}, syncfs)
+	slow = in_thread(getattr(rv, sync), 'slow_vault', 'slow_job')
+	assert in_slow.wait(10)
+	fast = in_thread(getattr(rv, sync), 'fast_vault', 'fast_job')
+	fast.join(5)
+	waited = fast.is_alive()
+	release.set()
+	slow.join(10)
+	fast.join(10)
+	assert not waited
+
+
+def test_two_syncs_of_a_disk_go_one_at_a_time_and_the_first_ones_error_is_marked_before_the_second_gets_its_0(monkeypatch, boot):
+	steps = []
+	in_first = threading.Event()
+	release = threading.Event()
+	def syncfs(folder):
+		if steps:
+			steps.append('second sync')
+			return
+		steps.append('first sync')
+		in_first.set()
+		assert release.wait(20)
+		steps.append('first sync failed')
+		raise OSError(errno.EIO, os.strerror(errno.EIO), folder)
+	real_mark = rv.mark_failed_sync
+	def mark(disk, error):
+		time.sleep(0.2)            # a second sync not held out runs in this gap
+		steps.append('marked')
+		return real_mark(disk, error)
+	monkeypatch.setattr(rv, 'mark_failed_sync', mark)
+	fake_disks(monkeypatch, {'vault_a': ['/fake/X'], 'vault_b': ['/fake/X']}, syncfs)
+	second_answer = []
+	first = in_thread(rv.check_vault_sync, 'vault_a', 'job_a')
+	assert in_first.wait(10)
+	second = in_thread(lambda: second_answer.append(rv.check_vault_sync('vault_b', 'job_b')))
+	second.join(0.2)
+	release.set()
+	first.join(10)
+	second.join(10)
+	assert steps == ['first sync', 'first sync failed', 'marked', 'second sync']
+	assert second_answer == [['/fake/X']]
+
+
+def test_a_vault_on_two_disks_takes_each_disks_lock_on_its_own(monkeypatch, boot):
+	in_slow = threading.Event()
+	release = threading.Event()
+	two_disks_b = threading.Event()
+	def syncfs(folder):
+		if folder == '/fake/A:slow_vault':
+			in_slow.set()
+			assert release.wait(20)
+		elif folder == '/fake/B:two_disks':
+			two_disks_b.set()
+	fake_disks(monkeypatch, {'slow_vault': ['/fake/A'], 'two_disks': ['/fake/A', '/fake/B'], 'b_only': ['/fake/B']}, syncfs)
+	slow = in_thread(rv.flush_vault_disks, 'slow_vault', 'slow_job')
+	assert in_slow.wait(10)
+	two = in_thread(rv.flush_vault_disks, 'two_disks', 'two_job')
+	# held out of A, it syncs B all the same, and waits for A with B's lock free
+	synced_b = two_disks_b.wait(5)
+	b_only = in_thread(rv.flush_vault_disks, 'b_only', 'b_job')
+	b_only.join(5)
+	b_waited = b_only.is_alive()
+	two_waits_for_a = two.is_alive()
+	release.set()
+	for thread in (slow, two, b_only):
+		thread.join(10)
+		assert not thread.is_alive()
+	assert synced_b and not b_waited and two_waits_for_a
+
+
+def test_reading_the_markers_leaves_the_one_another_disks_failed_sync_rewrites(monkeypatch, boot):
+	# a job on disk Y reads the markers while a job on disk X fails its sync: X's marker of another boot, which the reader
+	# removes, must not take the new one with it
+	error = OSError(errno.EIO, os.strerror(errno.EIO))
+	assert rv.mark_failed_sync('/fake/X', error) is True
+	boot.write_text('boot-2\n')
+	def syncfs(folder):
+		if folder.startswith('/fake/X'):
+			raise OSError(errno.EIO, os.strerror(errno.EIO), folder)
+	fake_disks(monkeypatch, {'vault_x': ['/fake/X'], 'vault_y': ['/fake/Y']}, syncfs)
+	real_read = rv.read_vault_sync_marker
+	failing = []
+	def read(path):
+		marker = real_read(path)
+		if not failing:
+			failing.append(in_thread(rv.check_vault_sync, 'vault_x', 'job_x'))
+			failing[0].join(0.3)
+		return marker
+	monkeypatch.setattr(rv, 'read_vault_sync_marker', read)
+	assert rv.check_vault_sync('vault_y', 'job_y') == []
+	failing[0].join(10)
+	assert not failing[0].is_alive() and rv.failed_sync_disks() == {'/fake/X'}
+
+
 def test_a_marker_is_written_once_per_boot(boot):
 	error = OSError(errno.EIO, 'Input/output error')
 	assert rv.mark_failed_sync('/mnt/d1', error) is True
@@ -392,7 +514,7 @@ def test_a_comparison_storing_no_checked_file_record_makes_no_sync(job, monkeypa
 
 def test_the_real_sync_succeeds_on_the_test_filesystem(job):
 	os.makedirs(job.job_vault, exist_ok=True)
-	REAL_SYNC_VAULT_FILESYSTEMS(job.job_vault)
+	REAL_SYNC_VAULT_FILESYSTEMS(job.job_vault, 'job')
 	with pytest.raises(OSError):
 		rv.syncfs_folder(os.path.join(job.job_vault, 'not there'))
 
