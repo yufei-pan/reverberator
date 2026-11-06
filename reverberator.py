@@ -12591,6 +12591,10 @@ class TreeWriter:
 		'''The file or link at source of the tree, held at dest on its way to rel in the previous version (link_or_copy()), and counted. A file the tree shares counts when the tree lets it go.'''
 		st = os.lstat(source)
 		linked = link_or_copy(source, dest)
+		if not linked and self.manifest is not None:
+			# a copy where hard links are refused is written like any copy: the commit's flush puts it on the disk (spec section 2.6),
+			# or a comparison's clean sync after it. record(), hl_record(), unfold() and hard_link_tree() all come through here
+			self.manifest.copies_unsynced = True
 		if stat.S_ISLNK(st.st_mode):
 			self.sizes.record_dropped(0, 1)
 		elif linked:

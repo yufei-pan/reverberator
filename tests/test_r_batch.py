@@ -1044,3 +1044,48 @@ def test_a_failed_flush_of_a_first_version_commits_nothing(r_job, monkeypatch):
 	assert 0 <= failed.value.reason.index('/dev/fake') < failed.value.reason.index('no version of this job') < failed.value.reason.index('look at')
 	run_backup(r_job, OrderedDict(), **KEPT)
 	assert check_vault(r_job.job_vault, {version_number(os.path.basename(newest_version(r_job))): wanted}, set()) == []
+
+
+# ---- a record made by a copy, where hard links are refused, is a copy not yet flushed
+
+@pytest.fixture
+def no_hard_links(monkeypatch):
+	'''os.link refused with EMLINK, as a filesystem that cannot link answers it; the vault is on one filesystem and not a pool.'''
+	def refuse(*args, **kwargs):
+		raise OSError(errno.EMLINK, os.strerror(errno.EMLINK))
+	monkeypatch.setattr(os, 'link', refuse)
+
+
+@pytest.fixture
+def new_copies_fail(monkeypatch):
+	'''A copy written under a partial name fails as cp fails on a file it may not read, so a replaced file's old content is all the batch kept.'''
+	real = rv.copy_command
+	def command(source_path, dest_path):
+		if dest_path.endswith(rv.PARTIAL_COPY_SUFFIX):
+			return ['sh', '-c', 'printf "%s\\n" "$1" >&2; exit 1', 'sh', f"cp: cannot open '{source_path}' for reading: Permission denied"]
+		return real(source_path, dest_path)
+	return lambda: monkeypatch.setattr(rv, 'copy_command', command)
+
+
+def test_a_record_made_by_a_copy_is_flushed_before_the_change_list(r_job, commit_steps, no_hard_links, new_copies_fail):
+	build_base(r_job, **KEPT)
+	new_copies_fail()
+	# the old file is kept in the previous version by a copy, as os.link is refused, and the new content never lands: that copy is all the
+	# batch wrote, and nothing else would put it on the disk before the commit
+	backup_events(r_job, modify_file(r_job.monitor), **KEPT)
+	assert commit_steps == ['flush', 'list', 'commit']
+	assert not os.path.islink(os.path.join(r_job.job_vault, folder_of(r_job, 2), 'a/x.txt'))
+
+
+def test_a_record_made_by_a_link_adds_no_flush(r_job, commit_steps, new_copies_fail):
+	build_base(r_job, **KEPT)
+	new_copies_fail()
+	backup_events(r_job, modify_file(r_job.monitor), **KEPT)
+	assert commit_steps == ['list', 'commit']
+
+
+@pytest.mark.parametrize('item', [move_file, move_folder], ids=['move', 'folder_move'])
+def test_a_comparison_that_synced_after_a_record_made_by_a_copy_leaves_nothing_to_flush(r_job, commit_steps, no_hard_links, item):
+	build_base(r_job, **KEPT)
+	backup_events(r_job, item(r_job.monitor), **KEPT)
+	assert commit_steps == ['sync', 'list', 'commit']
