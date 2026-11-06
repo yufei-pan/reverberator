@@ -241,11 +241,28 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** when a batch is taken within one inotify read of a move into a new folder or out of the tree
   (mkdir d; mv f d/f), that batch's version, rarely the next one too, still shows f at its old place; later versions are
-  right.
+  right. A batch holding a change inside a folder that is renamed before the watcher handles the rename gives a version
+  without the changed file, or without the whole folder when the change was to the folder itself; reproduced with the
+  batch taken in that gap, and by reading a rename at any point while the batch runs does the same. The next version is
+  right, and nothing is lost for good.
 - **Why:** a move's two events can straddle one read, so a move-out is carried into a batch only once a whole read has
-  passed; carrying it sooner would break a rename split by the take into a delete and a copy.
-- **Revisit when:** it is seen on the live jobs.
-- **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
+  passed; carrying it sooner would break a rename split by the take into a delete and a copy. A batch's comparison reads
+  the live tree, so a path renamed away looks deleted; holding such a path back until a later read confirms it would
+  change how every version is checked.
+- **Revisit when:** it is seen on the live jobs, or a version missing a folder matters in practice.
+- **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)"; widened 2026-11-05, the user's choice
+  "Known limitation (Recommended)".
+
+### A disk that hangs while a renamed folder gets its watches
+
+- **Kind:** known limitation.
+- **What the operator sees:** a batch waits while the watcher adds the watches of a folder renamed inside the tree. If the
+  disk hangs at that moment, the backuper hangs with it: status shows no wait, and after a forced kill no pending
+  transactions are left, so the next start compares the whole tree. No wrong result and nothing lost.
+- **Why:** the wait is what keeps a rename and its folder's changes in one batch, and a stop already hangs in this state;
+  showing it would add parts for a state that already stalls the daemon.
+- **Revisit when:** a hung disk during a rename is seen on the live jobs.
+- **Approved:** 2026-11-05, the user's choice "Known limitation (Recommended)".
 
 ### A failed batch of scans handed back as a whole-tree comparison
 

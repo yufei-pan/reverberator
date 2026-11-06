@@ -17,12 +17,13 @@ def _events(to_process, lock):
 
 
 def _wait_watch_ready(job, to_process, lock):
-	probe = os.path.join(job.monitor, '.watch_ready')
+	# a name of its own for each wait: an earlier wait's create can still be queued, and says nothing of what came since
+	probe = os.path.join(job.monitor, f'.watch_ready_{time.monotonic_ns()}')
 	def ready():
 		if os.path.exists(probe):
 			os.remove(probe)
 		open(probe, 'w').write('1')
-		return any(e.event == 'create' and e.path.endswith('.watch_ready') for e in _events(to_process, lock))
+		return any(e.event == 'create' and e.path == probe for e in _events(to_process, lock))
 	wait_until(ready, message='watcher not ready')
 
 

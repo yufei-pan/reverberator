@@ -3049,10 +3049,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# the recursive copy holds this folder, but it still needs watches for later changes,
 						# and a folder moved in keeps its watches under its old path until they are added again here
 						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
-						# a take since this read: its copy may have passed this folder before the watch above, so the next batch copies it
+						# a take since this read: its copy may have passed this folder before the watch above, so the next batch compares it
 						with to_process_lock:
 							if to_process.takes != seen_takes:
-								to_process.append(ChangeEvent(monTime,True,'create',eventPath,None))
+								to_process.append(ChangeEvent(monTime,True,'scan',eventPath,None))
 					if isDir and event.mask & flags.MOVED_TO and event.cookie in cookieDic:
 						# the source stays in cookieDic so it still expires into its delete; its old-path watches are stale now
 						remove_watches_under(inotify_obj,wdDic,irm,cookieDic[event.cookie].path)
@@ -3127,36 +3127,39 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# what moved away from the destination is gone before the move lands on its name, or its late
 						# delete would remove the moved-in entry
 						queue_pending_move_from_at(eventPath,monTime)
-						if isDir:
-							# we need to update wdDic to reflect the new path,
-							# including all descendant watches of the moved directory.
-							# iterate over a snapshot as wdDic mutates its inverse mapping on assignment
-							old_path_norm = cookie_value.path.rstrip('/')
-							old_prefix = old_path_norm + '/'
-							new_path_norm = eventPath.rstrip('/')
-							for wd, wd_path in list(wdDic.items()):
-								wd_path_norm = wd_path.rstrip('/')
-								if wd_path_norm == old_path_norm:
-									new_wd_path = new_path_norm
-								elif wd_path_norm.startswith(old_prefix):
-									new_wd_path = new_path_norm + '/' + wd_path_norm[len(old_prefix):]
-								else:
-									continue
-								if wd_path.endswith('/'):
-									new_wd_path += '/'
-								if DEBUG:
-									watcherTeeLogToTl(monitor_path,f'Updating wdDic entry {wd}: {wd_path} -> {new_wd_path}')
-								wdDic[wd] = new_wd_path
-							forget_unwatched_under(unwatched,cookie_value.path)
-							if skip_list is not None and skip_list.location_dependent:
-								remove_newly_skipped_watches(inotify_obj,eventPath,wdDic,irm,skip_list)
-							# the folder can move before its watches are all in place: renamed before its create was handled
-							# (mkdir d; mv d e), while the walk was inside it, or with a subfolder whose create is handled at
-							# the old path. this walk hands each folder watched already its own watch back and watches the
-							# rest; one gone again (renamed on) is walked when that rename is handled
-							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
-						# after the walk, as a create is: a take during it would copy the folder before its watches are in place
-						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,cookie_value.path))
+						# a take waits for the move and its walk: between them it would copy the folder before its watches are in
+						# place (mkdir d; mv d e), so a file written then raises no event, and with the move queued after the walk it
+						# would hold the folder's changes without their move, and its comparison would drop them as gone
+						with to_process_lock:
+							to_process.append(ChangeEvent(monTime,isDir,'move',eventPath,cookie_value.path))
+							if isDir:
+								# we need to update wdDic to reflect the new path,
+								# including all descendant watches of the moved directory.
+								# iterate over a snapshot as wdDic mutates its inverse mapping on assignment
+								old_path_norm = cookie_value.path.rstrip('/')
+								old_prefix = old_path_norm + '/'
+								new_path_norm = eventPath.rstrip('/')
+								for wd, wd_path in list(wdDic.items()):
+									wd_path_norm = wd_path.rstrip('/')
+									if wd_path_norm == old_path_norm:
+										new_wd_path = new_path_norm
+									elif wd_path_norm.startswith(old_prefix):
+										new_wd_path = new_path_norm + '/' + wd_path_norm[len(old_prefix):]
+									else:
+										continue
+									if wd_path.endswith('/'):
+										new_wd_path += '/'
+									if DEBUG:
+										watcherTeeLogToTl(monitor_path,f'Updating wdDic entry {wd}: {wd_path} -> {new_wd_path}')
+									wdDic[wd] = new_wd_path
+								forget_unwatched_under(unwatched,cookie_value.path)
+								if skip_list is not None and skip_list.location_dependent:
+									remove_newly_skipped_watches(inotify_obj,eventPath,wdDic,irm,skip_list)
+								# the folder can move before its watches are all in place: renamed before its create was handled
+								# (mkdir d; mv d e), while the walk was inside it, or with a subfolder whose create is handled at
+								# the old path. this walk hands each folder watched already its own watch back and watches the
+								# rest; one gone again (renamed on) is walked when that rename is handled
+								initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
 					else:
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Cookie not found for {event.cookie}')
@@ -5202,7 +5205,7 @@ def change_events_to_backup_entries(change_events:deque, monitor_path:str = None
 			backuperTeeLogToTl(abs_path,f'Monitor root self destructed ({abs_path}), keeping existing vault content untouched',error=True)
 			continue
 		if event == 'scan':
-			# a folder to compare with the vault (an inner mount came or went), not an entry of its own
+			# a folder to compare with the vault (an inner mount came or went, or a take came before its watch), not an entry of its own
 			continue
 		if os.path.abspath(changeEvent.path) == root:
 			# the monitored root itself ( an attrib on it ): its version is the version folder, no entry of it
