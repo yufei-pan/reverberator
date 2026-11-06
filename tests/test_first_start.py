@@ -484,7 +484,7 @@ def test_a_conversion_that_failed_goes_on_at_the_next_attempt_after_the_r_scan(s
 	done = []
 	def fails_second(job_vault, name, stop=None):
 		if done:
-			os.mkdir(os.path.join(rv.staging_path(job_vault), f'm-{name}'))
+			os.mkdir(os.path.join(rv.staging_path(job_vault), 'm'))
 			raise OSError(28, 'No space left on device')
 		done.append(name)
 		return real(job_vault, name, stop)

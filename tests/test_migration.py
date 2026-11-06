@@ -255,6 +255,62 @@ def test_a_dangling_chain_stays_the_link(small):
 	assert rv.walk_version(small.job_vault, 2, 'a.txt', False).kind == 'symlink'
 
 
+def long_rel(room):
+	'''A relative path of exactly room bytes, in parts of 200.'''
+	parts = []
+	while room > 201:
+		parts.append('d' * 200)
+		room -= 201
+	parts.append('f' * room)
+	return '/'.join(parts)
+
+
+def put_long(root, rel, text):
+	'''A file at a path too long to name at once, made a folder at a time.'''
+	fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+	parts = rel.split('/')
+	for part in parts[:-1]:
+		try:
+			os.mkdir(part, dir_fd=fd)
+		except FileExistsError:
+			pass
+		below = os.open(part, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+		os.close(fd)
+		fd = below
+	file_fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd)
+	os.write(file_fd, text.encode())
+	os.close(file_fd)
+	os.close(fd)
+
+
+@pytest.mark.parametrize('spare', [1, 12, 22])
+def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
+	# the tree is built in staging, whose own name must not be longer than the version's: a path that fits in a version converts
+	job = create_job(str(tmp_path))
+	room = 4095 - len(os.path.join(job.job_vault, 'V0--2026-11-06_04-58-06_-0800', '')) - spare
+	rel = long_rel(room)
+	def seed(monitor):
+		put_long(monitor, rel, 'long')
+
+	def add(monitor):
+		put_text(monitor, 'z', 'z')
+		return [(False, 'create', 'z', None)]
+
+	def change(monitor):
+		put_text(monitor, 'z', 'z2')
+		return [(False, 'modify', 'z', None)]
+	v054.build(job, [seed, add, change], keep_n_versions=5)
+	names = folders_of(job)
+	newest = os.path.join(job.job_vault, names[max(names)], rel)
+	assert 4072 <= len(newest) <= 4094 and os.path.islink(newest)
+	before = expected(job)
+	assert migrate(job) is True
+	assert not os.path.islink(newest) and open(newest).read() == 'long'
+	assert layout_of(job) == 'r'
+	assert expected(job) == before
+	assert cli_differences(job.job_vault, before) == []
+
+
 def test_a_prune_temp_is_left_out(small):
 	names = folders_of(small)
 	top = os.path.join(small.job_vault, names[2])
@@ -712,7 +768,7 @@ def test_a_stop_during_conversion_goes_on_at_the_next_start(small):
 	polls = []
 	assert migrate(small, lambda: len(polls) > 3 or polls.append(1)) is False
 	staging = rv.staging_path(small.job_vault)
-	assert [name for name in os.listdir(staging) if name.startswith('m-')] != []
+	assert os.listdir(staging) == ['m']
 	assert layout_of(small) is None
 	assert expected(small) == before
 	assert cli_differences(small.job_vault, before) == []

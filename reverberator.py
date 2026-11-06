@@ -13596,7 +13596,8 @@ def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 	an earlier attempt left in staging goes first. Run again it makes the same tree.
 	'''
 	version = os.path.join(job_vault, name)
-	built = os.path.join(staging_path(job_vault), f'm-{name}')
+	# one name for every version: the staging folder and 'm' are shorter than any version's name, so a path that fits in a version fits here
+	built = os.path.join(staging_path(job_vault), 'm')
 	empty_staging(job_vault)
 	os.mkdir(built)
 	folders = [('', os.lstat(version))]
