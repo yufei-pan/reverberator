@@ -192,12 +192,12 @@ def snapshot_tree(path: str) -> dict:
 
 
 def compared(view: EntryView, folder_times: bool, loose: bool) -> EntryView:
-	'''view with what the check is told not to compare taken out; loose: a file or link of a shared inode, whose metadata is not compared.'''
+	'''view with what the check is told not to compare taken out; loose: a file, link or special file of a shared inode, whose metadata is not compared.'''
 	if view is None:
 		return None
 	if view.kind == 'd' and not folder_times:
 		return view._replace(mtime_ns=None)
-	if view.kind in ('f', 'l') and loose:
+	if view.kind in ('f', 'l', 'special') and loose:
 		return view._replace(mode=None, uid=None, gid=None, mtime_ns=None, xattrs=None)
 	return view
 
@@ -218,7 +218,7 @@ def recorded_design_r(job_vault: str) -> bool:
 
 
 def daemon_links(job_vault: str, folder_name: str) -> list:
-	'''The rels of the links in the folder of a version whose text is a daemon link's (linked_place()), forward or backward.'''
+	'''[(rel, text)] of the links in the folder of a version whose text is a daemon link's (linked_place()), forward or backward.'''
 	found = []
 	top = os.path.join(job_vault, folder_name)
 	for folder, names, files in os.walk(top):
@@ -226,8 +226,9 @@ def daemon_links(job_vault: str, folder_name: str) -> list:
 			path = os.path.join(folder, name)
 			if os.path.islink(path):
 				rel = os.path.relpath(path, top)
-				if linked_place(folder_name, rel, os.readlink(path)) is not None:
-					found.append(rel)
+				text = os.readlink(path)
+				if linked_place(folder_name, rel, text) is not None:
+					found.append((rel, text))
 	return found
 
 
@@ -238,11 +239,16 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 	expected: {version number: its view (snapshot_tree() form)}, every version the vault may keep. A number in allowed_new
 	may be missing, as a batch cut before its commit leaves it; any other must be there, and no other may. folder_times
 	False leaves folder mtimes out; free_file_meta leaves out everything of a file but its contents, and of a user's link but
-	its text, as an Only Sync Attributes change reaches every version sharing it (spec section 2.4): in the versions before the
-	newest, and only for an inode that more than one version reads. A file no other version shares, and every file of the newest
-	version, are compared whole. A version's own folder must have the mode and owner of the job vault's (the daemon makes
-	both, and a version's root is recorded in its attribute instead). On design R the newest version is the real tree and
-	holds no daemon link, of 0.54's kind or any.
+	its text (a special file's device number stays), as an Only Sync Attributes change reaches every version sharing it (spec
+	section 2.4): in the versions before the newest, and only for an inode that more than one version reads. A file no other
+	version shares, and every file of the newest version, are compared whole. A cut batch's tree, a version folder with no list,
+	is no version read here, and it shares with the newest listed version, which is then loose as an older one. Limit: an inode
+	read by one version only passes for never shared, but a batch that changes a file's attributes in place and then swaps
+	it for a fresh copy leaves a version with the changed attributes on an inode no other version reads; that exact vault is
+	reported, and the check is not widened for it. A version's own folder must have the mode and owner of the job vault's (the
+	daemon makes both, and a version's root is recorded in its attribute instead). On design R the newest version is the real
+	tree and holds no daemon link, of 0.54's kind or any, except a user's own link whose text has that form, which the
+	monitored tree holds with that text (expected for the newest version).
 	'''
 	problems = []
 	folders, lists = {}, {}
@@ -297,9 +303,14 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 		st = os.lstat(os.path.join(job_vault, folders[number]))
 		if (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid) != (stat.S_IMODE(vault_st.st_mode), vault_st.st_uid, vault_st.st_gid):
 			problems.append(f'V{number}: the version folder has mode {stat.S_IMODE(st.st_mode):o}, owner {st.st_uid}:{st.st_gid}, not the job vault\'s')
-	if kept and recorded_design_r(job_vault):
-		for rel in daemon_links(job_vault, folders[kept[-1]]):
-			problems.append(f'V{kept[-1]}:{rel!r}: a daemon link in the newest version of a design R vault')
+	listed_versions = [number for number in kept if lists.get(folders[number])]
+	# a folder after the newest listed one has no list: the tree of a cut batch, which the newest listed version links to
+	cut_tree = bool(listed_versions) and kept[-1] != listed_versions[-1]
+	if kept and not cut_tree and recorded_design_r(job_vault):
+		held = expected.get(kept[-1], {})
+		for rel, text in daemon_links(job_vault, folders[kept[-1]]):
+			if held.get(rel) is None or held[rel].kind != 'l' or held[rel].data != text:
+				problems.append(f'V{kept[-1]}:{rel!r}: a daemon link in the newest version of a design R vault')
 	views, inodes = {}, {}
 	for number in kept:
 		if number in expected:
@@ -308,8 +319,9 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 	readers = Counter(place for number in inodes for place in set(inodes[number].values()))
 	for number, view in views.items():
 		want = expected[number]
+		newest = number == kept[-1]
 		for rel in sorted(set(view) | set(want)):
-			loose = free_file_meta and number != kept[-1] and readers[inodes[number].get(rel)] > 1
+			loose = free_file_meta and not newest and (readers[inodes[number].get(rel)] > 1 or (cut_tree and number == listed_versions[-1]))
 			held = compared(view.get(rel), folder_times, loose)
 			wanted = compared(want.get(rel), folder_times, loose)
 			if held != wanted:

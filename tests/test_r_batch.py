@@ -692,6 +692,20 @@ def test_the_attributes_of_a_users_link_go_on_the_link_itself_in_the_tree(r_job,
 		rv.is_previous_version_name.cache_clear()
 
 
+def test_a_users_link_with_the_text_of_a_daemon_link_is_no_daemon_link_in_the_newest_version(r_job):
+	# the oracle reads such a link as a daemon link to nowhere, but what it flags as a daemon link in the newest version of an R vault is
+	# a link the monitored tree does not hold with that text
+	put_text(r_job.monitor, 'a', 'a')
+	os.symlink('../V1--2030-01-01_00-00-00_-0800/ulink', at(r_job.monitor, 'ulink'))
+	expected = {0: snapshot_tree(r_job.monitor)}
+	run_backup(r_job, only_sync_attributes=False, **KEPT)
+	def flagged(want):
+		return [line for line in check_vault(r_job.job_vault, want, set()) if 'daemon link' in line]
+	assert flagged(expected) == []
+	assert len(flagged({0: without(expected[0], 'ulink')})) == 1
+	assert len(flagged({0: {**expected[0], 'ulink': expected[0]['ulink']._replace(data='elsewhere')}})) == 1
+
+
 # --- the plugin ---
 
 def test_the_plugin_reads_nothing_of_a_054_vault(tmp_path, monkeypatch):

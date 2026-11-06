@@ -29,7 +29,7 @@ from tests import version_view_ground_truth as view_truth
 from tests.crash_batches import after_retries, apply_batch3, batch3_of, build_base, expected_of, OPTIONS, prepare, put_text, raw_events, restore, restore_monitor, UNREADABLE
 from tests.crash_child import failing_copy_command, in_child, kill_run, retry, run_do_backup
 from tests.harness import create_job
-from tests.vault_oracle import check_vault, forward_text, read_view, sizes_by_newest_holder, snapshot_tree, version_number
+from tests.vault_oracle import check_vault, compared, entry_view, forward_text, read_view, sizes_by_newest_holder, snapshot_tree, version_number
 
 pytestmark = pytest.mark.skipif(os.geteuid() != 0, reason='the root record is a trusted.* attribute, and a file is chowned')
 
@@ -213,6 +213,54 @@ def test_free_file_meta_still_compares_a_file_nothing_shares_and_the_newest_whol
 	assert check_vault(job_vault, osa_r_vault.expected, set(), free_file_meta=True) == []
 	tamper(path)
 	assert check_vault(job_vault, osa_r_vault.expected, set(), free_file_meta=True) != []
+
+
+def test_free_file_meta_loosens_the_newest_listed_version_while_a_tree_is_cut(tmp_path, r_layout):
+	# f was rewritten in version 1, so version 0 keeps its own copy and only version 1 reads the inode it shares with the tree; the batch
+	# after it puts a chmod on that inode. Cut after that, version 1 reads the tree's f with the new mode
+	job = create_job(str(tmp_path))
+	options = dict(only_sync_attributes=True)
+	put_text(job.monitor, 'f', 'one', STAMP)
+	put_text(job.monitor, 'g', 'g0', STAMP)
+	expected = {0: snapshot_tree(job.monitor)}
+	run_do_backup(job, OrderedDict(), options, matched_since=time.time_ns())
+	put_text(job.monitor, 'f', 'two', STAMP + 1)
+	expected[1] = snapshot_tree(job.monitor)
+	raw = raw_events(job.monitor, [(False, 'modify', 'f', None)])
+	run_do_backup(job, rv.change_events_to_backup_entries(deque(raw), job.monitor), options, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns())
+	template = str(tmp_path / 'template')
+	subprocess.run(['cp', '-a', job.vault, template], check=True)
+	os.chmod(os.path.join(job.monitor, 'f'), 0o600)
+	put_text(job.monitor, 'g', 'g1', STAMP + 2)
+	raw = raw_events(job.monitor, [(False, 'attrib', 'f', None), (False, 'modify', 'g', None)])
+	def work():
+		return run_do_backup(job, rv.change_events_to_backup_entries(deque(raw), job.monitor), options, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns())
+	seen = 0
+	for point in range(1, 100):
+		shutil.rmtree(job.vault)
+		subprocess.run(['cp', '-a', template, job.vault], check=True)
+		if not in_child(job, point, work).killed:
+			break
+		if rv.get_vault_info(job.job_vault).tree is None:
+			continue
+		if read_view(job.job_vault, folder_of(job.job_vault, 1))['f'].mode == 0o600:
+			seen += 1
+		listed = [line for line in check_vault(job.job_vault, expected, set(), folder_times=False, free_file_meta=True) if line.startswith(('V0:', 'V1:'))]
+		assert listed == [], (point, listed)
+	assert seen > 0
+
+
+def test_a_loose_special_file_keeps_its_device_number_and_nothing_else(tmp_path):
+	# an Only Sync Attributes change reaches every version sharing a device node, fifo or socket as it does a file
+	device = tmp_path / 'dev'
+	os.mknod(device, 0o600 | stat.S_IFCHR, os.makedev(1, 3))
+	view = entry_view(str(device))
+	other = view._replace(data=(stat.S_IFCHR, os.makedev(1, 5)))
+	changed = view._replace(mode=0o640, uid=1234, gid=1235, mtime_ns=1, xattrs=(('user.x', b'y'),))
+	assert view.kind == 'special'
+	assert compared(changed, True, True) == compared(view, True, True)
+	assert compared(changed, True, False) != compared(view, True, False)
+	assert compared(other, True, True) != compared(view, True, True)
 
 
 def test_a_backward_link_in_the_newest_version_of_an_r_vault_is_damage(plain_r_vault):
