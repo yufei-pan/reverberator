@@ -92,9 +92,9 @@ def test_file_history_create_modify_move_delete(job):
 	assert (moved.source, moved.size) == (f'{job.monitor}/a.txt', 3)
 	assert (deleted.source, deleted.size) == (None, None)
 	assert all(row.counts is None and row.files is None for row in hist(job, 'a.txt') + hist(job, 'b/a.txt'))
-	assert rv.path_kind(job.job_vault, versions(job), job.monitor, 'a.txt') == 'file'
-	assert rv.path_kind(job.job_vault, versions(job), job.monitor, 'b') == 'folder'
-	assert rv.path_kind(job.job_vault, versions(job), job.monitor, 'nothing') is None
+	assert rv.path_kind(job.job_vault, versions(job), 'a.txt') == 'file'
+	assert rv.path_kind(job.job_vault, versions(job), 'b') == 'folder'
+	assert rv.path_kind(job.job_vault, versions(job), 'nothing') is None
 
 
 def test_attribute_change_is_listed(job):
@@ -222,7 +222,7 @@ def test_history_of_versions_without_change_rows(job):
 	os.symlink(f'../V1--{T1}/gone', os.path.join(v2, 'b'))
 	assert [(r.version.number, r.event, r.size) for r in hist(job, 'a')] == [(1, 'changed', 2), (0, 'oldest', 1)]
 	assert [(r.version.number, r.event, r.size) for r in hist(job, 'b')] == [(2, 'create', None)]
-	assert rv.path_kind(job.job_vault, versions(job), job.monitor, 'b') == 'file'
+	assert rv.path_kind(job.job_vault, versions(job), 'b') == 'file'
 
 
 def test_history_root_and_trailing_slash(job, tmp_path, capsys):
@@ -231,7 +231,7 @@ def test_history_root_and_trailing_slash(job, tmp_path, capsys):
 	write(job, 'proj/a', 'a1')
 	backup(job, ('proj/a', 'modify'))
 	write_rule(job)
-	assert rv.path_kind(job.job_vault, versions(job), job.monitor, '') == 'folder'
+	assert rv.path_kind(job.job_vault, versions(job), '') == 'folder'
 	for path in (job.monitor, job.monitor + '/', job.monitor + '/proj/', job.monitor + '/proj'):
 		code, out, err = history(tmp_path, capsys, path, '--files')
 		assert (code, err) == (0, '')
@@ -506,15 +506,15 @@ def test_history_reads_only_change_lists_next_to_the_path_and_resolves_each_vers
 			os.remove(f'{job.monitor}/x.txt')
 			entries.append(('x.txt', 'delete'))
 		backup(job, *entries)
-	read, resolved = [], []
-	real_changes, real_resolve = rv.path_changes, rv.resolve_version_entry
+	read, walked = [], []
+	real_changes, real_walk = rv.path_changes, rv.read_walked
 	monkeypatch.setattr(rv, 'path_changes', lambda change_list, *args, **kwargs: read.append(change_list) or real_changes(change_list, *args, **kwargs))
-	monkeypatch.setattr(rv, 'resolve_version_entry', lambda job_vault, version_path, *args: resolved.append(version_path) or real_resolve(job_vault, version_path, *args))
+	monkeypatch.setattr(rv, 'read_walked', lambda job_vault, number, *args: walked.append(number) or real_walk(job_vault, number, *args))
 	rows = hist(job, 'x.txt')
 	assert events(rows) == [(5, 'delete'), (2, 'create')]
 	# V2 to V5 hold the file or lost it; V0, V1 and V6 never meet it
 	assert sorted(read) == sorted(v.change_list for v in versions(job) if 2 <= v.number <= 5)
-	assert sorted(resolved) == sorted(v.path for v in versions(job))
+	assert sorted(walked) == sorted(v.number for v in versions(job))
 
 
 def test_history_files_prints_each_row_as_it_is_produced(job, tmp_path, capsys, monkeypatch):
@@ -539,7 +539,8 @@ def test_history_files_prints_each_row_as_it_is_produced(job, tmp_path, capsys, 
 	assert out.endswith(f'V0  {at(job, 0)}  oldest kept copy\n')
 
 
-def test_a_move_row_without_a_source_shows_the_chain_source(job):
+def test_a_move_row_without_a_source_shows_no_source(job):
+	# moves come from the rows alone: which way a link points means nothing on design R
 	a_txt_lifetime(job)
 	moved_list = versions(job)[3].change_list
 	with open(moved_list, encoding='utf-8', newline='\n') as f:
@@ -551,7 +552,7 @@ def test_a_move_row_without_a_source_shows_the_chain_source(job):
 	with open(moved_list, 'w', encoding='utf-8', newline='\n') as f:
 		f.write('\n'.join('\0'.join(fields) for fields in rows))
 	moved = hist(job, 'b/a.txt')[1]
-	assert (moved.version.number, moved.event, moved.source) == (3, 'move', f'{job.monitor}/a.txt')
+	assert (moved.version.number, moved.event, moved.source) == (3, 'move', None)
 
 
 def test_never_backed_up_knows_a_folder_from_its_trailing_slash(job, tmp_path, capsys):
@@ -650,4 +651,4 @@ def test_a_file_deleted_and_made_again_shows_both_lives(job):
 	rows = hist(job, 'a.txt')
 	assert events(rows) == [(3, 'create'), (2, 'delete'), (1, 'create')]
 	assert [row.size for row in rows] == [4, None, 2]
-	assert rv.path_kind(job.job_vault, versions(job), job.monitor, 'a.txt') == 'file'
+	assert rv.path_kind(job.job_vault, versions(job), 'a.txt') == 'file'

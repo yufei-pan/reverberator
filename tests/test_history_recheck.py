@@ -150,6 +150,42 @@ def wrong_reads(vault, offset, monkeypatch) -> list:
 	return wrong
 
 
+# history's reads of these, in a quiet vault and under the batch: files it changes, moves or leaves, and folders it changes
+HISTORY_PATHS = (('a/x.txt', False), ('b/y.txt', False), ('a/sub/m.txt', False), ('c/z.txt', False), ('lnk', False), ('attrs.txt', False), ('a', True), ('big', True))
+
+
+def history_of(vault, listed) -> dict:
+	reading = rv.VaultReading(False, None, None)
+	return {rel: [(row.version.number, row.event, row.size, row.source) for row in rv.path_history(vault.job.job_vault, listed, vault.job.monitor, rel, folder, reading=reading)]
+		for rel, folder in HISTORY_PATHS}
+
+
+def wrong_history(vault, offset, monkeypatch) -> dict:
+	'''What history shows of the versions kept before the batch, the batch started offset changes before the first, where it differs from a quiet vault.'''
+	restore(vault)
+	# V0 goes with the batch's prune here, which a real history's lock holds off
+	listed = rv.list_versions(vault.job.job_vault)[1:]
+	want = history_of(vault, listed)
+	lockstep = Lockstep(vault.job)
+	lockstep.start()
+	for _ in range(offset):
+		lockstep.advance()
+	real_lstat, real_readlink = os.lstat, os.readlink
+	def stepping(real):
+		def call(*args, **kwargs):
+			lockstep.advance()
+			return real(*args, **kwargs)
+		return call
+	try:
+		with monkeypatch.context() as patched:
+			patched.setattr(os, 'lstat', stepping(real_lstat))
+			patched.setattr(os, 'readlink', stepping(real_readlink))
+			got = history_of(vault, listed)
+	finally:
+		lockstep.end()
+	return {rel: (got[rel], want[rel]) for rel in want if got[rel] != want[rel]}
+
+
 def batch_changes(vault) -> int:
 	'''How many changes of the vault the batch makes.'''
 	restore(vault)
@@ -175,6 +211,15 @@ def test_no_read_is_wrong_while_a_batch_runs(crash_vault, monkeypatch):
 		if found:
 			wrong[offset] = found
 	print(f'recheck on: {len(points)} starts, {len(wrong)} with a wrong read')
+	assert not wrong, (len(wrong), next(iter(wrong.items())))
+
+
+def test_history_shows_the_same_rows_while_a_batch_runs(crash_vault, monkeypatch):
+	wrong = {}
+	for offset in starts(crash_vault):
+		found = wrong_history(crash_vault, offset, monkeypatch)
+		if found:
+			wrong[offset] = found
 	assert not wrong, (len(wrong), next(iter(wrong.items())))
 
 

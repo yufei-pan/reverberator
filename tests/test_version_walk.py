@@ -268,11 +268,12 @@ def test_the_layout_is_read_once_a_pass(vault):
 	record_layout(vault, 'r')
 	assert rv.read_vault_layout_for_command(vault) == 'r'
 	path = os.path.join(vault, rv.MANIFEST_FILE_NAME)
-	moves = rv.VaultMoves(vault, '/monitored')
-	assert moves.reads_backward() is False
+	reading = rv.vault_reading(vault)
+	assert reading.backward is False
 	os.remove(path)
-	assert moves.reads_backward() is False
-	assert rv.VaultMoves(vault, '/monitored').reads_backward() is True
+	assert rv.read_walked(vault, 1, 'a/x', reading).kind == 'file'
+	assert reading.backward is False
+	assert rv.vault_reading(vault).backward is True
 
 
 def test_a_manifest_locked_for_a_moment_is_retried(vault):
@@ -487,6 +488,21 @@ def test_a_stop_ends_the_wait_for_a_backup(vault):
 	finally:
 		rv.RESTORE_STOP.clear()
 		os.close(fd)
+
+
+def test_a_users_link_recorded_between_the_lstat_and_the_readlink_comes_with_its_own_lstat(vault, monkeypatch):
+	# the forward link read by the lstat, the user's link a record renamed over it by the readlink: its lstat would be the forward link's
+	top = write_version(vault, 1, {'u': FORWARD})
+	held = write_version(vault, 2, {'u': Link('elsewhere')})
+	real = os.readlink
+	def readlink(path, *args, **kwargs):
+		if path == os.path.join(top, 'u') and os.path.lexists(os.path.join(held, 'u')):
+			os.rename(os.path.join(held, 'u'), path)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'readlink', readlink)
+	walked = rv.walk_version(vault, 1, 'u', False)
+	assert (walked.kind, walked.path, walked.detail) == ('symlink', at(vault, 1, 'u'), 'elsewhere')
+	assert rv.same_inode(walked.st, os.lstat(at(vault, 1, 'u')))
 
 
 def test_a_real_batch_vault_walks_as_the_oracle_reads(tmp_path, r_layout):

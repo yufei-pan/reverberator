@@ -285,8 +285,7 @@ def test_a_stray_temp_beside_its_copy_goes_after_a_cut(tmp_path, monkeypatch):
 	os.replace(temp, link)
 	os.link(os.path.join(v0, 'a'), temp)
 	# a restore before the rerun passes it over too
-	moves = rv.VaultMoves(job.job_vault, job.monitor, None)
-	assert rv.is_prune_temp(job.job_vault, v1, os.path.basename(temp), job.monitor, moves)
+	assert rv.is_prune_temp(job.job_vault, v1, os.path.basename(temp), job.monitor)
 	rv.write_prune_marker(job.job_vault, os.path.basename(v0))
 	prune(job)
 	assert not os.path.lexists(temp) and open(link).read() == 'a'

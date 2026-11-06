@@ -504,7 +504,7 @@ def test_restore_gives_a_user_link_naming_a_folder_as_the_link(tmp_path, capsys)
 	bump(job, 1)
 	write_rule(job)
 	versions = rv.list_versions(job.job_vault)
-	assert rv.path_kind(job.job_vault, versions, job.monitor, 'a/U') == 'file'
+	assert rv.path_kind(job.job_vault, versions, 'a/U') == 'file'
 	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'a/U'))
 	assert code == 0 and 'moved' not in out
 	dest = tmp_path / 'out'
@@ -567,16 +567,14 @@ def test_a_chain_link_into_a_missing_version_is_dangling_only_by_the_rule(job):
 	os.symlink(f'../../{gone}/D/secret', os.path.join(v2, 'a/U'))
 	os.symlink(f'../{gone}/a/short', os.path.join(v2, 'a/short'))
 	os.symlink(f'../../../{gone}/b/x', os.path.join(v2, 'deep/er/x'))
-	moves = rv.VaultMoves(job.job_vault, job.monitor)
-	kinds = {rel: rv.resolve_version_entry(job.job_vault, v2, rel, job.monitor, moves).kind for rel in ('a/own', 'a/U', 'a/short', 'deep/er/x')}
+	kinds = {rel: rv.resolve_version_entry(job.job_vault, v2, rel, job.monitor).kind for rel in ('a/own', 'a/U', 'a/short', 'deep/er/x')}
 	# by the text alone: a moved link's text names another path, so it is the symlink it may be, as the migration leaves it
 	assert kinds == {'a/own': 'dangling', 'a/U': 'symlink', 'a/short': 'symlink', 'deep/er/x': 'symlink'}
 	# with rows that cannot be used, only the text of the link's own place
 	rv.VERSION_MOVES.clear()
 	with open(rv.list_versions(job.job_vault)[-1].change_list, 'w') as f:
 		f.write('path\tiso_time\tevent\tsource_path\n')
-	moves = rv.VaultMoves(job.job_vault, job.monitor)
-	assert [rv.resolve_version_entry(job.job_vault, v2, rel, job.monitor, moves).kind for rel in ('a/own', 'deep/er/x')] == ['dangling', 'symlink']
+	assert [rv.resolve_version_entry(job.job_vault, v2, rel, job.monitor).kind for rel in ('a/own', 'deep/er/x')] == ['dangling', 'symlink']
 
 
 def test_reading_follows_a_link_the_rows_cannot_tell_as_a_chain_link(job):
@@ -585,12 +583,10 @@ def test_reading_follows_a_link_the_rows_cannot_tell_as_a_chain_link(job):
 	v1 = write_committed_version(job, 1, {'deep/': None}, timestamp=T1, rows=[('other', 'modify', None)])
 	os.symlink(f'../../V0--{T0}/a/x', os.path.join(v1, 'deep/x'))
 	moves = rv.VaultMoves(job.job_vault, job.monitor)
-	resolved = rv.resolve_version_entry(job.job_vault, v1, 'deep/x', job.monitor, moves)
+	resolved = rv.resolve_version_entry(job.job_vault, v1, 'deep/x', job.monitor)
 	assert (resolved.kind, resolved.path) == ('file', os.path.join(v0, 'a/x'))
 	assert rv.chain_end(job.job_vault, v1, 'deep/x', moves).path == os.path.join(v0, 'a/x')
 	assert rv.read_vault_record(v1, 'deep/x', job.monitor, moves).kind == 'f'
-	_, hop_rel = rv.history_entry(job.job_vault, rv.list_versions(job.job_vault)[1], job.monitor, 'deep/x', moves)
-	assert hop_rel == 'a/x'
 
 
 # --- carried from Task 1's reviews ---
@@ -797,8 +793,7 @@ def test_a_pass_reads_each_change_list_once(job, monkeypatch):
 
 @pytest.mark.parametrize('which', ['history', 'restore'])
 def test_the_history_and_restore_commands_read_each_change_list_once(tmp_path, capsys, monkeypatch, which):
-	# probe review3/cache_thrash, through the commands: two versions whose moved links are read for their rows, with
-	# room kept for one version's rows at a time
+	# probe review3/cache_thrash, through the commands: two versions whose moved links once were read for their rows
 	job, v0, v1 = moved_job(tmp_path)
 	os.makedirs(os.path.join(job.monitor, 'b'))
 	os.rename(os.path.join(job.monitor, 'deep/er/x'), os.path.join(job.monitor, 'b/x'))
@@ -824,8 +819,8 @@ def test_the_history_and_restore_commands_read_each_change_list_once(tmp_path, c
 		code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'b/x'), str(dest), '--version', '3')
 		assert open(dest / 'x').read() == 'x'
 	assert code == 0, err
-	# the walk reads no rows; only history's own moved_from still does, for the one link it asks about
-	assert sorted(reads) == (['V2'] if which == 'history' else [])
+	# the walk reads no rows, and a move comes from the change list as history streams it
+	assert reads == []
 
 
 # --- pruning keeps the oldest version when the next one cannot be looked at in full ---
@@ -935,7 +930,7 @@ def test_a_vault_path_with_glob_characters_removes_only_its_own_version(tmp_path
 	assert sorted(os.listdir(decoy_vault)) == held and open(os.path.join(decoy, 'D/secret')).read() == 'secret'
 
 
-# --- the commands read the record of monitored paths once, waiting while the daemon writes the manifest ---
+# --- the commands read the vault's layout, waiting while the daemon writes the manifest ---
 
 def lock_manifest(job):
 	'''An exclusive lock on the job's manifest, as a big backup's spilled write holds it; close() releases it.'''
@@ -974,48 +969,6 @@ def test_a_command_waits_for_the_manifest_and_then_judges_by_the_rows(tmp_path, 
 	assert code == 0, err
 	assert err.count('Waiting for reverberator to finish writing') == 1 and 'cannot be read' not in err
 	assert 1.0 <= elapsed < 3.0
-
-
-def test_a_command_reads_the_record_once_and_only_when_rows_are_needed(tmp_path, capsys, monkeypatch):
-	job = fresh_job(tmp_path)
-	text = chain_text(latest(job).name, 'D/secret')
-	add_user_link(job, 'a/U', text)
-	bump(job, 4)
-	write_rule(job)
-	reads = []
-	real = rv.read_recorded_monitor_paths
-	monkeypatch.setattr(rv, 'read_recorded_monitor_paths', lambda *args, **kwargs: reads.append(args) or real(*args, **kwargs))
-	# keep is copied in each version, D/secret linked at its own path: no rows needed
-	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'D/secret'))
-	assert code == 0 and reads == []
-	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'a/U'))
-	assert code == 0 and len(reads) == 1 and 'moved' not in out and err == ''
-
-
-@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the record of monitored paths is broken on purpose, so a/U goes by its text')
-def test_a_command_says_once_when_the_record_cannot_be_read(tmp_path, capsys):
-	job = fresh_job(tmp_path)
-	add_user_link(job, 'a/U', chain_text(latest(job).name, 'D/secret'))
-	bump(job, 2)
-	write_rule(job)
-	manifest = sqlite3.connect(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), isolation_level=None)
-	manifest.execute("UPDATE meta SET value = 'not a record' WHERE key = 'monitor_paths'")
-	manifest.close()
-	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'a/U'))
-	assert code == 0
-	assert err.count("the vault's record of monitored paths cannot be read; links are judged by their text") == 1
-	assert 'Waiting' not in err
-
-
-def test_a_history_pass_lets_go_of_the_versions_it_has_passed(tmp_path):
-	job, v0, v1 = moved_job(tmp_path)
-	bump(job, 3)
-	versions = rv.list_versions(job.job_vault)
-	moves = rv.VaultMoves(job.job_vault, job.monitor)
-	rows = list(rv.path_history(job.job_vault, versions, job.monitor, 'deep/er/x', folder=False, moves=moves))
-	assert [(row.version.number, row.event) for row in rows][-1:] == [(1, 'move')]
-	# the walk is done with every version above the last two it resolved
-	assert set(moves._held) <= {v0.path, v1.path}
 
 
 @pytest.mark.parametrize('sig', [signal.SIGINT, signal.SIGTERM], ids=['SIGINT', 'SIGTERM'])

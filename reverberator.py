@@ -9884,7 +9884,6 @@ class VaultMoves:
 		self.applied = applied
 		self._read_record = recorded_monitor_paths if read_record is None else read_record
 		self._record_read = monitor_paths is not None
-		self._backward = None
 		self._held = {}
 		self._lock = threading.Lock()
 		self._record_lock = threading.Lock()
@@ -9896,13 +9895,6 @@ class VaultMoves:
 				self.monitor_paths = self._read_record(self.job_vault)
 				self._record_read = True
 			return self.monitor_paths
-
-	def reads_backward(self) -> bool:
-		'''Whether this pass's walks follow 0.54 chain links (walk_version()): the vault's layout, read the first time it is asked for.'''
-		with self._record_lock:
-			if self._backward is None:
-				self._backward = read_vault_layout_for_command(self.job_vault) != 'r'
-			return self._backward
 
 	def of(self, version) -> VersionMoves:
 		'''The moves of version: a version folder's path, or anything with one as its path, such as a KeptVersion.'''
@@ -14423,6 +14415,10 @@ def walk_folder(job_vault:str, folder_name:str, rel:str, backward:bool) -> Walke
 						name, parts, hop = chain[0], chain[1], True
 						break
 					if last:
+						# a record can put a user's link in a forward link's place after the lstat: st must be of the link read
+						if not same_inode(st, os.lstat(path)):
+							hop = True
+							break
 						return Walked('symlink', path, st, followed, text)
 					if came_by is not None:
 						return users_link()
@@ -14491,25 +14487,40 @@ def wait_for_backup(job_name:'str | None', state_dir:str = None) -> bool:
 			raise KeyboardInterrupt
 	return True
 
+def newest_folder_number(job_vault:str) -> 'int | None':
+	'''The highest number of a version folder in job_vault, one with no change list yet included; None with none, or when it cannot be listed.'''
+	try:
+		with os.scandir(job_vault) as entries:
+			return max((vault_version_number(entry.name) for entry in entries if is_version_folder_name(entry.name)), default=None)
+	except OSError:
+		return None
+
 def read_checked(job_vault:str, number:int, rel:str, read, job:str = None, backward:bool = None, state_dir:str = None):
 	'''
 	read(walked) of walk_version() of rel in the version numbered number, right while a batch records under the walk, as the
 	reader holds no lock a batch needs. read is given every Walked, a missing one too, and its answer is returned once the links
 	followed still read as they did: a batch only turns a link into a real entry, so what the links led to was the version's
-	all along. Else it walks again. An entry missing, a link leading nowhere or a read finding its entry gone, while
-	job's batch runs (backup_is_running()), can be a pool's two renames: it waits for the batch to end, then walks again. Raises
-	what read raises, an entry gone twice with nothing changed included. backward: as walk_version() has it, the vault's
-	layout when None; a caller reading many paths reads it once. A reader holding the restore lock passes no job: no batch
-	changes the vault then, and one waiting for that lock holds the backup lock. state_dir: where job's locks are, as a
-	command is told.
+	all along. Else it walks again. An entry missing or a link leading nowhere while job's batch runs (backup_is_running()) can be
+	a pool's two renames: it waits for the batch to end, then walks again. Not on a vault of layout 'r' when the walk ended in a
+	version numbered at least two below a version folder there, as a batch touches only the two newest, and most paths are
+	missing from some old version; a vault not yet migrated waits at any version, as a migration changes them all. A read finding
+	its entry gone waits the same way, at any version. Raises what read raises, an entry gone twice with nothing changed
+	included. backward: as walk_version() has it, the vault's layout when None; a caller reading many paths reads it once. A
+	reader holding the restore lock passes no job: no batch changes the vault then, and one waiting for that lock holds the
+	backup lock. state_dir: where job's locks are, as a command is told.
 	'''
 	if backward is None:
 		backward = read_vault_layout_for_command(job_vault) != 'r'
 	failed = None
 	while True:
+		# listed before the walk: one that is stale by then can only make the read wait more
+		newest = None if backward or job is None else newest_folder_number(job_vault)
 		walked = walk_version(job_vault, number, rel, backward)
-		if walked.kind in ('missing', 'dangling') and wait_for_backup(job, state_dir):
-			continue
+		if walked.kind in ('missing', 'dangling') and backup_is_running(job, state_dir):
+			ended = vault_version_number(os.path.relpath(walked.path, job_vault).partition('/')[0])
+			settled = newest is not None and ended is not None and ended + 2 <= newest
+			if not settled and wait_for_backup(job, state_dir):
+				continue
 		try:
 			value = read(walked)
 		except OSError as e:
@@ -14523,6 +14534,48 @@ def read_checked(job_vault:str, number:int, rel:str, read, job:str = None, backw
 			continue
 		if followed_unchanged(walked.followed):
 			return value
+
+# how a command that holds no lock a batch needs reads a vault. backward: as walk_version() has it. job, state_dir: read_checked()'s,
+# so a read waits for that job's batch when it has to
+VaultReading = namedtuple('VaultReading', ['backward', 'job', 'state_dir'])
+
+def vault_reading(job_vault:str, job:str = None, state_dir:str = None) -> VaultReading:
+	'''The VaultReading of a pass over job_vault: its layout is read once.'''
+	return VaultReading(read_vault_layout_for_command(job_vault) != 'r', job, state_dir)
+
+def read_walked(job_vault:str, number:int, rel:str, reading:VaultReading) -> Walked:
+	'''The walk of rel in the version numbered number, checked: read_checked(), the Walked being the read, as it holds the entry's lstat.'''
+	return read_checked(job_vault, number, rel, lambda walked: walked, reading.job, reading.backward, reading.state_dir)
+
+def iter_folder_entries(job_vault:str, folder:Walked, rel:str, backward:bool, refused, errors:list):
+	'''iter_version_entries() below rel, the folder walked as folder: each entry is walked from the version folder landed in, as the links on the way there are behind it.'''
+	name = os.path.relpath(folder.path, job_vault).partition('/')[0]
+	try:
+		with os.scandir(folder.path) as entries:
+			for entry in entries:
+				entry_rel = os.path.join(rel, entry.name)
+				walked = walk_folder(job_vault, name, entry_rel, backward)
+				yield entry_rel, walked
+				if walked.kind == 'folder' and entry_rel not in refused:
+					yield from iter_folder_entries(job_vault, walked, entry_rel, backward, refused, errors)
+	except Exception as e:
+		if errors is not None:
+			errors.append((rel, e))
+
+def iter_version_entries(job_vault:str, number:int, rel:str, backward:bool, refused = (), errors:list = None):
+	'''
+	Yield (rel, Walked) of rel in the version numbered number and, when it is a folder, of all below it, each folder right before
+	what is in it, walking forward into the version a folder forwards to: what a folder holds is listed where the walk landed.
+	A link is an entry of its own, by walk_version()'s rules, so a forwarded folder comes as a folder and a forward link leading
+	nowhere as 'missing'. Nothing is listed up front. A folder whose rel is in refused by the time the caller asks for the next
+	entry is not gone into. A folder that cannot be listed adds (its rel, the error) to errors when given; what is in it is left
+	out. For a reader holding the restore lock: nothing here is read again under a running batch.
+	'''
+	vault = os.path.abspath(job_vault)
+	walked = walk_version(vault, number, rel, backward)
+	yield rel, walked
+	if walked.kind == 'folder' and rel not in refused:
+		yield from iter_folder_entries(vault, walked, rel, backward, refused, errors)
 
 def chain_form_missing_version(job_vault:str, link_path:str, link_text:str, moves:VersionMoves = None):
 	'''
@@ -14571,25 +14624,30 @@ def chain_form_missing_version(job_vault:str, link_path:str, link_text:str, move
 	# None: the rows cannot tell, so it may be a chain link, as reading takes it
 	return None if moves.tells(named, rel, version_name)[0] is False else name
 
-def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None) -> ResolvedEntry:
+def resolved_entry(job_vault:str, walked:Walked, monitor_path:str) -> ResolvedEntry:
 	'''
-	Where the content of rel in the version at version_path really is, by walk_folder(), on the vault's layout (moves, a
-	VaultMoves for the pass, reads it once; a VaultMoves for this one call when None).
+	The ResolvedEntry of a walk of job_vault: its kind and path, but for a user's link to the monitored file itself ('referenced':
+	a 0.54 referenced backup's). detail says what the link holds, or what and where for 'dangling' and 'unreadable'.
+	'''
+	if walked.kind == 'symlink':
+		entry_rel = walked.path[len(os.path.abspath(job_vault)) + 1:].partition('/')[2]
+		# a rule keeps a monitored path that is missing as typed, so it is normalised as the link's text is
+		if os.path.isabs(walked.detail) and os.path.normpath(walked.detail) == os.path.abspath(os.path.join(monitor_path, entry_rel)):
+			return ResolvedEntry('referenced', walked.path, walked.detail)
+	return ResolvedEntry(walked.kind, walked.path, walked.detail)
+
+def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path:str, backward:bool = None) -> ResolvedEntry:
+	'''
+	Where the content of rel in the version at version_path really is, by walk_folder(), backward being the vault's layout when None.
 	The kind is 'file' or 'folder' (path is the real copy), 'symlink' (a user's symlink backed up as one; path is the
 	link), 'referenced' (a link to the monitored file itself; path is the link), 'missing' (the version has no such
 	entry, or a forward link leads nowhere), 'dangling' (a 0.54 chain leads to nothing) or 'unreadable' (a link or folder
 	could not be looked at); detail says what and where for the last two.
 	'''
 	vault = os.path.abspath(job_vault)
-	if moves is None:
-		moves = VaultMoves(vault, monitor_path)
-	walked = walk_folder(vault, os.path.basename(os.path.abspath(version_path)), rel, moves.reads_backward())
-	if walked.kind == 'symlink':
-		entry_rel = walked.path[len(vault) + 1:].partition('/')[2]
-		# a rule keeps a monitored path that is missing as typed, so it is normalised as the link's text is
-		if os.path.isabs(walked.detail) and os.path.normpath(walked.detail) == os.path.abspath(os.path.join(monitor_path, entry_rel)):
-			return ResolvedEntry('referenced', walked.path, walked.detail)
-	return ResolvedEntry(walked.kind, walked.path, walked.detail)
+	if backward is None:
+		backward = read_vault_layout_for_command(vault) != 'r'
+	return resolved_entry(vault, walk_folder(vault, os.path.basename(os.path.abspath(version_path)), rel, backward), monitor_path)
 
 ChangeRow = namedtuple('ChangeRow', ['path', 'iso_time', 'event', 'source_path'])
 
@@ -15058,111 +15116,97 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 			moved_to, to_depth = row.path.rstrip('/') + '/' + own[len(source):], len(source)
 	return PathChanges(row_found, moved_from, moved_to, counts, files, recopied)
 
-def history_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, moves:'VaultMoves' = None) -> tuple:
+def listed_path_changes(job_vault:str, version:KeptVersion, path:str, folder:bool, list_files:bool, reading:VaultReading) -> PathChanges:
 	'''
-	How version holds rel: its ResolvedEntry, and the path the entry's own chain link (told by version's moves, as
-	resolve_version_entry() tells it) names in the older version it links to, None when the entry is not a chain link.
+	path_changes() of version's change list. A commit renames the list of the version before it, so a list gone is looked for
+	again by its version's name; gone with a batch running, it is looked for once that ended. Gone for good raises FileNotFoundError.
 	'''
-	vault = os.path.abspath(job_vault)
-	if moves is None:
-		moves = VaultMoves(vault, monitor_path)
-	resolved = resolve_version_entry(job_vault, version.path, rel, monitor_path, moves)
-	entry = os.path.join(os.path.abspath(version.path), rel)
-	# a link the walk stopped at is a user's, whatever the rows would make of it
-	if resolved.kind == 'missing' or not rel or resolved.path == entry:
-		return resolved, None
-	try:
-		hop = moves.follow(entry, os.readlink(entry))
-	except (OSError, ValueError, UncheckedVaultLink):
-		# not a link, or one that cannot be looked at, as resolved says
-		hop = None
-	return resolved, None if hop is None else hop[len(vault) + 1:].partition('/')[2]
+	while True:
+		try:
+			return path_changes(version.change_list, path, folder, list_files)
+		except FileNotFoundError:
+			fresh = next((kept for kept in list_versions(job_vault) if kept.name == version.name), None)
+			if fresh is not None and fresh.change_list != version.change_list:
+				version = fresh
+			elif not wait_for_backup(reading.job, reading.state_dir):
+				raise
 
-def resolved_size(resolved:ResolvedEntry):
-	'''The size of the file a version holds, None for anything else or a copy that cannot be looked at.'''
-	if resolved.kind != 'file':
-		return None
-	try:
-		return os.lstat(resolved.path).st_size
-	except OSError:
-		return None
+def same_landing(first:Walked, second:Walked) -> bool:
+	'''
+	Whether two versions hold one entry at a path, as their walks say (plan S8): the walks land on one inode. A forward link lands
+	there by construction, and a migrated version, a record by hard link or a 0.54 chain link by sharing the inode.
+	'''
+	return first.st is not None and second.st is not None and same_inode(first.st, second.st)
 
-def held_event(changes:PathChanges, resolved:ResolvedEntry, moved_from:str, held_before:bool) -> tuple:
+def held_event(changes:PathChanges, walked:Walked, held_before:bool) -> tuple:
 	'''
 	(event, source) for a version that holds a path and changed it: its change list row's event when that fits a path
-	the version holds; else a move when the entry came from another path; else a creation when the version below
-	lacked it, or 'changed'. A link that leads nowhere or cannot be read is 'changed' unless its row says more. A move
-	row that names no source takes moved_from, where the entry's chain link leads, as the source.
+	the version holds; else a move when a move took the entry there; else a creation when the version below lacked it, or
+	'changed'. A link that leads nowhere or cannot be read is 'changed' unless its row says more.
 	'''
 	row = changes.row
 	if row is not None and row.event in ('create', 'modify', 'attrib', 'move'):
-		if row.event != 'move':
-			return row.event, None
-		# a move row without a source leaves it to the chain
-		return 'move', moved_from if changes.moved_from is None else changes.moved_from
-	if resolved.kind in ('dangling', 'unreadable'):
+		return row.event, changes.moved_from if row.event == 'move' else None
+	if walked.kind in ('dangling', 'unreadable'):
 		return 'changed', None
-	if moved_from is not None:
-		return 'move', moved_from
+	if changes.moved_from is not None:
+		return 'move', changes.moved_from
 	return ('changed' if held_before else 'create'), None
 
-def path_history(job_vault:str, versions:list, monitor_path:str, rel:str, folder:bool, list_files:bool = True, moves:'VaultMoves' = None):
+def path_history(job_vault:str, versions:list, monitor_path:str, rel:str, folder:bool, list_files:bool = True, reading:VaultReading = None):
 	'''
-	Yield the HistoryRows of file_history() or folder_history(), newest first, each as it is found: the version folders
-	tell when the path changed, the change lists what. Each version's entry is resolved once, its links told by moves
-	(a VaultMoves for the whole pass, made here when None), and a version's change list is read only when that version
-	or the one below it holds the path.
+	Yield the HistoryRows of file_history() or folder_history(), newest first, each as it is found: the walks tell when the
+	path changed, the change lists what. Each version is walked once, checked against a running batch (read_walked()), as
+	reading says (the vault's layout and no job when None), and a version's change list is read only when that version or
+	the one below it holds the path. A folder's list is read even when its walk lands where the one below does: an attribute
+	change under Only Sync Attributes is recorded nowhere else.
 	'''
 	path = os.path.join(monitor_path, rel) if rel else monitor_path
 	if not versions:
 		return
-	if moves is None:
-		# one pass: each version's rows are read once, however many versions are walked
-		moves = VaultMoves(job_vault, monitor_path)
-	# walking down, the entry of the version below is the next one's own
-	below = history_entry(job_vault, versions[-1], monitor_path, rel, moves)
+	if reading is None:
+		reading = vault_reading(job_vault)
+	below = read_walked(job_vault, versions[-1].number, rel, reading)
 	for index in range(len(versions) - 1, -1, -1):
 		version = versions[index]
-		resolved, hop_rel = below
-		held = resolved.kind != 'missing'
-		size = None if folder else resolved_size(resolved)
+		# walking down, the entry of the version below is the next one's own
+		walked = below
+		held = walked.kind != 'missing'
+		size = walked.st.st_size if walked.kind == 'file' and not folder else None
 		if not index:
 			# not a change: what it changed from is no longer kept, so its change list is not read
 			if held:
 				yield HistoryRow(version, 'oldest', size, None, dict.fromkeys(CHANGE_EVENTS, 0) if folder else None,
 					[] if folder and list_files else None)
 			continue
-		below = history_entry(job_vault, versions[index - 1], monitor_path, rel, moves)
-		# every chain from here on starts below version, so its rows are no longer needed
-		moves.release(version)
-		held_before = below[0].kind != 'missing'
+		below = read_walked(job_vault, versions[index - 1].number, rel, reading)
+		held_before = below.kind != 'missing'
 		if not held and not held_before:
 			continue
-		changes = path_changes(version.change_list, path, folder, list_files)
+		changes = listed_path_changes(job_vault, version, path, folder, list_files, reading)
 		if held:
-			# a version's folders are real folders; a file is unchanged when it links to the same path in an older version,
-			# or holds a copy of it made again from the vault
+			# a file is unchanged when it is the entry the version below holds, or a copy of it made again from the vault
 			changed = (not held_before or changes.row is not None or (folder and any(changes.counts.values()))
-				or (not folder and hop_rel != rel and not changes.recopied))
+				or (not folder and not same_landing(walked, below) and not changes.recopied))
 			if changed:
-				moved_from = os.path.join(monitor_path, hop_rel) if hop_rel not in (None, rel) else changes.moved_from
-				event, source = held_event(changes, resolved, moved_from, held_before)
+				event, source = held_event(changes, walked, held_before)
 				yield HistoryRow(version, event, size, source, changes.counts, changes.files)
 		else:
 			event = 'delete' if changes.moved_to is None else 'moved_away'
 			yield HistoryRow(version, event, None, changes.moved_to, changes.counts, changes.files)
 
-def path_kind(job_vault:str, versions:list, monitor_path:str, rel:str, moves:'VaultMoves' = None) -> str:
+def path_kind(job_vault:str, versions:list, rel:str, reading:VaultReading = None) -> str:
 	'''
 	Whether rel is a 'folder' or a 'file' (anything else held for it too, such as a symlink) in the newest version that
-	holds it, None when no kept version does. The monitored path itself is a folder. moves tells the vault's links, as
-	resolve_version_entry() says.
+	holds it, None when no kept version does. The monitored path itself is a folder. reading: as path_history() has it.
 	'''
 	if not rel:
 		return 'folder'
+	if reading is None:
+		reading = vault_reading(job_vault)
 	found = None
 	for version in reversed(versions):
-		kind = resolve_version_entry(job_vault, version.path, rel, monitor_path, moves).kind
+		kind = read_walked(job_vault, version.number, rel, reading).kind
 		if kind == 'folder':
 			return 'folder'
 		if kind == 'unreadable':
@@ -15172,25 +15216,25 @@ def path_kind(job_vault:str, versions:list, monitor_path:str, rel:str, moves:'Va
 			return 'file'
 	return found
 
-def file_history(job_vault:str, versions:list, monitor_path:str, rel:str, moves:'VaultMoves' = None) -> list:
+def file_history(job_vault:str, versions:list, monitor_path:str, rel:str, reading:VaultReading = None) -> list:
 	'''
 	The HistoryRows of a file (or symlink) at rel, newest first, from the kept versions (oldest first, as list_versions()
-	gives them). A version is listed when its entry is not a chain link to the same path in an older version (a chain
-	link to another path is a move from it), when it lacks the entry the version below held (delete, or moved_away when
+	gives them). A version is listed when it holds another entry than the version below (same_landing(); a change list's move
+	says it came from another path), when it lacks the entry the version below held (delete, or moved_away when
 	its change list moved the path, or a folder above it, elsewhere), or when its change list has a row for the path
-	(such as an attribute change, which the version's link does not show); the row gives the event when it has one.
+	(such as an attribute change, which the walks do not show); the row gives the event when it has one.
 	The oldest kept version is listed as 'oldest' when it holds the entry. A change list is read once, streamed, and only when the version or the one below holds the entry.
 	'''
-	return list(path_history(job_vault, versions, monitor_path, rel, folder=False, moves=moves))
+	return list(path_history(job_vault, versions, monitor_path, rel, folder=False, reading=reading))
 
-def folder_history(job_vault:str, versions:list, monitor_path:str, rel:str, list_files:bool = True, moves:'VaultMoves' = None) -> list:
+def folder_history(job_vault:str, versions:list, monitor_path:str, rel:str, list_files:bool = True, reading:VaultReading = None) -> list:
 	'''
 	The HistoryRows of the folder at rel ('' for the monitored path), newest first: a version is listed when its change
 	list has rows below the folder (counted by event, and each with its path below the folder in files unless
 	list_files is False), or a row for the folder itself, or when the folder appears or goes in it (as its own row or a
 	move of a folder above it says, else create or delete); the oldest kept version holding it is listed as 'oldest'.
 	'''
-	return list(path_history(job_vault, versions, monitor_path, rel, folder=True, list_files=list_files, moves=moves))
+	return list(path_history(job_vault, versions, monitor_path, rel, folder=True, list_files=list_files, reading=reading))
 
 HISTORY_LABELS = {'create': 'created', 'modify': 'modified', 'attrib': 'attributes changed', 'delete': 'deleted',
 	'changed': 'changed', 'oldest': 'oldest kept copy'}
@@ -15335,14 +15379,13 @@ def history_command(args) -> int:
 		try:
 			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
-			# the moves of each version, read once for the whole command, and the record of monitored paths once, when a
-			# link first needs rows, waiting while the daemon writes the manifest
-			moves = VaultMoves(job_vault, rule.mon_path, read_record=command_monitor_paths)
-			kind = path_kind(job_vault, versions, rule.mon_path, rel, moves) if versions else None
+			# the layout, read once for the whole command, waiting while the daemon writes the manifest
+			reading = vault_reading(job_vault, rule.job_name, args.state_dir)
+			kind = path_kind(job_vault, versions, rel, reading) if versions else None
 			if kind is not None:
 				# each row is printed as it is found, so a job's whole history is never held; the lock is held all the while,
 				# so pruning waits for the output to be read (in a pager, say)
-				rows = path_history(job_vault, versions, rule.mon_path, rel, folder=kind == 'folder', list_files=args.files and kind == 'folder', moves=moves)
+				rows = path_history(job_vault, versions, rule.mon_path, rel, folder=kind == 'folder', list_files=args.files and kind == 'folder', reading=reading)
 				lines = history_lines(rule, job_vault, rows, kind, args.files)
 				# an OSError from the next line is the vault's; one from writing it is the reader's going away
 				for line in lines:
@@ -15408,13 +15451,13 @@ def version_ranges(numbers) -> str:
 			runs.append([number, number])
 	return ', '.join(f'V{first}' if first == last else f'V{first}-V{last}' for first, last in runs) or 'none'
 
-def restore_candidates(job_vault:str, versions:list, monitor_path:str, rel:str, kind:str, moves:'VaultMoves' = None) -> list:
+def restore_candidates(job_vault:str, versions:list, monitor_path:str, rel:str, kind:str, reading:VaultReading = None) -> list:
 	'''The HistoryRows of the versions that hold rel, a 'file' or a 'folder' as kind says, and differ: newest first, as history lists them.'''
 	if kind == 'folder':
 		# the picker shows no paths, and a whole job's would all be held at once
-		rows = folder_history(job_vault, versions, monitor_path, rel, list_files=False, moves=moves)
+		rows = folder_history(job_vault, versions, monitor_path, rel, list_files=False, reading=reading)
 	else:
-		rows = file_history(job_vault, versions, monitor_path, rel, moves)
+		rows = file_history(job_vault, versions, monitor_path, rel, reading)
 	return [row for row in rows if row.event not in ('delete', 'moved_away')]
 
 def choose_version(candidates:list, versions:list, holds, version:int = None, at:str = None, stdin = None, stderr = None) -> KeptVersion:
@@ -15673,9 +15716,7 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 		discard_copies(rest)
 
 def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
-	'''Why the entry version holds, as resolve_version_entry() found it, cannot be copied out: None for a file or a user's symlink.'''
-	if resolved.kind in ('file', 'symlink'):
-		return None
+	'''Why the entry version holds, as resolved_entry() gives it, cannot be copied out: None for a file, a user's symlink or a folder.'''
 	if resolved.kind == 'dangling':
 		return f'dangling vault link: {resolved.detail}'
 	if resolved.kind == 'referenced':
@@ -15685,8 +15726,7 @@ def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
 		return f'unreadable in the vault: {resolved.detail}'
 	if resolved.kind == 'missing':
 		return f'not in V{version.number}: {resolved.detail}'
-	# a folder where the walk found a link
-	return f'a vault link to a folder: {resolved.path}'
+	return None
 
 def restore_folder_meta(source:str, dest:str, top:bool = False, warn = None):
 	'''
@@ -15916,13 +15956,14 @@ def remove_stale_partials(folder:str, held:str) -> None:
 			if PARTIAL_COPY_NAME.fullmatch(entry.name) and not entry.is_dir(follow_symlinks=False) and not os.path.lexists(os.path.join(held, entry.name)):
 				os.unlink(entry.path)
 
-def is_prune_temp(job_vault:str, version_path:str, rel:str, monitor_path:str, moves:'VaultMoves') -> bool:
+def is_prune_temp(job_vault:str, version_path:str, rel:str, monitor_path:str) -> bool:
 	'''
 	Whether rel in the version at version_path is the temporary a prune cut off between its hard link and its rename left
 	(prune_link_path()): its name is of the partial copy form, and it is the same file as the entry some symlink beside
 	it in the version leads to, which pruning was about to replace by it, or as a regular file beside it, the copy a cut
 	on a mergerfs pool put in the link's place while the temp stayed on another disk. A user's file of that name shares no
-	inode with a copy beside it. No salt is read, and any OSError gives False, so the entry is restored as any other.
+	inode with a copy beside it. No salt is read, and any OSError gives False, so the entry is restored as any other. Only a
+	vault not yet migrated has them.
 	'''
 	name = os.path.basename(rel)
 	if not PARTIAL_COPY_NAME.fullmatch(name):
@@ -15940,7 +15981,7 @@ def is_prune_temp(job_vault:str, version_path:str, rel:str, monitor_path:str, mo
 					continue
 				if not entry.is_symlink():
 					continue
-				found = resolve_version_entry(job_vault, version_path, os.path.join(folder_rel, entry.name), monitor_path, moves)
+				found = resolve_version_entry(job_vault, version_path, os.path.join(folder_rel, entry.name), monitor_path, True)
 				# a referenced first version's link into the monitored path is pruned as a copy is ( kind 'referenced' )
 				if found.kind in ('file', 'symlink', 'referenced') and same_inode(temp_st, os.lstat(found.path)):
 					return True
@@ -15985,7 +16026,7 @@ def claim_restore_target(target:str, check = None) -> int:
 		raise
 	return fd
 
-def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None, marked:bool = False, moves:'VaultMoves' = None) -> None:
+def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None, marked:bool = False) -> None:
 	'''
 	Copy what version holds at rel ('' for the monitored path) to target, filling report in. Nothing in the vault is
 	written: it is only read from.
@@ -15995,8 +16036,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	is a CommandError, naming aside, where a restore in place moved what was there) with mode 0700, or with resume is
 	the folder already there, made 0700: the unfinished output of an earlier run of this same restore, or for the whole
 	job in place the empty monitored path (the caller checks which). It is marked as this restore's own
-	(write_restore_marker()) before anything is copied, and the folder is walked in the version: its folders are made as
-	they are met and its files copied, threads at a time, each copy put in place every RESTORE_COPY_BATCH of them. Once
+	(write_restore_marker()) before anything is copied, and the folder is walked in the version (iter_version_entries(), so
+	what a folder forwards to is restored as a real tree): its folders are made as they are met and its files copied, threads at a time, each copy put in place every RESTORE_COPY_BATCH of them. Once
 	all are, and nothing failed, the marker goes and each folder gets the vault folder's metadata, the ones inside it
 	first and the target last, so nothing copied into it changes its times afterwards. While anything failed, or when
 	the restore stops, the marker stays and every folder is left as this restore made it, the target 0700, for a run of
@@ -16011,6 +16052,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	entries it names as kept without all of their metadata come back as warnings when they are kept again, and the
 	marker a run leaves names those it knows of (RESTORE_MARKER_UNSET_LIMIT at most). However the restore ends, no partial file is left in target:
 	a RESTORE_STOP_SIGNALS signal stops it, as a KeyboardInterrupt, once its copies can be stopped.
+	The caller holds the restore lock: no batch changes the vault, so nothing is read twice.
 	'''
 	report.version, report.rel, report.target = version, rel, target
 	RESTORE_STOP.clear()
@@ -16057,9 +16099,13 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			# only the main thread can set them, and only it gets them
 			for sig in RESTORE_STOP_SIGNALS:
 				handlers[sig] = signal.signal(sig, lambda signum, frame: RESTORE_STOP.set())
-		if moves is None:
-			moves = VaultMoves(job_vault, monitor_path)
-		resolved = resolve_version_entry(job_vault, version.path, rel, monitor_path, moves)
+		backward = read_vault_layout_for_command(job_vault) != 'r'
+		# the rels of the folders not restored, whose contents are not either
+		refused = set()
+		errors = []
+		walk = iter_version_entries(job_vault, version.number, rel, backward, refused, errors)
+		_, top = next(walk)
+		resolved = resolved_entry(job_vault, top, monitor_path)
 		if resolved.kind != 'folder':
 			try:
 				restore_one(resolved, rel, target)
@@ -16097,39 +16143,33 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 				return
 			if resume:
 				clear_partials(target, resolved.path, rel)
-			# the walk rels (ending with /) of the folders not restored, whose contents are not either
-			refused = set()
-			skip = lambda walk_rel: os.path.dirname(walk_rel.rstrip('/')) + '/' in refused
-			errors = []
-			for entry_path, walk_rel, is_dir in iter_tree_entries(resolved.path, skip=skip, errors=errors):
-				below = walk_rel.rstrip('/')
-				entry_rel = os.path.join(rel, below) if rel else below
+			for entry_rel, walked in walk:
+				below = entry_rel[len(rel):].lstrip('/')
 				dest = os.path.join(target, below)
 				try:
 					if os.path.basename(below) == RESTORE_MARKER_NAME:
 						# backed up while a restore into the monitored path was under way: this restore's own stays in its
 						# place, and one deeper down marks an unfinished restore that is none of this one's
 						report.warn(entry_rel, 'not restored: it is the marker of a restore under way when this version was taken')
-						if is_dir:
-							refused.add(walk_rel)
-					elif is_dir:
+						refused.add(entry_rel)
+					elif walked.kind == 'folder':
 						try:
 							reason = make_restore_folder(dest)
 						except OSError as e:
 							reason = str(e)
 						if reason is not None:
 							report.fail(entry_rel, f'{reason}: nothing in it was restored')
-							refused.add(walk_rel)
+							refused.add(entry_rel)
 						else:
 							if resume:
-								clear_partials(dest, entry_path.rstrip('/'), entry_rel)
+								clear_partials(dest, walked.path, entry_rel)
 							report.restored += 1
-							folders.append((entry_path.rstrip('/'), dest, entry_rel))
-					elif is_prune_temp(job_vault, version.path, entry_rel, monitor_path, moves):
+							folders.append((walked.path, dest, entry_rel))
+					elif backward and is_prune_temp(job_vault, version.path, entry_rel, monitor_path):
 						# a prune's leftover beside a link of the version, not the user's: passed over, not counted
 						pass
 					else:
-						entry = resolve_version_entry(job_vault, version.path, entry_rel, monitor_path, moves)
+						entry = resolved_entry(job_vault, walked, monitor_path)
 						there = None
 						if resume:
 							try:
@@ -16154,9 +16194,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 				if len(pending) >= RESTORE_COPY_BATCH:
 					finish_batch()
 				report.progress(sys.stderr)
-			for walk_rel, error in errors:
-				below = walk_rel.rstrip('/')
-				report.fail(os.path.join(rel, below) if rel else below, f'unreadable in the vault: {error}')
+			for entry_rel, error in errors:
+				report.fail(entry_rel, f'unreadable in the vault: {error}')
 		finish_batch()
 		if report.failed:
 			# a folder handed to its owner now could be swapped for a symlink before a re-run writes into it
@@ -16208,7 +16247,7 @@ def hand_over_folders(folders:list, report:RestoreReport, check_stop = None) -> 
 		else:
 			report.warn(entry_rel, f'restored without all of its metadata: {error}')
 
-def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, report:RestoreReport, moves:'VaultMoves' = None) -> None:
+def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, report:RestoreReport) -> None:
 	'''
 	Keep the unfinished output of a folder restore of rel from version at target as it is (--accept), filling report
 	in: copy nothing, but give its folders the metadata the version's folders have and end the restore, its marker
@@ -16227,13 +16266,14 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 	try:
 		for entry_rel in unset:
 			report.warn(entry_rel, 'kept without all of its metadata: an earlier run could not set it')
-		resolved = resolve_version_entry(job_vault, version.path, rel, monitor_path, moves)
+		refused = set()
+		errors = []
+		walk = iter_version_entries(job_vault, version.number, rel, read_vault_layout_for_command(job_vault) != 'r', refused, errors)
+		_, top = next(walk)
+		resolved = resolved_entry(job_vault, top, monitor_path)
 		if resolved.kind != 'folder':
 			raise CommandError(f'Cannot keep {target} as it is: V{version.number} holds no folder there now ({restore_failure(resolved, version) or resolved.kind})', EXIT_COMMAND_FAILED)
 		folders = [(resolved.path, target, rel)]
-		refused = set()
-		skip = lambda walk_rel: os.path.dirname(walk_rel.rstrip('/')) + '/' in refused
-		errors = []
 
 		def clear_partials(folder:str, held:str, entry_rel:str):
 			try:
@@ -16241,40 +16281,33 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 			except OSError as e:
 				report.warn(entry_rel, f'partial files an earlier run left could not be removed: {e}')
 		clear_partials(target, resolved.path, rel)
-		for entry_path, walk_rel, is_dir in iter_tree_entries(resolved.path, skip=skip, errors=errors):
-			if not is_dir:
+		for entry_rel, walked in walk:
+			if walked.kind != 'folder':
 				continue
-			below = walk_rel.rstrip('/')
-			entry_rel = os.path.join(rel, below) if rel else below
+			below = entry_rel[len(rel):].lstrip('/')
 			dest = os.path.join(target, below)
-			held = entry_path.rstrip('/')
 			try:
 				st = os.lstat(dest)
 			except FileNotFoundError:
 				# never made, so nothing under it was restored either
-				refused.add(walk_rel)
+				refused.add(entry_rel)
 				continue
 			except OSError as e:
-				refused.add(walk_rel)
+				refused.add(entry_rel)
 				report.warn(entry_rel, f'{e}: left as it is')
 				continue
 			reason = folder_refusal(st)
 			if reason is None and os.path.basename(below) != RESTORE_MARKER_NAME:
-				clear_partials(dest, held, entry_rel)
-				folders.append((held, dest, entry_rel))
+				clear_partials(dest, walked.path, entry_rel)
+				folders.append((walked.path, dest, entry_rel))
 				continue
-			refused.add(walk_rel)
-			try:
-				vault_st = os.lstat(held)
-			except OSError:
-				vault_st = None
-			if stat.S_ISDIR(st.st_mode) and vault_st is not None and (st.st_uid, st.st_gid) == (vault_st.st_uid, vault_st.st_gid):
+			refused.add(entry_rel)
+			if stat.S_ISDIR(st.st_mode) and (st.st_uid, st.st_gid) == (walked.st.st_uid, walked.st.st_gid):
 				# handed over already, deepest first, so all under it was too
 				continue
 			report.warn(entry_rel, f'{reason or "not one this restore made"}: left as it is')
-		for walk_rel, error in errors:
-			below = walk_rel.rstrip('/')
-			report.warn(os.path.join(rel, below) if rel else below, f'unreadable in the vault: {error}; the folders under it keep what the restore gave them')
+		for entry_rel, error in errors:
+			report.warn(entry_rel, f'unreadable in the vault: {error}; the folders under it keep what the restore gave them')
 		hand_over_folders(folders, report)
 	finally:
 		os.close(lock)
@@ -16451,16 +16484,18 @@ def check_target(target:str, job_name:str, rel:str, in_place:bool, version:KeptV
 	require_empty_root(target)
 	return 'into root'
 
-def confirm_whole_job_in_place(job_name:str, version:KeptVersion, versions:list, root:str, status:DaemonStatus, yes:bool, resuming:bool, stdin = None, stderr = None):
+def confirm_whole_job_in_place(job_name:str, version:KeptVersion, versions:list, root:str, status:DaemonStatus, yes:bool, resuming:bool, stdin = None, stderr = None, backward:bool = False):
 	'''
 	Before the whole job is restored in place into root from version, one of versions (the kept ones, oldest first): say
 	which filesystem that writes to (the mount holding root as the mount table has it, so an empty mount point whose
-	disk is not mounted shows the disk under it) with its free space and what the versions up to version took in the
+	disk is not mounted shows the disk under it) with its free space and what the versions holding its files took in the
 	vault, and while status shows the daemon alive and job_name not stopped, that the job will back the restore up as
-	one large change; then, unless yes, ask whether to go on. A version's recorded size is only what it copied, but the
-	oldest kept version holds the whole tree it was made from: less free space than that is a CommandError when
-	starting afresh (a restore picked up has some of it in place), and less than all of them together up to version is
-	said to be a restore that may not fit. No terminal on stdin to ask on is a CommandError, as is any answer but yes
+	one large change; then, unless yes, ask whether to go on. The newest version's recorded size is the whole tree, and each
+	version below it holds only what the next one changed, so a file of version is in version or one above it: less free space
+	than the newest is a CommandError when starting afresh (a restore picked up has some of it in place), and less than all of
+	them together from version up is said to be a restore that may not fit. With backward, a vault not yet migrated, it is the
+	other way round: the oldest version's size is the whole tree it was made from, and a file of version is in it or one below.
+	No terminal on stdin to ask on is a CommandError, as is any answer but yes
 	(with EXIT_COMMAND_FAILED). stdin and stderr are sys.stdin and sys.stderr unless given (what it says is a prompt, which stays on the terminal when the output is redirected).
 	'''
 	stdin = sys.stdin if stdin is None else stdin
@@ -16474,12 +16509,13 @@ def confirm_whole_job_in_place(job_name:str, version:KeptVersion, versions:list,
 	except OSError as e:
 		raise CommandError(f'Cannot tell how much space {there} has: {e}', EXIT_COMMAND_FAILED)
 	free = st.f_bavail * st.f_frsize
-	oldest = versions[0]
+	whole, end = (versions[0], 'oldest') if backward else (versions[-1], 'newest')
 	# each file of version is a copy one of these made: at most all of them together
-	most = sum(kept.size for kept in versions if kept.number <= version.number)
-	if not resuming and free < oldest.size:
-		raise CommandError(f'Not restoring the whole job into {root}: {where} has {show_size(free)} free, less than the {show_size(oldest.size)} the oldest kept version, V{oldest.number}, took in the vault; is the right disk mounted there? Restore into a folder instead')
-	took = f'V{oldest.number}' if oldest.number == version.number else f'V{oldest.number} to V{version.number}'
+	holders = [kept for kept in versions if (kept.number <= version.number if backward else kept.number >= version.number)]
+	most = sum(kept.size for kept in holders)
+	if not resuming and free < whole.size:
+		raise CommandError(f'Not restoring the whole job into {root}: {where} has {show_size(free)} free, less than the {show_size(whole.size)} the {end} kept version, V{whole.number}, took in the vault; is the right disk mounted there? Restore into a folder instead')
+	took = f'V{holders[0].number}' if len(holders) == 1 else f'V{holders[0].number} to V{holders[-1].number}'
 	lines = [f'Restoring the whole job into {root}, on {where}: {show_size(free)} free, {took} took {show_size(most)} in the vault']
 	if not resuming and free < most:
 		lines.append(f'V{version.number} may not fit: its files can come from any of {took}, more than the free space')
@@ -16524,19 +16560,19 @@ def restore_command(args) -> int:
 		try:
 			require_job_vault(job_vault)
 			versions = list_versions(job_vault)
-			# the moves of each version, read once for the whole command, and the record of monitored paths once, when a
-			# link first needs rows, waiting while the daemon writes the manifest
-			moves = VaultMoves(job_vault, rule.mon_path, read_record=command_monitor_paths)
-			kind = path_kind(job_vault, versions, rule.mon_path, rel, moves) if versions else None
+			# the layout, read once for the picking, waiting while the daemon writes the manifest. no restore lock is held yet,
+			# so these reads are checked against a running batch, and may wait for it
+			reading = vault_reading(job_vault, rule.job_name, args.state_dir)
+			kind = path_kind(job_vault, versions, rel, reading) if versions else None
 			if kind is None:
 				raise CommandError(never_backed_up(rule, rule_path, rel, args.path.endswith('/')))
 			# refused before a version is picked, and again once one is, as picking can take a while
 			target = restore_target(rules, dest, rel, rule.mon_path, args.dest)
 			first = check_target(target, rule.job_name, rel, args.in_place, accept=args.accept)
-			holds = lambda version: resolve_version_entry(job_vault, version.path, rel, rule.mon_path, moves).kind != 'missing'
+			holds = lambda version: read_walked(job_vault, version.number, rel, reading).kind != 'missing'
 			# only the picker shows them, and for a whole job they come from every change list
 			picking = args.version is None and args.at is None and sys.stdin is not None and sys.stdin.isatty()
-			candidates = restore_candidates(job_vault, versions, rule.mon_path, rel, kind, moves) if picking else []
+			candidates = restore_candidates(job_vault, versions, rule.mon_path, rel, kind, reading) if picking else []
 			version = choose_version(candidates, versions, holds, args.version, args.at, sys.stdin, sys.stderr)
 		except OSError as e:
 			raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
@@ -16544,13 +16580,13 @@ def restore_command(args) -> int:
 		if args.in_place and not rel and not args.accept:
 			# the daemon as it is now, not before the picking; asked before the monitored path is looked at for the last
 			# time, as an answer can take a while
-			confirm_whole_job_in_place(rule.job_name, version, versions, target, read_status(state_dir_path(args.state_dir)), args.yes, first == 'resume', sys.stdin, sys.stderr)
+			confirm_whole_job_in_place(rule.job_name, version, versions, target, read_status(state_dir_path(args.state_dir)), args.yes, first == 'resume', sys.stdin, sys.stderr, reading.backward)
 		# the daemon backs the job up only once the copy ends. what the picking read is read again: a backup may have
 		# committed since
 		with command_restore_locks(rule.job_name, args.state_dir):
+			# no batch changes the vault from here on, and one waiting for this lock holds the backup lock: nothing here waits for it
 			try:
 				versions = list_versions(job_vault)
-				moves = VaultMoves(job_vault, rule.mon_path, read_record=command_monitor_paths)
 			except OSError as e:
 				raise CommandError(f'The vault {job_vault} cannot be read: {e}', EXIT_COMMAND_FAILED)
 			picked = version
@@ -16563,17 +16599,17 @@ def restore_command(args) -> int:
 			if found == 'move aside':
 				# the live entry is moved only for a version that can put something in its place
 				try:
-					entry = resolve_version_entry(job_vault, version.path, rel, rule.mon_path, moves)
+					entry = resolve_version_entry(job_vault, version.path, rel, rule.mon_path)
 				except OSError:
 					entry = None
-				if entry is None or entry.kind == 'folder' or restore_failure(entry, version) is None:
+				if entry is None or restore_failure(entry, version) is None:
 					aside = move_target_aside(target)
 			report = RestoreReport()
 			try:
 				if args.accept:
-					accept_restore(job_vault, version, rule.mon_path, rel, target, report, moves)
+					accept_restore(job_vault, version, rule.mon_path, rel, target, report)
 				else:
-					restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report, resume=found in ('resume', 'into root'), aside=aside, marked=found == 'resume', moves=moves)
+					restore_entry(job_vault, version, rule.mon_path, rel, target, args.threads, report, resume=found in ('resume', 'into root'), aside=aside, marked=found == 'resume')
 			except KeyboardInterrupt:
 				if report.marker is None:
 					raise
