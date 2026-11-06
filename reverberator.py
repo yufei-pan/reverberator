@@ -16,6 +16,7 @@ from collections import OrderedDict
 import os
 import threading
 import functools
+import itertools
 import sys
 import signal
 import resource
@@ -3796,6 +3797,9 @@ def current_mount_table() -> list:
 # statx(2): the unique mount id (never reused, unlike mountinfo's) and whether a path is the root of a mount
 AT_FDCWD = -100
 STATX_MNT_ID_UNIQUE = 0x4000
+STATX_NLINK = 0x4
+AT_SYMLINK_NOFOLLOW = 0x100
+AT_STATX_FORCE_SYNC = 0x2000
 STATX_ATTR_MOUNT_ROOT = 0x2000
 STATX_SIZE = 256
 # f2fs keeps a dead disk mounted and answers statx and readdir from cache: its checkpoint's flags (in hex in sysfs, under
@@ -3839,6 +3843,30 @@ def statx_mount(path:str) -> 'tuple | None':
 	if not field(0, 4) & STATX_MNT_ID_UNIQUE or not field(56, 8) & STATX_ATTR_MOUNT_ROOT:
 		return None
 	return field(144, 8), bool(field(8, 8) & STATX_ATTR_MOUNT_ROOT)
+
+def links_now(path:str) -> int:
+	'''
+	How many names the file at path has, not followed, as the filesystem says at this moment: mergerfs keeps an attribute for each
+	name for a second, so an lstat of one name misses a link or a removal made under another; an NFS client does the same. Raises OSError.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     path = os.path.join(folder, 'f')
+		...     open(path, 'w').close()
+		...     os.link(path, path + '2')
+		...     links_now(path)
+		2
+	'''
+	if LIBC_STATX is None:
+		return os.lstat(path).st_nlink
+	buffer = ctypes.create_string_buffer(STATX_SIZE)
+	if LIBC_STATX(AT_FDCWD, os.fsencode(path), AT_SYMLINK_NOFOLLOW | AT_STATX_FORCE_SYNC, STATX_NLINK, buffer) != 0:
+		code = ctypes.get_errno()
+		if code == errno.ENOSYS:
+			return os.lstat(path).st_nlink
+		raise OSError(code, os.strerror(code), path)
+	# struct statx: stx_nlink at 16
+	return int.from_bytes(buffer.raw[16:20], sys.byteorder)
 
 def read_pool_branches(mount_point:str) -> list:
 	'''
@@ -5757,7 +5785,7 @@ def do_backup(backup_entries:dict,
 				if not prune_salt and not on_tree:
 					prune_salt.append(vault_prune_salt(job_vault, job_name))
 				oldest = next(iter(vault_info_dict))
-				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths,prune_salt=prune_salt[0] if prune_salt else None,threads=copy_threads,on_tree=on_tree)
+				removed_size, removed_inodes = prune_oldest(vault_info_dict,job_name,monitor_path,postponed,monitor_paths=monitor_paths,prune_salt=prune_salt[0] if prune_salt else None,threads=copy_threads,on_tree=on_tree,pool_guard=pool_guard)
 				vault_size -= removed_size
 				vault_inodes -= removed_inodes
 				return next(iter(vault_info_dict), None) != oldest
@@ -5987,8 +6015,9 @@ def do_backup(backup_entries:dict,
 		# committed: a copy may have landed on no disk of the vault, or a file of a missing monitored disk may read as deleted
 		try:
 			# on design R a commit says its copies are on the disk (spec section 2.6). a roll-forward always flushes: it commits what the
-			# cut batch left in the tree, whose rows went with that batch, and nothing tells which of those copies are on the disk yet
-			if on_tree and (tree is not None or manifest.holds_copies_of(this_version_number)):
+			# cut batch left in the tree, whose rows went with that batch, and nothing tells which of those copies are on the disk yet.
+			# so does a batch of two renames: a disk's own order says nothing of the manifest's on another, whatever the batch changed
+			if on_tree and (tree is not None or manifest.holds_copies_of(this_version_number) or (writer is not None and writer.two_renames)):
 				flush_copies(job_vault,job_name,backup_folder)
 			pool_guard.require()
 		except JobFailure:
@@ -6044,12 +6073,16 @@ def flush_copies(job_vault:str, job_name:str, version_path:str) -> None:
 	would leave those copies all NUL in a committed version. Raises JobFailure, the disk first as status cuts a reason short,
 	when a sync failed: the caller commits nothing.
 	'''
+	flush_or_fail(job_vault,job_name,f'{version_path} is not committed; the next attempt tries again')
+
+def flush_or_fail(job_vault:str, job_name:str, stopped:str) -> None:
+	'''flush_vault_disks(), for a step that must not go on past a disk not written out: JobFailure, the disk first as status cuts a reason short, ending in stopped, when a sync failed.'''
 	try:
 		failed_disks = flush_vault_disks(job_vault,job_name)
 	except OSError as e:
-		raise JobFailure(f'{e}: the disks of {job_vault} cannot be flushed, so {version_path} is not committed; the next attempt tries again')
+		raise JobFailure(f'{e}: the disks of {job_vault} cannot be flushed, so {stopped}')
 	if failed_disks:
-		raise JobFailure(f'{", ".join(failed_disks)} failed a sync, so {version_path} is not committed; the next attempt tries again')
+		raise JobFailure(f'{", ".join(failed_disks)} failed a sync, so {stopped}')
 
 def swap_current_version(job_vault:str, text:str) -> None:
 	'''Point job_vault's current_version link at text, swapped in under a temporary name, so the link is never missing.'''
@@ -6750,16 +6783,36 @@ def give_back_folder_times(previous:str, manifest:'VaultManifest') -> list:
 		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
 	return recorded
 
+def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest') -> None:
+	'''
+	A cut between two renames leaves the previous version with nothing at a path whose link was moved to staging (TreeWriter.exchange_in()):
+	each row of that version under a real folder of it, with no entry there, gets its forward link again when the tree holds the entry, which
+	is unchanged, as its record never ended. The folder's time is give_back_folder_times()'s. Raises OSError.
+	'''
+	errors = []
+	real = {''}
+	real.update(rel.rstrip('/') for _, rel, is_dir in iter_tree_entries(previous, errors=errors) if is_dir)
+	if errors:
+		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
+	name = os.path.basename(os.path.normpath(tree))
+	for row in itertools.chain(manifest.iter_folders(), manifest.iter_files()):
+		rel = row.rstrip('/')
+		if os.path.dirname(rel) in real and not os.path.lexists(os.path.join(previous, rel)) and os.path.lexists(os.path.join(tree, rel)):
+			os.symlink(forward_text(rel, name), os.path.join(previous, rel))
+
 def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> None:
 	'''
 	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4), so the versions read exact
 	from here on, and a restore can run before the monitored path is back. Each real folder of the previous version gets its
 	times back (give_back_folder_times()), and the files recorded are marked unchecked, in a transaction of its own, as the tree
 	may hold another copy now where the row still says version n's: the comparison reads them there. A link a cut exchange left
-	in a folder's place in the tree is no concern of it: the comparison and the sweep of the whole tree take it. Idempotent: a cut
+	in a folder's place in the tree is no concern of it: the comparison and the sweep of the whole tree take it. A record cut between
+	two renames gets its link back first (put_back_forward_links()); a lost manifest has no rows to tell it by. Idempotent: a cut
 	here repeats it. Raises OSError or sqlite3.Error.
 	'''
 	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
+	if manifest.describes(previous):
+		put_back_forward_links(previous, info.tree, manifest)
 	recorded = give_back_folder_times(previous, manifest)
 	manifest.begin()
 	manifest.mark_unchecked(rel for rel in recorded if not rel.endswith('/'))
@@ -6860,10 +6913,8 @@ def measure_previous(previous:str, tree:str) -> tuple:
 			for entry in entries:
 				if entry.is_dir(follow_symlinks=False):
 					pending.append(entry.path)
-				elif not entry.is_symlink():
-					st = entry.stat(follow_symlinks=False)
-					if st.st_nlink > 1:
-						shared.add(st.st_ino)
+				elif not entry.is_symlink() and links_now(entry.path) > 1:
+					shared.add(entry.stat(follow_symlinks=False).st_ino)
 	return measure_version(previous, shared)
 
 def measure_version(version:str, seen:set) -> tuple:
@@ -6892,6 +6943,43 @@ def measure_version(version:str, seen:set) -> tuple:
 						inodes += 1
 	return size, inodes
 
+def version_without_folder(job_vault:str) -> 'str | None':
+	'''The folder name of the newest version whose change list is there and whose folder is not, None when there is none. Raises OSError.'''
+	names = os.listdir(job_vault)
+	wanting = [parsed for parsed in map(parse_change_list_name, names) if parsed is not None and parsed[1] not in names]
+	return max(wanting)[1] if wanting else None
+
+def repair_pool_vault(job_vault:str, manifest:'VaultManifest') -> None:
+	'''
+	What a cut between two renames left, before the vault is read, as a version then has a list and no folder (spec section 5):
+	- a hand-over's skeleton in staging, whose version's name is free, is renamed in: the tree is already under the new version's name;
+	- a conversion's tree in staging, on a vault still being converted, is renamed in under the name of the version with no folder, as one
+	  tree is built at a time. A vault on design R has no such tree: a list with no folder there is a prune's.
+	Anything else in staging goes as usual, a skeleton whose version stands among it. Then every disk is flushed. Run again it changes nothing.
+	Raises OSError, or JobFailure when a flush fails.
+	'''
+	staging = staging_path(job_vault)
+	try:
+		names = os.listdir(staging)
+	except (FileNotFoundError, NotADirectoryError):
+		return
+	repaired = False
+	for name in names:
+		version = os.path.join(job_vault, name.removeprefix(SKELETON_PREFIX))
+		if name.startswith(SKELETON_PREFIX) and not os.path.lexists(version):
+			st = os.lstat(os.path.join(staging, name))
+			os.rename(os.path.join(staging, name), version)
+			os.utime(version, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+			repaired = True
+	if CONVERTED_NAME in names and manifest.layout() != 'r':
+		name = version_without_folder(job_vault)
+		if name is not None:
+			# its times are the conversion's to give back
+			os.rename(os.path.join(staging, CONVERTED_NAME), os.path.join(job_vault, name))
+			repaired = True
+	if repaired:
+		flush_or_fail(job_vault, os.path.basename(job_vault), f'the scan of {job_vault} stops here; the next attempt goes on with it')
+
 def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> VaultInfo:
 	'''
 	The scan of a vault on design R (spec section 3, plan S3), whose caller holds the job's locks. A version folder with no list
@@ -6903,9 +6991,14 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	anything is removed. A lost manifest names nothing: its private list goes, and the orphan is judged the same way, so a cut tree stays.
 	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54. A vault with no version and no orphan
 	is one started over: the manifest's version is forgotten (a conversion begun is no more to finish), and the next batch is V0.
+	A cut between two renames is finished first (repair_pool_vault()).
 	Raises VaultScanError, or PoolNotReady with a disk of the vault's pool missing, as get_vault_info() does.
 	'''
 	guard = PoolGuard([job_vault])
+	try:
+		repair_pool_vault(job_vault, manifest)
+	except OSError as e:
+		raise VaultScanError(f'cannot finish a cut rename in {job_vault}: {e}')
 	listing = read_vault_whole(job_vault, guard, judge_orphans=False)
 	if listing is None:
 		return VaultInfo({},0,0)
@@ -11012,7 +11105,7 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	backuperTeeLogToTl(path=monitor_path,message=f'Compared {compared} tracked entries{compared_what} in {time.monotonic() - start_time:.1f}s, {recorded} read from the vault, {len(backup_entries)} differences')
 	return compared
 
-def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:TouchedScopes, writer:'TreeWriter' = None) -> tuple:
+def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:TouchedScopes, writer:'TreeWriter' = None, before_removal = None) -> tuple:
 	'''
 	Make the folder of the version a backup is writing, version_path, agree with the manifest rows describing it under
 	each subtree of scopes. Returns (removed, missing), as rels (a folder's ending with /):
@@ -11024,7 +11117,8 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 	as copying it would write through the link.
 	Only what lies in version_path through real folders is looked at or removed, and never version_path itself.
 	An entry that cannot be removed raises JobFailure, as the version would be committed holding what no row names.
-	writer is the version's TreeWriter, by default one on version_path.
+	writer is the version's TreeWriter, by default one on version_path. before_removal, when given, is told the rels about to be removed,
+	once the walk ended and before anything is: a pool records them all and flushes once (TreeWriter.pre_record()).
 	'''
 	if writer is None:
 		writer = TreeWriter(version_path)
@@ -11034,6 +11128,10 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 	if '' in subtrees:
 		# the whole version
 		subtrees = {''}
+	# what each scope's walk found, for the look at its rows, which comes once the entries that go are gone
+	walked = []
+	# (path, rel) of what no row tracks
+	doomed = []
 	for scope in sorted(subtrees):
 		if scope and inside_folders(scope, subtrees):
 			continue
@@ -11068,7 +11166,7 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 					is_dir = None
 					unlisted.append(scope)
 				if is_dir is not None:
-					folders = sweep_entry(manifest, version_path, os.path.join(version_path, name), scope if is_dir else name, is_dir, found, removed, writer)
+					folders = sweep_entry(manifest, version_path, os.path.join(version_path, name), scope if is_dir else name, is_dir, found, doomed)
 		while folders:
 			folder_path, folder_rel = folders.pop()
 			try:
@@ -11079,7 +11177,21 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 				unlisted.append(folder_rel)
 				continue
 			for path, name, is_dir in sorted(entries, key=lambda entry: entry[1]):
-				folders.extend(sweep_entry(manifest, version_path, path, folder_rel + name + ('/' if is_dir else ''), is_dir, found, removed, writer))
+				folders.extend(sweep_entry(manifest, version_path, path, folder_rel + name + ('/' if is_dir else ''), is_dir, found, doomed))
+		walked.append((scope, found, unlisted))
+	if doomed and before_removal is not None:
+		before_removal([rel for _, rel in doomed])
+	for path, rel in doomed:
+		try:
+			# a link is unlinked, never followed; a real folder goes with everything in it
+			writer.remove_now(rel)
+		except OSError as e:
+			backuperTeeLogToTl(path=version_path,error=True,message=f'Cannot remove {path}, which the version does not track: {e}')
+			# committed, the version would hold what no row names: the batch fails, rolls back and is retried
+			raise JobFailure(f'removing {path} from the version failed: {e}')
+		backuperTeeLogToTl(path=version_path,message=f'Removed {path}, which the version does not track')
+		removed.append(rel)
+	for scope, found, unlisted in walked:
 		tracked = [rel for rel in (scope, scope[:-1]) if rel and manifest.lookup(rel) is not None]
 		tracked += list(manifest.iter_under(scope)) if scope else list(manifest.iter_folders()) + list(manifest.iter_files())
 		for rel in tracked:
@@ -11094,14 +11206,11 @@ def sweep_version_folder(manifest:VaultManifest, version_path:str, scopes:Touche
 				missing.append(rel)
 	return removed, missing
 
-def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_dir:bool, found:set, removed:list, writer:'TreeWriter' = None) -> list:
+def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_dir:bool, found:set, doomed:list) -> list:
 	'''
 	sweep_version_folder() for the entry at path, rel in version_path: kept and added to found when it is tracked,
-	removed and appended to removed when not. Returns [(path, rel)] for a folder to look into, else []. Raises JobFailure
-	when the removal fails. writer is the version's TreeWriter, by default one on version_path.
+	appended to doomed as (path, rel), to be removed, when not. Returns [(path, rel)] for a folder to look into, else [].
 	'''
-	if writer is None:
-		writer = TreeWriter(version_path)
 	if manifest.lookup(rel) is not None:
 		found.add(rel)
 		return [(path, rel)] if is_dir else []
@@ -11116,15 +11225,7 @@ def sweep_entry(manifest:VaultManifest, version_path:str, path:str, rel:str, is_
 		# would reach through a link
 		backuperTeeLogToTl(path=version_path,error=True,message=f'Not removing {path}: a folder above it in the version is not a real folder')
 		return []
-	try:
-		# a link is unlinked, never followed; a real folder goes with everything in it
-		writer.remove_now(rel)
-	except OSError as e:
-		backuperTeeLogToTl(path=version_path,error=True,message=f'Cannot remove {path}, which the version does not track: {e}')
-		# committed, the version would hold what no row names: the batch fails, rolls back and is retried
-		raise JobFailure(f'removing {path} from the version failed: {e}')
-	backuperTeeLogToTl(path=version_path,message=f'Removed {path}, which the version does not track')
-	removed.append(rel)
+	doomed.append((path, rel))
 	return []
 
 def full_comparison_since(vault_info_dict:OrderedDict, matched:tuple = None) -> int:
@@ -11709,34 +11810,45 @@ def version_change_list(job_vault:str, entry:VaultEntry) -> 'str | None':
 			return os.path.join(job_vault, name)
 	return None
 
-def prune_version(job_vault:str, entry:VaultEntry) -> None:
+def prune_version(job_vault:str, entry:VaultEntry, guard:PoolGuard = None) -> None:
 	'''
 	Remove the oldest version on design R (spec section 2.7): nothing links into it, so its folder is renamed into staging, and
-	it stops being a version in that one call. Then its change list and the folder go. A failed rename raises OSError with
-	nothing changed. Past it, the version is gone whatever else fails: an error line says what is left, which the
-	scan removes (staging, and a list whose folder is gone).
+	it stops being a version in that one call. On a pool every disk is then flushed, as the rename can land on one disk at a time. The
+	folder goes, and its change list last: a disk out during the rename can bring part of the folder back under the version's name, and
+	a version folder with no list below the newest is an error for every scan, while one with its list is the oldest version, pruned again.
+	A failed rename raises OSError with nothing changed. Past it, the version is gone whatever else fails: an error line
+	says what is left, which the scan removes (staging, and a list whose folder is gone).
+
+	guard holds the pools as the step began, by default the vault's now: PoolNotReady, with the list kept, when a disk is missing or was
+	mounted again, before the rename or by the end of the removal. JobFailure, with the staged folder and the list kept, when a flush fails.
 	'''
+	if guard is None:
+		guard = PoolGuard([job_vault])
+	guard.require()
 	staged = os.path.join(staging_path(job_vault), os.path.basename(os.path.normpath(entry.path)))
 	os.makedirs(staging_path(job_vault), exist_ok=True)
 	os.rename(entry.path, staged)
+	if pool_state(job_vault) is not None:
+		flush_or_fail(job_vault, os.path.basename(job_vault), f'{entry.path} is not removed yet; the next scan does it')
+	task = multiCMD.run_command(['rm', '-rf', staged], quiet=True, return_object=True)
+	if task.returncode != 0:
+		backuperTeeLogToTl(job_vault, f'Cannot remove {staged}, what is left of {entry.path}, for now: {rm_cause(task)}', error=True)
+	guard.require()
 	try:
 		change_list = version_change_list(job_vault, entry)
 		if change_list is not None:
 			os.remove(change_list)
 	except OSError as e:
 		backuperTeeLogToTl(job_vault, f'Cannot remove the change list of {entry.path}, which is gone: {e}', error=True)
-	task = multiCMD.run_command(['rm', '-rf', staged], quiet=True, return_object=True)
-	if task.returncode != 0:
-		backuperTeeLogToTl(job_vault, f'Cannot remove {staged}, what is left of {entry.path}, for now: {rm_cause(task)}', error=True)
 
-def prune_tree_version(vault_info_dict:OrderedDict, job_name:str) -> tuple:
-	'''prune_version() of the oldest of vault_info_dict, taken out of it: (bytes, inodes) it freed. The last version is never pruned; one whose rename failed stays, with an error line. Either returns (0, 0).'''
+def prune_tree_version(vault_info_dict:OrderedDict, job_name:str, guard:PoolGuard = None) -> tuple:
+	'''prune_version() of the oldest of vault_info_dict, with guard, taken out of it: (bytes, inodes) it freed. The last version is never pruned; one whose rename failed stays, with an error line. Either returns (0, 0). PoolNotReady and JobFailure go on up, to fail the attempt.'''
 	if len(vault_info_dict) < 2:
 		return 0, 0
 	number = next(iter(vault_info_dict))
 	entry = vault_info_dict[number]
 	try:
-		prune_version(os.path.dirname(os.path.normpath(entry.path)), entry)
+		prune_version(os.path.dirname(os.path.normpath(entry.path)), entry, guard)
 	except OSError as e:
 		backuperTeeLogToTl(job_name, f'Cannot remove the oldest version {entry.path}: {e}', error=True)
 		return 0, 0
@@ -11744,9 +11856,9 @@ def prune_tree_version(vault_info_dict:OrderedDict, job_name:str) -> tuple:
 	return entry.size, entry.inode
 
 def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, postponed:list = None, clock = time.monotonic, monitor_paths:list = None,
-		prune_salt:bytes = None, threads:int = None, on_tree:bool = False) -> tuple:
+		prune_salt:bytes = None, threads:int = None, on_tree:bool = False, pool_guard:PoolGuard = None) -> tuple:
 	'''
-	decrement_stepper, or with on_tree prune_tree_version() (design R), while no history or restore command holds the job's history lock; when one does, postpone and
+	decrement_stepper, or with on_tree prune_tree_version() (design R) with pool_guard, while no history or restore command holds the job's history lock; when one does, postpone and
 	return (0, 0) so the retention loops stop. Its caller holds the backup and restore locks (BackupLocks). Without a
 	state folder nothing can hold the lock, so it prunes; any other failure to lock postpones too, with
 	job_lock_unchecked()'s marker, as no version is removed meanwhile and the vault keeps growing.
@@ -11756,7 +11868,7 @@ def prune_oldest(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, po
 	lock_path = job_lock_path(job_name, 'history')
 	def remove() -> tuple:
 		if on_tree:
-			return prune_tree_version(vault_info_dict, job_name)
+			return prune_tree_version(vault_info_dict, job_name, pool_guard)
 		return decrement_stepper(vault_info_dict, job_name, monitor_path, monitor_paths, clock, prune_salt, threads)
 	def postpone(reason:str, cannot_check:OSError = None) -> tuple:
 		if cannot_check is None:
@@ -12990,9 +13102,15 @@ class NotRenamed(Exception):
 
 # the job vault's scratch folder, on the vault's filesystem: folders being built, links swapped out, link temps. kept between backups
 STAGING_NAME = '.reverberator_staging'
+# in staging, on two renames: a hand-over's skeleton, skel-<the version it will stand for>, and a conversion's tree and the tree it replaces
+SKELETON_PREFIX = 'skel-'
+CONVERTED_NAME = 'm'
+REPLACED_NAME = 'old'
 # renameat2(2): the folder a relative path starts from, and the flag that swaps two names in one call
 AT_FDCWD = -100
 RENAME_EXCHANGE = 2
+# what a filesystem with no RENAME_EXCHANGE answers it with
+NO_EXCHANGE_ERRNOS = frozenset({errno.EINVAL, errno.ENOSYS, errno.ENOTSUP})
 LIBC_RENAMEAT2 = ctypes.CDLL(None, use_errno=True).renameat2
 LIBC_RENAMEAT2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
 LIBC_RENAMEAT2.restype = ctypes.c_int
@@ -13023,6 +13141,16 @@ def rename_exchange(a:str, b:str) -> None:
 	if LIBC_RENAMEAT2(AT_FDCWD, os.fsencode(a), AT_FDCWD, os.fsencode(b), RENAME_EXCHANGE) != 0:
 		code = ctypes.get_errno()
 		raise OSError(code, os.strerror(code), a, None, b)
+
+def exchanged(a:str, b:str) -> bool:
+	'''rename_exchange(a, b), True: or False, with nothing changed, on a filesystem that has no such call (NFS, older ZFS, exfat, a FUSE filesystem). Any other OSError is raised.'''
+	try:
+		rename_exchange(a, b)
+		return True
+	except OSError as e:
+		if e.errno not in NO_EXCHANGE_ERRNOS:
+			raise
+		return False
 
 def staging_path(job_vault:str) -> str:
 	'''
@@ -13187,7 +13315,7 @@ class BatchSizes:
 		'''(bytes, inodes) of the previous version, as of now: the files recorded by hard links the tree has let go count. Raises OSError.'''
 		size, inodes = self.size, self.inodes
 		for rel, bytes_, links in self.shared:
-			if os.lstat(os.path.join(self.previous, rel)).st_nlink < links:
+			if links_now(os.path.join(self.previous, rel)) < links:
 				size += bytes_
 				inodes += 1
 		return size, inodes
@@ -13207,6 +13335,12 @@ class TreeWriter:
 	part is the set of records, no other list is kept, and a record only acts where a forward link still stands, so running
 	one again changes nothing. Without previous (V0, the 0.54 layout) nothing is recorded. An error of a record raises
 	before the tree changes.
+
+	two_renames (spec section 5, plan S11): the vault is on a mergerfs pool, or its filesystem has no RENAME_EXCHANGE, which the first
+	exchange finds out. A folder goes into the previous version by two renames, and a record is always made by hard links, so the tree
+	keeps every entry until its apply phase. Each disk of a pool comes back from a power cut at its own last checkpoint, so a record
+	must be on every disk before the change it guards: pre_record() makes a phase's records and flushes once, and a record
+	made inline, when the phase turned out other than foreseen, is flushed by flush_if_needed() in the verb, before its change.
 	'''
 	def __init__(self, tree:str, previous:str = None, job_vault:str = None, manifest:'VaultManifest' = None, sizes = None):
 		self.tree = tree
@@ -13218,10 +13352,14 @@ class TreeWriter:
 		# the real folders of previous met so far, with the (atime, mtime) each keeps: a change in one bumps them, and they are given back at once
 		self.saved = {}
 		self.staging_made = False
+		self.two_renames = False
+		# a record was made that no flush has put on every disk yet
+		self.needs_flush = False
 		if previous is not None:
 			self.tree_name = os.path.basename(os.path.normpath(tree))
 			self.job_vault = job_vault or os.path.dirname(os.path.normpath(tree))
 			self.staging = staging_path(self.job_vault)
+			self.two_renames = pool_state(self.job_vault) is not None
 
 	def path(self, rel:str) -> str:
 		'''Where rel is, never with a trailing /, which makes the kernel follow a link there.'''
@@ -13253,6 +13391,46 @@ class TreeWriter:
 	def give_back_times(self, folder:str) -> None:
 		'''The real folder of the previous version, in which something just changed, as its version had it.'''
 		os.utime(self.kept_path(folder), ns=self.saved[folder], follow_symlinks=False)
+		self.needs_flush = self.two_renames
+
+	def flush(self) -> None:
+		'''
+		Every disk of the vault written out. JobFailure when one cannot be: nothing after this step runs, and the next attempt goes on from the cut
+		it leaves. Each real folder met gets its times back first: mergerfs makes the folders above a new entry on a disk without them, and
+		each one made in the next moves that one's mtime there, up the path, past the parent the record gave back.
+		'''
+		self.needs_flush = False
+		for folder, times in self.saved.items():
+			os.utime(self.kept_path(folder), ns=times, follow_symlinks=False)
+		flush_or_fail(self.job_vault, os.path.basename(self.job_vault), f'the batch writing {self.tree} stops here; the next attempt goes on with it')
+
+	def flush_if_needed(self) -> None:
+		'''Before a change of the tree: the records guarding it are on every disk. A record made by pre_record() has been; this is for one made since.'''
+		if self.needs_flush:
+			self.flush()
+
+	def pre_record(self, ops:list, poll = None) -> None:
+		'''
+		Before a phase's changes on two renames (spec section 5): ops, as replay_ops() and settle_ops() give them, recorded by hard links with the
+		tree left as it is, then every disk flushed, once, if anything was recorded. The same records made inline find nothing left to do.
+		poll, when given, is called before each one (a pool guard's). A stop ends it early, leaving the flush to the first change that needs it.
+		Off two renames each record is made inline, as it costs no flush. Raises JobFailure when a record fails.
+		'''
+		if not self.two_renames:
+			return
+		try:
+			for kind, rel in ops:
+				if poll is not None:
+					poll()
+				if not GREEN_LIGHT.is_set():
+					return
+				if kind == FOLDER_OP:
+					self.ensure_real(rel)
+				else:
+					self.hl_record(rel)
+		except OSError as e:
+			raise JobFailure(f'recording in {self.previous} before the batch writes {self.tree} failed: {e}')
+		self.flush_if_needed()
 
 	def held_in_tree(self, rel:str) -> 'str | None':
 		'''
@@ -13308,13 +13486,21 @@ class TreeWriter:
 		which so never holds anything between the two, then unlink the link. The times are set again in place, as f2fs bumps
 		the mtime of a folder renamed into another parent, and the parent's are given back, before the link goes: a cut leaves
 		the link in staging, or in the tree under a text naming its own place, and the scan knows both.
+
+		On two renames the link is moved to staging first, then the folder in: the previous version holds nothing at rel between
+		them, and a cut there has the scan put the link back (put_back_forward_links()), as the tree still holds what it led to.
 		'''
-		rename_exchange(holder, self.kept_path(rel))
+		link = holder
+		if self.two_renames or not exchanged(holder, self.kept_path(rel)):
+			self.two_renames = True
+			link = self.staged()
+			os.rename(self.kept_path(rel), link)
+			os.rename(holder, self.kept_path(rel))
 		times = (st.st_atime_ns, st.st_mtime_ns)
 		os.utime(self.kept_path(rel), ns=times, follow_symlinks=False)
 		self.saved[rel] = times
 		self.give_back_times(os.path.dirname(rel))
-		os.unlink(holder)
+		os.unlink(link)
 
 	def copy_folder_meta_onto(self, source:str, dest:str) -> None:
 		'''All of source's metadata onto the folder at dest, which is on its way into the previous version and must say what source says.'''
@@ -13331,7 +13517,7 @@ class TreeWriter:
 		if stat.S_ISLNK(st.st_mode):
 			self.sizes.record_dropped(0, 1)
 		elif linked:
-			self.sizes.pending(rel, st.st_size, st.st_nlink + 1)
+			self.sizes.pending(rel, st.st_size, links_now(dest))
 		else:
 			self.sizes.record_dropped(st.st_size, 1)
 
@@ -13411,10 +13597,12 @@ class TreeWriter:
 		file or link is hard linked in, and a folder too, entry by entry, rather than left to the copy (a failed copy keeps the
 		last copy in both versions). Without keep, a file is renamed in and a folder exchanged in, which costs one call. Where
 		both versions already hold real folders, each entry is recorded the same way. Nothing else needs recording: the
-		previous version holds nothing there, or holds its own. rows goes to folder_usage().
+		previous version holds nothing there, or holds its own. rows goes to folder_usage(). On two renames every record is a
+		keep, and the caller removes what the tree holds. flush_if_needed() is the caller's, before it changes the tree.
 		'''
 		if self.previous is None:
 			return
+		keep = keep or self.two_renames
 		pending = [rel.rstrip('/')]
 		try:
 			while pending:
@@ -13474,6 +13662,7 @@ class TreeWriter:
 					break
 				there = below
 			self.ensure_real(there)
+			self.flush_if_needed()
 		return real_folders_to(self.tree, rel, make=True, made=made)
 
 	def make_folder(self, rel:str) -> bool:
@@ -13481,8 +13670,10 @@ class TreeWriter:
 		if self.previous is not None:
 			if kind_at(self.path(rel)) == 'd':
 				self.ensure_real(rel)
+				self.flush_if_needed()
 				return True
 			self.record(rel, False)
+			self.flush_if_needed()
 			if not make_real_folder(self.path(rel)):
 				# a version with a new tree's folder left out would read as if it went: the next attempt finishes it
 				raise JobFailure(f'making the folder {self.path(rel)} in the version failed')
@@ -13497,12 +13688,14 @@ class TreeWriter:
 	def copy(self, source:str, rel:str, mcae:multiCMD.AsyncExecutor, pending:list):
 		'''Queue a copy of source to rel on mcae (cp_af_copy_path()), which place() or discard_temp() ends: its task, or False when nothing is copied.'''
 		self.record(rel, True)
+		self.flush_if_needed()
 		self._folders_for_copy(source, rel)
 		return cp_af_copy_path(source_path=source,dest_path=self.path(rel),mcae=mcae,pending=pending)
 
 	def copy_now(self, source:str, rel:str) -> int:
 		'''Copy source to rel and put it in place, now (cp_af_copy_path()): cp's exit code, or False when nothing is copied.'''
 		self.record(rel, True)
+		self.flush_if_needed()
 		self._folders_for_copy(source, rel)
 		return cp_af_copy_path(source_path=source,dest_path=self.path(rel),writer=self)
 
@@ -13517,11 +13710,13 @@ class TreeWriter:
 	def remove_now(self, rel:str) -> None:
 		'''Remove what is at rel, a folder with everything in it, now. A link is unlinked, never followed.'''
 		self.record(rel, False)
+		self.flush_if_needed()
 		remove_entry(self.path(rel))
 
 	def remove_queued(self, rel:str, is_dir:bool, mcae:multiCMD.AsyncExecutor, removals:list) -> None:
 		'''Queue the rm of rel on mcae, its (task, path) appended to removals for failed_removal(): a real folder with all it holds, or else one entry. No rm runs for an entry its record took out of the tree.'''
 		self.record(rel, False)
+		self.flush_if_needed()
 		path = self.path(rel)
 		if self.previous is None or os.path.lexists(path):
 			removals.append((mcae.run_command(['rm','-rf' if is_dir else '-f',path]),path))
@@ -13543,11 +13738,13 @@ class TreeWriter:
 				return False
 			# the move's rows are at dst already
 			self.record(dst, False, rows=False)
+			self.flush_if_needed()
 		if os.path.isdir(target) and not os.path.islink(target):
 			remove_entry(target)
 		elif os.path.lexists(target):
 			os.remove(target)
 		self.hl_record(src)
+		self.flush_if_needed()
 		try:
 			os.rename(source, target)
 		except FileNotFoundError as e:
@@ -13560,11 +13757,13 @@ class TreeWriter:
 	def folder_times(self, rel:str, st:os.stat_result) -> None:
 		'''Give the folder at rel st's times. Raises OSError.'''
 		self.ensure_real(rel)
+		self.flush_if_needed()
 		os.utime(self.path(rel), ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
 
 	def folder_meta(self, source:str, rel:str, st, unsynced:list) -> bool:
 		'''All of the monitored folder source's metadata onto the folder at rel (copy_new_folder_meta(), st its lstat or None).'''
 		self.ensure_real(rel)
+		self.flush_if_needed()
 		return copy_new_folder_meta(source, self.path(rel), st, unsynced)
 
 	def file_meta(self, source:str, rel:str, st, failed:list) -> None:
@@ -13585,29 +13784,51 @@ def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManif
 	which reads the same, in one RENAME_EXCHANGE: at no moment does a link lead nowhere. Until then new_path holds only links
 	that name their own folder, an orphan no reader follows and the scan removes. Returns the writer of the new version.
 
+	On a pool, or a filesystem with no such call, it is spec section 5's six steps: the skeleton built in staging (where a pool's links
+	go straight, and a filesystem that refused the exchange moves its folder), a flush, the tree renamed, a flush, the skeleton
+	renamed in, a flush. Between the two renames newest_path is not there: a reader waits (read_walked()), and a cut leaves the scan to
+	finish it (repair_pool_vault()). The rename from staging can move the folder's mtime, so its times are set again.
+
 	new_path must not be there: FileExistsError otherwise, with nothing changed. Any other OSError also leaves the
-	versions as they were. Staging is made first, as a vault whose manifest is lost reads as design R by it (vault_layout()),
-	and the 0.54 rules would remove a cut batch's tree as an orphan. manifest, the tree's rows, is what the writer sums a removed folder's size from.
+	versions as they were, up to the first rename; from there it is a cut, and so is a JobFailure from a flush. Staging is made first, as a vault
+	whose manifest is lost reads as design R by it (vault_layout()), and the 0.54 rules would remove a cut batch's tree as an orphan.
+	manifest, the tree's rows, is what the writer sums a removed folder's size from.
 	'''
 	os.makedirs(staging_path(job_vault), exist_ok=True)
-	os.mkdir(new_path)
+	pooled = pool_state(job_vault) is not None
+	skeleton = os.path.join(staging_path(job_vault), SKELETON_PREFIX + os.path.basename(os.path.normpath(newest_path)))
+	if pooled and os.path.lexists(new_path):
+		raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), new_path)
+	built = skeleton if pooled else new_path
+	os.mkdir(built)
 	new_name = os.path.basename(os.path.normpath(new_path))
 	# before the listing, which can bump the atime
 	st = os.lstat(newest_path)
 	links = 0
 	with os.scandir(newest_path) as entries:
 		for entry in entries:
-			os.symlink(forward_text(entry.name, new_name), os.path.join(new_path, entry.name))
+			os.symlink(forward_text(entry.name, new_name), os.path.join(built, entry.name))
 			links += 1
 	try:
-		os.setxattr(new_path, ROOT_META_XATTR, os.getxattr(newest_path, ROOT_META_XATTR, follow_symlinks=False), follow_symlinks=False)
+		os.setxattr(built, ROOT_META_XATTR, os.getxattr(newest_path, ROOT_META_XATTR, follow_symlinks=False), follow_symlinks=False)
 	except OSError as e:
 		# none to copy: an attribute that could not be written has none here either (record_root_meta())
 		if e.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
 			raise
-	os.utime(new_path, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
-	rename_exchange(new_path, newest_path)
-	return TreeWriter(new_path, previous=newest_path, job_vault=job_vault, manifest=manifest, sizes=BatchSizes(newest_path, links))
+	times = (st.st_atime_ns, st.st_mtime_ns)
+	os.utime(built, ns=times, follow_symlinks=False)
+	writer = TreeWriter(new_path, previous=newest_path, job_vault=job_vault, manifest=manifest, sizes=BatchSizes(newest_path, links))
+	if pooled or not exchanged(new_path, newest_path):
+		writer.two_renames = True
+		if not pooled:
+			os.rename(new_path, skeleton)
+		writer.flush()
+		os.rename(newest_path, new_path)
+		writer.flush()
+		os.rename(skeleton, newest_path)
+		os.utime(newest_path, ns=times, follow_symlinks=False)
+		writer.flush()
+	return writer
 
 def is_chain_link(job_vault:str, path:str) -> bool:
 	'''Whether the link at path of a version is a 0.54 chain link: by its text alone, as the walk has it (parse_chain_text()).'''
@@ -13649,6 +13870,8 @@ def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 	metadata and times, each other entry hard linked to what plain_tree_entry() says, or copied where it cannot be
 	(link_or_copy()), a prune's temp left out; then swapped with the version folder in one call, so a reader sees one or the
 	other, and the old tree goes with the rest of staging. The version's own folder keeps its metadata and root record the same way.
+	A pool or a filesystem with no such call uses two renames, each flushed: the version is not there between them, and a cut leaves
+	the scan to finish it (repair_pool_vault()). Its caller gives the folder back the times a rename from staging can move.
 
 	stop, polled per entry, ends the build: False, with the version as it was and the unfinished tree left for the next scan
 	(empty_staging()). Raises OSError or JobFailure with the version as it was, as nothing changes it before the swap. A tree
@@ -13656,7 +13879,7 @@ def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 	'''
 	version = os.path.join(job_vault, name)
 	# one name for every version: the staging folder and 'm' are shorter than any version's name, so a path that fits in a version fits here
-	built = os.path.join(staging_path(job_vault), 'm')
+	built = os.path.join(staging_path(job_vault), CONVERTED_NAME)
 	empty_staging(job_vault)
 	os.mkdir(built)
 	folders = [('', os.lstat(version))]
@@ -13680,7 +13903,12 @@ def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 		copy_new_folder_meta(os.path.join(version, rel), os.path.join(built, rel), st, failed)
 		if failed:
 			raise JobFailure(f'cannot convert {name}: the metadata of {rel or "its folder"} cannot be kept')
-	rename_exchange(built, version)
+	if pool_state(job_vault) is not None or not exchanged(built, version):
+		stopped = f'the conversion of {name} stops here; the next attempt goes on with it'
+		os.rename(version, os.path.join(staging_path(job_vault), REPLACED_NAME))
+		flush_or_fail(job_vault, os.path.basename(job_vault), stopped)
+		os.rename(built, version)
+		flush_or_fail(job_vault, os.path.basename(job_vault), stopped)
 	empty_staging(job_vault)
 	return True
 
@@ -13826,6 +14054,49 @@ def convert_at_start(job_vault:str, info:VaultInfo, job_name:str, monitor_path:s
 		if wait is not None:
 			job.end_wait(wait)
 		manifest.close()
+
+# what TreeWriter.pre_record() does with a rel: makes the previous version's folder there real, or records the entry there
+FOLDER_OP, ENTRY_OP = 'folder', 'entry'
+
+def replay_ops(entries:dict, monitor_path:str, only_sync_attributes:bool) -> list:
+	'''
+	What a replay of entries, or the verification's fixes, records first (spec section 2.2's table), for TreeWriter.pre_record(), as a list of
+	(FOLDER_OP or ENTRY_OP, rel). A create, a modify or a delete records its entry, a folder copied over a folder with all it holds, as each file
+	below it may be replaced. A move records its source and its target. A folder's attributes want its folder real. A file's attributes
+	under Only Sync Attributes record nothing, and without it they are a copy. Paths the version did not hold find nothing there.
+
+	Examples:
+		>>> entries = OrderedDict([('/m/d/', BackupEntryValues('t', 'attrib', None)), ('/m/f', BackupEntryValues('t', 'attrib', None)),
+		...     ('/m/g', BackupEntryValues('t', 'move', '/m/e')), ('/m/h', BackupEntryValues('t', 'delete', None))])
+		>>> replay_ops(entries, '/m', True)
+		[('folder', 'd'), ('entry', 'g'), ('entry', 'e'), ('entry', 'h')]
+		>>> replay_ops({'/m/f': BackupEntryValues('t', 'attrib', None)}, '/m', False)
+		[('entry', 'f')]
+	'''
+	ops = []
+	for path, values in entries.items():
+		rel = os.path.relpath(path, monitor_path)
+		if rel == '.':
+			# the version's own folder is real, and keeps its own
+			continue
+		if values.event == 'attrib' and path.endswith('/'):
+			ops.append((FOLDER_OP, rel))
+		elif values.event != 'attrib' or not only_sync_attributes:
+			ops.append((ENTRY_OP, rel))
+		if values.event == 'move':
+			ops.append((ENTRY_OP, os.path.relpath(values.source_path, monitor_path)))
+	return ops
+
+def settle_ops(folders, sweep = ()) -> list:
+	'''
+	What the end of a batch records first, for TreeWriter.pre_record(): each of folders, rels that get the monitored folders' metadata, made real;
+	each rel of sweep, what the sweep removes, recorded.
+
+	Examples:
+		>>> settle_ops(['a/b/', '.', ''], ['c/', 'd'])
+		[('folder', 'a/b'), ('entry', 'c'), ('entry', 'd')]
+	'''
+	return [(FOLDER_OP, rel.strip('/')) for rel in folders if rel.strip('/') not in ('', '.')] + [(ENTRY_OP, rel.rstrip('/')) for rel in sweep]
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
@@ -14400,6 +14671,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		if need_delete_barrier:
 			wait_for_async_commands(mcae)
 		return applied
+	def record_settled(sweep = ()):
+		# what the sweep removes and the folders settle() gives metadata: one phase, so one flush
+		writer.pre_record(settle_ops([*written.rels, *(() if touched is None else touched.folders)],sweep),poll_pools)
 	def verify():
 		# what the batch's events touched is compared with the monitored tree, and the version fixed where they differ:
 		# the collapse into one entry per path cannot replay every order of moves, re-creations and deletes. the rows this
@@ -14427,12 +14701,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		applied = {}
 		if fixes:
 			backuperTeeLogToTl(path=monitor_path,message=f'Fixing {len(fixes)} differences between {backup_folder} and the touched places of the monitored tree')
+			writer.pre_record(replay_ops(fixes,monitor_path,only_sync_attributes),poll_pools)
 			applied = replay(prepare_backup_entries_for_replay(fixes))
 			wait_for_async_commands(mcae)
 			if not GREEN_LIGHT.is_set():
 				return
 		# a copy fallback of a failed rename can leave entries in the version that no row tracks
-		removed, missing = sweep_version_folder(manifest, backup_folder, touched, writer=writer)
+		removed, missing = sweep_version_folder(manifest, backup_folder, touched, writer=writer, before_removal=record_settled)
 		for rel in removed:
 			written.wrote_in(rel)
 		fix_time = datetime.datetime.now().isoformat()
@@ -14496,6 +14771,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 			if recopied is not None:
 				recopied.extend(copied)
 			backuperTeeLogToTl(path=monitor_path,message=f'Copied {len(copied)} of {len(recopy)} files again from the vault, as their link chains would pass their limit')
+		writer.pre_record(replay_ops(backup_entries,monitor_path,only_sync_attributes),poll_pools)
 		replay(backup_entries)
 		wait_for_async_commands(mcae)
 		# the moves are made: whatever they left out, the verification's copies take whole
@@ -14521,6 +14797,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	if touched is not None:
 		for rel in touched.folders:
 			written.add(rel)
+	if writer.two_renames:
+		# mergerfs makes the folders above a new entry on a disk without them, and each one made in the next moves that one's mtime there
+		for rel in list(written.rels):
+			while '/' in rel:
+				rel = rel.rpartition('/')[0]
+				written.add(rel)
+	record_settled()
 	for rel in written.settle(backup_folder,monitor_path,unsynced,paused,poll_pools,writer=writer):
 		if manifest.lookup(as_folder_entry(rel)) is not None:
 			manifest.add(as_folder_entry(rel),dirty=True)
@@ -14811,6 +15094,21 @@ def wait_for_backup(job_name:'str | None', state_dir:str = None) -> bool:
 		if RESTORE_STOP.wait(RESTORE_WAIT_SECONDS):
 			raise KeyboardInterrupt
 	return True
+
+def versions_of_a_batch(job_vault:str, job:'str | None', state_dir:str = None) -> list:
+	'''
+	list_versions(), for a command holding no lock a batch needs: while job's batch runs, a version above the oldest with its list and no
+	folder is a hand-over between its two renames (spec section 5), which would be left out, so it waits for the batch to end, and lists again. A
+	list below the oldest is a prune's, and a version that went. Raises OSError.
+	'''
+	versions = list_versions(job_vault)
+	while backup_is_running(job, state_dir):
+		wanting = version_without_folder(job_vault)
+		if wanting is None or (versions and vault_version_number(wanting) < versions[0].number):
+			break
+		wait_for_backup(job, state_dir)
+		versions = list_versions(job_vault)
+	return versions
 
 def newest_folder_number(job_vault:str) -> 'int | None':
 	'''The highest number of a version folder in job_vault, one with no change list yet included; None with none, or when it cannot be listed.'''
@@ -15731,7 +16029,7 @@ def history_command(args) -> int:
 		warned = vault_pool_warning(job_vault)
 		try:
 			require_job_vault(job_vault)
-			versions = list_versions(job_vault)
+			versions = versions_of_a_batch(job_vault, rule.job_name, args.state_dir)
 			# the layout, read once for the whole command, waiting while the daemon writes the manifest
 			reading = vault_reading(job_vault, rule.job_name, args.state_dir)
 			kind = path_kind(job_vault, versions, rel, reading) if versions else None
@@ -16912,7 +17210,7 @@ def restore_command(args) -> int:
 		warned = vault_pool_warning(job_vault)
 		try:
 			require_job_vault(job_vault)
-			versions = list_versions(job_vault)
+			versions = versions_of_a_batch(job_vault, rule.job_name, args.state_dir)
 			# the layout, read once for the picking, waiting while the daemon writes the manifest. no restore lock is held yet,
 			# so these reads are checked against a running batch, and may wait for it
 			reading = vault_reading(job_vault, rule.job_name, args.state_dir)

@@ -248,7 +248,11 @@ def monitor_template(job) -> str:
 
 
 def restore(vault: CrashVault) -> None:
-	'''The vault back as batch 2 left it.'''
+	'''The vault back as batch 2 left it. A vault that is a mount point, a pool's, stays one.'''
+	if os.path.ismount(vault.job.vault):
+		shutil.rmtree(vault.job.job_vault)
+		subprocess.run(['cp', '-a', os.path.join(vault.template, vault.job.job_name), vault.job.vault], check=True)
+		return
 	shutil.rmtree(vault.job.vault)
 	subprocess.run(['cp', '-a', vault.template, vault.job.vault], check=True)
 
