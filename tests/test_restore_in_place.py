@@ -337,7 +337,7 @@ def test_failures_keep_the_marker_and_a_rerun_retries(job, tmp_path, capsys, mon
 	write(job, 'proj/a.txt', 'a1')
 	backup(job, ('proj/a.txt', 'modify'))
 	write_rule(job)
-	held = os.path.join(version_path(job, 0), 'proj/b.txt')
+	held = os.path.join(version_path(job, 1), 'proj/b.txt')
 	with open(held, encoding='utf-8') as f:
 		kept_copy = f.read()
 	st = os.lstat(held)
@@ -345,10 +345,10 @@ def test_failures_keep_the_marker_and_a_rerun_retries(job, tmp_path, capsys, mon
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
 	marker = os.path.join(target, rv.RESTORE_MARKER_NAME)
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '1')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
 	lines = stdout.rstrip('\n').split('\n')
-	assert lines[1].startswith('FAILED proj/b.txt: dangling vault link')
+	assert lines[1].startswith('FAILED proj/b.txt: not in V0: ')
 	assert lines[-1] == f'1 failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {until_then(target)}'
 	assert os.path.isfile(marker)
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o700
@@ -360,16 +360,16 @@ def test_failures_keep_the_marker_and_a_rerun_retries(job, tmp_path, capsys, mon
 	os.utime(held, ns=(st.st_atime_ns, st.st_mtime_ns))
 	before = inodes(target)
 	handed = watch_folder_meta(monkeypatch, marker)
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '1')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert (code, err) == (0, '')
 	# the marker stays through the inner folders, so a crash among them leaves a restore to pick up; the target is last
 	assert handed == [(os.path.join(target, 'sub'), True), (target, False)]
 	# the target and its folder, and b.txt; a.txt and sub/c.txt were there
-	assert stdout == f'Restored 3 entries ({rv.show_size(1)}) from V1 to {target}, keeping 2 already there\n'
-	assert tree(target) == {'a.txt': 'a1', 'b.txt': 'b', 'sub/': None, 'sub/c.txt': 'c'}
+	assert stdout == f'Restored 3 entries ({rv.show_size(1)}) from V0 to {target}, keeping 2 already there\n'
+	assert tree(target) == {'a.txt': 'a', 'b.txt': 'b', 'sub/': None, 'sub/c.txt': 'c'}
 	assert {rel: ino for rel, ino in inodes(target).items() if rel in before} == before
 	for rel in ('', 'sub'):
-		assert metadata(os.path.join(target, rel)) == metadata(os.path.join(version_path(job, 1), 'proj', rel)), rel
+		assert metadata(os.path.join(target, rel)) == metadata(os.path.realpath(os.path.join(version_path(job, 0), 'proj', rel))), rel
 
 
 def test_in_place_rerun_does_not_move_aside_again(job, tmp_path, capsys, monkeypatch):
@@ -727,11 +727,11 @@ def test_accept_keeps_a_failed_restore_as_it_is(job, tmp_path, capsys, monkeypat
 	backup(job, ('proj/a.txt', 'modify'))
 	write_rule(job)
 	# gone for good: every re-run fails on it
-	os.remove(os.path.join(version_path(job, 0), 'proj/b.txt'))
+	os.remove(os.path.join(version_path(job, 1), 'proj/b.txt'))
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
 	marker = os.path.join(target, rv.RESTORE_MARKER_NAME)
-	code, stdout, _ = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '1')
+	code, stdout, _ = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
 	# the two ways out, and never removing the marker by hand
 	assert stdout.rstrip('\n').split('\n')[-1] == f'1 failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {until_then(target)}'
@@ -740,17 +740,17 @@ def test_accept_keeps_a_failed_restore_as_it_is(job, tmp_path, capsys, monkeypat
 	copies = []
 	monkeypatch.setattr(rv, 'copy_command', lambda *args: copies.append(args) or ['false'])
 	handed = watch_folder_meta(monkeypatch, marker)
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '1', '--accept')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0', '--accept')
 	assert (code, err) == (0, '')
-	assert stdout == f'Kept {target} as it is, restored from V1: gave 3 folders their own metadata, copied nothing\n'
+	assert stdout == f'Kept {target} as it is, restored from V0: gave 3 folders their own metadata, copied nothing\n'
 	# nothing copied; each folder handed over deepest first, the target last and after the marker went
 	assert copies == [] and inodes(target) == before
 	assert handed == [(os.path.join(target, 'sub/deeper'), True), (os.path.join(target, 'sub'), True), (target, False)]
-	assert tree(target) == {'a.txt': 'a1', 'sub/': None, 'sub/c.txt': 'c', 'sub/deeper/': None, 'sub/deeper/d.txt': 'd'}
+	assert tree(target) == {'a.txt': 'a', 'sub/': None, 'sub/c.txt': 'c', 'sub/deeper/': None, 'sub/deeper/d.txt': 'd'}
 	for rel in ('', 'sub', 'sub/deeper'):
-		assert metadata(os.path.join(target, rel)) == metadata(os.path.join(version_path(job, 1), 'proj', rel)), rel
+		assert metadata(os.path.join(target, rel)) == metadata(os.path.realpath(os.path.join(version_path(job, 0), 'proj', rel))), rel
 	# accepted: nothing more to keep
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '1', '--accept')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0', '--accept')
 	assert (code, stdout) == (rv.EXIT_USAGE, '') and 'no unfinished restore' in err and '--accept' in err
 
 
@@ -802,7 +802,7 @@ def test_in_place_root_shows_the_disk_and_refuses_too_little_space(job, frozen_d
 
 
 def test_in_place_root_weighs_free_space_against_the_whole_tree(job, tmp_path, capsys, monkeypatch):
-	# V0 holds the whole tree, V1 only what changed after it
+	# V1, the newest, holds the whole tree, V0 only what V1 changed
 	seed_monitor(job, {'big.txt': 'a' * 200000, 'small.txt': 's'})
 	run_backup(job)
 	write(job, 'small.txt', 's2')
@@ -811,7 +811,7 @@ def test_in_place_root_weighs_free_space_against_the_whole_tree(job, tmp_path, c
 	for rel in ('big.txt', 'small.txt'):
 		os.remove(f'{job.monitor}/{rel}')
 	v0, v1 = versions(job)
-	assert v1.size < v0.size
+	assert v0.size < v1.size
 	mount_point, source = rv.mount_holding(rv.current_mount_table(), job.monitor)
 	statvfs = os.statvfs
 	def free_space(free):
@@ -819,23 +819,23 @@ def test_in_place_root_weighs_free_space_against_the_whole_tree(job, tmp_path, c
 		monkeypatch.setattr(os, 'statvfs', lambda path: result if os.fspath(path) == job.monitor else statvfs(path))
 		return (f'Restoring the whole job into {job.monitor}, on the filesystem mounted at {mount_point} ({source}): '
 			f'{rv.show_size(free)} free, V0 to V1 took {rv.show_size(v0.size + v1.size)} in the vault')
-	# room for what V1 copied, but not for the tree the oldest version holds
-	free_space(v0.size - 1)
-	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1', '--yes')
+	# room for what V0 kept, but not for the tree the newest version holds
+	free_space(v1.size - 1)
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
 	assert (code, stdout) == (rv.EXIT_USAGE, '')
-	assert rv.show_size(v0.size - 1) in err and rv.show_size(v0.size) in err and 'V0' in err and mount_point in err
+	assert rv.show_size(v1.size - 1) in err and rv.show_size(v1.size) in err and 'V1' in err and mount_point in err
 	assert os.listdir(job.monitor) == []
-	# room for the oldest version's tree, but not for every version up to V1
-	shown_disk = free_space(v0.size)
+	# room for the newest version's tree, but not for every version from V0 up
+	shown_disk = free_space(v1.size)
 	monkeypatch.setattr(sys, 'stdin', Terminal('n\n'))
-	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1')
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED and 'Cancelled' in err
-	assert err == f'{shown_disk}\nV1 may not fit: its files can come from any of V0 to V1, more than the free space\nContinue? [y/N] Cancelled\n' and stdout == ''
+	assert err == f'{shown_disk}\nV0 may not fit: its files can come from any of V0 to V1, more than the free space\nContinue? [y/N] Cancelled\n' and stdout == ''
 	shown_disk = free_space(v0.size + v1.size)
-	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '1', '--yes')
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
 	assert code == 0 and err.startswith('Restoring the whole job into ')
 	assert err.startswith(shown_disk + '\n') and stdout.startswith('Restored ')
-	assert tree(job.monitor) == {'big.txt': 'a' * 200000, 'small.txt': 's2'}
+	assert tree(job.monitor) == {'big.txt': 'a' * 200000, 'small.txt': 's'}
 
 
 def test_a_picked_up_whole_job_restore_skips_the_free_space_checks(job, tmp_path, capsys, monkeypatch):

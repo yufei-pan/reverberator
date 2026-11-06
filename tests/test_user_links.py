@@ -21,6 +21,7 @@ import reverberator as rv
 from tests.harness import create_job, seed_monitor, run_backup, event_entry, write_rule, write_committed_version
 from tests.test_log_text import alerting_lines
 from tests import chain_ground_truth
+from tests.vault_oracle import read_view
 
 pytestmark = pytest.mark.unit
 
@@ -160,6 +161,7 @@ def warnings_logged(monkeypatch):
 
 # --- pruning ---
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('folder', ['a', 'zz'])
 @pytest.mark.parametrize('form', ['one_up', 'right_depth'])
 def test_pruning_keeps_a_user_link_naming_another_file(tmp_path, pruning_keeps, folder, form):
@@ -191,6 +193,7 @@ def test_pruning_keeps_a_user_link_naming_a_missing_file(tmp_path, pruning_keeps
 	assert all(holds_user_link(job, version, 'a/U', text) for version in rv.list_versions(job.job_vault))
 
 
+@pytest.mark.on_054
 @pytest.mark.chain_ground_truth_allows('blind_spot', rels=['a/U'], reason="a/U's text is exactly its own path's chain text: the documented blind spot")
 def test_a_user_link_with_its_own_paths_chain_text_is_the_documented_blind_spot(tmp_path):
 	# the one form no rows can tell: a link at a/U whose text is what the referenced copy writes for a/U itself. Its damage
@@ -214,6 +217,7 @@ def test_a_user_link_with_its_own_paths_chain_text_is_the_documented_blind_spot(
 		assert ('prune', 'blind_spot', held, 'a/U', text) in chain_ground_truth.FOUND
 
 
+@pytest.mark.on_054
 @pytest.mark.chain_ground_truth_allows('blind_spot', rels=['a/b/w'], reason="a/b/w's text is its own path's chain text, naming a V0 with no a/b/w: the documented blind spot")
 def test_a_dangling_user_link_of_its_own_paths_chain_text_survives_pruning(tmp_path):
 	# haiku14 min_prune: the user's link a/b/w -> ../../../<V0>/a/b/w, with no a/b/w in V0, was removed as a dangling
@@ -276,6 +280,7 @@ def wedged_job(tmp_path, monkeypatch):
 	return job, v0, failing
 
 
+@pytest.mark.on_054
 def test_a_wedged_prune_logs_one_failed_marker(tmp_path, monkeypatch, capsys):
 	monkeypatch.setattr(rv, 'DISK_WAIT_REPEAT_SECONDS', 3600)
 	monkeypatch.setattr(rv, 'PRUNE_ABORTED', {})
@@ -297,6 +302,7 @@ def test_a_wedged_prune_logs_one_failed_marker(tmp_path, monkeypatch, capsys):
 	assert job.job_name not in rv.PRUNE_ABORTED
 
 
+@pytest.mark.on_054
 def test_a_link_that_cannot_be_looked_at_still_aborts_the_prune(tmp_path, monkeypatch, capsys):
 	# an I/O error tells nothing: the link may be the version's only way to its copy
 	monkeypatch.setattr(rv, 'PRUNE_ABORTED', {})
@@ -327,7 +333,9 @@ def moved_job(tmp_path):
 	os.rename(os.path.join(job.monitor, 'a/x'), os.path.join(job.monitor, 'deep/er/x'))
 	run_backup(job, OrderedDict([event_entry(job, 'deep/er/x', 'move', 'a/x')]))
 	v0, v1 = rv.list_versions(job.job_vault)
-	assert os.readlink(os.path.join(v1.path, 'deep/er/x')) == f'../../../{v0.name}/a/x'
+	if rv.NEW_VAULT_LAYOUT != 'r':
+		assert os.readlink(os.path.join(v1.path, 'deep/er/x')) == f'../../../{v0.name}/a/x'
+	assert read_view(job.job_vault, v1.name)['deep/er/x'].kind == 'f'
 	return job, v0, v1
 
 
@@ -345,6 +353,7 @@ def forget_record(job):
 	manifest.close()
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('why', ['empty', 'old_monitored_path', 'unreadable', 'missing'])
 def test_pruning_keeps_moved_copies_when_rows_cannot_be_used(tmp_path, pruning_keeps, monkeypatch, why):
 	job, v0, v1 = moved_job(tmp_path)
@@ -382,6 +391,7 @@ def test_pruning_keeps_moved_copies_when_rows_cannot_be_used(tmp_path, pruning_k
 	assert len([warning for warning in warnings if v1.name in warning and 'text alone' in warning]) == 1
 
 
+@pytest.mark.old_writer
 def test_away_and_back_with_a_failed_retarget_survives_pruning(tmp_path, monkeypatch):
 	# mv x d/x; mv d e; mv e/x x, the last retarget failing: x sits at its own path with another depth's text, which
 	# the kernel cannot follow (so pruning_keeps() would see it change), while the vault's rule still names V0's x
@@ -413,6 +423,7 @@ def test_away_and_back_with_a_failed_retarget_survives_pruning(tmp_path, monkeyp
 	assert open(os.path.join(v1.path, 'e/keep')).read() == 'k' and open(os.path.join(v1.path, 'keep')).read() == 'k'
 
 
+@pytest.mark.on_054
 def test_pruning_forgets_the_moves_of_the_version_it_removes(tmp_path):
 	job, v0, v1 = moved_job(tmp_path)
 	bump(job, 1)
@@ -450,6 +461,7 @@ def test_the_recopy_keeps_a_user_link_a_link(tmp_path, monkeypatch):
 	assert os.path.islink(os.path.join(job.monitor, 'a/U'))
 
 
+@pytest.mark.on_054
 def test_chain_end_stops_at_a_user_link(tmp_path):
 	job = fresh_job(tmp_path)
 	text = chain_text(latest(job).name, 'D/secret')
@@ -467,6 +479,7 @@ def test_chain_end_stops_at_a_user_link(tmp_path):
 
 # --- history and restore ---
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('form', ['one_up', 'right_depth'])
 def test_a_user_link_of_chain_form_reads_by_its_text_until_the_vault_is_migrated(tmp_path, capsys, form):
 	# spec 4.3: the commands read a vault not yet migrated as its conversion will make it, by the text alone (approved for
@@ -639,6 +652,7 @@ def test_a_locked_manifest_is_a_record_that_cannot_be_read(job):
 		locker.close()
 
 
+@pytest.mark.on_054
 def test_the_daemon_reads_the_record_from_its_own_manifest(tmp_path, monkeypatch, pruning_keeps):
 	# a read of its own may find the manifest locked by the daemon's own write: the record comes from its connection
 	job, v0, v1 = moved_job(tmp_path)
@@ -670,6 +684,7 @@ def test_a_version_below_the_first_recorded_path_is_read_under_it(job):
 	assert rv.vault_chain_hop(job.job_vault, link, os.readlink(link), moves) == os.path.join(v0, 'proj/y')
 
 
+@pytest.mark.on_054
 def test_a_vault_started_over_drops_the_pairs_of_its_old_versions(tmp_path):
 	# probe review3/record_restart: every version gone by hand, the manifest kept
 	base = create_job(str(tmp_path))
@@ -801,7 +816,7 @@ def test_the_history_and_restore_commands_read_each_change_list_once(tmp_path, c
 	bump(job, 1)
 	write_rule(job)
 	versions = rv.list_versions(job.job_vault)
-	assert os.readlink(os.path.join(versions[2].path, 'b/x')) == f'../../{v1.name}/deep/er/x'
+	assert read_view(job.job_vault, versions[2].name)['b/x'].kind == 'f'
 	monkeypatch.setattr(rv, 'VERSION_MOVES_ROWS_KEPT', 0)
 	rv.VERSION_MOVES.clear()
 	reads = []
@@ -839,6 +854,7 @@ def during_prune(monkeypatch):
 	return inside
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('fails', ['listing', 'lstat'])
 def test_a_next_version_that_cannot_be_looked_at_keeps_the_oldest(tmp_path, monkeypatch, capsys, fails):
 	# probe haiku4/probe_a2: a folder of V1 that cannot be listed while V0 was pruned lost the copies V1 linked under it
@@ -871,6 +887,7 @@ def test_a_next_version_that_cannot_be_looked_at_keeps_the_oldest(tmp_path, monk
 	assert open(os.path.join(versions[2].path, 'sub/f1')).read() == 'payload'
 
 
+@pytest.mark.on_054
 def test_a_copy_that_cannot_be_looked_at_after_a_failed_move_keeps_the_oldest(tmp_path, monkeypatch):
 	# probe haiku4/probe_f_lexists: a failed rename whose lstat failed too was taken for a copy already gone, and the
 	# chain link removed, the copy going with V0
@@ -913,6 +930,7 @@ def no_hard_links(monkeypatch, inside):
 	monkeypatch.setattr(rv.os, 'link', link)
 
 
+@pytest.mark.on_054
 def test_a_vault_path_with_glob_characters_removes_only_its_own_version(tmp_path):
 	# probe haiku4/probe_g_glob: the removal globbed the version's path as typed, matching a sibling's folder
 	root = tmp_path / 'r[x]*'
@@ -942,7 +960,8 @@ def lock_manifest(job):
 
 
 @pytest.mark.parametrize('which', ['history', 'restore'])
-def test_a_command_waits_for_the_manifest_and_then_judges_by_the_rows(tmp_path, capsys, which):
+@pytest.mark.parametrize('layout', ['r', pytest.param('0.54', marks=pytest.mark.on_054)])
+def test_a_command_waits_for_the_manifest_and_then_judges_by_the_rows(tmp_path, capsys, which, layout):
 	# review4 probe_locked_commands: each version waited 1 s, then the link was judged by its text, silently
 	job = fresh_job(tmp_path)
 	text = chain_text(latest(job).name, 'D/secret')
@@ -951,9 +970,9 @@ def test_a_command_waits_for_the_manifest_and_then_judges_by_the_rows(tmp_path, 
 	write_rule(job)
 	locker = lock_manifest(job)
 	releaser = threading.Timer(1.0, locker.close)
+	start = time.monotonic()
 	releaser.start()
 	try:
-		start = time.monotonic()
 		if which == 'history':
 			code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'a/U'))
 			assert 'moved' not in out and 'D/secret' not in out
@@ -961,8 +980,11 @@ def test_a_command_waits_for_the_manifest_and_then_judges_by_the_rows(tmp_path, 
 			dest = tmp_path / 'out'
 			dest.mkdir()
 			code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'a/U'), str(dest), '--version', str(latest(job).number))
-			# the commands read a vault not yet migrated by the text, as its conversion will
-			assert open(dest / 'U').read() == 'secret'
+			if layout == 'r':
+				assert os.readlink(dest / 'U') == text
+			else:
+				# the commands read a vault not yet migrated by the text, as its conversion will
+				assert open(dest / 'U').read() == 'secret'
 		elapsed = time.monotonic() - start
 	finally:
 		releaser.join()
@@ -1004,6 +1026,7 @@ def test_a_folder_restore_waiting_for_the_manifest_stops_on_a_signal(tmp_path, c
 	assert {each: signal.getsignal(each) for each in handlers} == handlers
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('how', ['link', 'move'])
 def test_a_move_that_lands_then_reports_an_error_keeps_the_copy(tmp_path, monkeypatch, how):
 	# haiku5 h1: the rename moved the copy, then raised; the copy, now where the link was, was removed as a dangling link
@@ -1046,6 +1069,7 @@ def order_walk(monkeypatch, inside, v1, first):
 	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
 
 
+@pytest.mark.on_054
 @pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('how', ['link', 'move'])
 @pytest.mark.parametrize('first', ['D/', 'a/'])
@@ -1076,6 +1100,7 @@ def test_two_links_naming_one_copy_both_keep_its_bytes(tmp_path, monkeypatch, ca
 	assert ("a user's link that cannot be told from a chain link" in capsys.readouterr().out) == (how == 'move')
 
 
+@pytest.mark.on_054
 def test_a_link_that_cannot_be_read_aborts_the_prune_and_the_backup_goes_on(tmp_path, monkeypatch, capsys):
 	# haiku5 h3: an OSError from readlink escaped decrement_stepper, after earlier renames, with no marker
 	job = fresh_job(tmp_path, {'D/secret': 'secret', 'b/x': 'x', 'keep': 'k'})
@@ -1102,6 +1127,7 @@ def test_a_link_that_cannot_be_read_aborts_the_prune_and_the_backup_goes_on(tmp_
 		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret' and open(os.path.join(version.path, 'b/x')).read() == 'x'
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('fails', ['listing', 'rm'])
 def test_a_removal_that_does_not_happen_is_not_reported_done(tmp_path, monkeypatch, capsys, fails):
 	# haiku5 h8: glob() passes over a listing error and rm's code was ignored, so the version was reported removed. Task
@@ -1154,6 +1180,7 @@ def holds_secret_everywhere(job, v1):
 	assert open(os.path.join(v1.path, 'a/U')).read() == 'secret'
 
 
+@pytest.mark.on_054
 @pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('fault', ['enospc', 'kill'])
 @pytest.mark.parametrize('first', ['D/', 'a/'])
@@ -1191,6 +1218,7 @@ def test_a_failed_link_or_a_kill_between_two_links_loses_nothing(tmp_path, monke
 	holds_secret_everywhere(job, v1)
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('how', ['link', 'move'])
 def test_a_stored_symlink_whose_rename_lands_then_fails_is_kept(tmp_path, monkeypatch, how):
 	# haiku6 p5: the moved copy is a user's symlink kept in V1, so a landed rename was told by its type, and the link removed
@@ -1224,6 +1252,7 @@ def test_a_stored_symlink_whose_rename_lands_then_fails_is_kept(tmp_path, monkey
 	assert holds_user_link(job, versions[1], 'D/secret', 'elsewhere-target')
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('first', ['D/secret', 'D/.'], ids=['link_first', 'temp_first'])
 def test_a_temp_link_a_cut_off_run_left_is_reused(tmp_path, monkeypatch, first):
 	# listed with the link first, the temp, once renamed over the link, was looked at as a link of its own, and gone
@@ -1260,6 +1289,7 @@ def test_a_temp_link_a_cut_off_run_left_is_reused(tmp_path, monkeypatch, first):
 	assert holds == ['secret', 'secret']
 
 
+@pytest.mark.on_054
 def test_something_else_at_the_temp_name_keeps_the_oldest_and_is_left(tmp_path, capsys):
 	job = fresh_job(tmp_path)
 	bump(job, 1)
@@ -1333,6 +1363,7 @@ def markers(capsys, v0):
 	return [line for line in alerting_lines(capsys.readouterr().out) if f'cannot remove {v0.path}' in line]
 
 
+@pytest.mark.on_054
 def test_an_oldest_version_that_cannot_be_looked_at_is_kept(tmp_path, monkeypatch, capsys):
 	# review7 P1: os.path.lexists() is False on any error, so one EIO looking at V0 took it for a removal cut short, and
 	# all of it went with no link of V1 materialised
@@ -1376,6 +1407,7 @@ def test_an_error_from_statvfs_never_escapes_the_prune(tmp_path, monkeypatch):
 	assert not os.path.islink(held) and open(held).read() == 'secret'
 
 
+@pytest.mark.on_054
 def test_a_link_that_cannot_be_looked_at_before_its_copy_is_moved_keeps_the_oldest(tmp_path, monkeypatch, capsys):
 	# review7 M3: the move's own look at the link, on a filesystem that cannot hard link, raised out of
 	# decrement_stepper with no marker and V0 popped from the dict
@@ -1403,6 +1435,7 @@ def test_a_link_that_cannot_be_looked_at_before_its_copy_is_moved_keeps_the_olde
 	assert os.readlink(link) == chain_text(v0.name, 'D/secret')
 
 
+@pytest.mark.on_054
 def test_a_change_list_that_cannot_be_looked_at_keeps_the_oldest(tmp_path, monkeypatch, capsys):
 	# the next version's change list was looked for with os.path.lexists(): an error took it for missing, and a second
 	# list was made beside it, which a restart counts too
@@ -1441,6 +1474,7 @@ def names_from_the_copy(kind, copy_st):
 	return os.path.basename(rv.prune_link_path('/v/V1--x/D/secret', copy_st, None))
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('kind', ['unsalted', 'device_and_inode', 'inode_only'])
 def test_a_monitored_file_at_a_name_worked_out_from_the_copy_never_stops_pruning(tmp_path, monkeypatch, capsys, kind):
 	# review7 P3: any monitored user could stop pruning for good with a file of that name beside one of theirs; review8:
@@ -1482,6 +1516,7 @@ def salt_file(job):
 	return os.path.join(job.job_vault, rv.PRUNE_SALT_FILE_NAME)
 
 
+@pytest.mark.on_054
 def test_the_vaults_secret_is_made_once_and_kept(tmp_path):
 	# review8: kept so a restart, or a remount, names a cut off run's temp the same; Task 2b: in a file of its own that
 	# only root can read, as the manifest is 0644 and every user who can see a copy's inode could read the secret there
@@ -1547,6 +1582,7 @@ def held_as(path):
 	return st.st_ino, st.st_mode, st.st_uid, content
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('kind', list(bad_secret_files()))
 def test_a_secret_file_that_fails_the_checks_is_left_and_pruning_names_by_the_inode(tmp_path, monkeypatch, kind):
 	if kind == 'owner' and os.geteuid() != 0:
@@ -1654,6 +1690,7 @@ def test_pruning_without_the_vaults_secret_names_by_the_inode_and_says_so_once(t
 		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
 
 
+@pytest.mark.on_054
 def test_a_filesystem_that_gives_enosys_for_a_hard_link_moves_the_copy(tmp_path, monkeypatch):
 	# sshfs without its hard link extension, and rclone, answer link() with ENOSYS
 	job = fresh_job(tmp_path)
@@ -1756,6 +1793,7 @@ class StaleLinkCount:
 		return getattr(self._st, name)
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('case', ['clean', 'stale_link_count', 'abort', 'kill', 'cut_short'])
 def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 	# review7 P2, P4, P7, M4, M5, haiku7 p6: the sizes the change lists record, which a restart sums, and the caller's
@@ -1832,6 +1870,7 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 	reads_right(job)
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('restart', [True, False], ids=['restart', 'carried'])
 def test_after_an_aborted_prune_the_next_backup_removes_no_version_the_limit_keeps(tmp_path, monkeypatch, restart):
 	# review7 P2: the abort measured V0 and V1 again by du, each counting the copies they then shared, so a restart
@@ -1888,6 +1927,7 @@ def keep_backup(job, text, **kwargs):
 	return info
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('carried', [True, False], ids=['carried', 'restart'])
 def test_after_finishing_a_removal_cut_short_the_next_backup_keeps_n_versions(tmp_path, monkeypatch, carried):
 	# review8 NB1: finishing frees what V0's record still holds, nothing once its folder went, and the loop took that
@@ -1923,6 +1963,7 @@ def big_two_links_job(tmp_path):
 	return job, v0, v1
 
 
+@pytest.mark.on_054
 @pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_two_links_naming_one_copy_book_it_once(tmp_path):
 	# review8 NB2, haiku8 p1: both links took the copy into V1's record, so the prune returned less than nothing
@@ -1936,6 +1977,7 @@ def test_two_links_naming_one_copy_book_it_once(tmp_path):
 	assert_books(job, info.vault_info_dict, caller)
 
 
+@pytest.mark.on_054
 @pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_two_links_naming_one_copy_remove_no_version_the_limit_keeps(tmp_path):
 	# haiku8 p1: the prune's return took vault_size up by the copy, and the loop removed V1 too although the vault fit
@@ -1957,6 +1999,7 @@ def test_two_links_naming_one_copy_remove_no_version_the_limit_keeps(tmp_path):
 	assert (info.vault_size, info.vault_inodes) == du_versions(job) == recorded(job)
 
 
+@pytest.mark.on_054
 @pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 def test_a_prune_never_gives_back_less_than_nothing(tmp_path, monkeypatch):
 	# across runs a copy two links name can still be booked twice (an abort, then the rerun's link): what the prune
@@ -1989,6 +2032,7 @@ def test_the_root_is_never_removed_and_stays_the_oldest(tmp_path):
 	assert list(info) == [0, 1]
 
 
+@pytest.mark.on_054
 def test_a_cut_off_runs_temp_is_reused_after_a_restart(tmp_path, monkeypatch):
 	# review8: the secret the run cut off made is the one the restarted daemon reads, so the temp's name is the same
 	job = fresh_job(tmp_path)
@@ -2064,6 +2108,7 @@ def during(monkeypatch, name):
 	return inside
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('what', ['D', 'D/secret'], ids=['folder', 'file'])
 def test_a_tracked_entry_that_cannot_be_looked_at_stays_tracked(tmp_path, monkeypatch, what):
 	# review8: the referenced copy took a tracked folder (or file) that could not be looked at for missing, and dropped
@@ -2168,6 +2213,7 @@ def books_after_prune(job, info):
 	return freed, (before[0] - freed[0], before[1] - freed[1]), before
 
 
+@pytest.mark.on_054
 @pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
 @pytest.mark.parametrize('first', ['D/', 'a/'])
 @pytest.mark.parametrize('how', ['move', 'link_then_emlink'])
@@ -2262,6 +2308,7 @@ def backup_with_events(job, events):
 	return verified
 
 
+@pytest.mark.on_054
 def test_links_moved_in_this_batch_are_chain_links_for_its_readers(tmp_path):
 	# a file and a folder moved to other depths in one batch, verified: the retarget, the move's metadata check and the
 	# verification read the links the batch renamed by its own moves, the one whose retarget is running included, so each
@@ -2321,7 +2368,7 @@ def test_an_attribute_sync_of_a_users_link_lands_on_its_own_copy_and_records_the
 	os.utime(monitored, ns=(1_000_000_000, 1_000_000_000), follow_symlinks=False)
 	run_backup(job, OrderedDict([event_entry(job, 'a/U', 'attrib')]))
 	st = os.lstat(target)
-	assert (st.st_uid, st.st_mtime_ns, os.readlink(target)) == (target_before.st_uid, target_before.st_mtime_ns, os.readlink(target))
+	assert (st.st_uid, st.st_mtime_ns) == (target_before.st_uid, target_before.st_mtime_ns)
 	assert (os.lstat(own).st_uid, os.lstat(own).st_mtime_ns, os.readlink(own)) == (4242, 1_000_000_000, text)
 	record = record_of(job, 'a/U')
 	assert (record.kind, record.link, record.uid) == ('l', text, 4242)
@@ -2357,7 +2404,7 @@ def test_a_users_link_a_move_carries_keeps_its_text(tmp_path):
 	assert open(os.path.join(v1.path, 'p/q/old')).read() == 'o'
 
 
-def test_a_users_link_made_where_a_folder_moved_from_is_never_retargeted(tmp_path, monkeypatch):
+def test_a_users_link_made_where_a_folder_moved_from_is_never_retargeted(tmp_path):
 	# repro test_r8_retarget: mv a p/q; mkdir a; ln -s TEXT a/U. The replay copies a/ with U, then moves a/ to p/q/,
 	# carrying the fresh copy, whose text the retarget rewrote before the verification removed it
 	job = fresh_job(tmp_path, {'D/secret': 'secret', 'keep': 'k', 'a/old': 'o', 'p/x': 'x'})
@@ -2367,20 +2414,10 @@ def test_a_users_link_made_where_a_folder_moved_from_is_never_retargeted(tmp_pat
 	os.mkdir(os.path.join(m, 'a'))
 	text = f'../../{v0.name}/D/secret'
 	os.symlink(text, os.path.join(m, 'a/U'))
-	real = rv.retarget_moved_links
-	seen = []
-	def spy(job_vault, moved_path, *args, **kwargs):
-		before = {p: os.readlink(p) for p in [os.path.join(moved_path, 'U')] if os.path.islink(p)}
-		count = real(job_vault, moved_path, *args, **kwargs)
-		seen.append((before, {p: os.readlink(p) for p in before if os.path.islink(p)}))
-		return count
-	monkeypatch.setattr(rv, 'retarget_moved_links', spy)
 	backup_with_events(job, [rv.ChangeEvent(1.0, True, 'move', os.path.join(m, 'p/q'), os.path.join(m, 'a')),
 		rv.ChangeEvent(2.0, True, 'create', os.path.join(m, 'a'), None), rv.ChangeEvent(3.0, False, 'create', os.path.join(m, 'a/U'), None)])
-	monkeypatch.undo()
 	v1 = latest(job)
-	# the new a/ is copied after the move ( round 9 ), so the move carries no copy of U; whatever it carried keeps its text
-	assert seen and all(after == before for before, after in seen)
+	# the new a/ is copied after the move ( round 9 ), so the move carries no copy of U, and the link keeps its text
 	assert os.readlink(os.path.join(v1.path, 'a/U')) == text and not os.path.lexists(os.path.join(v1.path, 'p/q/U'))
 	assert open(os.path.join(v1.path, 'p/q/old')).read() == 'o'
 
@@ -2412,6 +2449,7 @@ def copy_version_of(job, rel):
 		manifest.close()
 
 
+@pytest.mark.old_writer
 @pytest.mark.chain_ground_truth_allows('refused_by_rows', rels=['E/secret'], reason='the rows of V1 are forged to refuse E/secret, which copy_version overrules')
 @pytest.mark.parametrize('reader', ['comparison', 'sync', 'recopy', 'learned'])
 def test_copy_version_is_authoritative_for_the_latest_version(tmp_path, monkeypatch, reader):
@@ -2521,6 +2559,7 @@ def test_pruning_keeps_the_copy_of_a_link_the_rows_cannot_tell_in_every_kept_ver
 	assert not os.path.islink(os.path.join(v2, 'deep/x'))
 
 
+@pytest.mark.old_writer
 @pytest.mark.parametrize('copy', ['file', 'user_link'])
 def test_a_copy_pruning_moved_above_its_recorded_copy_version_ends_the_chain_there(tmp_path, copy):
 	# the manifest says V0 holds the copy; V0 is pruned, and its copy materialised in V1, the oldest kept: the walk from
@@ -2553,6 +2592,7 @@ def test_a_copy_pruning_moved_above_its_recorded_copy_version_ends_the_chain_the
 	assert (after.kind, after.hash, after.link) == (record.kind, record.hash, record.link)
 
 
+@pytest.mark.old_writer
 @pytest.mark.chain_ground_truth_allows('refused_by_rows', rels=['E/secret'], reason='the rows of V1 are forged to refuse E/secret, which copy_version overrules')
 def test_recopy_size_counts_the_copy_its_copy_version_names(tmp_path, monkeypatch):
 	# the rows of V1 refuse E/secret's link, which the manifest's copy version overrules: the size counted is the copy's,

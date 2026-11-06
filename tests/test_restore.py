@@ -9,7 +9,7 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup, event_entry, write_rule, rule_row, write_committed_version, create_job
+from tests.harness import reads_the_file_before, seed_monitor, run_backup, event_entry, write_rule, rule_row, write_committed_version, create_job
 
 pytestmark = pytest.mark.unit
 
@@ -120,18 +120,18 @@ def test_restore_file_to_a_destination(job, tmp_path, capsys):
 	write(job, 'b.txt', 'b1')
 	backup(job, ('b.txt', 'modify'))
 	write_rule(job)
-	# V1 holds a.txt as a link chained to V0's copy
-	assert os.path.islink(os.path.join(version_path(job, 1), 'a.txt'))
+	# V0 reads a.txt by a link forward to V1's copy
+	assert reads_the_file_before(version_path(job, 1), 'a.txt')
 	out = destination(tmp_path)
-	code, stdout, err = restore(tmp_path, capsys, path, out, '--version', '1')
+	code, stdout, err = restore(tmp_path, capsys, path, out, '--version', '0')
 	assert (code, err) == (0, '')
 	restored = os.path.join(out, 'a.txt')
-	st, copy = os.lstat(restored), os.lstat(os.path.join(version_path(job, 0), 'a.txt'))
+	st, copy = os.lstat(restored), os.lstat(os.path.join(version_path(job, 1), 'a.txt'))
 	assert stat.S_ISREG(st.st_mode)
 	with open(restored, encoding='utf-8') as f:
 		assert f.read() == 'hello'
 	assert (st.st_mode, st.st_mtime_ns, st.st_uid, st.st_gid) == (copy.st_mode, copy.st_mtime_ns, copy.st_uid, copy.st_gid)
-	assert stdout == f'Restored 1 entries ({rv.show_size(5)}) from V1 to {restored}\n'
+	assert stdout == f'Restored 1 entries ({rv.show_size(5)}) from V0 to {restored}\n'
 	assert os.listdir(out) == ['a.txt']
 
 
@@ -276,26 +276,26 @@ def test_restore_keeps_an_old_absolute_link_to_a_removed_version_as_a_link(job, 
 	assert os.path.isdir(v0)
 
 
-def test_restore_reports_dangling_and_continues(job, tmp_path, capsys):
+def test_restore_reports_a_copy_gone_and_continues(job, tmp_path, capsys):
 	seed_monitor(job, {'proj/a.txt': 'a', 'proj/b.txt': 'b', 'proj/c.txt': 'c'})
 	run_backup(job)
 	write(job, 'proj/c.txt', 'c1')
 	backup(job, ('proj/c.txt', 'modify'))
 	write_rule(job)
-	# the copy V1's link for b.txt chains to is gone
-	os.remove(os.path.join(version_path(job, 0), 'proj/b.txt'))
+	# the copy V0's link for b.txt leads to is gone
+	os.remove(os.path.join(version_path(job, 1), 'proj/b.txt'))
 	out = destination(tmp_path)
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '1')
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
 	assert 'Traceback' not in err
 	lines = stdout.rstrip('\n').split('\n')
 	assert lines[0].startswith('Restored 3 entries')
-	assert lines[1].startswith('FAILED proj/b.txt: dangling vault link: proj/b.txt is missing from V0--')
+	assert lines[1].startswith('FAILED proj/b.txt: not in V0: proj/b.txt is not in V1--')
 	target = os.path.join(out, 'proj')
 	# not everything is there: nobody else may look in, or put anything in for a later run to write through
 	assert lines[2:] == [f'1 failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {rv.unfinished_note(target)}']
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o700
-	assert marked_tree(target) == {'a.txt': 'a', 'c.txt': 'c1'}
+	assert marked_tree(target) == {'a.txt': 'a', 'c.txt': 'c'}
 	assert partial_files(out) == []
 
 
@@ -372,32 +372,31 @@ def test_restore_names_with_spaces_and_unicode(job, tmp_path, capsys):
 	assert tree(out) == {'café.txt': 'crème'}
 
 
-@pytest.mark.chain_ground_truth_allows('refused_chain', reason='V0 is removed by hand, so the links of V1 name no version')
 def test_restore_reports_a_version_removed_mid_restore(job, tmp_path, monkeypatch, capsys):
 	seed_monitor(job, {'proj/a.txt': 'a', 'proj/b.txt': 'b', 'proj/sub/c.txt': 'c'})
 	run_backup(job)
 	write(job, 'proj/a.txt', 'a1')
 	backup(job, ('proj/a.txt', 'modify'))
 	write_rule(job)
-	v0 = version_path(job, 0)
+	v1 = version_path(job, 1)
 	choose_version = rv.choose_version
 
 	def choose_then_remove(*args, **kwargs):
 		chosen = choose_version(*args, **kwargs)
-		# what V1's unchanged files chain to goes, as a manual removal of the oldest version would take it
-		shutil.rmtree(v0)
+		# what V0's unchanged files lead to goes, as a manual removal of the version above would take it
+		shutil.rmtree(v1)
 		return chosen
 	monkeypatch.setattr(rv, 'choose_version', choose_then_remove)
 	out = destination(tmp_path)
-	code, stdout, err = restore(tmp_path, capsys, job.monitor, out, '--version', '1')
+	code, stdout, err = restore(tmp_path, capsys, job.monitor, out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
 	assert 'Traceback' not in err
 	lines = stdout.rstrip('\n').split('\n')
-	assert lines[0] == f'Restored 4 entries ({rv.show_size(2)}) from V1 to {out}/monitor'
-	assert sorted(line.partition(': ')[0] for line in lines[1:-1]) == ['FAILED proj/b.txt', 'FAILED proj/sub/c.txt']
-	assert all(': dangling vault link: ' in line for line in lines[1:-1])
+	assert lines[0] == f'Restored 3 entries ({rv.show_size(1)}) from V0 to {out}/monitor'
+	assert sorted(line.partition(': ')[0] for line in lines[1:-1]) == ['FAILED proj/b.txt', 'FAILED proj/sub']
+	assert all(': not in V0: ' in line for line in lines[1:-1])
 	assert lines[-1] == f'2 failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {rv.unfinished_note(out + "/monitor")}'
-	assert marked_tree(os.path.join(out, 'monitor')) == {'proj/': None, 'proj/a.txt': 'a1', 'proj/sub/': None}
+	assert marked_tree(os.path.join(out, 'monitor')) == {'proj/': None, 'proj/a.txt': 'a'}
 	assert partial_files(out) == []
 
 

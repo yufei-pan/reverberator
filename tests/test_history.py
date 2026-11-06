@@ -5,7 +5,7 @@ from collections import OrderedDict
 import pytest
 import TSVZ
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup, event_entry, write_rule, rule_row, write_committed_version
+from tests.harness import reads_the_file_before, seed_monitor, run_backup, event_entry, write_rule, rule_row, write_committed_version
 
 pytestmark = pytest.mark.unit
 
@@ -102,8 +102,8 @@ def test_attribute_change_is_listed(job):
 	run_backup(job)
 	os.chmod(f'{job.monitor}/a.txt', 0o600)
 	v1 = backup(job, ('a.txt', 'attrib'))[-1]
-	# with Only Sync Attributes the version holds a link to the shared copy: only the change list shows the change
-	assert os.path.islink(os.path.join(v1, 'a.txt'))
+	# with Only Sync Attributes the versions share the one copy: only the change list shows the change
+	assert reads_the_file_before(v1, 'a.txt')
 	rows = hist(job, 'a.txt')
 	assert events(rows) == [(1, 'attrib'), (0, 'oldest')]
 	assert rows[0].size == 1

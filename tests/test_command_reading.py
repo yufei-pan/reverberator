@@ -36,6 +36,17 @@ def versions_of(job):
 	return rv.list_versions(job.job_vault)
 
 
+@pytest.fixture(params=['r', pytest.param('0.54', marks=pytest.mark.on_054)])
+def either_layout(request):
+	'''A reader's rule on both layouts: on R a version leads forward, on a vault not yet migrated (spec 4.3) backward.'''
+	return request.param
+
+
+def far_ends(paths):
+	'''The version a reader starts its longest walk at, and the one that holds the real copy.'''
+	return (paths[0], paths[-1]) if rv.NEW_VAULT_LAYOUT == 'r' else (paths[-1], paths[0])
+
+
 def test_read_only_parse_leaves_the_rule_file_unchanged(job):
 	# an 11 column rule file (header without Skip List File), signatures 'auto', blank keep_n_versions, vault missing
 	missing_vault = os.path.join(job.root, 'not_made_yet')
@@ -107,12 +118,11 @@ def test_parse_change_list_name():
 	assert rv.parse_change_list_name(f'V3--{T}') is None
 
 
-def test_resolve_follows_chains(job):
-	paths = three_versions(job)
-	assert os.path.islink(os.path.join(paths[2], 'a/x'))
-	got = rv.resolve_version_entry(job.job_vault, paths[2], 'a/x', job.monitor)
-	assert got.kind == 'file' and got.path == os.path.join(paths[0], 'a/x')
-	assert rv.resolve_version_entry(job.job_vault, paths[2], 'a', job.monitor).kind == 'folder'
+def test_resolve_follows_chains(job, either_layout):
+	start, end = far_ends(three_versions(job))
+	got = rv.resolve_version_entry(job.job_vault, start, 'a/x', job.monitor)
+	assert got.kind == 'file' and got.path == os.path.join(end, 'a/x') and got.path != os.path.join(start, 'a/x')
+	assert rv.resolve_version_entry(job.job_vault, start, 'a', job.monitor).kind == 'folder'
 
 
 def test_resolve_missing_entry(job):
@@ -121,18 +131,19 @@ def test_resolve_missing_entry(job):
 
 
 @pytest.mark.chain_ground_truth_allows('refused_chain', reason='V1 is renamed by hand, so the links of V2 name no version')
-def test_resolve_dangling_chain(job):
+def test_resolve_dangling_chain(job, either_layout):
 	paths = three_versions(job)
 	os.rename(paths[1], paths[1] + '.gone')
-	got = rv.resolve_version_entry(job.job_vault, paths[2], 'a/x', job.monitor)
-	assert got.kind == 'dangling' and 'V1' in got.detail
+	got = rv.resolve_version_entry(job.job_vault, far_ends(paths)[0], 'a/x', job.monitor)
+	# a forward link is the daemon's whatever is behind it, so what it led to is simply not there
+	assert got.kind == ('missing' if either_layout == 'r' else 'dangling') and 'V1' in got.detail
 
 
-def test_resolve_chain_to_a_pruned_entry_is_dangling(job):
-	paths = three_versions(job)
-	os.remove(os.path.join(paths[0], 'a/x'))
-	got = rv.resolve_version_entry(job.job_vault, paths[2], 'a/x', job.monitor)
-	assert got.kind == 'dangling' and 'a/x' in got.detail
+def test_resolve_chain_to_a_pruned_entry_is_dangling(job, either_layout):
+	start, end = far_ends(three_versions(job))
+	os.remove(os.path.join(end, 'a/x'))
+	got = rv.resolve_version_entry(job.job_vault, start, 'a/x', job.monitor)
+	assert got.kind == ('missing' if either_layout == 'r' else 'dangling') and 'a/x' in got.detail
 
 
 def test_resolve_old_absolute_link_to_a_removed_version_is_a_symlink(job):
@@ -221,19 +232,22 @@ def test_resolve_through_a_relative_user_folder_symlink_is_missing(job):
 	assert rv.resolve_version_entry(job.job_vault, paths[2], 'a/x', job.monitor).kind == 'file'
 
 
-def test_resolve_unreadable_link(job, monkeypatch):
+def test_resolve_unreadable_link(job, monkeypatch, either_layout):
 	paths = three_versions(job)
+	start = far_ends(paths)[0]
+	# on R the folder a is the link: nothing in it changed
+	link = os.path.join(start, 'a' if either_layout == 'r' else 'a/x')
 	real_readlink = os.readlink
 	def refuse(path, *args, **kwargs):
-		if path == os.path.join(paths[2], 'a/x'):
+		if path == link:
 			raise OSError(errno.EIO, 'Input/output error')
 		return real_readlink(path, *args, **kwargs)
 	monkeypatch.setattr(os, 'readlink', refuse)
-	got = rv.resolve_version_entry(job.job_vault, paths[2], 'a/x', job.monitor)
+	got = rv.resolve_version_entry(job.job_vault, start, 'a/x', job.monitor)
 	assert got.kind == 'unreadable' and 'Input/output error' in got.detail
 
 
-def test_resolve_unreadable_folder_on_the_way(job, monkeypatch):
+def test_resolve_unreadable_folder_on_the_way(job, monkeypatch, either_layout):
 	paths = three_versions(job)
 	real_lstat = os.lstat
 	def lstat(path, *args, **kwargs):
@@ -242,9 +256,10 @@ def test_resolve_unreadable_folder_on_the_way(job, monkeypatch):
 		return real_lstat(path, *args, **kwargs)
 	monkeypatch.setattr(os, 'lstat', lstat)
 	rv.REAL_VAULT_FOLDERS.clear()
-	assert rv.resolve_version_entry(job.job_vault, paths[2], 'a/x', job.monitor).kind == 'unreadable'
+	assert rv.resolve_version_entry(job.job_vault, far_ends(paths)[0], 'a/x', job.monitor).kind == 'unreadable'
 
 
+@pytest.mark.on_054
 def test_resolve_link_broken_by_an_old_move(job):
 	# the text of a link from another folder depth, which older daemons left in place after a move
 	paths = three_versions(job)
@@ -342,6 +357,7 @@ def test_unescape_change_list_field_without_an_escape_reads_nothing(monkeypatch)
 	assert rv.unescape_change_list_field('plain name.txt ') == 'plain name.txt '
 
 
+@pytest.mark.on_054
 def test_an_unnumbered_version_follows_its_whole_chain(job, monkeypatch):
 	seed_monitor(job, {'a': 'x', 'k': 'k0'})
 	run_backup(job)
@@ -350,15 +366,15 @@ def test_an_unnumbered_version_follows_its_whole_chain(job, monkeypatch):
 			f.write(f'k{number}')
 		run_backup(job, OrderedDict([event_entry(job, 'k', 'modify')]))
 	versions = rv.list_versions(job.job_vault)
-	assert os.path.islink(os.path.join(versions[2].path, 'a'))
+	start, end = far_ends([version.path for version in versions])
 	# a version folder whose name carries no number, as the first look at it sees it (a chain link needs the number, so
 	# only the bound on the hops is in question): two hops back to the real copy
 	real, first = rv.vault_version_number, []
 	def number(name):
-		if name == versions[2].name and not first:
+		if name == os.path.basename(start) and not first:
 			first.append(name)
 			return None
 		return real(name)
 	monkeypatch.setattr(rv, 'vault_version_number', number)
-	resolved = rv.resolve_version_entry(job.job_vault, versions[2].path, 'a', job.monitor)
-	assert first and (resolved.kind, resolved.path) == ('file', os.path.join(versions[0].path, 'a'))
+	resolved = rv.resolve_version_entry(job.job_vault, start, 'a', job.monitor)
+	assert first and (resolved.kind, resolved.path) == ('file', os.path.join(end, 'a'))

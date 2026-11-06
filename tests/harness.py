@@ -218,12 +218,31 @@ def daemon():
 	return rv if LEGACY is None else LEGACY.module
 
 
+def prune_before_a_batch(job: JobPaths, keep: int) -> None:
+	'''The product's prune of a 0.54 vault down to keep versions less one, as a batch runs it before its version: what the tests of that prune build on.'''
+	versions = rv.get_vault_info(job.job_vault).vault_info_dict
+	if not keep or len(versions) < keep:
+		return
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		monitor_paths = rv.manifest_monitor_paths(manifest)
+	finally:
+		manifest.close()
+	postponed, salt = [], rv.vault_prune_salt(job.job_vault, job.job_name)
+	while len(versions) >= keep:
+		oldest = next(iter(versions))
+		rv.prune_oldest(versions, job.job_name, job.monitor, postponed, monitor_paths=monitor_paths, prune_salt=salt)
+		if next(iter(versions), None) == oldest:
+			break
+
+
 def run_backup(job: JobPaths, entries=None, **kwargs) -> list:
 	'''
 	One committed backup as the backuper runs it: empty entries delta generate against the latest version.
 	kwargs override do_backup's keywords, such as keep_n_versions. A test on 0.54 gets it from the 0.54 daemon.
 	'''
 	if LEGACY is not None:
+		prune_before_a_batch(job, kwargs.pop('keep_n_versions', 0))
 		LEGACY.backup(job, entries, **kwargs)
 		return committed_versions(job)
 	options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
