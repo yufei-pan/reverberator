@@ -13203,7 +13203,10 @@ class TreeWriter:
 		if not self.staging_made:
 			os.makedirs(self.staging, exist_ok=True)
 			self.staging_made = True
-		return os.path.join(self.staging, uuid.uuid4().hex)
+		# 6 hex characters: a path built under this name (28 bytes with staging's own) must never be longer than the same path in a
+		# version, whose folder name is at least 29. a full uuid is 32, and a path of 4073 bytes or more in a version would not fit here.
+		# random, not a counter: a leftover that empty_staging() could not clear must not collide
+		return os.path.join(self.staging, uuid.uuid4().hex[:6])
 
 	def forwards(self, rel:str) -> bool:
 		'''Whether the previous version's entry at rel, whose folders are real, is a forward link: by its exact text, and nothing looser.'''

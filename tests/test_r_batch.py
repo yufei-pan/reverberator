@@ -13,6 +13,7 @@ from tests import version_view_ground_truth as view_truth
 from tests.crash_batches import (BAD_NAME, NEWLINE_NAME, OPTIONS, UNREADABLE, apply_batch3, backup_events, batch3_of, build_base, expected_of, put_text)
 from tests.crash_child import failing_copy_command
 from tests.harness import create_job, event_entry, run_backup
+from tests.test_migration import long_rel, put_long
 from tests.vault_oracle import check_vault, forward_text, linked_place, read_view, snapshot_tree, version_number
 
 # every version stays to be read; tests/test_r_sizes.py runs each item through a real keep-N
@@ -741,3 +742,25 @@ def test_the_plugin_lets_a_dangling_link_go_and_nothing_else(tmp_path):
 	assert view_truth.differences(str(job_vault), before, False) == []
 	(job_vault / name / 'kept').write_text('b')
 	assert view_truth.differences(str(job_vault), before, False) != []
+
+
+@pytest.mark.parametrize('spare', [1, 12, 22])
+def test_a_folder_holding_a_path_near_the_limit_moves_as_one_row(r_job, spare):
+	# the moved folder's subtree is built in staging, whose own names must be shorter than a version's: a path of 4073 to 4094 bytes
+	# fits in a version, and its staging name must not make it too long
+	name = 'V0--2026-11-06_04-58-06_-0800'
+	rel = 'd/' + long_rel(4095 - len(os.path.join(r_job.job_vault, name, 'd', '')) - spare)
+	put_long(r_job.monitor, rel, 'long')
+	put_text(r_job.monitor, 'z', 'z')
+	run_backup(r_job)
+	assert 4073 <= len(os.path.join(r_job.job_vault, name, rel)) <= 4094
+	os.rename(at(r_job.monitor, 'd'), at(r_job.monitor, 'e'))
+	backup_events(r_job, [(True, 'move', 'e', 'd')], **KEPT)
+	versions = rv.list_versions(r_job.job_vault)
+	assert [version.number for version in versions] == [0, 1]
+	assert [(row.event, row.path) for row in rv.iter_change_list(versions[1].change_list) if row.event != 'recopy'] == [
+		('move', at(r_job.monitor, 'e') + '/')]
+	reading = rv.vault_reading(r_job.job_vault)
+	for number, long_path in ((0, rel), (1, 'e' + rel[1:])):
+		walked = rv.read_walked(r_job.job_vault, number, long_path, reading)
+		assert (walked.kind, walked.st.st_size) == ('file', 4)
