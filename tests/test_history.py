@@ -322,6 +322,22 @@ def test_a_folder_moved_out_of_the_tree_before_its_parent_moves_reads_as_deleted
 	assert moves(hist(job, 'e/kept'))[0] == (1, 'moved_away', f'{m}/g/kept')
 
 
+def test_a_file_moved_out_of_a_folder_that_is_then_deleted_is_followed_to_where_it_went(job):
+	# mv d/a c/b; rm -r d; mv c b/c: the delete of d does not end what the file did after it left
+	m = job.monitor
+	write(job, 'd/a', 'A')
+	write(job, 'd/b', 'B')
+	os.makedirs(f'{m}/c')
+	run_backup(job)
+	os.rename(f'{m}/d/a', f'{m}/c/b')
+	shutil.rmtree(f'{m}/d')
+	os.makedirs(f'{m}/b')
+	os.rename(f'{m}/c', f'{m}/b/c')
+	backup_events(job, [(False, 'move', 'c/b', 'd/a'), (False, 'delete', 'd/b', None), (True, 'delete', 'd', None), (True, 'create', 'b', None), (True, 'move', 'b/c', 'c')], keep_n_versions=0)
+	assert moves(hist(job, 'd/a'))[0] == (1, 'moved_away', f'{m}/b/c/b')
+	assert moves(hist(job, 'd/b'))[0][:2] == (1, 'delete')
+
+
 def test_a_file_moved_into_a_folder_that_then_moves_is_followed_forward(job):
 	m = job.monitor
 	write(job, 'k', 'K')
