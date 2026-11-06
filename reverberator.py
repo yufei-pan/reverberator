@@ -59,7 +59,7 @@ from shutil import copystat
 # 7. compatible with symlink events 
 
 
-__version__ = "0.54.2"
+__version__ = "0.55"
 
 ## WIP
 
@@ -1335,10 +1335,10 @@ DEBUG = False
 
 SAMPLE_REVERB_RULE_FILE = '''
 Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signature	Minium snapshot interval	Maximum snapshot interval	Keep 1 Compelete Backup	Only Sync Attributes (permissions) 	Keep N versions	Backup Size Limit	Vault File System Signature	Skip List File	Full Comparison Interval	Chain Length	Copy threads
-# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	When vault is empty, copy entire monitorig path to vault instead of using links	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Stricter (smaller) limits take precedence	The UUID > Label > path for the vault file system	A gitignore style list of paths not to back up, matched relative to the monitored path	How often the whole tree is compared with the vault, as 1d, 12h, 30m or 45s (a plain number is seconds)
-# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	If true, can take long to initialize / fail to initialize if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS	Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything	Blank or 0 for never. Catches writes no event reports, such as through mmap
-# Incomplete V* directories (no .modified_contents.nsv) are removed on startup.
-# If you need data from a partial backup after a crash/stop, copy it out before restarting.
+# The name for the Job, will store in folder with this name 	The path to monitor file changes 	The Path to store the version history vault 	The UUID > Label > Device Name for the monitoring path	The minimum amount of time the script will wait before backup. 	The maximum amount of time the script will wait after IO before backup.	From 0.55 always True: the first version is a complete copy, and False is read as True with one line at start	Do not backup file content upon attr change	How many max versions of the file to keep in vault 	Keep purging old versions until 1 left if vault size exceed this limit. Use comma (,) to seperate multiple rules. Stricter (smaller) limits take precedence	The UUID > Label > path for the vault file system	A gitignore style list of paths not to back up, matched relative to the monitored path	How often the whole tree is compared with the vault, as 1d, 12h, 30m or 45s (a plain number is seconds)
+# need to be unique for path distinction	Please use absolute path 	Please use absolute path	will auto record if not set, use string literal N/A if does not care about FS ( can be inefficient ) 	Will only backup upon X seconds of inactivity 	Will backup even if the content is still buzy after X seconds.	The first backup copies the whole monitoring path, so it can take long, or fail if backup space is small 	If true, file attr change will get synced to the most recent file backup 	set to 0 for infinity	Maybe inaccurate on CoW File systems. Use 0 for infinity, % numbers refer to disk usage %, use leading i to represent inodes	Will auto record if not set, use string literal N/A if does not care about FS	Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything	Blank or 0 for never. Catches writes no event reports, such as through mmap
+# Incomplete V* directories (no .modified_contents.nsv) are removed on startup only when they hold nothing but links to themselves.
+# Any other is the tree a cut backup was writing, and the job's next attempt finishes and commits it.
 #_defaults_#		/var/reverbs/	auto	60	86400	True	True	0	5%,i5%	auto	
 '''
 
