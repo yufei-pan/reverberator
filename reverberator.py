@@ -15342,9 +15342,11 @@ PathChanges = namedtuple('PathChanges', ['row', 'moved_from', 'moved_to', 'count
 
 def follow_moves(name:str, moves:list) -> 'str | None':
 	'''
-	Where name goes by moves, a list of (from, to) in the order they apply: each one whose from is name, or a folder (ending with
-	'/') holding it, takes it to its to. None when it ends where it began. Rows that come back to a name already held are two moves
-	of one swap, which the batch's collapse leaves side by side, not one after the other: the walk ends before it.
+	Where name goes by moves, a list of (from, to): the first row whose from is name itself takes it to its to, then each later row
+	whose from is where it is now, or a folder (ending with '/') holding it, takes it on. None when it ends where it began.
+	A batch's collapse keeps a chain of moves as one row, standing at its last move's place with the source its first move left,
+	so name's own row is taken first wherever it stands. A row whose from is the place the last row left the entry is not a step
+	of it: the collapse would have merged such a pair, so it is the other half of a swap or rotation, and is passed over.
 
 	Examples:
 		>>> follow_moves('/m/b/f/x', [('/m/b/f/', '/m/h/'), ('/m/h/x', '/m/b/b')])
@@ -15353,20 +15355,26 @@ def follow_moves(name:str, moves:list) -> 'str | None':
 		'/m/p'
 		>>> follow_moves('/m/q', [('/m/z', '/m/p')]) is None
 		True
+		>>> follow_moves('/m/a', [('/m/c', '/m/a'), ('/m/b', '/m/c'), ('/m/a', '/m/b')])
+		'/m/b'
+		>>> follow_moves('/m/d/x', [('/m/d/', '/m/e/'), ('/m/d/x', '/m/e/y')])
+		'/m/e/y'
 	'''
-	current = name
-	seen = {name}
-	for source, destination in moves:
-		if source.rstrip('/') == current:
-			after = destination.rstrip('/')
-		elif source.endswith('/') and current.startswith(source):
-			after = destination.rstrip('/') + '/' + current[len(source):]
-		else:
-			continue
-		if after in seen:
+	current, last, start = name, None, 0
+	for index, (source, destination) in enumerate(moves):
+		if source.rstrip('/') == name:
+			current = last = destination.rstrip('/')
+			start = index + 1
 			break
-		seen.add(after)
-		current = after
+	for source, destination in moves[start:]:
+		plain = source.rstrip('/')
+		if plain == last:
+			continue
+		if plain == current:
+			current = last = destination.rstrip('/')
+		elif source.endswith('/') and current.startswith(source):
+			current = destination.rstrip('/') + '/' + current[len(source):]
+			last = destination.rstrip('/')
 	return None if current == name else current
 
 def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool = True) -> PathChanges:
@@ -15379,10 +15387,11 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 	('moved_away', the path it left). A file the version copied again from the vault is no change: its recopy row is
 	neither the path's row nor counted, and only sets recopied.
 
-	The move rows are kept in the list's order, which is the order of the moves where a folder move follows a move into it
-	(the rows name the folder as the first move left it). moved_from undoes the rows newest first and moved_to applies them
-	oldest first (follow_moves()), so each names a path a version held. A move back to the same name reads none, and a move
-	of a folder after the path was deleted from it does not take the path along.
+	The move rows are kept in the list's order. The batch's collapse writes a chain of moves as one row, at its last move's
+	place and with the source its first move left, so the order is not that of the moves, and the name a row gives is not
+	always one a version held. follow_moves() reads them: moved_from undoes the rows newest first and moved_to applies them
+	oldest first, each taking the path's own row before the others. A move back to the same name reads none, and a delete of
+	the path ends what moved_to follows: a folder moved after that does not take the path along.
 	'''
 	own = path.rstrip('/')
 	prefix = own + '/'

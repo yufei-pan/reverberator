@@ -253,6 +253,61 @@ def test_a_file_deleted_before_its_folder_moves_reads_as_deleted(job):
 	assert moves(hist(job, 'e/kept'))[0] == (1, 'moved_away', f'{m}/g/kept')
 
 
+def test_a_folder_rotated_into_an_archive_names_the_folder_it_was(job):
+	# mv site site.old; mv site.new site; mv site.old archive/site-1: the collapse keeps `site <- site.new` and `archive/site-1 <- site`
+	m = job.monitor
+	seed_monitor(job, {'site/index': 'old', 'site.new/index': 'new', 'archive/keep': 'k'})
+	run_backup(job)
+	os.rename(f'{m}/site', f'{m}/site.old')
+	os.rename(f'{m}/site.new', f'{m}/site')
+	os.rename(f'{m}/site.old', f'{m}/archive/site-1')
+	backup_events(job, [(True, 'move', 'site.old', 'site'), (True, 'move', 'site', 'site.new'), (True, 'move', 'archive/site-1', 'site.old')], keep_n_versions=0)
+	assert moves(folder_hist(job, 'archive/site-1'))[0] == (1, 'move', f'{m}/site')
+	assert moves(folder_hist(job, 'site.new'))[0] == (1, 'moved_away', f'{m}/site')
+
+
+def test_a_file_rotated_into_an_archive_names_the_file_it_was(job):
+	m = job.monitor
+	seed_monitor(job, {'app.conf': 'old', 'app.conf.new': 'new', 'old/keep': 'k'})
+	run_backup(job)
+	os.rename(f'{m}/app.conf', f'{m}/app.conf.bak')
+	os.rename(f'{m}/app.conf.new', f'{m}/app.conf')
+	os.rename(f'{m}/app.conf.bak', f'{m}/old/app.conf.1')
+	backup_events(job, [(False, 'move', 'app.conf.bak', 'app.conf'), (False, 'move', 'app.conf', 'app.conf.new'), (False, 'move', 'old/app.conf.1', 'app.conf.bak')], keep_n_versions=0)
+	assert moves(hist(job, 'app.conf.new'))[0] == (1, 'moved_away', f'{m}/app.conf')
+	changes = rv.path_changes(versions(job)[1].change_list, f'{m}/old/app.conf.1')
+	assert changes.moved_from == f'{m}/app.conf'
+
+
+def test_a_file_moved_out_of_a_folder_that_then_moves_is_not_said_to_move_with_it(job):
+	# mv d/x t; mv d e; mv t e/y: the rows are `e <- d` and `e/y <- d/x`, and no version held e/x
+	m = job.monitor
+	seed_monitor(job, {'d/x': 'X', 'd/k': 'K'})
+	run_backup(job)
+	os.rename(f'{m}/d/x', f'{m}/t')
+	os.rename(f'{m}/d', f'{m}/e')
+	os.rename(f'{m}/t', f'{m}/e/y')
+	backup_events(job, [(False, 'move', 't', 'd/x'), (True, 'move', 'e', 'd'), (False, 'move', 'e/y', 't')], keep_n_versions=0)
+	assert moves(hist(job, 'e/y'))[0] == (1, 'move', f'{m}/d/x')
+	assert moves(hist(job, 'd/x'))[0] == (1, 'moved_away', f'{m}/e/y')
+	assert moves(hist(job, 'd/k'))[0] == (1, 'moved_away', f'{m}/e/k')
+	assert moves(hist(job, 'e/k'))[0] == (1, 'move', f'{m}/d/k')
+
+
+def test_a_rotation_of_three_names_each_file_the_name_it_came_from(job):
+	m = job.monitor
+	seed_monitor(job, {'a': 'A', 'b': 'B', 'c': 'C'})
+	run_backup(job)
+	os.rename(f'{m}/a', f'{m}/t')
+	os.rename(f'{m}/c', f'{m}/a')
+	os.rename(f'{m}/b', f'{m}/c')
+	os.rename(f'{m}/t', f'{m}/b')
+	backup_events(job, [(False, 'move', 't', 'a'), (False, 'move', 'a', 'c'), (False, 'move', 'c', 'b'), (False, 'move', 'b', 't')], keep_n_versions=0)
+	changes = {name: rv.path_changes(versions(job)[1].change_list, f'{m}/{name}') for name in 'abc'}
+	assert {name: (change.moved_from, change.moved_to) for name, change in changes.items()} == {
+		'a': (f'{m}/c', f'{m}/b'), 'b': (f'{m}/a', f'{m}/c'), 'c': (f'{m}/b', f'{m}/a')}
+
+
 def test_a_file_moved_into_a_folder_that_then_moves_is_followed_forward(job):
 	m = job.monitor
 	write(job, 'k', 'K')
