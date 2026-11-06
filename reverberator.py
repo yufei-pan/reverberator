@@ -5646,6 +5646,9 @@ def do_backup(backup_entries:dict,
 		# design R: the newest version is the one real tree, and a batch hands it over (hand_over()). only a vault that reads
 		# as 0.54 gets the referenced copy: the 0.54 rules must never run again on one with staging (vault_layout())
 		on_tree = vault_layout(job_vault,manifest) != '0.54'
+		if manifest.conversion_unfinished():
+			# until the sizes pass ends, the versions are part converted and the lists hold 0.54's sizes, which the size limit would prune by
+			raise JobFailure(f'the conversion of {job_vault} from 0.54 has not ended: no backup or prune runs until it has, and the next start goes on with it')
 		# the files the new version copied again from the vault, and those of them its batch then wrote over
 		recopied = []
 		recopies_rewritten = set()
@@ -6823,8 +6826,16 @@ def measure_previous(previous:str, tree:str) -> tuple:
 					st = entry.stat(follow_symlinks=False)
 					if st.st_nlink > 1:
 						shared.add(st.st_ino)
+	return measure_version(previous, shared)
+
+def measure_version(version:str, seen:set) -> tuple:
+	'''
+	(bytes, inodes) of what the version folder at version holds beyond the inodes of seen, which it adds its own to (spec section 6):
+	each file not seen its size and an inode, each real folder 4 KiB and an inode, each link an inode. Its root is no row
+	of it. Raises OSError.
+	'''
 	size = inodes = 0
-	pending = [previous]
+	pending = [version]
 	while pending:
 		with os.scandir(pending.pop()) as entries:
 			for entry in entries:
@@ -6836,9 +6847,9 @@ def measure_previous(previous:str, tree:str) -> tuple:
 					inodes += 1
 				else:
 					st = entry.stat(follow_symlinks=False)
-					if st.st_ino not in shared:
+					if st.st_ino not in seen:
 						# a file held twice here counts once
-						shared.add(st.st_ino)
+						seen.add(st.st_ino)
 						size += st.st_size
 						inodes += 1
 	return size, inodes
@@ -6882,6 +6893,8 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 			raise VaultScanError(f'cannot read {orphan}, nothing in the vault is removed: {e}')
 	remove_unfinished_change_lists(job_vault, listing)
 	empty_staging(job_vault)
+	if manifest.layout() == 'r':
+		remove_054_files(job_vault)
 	if skeleton is not None:
 		if newest is not None:
 			try:
@@ -8695,6 +8708,22 @@ class VaultManifest:
 
 	def add_migrated(self, name:str):
 		self._set_meta_json('migrated', sorted(self.migrated() | {name}))
+
+	def version_times(self) -> dict:
+		'''{version folder name: [atime_ns, mtime_ns]} of the version folders as a conversion from 0.54 found them.'''
+		return self._meta_json('version_times') or {}
+
+	def begin_migration(self, times:dict):
+		'''
+		Say a conversion from 0.54 has begun, keeping the versions it did, so no batch runs until it ends (conversion_unfinished()).
+		times gives the version folders' version_times(); a time already kept stands, as a swap may have moved the folder's since.
+		'''
+		self._set_meta_json('migrated', sorted(self.migrated()))
+		self._set_meta_json('version_times', {**times, **self.version_times()})
+
+	def conversion_unfinished(self) -> bool:
+		'''Whether a conversion from 0.54 began here and has not set the layout. Versions and change lists are then neither 0.54's nor design R's, and no batch may touch them.'''
+		return self.layout() != 'r' and self._meta_json('migrated') is not None
 
 	def recorded_version(self) -> 'str | None':
 		'''The name of the version folder these rows describe, the last commit's; None when they describe none.'''
@@ -12901,6 +12930,18 @@ LIBC_RENAMEAT2 = ctypes.CDLL(None, use_errno=True).renameat2
 LIBC_RENAMEAT2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
 LIBC_RENAMEAT2.restype = ctypes.c_int
 
+def link_or_copy(source:str, dest:str) -> bool:
+	'''A hard link at dest of the entry at source, itself even if it is a link; a copy where hard links are refused (NO_HARD_LINK_ERRNOS: EMLINK, say). Whether it is a hard link.'''
+	try:
+		os.link(source, dest, follow_symlinks=False)
+		return True
+	except OSError as e:
+		if e.errno not in NO_HARD_LINK_ERRNOS:
+			raise
+		if multiCMD.run_command(copy_command(source, dest),quiet=True,return_code_only=True,wait_for_return=True) != 0:
+			raise JobFailure(f'keeping {source} by a copy, as it cannot be hard linked ({e}), failed')
+		return False
+
 def rename_exchange(a:str, b:str) -> None:
 	'''
 	Swap the entries at a and b in one call, so nothing can see either name empty. Both must exist. Raises OSError, EINVAL
@@ -13205,22 +13246,10 @@ class TreeWriter:
 		if failed:
 			raise JobFailure(f'copying the metadata of {source} onto {dest} failed')
 
-	def link_or_copy(self, source:str, dest:str) -> bool:
-		'''A hard link at dest of the entry at source, itself even if it is a link; a copy where hard links are refused (NO_HARD_LINK_ERRNOS: EMLINK, say). Whether it is a hard link.'''
-		try:
-			os.link(source, dest, follow_symlinks=False)
-			return True
-		except OSError as e:
-			if e.errno not in NO_HARD_LINK_ERRNOS:
-				raise
-			if multiCMD.run_command(copy_command(source, dest),quiet=True,return_code_only=True,wait_for_return=True) != 0:
-				raise JobFailure(f'recording {source} by a copy, as it cannot be hard linked ({e}), failed')
-			return False
-
 	def keep_entry(self, source:str, dest:str, rel:str) -> None:
 		'''The file or link at source of the tree, held at dest on its way to rel in the previous version (link_or_copy()), and counted. A file the tree shares counts when the tree lets it go.'''
 		st = os.lstat(source)
-		linked = self.link_or_copy(source, dest)
+		linked = link_or_copy(source, dest)
 		if stat.S_ISLNK(st.st_mode):
 			self.sizes.record_dropped(0, 1)
 		elif linked:
@@ -13501,6 +13530,163 @@ def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManif
 	os.utime(new_path, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
 	rename_exchange(new_path, newest_path)
 	return TreeWriter(new_path, previous=newest_path, job_vault=job_vault, manifest=manifest, sizes=BatchSizes(newest_path, links))
+
+def is_chain_link(job_vault:str, path:str) -> bool:
+	'''Whether the link at path of a version is a 0.54 chain link: by its text alone, as the walk has it (parse_chain_text()).'''
+	return parse_chain_text(job_vault, os.readlink(path), path) is not None
+
+def needs_plain_tree(job_vault:str, name:str) -> bool:
+	'''Whether the version in folder name holds what a plain tree does not: a 0.54 chain link, or a prune's temp. Raises OSError.'''
+	version = os.path.join(job_vault, name)
+	pending = [version]
+	while pending:
+		with os.scandir(pending.pop()) as entries:
+			for entry in entries:
+				if entry.is_dir(follow_symlinks=False):
+					pending.append(entry.path)
+				elif (entry.is_symlink() and is_chain_link(job_vault, entry.path)) or is_prune_temp(job_vault, version, entry.path[len(version) + 1:], ''):
+					return True
+	return False
+
+def plain_tree_entry(job_vault:str, name:str, rel:str, path:str, is_link:bool) -> str:
+	'''
+	The path of the entry that rel of the version in folder name is in a plain tree, path being rel there and is_link whether it
+	is a link: the end of its chain by walk_folder(), the rule the commands read the version by, so conversion shows what they
+	showed. A link that is no chain link, a forward link among them, is itself, and so is a chain that leads nowhere. Raises JobFailure when the walk cannot tell.
+	'''
+	if not is_link or not is_chain_link(job_vault, path):
+		return path
+	walked = walk_folder(job_vault, name, rel, True)
+	if walked.kind in ('file', 'symlink'):
+		return walked.path
+	if walked.kind == 'dangling':
+		return path
+	raise JobFailure(f'cannot read {rel} of {name} to convert it: {walked.kind} {walked.detail}')
+
+def materialize_version(job_vault:str, name:str, stop = None) -> bool:
+	'''
+	The version in folder name of job_vault becomes a plain tree (spec section 7): built in staging, real folders with the version's
+	metadata and times, each other entry hard linked to what plain_tree_entry() says, or copied where it cannot be
+	(link_or_copy()), a prune's temp left out; then swapped with the version folder in one call, so a reader sees one or the
+	other, and the old tree goes with the rest of staging. The version's own folder keeps its metadata and root record the same way.
+
+	stop, polled per entry, ends the build: False, with the version as it was and the unfinished tree left for the next scan
+	(empty_staging()). Raises OSError or JobFailure with the version as it was, as nothing changes it before the swap. A tree
+	an earlier attempt left in staging goes first. Run again it makes the same tree.
+	'''
+	version = os.path.join(job_vault, name)
+	built = os.path.join(staging_path(job_vault), f'm-{name}')
+	empty_staging(job_vault)
+	os.mkdir(built)
+	folders = [('', os.lstat(version))]
+	pending = ['']
+	while pending:
+		folder = pending.pop()
+		with os.scandir(os.path.join(version, folder)) as entries:
+			for entry in entries:
+				if stop is not None and stop():
+					return False
+				rel = os.path.join(folder, entry.name)
+				if entry.is_dir(follow_symlinks=False):
+					os.mkdir(os.path.join(built, rel))
+					folders.append((rel, entry.stat(follow_symlinks=False)))
+					pending.append(rel)
+				elif not is_prune_temp(job_vault, version, rel, ''):
+					link_or_copy(plain_tree_entry(job_vault, name, rel, entry.path, entry.is_symlink()), os.path.join(built, rel))
+	# once every entry is in, as each moves its folder's times
+	for rel, st in folders:
+		failed = []
+		copy_new_folder_meta(os.path.join(version, rel), os.path.join(built, rel), st, failed)
+		if failed:
+			raise JobFailure(f'cannot convert {name}: the metadata of {rel or "its folder"} cannot be kept')
+	rename_exchange(built, version)
+	empty_staging(job_vault)
+	return True
+
+def sizes_pass(job_vault:str, manifest:'VaultManifest') -> None:
+	'''
+	Every change list of job_vault names what spec section 6 says its version holds: each inode counted once, in the newest version
+	holding it, by a walk of every version folder, newest first. A cut batch's tree has no list, but it comes first, as the newest
+	holder of what it holds. A list already right is not touched, so a cut pass is run again and a second one changes
+	nothing. manifest is not read: only what the folders hold counts. Raises OSError, or VaultScanError when the vault cannot be read.
+	'''
+	listing = read_job_vault(job_vault, judge_orphans=False)
+	folders = {vault_version_number(os.path.basename(path)): path for path in listing.orphans}
+	folders.update((number, entry.path) for number, entry in listing.versions.items())
+	seen = set()
+	for number in sorted(folders, reverse=True):
+		size, inodes = measure_version(folders[number], seen)
+		if number in listing.change_lists:
+			held = change_list_path(folders[number], size, inodes)
+			if listing.change_lists[number] != held:
+				os.rename(listing.change_lists[number], held)
+	# each time, as a cut pass may have left its renames unflushed, and the layout's commit must not outlive them
+	fsync_vault_folder(job_vault)
+
+def remove_054_files(job_vault:str) -> None:
+	'''Remove the files only the 0.54 prune had a use for. A failure is logged, and the next scan looks again: nothing reads them on design R.'''
+	for name in (PRUNE_SALT_FILE_NAME, PRUNE_MARKER_FILE_NAME):
+		try:
+			os.remove(os.path.join(job_vault, name))
+		except FileNotFoundError:
+			pass
+		except OSError as e:
+			backuperTeeLogToTl(job_vault, f'Cannot remove {name} for now: {e}', error=True)
+
+def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, stop = None) -> bool:
+	'''
+	Convert job_vault from 0.54 (spec section 7), the 0.54 rules or the R scan having run, under the job's locks. Each version
+	not yet done, newest first, becomes a plain tree when it needs to (materialize_version()), its log line said either
+	way, and gets back the times of its folder, kept in the manifest before anything changes; then the sizes pass; only then
+	the layout is set, and the prune's files go after it. A version counts as done only once flushed: the manifest's word must not outlive its swap
+	in a power cut. A cut anywhere is resumed by a scan and another call, every step being idempotent, and the rows stand,
+	as every file keeps its inode. Until the layout is set no batch runs (VaultManifest.conversion_unfinished()).
+
+	On a vault of forward links whose manifest was lost this changes no version, and the sizes pass is right there too.
+
+	Whether it ended: False when stop(), polled per entry, asked it to go, with the rest left for the next start. Raises
+	OSError, JobFailure or VaultScanError when a step fails, the versions reading as they did.
+	'''
+	stopped = stop if stop is not None else (lambda: False)
+	versions = read_job_vault(job_vault, judge_orphans=False).versions
+	found = {}
+	for entry in versions.values():
+		st = os.lstat(entry.path)
+		found[os.path.basename(entry.path)] = [st.st_atime_ns, st.st_mtime_ns]
+	manifest.begin()
+	manifest.begin_migration(found)
+	manifest.commit()
+	times = manifest.version_times()
+	# on the disk before any version changes: with it there the 0.54 rules never run again (vault_layout())
+	os.makedirs(staging_path(job_vault), exist_ok=True)
+	fsync_vault_folder(job_vault)
+	done = manifest.migrated()
+	todo = [number for number in sorted(versions, reverse=True) if os.path.basename(versions[number].path) not in done]
+	for index, number in enumerate(todo, 1):
+		if stopped():
+			return False
+		name = os.path.basename(versions[number].path)
+		backuperTeeLogToTl(job_name, f'Converting {job_name} vault: V{number} ({index} of {len(todo)})')
+		changed = needs_plain_tree(job_vault, name)
+		if changed and not materialize_version(job_vault, name, stop):
+			return False
+		# a swap across folders can move the folder's own mtime, as f2fs does, and one cut after its swap changes nothing more here
+		os.utime(versions[number].path, ns=tuple(times[name]), follow_symlinks=False)
+		if changed:
+			failed_disks = flush_vault_disks(job_vault, job_name)
+			if failed_disks:
+				raise JobFailure(f'the conversion of {job_vault} stops: {", ".join(failed_disks)} failed a sync')
+		manifest.begin()
+		manifest.add_migrated(name)
+		manifest.commit()
+	if stopped():
+		return False
+	sizes_pass(job_vault, manifest)
+	manifest.begin()
+	manifest.set_layout('r')
+	manifest.commit()
+	remove_054_files(job_vault)
+	return True
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,

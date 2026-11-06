@@ -118,11 +118,8 @@ def build_base(job, **options) -> dict:
 	return expected
 
 
-def apply_batch3(job) -> OrderedDict:
-	'''
-	Change the monitored tree as batch 3 does; its backup entries. Its raw events are kept beside the job, for the crash child.
-	'''
-	monitor = job.monitor
+def change_batch3(monitor: str) -> list:
+	'''Change the monitored tree as batch 3 does; its events, as (is_dir, event, rel, moved_from rel or None).'''
 	def at(rel):
 		return os.path.join(monitor, rel)
 	put_text(monitor, 'n1.txt', 'n1')
@@ -170,7 +167,7 @@ def apply_batch3(job) -> OrderedDict:
 	put_text(monitor, 'w/new.txt', 'wn')
 	put_text(monitor, BAD_NAME, 'bad name')
 	put_text(monitor, NEWLINE_NAME, 'newline name')
-	events = [(True, 'create', 'w', None),
+	return [(True, 'create', 'w', None),
 		(False, 'modify', 'g/h/i/j.txt', None), (False, 'delete', 'g/h/i/gone.txt', None), (False, 'create', 'g/h/i/new.txt', None),
 		(False, 'delete', 'c/z.txt', None), (True, 'delete', 'big', None),
 		(False, 'move', 'y', 'd/g'), (True, 'delete', 'd', None),
@@ -185,7 +182,14 @@ def apply_batch3(job) -> OrderedDict:
 		(False, 'create', 'n1.txt', None), (True, 'create', 'newf', None), (False, 'modify', 'a/x.txt', None), (False, 'modify', 'b/y.txt', None), (False, 'modify', 'b/y.txt', None),
 		(False, 'delete', 'lnk', None), (False, 'create', 'lnk', None), (False, 'attrib', 'top.txt', None),
 		(False, 'create', BAD_NAME, None), (False, 'create', NEWLINE_NAME, None)]
-	raw = raw_events(monitor, events)
+
+
+def apply_batch3(job) -> OrderedDict:
+	'''
+	Change the monitored tree as batch 3 does; its backup entries. Its raw events are kept beside the job, for the crash child.
+	'''
+	monitor = job.monitor
+	raw = raw_events(monitor, change_batch3(monitor))
 	with open(os.path.join(job.root, BATCH3_FILE), 'wb') as f:
 		pickle.dump(list(raw), f)
 	return rv.change_events_to_backup_entries(deque(raw), monitor)

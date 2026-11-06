@@ -39,6 +39,8 @@ USERS = {
 	'do_referenced_copy': {'copy_new_folder_meta'},
 	'retarget_chain_link': {'remove_entry'},
 	'decrement_stepper': {'copy_file_meta'},
+	# the conversion from 0.54: a plain tree built in staging, with the metadata of the version it replaces
+	'materialize_version': {'copy_new_folder_meta'},
 	# never the vault: a restore writes its destination
 	'finish_restore_copies': {'replace_entry'},
 	'restore_entry': {'cp_af_copy_path'},
