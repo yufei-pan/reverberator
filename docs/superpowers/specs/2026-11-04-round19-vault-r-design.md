@@ -200,8 +200,8 @@ A cut before the flush ends is §3's: the roll-forward copies again every file w
 
 ### 2.7 Prune
 1. Rename V<k> into `.reverberator_staging/<name>`. It stops being a version in that one call.
-2. Remove its list.
-3. `rm -rf` the staged folder.
+2. `rm -rf` the staged folder.
+3. Remove its list. It goes last: a disk out during the rename can bring part of the folder back, and a version folder with no list below the newest fails every scan.
 
 After a cut, the scan empties staging and removes a stale list below the oldest version (today's rule). On a pool, every disk is flushed after the rename.
 
