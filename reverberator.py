@@ -12929,10 +12929,12 @@ def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 	metadata and times, each other entry hard linked to what plain_tree_entry() says, or copied where it cannot be
 	(link_or_copy()), a prune's temp left out; then swapped with the version folder in one call, so a reader sees one or the
 	other, and the old tree goes with the rest of staging. The version's own folder keeps its metadata and root record the same way.
-	A pool or a filesystem with no such call moves the version away, then the tree in, each flushed: the version is not there between them, and a cut leaves
+	A pool or a filesystem with no such call flushes the tree built, moves the version away, then the tree in, each flushed: the version is not there between them, and a cut leaves
 	the scan to finish it (repair_pool_vault()). As each disk comes back from a cut at its own checkpoint, either rename may be on one disk and not on another, and
 	the two halves of the folder under the version's name would look alike: so the tree is renamed in staging once the old one is out on every disk, which
-	tells the scan which way to go. Its caller gives the folder back the times a rename from staging can move.
+	tells the scan which way to go. The first flush is what makes old mean something: with the tree built lost on a disk and the version's rename kept on another,
+	old alone with the version showing would read as the tree being in, and the old tree would go with staging; with it, old on any disk means m or n shows somewhere
+	until the tree is in. Its caller gives the folder back the times a rename from staging can move.
 
 	stop, polled per entry, ends the build: False, with the version as it was and the unfinished tree left for the next scan
 	(empty_staging()). Raises OSError or JobFailure with the version as it was, as nothing changes it before the swap. A tree
@@ -12967,6 +12969,8 @@ def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 	if pool_state(job_vault) is not None or not exchanged(built, version):
 		stopped = f'the conversion of {name} stops here; the next attempt goes on with it'
 		ready = os.path.join(staging_path(job_vault), READY_NAME)
+		# the tree built is on every disk before the version moves, so old on a disk means m or n shows somewhere until the tree is in
+		flush_or_fail(job_vault, os.path.basename(job_vault), stopped)
 		os.rename(version, os.path.join(staging_path(job_vault), REPLACED_NAME))
 		flush_or_fail(job_vault, os.path.basename(job_vault), stopped)
 		os.rename(built, ready)

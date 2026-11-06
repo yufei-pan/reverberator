@@ -415,6 +415,53 @@ def test_a_conversion_whose_tree_is_in_leaves_the_old_one_to_staging(tmp_path, f
 	assert os.path.isfile(os.path.join(b, rv.STAGING_NAME, rv.REPLACED_NAME, 'old'))
 
 
+def test_a_conversion_on_two_renames_flushes_before_the_version_moves(tmp_path, fake_pool, monkeypatch):
+	# the tree built in staging must be on every disk before the version goes to old: then old on a disk means m or n shows somewhere,
+	# and old with the version showing means the tree is in. without the flush a disk may come back with old and the other with no m
+	job_vault, newest = a_vault(str(tmp_path), {'d/f': 'x', 'g': 'y'})
+	fake_pool.add(job_vault, ['a', 'b'])
+	os.makedirs(os.path.join(job_vault, rv.STAGING_NAME))
+	steps = []
+	real_rename = os.rename
+	def rename(source, target, *args, **kwargs):
+		steps.append(('rename', os.path.basename(source), os.path.basename(target)))
+		return real_rename(source, target, *args, **kwargs)
+	monkeypatch.setattr(os, 'rename', rename)
+	monkeypatch.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: steps.append(('flush',)) or [])
+	assert rv.materialize_version(job_vault, V1) is True
+	moves = [step for step in steps if step[0] == 'rename' and step[2] in (rv.REPLACED_NAME, rv.READY_NAME, V1)]
+	assert moves == [('rename', V1, rv.REPLACED_NAME), ('rename', rv.CONVERTED_NAME, rv.READY_NAME), ('rename', rv.READY_NAME, V1)]
+	# a flush before the first of them, and one after each
+	first = steps.index(moves[0])
+	assert first > 0 and steps[first - 1] == ('flush',)
+	for move in moves:
+		assert steps[steps.index(move) + 1] == ('flush',)
+
+
+def test_a_conversion_on_one_swap_has_no_flush_of_its_own(tmp_path, flushes):
+	# a swap in one call (RENAME_EXCHANGE) is one step on one disk
+	job_vault, newest = a_vault(str(tmp_path), {'d/f': 'x', 'g': 'y'})
+	os.makedirs(os.path.join(job_vault, rv.STAGING_NAME))
+	assert rv.materialize_version(job_vault, V1) is True
+	assert flushes == []
+
+
+def test_a_conversion_split_in_the_middle_goes_back(tmp_path, fake_pool, flushes):
+	# m on one disk, n on the other, old on both: the middle rename reached one disk only, and the version is converted again
+	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
+	try:
+		conversion_in_staging(job_vault, {rv.CONVERTED_NAME: 'x', rv.READY_NAME: 'x', rv.REPLACED_NAME: 'x'})
+		on_disk(a, f'{rv.STAGING_NAME}/{rv.CONVERTED_NAME}/built')
+		on_disk(b, f'{rv.STAGING_NAME}/{rv.READY_NAME}/built')
+		on_disk(a, f'{rv.STAGING_NAME}/{rv.REPLACED_NAME}/left-a')
+		on_disk(b, f'{rv.STAGING_NAME}/{rv.REPLACED_NAME}/left-b')
+		rv.repair_pool_vault(job_vault, manifest)
+	finally:
+		manifest.close()
+	assert os.path.isfile(os.path.join(a, V1, 'left-a')) and os.path.isfile(os.path.join(b, V1, 'left-b'))
+	assert flushes
+
+
 def test_the_version_being_converted_is_the_newest_not_done(tmp_path):
 	job_vault, newest = a_vault(str(tmp_path), {'g': 'y'})
 	manifest = rv.VaultManifest(job_vault)
@@ -480,7 +527,8 @@ def private_mounts() -> None:
 
 class Pool:
 	'''A mergerfs at root/vault over one image per disk, mounted at root/d<i>: new ones, or copies of those in template. Every path is the same in each worker.'''
-	def __init__(self, root: str, work: str, disks: int, template: str = None):
+	def __init__(self, root: str, work: str, disks: int, template: str = None, options: str = MERGERFS_OPTIONS):
+		self.options = options
 		self.root = root
 		self.work = work
 		self.vault = os.path.join(root, 'vault')
@@ -490,7 +538,7 @@ class Pool:
 		self.mergerfs = None
 
 	def start(self) -> None:
-		self.mergerfs = subprocess.Popen(['mergerfs', '-f', ':'.join(self.branches), self.vault, '-o', MERGERFS_OPTIONS], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+		self.mergerfs = subprocess.Popen(['mergerfs', '-f', ':'.join(self.branches), self.vault, '-o', self.options], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 		deadline = time.monotonic() + 30
 		while not os.path.ismount(self.vault):
 			assert self.mergerfs.poll() is None and time.monotonic() < deadline, 'mergerfs did not start'
@@ -536,6 +584,9 @@ class Pool:
 
 class Shape:
 	'''A batch on a pool of so many disks: its template, built once, what a run does and what it must find. Its paths are the same in each worker.'''
+	# how the pool places a new entry; a shape may force it
+	mergerfs_options = MERGERFS_OPTIONS
+
 	def __init__(self, disks: int, options: dict = None):
 		self.disks = disks
 		self.options = options or {}
@@ -571,7 +622,7 @@ class Shape:
 			def build():
 				job = self.job_paths()
 				write_rule(job)
-				with Pool(self.root, os.path.join(self.root, 'building'), self.disks) as pool:
+				with Pool(self.root, os.path.join(self.root, 'building'), self.disks, options=self.mergerfs_options) as pool:
 					wanted = self.build(job, fixture)
 					pool.keep_images(self.template)
 				with open(os.path.join(self.template, 'wanted.pickle'), 'wb') as f:
@@ -665,10 +716,16 @@ class Conversion(Shape):
 		return lines, wanted
 
 
+class ForcedConversion(Conversion):
+	"""The conversion on a pool that puts every new entry on its first disk, for the one state placement decides (see the test of it)."""
+	batch = 'forced-conversion'
+	mergerfs_options = MERGERFS_OPTIONS.replace('category.create=pfrd', 'category.create=ff')
+
+
 def run_uncut(shape: Shape, work: str, cut_fault=None) -> tuple:
 	'''(the steps of the batch with nothing cut, the bytes its images hold at the end).'''
 	job = shape.job_paths()
-	with Pool(shape.root, work, shape.disks, shape.template) as pool:
+	with Pool(shape.root, work, shape.disks, shape.template, shape.mergerfs_options) as pool:
 		points = CutPoints(job.job_vault, pool.branches)
 		def batch():
 			done = shape.work(job, points)
@@ -692,7 +749,7 @@ def one_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, ret
 	'''What is wrong after the run (kill, cuts), as lines. Empty means it passed.'''
 	job = shape.job_paths()
 	lines = []
-	with Pool(shape.root, work, shape.disks, shape.template) as pool:
+	with Pool(shape.root, work, shape.disks, shape.template, shape.mergerfs_options) as pool:
 		at = {}
 		for disk, position in zip(pool.branches, cuts):
 			at.setdefault(position, []).append(disk)
@@ -828,11 +885,15 @@ SHAPES = {'mixed-2': (MixedBatch, 2), 'mixed-3': (MixedBatch, 3), 'mixed-2-only-
 	'mixed-3-only-sync-attributes': (MixedBatch, 3, {'only_sync_attributes': True}), 'conversion-2': (Conversion, 2), 'conversion-3': (Conversion, 3)}
 
 
+# the shape of the test of one state, not swept
+FORCED = {'forced-conversion-2': (ForcedConversion, 2)}
+
+
 def built_shape(name: str, request) -> Shape:
-	kind, *arguments = SHAPES[name]
+	kind, *arguments = {**SHAPES, **FORCED}[name]
 	made = kind(*arguments)
 	os.makedirs(made.base, exist_ok=True)
-	made.build_template(request.getfixturevalue('v054') if kind is Conversion else None)
+	made.build_template(request.getfixturevalue('v054') if issubclass(kind, Conversion) else None)
 	return made
 
 
@@ -916,3 +977,65 @@ def skipping(name: str):
 	('conversion-2', 'finish_conversion_renames')])
 def test_a_skipped_repair_is_caught(name, repair, request):
 	assert caught(name, request, apply_runs if repair == 'remove_mixed_names' else control_runs, f'-control-{repair}', retry_fault=skipping(repair))
+
+
+# --- the one state placement decides ---
+
+FORCED_TRIES = 12
+
+
+def one_forced_try(shape: Shape, rename: int, flushed: int) -> dict:
+	"""
+	A conversion cut right after the version's rename to old, on a pool where every entry of the version's tree built sits on the first disk
+	(d0) and the version's links are on the second (d1): d0 comes back from the flush before the rename, d1 from the flush after it. Gives what was
+	found: the version's names before and after, what the oracle says, and whether the retry committed.
+	"""
+	job = shape.job_paths()
+	work = os.path.join(shape.base, 'work', 'forced')
+	shutil.rmtree(work, ignore_errors=True)
+	os.makedirs(work)
+	found = {}
+	with Pool(shape.root, work, shape.disks, shape.template, shape.mergerfs_options) as pool:
+		d0, d1 = pool.branches
+		rel = os.path.relpath(job.job_vault, pool.vault)
+		pool.stop()
+		name = next(entry for entry in sorted(os.listdir(os.path.join(d0, rel))) if entry.startswith('V2--') and os.path.isdir(os.path.join(d0, rel, entry)))
+		os.makedirs(os.path.join(d1, rel, name, 'd'))
+		for moved in ('a.txt', 'b.txt', 'lnk'):
+			shutil.move(os.path.join(d0, rel, name, moved), os.path.join(d1, rel, name, moved))
+		pool.start()
+		for branch in pool.branches:
+			# moving the entries changed the folders' times
+			os.utime(os.path.join(branch, rel, name), ns=(shape.wanted['times'][name],) * 2)
+			flush_scratch(branch)
+		version = os.path.join(job.job_vault, name)
+		found['before'] = sorted(os.listdir(version))
+		points = CutPoints(job.job_vault, pool.branches, rename, {max(flushed, 2): [d0], rename: [d1]})
+		cut = in_child(job, None, lambda: shape.work(job, points), real_flushes(pool.branches, points), points=points)
+		found['cut'] = cut.killed
+		pool.power_back()
+		again = shape.again(job, real_flushes(pool.branches))
+		found['retry'] = (again.committed, again.error)
+		found['after'] = sorted(os.listdir(version)) if os.path.isdir(version) else None
+		found['wrong'] = [line[:110] for line in shape.wrong(job)[0]][:8]
+	return found
+
+
+@needs_mergerfs
+def test_a_conversion_cut_after_the_version_moved_keeps_every_name(request):
+	# old on one disk and the version's other part in place on the other must never read as "the tree is in": that depends on where the pool put
+	# the tree built, which the random placement of the other shapes leaves to chance, so it is forced here (spec section 7). Tries are
+	# repeated, as a disk may come back further on than asked, from a checkpoint of its own
+	shape = built_shape('forced-conversion-2', request)
+	trace, _ = steps_of(shape)
+	rename = next(number for number, step in enumerate(trace, 1) if step[0] == 'rename' and len(step) == 3 and step[2].endswith('/' + rv.REPLACED_NAME))
+	flushed = max(position for position in flushes_of(trace) if position < rename)
+	# the flush right before the rename is what the test is about: without it d0 comes back from the one before the tree was built
+	bad = []
+	for number in range(FORCED_TRIES):
+		found = in_worker_result(lambda: one_forced_try(shape, rename, flushed))
+		print(f'forced try {number + 1}: {found}')
+		if found['cut'] is not True or found['retry'] != (True, None) or found['after'] != found['before'] or found['wrong']:
+			bad.append(found)
+	print(f'forced-conversion-2: {len(bad)} of {FORCED_TRIES} tries wrong')
+	assert not bad, f'{len(bad)} of {FORCED_TRIES} tries wrong: {bad[:2]}'
