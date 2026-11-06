@@ -427,7 +427,7 @@ def test_sizes_pass_on_hand_made_sharing_counts_each_inode_in_the_newest_holder(
 		f.write('y' * 300)
 	os.link(os.path.join(small.job_vault, names[1], 'shared'), os.path.join(small.job_vault, names[0], 'shared'))
 	manifest = rv.VaultManifest(small.job_vault)
-	rv.sizes_pass(small.job_vault, manifest)
+	rv.sizes_pass(small.job_vault)
 	manifest.close()
 	assert wrong_lists(small.job_vault) == []
 
@@ -440,7 +440,7 @@ def test_sizes_pass_twice_changes_nothing(small, monkeypatch):
 	real = os.rename
 	monkeypatch.setattr(os, 'rename', lambda *args, **kwargs: (renames.append(args), real(*args, **kwargs))[1])
 	manifest = rv.VaultManifest(small.job_vault)
-	rv.sizes_pass(small.job_vault, manifest)
+	rv.sizes_pass(small.job_vault)
 	manifest.close()
 	assert renames == []
 	assert lists_of(small) == lists

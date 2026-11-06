@@ -1638,14 +1638,11 @@ def run_daemon():
 			tl.teeprint(log_text(f"Reverting to default value: {DEFAULT_MAX_DELAY}"))
 			max_shapshot_delay_seconds = DEFAULT_MAX_DELAY
 		vault_path = reverb_rule.vault_path
-		if reverb_rule.keep_one_complete_backup.lower() == 'none':
-			keep_one_complete_backup = DEFAULT_KEEP_ONE_COMPLETE_BACKUP
-		else:
-			keep_one_complete_backup = reverb_rule.keep_one_complete_backup.lower() in ['true','yes','1','t','y','on','enable','enabled','en','e']
+		keep_one_complete_backup = read_keep_one_complete_backup(reverb_rule.keep_one_complete_backup, job_name)
 		if reverb_rule.only_sync_attributes.lower() == 'none':
 			only_sync_attributes = DEFAULT_ONLY_SYNC_ATTRIBUTES
 		else:
-			only_sync_attributes = reverb_rule.only_sync_attributes.lower() in ['true','yes','1','t','y','on','enable','enabled','en','e']
+			only_sync_attributes = reverb_rule.only_sync_attributes.lower() in TRUE_CELLS
 		keep_n_versions = DEFAULT_KEEP_N_VERSIONS
 		try:
 			keep_n_versions = int(reverb_rule.keep_n_versions)
@@ -2284,6 +2281,22 @@ def read_full_comparison_interval(cell:str, job_name:str) -> float:
 	except ValueError:
 		tl.teeerror(log_text(f'Error: Rule {job_name} has invalid Full Comparison Interval value: {cell}; use a duration like 1d, 12h, 30m or 45s (a plain number is seconds), or 0 for none. Running without scheduled full comparisons'))
 		return 0
+
+# what a yes or no cell of a rule says yes with
+TRUE_CELLS = ['true','yes','1','t','y','on','enable','enabled','en','e']
+
+def read_keep_one_complete_backup(cell:str, job_name:str) -> bool:
+	'''
+	The Keep 1 Complete Backup cell: always True, as on design R the first version is the tree every later version links
+	forward to, and a tree of links to the monitored files would hold nothing. A cell saying False gets one line.
+
+	>>> read_keep_one_complete_backup('True', 'j'), read_keep_one_complete_backup('none', 'j')
+	(True, True)
+	'''
+	text = cell.strip().lower()
+	if text != 'none' and text not in TRUE_CELLS:
+		tl.teeprint(log_text(f'Keep 1 Complete Backup is False for {job_name}: from 0.55 its first version is always a complete copy'))
+	return True
 
 def read_chain_length(cell:str, job_name:str) -> int:
 	'''
@@ -4707,14 +4720,18 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		job_vault = os.path.join(vault_path,job_name)
 		def scan():
 			# the scan can change the vault: under the job's backup and restore locks, so no restore reads it meanwhile. they
-			# go before the wait for the monitored path: a disk that died is when a restore is wanted, and the versions
-			# read exact from here on, as the scan prepared a cut batch's roll-forward (prepare_roll_forward()).
-			# None when the job stops while it waits for them
+			# are held through a conversion from 0.54, and go before the wait for the monitored path: a disk that died is when a
+			# restore is wanted, and the versions read exact from here on, as the scan prepared a cut batch's roll-forward
+			# (prepare_roll_forward()). None when the job stops while it waits for them or while it converts: nothing goes
+			# on past a stop, so no batch finds the conversion unfinished
 			locks = BackupLocks(job_name, job=job)
 			if not locks.take(running):
 				return None
 			try:
-				return get_vault_info(job_vault)
+				info = get_vault_info(job_vault)
+				if NEW_VAULT_LAYOUT == 'r' and info.vault_info_dict:
+					return convert_at_start(job_vault, info, job_name, monitor_path, running, copy_threads, job)
+				return info
 			finally:
 				locks.release()
 		scanned = scan() if running() and os.path.isdir(job_vault) else None
@@ -8730,6 +8747,10 @@ class VaultManifest:
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
 		return None if row is None else row[0]
 
+	def forget_version(self):
+		'''These rows describe no version: the next batch lists them anew (describes()).'''
+		self.conn.execute("DELETE FROM meta WHERE key = 'version'")
+
 	def describes(self, version_path:str) -> bool:
 		return self.recorded_version() == os.path.basename(os.path.normpath(version_path))
 
@@ -10515,10 +10536,9 @@ def compare_monitor_entry(monitor_entry:str, monitor_stat:os.stat_result, record
 	folder_times, a folder whose mtime is not the record's is an attrib too (a record of a daemon before 0.54 holds
 	none): a full comparison's, which finds the folder times its events missed. A batch's comparisons leave them out,
 	as the folders the batch wrote into have moved times their records do not hold yet (WrittenFolders gives them).
+	A row of a 0.54 referenced backup's link (kind 'r') is of no kind a monitored entry has, so it is a 'modify', and the file
+	gets its copy: on design R the tree holds what the versions lead to, and that link holds nothing (compare_entry() keeps it on 0.54).
 	'''
-	if record.kind == 'r':
-		# the vault entry is this very file
-		return None
 	kind = entry_kind(monitor_stat.st_mode)
 	if kind != record.kind:
 		return 'modify'
@@ -10641,7 +10661,8 @@ def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_pat
 		backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Error getting stat for {monitor_entry}, treating as create')
 		return 'create', found
 	try:
-		event = compare_monitor_entry(monitor_entry, monitor_stat, record, folder_times)
+		# on 0.54 a referenced backup's link is this very file
+		event = None if record.kind == 'r' and moves is not TREE_LINKS else compare_monitor_entry(monitor_entry, monitor_stat, record, folder_times)
 		if (event is None and xattrs_since is not None and monitor_stat.st_ctime_ns >= xattrs_since and record.kind not in ('l', 'r')
 				and xattrs_differ(monitor_entry, os.path.join(version_path, rel))):
 			event = 'attrib'
@@ -13603,12 +13624,12 @@ def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 	empty_staging(job_vault)
 	return True
 
-def sizes_pass(job_vault:str, manifest:'VaultManifest') -> None:
+def sizes_pass(job_vault:str) -> None:
 	'''
 	Every change list of job_vault names what spec section 6 says its version holds: each inode counted once, in the newest version
 	holding it, by a walk of every version folder, newest first. A cut batch's tree has no list, but it comes first, as the newest
 	holder of what it holds. A list already right is not touched, so a cut pass is run again and a second one changes
-	nothing. manifest is not read: only what the folders hold counts. Raises OSError, or VaultScanError when the vault cannot be read.
+	nothing. Raises OSError, or VaultScanError when the vault cannot be read.
 	'''
 	listing = read_job_vault(job_vault, judge_orphans=False)
 	folders = {vault_version_number(os.path.basename(path)): path for path in listing.orphans}
@@ -13640,7 +13661,8 @@ def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, sto
 	way, and gets back the times of its folder, kept in the manifest before anything changes; then the sizes pass; only then
 	the layout is set, and the prune's files go after it. A version counts as done only once flushed: the manifest's word must not outlive its swap
 	in a power cut. A cut anywhere is resumed by a scan and another call, every step being idempotent, and the rows stand,
-	as every file keeps its inode. Until the layout is set no batch runs (VaultManifest.conversion_unfinished()).
+	as every file keeps its inode, unless they name a version past the newest: a commit the 0.54 rules undid, which they are told to forget.
+	Until the layout is set no batch runs (VaultManifest.conversion_unfinished()).
 
 	On a vault of forward links whose manifest was lost this changes no version, and the sizes pass is right there too.
 
@@ -13655,6 +13677,12 @@ def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, sto
 		found[os.path.basename(entry.path)] = [st.st_atime_ns, st.st_mtime_ns]
 	manifest.begin()
 	manifest.begin_migration(found)
+	# a commit the 0.54 rules undid leaves its name here, which they read past, as current_version outranks it. the R scan reads the
+	# manifest first, and would wait for that version's list for ever: its rows are listed anew by the next batch either way
+	named = manifest.recorded_version()
+	number = None if named is None else vault_version_number(named)
+	if number is not None and number > max(versions, default=-1):
+		manifest.forget_version()
 	manifest.commit()
 	times = manifest.version_times()
 	# on the disk before any version changes: with it there the 0.54 rules never run again (vault_layout())
@@ -13681,12 +13709,62 @@ def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, sto
 		manifest.commit()
 	if stopped():
 		return False
-	sizes_pass(job_vault, manifest)
+	sizes_pass(job_vault)
 	manifest.begin()
 	manifest.set_layout('r')
 	manifest.commit()
 	remove_054_files(job_vault)
 	return True
+
+def finish_cut_prune(job_vault:str, versions:OrderedDict, manifest:'VaultManifest', job_name:str, monitor_path:str, threads:int = None) -> None:
+	'''
+	One of the 0.54 rules (spec section 3.1), on a vault on a mergerfs pool: a prune of the oldest of versions cut off before its first
+	flush, which left the next version's links in any mix of states, is finished by decrement_stepper(), the one prune that repairs that, as
+	the conversion would make the mix the version's plain tree and take the marker away. A marker that cannot be read is
+	a write of it cut off, by a prune then under way: the stepper reads it the same way. Raises JobFailure while the oldest version
+	stays, so nothing is converted: the next attempt tries again.
+	'''
+	if len(versions) < 2 or not PoolGuard([job_vault]).covers(job_vault):
+		return
+	oldest = next(iter(versions))
+	path = versions[oldest].path
+	try:
+		if read_prune_marker(job_vault) != os.path.basename(path):
+			return
+	except UnreadablePruneMarker as e:
+		backuperTeeLogToTl(job_name, f'{e}: taken for a prune of {path} cut off before its flush', error=True)
+	backuperTeeLogToTl(job_name, f'Finishing the prune of {path}, which was cut off before its flush, before converting the vault')
+	prune_oldest(versions, job_name, monitor_path, [], monitor_paths=manifest_monitor_paths(manifest), prune_salt=vault_prune_salt(job_vault, job_name), threads=threads)
+	if oldest in versions:
+		raise JobFailure(f'the prune of {path} cut off before its flush has not finished, so {job_vault} is not converted from 0.54 yet')
+
+def convert_at_start(job_vault:str, info:VaultInfo, job_name:str, monitor_path:str, running, threads:int = None, job:JobControl = None) -> 'VaultInfo | None':
+	'''
+	The scan of a job's start once its vault is on design R, the job's locks held, and the 0.54 rules or the R scan having given info,
+	which holds versions: info itself on a vault that is already, else a new scan after the conversion, as the sizes in info
+	are 0.54's. A pool's cut prune is the last of the 0.54 rules, so it never runs once staging is there. The job's status shows
+	the conversion as a wait. None when running() turned false and the conversion stopped, the rest left for the next start. Raises
+	JobFailure, with the versions reading as they did: the next attempt goes on, and no other job is touched.
+	'''
+	manifest = VaultManifest(job_vault)
+	wait = None
+	try:
+		if manifest.layout() == 'r':
+			return info
+		if job is not None:
+			wait = job.begin_wait(None, 'converting the vault from 0.54')
+		if vault_layout(job_vault, manifest) == '0.54':
+			finish_cut_prune(job_vault, info.vault_info_dict, manifest, job_name, monitor_path, threads)
+		if not migrate_job_vault(job_vault, manifest, job_name, lambda: not running()):
+			return None
+		return get_vault_info(job_vault, manifest=manifest)
+	except (OSError, sqlite3.Error) as e:
+		# the error first, as status cuts a reason short
+		raise JobFailure(f'{e}: the conversion of {job_vault} from 0.54 stopped, and the next attempt goes on with it') from e
+	finally:
+		if wait is not None:
+			job.end_wait(wait)
+		manifest.close()
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
