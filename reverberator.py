@@ -15381,13 +15381,15 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 
 	The move rows are kept in the list's order, which is the order of the moves where a folder move follows a move into it
 	(the rows name the folder as the first move left it). moved_from undoes the rows newest first and moved_to applies them
-	oldest first (follow_moves()), so each names a path a version held. A move back to the same name reads none.
+	oldest first (follow_moves()), so each names a path a version held. A move back to the same name reads none, and a move
+	of a folder after the path was deleted from it does not take the path along.
 	'''
 	own = path.rstrip('/')
 	prefix = own + '/'
 	row_found = None
 	# (where it went to, where it came from) of each move row
 	move_rows = []
+	deleted_at = None
 	counts = dict.fromkeys(CHANGE_EVENTS, 0) if folder else None
 	files = [] if folder and list_files else None
 	recopied = False
@@ -15398,6 +15400,8 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 			continue
 		if its_own:
 			row_found = row
+			if row.event == 'delete' and deleted_at is None:
+				deleted_at = len(move_rows)
 		elif folder and row.path.startswith(prefix) and row.event in counts:
 			counts[row.event] += 1
 			if files is not None:
@@ -15410,7 +15414,7 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 		if row.event == 'move' and row.source_path:
 			move_rows.append((row.path, row.source_path))
 	moved_from = follow_moves(own, move_rows[::-1])
-	moved_to = follow_moves(own, [(source, path) for path, source in move_rows])
+	moved_to = follow_moves(own, [(source, path) for path, source in move_rows[:deleted_at]])
 	return PathChanges(row_found, moved_from, moved_to, counts, files, recopied)
 
 def listed_path_changes(job_vault:str, version:KeptVersion, path:str, folder:bool, list_files:bool, reading:VaultReading) -> PathChanges:

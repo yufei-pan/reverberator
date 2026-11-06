@@ -241,6 +241,18 @@ def test_a_swap_of_two_names_through_a_third_names_each_others(job):
 	assert (changes['q'].moved_from, changes['q'].moved_to) == (f'{m}/p', f'{m}/p')
 
 
+def test_a_file_deleted_before_its_folder_moves_reads_as_deleted(job):
+	m = job.monitor
+	write(job, 'e/sub', 'S')
+	write(job, 'e/kept', 'K')
+	run_backup(job)
+	os.remove(f'{m}/e/sub')
+	os.rename(f'{m}/e', f'{m}/g')
+	backup_events(job, [(False, 'delete', 'e/sub', None), (True, 'move', 'g', 'e')], keep_n_versions=0)
+	assert moves(hist(job, 'e/sub'))[0][:2] == (1, 'delete')
+	assert moves(hist(job, 'e/kept'))[0] == (1, 'moved_away', f'{m}/g/kept')
+
+
 def test_a_file_moved_into_a_folder_that_then_moves_is_followed_forward(job):
 	m = job.monitor
 	write(job, 'k', 'K')
