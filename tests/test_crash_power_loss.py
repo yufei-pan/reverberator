@@ -121,6 +121,28 @@ def test_the_helper_refuses_a_loop_device_of_someone_else(monkeypatch, tmp_path)
 	assert 'f2fs_io' not in ran and 'sync' not in ran
 
 
+def test_a_loop_device_taken_by_another_run_between_find_and_set_up_is_tried_again(monkeypatch, tmp_path):
+	# losetup -f finds a free device and then sets it up: two runs at once can both find the same one, and the second exits 1. nothing has been
+	# done to the vault then, so it is not a run gone wrong
+	answers = [subprocess.CompletedProcess(['losetup'], 1, '', 'losetup: cannot find free device'), subprocess.CompletedProcess(['losetup'], 1, '', ''),
+		subprocess.CompletedProcess(['losetup'], 0, '/dev/loop9\n', '')]
+	tried = []
+	def answering(command, *args, **kwargs):
+		tried.append(command[0])
+		return answers.pop(0)
+	monkeypatch.setattr(scratch_images.subprocess, 'run', answering)
+	monkeypatch.setattr(scratch_images.time, 'sleep', lambda seconds: None)
+	monkeypatch.setattr(scratch_images, 'ATTACHED', {})
+	image = LoopImage(str(tmp_path), 1)
+	image.image = str(tmp_path / 'image')
+	image.attach()
+	assert image.device == '/dev/loop9' and tried == ['losetup'] * 3 and scratch_images.ATTACHED == {'/dev/loop9': image.image}
+	# a device that never comes is an error, after a few tries
+	answers[:] = [subprocess.CompletedProcess(['losetup'], 1, '', 'busy')] * scratch_images.ATTACH_TRIES
+	with pytest.raises(subprocess.CalledProcessError):
+		image.attach()
+
+
 def test_no_test_calls_f2fs_io_or_syncfs_but_through_the_helper():
 	tests = os.path.dirname(os.path.abspath(__file__))
 	for name in sorted(os.listdir(tests)):

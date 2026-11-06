@@ -4,10 +4,12 @@ else lives there. Keep REVERB_SCRATCH private; a tmpfs folder such as /dev/shm/r
 '''
 import contextlib
 import os
+import random
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 import pytest
 
@@ -50,6 +52,8 @@ class NotOurLoopImage(Exception):
 	'''A flush or a shutdown asked of anything but a loop image this test process attached under REVERB_SCRATCH.'''
 
 
+# how often a loop device is asked for (LoopImage.attach())
+ATTACH_TRIES = 6
 # the loop devices this process attached: device -> its image
 ATTACHED = {}
 
@@ -109,7 +113,18 @@ class LoopImage:
 		subprocess.run(['mount', '-t', 'f2fs', '-o', F2FS_OPTIONS.removeprefix('loop,'), self.device, self.mount_point], check=True)
 
 	def attach(self) -> None:
-		self.device = subprocess.run(['losetup', '-f', '--show', self.image], check=True, capture_output=True, text=True).stdout.strip()
+		'''
+		The image on a loop device. losetup -f finds a free device and then sets it up, so two runs at once can find the same one and the second exits 1:
+		it is tried again, a few times, as nothing of the test has begun.
+		'''
+		for attempt in range(ATTACH_TRIES):
+			found = subprocess.run(['losetup', '-f', '--show', self.image], capture_output=True, text=True)
+			if found.returncode == 0:
+				break
+			time.sleep(random.uniform(0.05, 0.3) * (attempt + 1))
+		else:
+			raise subprocess.CalledProcessError(found.returncode, found.args, found.stdout, found.stderr)
+		self.device = found.stdout.strip()
 		ATTACHED[self.device] = self.image
 
 	def detach(self) -> None:

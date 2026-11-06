@@ -925,25 +925,32 @@ def run_all(shape: Shape, runs: list, held: int, tag: str = '', cut_fault=None, 
 			with open(f'{results}.{number}', 'w') as f:
 				for kill, *cuts in runs[number::count]:
 					started = time.monotonic()
+					rig = None
 					try:
 						lines = runner(shape, work, kill, tuple(cuts), cut_fault, retry_fault)
 					except Exception:
-						lines = [f'the rig: {traceback.format_exc()}']
-					f.write(json.dumps({'shape': shape.name, 'kill': kill, 'cuts': cuts, 'wrong': lines[:8], 'seconds': round(time.monotonic() - started, 3)}) + '\n')
+						# the rig failed (a mount, an image), which is the test's own and no run gone wrong: kept apart from the wrong ones
+						lines, rig = [], traceback.format_exc()
+					f.write(json.dumps({'shape': shape.name, 'kill': kill, 'cuts': cuts, 'wrong': lines[:8], 'rig': rig, 'seconds': round(time.monotonic() - started, 3)}) + '\n')
 					f.flush()
 		return job
 	failures = in_workers([worker(number) for number in range(count)])
 	assert not any(failures), [failure for failure in failures if failure][:2]
 	wrong = []
+	rigs = []
 	with open(results, 'a') as whole:
 		for number in range(count):
 			with open(f'{results}.{number}') as f:
 				for text in f:
 					whole.write(text)
-					if json.loads(text)['wrong']:
-						wrong.append(json.loads(text))
+					row = json.loads(text)
+					if row['wrong']:
+						wrong.append(row)
+					if row['rig']:
+						rigs.append(row)
 			os.remove(f'{results}.{number}')
 	shutil.rmtree(os.path.join(shape.base, 'work'), ignore_errors=True)
+	assert not rigs, f'the rig failed in {len(rigs)} of {len(runs)} runs, which are no runs gone wrong: {rigs[0]["rig"]}'
 	return wrong
 
 
