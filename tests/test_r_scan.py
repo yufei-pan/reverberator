@@ -575,6 +575,34 @@ def test_a_conversion_begun_with_no_staging_and_no_version_runs_v0(r_job):
 		manifest.close()
 
 
+@pytest.mark.parametrize('scanned_first', [True, False], ids=['scan_then_backup', 'backup_scans'])
+def test_a_conversion_begun_with_no_staging_and_only_an_orphan_version_folder_runs_v0(r_job, scanned_first):
+	# a folder of the version after the recorded one, with no list, where the conversion had begun: the 0.54 scan clears it, and the next attempt is V0 and ends the conversion
+	build_base(r_job, **KEPT)
+	manifest = opened_manifest(r_job)
+	manifest.begin()
+	manifest.conn.execute("DELETE FROM meta WHERE key = 'layout'")
+	manifest.begin_migration({})
+	manifest.commit()
+	manifest.close()
+	start_over(r_job)
+	shutil.rmtree(rv.staging_path(r_job.job_vault))
+	orphan = os.path.join(r_job.job_vault, 'V3--2026-11-06_04-58-06_-0800')
+	os.mkdir(orphan)
+	with open(os.path.join(orphan, 'half'), 'w') as f:
+		f.write('half a copy')
+	if scanned_first:
+		assert dict(rv.get_vault_info(r_job.job_vault).vault_info_dict) == {}
+		assert not os.path.lexists(orphan)
+	run_backup(r_job)
+	assert os.path.isdir(folder_of(r_job, 0))
+	manifest = opened_manifest(r_job)
+	try:
+		assert manifest.layout() == 'r' and not manifest.conversion_unfinished()
+	finally:
+		manifest.close()
+
+
 def test_a_vault_shown_empty_by_a_missing_disk_is_still_refused(r_job, fake_pool, monkeypatch):
 	build_base(r_job, **KEPT)
 	start_over(r_job)
