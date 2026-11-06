@@ -13070,7 +13070,7 @@ def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, sto
 		if stopped():
 			return False
 		name = os.path.basename(versions[number].path)
-		backuperTeeLogToTl(job_name, f'Converting {job_name} vault: V{number} ({index} of {len(todo)})')
+		backuperTeeLogToTl(job_name, f'Converting {job_name} vault: V{number} ({index} of {len(todo)})', ok=True)
 		changed = needs_plain_tree(job_vault, name)
 		if changed and not materialize_version(job_vault, name, stop):
 			return False

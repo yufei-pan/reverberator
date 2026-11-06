@@ -235,6 +235,19 @@ def test_a_version_left_whole_gets_its_line_too(small):
 	assert [line for line in lines if line.startswith('Converting ')] == ['Converting job vault: V2 (1 of 3)', 'Converting job vault: V1 (2 of 3)', 'Converting job vault: V0 (3 of 3)']
 
 
+def test_each_conversion_line_reaches_the_journal(small):
+	# the Rollout says to watch the journal, which gets stdout: only a line sent the ok way is teed to it
+	seen = []
+	real = rv.backuperTeeLogToTl
+	rv.backuperTeeLogToTl = lambda *args, **kwargs: (seen.append((args[1] if len(args) > 1 else kwargs.get('message'), kwargs)), real(*args, **kwargs))[1]
+	try:
+		assert migrate(small) is True
+	finally:
+		rv.backuperTeeLogToTl = real
+	lines = [(message, kwargs) for message, kwargs in seen if message.startswith('Converting ')]
+	assert len(lines) == 3 and all(kwargs.get('ok') is True for _, kwargs in lines)
+
+
 def test_a_dangling_chain_stays_the_link(small):
 	names = folders_of(small)
 	# the end of a's chain, gone by hand
