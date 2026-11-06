@@ -9,13 +9,15 @@ version pruned by the batch is not compared. A vault with no staging folder is o
 so the suite's cost stays flat. A tree of more than MAX_ENTRIES is not read either, and nothing is checked while tracemalloc
 traces, so a memory test measures the daemon alone. REVERB_VIEW_GROUND_TRUTH=0 turns the plugin off.
 
+After a batch that committed, each kept version's change list must also name what the oracle counts it as holding (spec section 6).
+
 A test that means to break a version (a negative control) takes the lines out of WRONG, having looked at them.
 '''
 import os
 import tracemalloc
 import pytest
 import reverberator as rv
-from tests.vault_oracle import STAGING, VERSION_LIST, compared, read_view, version_number
+from tests.vault_oracle import STAGING, VERSION_LIST, compared, read_view, sizes_by_newest_holder, version_number
 
 ENABLED = os.environ.get('REVERB_VIEW_GROUND_TRUTH', '1') != '0'
 MAX_ENTRIES = 5000
@@ -61,6 +63,21 @@ def differences(job_vault: str, before: dict, only_sync_attributes: bool) -> lis
 	return lines
 
 
+def wrong_lists(job_vault: str) -> list:
+	'''The kept versions whose change list does not name what the oracle counts, as lines.'''
+	sizes = sizes_by_newest_holder(job_vault)
+	names = os.listdir(job_vault)
+	lines = []
+	for name in names:
+		number = version_number(name)
+		if number is None:
+			continue
+		wanted = os.path.basename(rv.change_list_path(os.path.join(job_vault, name), *sizes[number]))
+		if wanted not in names:
+			lines.append(f'{name}: its list should be {wanted}, the lists are {sorted(listed for listed in names if listed.startswith(name + "--"))}')
+	return lines
+
+
 def checking_do_backup(backup_entries, job_name, monitor_path, vault_path, *args, **kwargs):
 	job_vault = os.path.join(vault_path, job_name)
 	if tracemalloc.is_tracing() or not os.path.lexists(os.path.join(job_vault, STAGING)):
@@ -68,7 +85,10 @@ def checking_do_backup(backup_entries, job_name, monitor_path, vault_path, *args
 	before = views_of(job_vault)
 	only_sync_attributes = args[1] if len(args) > 1 else kwargs.get('only_sync_attributes')
 	try:
-		return _wrapped(backup_entries, job_name, monitor_path, vault_path, *args, **kwargs)
+		result = _wrapped(backup_entries, job_name, monitor_path, vault_path, *args, **kwargs)
+		if before is not None and result[2]:
+			WRONG.extend(wrong_lists(job_vault))
+		return result
 	finally:
 		if before is not None:
 			TOTALS['batches'] += 1

@@ -13,7 +13,7 @@ from tests.crash_child import failing_copy_command
 from tests.harness import create_job, event_entry, run_backup
 from tests.vault_oracle import check_vault, forward_text, linked_place, read_view, snapshot_tree, version_number
 
-# no prune here: a batch's prune on R is a later task's
+# every version stays to be read; tests/test_r_sizes.py runs each item through a real keep-N
 KEPT = dict(keep_n_versions=0)
 
 
@@ -232,10 +232,10 @@ def test_an_attempt_in_the_same_second_changes_nothing(r_job, monkeypatch):
 	item_modify(r_job.monitor)
 	taken = []
 	real = rv.hand_over
-	def taken_folder(job_vault, newest, new):
+	def taken_folder(job_vault, newest, new, *rest):
 		os.mkdir(new)
 		taken.append(new)
-		return real(job_vault, newest, new)
+		return real(job_vault, newest, new, *rest)
 	monkeypatch.setattr(rv, 'hand_over', taken_folder)
 	_, manifest, committed = rv.do_backup(rv.OrderedDict(), job_name=r_job.job_name, monitor_path=r_job.monitor, vault_path=r_job.vault, **{**OPTIONS, **KEPT})
 	assert committed is False and taken
@@ -378,8 +378,8 @@ def test_a_file_removed_by_hand_then_copied_again_reads_missing_in_the_older_ver
 def removed_after_the_hand_over(monkeypatch, *rels):
 	'''A hand removes rels from the tree just after the hand-over, so the previous version's links to them lead nowhere.'''
 	real = rv.hand_over
-	def removing(job_vault, newest, new):
-		writer = real(job_vault, newest, new)
+	def removing(job_vault, newest, new, *rest):
+		writer = real(job_vault, newest, new, *rest)
 		for rel in rels:
 			path = os.path.join(new, rel)
 			shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
@@ -411,8 +411,8 @@ def test_a_forward_link_whose_entry_is_gone_goes_with_a_warning_and_the_job_goes
 def test_a_forward_link_whose_entry_is_gone_fails_the_attempt_on_a_pool(r_job, monkeypatch):
 	build_base(r_job, **KEPT)
 	real = rv.hand_over
-	def removing(job_vault, newest, new):
-		writer = real(job_vault, newest, new)
+	def removing(job_vault, newest, new, *rest):
+		writer = real(job_vault, newest, new, *rest)
 		os.remove(os.path.join(new, 'top.txt'))
 		monkeypatch.setattr(rv, 'pool_state', lambda *args, **kwargs: object())
 		return writer
