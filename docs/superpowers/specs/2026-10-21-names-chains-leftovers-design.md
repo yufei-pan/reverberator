@@ -107,7 +107,7 @@ Made by Claude while designing (flagged so they can be checked):
 
 ## Appendix: round 3's deferred items
 
-From the round 3 ledger (saved at <scratchpad>/history-restore-ledger.md);
+From the round 3 ledger (saved at <scratchpad>);
 items already fixed in round 3's final fix wave are left out.
 
 | # | Item | Plan |

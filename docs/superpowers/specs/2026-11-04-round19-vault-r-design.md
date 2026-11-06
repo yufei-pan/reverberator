@@ -33,7 +33,7 @@ Background: study `r19/design/report.md`, reviews `r19/opus-review.md` and `r19/
 # reverberator 0.55: design R, second pass (the spec, revision 2)
 
 I wrote no daemon code, and the repo was not touched. The prototype and results are in scratch:
-- Scripts: `<scratchpad>/r19/design2/scripts/`
+- Scripts: `<scratchpad>`
   - `r2.py`: writer, scan, reader and the checked walk.
   - `crash.py`: the oracle harness.
   - `recheck.py`: the history-walk test.

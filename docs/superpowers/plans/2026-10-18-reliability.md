@@ -1282,6 +1282,6 @@ Expected: PASS
 - [ ] **Step 5: Commit** `firewatcher/reverberator.txt README.md reverberator.py pyproject.toml tests/test_jobs.py` — "Ship a firewatcher pattern for the failure markers, document them, bump to 0.38."
 
 - [ ] **Step 6 (controller, after asking the user — not an implementer step):** with the user's explicit OK at this point:
-  1. Copy `firewatcher/reverberator.txt` to `/etc/firewatcher/patterns.d/reverberator.txt`; check how firewatcher loads patterns (`firewatcher --help`, its source under `/root/.local/bin/firewatcher`) and restart `firewatcher.service` only if it reads patterns only at start; confirm it is active afterwards.
+  1. Copy `firewatcher/reverberator.txt` to `/etc/firewatcher/patterns.d/reverberator.txt`; check how firewatcher loads patterns (`firewatcher --help`, its source) and restart `firewatcher.service` only if it reads patterns only at start; confirm it is active afterwards.
   2. Add `RestartPreventExitStatus=3` under `[Service]` in `/etc/systemd/system/reverberator.service`, run `systemctl daemon-reload`, and confirm with `systemctl show reverberator.service -p RestartPreventExitStatus`.
   3. Do not restart `reverberator.service`: report that the new version takes effect when the user restarts it.

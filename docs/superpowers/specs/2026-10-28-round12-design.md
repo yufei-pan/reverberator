@@ -120,7 +120,7 @@ rebuilding the batch.
 ## Constraints
 
 - Work in `.worktrees/round12`, branch `round12`; never in the live checkout; never write under /mnt/vaults, /mnt/pool,
-  /mnt/pool2 or /etc; never read /etc/firewatcher/firewatcher.conf; never `sudo sysctl`; tests at 2 processes at most;
+  /mnt/pool2 or /etc; never read the firewatcher config file; never `sudo sysctl`; tests at 2 processes at most;
   both full suites pass (worktree venv and the live venv's older libraries).
 - The user's rules: /mnt/fast/work/agent-rules/RULES.md.
 
