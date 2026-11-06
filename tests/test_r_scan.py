@@ -357,6 +357,30 @@ def test_current_version_moves_forward(r_job):
 	assert os.readlink(os.path.join(r_job.job_vault, 'current_version')) == os.path.basename(folder_of(r_job, 2))
 
 
+@pytest.mark.parametrize('kind', ['file', 'folder'])
+def test_a_current_version_that_is_no_link_fails_the_scan_and_is_left_as_it_is(r_job, kind):
+	# something there that is no link, which the move forward would replace (a file) or fail on (a folder)
+	build_base(r_job, **KEPT)
+	link = os.path.join(r_job.job_vault, 'current_version')
+	os.remove(link)
+	if kind == 'file':
+		with open(link, 'w') as f:
+			f.write('mine')
+	else:
+		os.mkdir(link)
+		open(os.path.join(link, 'inside'), 'w').close()
+	# a skeleton the scan would remove, and a stale list: nothing is touched before the refusal
+	os.mkdir(new_folder(r_job))
+	before = sorted(os.listdir(r_job.job_vault))
+	with pytest.raises(rv.VaultScanError, match='current_version is no link'):
+		rv.get_vault_info(r_job.job_vault)
+	assert sorted(os.listdir(r_job.job_vault)) == before
+	if kind == 'file':
+		assert open(link).read() == 'mine'
+	else:
+		assert os.listdir(link) == ['inside']
+
+
 def test_the_private_list_of_an_uncommitted_attempt_goes(r_job):
 	build_base(r_job, **KEPT)
 	tree = cut_batch(r_job)

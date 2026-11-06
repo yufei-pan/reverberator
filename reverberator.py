@@ -6265,6 +6265,10 @@ VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans'
 # records none, or was not read as the link gave the number)
 LatestRecord = namedtuple('LatestRecord', ['number', 'link', 'manifest', 'recorded'])
 
+def no_link_error(link:str) -> VaultScanError:
+	# never the daemon's own: it makes the entry by a link's swap alone
+	return VaultScanError(f'{link} is no link, which the daemon\'s own never is: it is left as it is (move it away and the job goes on)')
+
 def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 	'''
 	The latest version a commit got under way for, as job_vault_path records it: by the text of its current_version
@@ -6284,8 +6288,7 @@ def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 		has_link = False
 	except OSError as e:
 		if e.errno == errno.EINVAL:
-			# never the daemon's own: it makes the entry by a link's swap alone
-			raise VaultScanError(f'{link} is no link, which the daemon\'s own never is: it is left as it is (move it away and the job goes on)')
+			raise no_link_error(link)
 		raise VaultScanError(f'cannot read {link}: {e}')
 	path = os.path.join(job_vault_path, MANIFEST_FILE_NAME)
 	try:
@@ -6887,6 +6890,13 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	listing = read_vault_whole(job_vault, guard, judge_orphans=False)
 	if listing is None:
 		return VaultInfo({},0,0)
+	# before anything acts: the move forward would replace a file there, and fail on a folder after the batch ran
+	link = os.path.join(job_vault, 'current_version')
+	try:
+		os.readlink(link)
+	except OSError as e:
+		if e.errno == errno.EINVAL:
+			raise no_link_error(link)
 	try:
 		if finish_r_commit(job_vault, manifest, listing):
 			listing = read_vault_whole(job_vault, guard, judge_orphans=False)
