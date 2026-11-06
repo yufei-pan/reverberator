@@ -15393,7 +15393,7 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 	place and with the source its first move left, so the order is not that of the moves, and the name a row gives is not
 	always one a version held. follow_moves() reads them: moved_from undoes the rows newest first and moved_to applies them
 	oldest first, each taking the path's own row before the others. A move back to the same name reads none, and a delete of
-	the path ends what moved_to follows: a folder moved after that does not take the path along.
+	the path, or of a folder above it, ends what moved_to follows: a folder moved after that does not take the path along.
 	'''
 	own = path.rstrip('/')
 	prefix = own + '/'
@@ -15409,10 +15409,11 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 		if row.event == 'recopy':
 			recopied = recopied or its_own
 			continue
+		if row.event == 'delete' and deleted_at is None and (its_own or (row.path.endswith('/') and prefix.startswith(row.path))):
+			# the path, or a folder above it, is gone: what moved_to follows ends here
+			deleted_at = len(move_rows)
 		if its_own:
 			row_found = row
-			if row.event == 'delete' and deleted_at is None:
-				deleted_at = len(move_rows)
 		elif folder and row.path.startswith(prefix) and row.event in counts:
 			counts[row.event] += 1
 			if files is not None:

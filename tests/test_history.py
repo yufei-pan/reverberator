@@ -308,6 +308,20 @@ def test_a_rotation_of_three_names_each_file_the_name_it_came_from(job):
 		'a': (f'{m}/c', f'{m}/b'), 'b': (f'{m}/a', f'{m}/c'), 'c': (f'{m}/b', f'{m}/a')}
 
 
+def test_a_folder_moved_out_of_the_tree_before_its_parent_moves_reads_as_deleted(job, tmp_path):
+	# mv e/sub /outside; mv e g: one delete row for the folder, none for the file in it, and the file did not go to g
+	m = job.monitor
+	write(job, 'e/sub/f', 'F')
+	write(job, 'e/kept', 'K')
+	run_backup(job)
+	shutil.move(f'{m}/e/sub', str(tmp_path / 'outside'))
+	os.rename(f'{m}/e', f'{m}/g')
+	backup_events(job, [(True, 'delete', 'e/sub', None), (True, 'move', 'g', 'e')], keep_n_versions=0)
+	assert moves(hist(job, 'e/sub/f'))[0][:2] == (1, 'delete')
+	assert moves(folder_hist(job, 'e/sub'))[0][:2] == (1, 'delete')
+	assert moves(hist(job, 'e/kept'))[0] == (1, 'moved_away', f'{m}/g/kept')
+
+
 def test_a_file_moved_into_a_folder_that_then_moves_is_followed_forward(job):
 	m = job.monitor
 	write(job, 'k', 'K')
