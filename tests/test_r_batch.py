@@ -958,6 +958,30 @@ def test_a_failed_flush_commits_nothing(r_job, monkeypatch, failure, named):
 	assert check_vault(r_job.job_vault, {**expected, 3: wanted}, set()) == []
 
 
+def test_a_roll_forward_that_copies_nothing_flushes_the_cut_batchs_copies_before_its_commit_point(r_job, commit_steps, monkeypatch):
+	# an attribute change with Only Sync Attributes off copies a file whose content is as its row says: the roll-forward replays nothing, so
+	# no copy of its own sets the flag, and the cut batch's copy is on the disk only when a sync after it worked. its comparisons read
+	# the copy back and sync, and those syncs fail: nothing says the copy is on the disk but the commit's flush
+	options = {'only_sync_attributes': False}
+	expected = build_base(r_job, **KEPT)
+	events = chmod_file(r_job.monitor)
+	wanted = snapshot_tree(r_job.monitor)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'sync_vault_filesystems', failing_flush({'/dev/fake': OSError(errno.EIO, 'input/output error')}))
+		with pytest.raises(rv.JobFailure):
+			backup_events(r_job, events, **KEPT, **options)
+	assert version_number(os.path.basename(newest_version(r_job))) == 3
+	counted = rv.sync_vault_filesystems
+	def sync(job_vault):
+		counted(job_vault)
+		return {'/dev/fake': OSError(errno.EIO, 'input/output error')} if commit_steps[-1] == 'sync' else {}
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', sync)
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=r_job.job_name, monitor_path=r_job.monitor, vault_path=r_job.vault, matched_since=time.time_ns(), **{**OPTIONS, **KEPT, **options})
+	manifest.close()
+	assert committed is True and commit_steps == ['sync', 'sync', 'flush', 'list', 'commit']
+	assert check_vault(r_job.job_vault, {**expected, 3: wanted}, set()) == []
+
+
 def test_a_failed_flush_of_a_first_version_commits_nothing(r_job, monkeypatch):
 	put_text(r_job.monitor, 'a.txt', 'a')
 	wanted = snapshot_tree(r_job.monitor)
