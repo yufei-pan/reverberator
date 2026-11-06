@@ -202,9 +202,9 @@ def test_a_writer_given_whether_the_vault_is_on_a_pool_does_not_ask(tmp_path, mo
 	job_vault, newest = a_vault_in(tmp_path)
 	monkeypatch.setattr(rv, 'pool_state', lambda *args, **kwargs: pytest.fail('asked whether the vault is on a pool'))
 	writer = rv.hand_over(job_vault, newest, os.path.join(job_vault, 'V2--2021-01-02_00-00-00_-0800'), pooled=False)
-	assert writer.two_renames is False and writer.sizes.pooled is False
+	assert writer.two_renames is False
 	other = rv.TreeWriter(writer.tree, previous=writer.previous, job_vault=job_vault, pooled=True)
-	assert other.two_renames is True and other.sizes.pooled is True
+	assert other.two_renames is True
 
 
 def a_vault_in(tmp_path):

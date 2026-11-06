@@ -5784,7 +5784,7 @@ def do_backup(backup_entries:dict,
 			# what was the newest version holds only what the tree let go in this batch, and its list is named for that from
 			# this commit on, as the size limit counts it. the numbers are the batch's, not its old whole tree's
 			# a roll-forward's counters know nothing of what the cut batch did
-			previous_size, previous_inodes = writer.sizes.result() if tree is None else measure_previous(latest_version_info.path,tree)
+			previous_size, previous_inodes = writer.sizes.result(writer.two_renames) if tree is None else measure_previous(latest_version_info.path,tree)
 			previous_entry = latest_version_info._replace(size=previous_size,inode=previous_inodes)
 			vault_size += previous_size - latest_version_info.size
 			vault_inodes += previous_inodes - latest_version_info.inode
@@ -12349,13 +12349,9 @@ class BatchSizes:
 	the hand-over and a version's entry is recorded once.
 
 	A user's link kept by a hard link counts its inode in each version holding it, as measure_previous() and the oracle do.
-
-	pooled: the vault is on a mergerfs pool, whose attribute for a name can be a second old (links_now()). Off one, an lstat is exact and costs
-	less than half.
 	'''
-	def __init__(self, previous:str, links:int = 0, pooled:bool = True):
+	def __init__(self, previous:str, links:int = 0):
 		self.previous = previous
-		self.pooled = pooled
 		self.size = 0
 		self.inodes = links
 		self.shared = []
@@ -12374,11 +12370,15 @@ class BatchSizes:
 		self.size += FOLDER_BYTES
 		self.inodes += 1 + links
 
-	def result(self) -> tuple:
-		'''(bytes, inodes) of the previous version, as of now: the files recorded by hard links the tree has let go count. Raises OSError.'''
+	def result(self, two_renames:bool) -> tuple:
+		'''
+		(bytes, inodes) of the previous version, as of now: the files recorded by hard links the tree has let go count. Raises OSError.
+		two_renames is the writer's: a count is read the way the record took it, links_now() where the attribute for a name can be a second old
+		(a pool, a filesystem with no exchange), and an lstat, exact and less than half the cost, elsewhere.
+		'''
 		size, inodes = self.size, self.inodes
 		for rel, bytes_, links in self.shared:
-			if (links_now(os.path.join(self.previous, rel)) if self.pooled else os.lstat(os.path.join(self.previous, rel)).st_nlink) < links:
+			if (links_now(os.path.join(self.previous, rel)) if two_renames else os.lstat(os.path.join(self.previous, rel)).st_nlink) < links:
 				size += bytes_
 				inodes += 1
 		return size, inodes
@@ -12405,14 +12405,15 @@ class TreeWriter:
 	must be on every disk before the change it guards: pre_record() makes a phase's records and flushes once, and a record
 	made inline, when the phase turned out other than foreseen, is flushed by flush_if_needed() in the verb, before its change.
 
-	pooled, when given, is whether the vault is on a pool, asked once for the batch by do_backup(); a writer made alone asks.
+	pooled, when given, is whether the vault is on a pool, asked once for the batch by do_backup(); a writer made alone asks. links is
+	the number of forward links the hand-over made, the start of the sizes (BatchSizes).
 	'''
-	def __init__(self, tree:str, previous:str = None, job_vault:str = None, manifest:'VaultManifest' = None, sizes = None, pooled:bool = None):
+	def __init__(self, tree:str, previous:str = None, job_vault:str = None, manifest:'VaultManifest' = None, links:int = 0, pooled:bool = None):
 		self.tree = tree
 		self.previous = previous
 		self.job_vault = job_vault
 		self.manifest = manifest
-		self.sizes = sizes
+		self.sizes = None
 		# the real folders of previous met so far, with the (atime, mtime) each keeps: a change in one bumps them, and they are given back at once
 		self.saved = {}
 		self.staging_made = False
@@ -12429,9 +12430,8 @@ class TreeWriter:
 			if pooled is None:
 				pooled = pool_state(self.job_vault) is not None
 			self.two_renames = pooled
-			# what the previous version alone holds, told of each record below
-			if sizes is None:
-				self.sizes = BatchSizes(previous, pooled=pooled)
+			# what the previous version alone holds, told of each record below; links, those of the hand-over
+			self.sizes = BatchSizes(previous, links)
 
 	def path(self, rel:str) -> str:
 		'''Where rel is, never with a trailing /, which makes the kernel follow a link there.'''
@@ -12887,7 +12887,7 @@ def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManif
 			raise
 	times = (st.st_atime_ns, st.st_mtime_ns)
 	os.utime(built, ns=times, follow_symlinks=False)
-	writer = TreeWriter(new_path, previous=newest_path, job_vault=job_vault, manifest=manifest, sizes=BatchSizes(newest_path, links, pooled), pooled=pooled)
+	writer = TreeWriter(new_path, previous=newest_path, job_vault=job_vault, manifest=manifest, links=links, pooled=pooled)
 	if pooled or not exchanged(new_path, newest_path):
 		writer.two_renames = True
 		if not pooled:

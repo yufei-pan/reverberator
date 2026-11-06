@@ -21,10 +21,11 @@ import pytest
 
 import reverberator as rv
 from tests import version_view_ground_truth as view_truth
-from tests.crash_batches import after_retries, batch3_of, OPTIONS, prepare, restore
+from tests.crash_batches import after_retries, batch3_of, OPTIONS, prepare, put_text, restore
 from tests.crash_child import in_child, kill_run, retry
 from tests.harness import create_job, event_entry, run_backup, seed_monitor, write_rule
 from tests.scratch_images import LoopImage, needs_f2fs, SCRATCH
+from tests.test_r_sizes import assert_sizes, Run
 from tests.test_migration import cli_differences, expected, folders_of, migrate, plain_links, SMALL
 from tests.test_tree_writer import a_vault, V1, V2
 from tests.vault_oracle import check_vault, read_view, recorded_design_r, snapshot_tree, version_number
@@ -759,3 +760,33 @@ def test_hard_links_on_a_pool_read_as_one_inode_and_their_count_as_it_is():
 		os.remove(first)
 		# the count an lstat would show for a second is 2: mergerfs keeps each name's attributes that long
 		assert rv.links_now(second) == 1
+
+
+@needs_mergerfs
+def test_sizes_on_a_vault_read_as_no_pool_whose_attributes_lag_match_the_oracle(monkeypatch):
+	# the shape of any FUSE filesystem with no exchange that keeps a name's attributes for a second and is not read as a pool: the records
+	# take links_now() off two renames, and the sizes at the end must read the same way, an lstat a second old sees no drop
+	with real_pool() as root:
+		monkeypatch.setattr(rv, 'mergerfs_mount', lambda mount_table, path: None)
+		writers = []
+		real_hand_over = rv.hand_over
+		monkeypatch.setattr(rv, 'hand_over', lambda *args, **kwargs: writers.append(real_hand_over(*args, **kwargs)) or writers[-1])
+		job = create_job(root)
+		names = [f'f{number}' for number in range(40)]
+		for name in names:
+			put_text(job.monitor, name, name * 1000)
+		one = Run(job, only_sync_attributes=False)
+		try:
+			one.backup()
+			for round_ in range(3):
+				# a walk looked at each file, so the kernel holds its attributes
+				newest = one.info.vault_info_dict[max(one.info.vault_info_dict)].path
+				for name in names:
+					os.lstat(os.path.join(newest, name))
+				for name in names:
+					put_text(job.monitor, name, str(round_) * 2000)
+				one.events([(False, 'modify', name, None) for name in names])
+				assert_sizes(one)
+			assert writers and all(writer.two_renames for writer in writers)
+		finally:
+			one.close()

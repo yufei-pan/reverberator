@@ -403,18 +403,44 @@ def test_a_forward_text_too_long_counts_what_is_held_real(tmp_path):
 	deepest = '/'.join(['d'] * levels)
 	writer = rv.hand_over(job_vault, newest, os.path.join(job_vault, V2))
 	assert copy_now(writer, source_file(str(tmp_path)), deepest + '/f') == 0
-	assert writer.sizes.result() == sizes_by_newest_holder(job_vault)[1]
+	assert writer.sizes.result(writer.two_renames) == sizes_by_newest_holder(job_vault)[1]
 
 
 def test_a_moved_folder_whose_files_the_tree_lets_go_later_counts_them(tmp_path):
 	job_vault, newest = deep_vault(str(tmp_path), 3)
 	writer = rv.hand_over(job_vault, newest, os.path.join(job_vault, V2))
 	assert writer.rename('d', 'moved')
-	assert writer.sizes.result() == sizes_by_newest_holder(job_vault)[1]
+	assert writer.sizes.result(writer.two_renames) == sizes_by_newest_holder(job_vault)[1]
 	writer.remove_now('moved/d')
-	assert writer.sizes.result() == sizes_by_newest_holder(job_vault)[1]
+	assert writer.sizes.result(writer.two_renames) == sizes_by_newest_holder(job_vault)[1]
 	writer.remove_now('moved')
-	assert writer.sizes.result() == sizes_by_newest_holder(job_vault)[1]
+	assert writer.sizes.result(writer.two_renames) == sizes_by_newest_holder(job_vault)[1]
+
+
+class StaleLinkCount:
+	'''An lstat result whose link count is the one before the last drop: what a filesystem that keeps a name's attributes for a second shows.'''
+	def __init__(self, st):
+		self.st = st
+
+	def __getattr__(self, name):
+		return self.st.st_nlink + 1 if name == 'st_nlink' else getattr(self.st, name)
+
+
+def test_a_filesystem_with_no_exchange_counts_by_the_link_count_it_reads_fresh(tmp_path, monkeypatch):
+	# not a pool, so the batch is not "pooled", but with no exchange its records go by two renames and take links_now(); the sizes at the end must take
+	# the same, as a filesystem like this (FUSE, NFS) can show an lstat a second old and miss a drop
+	job_vault, newest = deep_vault(str(tmp_path), 3)
+	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
+	writer = rv.hand_over(job_vault, newest, os.path.join(job_vault, V2), pooled=False)
+	assert writer.two_renames is True
+	assert writer.rename('d', 'moved')
+	writer.remove_now('moved/d')
+	wanted = sizes_by_newest_holder(job_vault)[1]
+	assert wanted[0] > 0
+	with monkeypatch.context() as stale:
+		real = os.lstat
+		stale.setattr(rv.os, 'lstat', lambda path, *args, **kwargs: StaleLinkCount(real(path, *args, **kwargs)))
+		assert writer.sizes.result(writer.two_renames) == wanted
 
 
 def test_a_move_over_a_folder_counts_the_folder_it_replaces(r_job, run):
