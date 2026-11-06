@@ -6842,11 +6842,13 @@ def finish_tree_rename(job_vault:str, name:str) -> bool:
 	'''
 	The rename of the tree of the version in folder name to its new name may be on one disk and not on another, as each comes back from a cut at its own
 	last checkpoint. Each disk whose folder under the old name holds more than the links of a skeleton has it renamed there, directly on the disk. A
-	skeleton's own rename came after a flush, so it never meets a tree cut half way. Whether a disk changed. Raises OSError.
+	skeleton's own rename came after a flush, so it never meets a tree cut half way. A new version with its change list is committed: a skeleton left beside it is stale, and nothing is renamed. Whether a disk changed. Raises OSError.
 	'''
 	number = vault_version_number(name)
-	new_names = [other for other in os.listdir(job_vault) if is_version_folder_name(other) and vault_version_number(other) == number + 1]
-	if not new_names:
+	listed = os.listdir(job_vault)
+	new_names = [other for other in listed if is_version_folder_name(other) and vault_version_number(other) == number + 1]
+	# a new version with its list is committed, so the skeleton in staging is a stale one, and its folder holds records
+	if not new_names or any(change_list_names(other, new_names[0]) for other in listed):
 		return False
 	changed = []
 	def finish(branch:str) -> None:

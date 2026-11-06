@@ -338,6 +338,32 @@ def test_no_new_folder_means_no_tree_to_rename(split_vault):
 	assert os.path.isfile(os.path.join(b, V1, 'there/x'))
 
 
+@pytest.mark.parametrize('second', ['full', 'empty', 'none'])
+def test_a_skeleton_left_beside_a_committed_version_is_no_tree_to_rename(tmp_path, fake_pool, flushes, second):
+	# the rm of a hand-over's skeleton failed, and V2 committed since: its list is there. disk b's folder of V1 holds the only copy of what V1
+	# changed, and is not the tree of a hand-over, whatever V2 holds on that disk
+	job_vault, newest = a_vault(str(tmp_path), {'g': 'y'})
+	a, b = fake_pool.add(job_vault, ['a', 'b'])
+	os.mkdir(os.path.join(job_vault, V2))
+	os.makedirs(os.path.join(job_vault, rv.STAGING_NAME, rv.SKELETON_PREFIX + V1))
+	on_disk(b, f'{V1}/old-record', 'the only copy')
+	on_disk(a, f'{V2}/tree-a')
+	if second == 'full':
+		on_disk(b, f'{V2}/tree-b')
+	elif second == 'empty':
+		os.makedirs(os.path.join(b, V2))
+	with open(rv.change_list_path(os.path.join(job_vault, V2), 1024, 1), 'w'):
+		pass
+	manifest = rv.VaultManifest(job_vault)
+	try:
+		rv.repair_pool_vault(job_vault, manifest)
+	finally:
+		manifest.close()
+	assert os.path.isfile(os.path.join(b, V1, 'old-record'))
+	assert not os.path.lexists(os.path.join(b, V2, 'old-record'))
+	assert flushes == []
+
+
 def conversion_in_staging(job_vault: str, names: dict) -> None:
 	"""Staging holding each of names, {name: one file's rel in it}, in the job vault shown."""
 	for name, rel in names.items():
