@@ -244,7 +244,7 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 	version shares, and every file of the newest version, are compared whole. A cut batch's tree, a version folder with no list,
 	is no version read here, and it shares with the newest listed version, which is then loose as an older one. Limit: an inode
 	read by one version only passes for never shared, but a batch that changes a file's attributes in place and then swaps
-	it for a fresh copy leaves a version with the changed attributes on an inode no other version reads; that exact vault is
+	it for a fresh copy, or drops it, leaves a version with the changed attributes on an inode no other version reads; that exact vault is
 	reported, and the check is not widened for it. A version's own folder must have the mode and owner of the job vault's (the
 	daemon makes both, and a version's root is recorded in its attribute instead). On design R the newest version is the real
 	tree and holds no daemon link, of 0.54's kind or any, except a user's own link whose text has that form, which the

@@ -5579,7 +5579,7 @@ def do_backup(backup_entries:dict,
 	# copy_threads: the job's Copy threads, the threads of the referenced copy and the prune, None for REFERENCED_COPY_THREADS
 	# job: the job's JobControl, None outside the daemon: the wait for the locks shows in its status and ends when it stops running
 	# a vaultInfo with a tree (design R) holds a cut batch's tree: this backup rolls it forward, a batch with no hand-over that
-	# compares the whole tree and always commits (spec section 3, plan S4); of the entries given only a plain file modify the comparison could not see is used (roll_forward_entries())
+	# compares the whole tree and always commits (spec section 3, plan S4); of the entries given only a plain file's change the comparison could not see is used (roll_forward_entries())
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -6760,10 +6760,11 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 		changed_since_wall:int = None, pool_guard:'PoolGuard' = None) -> OrderedDict:
 	'''
 	What the roll-forward of the tree info.tree replays (plan S4): what a full comparison finds between the monitored tree and that
-	tree, and one thing more from the entries a stop saved (given): each plain file "modify" that the comparison did not find, under
-	either form of its key, while the monitored path is a regular file now. A file rewritten at its size, with its mtime set back,
-	looks the same to the comparison, and only the watcher saw it; a copy of an unchanged file is only a spare one. No other saved entry is
-	used (no folder, move, delete or attribute change): the comparison covers the whole tree, and an entry it did not find would fight what it
+	tree, and one thing more from the entries a stop saved (given): each plain file "modify", "create" or "move" that the comparison did
+	not find, under either form of its key, while the monitored path is a regular file now, replayed as a modify. A file rewritten at its
+	size, with its mtime set back, looks the same to the comparison however it was written (in place, removed and made again, or a file
+	renamed over it), and only the watcher saw it; a copy of an unchanged file is only a spare one. No other saved entry is used (no folder,
+	delete or attribute change): the comparison covers the whole tree, and an entry it did not find would fight what it
 	found, as a file that became a folder since would. delta_generate_backup_entries() is never called on it, as it commits naming the
 	version it compares, and it would name the tree. All of it is in a transaction the commit of the version ends, or a cut rolls back; a manifest
 	that does not describe the previous version, as a lost one, lists the tree first. A stop leaves the comparison partial, for the caller to
@@ -6784,11 +6785,11 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 		manifest.rollback()
 		raise
 	for path, values in given.items():
-		if values.event != 'modify' or path.endswith('/') or path in found or path + '/' in found:
+		if values.event not in ('modify', 'create', 'move') or path.endswith('/') or path in found or path + '/' in found:
 			continue
 		try:
 			if stat.S_ISREG(os.lstat(path).st_mode):
-				found[path] = values
+				found[path] = values._replace(event='modify', source_path=None)
 		except OSError:
 			# gone, or a parent of it is a file now: the comparison says what is there
 			pass

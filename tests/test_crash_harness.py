@@ -757,6 +757,23 @@ def canonical_monitor(monitor):
 	with open(os.path.join(monitor, 'big.bin'), 'wb') as f:
 		f.write(b'x' * BIG)
 	os.utime(os.path.join(monitor, 'big.bin'), ns=(STAMP + 3, STAMP + 3))
+	# the rewrite of big.bin, from an earlier batch: renamed over it, it looks the same to a comparison
+	with open(os.path.join(monitor, 'spare.bin'), 'wb') as f:
+		f.write(rewritten_big())
+	os.utime(os.path.join(monitor, 'spare.bin'), ns=(STAMP + 3, STAMP + 3))
+
+
+def rewritten_big():
+	return b'x' * 10 + b'NEW' + b'x' * (BIG - 13)
+
+
+def rewrite_by_delete_and_create(monitor):
+	'''big.bin removed and made again with rewrite_in_place()'s result, as cp -p --remove-destination would.'''
+	path = os.path.join(monitor, 'big.bin')
+	os.remove(path)
+	with open(path, 'wb') as f:
+		f.write(rewritten_big())
+	os.utime(path, ns=(STAMP + 3, STAMP + 3))
 
 
 def rewrite_in_place(monitor):
@@ -785,6 +802,8 @@ def file_is_gone(monitor):
 # (what the batch changes, its events, what happens to the tree while the daemon is down); the saved entries are given again at the next start
 SAVED_ENTRIES = {
 	'rewrite': (lambda m: (put_text(m, 'a.txt', 'a1'), rewrite_in_place(m)), [(False, 'modify', 'a.txt', None), (False, 'modify', 'big.bin', None)], lambda m: None),
+	'rewrite_by_delete_and_create': (rewrite_by_delete_and_create, [(False, 'delete', 'big.bin', None), (False, 'create', 'big.bin', None)], lambda m: None),
+	'rewrite_by_rename_over': (lambda m: os.replace(os.path.join(m, 'spare.bin'), os.path.join(m, 'big.bin')), [(False, 'move', 'big.bin', 'spare.bin')], lambda m: None),
 	'created_file_becomes_folder': (lambda m: put_text(m, 'dd/new', 'n'), [(False, 'create', 'dd/new', None)],
 		lambda m: (os.remove(os.path.join(m, 'dd/new')), put_text(m, 'dd/new/in', 'inside'))),
 	'modified_file_becomes_folder': (lambda m: put_text(m, 'dd/f', 'f1'), [(False, 'modify', 'dd/f', None)], file_becomes_folder),
@@ -796,7 +815,7 @@ SAVED_ENTRIES = {
 @pytest.mark.parametrize('scenario', SAVED_ENTRIES)
 def test_a_cut_batch_is_rolled_forward_with_its_saved_entries_given_again(tmp_path, r_layout, scenario):
 	# a stop cuts the batch at each step; the tree changes while the daemon is down (or not); the next start is given the saved
-	# entries again. The comparison says what the tree is, and of the entries only a plain file modify it cannot see is added
+	# entries again. The comparison says what the tree is, and of the entries only a plain file's change it cannot see is added
 	change, events, after = SAVED_ENTRIES[scenario]
 	job = create_job(str(tmp_path))
 	canonical_monitor(job.monitor)
