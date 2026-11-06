@@ -12396,7 +12396,7 @@ class TreeWriter:
 	it is about to change. An entry of previous that is a forward link (forward_text()) means tree holds that whole
 	subtree as previous's version had it, so a change at a path is preceded by moving the old state in there: its real
 	part is the set of records, no other list is kept, and a record only acts where a forward link still stands, so running
-	one again changes nothing. Without previous (V0, the 0.54 layout) nothing is recorded. An error of a record raises
+	one again changes nothing. Without previous (V0, or a writer on a tree alone) nothing is recorded. An error of a record raises
 	before the tree changes.
 
 	two_renames (spec section 5, plan S11): the vault is on a mergerfs pool, or its filesystem has no RENAME_EXCHANGE, which the first
@@ -12838,7 +12838,7 @@ class TreeWriter:
 	def file_meta(self, source:str, rel:str, st, failed:list) -> None:
 		'''
 		source's metadata onto the entry at rel (copy_file_meta(), which reads it itself, so st goes unused and may be
-		None). An absolute rel is that path: on the 0.54 layout the end of a file's chain, in an older version. Nothing is
+		None). Nothing is
 		recorded: under Only Sync Attributes a change of a file's attributes reaches every version sharing it (spec section 2.4).
 		'''
 		copy_file_meta(source, self.path(rel), failed)
