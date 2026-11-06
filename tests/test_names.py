@@ -97,11 +97,11 @@ def test_manifest_round_trips_bad_names(job):
 	manifest.reset(version_path)
 	for rel in (folder, nested, other, name, 'café.txt'):
 		manifest.add(rel, dirty=rel != 'café.txt')
-	assert sorted(manifest.take_dirty(100)) == sorted([folder, nested, other, name])
+	assert sorted([rel for rel, _ in manifest.take_dirty_records(100)]) == sorted([folder, nested, other, name])
 	link = rv.ManifestRecord('l', None, None, 0o120777, 0, 0, None, 'target\udcff', 0)
 	manifest.set_records([(name, link), (nested, None)])
 	assert manifest.lookup(name) == link and manifest.lookup(nested) == unverified()
-	assert sorted(manifest.take_dirty(100)) == [folder, other]
+	assert sorted([rel for rel, _ in manifest.take_dirty_records(100)]) == [folder, other]
 	assert list(manifest.iter_under(folder)) == sorted([nested, other]) and manifest.counts() == (4, 1)
 	manifest.clear_seen()
 	manifest.mark_seen([name])
@@ -139,7 +139,7 @@ def test_manifest_round_trips_escape_lookalikes(job):
 	for rel in names:
 		manifest.add(rel, dirty=True)
 	assert sorted(manifest.files) == sorted(names) and manifest.folders == [folder]
-	assert sorted(manifest.take_dirty(100)) == sorted(names)
+	assert sorted([rel for rel, _ in manifest.take_dirty_records(100)]) == sorted(names)
 	link = rv.ManifestRecord('l', None, None, 0o120777, 0, 0, None, escape + '\U0010ff80' + escape, 0)
 	manifest.set_records([(rel, link) for rel in names])
 	assert all(manifest.lookup(rel) == link for rel in names)

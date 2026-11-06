@@ -8611,11 +8611,8 @@ class VaultManifest:
 		'''Mark the file records of rels unchecked, keeping the rest: each is a new copy of what it records, which delta generation reads back.'''
 		self.conn.executemany("UPDATE entries SET unchecked = 1 WHERE path = ? AND kind = 'f'", ((storable_name(rel),) for rel in rels))
 
-	def take_dirty(self, limit:int) -> list:
-		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty LIMIT ?', (limit,))]
-
 	def take_dirty_records(self, limit:int) -> list:
-		'''take_dirty(), each rel with its record, as (rel, record or None): the record is kept only for a row mark_vouched() marked.'''
+		'''The rels of the dirty rows, each with its record, as (rel, record or None): the record is kept only for a row mark_vouched() marked.'''
 		rows = []
 		for rel, *fields in self.conn.execute('SELECT path, kind, size, mtime_ns, mode, uid, gid, hash, link, unchecked FROM entries WHERE dirty LIMIT ?', (limit,)):
 			record = None if fields[0] is None else ManifestRecord(*fields)
@@ -9662,16 +9659,6 @@ class VaultMoves:
 		# an absolute link, or one outside the vault, is never a chain link: no rows to read for it
 		moves = None if os.path.isabs(link_text) else self.holding(link_path)
 		return None if moves is None else vault_chain_hop(self.job_vault, link_path, link_text, moves)
-
-	def follow(self, link_path:str, link_text:str) -> 'str | None':
-		'''
-		hop(), but a link whose version's rows cannot tell (UnexplainedChainLink) is followed to the hop its text names,
-		as reading and pruning follow a chain link. Raises UncheckedVaultLink when the link cannot be looked at.
-		'''
-		try:
-			return self.hop(link_path, link_text)
-		except UnexplainedChainLink as e:
-			return e.target
 
 def same_contents(source_path:str, path:str) -> bool:
 	'''
@@ -12054,7 +12041,7 @@ class WrittenFolders:
 ROOT_META_XATTR = 'trusted.reverberator.root'
 ROOT_META_PREFIX = 'trusted.reverberator.'
 
-# what read_root_meta() gives: the root's owner, mode ( permission bits ), times and extended attributes ( name -> bytes )
+# what load_root_meta() gives: the root's owner, mode ( permission bits ), times and extended attributes ( name -> bytes )
 RootMeta = namedtuple('RootMeta', ['uid', 'gid', 'mode', 'atime_ns', 'mtime_ns', 'xattrs'])
 
 def encode_root_meta(meta:RootMeta) -> bytes:
@@ -12093,14 +12080,6 @@ def decode_root_meta(data:bytes) -> RootMeta:
 def load_root_meta(version_path:str) -> RootMeta:
 	'''The monitored root's metadata version_path holds (record_root_meta()); OSError when it cannot be read, ValueError (or UnicodeDecodeError) when it is not a record.'''
 	return decode_root_meta(os.getxattr(version_path, ROOT_META_XATTR, follow_symlinks=False))
-
-def read_root_meta(version_path:str):
-	'''The monitored root's metadata version_path holds (record_root_meta()), None when it holds none this user can read or decode.'''
-	try:
-		return load_root_meta(version_path)
-	except (OSError, ValueError):
-		# none written ( a version before 0.54, a failed write ), no xattrs on that filesystem, no right to trusted.*, or a bad value
-		return None
 
 # the jobs whose last record_root_meta() did not keep all: (monitored path, the job's vault folder) -> 'failed' or 'trimmed', so
 # batch after batch that cannot keep it logs the first and nothing more, and one line says when it works again. Two rows
@@ -14504,10 +14483,6 @@ def status_text(view:dict) -> str:
 	# the view's texts are escaped already; this keeps any line that is not
 	return '\n'.join(shown(line) for line in lines)
 
-def format_status(status:DaemonStatus, rules:list, rule_path:str) -> str:
-	'''The status command's text: the daemon, then each job in the rule file.'''
-	return status_text(status_view(status, rules, rule_path))
-
 def status_command(args) -> int:
 	'''
 	Print the daemon's and each job's state: as text, or with --json as one JSON object on one line, both made from
@@ -15238,7 +15213,7 @@ def restore_folder_meta(source:str, dest:str, top:bool = False, warn = None):
 	'''
 	Give dest, a folder a restore made, the vault folder source's extended attributes, mode and times, then its owner
 	as the very last step: its own, all of them as it holds them. With top, dest is a whole job's top folder and source
-	its version folder, which holds the monitored root's metadata (read_root_meta()): that is given instead, and none of
+	its version folder, which holds the monitored root's metadata (load_root_meta()): that is given instead, and none of
 	the daemon's trusted.reverberator.* names; source's own when it holds no record. A record that is listed and cannot be
 	read or decoded is told to warn(why), once, before that fallback. Any other folder of a restore is a monitored
 	folder's own and gets all its names, a copy of a vault inside the monitored tree included. All of it is done on dest as

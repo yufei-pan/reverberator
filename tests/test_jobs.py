@@ -977,5 +977,5 @@ def test_each_nameless_row_quotes_its_own_name():
 def test_status_shows_a_nameless_job_as_stopped(tmp_path):
 	rules = [rv.ReverbRule(rv.NamelessJobName('!!!'), '/m', str(tmp_path), *['']*9)]
 	status = rv.DaemonStatus(None, False, {})
-	text = rv.format_status(status, rules, '/r/rules.tsv')
+	text = rv.status_text(rv.status_view(status, rules, '/r/rules.tsv'))
 	assert "!!!  stopped: its name has no letters, digits, '-' or '_' left after cleanup; rename it in /r/rules.tsv" in text

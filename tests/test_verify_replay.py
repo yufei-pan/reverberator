@@ -1515,7 +1515,7 @@ def test_version_folders_stay_the_daemons_and_keep_the_monitored_roots_metadata_
 	root_meta = lambda path: (lambda st: rv.RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns,
 		{name: os.getxattr(path, name) for name in os.listxattr(path)}))(os.lstat(path))
 	v0_meta = root_meta(job.monitor)
-	assert rv.read_root_meta(rv.list_versions(job.job_vault)[0].path) == v0_meta
+	assert rv.load_root_meta(rv.list_versions(job.job_vault)[0].path) == v0_meta
 	with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
 		f.write('changed')
 	os.chmod(job.monitor, 0o777)
@@ -1525,9 +1525,9 @@ def test_version_folders_stay_the_daemons_and_keep_the_monitored_roots_metadata_
 	# the root's own events give no entry
 	version = run_batch(job, [('attrib', '', None, True), ('modify', 'a.txt', None, False)])
 	assert version.number == 1
-	assert rv.read_root_meta(version.path) == root_meta(job.monitor)
-	assert rv.read_root_meta(version.path)[:5] == (1234, 5678, 0o777, 10 ** 18, 10 ** 18)
-	assert rv.read_root_meta(rv.list_versions(job.job_vault)[0].path) == v0_meta
+	assert rv.load_root_meta(version.path) == root_meta(job.monitor)
+	assert rv.load_root_meta(version.path)[:5] == (1234, 5678, 0o777, 10 ** 18, 10 ** 18)
+	assert rv.load_root_meta(rv.list_versions(job.job_vault)[0].path) == v0_meta
 	for path in (version.path, rv.list_versions(job.job_vault)[0].path):
 		st = os.lstat(path)
 		assert (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) == (os.geteuid(), os.getegid(), 0o755)

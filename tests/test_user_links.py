@@ -560,7 +560,6 @@ def test_rows_count_as_unusable_when_the_record_cannot_be_read(job, monkeypatch)
 	moves = rv.VersionMoves.of_committed(job.job_vault, v1, job.monitor)
 	assert not moves.usable and 'record' in moves.why
 	assert rv.vault_chain_hop(job.job_vault, link, os.readlink(link), moves) == os.path.join(v0, 'proj/y')
-	assert rv.VaultMoves(job.job_vault, job.monitor).follow(link, os.readlink(link)) == os.path.join(v0, 'proj/y')
 
 
 @pytest.mark.on_054

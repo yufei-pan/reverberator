@@ -41,7 +41,7 @@ def kept_root_metadata(version):
 	'''metadata() of the monitored root as version's folder keeps it (trusted.reverberator.root).'''
 	if not ROOT:
 		pytest.skip('trusted.* extended attributes need root')
-	root = rv.read_root_meta(version)
+	root = rv.load_root_meta(version)
 	return stat.S_IFDIR | root.mode, root.uid, root.gid, root.mtime_ns
 
 
@@ -1164,7 +1164,9 @@ def test_a_root_metadata_that_cannot_be_kept_is_one_error_and_the_version_falls_
 	errors = [kwargs['message'] for args, kwargs in lines if kwargs.get('error') and 'Cannot keep the metadata' in kwargs.get('message', '')]
 	assert len(errors) == 1 and 'No space left' in errors[0]
 	version = version_path(job, 0)
-	assert rv.read_root_meta(version) is None and xattrs(version) == {}
+	with pytest.raises(OSError):
+		rv.load_root_meta(version)
+	assert xattrs(version) == {}
 	write_rule(job)
 	out = destination(tmp_path)
 	code, stdout, err = restore(tmp_path, capsys, job.monitor + '/', out, '--version', '0')
@@ -1265,7 +1267,7 @@ def test_a_record_of_a_root_dated_before_1970_encodes_and_decodes(tmp_path):
 	os.utime(root, ns=(meta.atime_ns, meta.mtime_ns))
 	if ROOT:
 		assert rv.record_root_meta(str(root), str(version))
-		got = rv.read_root_meta(str(version))
+		got = rv.load_root_meta(str(version))
 		assert got is not None and got.mtime_ns == meta.mtime_ns
 		dest = tmp_path / 'made'
 		dest.mkdir()
@@ -1333,7 +1335,7 @@ def test_a_root_whose_attributes_do_not_fit_gets_a_record_without_them_and_one_l
 	assert len(rv.encode_root_meta(rv.RootMeta(0, 0, 0, 0, 0, {'user.big': b'x' * 3000}))) > 3500
 	for _ in range(3):
 		assert rv.record_root_meta(job.monitor, version)
-	got = rv.read_root_meta(version)
+	got = rv.load_root_meta(version)
 	assert got.xattrs == {} and got.mode == 0o750
 	said = [kwargs for args, kwargs in lines if 'do not fit' in kwargs.get('message', '')]
 	assert len(said) == 1 and not said[0].get('error') and 'without them' in said[0]['message']

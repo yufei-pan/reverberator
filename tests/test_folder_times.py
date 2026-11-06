@@ -174,7 +174,7 @@ def seed_tree(rng, job):
 
 def version_folders_of(version):
 	'''
-	folders_of() a version, its top folder's being the monitored root's it keeps (rv.read_root_meta()): the version folder
+	folders_of() a version, its top folder's being the monitored root's it keeps (rv.load_root_meta()): the version folder
 	itself stays the daemon's, root's 0755 folder.
 	'''
 	if os.geteuid() != 0:
@@ -184,7 +184,7 @@ def version_folders_of(version):
 	st = os.lstat(version)
 	assert (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid) == (0o755, os.geteuid(), os.getegid())
 	assert [name for name in os.listxattr(version) if name.startswith('trusted.reverberator.')] == [rv.ROOT_META_XATTR]
-	root = rv.read_root_meta(version)
+	root = rv.load_root_meta(version)
 	found[''] = (root.mtime_ns, root.mode, root.uid, root.gid, tuple(sorted(root.xattrs.items())))
 	return found
 
@@ -551,7 +551,7 @@ def test_a_symlinked_monitored_root_keeps_the_folders_own_metadata_on_the_versio
 	version.mkdir(0o755)
 	before = os.lstat(version)
 	assert rv.record_root_meta(str(link), str(version))
-	assert rv.read_root_meta(str(version)) == rv.RootMeta(os.geteuid(), os.getegid(), 0o750, OLD, OLD + 9, {'user.k': b'v'})
+	assert rv.load_root_meta(str(version)) == rv.RootMeta(os.geteuid(), os.getegid(), 0o750, OLD, OLD + 9, {'user.k': b'v'})
 	after = os.lstat(version)
 	# the version folder keeps its own
 	assert (after.st_mode, after.st_uid, after.st_gid, after.st_mtime_ns) == (before.st_mode, before.st_uid, before.st_gid, before.st_mtime_ns)
