@@ -292,7 +292,7 @@ During a running migration, already-converted versions simply have no chain link
 
 ### 4.4 Restore
 - Files are copied from where the walk lands.
-- Whole job: refuse when free space is below the newest version's size. Warn when it is below that size plus the sizes of the versions from the chosen one up.
+- Whole job: refuse when free space is below the newest version's size. Warn when it is below that size plus the sizes of the versions from the chosen one up, the newest counted once.
 - **Keep 1 Complete Backup = False** is read as True (the user's choice). The start logs one line: "Keep 1 Complete Backup is False for <job>: from 0.55 its first version is always a complete copy". Rows of 0.54 referenced links (kind 'r') count as different, so the first comparison copies those files. Restore reports a referenced link as today.
 
 ### 4.5 Browsing and copying by hand (what is true)
