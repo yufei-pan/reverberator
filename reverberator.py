@@ -13581,6 +13581,8 @@ def plain_tree_entry(job_vault:str, name:str, rel:str, path:str, is_link:bool) -
 	if walked.kind in ('file', 'symlink'):
 		return walked.path
 	if walked.kind == 'dangling':
+		# the last moment anything knows: after this the link reads as a user's link, and no restore says the copy is gone
+		backuperTeeLogToTl(job_vault, f'{rel} of {name} is a chain that leads nowhere ({walked.detail}): its copy was lost before the conversion, so it stays the link', error=True)
 		return path
 	raise JobFailure(f'cannot read {rel} of {name} to convert it: {walked.kind} {walked.detail}')
 

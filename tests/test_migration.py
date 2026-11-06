@@ -255,6 +255,23 @@ def test_a_dangling_chain_stays_the_link(small):
 	assert rv.walk_version(small.job_vault, 2, 'a.txt', False).kind == 'symlink'
 
 
+def test_a_dangling_chain_is_logged_once_and_a_users_own_link_is_not(small):
+	names = folders_of(small)
+	os.remove(os.path.join(small.job_vault, names[0], 'a.txt'))
+	# a user's own link that leads nowhere is no chain
+	os.symlink('nowhere', os.path.join(small.job_vault, names[2], 'own'))
+	lines = []
+	real = rv.backuperTeeLogToTl
+	rv.backuperTeeLogToTl = lambda *args, **kwargs: (lines.append((args[1] if len(args) > 1 else kwargs.get('message'), kwargs.get('error', False))), real(*args, **kwargs))[1]
+	try:
+		assert migrate(small) is True
+	finally:
+		rv.backuperTeeLogToTl = real
+	dangling = [line for line, error in lines if error]
+	assert len(dangling) == 2 and all('a.txt' in line for line in dangling)
+	assert names[2] in dangling[0] and names[1] in dangling[1]
+
+
 def long_rel(room):
 	'''A relative path of exactly room bytes, in parts of 200.'''
 	parts = []
