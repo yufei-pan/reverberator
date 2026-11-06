@@ -361,12 +361,12 @@ def capture_errors(monkeypatch):
 
 def take_before_first(monkeypatch, kind, batches):
 	'''Take the queue right before the watcher queues its first event of kind: a take landing mid-read.'''
-	real = rv.append_change_event
-	def wrapped(to_process, lock, event):
+	real = rv.ChangeEventQueue.append
+	def wrapped(to_process, event):
 		if not batches and event.event == kind:
 			batches.append(to_process.take())
-		return real(to_process, lock, event)
-	monkeypatch.setattr(rv, 'append_change_event', wrapped)
+		return real(to_process, event)
+	monkeypatch.setattr(rv.ChangeEventQueue, 'append', wrapped)
 
 
 @pytest.mark.parametrize('split', ['mid-read', 'across reads'])

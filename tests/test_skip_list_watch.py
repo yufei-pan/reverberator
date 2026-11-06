@@ -3,7 +3,7 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, wait_until
+from tests.harness import latest_version, run_backup, seed_monitor, wait_until
 
 pytestmark = pytest.mark.inotify
 
@@ -228,6 +228,10 @@ def test_folder_recreated_at_moved_away_path_keeps_its_watches(job, poll_fast, m
 		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
 		# a new folder takes the old path before the move expires: its fresh watches stay
 		os.makedirs(os.path.join(data, 'sub'))
+		# read after both folders' creates, so the watcher has watched them before the take. the probes' own events can have
+		# the flag set already, so without this the take can come first, and a file written then raises no event: its copy
+		# holds it (test_a_file_written_before_the_watcher_reaches_a_new_folder_is_in_the_next_batch)
+		_probe(job, to_process, lock)
 		wait_until(lambda: any(e.event == 'delete' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no delete')
 		_take_batch(to_process, lock, flag)
 		fresh = os.path.join(data, 'sub', 'z')
@@ -247,12 +251,184 @@ def test_folder_moved_back_before_its_move_expires_keeps_its_watches(job, poll_f
 		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
 		# restored from the trash: inotify hands back the watches the folder already had
 		os.rename(os.path.join(job.monitor, '.trash', 'data'), data)
+		# read after the move back, so its walk is done before the take, as in the test above
+		_probe(job, to_process, lock)
 		wait_until(lambda: any(e.event == 'delete' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no delete')
 		_take_batch(to_process, lock, flag)
 		restored = os.path.join(data, 'sub', 'y')
 		open(restored, 'w').write('y')
 		wait_until(lambda: any(e.path == restored for e in _events(to_process, lock)), message='restored folder not watched')
 	finally:
+		_stop(thread)
+
+
+def _hold_reads(monkeypatch):
+	'''Once hold is set, the watcher stops before its next read (held is set then) until go is set.'''
+	real = rv.inotify_simple.INotify.read
+	hold, held, go = threading.Event(), threading.Event(), threading.Event()
+	def read(self, *args, **kwargs):
+		if hold.is_set() and not go.is_set():
+			held.set()
+			go.wait(20)
+		return real(self, *args, **kwargs)
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+	return hold, held, go
+
+
+def _back_up_batch(job, to_process, lock, flag, skip_list):
+	# as the backuper does with each batch the watcher signals
+	wait_until(flag.is_set, message='watcher did not signal the backuper')
+	with lock:
+		batch = to_process.take()
+	flag.clear()
+	entries = rv.change_events_to_backup_entries(batch, job.monitor)
+	scans = [event.path for event in batch if event.event == 'scan']
+	scopes = rv.touched_scopes(batch, job.monitor)
+	if scans:
+		root_mount = rv.mount_fingerprint(rv.current_mount_table(), os.path.realpath(job.monitor))
+		rv.compare_scanned_folders(entries, scans, job.job_name, job.monitor, job.vault, skip_list=skip_list, root_mount=root_mount)[1].close()
+	run_backup(job, entries, skip_list=skip_list, touched=scopes if scopes.subtrees or scopes.paths else None, matched_since=batch.read_wall_ns)
+
+
+@pytest.mark.parametrize('data_read_first', [False, True])
+def test_a_file_written_before_the_watcher_reaches_a_new_folder_is_in_the_next_batch(job, poll_fast, monkeypatch, data_read_first):
+	# a batch is taken and backed up while the creates of the folders that took the moved-away path are unread: a file
+	# written then raises no event, as its folder has no watch yet. the create read after the take goes in the next
+	# batch, and that batch's copy holds the file
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
+	seed_monitor(job, {'data/sub/x': 'x', '.trash/': None})
+	skip_list = rv.SkipList(job.monitor, ['.trash/'])
+	run_backup(job, skip_list=skip_list)
+	hold, held, go = _hold_reads(monkeypatch)
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, ['.trash/'], flag)
+	def queued(event, path):
+		return any(e.event == event and e.path.rstrip('/') == path for e in _events(to_process, lock))
+	try:
+		data = os.path.join(job.monitor, 'data')
+		sub = os.path.join(data, 'sub')
+		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
+		wait_until(lambda: queued('delete', data), message='no delete')
+		if data_read_first:
+			os.mkdir(data)
+			wait_until(lambda: queued('create', data), message='no create of the folder')
+		hold.set()
+		assert held.wait(10)
+		os.makedirs(sub, exist_ok=True)
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		fresh = os.path.join(sub, 'z')
+		open(fresh, 'w').write('z')
+		go.set()
+		wait_until(lambda: queued('create', sub if data_read_first else data), message='no create in the next batch')
+		_probe(job, to_process, lock)
+		assert [e for e in _events(to_process, lock) if e.path == fresh] == []
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		assert open(os.path.join(latest_version(job).path, 'data', 'sub', 'z')).read() == 'z'
+	finally:
+		go.set()
+		_stop(thread)
+
+
+def _hold_walk(monkeypatch, folder):
+	'''The watcher stops before it walks folder (at is set then) until go is set.'''
+	real = rv.initializeFolderWatchers
+	at, go = threading.Event(), threading.Event()
+	def walk(inotify_obj, path, *args, **kwargs):
+		if path.rstrip('/') == folder:
+			at.set()
+			go.wait(20)
+		return real(inotify_obj, path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', walk)
+	return at, go
+
+
+@pytest.mark.parametrize('how', ['made', 'moved_in'])
+def test_a_file_written_before_the_watch_of_a_folder_read_before_the_take_is_in_the_next_batch(job, tmp_path, poll_fast, monkeypatch, how):
+	# the read holding the folder's event came before the take, so the event is discarded as the copy's, but the watch comes
+	# after the copy passed the folder: a file written between raises no event and is in no copy, so the next batch compares it
+	seed_monitor(job, {'keep': 'k'})
+	skip_list = rv.SkipList(job.monitor, [])
+	run_backup(job, skip_list=skip_list)
+	data = os.path.join(job.monitor, 'data')
+	sub = os.path.join(data, 'sub')
+	at, go = _hold_walk(monkeypatch, sub)
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, [], flag)
+	try:
+		os.mkdir(data)
+		wait_until(lambda: any(e.event == 'create' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no create of the folder')
+		wait_until(flag.is_set, message='watcher did not signal the backuper')
+		if how == 'made':
+			os.mkdir(sub)
+		else:
+			os.mkdir(tmp_path / 'outside')
+			os.rename(tmp_path / 'outside', sub)
+		assert at.wait(10)
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		open(os.path.join(sub, 'z'), 'w').write('z')
+		go.set()
+		wait_until(lambda: any(e.event == 'scan' and e.path.rstrip('/') == sub for e in _events(to_process, lock)), message='no scan of the folder')
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		assert open(os.path.join(latest_version(job).path, 'data', 'sub', 'z')).read() == 'z'
+	finally:
+		go.set()
+		_stop(thread)
+
+
+def test_a_take_waits_for_the_walk_of_a_folder_renamed_at_once(job, poll_fast, monkeypatch):
+	# mkdir d; mv d e read together: e has no watch until the walk after its move, and a take during that walk would copy e
+	# before it, so a file written then raises no event
+	seed_monitor(job, {'keep': 'k'})
+	skip_list = rv.SkipList(job.monitor, [])
+	run_backup(job, skip_list=skip_list)
+	made, moved = os.path.join(job.monitor, 'd'), os.path.join(job.monitor, 'e')
+	hold, held, read_go = _hold_reads(monkeypatch)
+	at, walk_go = _hold_walk(monkeypatch, moved)
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, [], flag)
+	try:
+		wait_until(flag.is_set, message='watcher did not signal the backuper')
+		hold.set()
+		assert held.wait(10)
+		os.mkdir(made)
+		os.rename(made, moved)
+		read_go.set()
+		assert at.wait(10)
+		assert not lock.acquire(timeout=0.1)
+		open(os.path.join(moved, 'z'), 'w').write('z')
+		walk_go.set()
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		assert open(os.path.join(latest_version(job).path, 'e', 'z')).read() == 'z'
+	finally:
+		read_go.set()
+		walk_go.set()
+		_stop(thread)
+
+
+def test_a_folders_changes_and_its_rename_stay_in_one_batch(job, poll_fast, monkeypatch):
+	# a take during the walk after a rename would otherwise hold the change without the move, and its comparison would drop
+	# the file as gone from the version
+	seed_monitor(job, {'d/f': 'old'})
+	skip_list = rv.SkipList(job.monitor, [])
+	run_backup(job, skip_list=skip_list)
+	source, moved = os.path.join(job.monitor, 'd'), os.path.join(job.monitor, 'e')
+	at, go = _hold_walk(monkeypatch, moved)
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, [], flag)
+	try:
+		changed = os.path.join(source, 'f')
+		open(changed, 'a').write(' new')
+		wait_until(lambda: any(e.path == changed for e in _events(to_process, lock)), message='no modify')
+		os.rename(source, moved)
+		assert at.wait(10)
+		assert not lock.acquire(timeout=0.1)
+		go.set()
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		version = latest_version(job).path
+		assert open(os.path.join(version, 'e', 'f')).read() == 'old new'
+		assert not os.path.lexists(os.path.join(version, 'd'))
+	finally:
+		go.set()
 		_stop(thread)
 
 
