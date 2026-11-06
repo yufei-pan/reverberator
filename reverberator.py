@@ -6742,6 +6742,21 @@ def remove_entry(path:str):
 	except FileNotFoundError:
 		pass
 
+def kind_at(path:str) -> 'str | None':
+	'''
+	entry_kind() of what is at path, not followed; None for nothing there. Other errors are raised.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     os.symlink(folder, os.path.join(folder, 'link'))
+		...     [kind_at(os.path.join(folder, name)) for name in ('.', 'link', 'gone', 'link/gone/x')]
+		['d', 'l', None, None]
+	'''
+	try:
+		return entry_kind(os.lstat(path).st_mode)
+	except (FileNotFoundError, NotADirectoryError):
+		return None
+
 class NotARealFolder(OSError):
 	'''What a backup would write or remove in a version lies behind a link there (see real_folders_to()).'''
 
@@ -12241,6 +12256,55 @@ def record_root_meta(monitor_path:str, version_path:str) -> bool:
 class NotRenamed(Exception):
 	'''TreeWriter.rename() left the move to a copy: its source or the folder it goes into is not in the version.'''
 
+# the job vault's scratch folder, on the vault's filesystem: folders being built, links swapped out, link temps. kept between backups
+STAGING_NAME = '.reverberator_staging'
+# renameat2(2): the folder a relative path starts from, and the flag that swaps two names in one call
+AT_FDCWD = -100
+RENAME_EXCHANGE = 2
+LIBC_RENAMEAT2 = ctypes.CDLL(None, use_errno=True).renameat2
+LIBC_RENAMEAT2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+LIBC_RENAMEAT2.restype = ctypes.c_int
+
+def rename_exchange(a:str, b:str) -> None:
+	'''
+	Swap the entries at a and b in one call, so nothing can see either name empty. Both must exist. Raises OSError, EINVAL
+	or ENOSYS on a filesystem that has no such call.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     a, b = os.path.join(folder, 'a'), os.path.join(folder, 'b')
+		...     os.mkdir(a); os.symlink('text', b); rename_exchange(a, b); os.readlink(a), os.path.isdir(b)
+		('text', True)
+	'''
+	if LIBC_RENAMEAT2(AT_FDCWD, os.fsencode(a), AT_FDCWD, os.fsencode(b), RENAME_EXCHANGE) != 0:
+		code = ctypes.get_errno()
+		raise OSError(code, os.strerror(code), a, None, b)
+
+def staging_path(job_vault:str) -> str:
+	'''
+	The job vault's staging folder.
+
+	Examples:
+		>>> staging_path('/v/job')
+		'/v/job/.reverberator_staging'
+	'''
+	return os.path.join(job_vault, STAGING_NAME)
+
+def forward_text(rel:str, next_name:str) -> str:
+	'''
+	The text of the forward link at rel of a version, which means the same as the version in the folder next_name at this
+	path, for the whole subtree: up to the job vault, then down to rel there. Bytes that are no UTF-8 stay as they came
+	(surrogateescape), as os.fsencode() gives them back.
+
+	Examples:
+		>>> forward_text('a', 'V2--x')
+		'../V2--x/a'
+		>>> forward_text('a/b/c', 'V2--x')
+		'../../../V2--x/a/b/c'
+	'''
+	ups = rel.count('/') + 1
+	return f"{'../' * ups}{next_name}/{rel}"
+
 class TreeWriter:
 	'''
 	The one door to the tree of a version being written: everything the replay makes, removes, renames or gives metadata
@@ -12249,6 +12313,13 @@ class TreeWriter:
 
 	A rel is relative to tree, a folder's with a trailing / or not. Every verb does what its name says and nothing else:
 	where a rel lies behind a link, or what an entry there means to the manifest, is the caller's to have looked at.
+
+	With previous, the folder of the version before tree (design R, spec section 2.2), every verb first records in it what
+	it is about to change. An entry of previous that is a forward link (forward_text()) means tree holds that whole
+	subtree as previous's version had it, so a change at a path is preceded by moving the old state in there: its real
+	part is the set of records, no other list is kept, and a record only acts where a forward link still stands, so running
+	one again changes nothing. Without previous (V0, the 0.54 layout) nothing is recorded. An error of a record raises
+	before the tree changes.
 	'''
 	def __init__(self, tree:str, previous:str = None, job_vault:str = None, manifest:'VaultManifest' = None, sizes = None):
 		self.tree = tree
@@ -12256,17 +12327,224 @@ class TreeWriter:
 		self.job_vault = job_vault
 		self.manifest = manifest
 		self.sizes = sizes
+		# the real folders of previous met so far, with the (atime, mtime) each keeps: a change in one bumps them, and they are given back at once
+		self.saved = {}
+		self.staging_made = False
+		if previous is not None:
+			self.tree_name = os.path.basename(os.path.normpath(tree))
+			self.staging = staging_path(job_vault or os.path.dirname(os.path.normpath(tree)))
 
 	def path(self, rel:str) -> str:
 		'''Where rel is, never with a trailing /, which makes the kernel follow a link there.'''
 		return os.path.join(self.tree, rel.rstrip('/'))
 
+	def kept_path(self, rel:str) -> str:
+		'''Where rel is in the previous version; rel has no trailing / here.'''
+		return os.path.join(self.previous, rel) if rel else self.previous
+
+	def staged(self) -> str:
+		'''A new name in staging, for something on its way into the previous version.'''
+		if not self.staging_made:
+			os.makedirs(self.staging, exist_ok=True)
+			self.staging_made = True
+		return os.path.join(self.staging, uuid.uuid4().hex)
+
+	def forwards(self, rel:str) -> bool:
+		'''Whether the previous version's entry at rel, whose folders are real, is a forward link: by its exact text, and nothing looser.'''
+		try:
+			return os.readlink(self.kept_path(rel)) == forward_text(rel, self.tree_name)
+		except OSError as e:
+			if e.errno in (errno.EINVAL, errno.ENOENT, errno.ENOTDIR):
+				return False
+			raise
+
+	def give_back_times(self, folder:str) -> None:
+		'''The real folder of the previous version, in which something just changed, as its version had it.'''
+		os.utime(self.kept_path(folder), ns=self.saved[folder], follow_symlinks=False)
+
+	def held_in_tree(self, rel:str) -> str:
+		'''The kind of the entry at rel in the tree, which the previous version forwards to; JobFailure when it is gone, as nothing is left to record.'''
+		kind = kind_at(self.path(rel))
+		if kind is None:
+			raise JobFailure(f'{self.kept_path(rel)} forwards to {self.path(rel)}, which is not there. If a disk is missing, it comes back at the next attempt; if the entry was removed by hand, removing that link lets backups go on')
+		return kind
+
+	def ensure_real(self, folder:str) -> bool:
+		'''
+		Make the previous version's entry at folder a real folder listing its entries, unfolded from the top down, so that
+		something can change in the tree's. False when that version has no folder there, so nothing below it needs
+		recording, or there is no previous version.
+		'''
+		if self.previous is None:
+			return False
+		folder = folder.rstrip('/')
+		if '' not in self.saved:
+			st = os.lstat(self.previous)
+			self.saved[''] = (st.st_atime_ns, st.st_mtime_ns)
+		# a real folder of the previous version stays one
+		if folder in self.saved:
+			return True
+		here = ''
+		for part in folder.split('/'):
+			here = f'{here}/{part}' if here else part
+			if here in self.saved:
+				continue
+			if self.forwards(here):
+				if self.held_in_tree(here) != 'd':
+					return False
+				self.unfold(here)
+			elif kind_at(self.kept_path(here)) == 'd':
+				st = os.lstat(self.kept_path(here))
+				self.saved[here] = (st.st_atime_ns, st.st_mtime_ns)
+			else:
+				return False
+		return True
+
+	def exchange_in(self, rel:str, st:os.stat_result, holder:str) -> None:
+		'''
+		Swap the folder at holder, which is version n's as st says, with the forward link at rel in the previous version,
+		which so never holds anything between the two, then unlink the link. The times are set again in place, as f2fs bumps
+		the mtime of a folder renamed into another parent, and the parent's are given back, before the link goes: a cut leaves
+		the link in staging, or in the tree under a text naming its own place, and the scan knows both.
+		'''
+		rename_exchange(holder, self.kept_path(rel))
+		times = (st.st_atime_ns, st.st_mtime_ns)
+		os.utime(self.kept_path(rel), ns=times, follow_symlinks=False)
+		self.saved[rel] = times
+		self.give_back_times(os.path.dirname(rel))
+		os.unlink(holder)
+
+	def copy_folder_meta_onto(self, source:str, dest:str) -> None:
+		'''All of source's metadata onto the folder at dest, which is on its way into the previous version and must say what source says.'''
+		failed = []
+		# an owner the filesystem cannot keep it keeps for no version: an error line says so, and the record stands
+		copy_file_meta(source, dest, failed)
+		if failed:
+			raise JobFailure(f'copying the metadata of {source} onto {dest} failed')
+
+	def link_or_copy(self, source:str, dest:str) -> None:
+		'''A hard link at dest of the entry at source, itself even if it is a link; a copy where hard links are refused (NO_HARD_LINK_ERRNOS: EMLINK, say).'''
+		try:
+			os.link(source, dest, follow_symlinks=False)
+		except OSError as e:
+			if e.errno not in NO_HARD_LINK_ERRNOS:
+				raise
+			if multiCMD.run_command(copy_command(source, dest),quiet=True,return_code_only=True,wait_for_return=True) != 0:
+				raise JobFailure(f'recording {source} by a copy, as it cannot be hard linked ({e}), failed')
+
+	def unfold(self, rel:str) -> None:
+		'''
+		The forward link at rel in the previous version becomes a real folder listing what the tree's folder at rel lists,
+		a forward link for each entry: nothing in that folder has changed, as the link still stood. It is built in staging, so
+		the previous version holds the link or the whole folder and nothing between. An entry whose forward text is too long
+		for a link (ENAMETOOLONG; about 800 levels down on f2fs, a fifth of that on xfs) is held real: a file or a link by a
+		hard link, a folder made real and unfolded in turn.
+		'''
+		rel = rel.rstrip('/')
+		st = os.lstat(self.path(rel))
+		built = self.staged()
+		folders = []
+		# a list, as a tree may be deeper than the interpreter's stack
+		pending = [(rel, built)]
+		while pending:
+			here, dest = pending.pop()
+			os.mkdir(dest)
+			folders.append((self.path(here), dest))
+			with os.scandir(self.path(here)) as entries:
+				for entry in entries:
+					entry_rel, entry_dest = f'{here}/{entry.name}', os.path.join(dest, entry.name)
+					try:
+						os.symlink(forward_text(entry_rel, self.tree_name), entry_dest)
+					except OSError as e:
+						if e.errno != errno.ENAMETOOLONG:
+							raise
+						if entry.is_dir(follow_symlinks=False):
+							pending.append((entry_rel, entry_dest))
+						else:
+							self.link_or_copy(entry.path, entry_dest)
+		# the innermost first, as an entry made in a folder bumps its times
+		for folder, dest in reversed(folders):
+			self.copy_folder_meta_onto(folder, dest)
+		self.exchange_in(rel, st, built)
+
+	def hard_link_tree(self, source:str, dest:str) -> None:
+		'''A new folder at dest holding what the folder at source holds, its folders made anew with their metadata, everything else hard linked.'''
+		folders = []
+		pending = [(source, dest)]
+		while pending:
+			from_folder, to_folder = pending.pop()
+			os.mkdir(to_folder)
+			folders.append((from_folder, to_folder))
+			with os.scandir(from_folder) as entries:
+				for entry in entries:
+					if entry.is_dir(follow_symlinks=False):
+						pending.append((entry.path, os.path.join(to_folder, entry.name)))
+					else:
+						self.link_or_copy(entry.path, os.path.join(to_folder, entry.name))
+		for from_folder, to_folder in reversed(folders):
+			self.copy_folder_meta_onto(from_folder, to_folder)
+
+	def record(self, rel:str, keep:bool) -> None:
+		'''
+		Before the tree's entry at rel is replaced or removed: version n's entry there goes in the previous version.
+		keep means the tree holds on to it until a new copy is in its place, which may never come when the copy fails, so a
+		file or link is hard linked in, and a folder too, entry by entry, rather than left to the copy (a failed copy keeps the
+		last copy in both versions). Without keep, a file is renamed in and a folder exchanged in, which costs one call. Where
+		both versions already hold real folders, each entry is recorded the same way. Nothing else needs recording: the
+		previous version holds nothing there, or holds its own.
+		'''
+		if self.previous is None:
+			return
+		pending = [rel.rstrip('/')]
+		while pending:
+			here = pending.pop()
+			parent = os.path.dirname(here)
+			if not self.ensure_real(parent):
+				continue
+			if self.forwards(here):
+				kind, tree_path = self.held_in_tree(here), self.path(here)
+				if kind != 'd':
+					if keep:
+						staged = self.staged()
+						self.link_or_copy(tree_path, staged)
+						os.rename(staged, self.kept_path(here))
+					else:
+						os.rename(tree_path, self.kept_path(here))
+					self.give_back_times(parent)
+				elif keep:
+					staged = self.staged()
+					st = os.lstat(tree_path)
+					self.hard_link_tree(tree_path, staged)
+					self.exchange_in(here, st, staged)
+				else:
+					self.exchange_in(here, os.lstat(tree_path), tree_path)
+			elif kind_at(self.kept_path(here)) == 'd' and kind_at(self.path(here)) == 'd':
+				pending.extend(f'{here}/{name}' for name in os.listdir(self.path(here)))
+
+	def hl_record(self, rel:str) -> None:
+		'''A move's source: version n's entry at rel in the previous version by hard links, as the tree keeps it to rename it.'''
+		self.record(rel, True)
+
 	def make_folders(self, rel:str, made:list = None) -> bool:
 		'''real_folders_to( make=True ): the folders above rel are real folders, the missing ones made and appended to made.'''
+		if self.previous is not None and is_entry_rel(rel) and not real_folders_to(self.tree, rel):
+			# something will be made in the deepest folder there is
+			there = ''
+			for part in rel.strip('/').split('/')[:-1]:
+				below = f'{there}/{part}' if there else part
+				if kind_at(self.path(below)) != 'd':
+					break
+				there = below
+			self.ensure_real(there)
 		return real_folders_to(self.tree, rel, make=True, made=made)
 
 	def make_folder(self, rel:str) -> bool:
-		'''make_real_folder() at rel, whose parent is a real folder: False, with an error line, when that cannot be done.'''
+		'''make_real_folder() at rel, whose parent is a real folder: False, with an error line, when that cannot be done. A folder already there stays, and its entries are recorded one by one as they are written.'''
+		if self.previous is not None:
+			if kind_at(self.path(rel)) == 'd':
+				self.ensure_real(rel)
+				return True
+			self.record(rel, False)
 		return make_real_folder(self.path(rel))
 
 	def _folders_for_copy(self, source:str, rel:str) -> None:
@@ -12276,11 +12554,13 @@ class TreeWriter:
 
 	def copy(self, source:str, rel:str, mcae:multiCMD.AsyncExecutor, pending:list):
 		'''Queue a copy of source to rel on mcae (cp_af_copy_path()), which place() or discard_temp() ends: its task, or False when nothing is copied.'''
+		self.record(rel, True)
 		self._folders_for_copy(source, rel)
 		return cp_af_copy_path(source_path=source,dest_path=self.path(rel),mcae=mcae,pending=pending)
 
 	def copy_now(self, source:str, rel:str) -> int:
 		'''Copy source to rel and put it in place, now (cp_af_copy_path()): cp's exit code, or False when nothing is copied.'''
+		self.record(rel, True)
 		self._folders_for_copy(source, rel)
 		return cp_af_copy_path(source_path=source,dest_path=self.path(rel),writer=self)
 
@@ -12294,27 +12574,37 @@ class TreeWriter:
 
 	def remove_now(self, rel:str) -> None:
 		'''Remove what is at rel, a folder with everything in it, now. A link is unlinked, never followed.'''
+		self.record(rel, False)
 		remove_entry(self.path(rel))
 
 	def remove_queued(self, rel:str, is_dir:bool, mcae:multiCMD.AsyncExecutor, removals:list) -> None:
-		'''Queue the rm of rel on mcae, its (task, path) appended to removals for failed_removal(): a real folder with all it holds, or else one entry.'''
+		'''Queue the rm of rel on mcae, its (task, path) appended to removals for failed_removal(): a real folder with all it holds, or else one entry. No rm runs for an entry its record took out of the tree.'''
+		self.record(rel, False)
 		path = self.path(rel)
-		removals.append((mcae.run_command(['rm','-rf' if is_dir else '-f',path]),path))
+		if self.previous is None or os.path.lexists(path):
+			removals.append((mcae.run_command(['rm','-rf' if is_dir else '-f',path]),path))
 
 	def rename(self, src:str, dst:str) -> bool:
 		'''
 		Move the entry at src to dst, in the place of what is there, a real folder with everything in it. False, and the
 		entry stays, when its source or the folder it goes into is not in the version, or dst lies under src: delete &
-		copy instead. Any other error is raised.
+		copy instead. Any other error is raised. What dst held is recorded and goes first, then src is recorded by hard
+		links, as the old inodes must stay in the previous version when a later copy replaces them at dst.
 		'''
 		src, dst = src.rstrip('/'), dst.rstrip('/')
 		if dst.startswith(src + '/'):
 			return False
 		source, target = self.path(src), self.path(dst)
+		if self.previous is not None:
+			# looked at first, so a move that will not happen records nothing
+			if not os.path.lexists(source) or not real_folders_to(self.tree, dst):
+				return False
+			self.record(dst, False)
 		if os.path.isdir(target) and not os.path.islink(target):
 			remove_entry(target)
 		elif os.path.lexists(target):
 			os.remove(target)
+		self.hl_record(src)
 		try:
 			os.rename(source, target)
 		except FileNotFoundError as e:
@@ -12326,22 +12616,53 @@ class TreeWriter:
 
 	def folder_times(self, rel:str, st:os.stat_result) -> None:
 		'''Give the folder at rel st's times. Raises OSError.'''
+		self.ensure_real(rel)
 		os.utime(self.path(rel), ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
 
 	def folder_meta(self, source:str, rel:str, st, unsynced:list) -> bool:
 		'''All of the monitored folder source's metadata onto the folder at rel (copy_new_folder_meta(), st its lstat or None).'''
+		self.ensure_real(rel)
 		return copy_new_folder_meta(source, self.path(rel), st, unsynced)
 
 	def file_meta(self, source:str, rel:str, st, failed:list) -> None:
 		'''
 		source's metadata onto the entry at rel (copy_file_meta(), which reads it itself, so st goes unused and may be
-		None). An absolute rel is that path: on the 0.54 layout the end of a file's chain, in an older version.
+		None). An absolute rel is that path: on the 0.54 layout the end of a file's chain, in an older version. Nothing is
+		recorded: under Only Sync Attributes a change of a file's attributes reaches every version sharing it (spec section 2.4).
 		'''
 		copy_file_meta(source, self.path(rel), failed)
 
 	def root_meta(self, monitor_path:str) -> None:
-		'''The monitored root's metadata as of now, kept on the tree's own folder (record_root_meta()).'''
+		'''The monitored root's metadata as of now, kept on the tree's own folder (record_root_meta()). Nothing is recorded: the previous version got its own at the hand-over.'''
 		record_root_meta(monitor_path, self.tree)
+
+def hand_over(job_vault:str, newest_path:str, new_path:str) -> TreeWriter:
+	'''
+	The tree in newest_path, the newest version, becomes new_path's, and newest_path becomes a folder of forward links,
+	which reads the same, in one RENAME_EXCHANGE: at no moment does a link lead nowhere. Until then new_path holds only links
+	that name their own folder, an orphan no reader follows and the scan removes. Returns the writer of the new version.
+
+	new_path must not be there: FileExistsError otherwise, with nothing changed. Any other OSError also leaves the
+	versions as they were. Staging is made first, as a vault whose manifest is lost reads as design R by it (vault_layout()),
+	and the 0.54 rules would remove a cut batch's tree as an orphan.
+	'''
+	os.makedirs(staging_path(job_vault), exist_ok=True)
+	os.mkdir(new_path)
+	new_name = os.path.basename(os.path.normpath(new_path))
+	# before the listing, which can bump the atime
+	st = os.lstat(newest_path)
+	with os.scandir(newest_path) as entries:
+		for entry in entries:
+			os.symlink(forward_text(entry.name, new_name), os.path.join(new_path, entry.name))
+	try:
+		os.setxattr(new_path, ROOT_META_XATTR, os.getxattr(newest_path, ROOT_META_XATTR, follow_symlinks=False), follow_symlinks=False)
+	except OSError as e:
+		# none to copy: an attribute that could not be written has none here either (record_root_meta())
+		if e.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+			raise
+	os.utime(new_path, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+	rename_exchange(new_path, newest_path)
+	return TreeWriter(new_path, previous=newest_path, job_vault=job_vault)
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
