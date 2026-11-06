@@ -209,11 +209,23 @@ def carried_from_before(version: str, rel: str) -> bool:
 	return file_read_at(job_vault, name, rel) in inodes.values()
 
 
+# the 0.54 daemon of the running test when it is one on 0.54 (conftest.py): tests/legacy054.py's Legacy054
+LEGACY = None
+
+
+def daemon():
+	'''The module that writes the vaults of the running test: the 0.54 one for a test on 0.54, or a patch of rv never reaches its batches.'''
+	return rv if LEGACY is None else LEGACY.module
+
+
 def run_backup(job: JobPaths, entries=None, **kwargs) -> list:
 	'''
 	One committed backup as the backuper runs it: empty entries delta generate against the latest version.
-	kwargs override do_backup's keywords, such as keep_n_versions.
+	kwargs override do_backup's keywords, such as keep_n_versions. A test on 0.54 gets it from the 0.54 daemon.
 	'''
+	if LEGACY is not None:
+		LEGACY.backup(job, entries, **kwargs)
+		return committed_versions(job)
 	options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 	options.update(kwargs)
 	_, manifest, committed = rv.do_backup(

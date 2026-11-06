@@ -24,6 +24,8 @@ from tests.crash_child import failing_copy_command
 TAG = 'v0.54.1'
 MODULE_NAME = 'reverberator054'
 # what isolated_runtime() clears on rv between tests, as far as 0.54.1 has it
+# what the fake_pool fixture patches on rv: a fake pool must show to this module too, as to a daemon on that vault
+POOL_SEAM = ('MOUNTINFO_PATH', 'FS_SIGNATURE_MONITOR', 'read_pool_branches', 'statx_mount', 'F2FS_SYSFS_PATH', 'SYS_DEV_BLOCK_PATH', 'F2FS_UNTOLD', 'POOL_CHECK_SECONDS')
 REMEMBERED = ('VERSION_MOVES', 'VERSION_MOVES_WARNED', 'PRUNE_ABORTED', 'PRUNE_SALT_MISSING', 'VAULTS_WITH_VERSIONS', 'UNRECORDED_FAILED_DISKS', 'JOB_LOCK_UNCHECKED')
 
 
@@ -45,6 +47,9 @@ def load_module(folder: str):
 	spec.loader.exec_module(module)
 	module.sync_vault_filesystems = lambda job_vault: {}
 	module.syncfs_folder = refused_syncfs
+	# a test's pytest.raises(rv.JobFailure) catches this module's failures too
+	for name in ('JobFailure', 'VaultScanError', 'PoolNotReady'):
+		setattr(module, name, getattr(rv, name))
 	return module
 
 
@@ -52,6 +57,7 @@ class Legacy054:
 	def __init__(self, module):
 		self.module = module
 		self.real_copy_command = module.copy_command
+		self.own = {name: getattr(module, name) for name in POOL_SEAM}
 
 	def isolate(self) -> None:
 		'''The module as isolated_runtime() leaves rv for this test: the environment and multiCMD it shares with rv, the rest set here.'''
@@ -64,10 +70,13 @@ class Legacy054:
 		module.POLL_WAIT_SECONDS = rv.POLL_WAIT_SECONDS
 		module.STATUS_BOARD = None
 		module.copy_command = failing_copy_command(self.real_copy_command)
+		faked = rv.MOUNTINFO_PATH != self.own['MOUNTINFO_PATH']
+		for name in POOL_SEAM:
+			setattr(module, name, getattr(rv, name) if faked else self.own[name])
 
 	def stop_monitor(self) -> None:
 		'''End the thread of the module's fs signature monitor, as stop_fs_signature_monitor() does for rv.'''
-		monitor = self.module.FS_SIGNATURE_MONITOR
+		monitor = self.own['FS_SIGNATURE_MONITOR']
 		with monitor.lock:
 			thread = monitor.thread
 		if thread is not None and thread.is_alive():
@@ -78,7 +87,8 @@ class Legacy054:
 		self.module.GREEN_LIGHT.set()
 
 	def run(self, job, entries, **kwargs) -> None:
-		_, manifest, committed = self.module.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(), **kwargs)
+		kwargs.setdefault('matched_since', time.time_ns())
+		_, manifest, committed = self.module.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, **kwargs)
 		manifest.close()
 		assert committed is True
 

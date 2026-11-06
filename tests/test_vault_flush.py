@@ -243,10 +243,11 @@ def test_a_failed_flush_after_the_swap_fails_the_attempt_and_the_next_scan_finis
 	assert attempt not in removed and scanned == [0, 1, 2, 3] and link_number(job) == 3 and private_folders(job) == []
 
 
-def test_the_undo_of_a_cut_off_commit_is_flushed_before_anything_is_removed(tmp_path, monkeypatch, v054):
+@pytest.mark.on_054
+def test_the_undo_of_a_cut_off_commit_is_flushed_before_anything_is_removed(tmp_path, monkeypatch):
 	# the undo is the 0.54 rule, for a vault's scan before its conversion
-	job = three_versions(tmp_path, v054)
-	attempt = cut_off_at_the_swap(job, v054=v054)
+	job = three_versions(tmp_path)
+	attempt = cut_off_at_the_swap(job)
 	events = []
 	real_flush = rv.fsync_vault_folder
 	def flushing(path):
@@ -261,9 +262,10 @@ def test_the_undo_of_a_cut_off_commit_is_flushed_before_anything_is_removed(tmp_
 	assert events[0] == ('flush', 2) and events[1:] == [('remove_unfinished_change_lists',), ('remove_orphan',)]
 
 
-def test_an_undo_that_cannot_be_flushed_fails_the_scan_and_removes_nothing(tmp_path, monkeypatch, v054):
-	job = three_versions(tmp_path, v054)
-	attempt = cut_off_at_the_swap(job, v054=v054)
+@pytest.mark.on_054
+def test_an_undo_that_cannot_be_flushed_fails_the_scan_and_removes_nothing(tmp_path, monkeypatch):
+	job = three_versions(tmp_path)
+	attempt = cut_off_at_the_swap(job)
 	def flushing(path):
 		raise OSError(errno.EIO, os.strerror(errno.EIO), path)
 	monkeypatch.setattr(rv, 'fsync_vault_folder', flushing)
