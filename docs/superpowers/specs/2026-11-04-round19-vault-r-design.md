@@ -331,7 +331,7 @@ Between steps 3 and 5, V<n> is missing: `current_version` and the older versions
 
 **Scan repairs, before staging is emptied:**
 - **A skeleton in staging and V<N> with no list:** redo the rename V<n>→V<N>, flush, rename the skeleton in, flush.
-- **`staging/m-<name>` present, `<name>` missing, its list present** (a cut migration): rename it into place.
+- **`staging/m` present, and a version's list present with no folder** (a cut migration): rename it into place under that name. One tree is built at a time, so the list says which version it is.
 
 **Roll-forward repairs, per disk:**
 - **A name that is a forward link on one disk and a real entry on another:** remove the link on its disk.
@@ -367,7 +367,7 @@ At commit, the previous newest version's list is renamed. Removing the oldest ve
 **When.** At a job's first 0.55 start, under the locks, after the 0.54 rules in §3.1. It runs when the manifest has no `layout`='r' and versions exist. A manifest that started over determines the layout while it is rebuilt.
 
 **Per version, newest first, for each version holding any 0.54 chain link:**
-1. Build `staging/m-<name>`: folders with the version's metadata, and each non-folder hard-linked to its chain end. Chains are followed by their text (accepted by the user). A dangling chain becomes the link itself. A 0.54 prune temp (`is_prune_temp`) is left out.
+1. Build `staging/m`: folders with the version's metadata, and each non-folder hard-linked to its chain end. Chains are followed by their text (accepted by the user). A dangling chain becomes the link itself. A 0.54 prune temp (`is_prune_temp`) is left out.
 2. `RENAME_EXCHANGE` it with the version folder. On a pool: two renames with flushes.
 3. `rm -rf` the old tree.
 4. Add the version to `migrated`.
