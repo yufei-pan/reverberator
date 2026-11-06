@@ -32,7 +32,7 @@
   ```
 - **The anti-goal: never refuse a real chain link.** Pruning by a rule that refuses one loses copies. Every task keeps the investigation's suite-wide ground truth at zero daemon links refused.
 - **Data safety from round 7 stays.** No write or removal through a link, and nothing outside the version being written changes.
-- **Reference data,** all under `<scratchpad>/r8/`:
+- **Reference data,** all under `<scratchpad>`:
   - `investigation.md` (section 6.1 is the rule)
   - `repro/` (25 repros, each passing while its bug is there)
   - `rules/` (`r8rules.py`, `r8plugin.py`: the ground-truth checker)

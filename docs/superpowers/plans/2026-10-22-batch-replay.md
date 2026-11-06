@@ -33,7 +33,7 @@
   Claude-Session: https://claude.ai/code/session_0179SV9GcZcp5fPuVSWUarb6
   ```
 - **Data safety (the spec's anti-goal):** nothing outside the new `backup_folder` and the open manifest transaction may change. Removals never follow links and never act on `backup_folder` itself (rel `''` or `.`).
-- **Reference data:** the raw watcher events of each sequence, as the real watcher reports them, are in `<scratchpad>/r7/investigation.md` (section 1, "events (...)" lines), `out_*.txt` and `check/` in the same folder. Use them verbatim for the event-level tests.
+- **Reference data:** the raw watcher events of each sequence, as the real watcher reports them, are in `<scratchpad>` (section 1, "events (...)" lines), `out_*.txt` and `check/` in the same folder. Use them verbatim for the event-level tests.
 
 ## Review Focus
 
@@ -212,7 +212,7 @@
   - `pyproject.toml` (`version`).
 
 **Interfaces:**
-- Consumes everything above. Port the harness in `<scratchpad>/r7/repro_lib.py`: the real `watchFolder` thread, `ChangeEventQueue.take()`, the collapse, and `do_backup` with `touched`. Keep its `MOVE_PAIR_TIMEOUT_SECONDS` patch, so move-outs expire quickly.
+- Consumes everything above. Port the harness in `<scratchpad>`: the real `watchFolder` thread, `ChangeEventQueue.take()`, the collapse, and `do_backup` with `touched`. Keep its `MOVE_PAIR_TIMEOUT_SECONDS` patch, so move-outs expire quickly.
 
 - [ ] **Step 1: Write the failing tests.** One test per sequence of the spec's table, running the real file operations under the real watcher, each asserting `assert_version_matches_tree`. Import that helper from `tests/test_verify_replay.py` or move it into `tests/harness.py`.
 

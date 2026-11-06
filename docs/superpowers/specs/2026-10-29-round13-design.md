@@ -174,7 +174,7 @@ passwords 9/14; the later line wins each time), rewrites nothing, and the file s
 ## Constraints
 
 - Work in `.worktrees/round13`, branch `round13` (from round12 91b490b, not merged); never in the live checkout; never
-  write under /etc, /run/reverberator, /mnt/vaults, /mnt/pool or /mnt/pool2; never read /etc/firewatcher/firewatcher.conf;
+  write under /etc, /run/reverberator, /mnt/vaults, /mnt/pool or /mnt/pool2; never read the firewatcher config file;
   never touch /mnt/other; no sysctl or systemctl; tests at 2 processes at most; both full suites pass.
 - The user's rules: /mnt/fast/work/agent-rules/RULES.md.
 

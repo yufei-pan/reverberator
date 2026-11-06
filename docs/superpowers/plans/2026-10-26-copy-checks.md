@@ -777,7 +777,7 @@ Added by the main session after Task 2's review (pre-existing; the spec's Goal 6
   them), and every watch removed or failed is given back.
 
 - [ ] **Step 1: Write the failing test,** from the review's probe
-  (<scratchpad>/r10/review-t2/copy/tests/test_probe_walk_race.py):
+  (<scratchpad>):
   make the walk itself create `d/a/b` right after `d/a` is listed and before `d/a`'s watch would be added on 0.45
   (wrap `rv.iter_tree_entries` or `os.scandir` to create it at the right moment), then assert `d/a/b` is watched (a
   change in it is queued by a real watcher, or its path is in `wdDic`). Plus: the watch count given to the `irm` equals
@@ -796,7 +796,7 @@ Added by the main session after Task 2's review (pre-existing; the spec's Goal 6
   reports; full comparisons still advance it with their own start. `initializeFolderWatchers()` returns, or records in a
   set the watcher passes it, the folders it left unwatched. Test: a folder unreadable at the walk, then a fresh batch
   elsewhere: the batch's `matched_since` is None and the key is carried (the review's probe:
-  <scratchpad>/r10/review-t3/copy/tests/test_probe_t3.py,
+  <scratchpad>,
   `test_probe_an_unreadable_folder_carries_the_time_for_one_attempt_only`).
 
 **Calls to confirm:** added to round 10 by the main session (a pre-existing silent loss); an unwatched folder stops the
@@ -821,8 +821,8 @@ Added by the main session after Task 2's second-opinion stress run (pre-existing
   goes (the re-walk does it), and `get_all_folders()` goes if nothing else uses it.
 
 - [ ] **Step 1: Write the failing tests** per the spec's Goal 8 Tests, starting from the repros
-  (<scratchpad>/r10/haiku-t2/repro_05e1d07.py;
-  the review's <scratchpad>/r10/review-t8/test_probe_t8.py
+  (<scratchpad>;
+  the review's <scratchpad>
   (rename inside a walked subtree) and test_probe_t8d.py (a subfolder's create handled after its parent moved); its
   scratch fix is in review-t8/fixc/).
 - [ ] **Step 2: Run them and see them fail.**

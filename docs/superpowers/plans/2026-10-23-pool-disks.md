@@ -462,7 +462,7 @@ Add to `tests/harness.py` (class) and `tests/conftest.py` (fixture `fake_pool(tm
 - [ ] **Step 5: Run the new file and both full suites.** Expected: all pass on both venvs.
 
 - [ ] **Step 6: The live read-only scan.**
-  - Copy `<scratchpad>/ff/live/live_scan_refused.py` to `<scratchpad>/r9/live_scan_refused.py`, with its `sys.path.insert` pointed at this worktree.
+  - Copy `<scratchpad>` to `<scratchpad>`, with its `sys.path.insert` pointed at this worktree.
   - Run it with the service venv's python.
   - Expected: all 8 jobs scan, with zero refused writes. The pool checks only read: mountinfo, getxattr and statvfs.
 
