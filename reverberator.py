@@ -5805,8 +5805,6 @@ def do_backup(backup_entries:dict,
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 		# a disk mounted while this backup walked is remembered too
 		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
-		# the change list's rows are absolute paths: which monitored path they are read under
-		manifest.note_monitor_path(this_version_number,monitor_path)
 		# a commit says its copies are on the disk (spec section 2.6). they are flushed before the change list is written, as the
 		# list's fsync is a checkpoint, which keeps a new file's size and not its data. a comparison's clean sync after the last copy
 		# flushed them already (manifest.copies_unsynced). a roll-forward always flushes: it commits what the cut batch left in the tree,
