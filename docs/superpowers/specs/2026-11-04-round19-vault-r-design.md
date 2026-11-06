@@ -77,7 +77,7 @@ Links point to the **next** version, not to the current one. A path that has not
   - a moved entry's source (recorded by hard link);
   - a file whose new copy failed;
   - every version after the migration.
-- **Who changes an older version.** Only the batch right after it, which only adds records. One exception: an Only Sync Attributes change is applied in place on the tree's file, so every version sharing that inode shows the new attributes. That is today's "shared copy" rule (§2.4).
+- **Who changes an older version.** Only the batch right after it, which only adds records. One exception: an Only Sync Attributes change is applied in place on the tree's file, so every version sharing that inode when the change landed shows the new attributes. That is today's "shared copy" rule (§2.4).
 - **`current_version`.** A link to the newest committed version, as today.
 - **Change lists.** The name format is unchanged. The size and inode count now mean what removing that version frees; the newest version's numbers are the whole tree (§6).
 - **`.reverberator_staging/`** (new). The daemon's scratch folder on the vault filesystem. It holds:
@@ -245,7 +245,7 @@ There are three lock files in the state folder:
    - A folder whose row holds no record keeps its current time. If a crash hit its one-call window, that is the backup's time (a tiny limitation proposed in §14).
 3. A self-named link a cut exchange left at T/<recorded folder> needs no step of its own: the comparison and the sweep take it.
 4. Mark the rows of every recorded path UNVERIFIED.
-5. Run a full comparison that **reads T = V<n+1>**. It alone says what to replay: the entries a stop saved are not used, as it covers the whole tree, and a saved file entry where a folder stands now would fight what it finds. A move the cut batch had not applied becomes a delete and a copy, once. There is no hand-over.
+5. Run a full comparison that **reads T = V<n+1>**. It says what to replay, with one addition: a saved plain file modify it did not find, while the monitored path is a regular file, as a rewrite that keeps size and mtime shows only to the watcher. No other saved entry is used: it covers the whole tree, and a saved file entry where a folder stands now would fight what it finds. A move the cut batch had not applied becomes a delete and a copy, once. There is no hand-over.
 6. Run the same retention loops as a batch, after the comparison and before the first write into the tree, counting the tree as the version being made. Never prune P, never the last version.
 7. Sweep the whole tree: tree entries that P does not hold and that no row tracks are removed through `delete()`.
 8. **Always commit V<n+1>.** Once the hand-over has happened, the tree carries V<n+1>'s name and P is the forward-link folder. As soon as anything was recorded, the tree also differs from version n: old copies have moved into P and new ones are in place. Undoing this would need a second writer that moves every record back. Finishing the version is the only consistent way forward, at the cost of one version slot after a crash. (Only a cut that came before any record could be undone, by one exchange. That case is not special-cased.)
