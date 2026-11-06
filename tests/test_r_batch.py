@@ -7,7 +7,7 @@ import os
 import shutil
 import stat
 import time
-from collections import OrderedDict
+from collections import deque, OrderedDict
 import pytest
 
 import reverberator as rv
@@ -170,6 +170,50 @@ def take_wrong():
 
 
 # --- the layout ---
+
+def test_a_batch_on_one_disk_does_none_of_the_pools_work(r_job, copies_fail, monkeypatch):
+	# the ops a pool records first, and the exact link counts it needs, are not made where an lstat does: a live job pays for them on every batch.
+	# the batch keeps a file about to be copied over by a hard link, which counts its inode from the link count
+	build_base(r_job, **KEPT)
+	copies_fail()
+	events = ITEMS['modify'](r_job.monitor) + ITEMS['move_then_changes'](r_job.monitor)
+	def never(name):
+		def fail(*args, **kwargs):
+			pytest.fail(f'{name} was called in a batch on one disk')
+		monkeypatch.setattr(rv, name, fail)
+	for name in ('replay_ops', 'settle_ops', 'links_now'):
+		never(name)
+	# as the daemon runs it: the scan was done at the start
+	manifest = rv.VaultManifest(r_job.job_vault)
+	info = rv.get_vault_info(r_job.job_vault, manifest=manifest)
+	asked = []
+	real = rv.pool_state
+	monkeypatch.setattr(rv, 'pool_state', lambda *args, **kwargs: asked.append(args) or real(*args, **kwargs))
+	raw = raw_events(r_job.monitor, events)
+	_, manifest, committed = rv.do_backup(rv.change_events_to_backup_entries(deque(raw), r_job.monitor), job_name=r_job.job_name, monitor_path=r_job.monitor, vault_path=r_job.vault,
+		vaultInfo=info, manifest=manifest, touched=rv.touched_scopes(raw, r_job.monitor), matched_since=time.time_ns(), **{**OPTIONS, **KEPT})
+	manifest.close()
+	assert committed is True
+	# the guard's two paths, and no more: the writer takes the guard's answer
+	assert len(asked) <= 2, asked
+
+
+def test_a_writer_given_whether_the_vault_is_on_a_pool_does_not_ask(tmp_path, monkeypatch):
+	job_vault, newest = a_vault_in(tmp_path)
+	monkeypatch.setattr(rv, 'pool_state', lambda *args, **kwargs: pytest.fail('asked whether the vault is on a pool'))
+	writer = rv.hand_over(job_vault, newest, os.path.join(job_vault, 'V2--2021-01-02_00-00-00_-0800'), pooled=False)
+	assert writer.two_renames is False and writer.sizes.pooled is False
+	other = rv.TreeWriter(writer.tree, previous=writer.previous, job_vault=job_vault, pooled=True)
+	assert other.two_renames is True and other.sizes.pooled is True
+
+
+def a_vault_in(tmp_path):
+	job_vault = tmp_path / 'vault'
+	newest = job_vault / 'V1--2021-01-01_00-00-00_-0800'
+	newest.mkdir(parents=True)
+	(newest / 'f').write_text('x')
+	return str(job_vault), str(newest)
+
 
 def test_a_new_vault_is_r(tmp_path):
 	job = create_job(str(tmp_path))

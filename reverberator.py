@@ -4724,8 +4724,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 			if not running():
 				break
-			# the pools as the batch begins: a disk that drops from here on stops it ( do_backup() )
-			pool_guard = PoolGuard([vault_path, monitor_path])
+			# the pools as the batch begins: a disk that drops from here on stops it ( do_backup() ), by the job's own folder, which is what the writer asks of them
+			pool_guard = PoolGuard([job_vault, monitor_path])
 			# an unreadable path is reported once for the batch, by its comparison or its backup
 			reported = set()
 			# whether the whole tree is compared right after this batch
@@ -5509,9 +5509,9 @@ def do_backup(backup_entries:dict,
 	global BACKUP_ENTRY_VALUES_HEADER
 	# this function will do the actual backup
 	skip = None if skip_list is None else skip_list.skips
-	if pool_guard is None:
-		pool_guard = PoolGuard([vault_path, monitor_path])
 	job_vault = os.path.join(vault_path,job_name)
+	if pool_guard is None:
+		pool_guard = PoolGuard([job_vault, monitor_path])
 	if not os.path.lexists(job_vault):
 		try:
 			os.makedirs(job_vault,exist_ok=True)
@@ -5738,11 +5738,13 @@ def do_backup(backup_entries:dict,
 					break
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
+			# asked once for the batch, of the guard that watches its pools: a pool that appears or goes meanwhile is the guard's to stop
+			on_pool = pool_guard.covers(job_vault)
 			if tree is not None:
 				# it is handed over already, and what it recorded stands, so a record only acts where a forward link still does
 				backup_folder = tree
 				this_timestamp = os.path.basename(tree).partition('--')[2]
-				writer = TreeWriter(tree,previous=latest_version_info.path,job_vault=job_vault,manifest=manifest)
+				writer = TreeWriter(tree,previous=latest_version_info.path,job_vault=job_vault,manifest=manifest,pooled=on_pool)
 			else:
 				# the rows are read from the tree while it still has the latest version's name: once it is handed over, that name holds links
 				manifest.begin()
@@ -5750,7 +5752,7 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name,f'Manifest does not describe {latest_version_info.path}, listing it')
 					manifest.rebuild(latest_version_info.path)
 				try:
-					writer = hand_over(job_vault,latest_version_info.path,backup_folder,manifest)
+					writer = hand_over(job_vault,latest_version_info.path,backup_folder,manifest,on_pool)
 				except FileExistsError:
 					log_version_folder_taken(job_name,backup_folder)
 					manifest.rollback()
@@ -10883,7 +10885,8 @@ def prune_version(job_vault:str, entry:VaultEntry, guard:PoolGuard = None) -> No
 	staged = os.path.join(staging_path(job_vault), os.path.basename(os.path.normpath(entry.path)))
 	os.makedirs(staging_path(job_vault), exist_ok=True)
 	os.rename(entry.path, staged)
-	if pool_state(job_vault) is not None:
+	# the guard has asked already, at the step's start
+	if guard.covers(job_vault):
 		flush_or_fail(job_vault, os.path.basename(job_vault), f'{entry.path} is not removed yet; the next scan does it')
 	task = multiCMD.run_command(['rm', '-rf', staged], quiet=True, return_object=True)
 	if task.returncode != 0:
@@ -12347,9 +12350,13 @@ class BatchSizes:
 	the hand-over and a version's entry is recorded once.
 
 	A user's link kept by a hard link counts its inode in each version holding it, as measure_previous() and the oracle do.
+
+	pooled: the vault is on a mergerfs pool, whose attribute for a name can be a second old (links_now()). Off one, an lstat is exact and costs
+	less than half.
 	'''
-	def __init__(self, previous:str, links:int = 0):
+	def __init__(self, previous:str, links:int = 0, pooled:bool = True):
 		self.previous = previous
+		self.pooled = pooled
 		self.size = 0
 		self.inodes = links
 		self.shared = []
@@ -12372,7 +12379,7 @@ class BatchSizes:
 		'''(bytes, inodes) of the previous version, as of now: the files recorded by hard links the tree has let go count. Raises OSError.'''
 		size, inodes = self.size, self.inodes
 		for rel, bytes_, links in self.shared:
-			if links_now(os.path.join(self.previous, rel)) < links:
+			if (links_now(os.path.join(self.previous, rel)) if self.pooled else os.lstat(os.path.join(self.previous, rel)).st_nlink) < links:
 				size += bytes_
 				inodes += 1
 		return size, inodes
@@ -12398,14 +12405,15 @@ class TreeWriter:
 	keeps every entry until its apply phase. Each disk of a pool comes back from a power cut at its own last checkpoint, so a record
 	must be on every disk before the change it guards: pre_record() makes a phase's records and flushes once, and a record
 	made inline, when the phase turned out other than foreseen, is flushed by flush_if_needed() in the verb, before its change.
+
+	pooled, when given, is whether the vault is on a pool, asked once for the batch by do_backup(); a writer made alone asks.
 	'''
-	def __init__(self, tree:str, previous:str = None, job_vault:str = None, manifest:'VaultManifest' = None, sizes = None):
+	def __init__(self, tree:str, previous:str = None, job_vault:str = None, manifest:'VaultManifest' = None, sizes = None, pooled:bool = None):
 		self.tree = tree
 		self.previous = previous
 		self.job_vault = job_vault
 		self.manifest = manifest
-		# what the previous version alone holds, told of each record below
-		self.sizes = sizes if sizes is not None or previous is None else BatchSizes(previous)
+		self.sizes = sizes
 		# the real folders of previous met so far, with the (atime, mtime) each keeps: a change in one bumps them, and they are given back at once
 		self.saved = {}
 		self.staging_made = False
@@ -12418,7 +12426,13 @@ class TreeWriter:
 			self.tree_name = os.path.basename(os.path.normpath(tree))
 			self.job_vault = job_vault or os.path.dirname(os.path.normpath(tree))
 			self.staging = staging_path(self.job_vault)
-			self.two_renames = pool_state(self.job_vault) is not None
+			# whether the vault is on a pool is the batch's to say, once (do_backup()); a writer made alone asks
+			if pooled is None:
+				pooled = pool_state(self.job_vault) is not None
+			self.two_renames = pooled
+			# what the previous version alone holds, told of each record below
+			if sizes is None:
+				self.sizes = BatchSizes(previous, pooled=pooled)
 
 	def path(self, rel:str) -> str:
 		'''Where rel is, never with a trailing /, which makes the kernel follow a link there.'''
@@ -12576,7 +12590,8 @@ class TreeWriter:
 		if stat.S_ISLNK(st.st_mode):
 			self.sizes.record_dropped(0, 1)
 		elif linked:
-			self.sizes.pending(rel, st.st_size, links_now(dest))
+			# the count the link left: an lstat is exact off a pool, and the link is one more than it saw
+			self.sizes.pending(rel, st.st_size, links_now(dest) if self.two_renames else st.st_nlink + 1)
 		else:
 			self.sizes.record_dropped(st.st_size, 1)
 
@@ -12840,7 +12855,7 @@ class TreeWriter:
 		'''The monitored root's metadata as of now, kept on the tree's own folder (record_root_meta()). Nothing is recorded: the previous version got its own at the hand-over.'''
 		record_root_meta(monitor_path, self.tree)
 
-def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManifest' = None) -> TreeWriter:
+def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManifest' = None, pooled:bool = None) -> TreeWriter:
 	'''
 	The tree in newest_path, the newest version, becomes new_path's, and newest_path becomes a folder of forward links,
 	which reads the same, in one RENAME_EXCHANGE: at no moment does a link lead nowhere. Until then new_path holds only links
@@ -12854,10 +12869,11 @@ def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManif
 	new_path must not be there: FileExistsError otherwise, with nothing changed. Any other OSError also leaves the
 	versions as they were, up to the first rename; from there it is a cut, and so is a JobFailure from a flush. Staging is made first, as a vault
 	whose manifest is lost reads as design R by it (vault_layout()), and the 0.54 rules would remove a cut batch's tree as an orphan.
-	manifest, the tree's rows, is what the writer sums a removed folder's size from.
+	manifest, the tree's rows, is what the writer sums a removed folder's size from. pooled, when given, is whether the vault is on a pool, which the batch has asked already.
 	'''
 	os.makedirs(staging_path(job_vault), exist_ok=True)
-	pooled = pool_state(job_vault) is not None
+	if pooled is None:
+		pooled = pool_state(job_vault) is not None
 	skeleton = os.path.join(staging_path(job_vault), SKELETON_PREFIX + os.path.basename(os.path.normpath(newest_path)))
 	if pooled and os.path.lexists(new_path):
 		raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), new_path)
@@ -12879,7 +12895,7 @@ def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManif
 			raise
 	times = (st.st_atime_ns, st.st_mtime_ns)
 	os.utime(built, ns=times, follow_symlinks=False)
-	writer = TreeWriter(new_path, previous=newest_path, job_vault=job_vault, manifest=manifest, sizes=BatchSizes(newest_path, links))
+	writer = TreeWriter(new_path, previous=newest_path, job_vault=job_vault, manifest=manifest, sizes=BatchSizes(newest_path, links, pooled), pooled=pooled)
 	if pooled or not exchanged(new_path, newest_path):
 		writer.two_renames = True
 		if not pooled:
@@ -13599,9 +13615,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 		if need_delete_barrier:
 			wait_for_async_commands(mcae)
 		return applied
+	def pre_record(make_ops):
+		# the phase's ops are made only on two renames, where they are recorded first; elsewhere each record is made inline
+		if writer.two_renames:
+			writer.pre_record(make_ops(),poll_pools)
 	def record_settled(sweep = ()):
 		# what the sweep removes and the folders settle() gives metadata: one phase, so one flush
-		writer.pre_record(settle_ops([*written.rels, *(() if touched is None else touched.folders)],sweep),poll_pools)
+		pre_record(lambda: settle_ops([*written.rels, *(() if touched is None else touched.folders)],sweep))
 	def verify():
 		# what the batch's events touched is compared with the monitored tree, and the version fixed where they differ:
 		# the collapse into one entry per path cannot replay every order of moves, re-creations and deletes. the rows this
@@ -13628,7 +13648,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 		applied = {}
 		if fixes:
 			backuperTeeLogToTl(path=monitor_path,message=f'Fixing {len(fixes)} differences between {backup_folder} and the touched places of the monitored tree')
-			writer.pre_record(replay_ops(fixes,monitor_path,only_sync_attributes),poll_pools)
+			pre_record(lambda: replay_ops(fixes,monitor_path,only_sync_attributes))
 			applied = replay(prepare_backup_entries_for_replay(fixes))
 			wait_for_async_commands(mcae)
 			if not GREEN_LIGHT.is_set():
@@ -13657,7 +13677,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 		manifest.begin()
 		backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
 		mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
-		writer.pre_record(replay_ops(backup_entries,monitor_path,only_sync_attributes),poll_pools)
+		pre_record(lambda: replay_ops(backup_entries,monitor_path,only_sync_attributes))
 		replay(backup_entries)
 		wait_for_async_commands(mcae)
 		# the moves are made: whatever they left out, the verification's copies take whole
