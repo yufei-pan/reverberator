@@ -6007,7 +6007,7 @@ def do_backup(backup_entries:dict,
 		# on design R a commit says its copies are on the disk (spec section 2.6). they are flushed before the change list is written, as the
 		# list's fsync is a checkpoint, which keeps a new file's size and not its data. a comparison's clean sync after the last copy
 		# flushed them already (manifest.copies_unsynced). a roll-forward always flushes: it commits what the cut batch left in the tree,
-		# whose copies' rows went with that batch, and nothing tells which of them are on the disk yet
+		# whose copies' rows went with that batch, and nothing tells which of them are on the disk yet.
 		# so does a batch of two renames: a disk's own order says nothing of the manifest's on another, whatever the batch changed
 		if on_tree and (tree is not None or manifest.copies_unsynced or (writer is not None and writer.two_renames)):
 			try:
@@ -6081,7 +6081,7 @@ def flush_copies(job_vault:str, job_name:str, version_path:str) -> None:
 	would leave those copies all NUL in a committed version. Raises JobFailure, the disk first as status cuts a reason short,
 	when a sync failed: the caller commits nothing.
 	'''
-	flush_or_fail(job_vault,job_name,f'{version_path} is not committed; the next attempt tries again')
+	flush_or_fail(job_vault,job_name,f'{version_path} is not committed, and no version of this job is until a sync of the disk works; look at the disk')
 
 def flush_or_fail(job_vault:str, job_name:str, stopped:str) -> None:
 	'''flush_vault_disks(), for a step that must not go on past a disk not written out: JobFailure, the disk first as status cuts a reason short, ending in stopped, when a sync failed.'''

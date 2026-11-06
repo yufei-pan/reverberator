@@ -942,7 +942,9 @@ def test_a_failed_flush_commits_nothing(r_job, monkeypatch, failure, named):
 		patched.setattr(rv, 'sync_vault_filesystems', failing_flush(failure))
 		with pytest.raises(rv.JobFailure) as failed:
 			backup_events(r_job, events, **KEPT)
-	assert named in failed.value.reason
+	# the disk first, as status cuts a reason short, then what it means for the job and what to do
+	reason = failed.value.reason
+	assert 0 <= reason.index(named) < reason.index('no version of this job') < reason.index('look at')
 	# nothing names the new version: no record, no link, no list, placed or private
 	assert sorted(name for name in os.listdir(r_job.job_vault) if '--' in name and not os.path.isdir(at(r_job.job_vault, name))) == lists_before
 	assert not [name for name in os.listdir(r_job.job_vault) if name.startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
@@ -989,6 +991,6 @@ def test_a_failed_flush_of_a_first_version_commits_nothing(r_job, monkeypatch):
 		patched.setattr(rv, 'sync_vault_filesystems', failing_flush({'/dev/fake': OSError(errno.EIO, 'input/output error')}))
 		with pytest.raises(rv.JobFailure) as failed:
 			run_backup(r_job, OrderedDict(), **KEPT)
-	assert '/dev/fake' in failed.value.reason
+	assert 0 <= failed.value.reason.index('/dev/fake') < failed.value.reason.index('no version of this job') < failed.value.reason.index('look at')
 	run_backup(r_job, OrderedDict(), **KEPT)
 	assert check_vault(r_job.job_vault, {version_number(os.path.basename(newest_version(r_job))): wanted}, set()) == []
