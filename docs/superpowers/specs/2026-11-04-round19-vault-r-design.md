@@ -334,14 +334,17 @@ Between steps 3 and 5, V<n> is missing: `current_version` and the older versions
 **Pre-record passes.** Before each apply phase (the replay; the verification's fixes; the sweep plus settle), the batch records every path the phase will change (the §2.2 table), then flushes every disk. Records made inline afterwards are no-ops. The prune flushes after its rename; the commit flushes as today.
 
 **Scan repairs, before staging is emptied:**
+- **A hand-over's tree still under its old name on a disk:** it gets the new name there, directly on that disk, then every disk is flushed.
 - **A skeleton in staging and V<N> with no list:** redo the rename V<n>→V<N>, flush, rename the skeleton in, flush.
-- **`staging/m` present, and a version's list present with no folder** (a cut migration): rename it into place under that name. One tree is built at a time, so the list says which version it is.
+- **A cut conversion on two renames** (§7), on a vault not yet on design R, directly on each disk. The version is the manifest's newest not yet converted, as one tree is built at a time and a list with no folder no longer tells it. `staging/m` showing, or no folder under the version's name: `staging/old` goes back on each disk and the version is converted again. `staging/n` showing: it goes in on each disk.
+- **After a change made directly on a disk,** the pool is told to forget what it holds (mergerfs's `invalidate-all-nodes` command), as it reads the old entry for about a second, and an entry of another kind reads as EIO. A mergerfs without the command only reads late, and the attempt goes on at the next.
 
 **Roll-forward repairs, per disk:**
 - **A name that is a forward link on one disk and a real entry on another:** remove the link on its disk.
+- **A tree name that is a folder on one disk and a file on another** (an apply phase cut half way): the name goes on every disk and the comparison copies it again, leaving out what the previous version forwards. Through the pool a folder's chmod would otherwise reach the file, whose inode an older version shares.
 - **A version-n row missing under a real P folder while T holds the entry:** put a forward link back. T is unchanged there, because its apply phase had not begun.
 
-**Expected loss after the repair:** none of the previous version, as long as every disk comes back. This is reasoned, not yet tested.
+**Expected loss after the repair:** none of the previous version, as long as every disk comes back. The pool cut test covers this: 16,606 runs on 2 and 3 disks, 0 wrong.
 
 **The pool cut test** (the build's gate):
 - Each branch is its own f2fs loop image under mergerfs.
@@ -372,7 +375,7 @@ At commit, the previous newest version's list is renamed. Removing the oldest ve
 
 **Per version, newest first, for each version holding any 0.54 chain link:**
 1. Build `staging/m`: folders with the version's metadata, and each non-folder hard-linked to its chain end. Chains are followed by their text (accepted by the user). A dangling chain becomes the link itself. A 0.54 prune temp (`is_prune_temp`) is left out.
-2. `RENAME_EXCHANGE` it with the version folder. On a pool: two renames with flushes.
+2. `RENAME_EXCHANGE` it with the version folder. On a pool or a filesystem with no exchange, three renames, each followed by a flush: the version to `staging/old`, `staging/m` to `staging/n`, `staging/n` to the version. The middle one is there because a cut can leave the version half out on one disk only, and the halves under its name look alike: `m` says the old tree may not be out of every disk yet, and `n` says it is (§5).
 3. `rm -rf` the old tree.
 4. Add the version to `migrated`.
 
