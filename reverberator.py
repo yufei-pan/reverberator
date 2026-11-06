@@ -5492,9 +5492,10 @@ def do_backup(backup_entries:dict,
 	# comparison has none. with no backup_entries, only the touched scopes are compared with the latest version: a new
 	# version, its replay verified with touched, is made only when they differ
 	# move events sync attrs from source where the vault entry is a real file/dir ( see do_reverb_backup )
-	# pool_guard: the mergerfs pools of vault_path and monitor_path as they were when the batch began ( taken here when
-	# None ). its poll stops the copies once a disk of one drops, and nothing is committed unless both are whole and
-	# never mounted again since: PoolNotReady fails the attempt
+	# pool_guard: the mergerfs pools holding the job's own folder and monitor_path as they were when the batch began ( the
+	# backuper builds it per batch, and it is taken here when None ). its poll stops the copies once a disk of one drops or
+	# a pool is gone, and nothing is committed unless they are whole and never mounted again since: PoolNotReady fails the
+	# attempt. it does not see a pool that appears after the batch began: a path it found on no pool stays one for this batch
 	# matched_since: the wall clock time, in ns, from which this attempt sees the whole tree ( a full comparison, or a fresh
 	# batch's read time ), None when it does not. the commit records it as the vault's matched time ( VaultManifest.matched )
 	# only when no inner mount was paused, nothing was logged unreadable and every metadata copy worked; else it carries
@@ -5740,7 +5741,8 @@ def do_backup(backup_entries:dict,
 					break
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
-			# asked once for the batch, of the guard that watches its pools: a pool that appears or goes meanwhile is the guard's to stop
+			# asked once for the batch, of the guard built when it began: it stops the batch on a pool going or a disk dropping, but does not see a
+			# pool that appears meanwhile (the next batch's guard does), so this answer holds for the whole batch
 			on_pool = pool_guard.covers(job_vault)
 			if tree is not None:
 				# it is handed over already, and what it recorded stands, so a record only acts where a forward link still does
