@@ -264,11 +264,12 @@ def listing(root):
 	'''What is under root by the bytes of each name: a file's text (through a link), None for a folder (ending with /).'''
 	found = {}
 	top = os.fsencode(root)
-	for folder, names, files in os.walk(top):
+	# a version's forward links lead to folders of the versions above
+	for folder, names, files in os.walk(top, followlinks=True):
 		for name in names + files:
 			path = os.path.join(folder, name)
 			rel = os.path.relpath(path, top)
-			if os.path.isdir(path) and not os.path.islink(path):
+			if os.path.isdir(path):
 				found[rel + b'/'] = None
 			else:
 				with open(path, encoding='utf-8') as f:
@@ -320,13 +321,13 @@ def test_first_full_backup_of_a_bad_name(job):
 	manifest = rv.VaultManifest(job.job_vault)
 	assert manifest.describes(v0) and manifest.folders == ['d\udcff/'] and sorted(manifest.files) == sorted(['bad\udcff.txt', 'd\udcff/x\udcfe', 'ok.txt'])
 	manifest.close()
-	# a referenced first backup links each name to the monitored file of the same bytes
+	# keep_one_complete_backup off reads as on: the first version is a complete copy under the same bytes
 	other = create_job(os.path.join(job.root, 'referenced'))
 	put(other.monitor, b'bad\xff.txt', 'bad')
 	put(other.monitor, b'd\xff/x\xfe', 'nested')
 	put(other.monitor, b'ok.txt', 'ok')
 	[v0] = backup(other, keep_one_complete_backup=False)
-	assert listing(v0) == expected and os.readlink(os.path.join(os.fsencode(v0), b'd\xff/x\xfe')) == os.fsencode(other.monitor) + b'/d\xff/x\xfe'
+	assert listing(v0) == expected and not is_link(v0, b'd\xff/x\xfe')
 
 
 def test_events_on_bad_names(job, poll_fast):
@@ -471,13 +472,13 @@ def test_retention_with_bad_names(job, poll_fast):
 	v0 = backup(job)[-1]
 	put(job.monitor, b'keep', 'k1')
 	v1 = backup(job, ('keep', 'modify'))[-1]
-	assert is_link(v1, b'bad\xff.txt') and is_link(v1, b'd\xff/x\xfe')
+	assert is_link(v0, b'bad\xff.txt') and is_link(v0, b'd\xff')
 	put(job.monitor, b'keep', 'k22')
 	backup(job, ('keep', 'modify'), keep_n_versions=2)
-	# V0 is pruned: its copies move into V1 under their own bytes, and V2 still reaches them
+	# V0 is pruned: the copies were never in it, and V1 still reaches them in V2 under their own bytes
 	kept = rv.list_versions(job.job_vault)
 	assert not os.path.lexists(v0) and [version.path for version in kept][:1] == [v1]
-	assert not is_link(v1, b'bad\xff.txt') and not is_link(v1, b'd\xff/x\xfe')
+	assert not is_link(kept[1].path, b'bad\xff.txt') and not is_link(kept[1].path, b'd\xff/x\xfe')
 	assert listing(v1) == {b'bad\xff.txt': 'old', b'd\xff/': None, b'd\xff/x\xfe': 'nested', b'keep': 'k1'}
 	assert listing(kept[1].path) == {b'bad\xff.txt': 'old', b'd\xff/': None, b'd\xff/x\xfe': 'nested', b'keep': 'k22'}
 	assert len(backup(job)) == 2

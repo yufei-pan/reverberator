@@ -132,7 +132,7 @@ each_item = pytest.mark.parametrize('item', ITEMS)
 
 
 @pytest.fixture
-def r_job(tmp_path, r_layout):
+def r_job(tmp_path):
 	return create_job(str(tmp_path))
 
 
@@ -168,27 +168,25 @@ def take_wrong():
 
 # --- the layout ---
 
-def test_a_new_vault_stays_on_054_unless_asked(tmp_path):
+def test_a_new_vault_is_r(tmp_path):
 	job = create_job(str(tmp_path))
 	put_text(job.monitor, 'a', 'a')
 	run_backup(job)
 	put_text(job.monitor, 'a', 'b')
 	run_backup(job)
-	assert not os.path.lexists(os.path.join(job.job_vault, rv.STAGING_NAME))
+	assert os.path.isdir(os.path.join(job.job_vault, rv.STAGING_NAME))
 	manifest = rv.VaultManifest(job.job_vault)
-	assert manifest.layout() is None and rv.vault_layout(job.job_vault, manifest) == '0.54'
+	assert manifest.layout() == 'r' and rv.vault_layout(job.job_vault, manifest) == 'r'
 	manifest.close()
 	assert os.path.islink(os.path.join(job.job_vault, folder_of(job, 1), 'a')) is False
 	assert view_truth.TOTALS is not None
 
 
-def test_vault_layout_answers(tmp_path, monkeypatch):
+def test_vault_layout_answers(tmp_path):
 	job_vault = tmp_path / 'job'
 	job_vault.mkdir()
 	manifest = rv.VaultManifest(str(job_vault))
-	assert rv.vault_layout(str(job_vault), manifest) == rv.NEW_VAULT_LAYOUT == '0.54'
-	monkeypatch.setattr(rv, 'NEW_VAULT_LAYOUT', 'r')
-	assert rv.vault_layout(str(job_vault), manifest) == 'r'
+	assert rv.vault_layout(str(job_vault), manifest) == rv.NEW_VAULT_LAYOUT == 'r'
 	(job_vault / 'V0--2021-01-01_00-00-00_-0800').mkdir()
 	assert rv.vault_layout(str(job_vault), manifest) == '0.54'
 	(job_vault / rv.STAGING_NAME).mkdir()
@@ -708,6 +706,7 @@ def test_a_users_link_with_the_text_of_a_daemon_link_is_no_daemon_link_in_the_ne
 
 # --- the plugin ---
 
+@pytest.mark.old_writer
 def test_the_plugin_reads_nothing_of_a_054_vault(tmp_path, monkeypatch):
 	job = create_job(str(tmp_path))
 	put_text(job.monitor, 'a', 'a')

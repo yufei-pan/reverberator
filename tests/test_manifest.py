@@ -576,7 +576,6 @@ def test_an_error_of_the_operation_keeps_the_manifest(job, monkeypatch, message)
 
 def test_a_vault_whose_manifest_cannot_be_opened_says_so_first_and_what_fixes_it(job, monkeypatch):
 	# every open fails: the scan stops at the layout, before any open of the manifest of the backup itself, so the reason is the scan's
-	monkeypatch.setattr(rv, 'NEW_VAULT_LAYOUT', 'r')
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
 	connect = sqlite3.connect

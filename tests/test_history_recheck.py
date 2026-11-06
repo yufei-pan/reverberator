@@ -31,7 +31,7 @@ PREPARED = {}
 
 
 @pytest.fixture
-def crash_vault(r_layout, tmp_path_factory):
+def crash_vault(tmp_path_factory):
 	'''The crash vault on design R, as batch 2 left it. Outside tmp_path, whose vaults the ground truth plugins read: they see no fork's links.'''
 	if 'vault' not in PREPARED:
 		place = os.environ.get('REVERB_CRASH_ROOT')

@@ -5,7 +5,7 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_pending, write_incomplete_version, committed_versions, wait_for_committed_count, wait_until
+from tests.harness import seed_monitor, write_pending, write_scan_leftover, write_incomplete_version, committed_versions, wait_for_committed_count, wait_until
 
 pytestmark = pytest.mark.unit
 
@@ -249,11 +249,11 @@ def test_stop_before_deciding_saves_queued_events_as_full_scan(job, poll_fast):
 
 
 def test_the_vault_scan_runs_while_the_job_waits_for_its_monitored_path(job, poll_fast):
-	# a job restarted with its monitored path missing still has the orphan of a killed copy removed, by the scan, before
+	# a job restarted with its monitored path missing still has what a killed batch left taken away, by the scan, before
 	# the path comes back
 	seed_monitor(job, {'a.txt': 'a'})
 	_v0(job)
-	orphan = write_incomplete_version(job, 1, {'a.txt': 'partial'})
+	orphan = write_scan_leftover(job)
 	shutil.rmtree(job.monitor)
 	startup = rv.JobStartup(job.job_name, job.monitor)
 	startup.watching.set()

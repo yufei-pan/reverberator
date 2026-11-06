@@ -6060,8 +6060,8 @@ def make_version_folder(job_name:str, path:str) -> bool:
 def log_version_folder_taken(job_name:str, path:str) -> None:
 	backuperTeeLogToTl(job_name,f'Not backing up into {path}: something is there already, left by an attempt that did not commit; this attempt fails and writes nothing',error=True)
 
-# the layout of a vault with no version yet. '0.54' until the suite has moved to design R
-NEW_VAULT_LAYOUT = '0.54'
+# the layout of a vault with no version yet: design R. A test of the 0.54 code still in this file sets '0.54', until Task 16 removes both
+NEW_VAULT_LAYOUT = 'r'
 
 def vault_layout(job_vault:str, manifest:'VaultManifest') -> str:
 	'''

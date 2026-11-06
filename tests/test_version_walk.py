@@ -505,7 +505,7 @@ def test_a_users_link_recorded_between_the_lstat_and_the_readlink_comes_with_its
 	assert rv.same_inode(walked.st, os.lstat(at(vault, 1, 'u')))
 
 
-def test_a_real_batch_vault_walks_as_the_oracle_reads(tmp_path, r_layout):
+def test_a_real_batch_vault_walks_as_the_oracle_reads(tmp_path):
 	# a vault of real batches: every version's every entry lands where the oracle's own rule lands
 	job = create_job(str(tmp_path))
 	build_base(job)

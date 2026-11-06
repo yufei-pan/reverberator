@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import (committed_versions, latest_version, seed_monitor, wait_for_committed_count, wait_until,
+from tests.harness import (write_scan_leftover, committed_versions, latest_version, seed_monitor, wait_for_committed_count, wait_until,
 	write_fstab, write_incomplete_version)
 
 pytestmark = pytest.mark.unit
@@ -91,7 +91,7 @@ def _goes_on(path):
 def test_a_missing_vault_disk_pauses_the_job_with_the_waiting_marker(job, fake_pool, grace, board, output, tmp_path):
 	seed_monitor(job, {'a.txt': 'a'})
 	_v0(job)
-	orphan = write_incomplete_version(job, 1, {'a.txt': 'partial'})
+	orphan = write_scan_leftover(job)
 	# a change since V0, so the comparison once the disk is back commits a version
 	seed_monitor(job, {'b.txt': 'b'})
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
@@ -101,7 +101,7 @@ def test_a_missing_vault_disk_pauses_the_job_with_the_waiting_marker(job, fake_p
 	try:
 		reason = f'disk {a} of pool {job.vault} is not mounted'
 		wait_until(lambda: _marker(job.vault, reason) in output(), timeout=5, message='no waiting marker')
-		assert os.path.isdir(orphan), 'the vault was scanned while a disk is out'
+		assert os.path.lexists(orphan), 'the vault was scanned while a disk is out'
 		assert len(committed_versions(job)) == 1
 		assert _state(tmp_path)['state'] == 'waiting' and _state(tmp_path)['detail'] == f'{job.vault}: {reason}'
 		fake_pool.mount(a)
@@ -116,7 +116,7 @@ def test_a_missing_vault_disk_pauses_the_job_with_the_waiting_marker(job, fake_p
 def test_a_missing_monitored_disk_pauses_the_backup_but_not_the_vault_scan(job, fake_pool, grace, output):
 	seed_monitor(job, {'a.txt': 'a'})
 	_v0(job)
-	orphan = write_incomplete_version(job, 1, {'a.txt': 'partial'})
+	orphan = write_scan_leftover(job)
 	# a change since V0, so the comparison once the disk is back commits a version
 	seed_monitor(job, {'b.txt': 'b'})
 	m, _ = fake_pool.add(job.monitor, ['m1', 'm2'])

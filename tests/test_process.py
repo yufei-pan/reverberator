@@ -48,31 +48,24 @@ def test_sigterm_does_not_commit_incomplete(job, run_reverberator):
 	open(os.path.join(job.monitor, 'c.txt'), 'w').write('c')
 	proc.send_signal(signal.SIGTERM)
 	proc.wait(timeout=5)
-	for name in os.listdir(job.job_vault) if os.path.isdir(job.job_vault) else []:
-		if not name.startswith('V'):
-			continue
-		path = os.path.join(job.job_vault, name)
-		if os.path.isdir(path) and rv.CONTENT_FILE_EXTENSION_NAME not in name:
-			from tests.harness import content_file_path
-			if not os.path.isfile(content_file_path(path)):
-				link = os.path.join(job.job_vault, 'current_version')
-				if os.path.lexists(link):
-					assert os.path.basename(os.path.realpath(link)) != name
+	# a cut batch's tree has no list, and the link never names it
+	link = os.path.join(job.job_vault, 'current_version')
+	assert os.path.realpath(link) in committed_versions(job)
 
 
-def test_restart_deletes_incomplete_keeps_committed(job, run_reverberator):
+def test_restart_finishes_incomplete_keeps_committed(job, run_reverberator):
 	seed_monitor(job, {'a.txt': 'hello'})
 	write_rule(job)
 	proc = run_reverberator(job.rule_path)
 	wait_for_committed_count(job, 1, timeout=10)
 	proc.send_signal(signal.SIGTERM)
 	proc.wait(timeout=5)
-	# the attempt after the latest commit, which a crash leaves; any other orphan stops the job (Task 2b)
+	# the attempt after the latest commit, which a crash leaves, is finished; any other orphan stops the job (Task 2b)
 	latest = max(int(name[1:].partition('--')[0]) for name in os.listdir(job.job_vault) if rv.is_version_folder_name(name))
 	orphan = write_incomplete_version(job, latest + 1, {'junk': 'x'}, timestamp='2021-12-31_00-00-00_-0800')
 	run_reverberator(job.rule_path)
-	wait_until(lambda: not os.path.isdir(orphan), timeout=10, message='incomplete version not removed')
-	assert len(committed_versions(job)) >= 1
+	wait_until(lambda: orphan in committed_versions(job), timeout=10, message='the tree of the cut batch was not rolled forward')
+	assert sorted(os.listdir(orphan)) == ['a.txt'] and open(os.path.join(orphan, 'a.txt')).read() == 'hello'
 
 
 def test_pending_resume_and_discard(job, run_reverberator):

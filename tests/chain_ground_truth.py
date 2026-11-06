@@ -16,7 +16,8 @@ out, as a test can forge any vault. vault_chain_hop() is judged:
 - at each test's end (once its monkeypatch is undone), on every link of every kept version of each job vault under
   its tmp_path that the test backed up or pruned in this process, or that holds a link this process's daemon code
   made, with the moves read under the record the manifest holds. Vaults written by a daemon subprocess, or by the
-  test alone, are not checked: no truth is known for their links.
+  test alone, are not checked: no truth is known for their links. Nor is a vault on design R, which has no chain links; the
+  0.54 vaults are the ones tests/legacy054.py's module builds, whose frames count as reverberator.py's.
 The test fails when a daemon link is refused, or a user link accepted, unless its
 chain_ground_truth_allows(kind, ..., reason=..., rels=...) marker names how; rels, a list of paths in their version,
 limits the marker to them. Each kind is told again here, from the vault and the moves, not taken from the test:
@@ -45,6 +46,7 @@ ENABLED = os.environ.get('REVERB_CHAIN_GROUND_TRUTH', '1').strip().lower() not i
 MARKER = 'chain_ground_truth_allows'
 KINDS = ('unusable_rows', 'cannot_tell', 'blind_spot', 'refused_chain', 'refused_by_rows')
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+MODULE054 = 'reverberator054.py'
 
 # (st_dev, st_ino) -> (its truth: 'chain', 'user' or 'test', its text), for the running test
 MADE = {}
@@ -68,7 +70,8 @@ def maker_frame():
 	frame = sys._getframe(2)
 	while frame is not None:
 		name = frame.f_code.co_filename
-		if name == rv.__file__:
+		# the 0.54 module of the tests builds the vaults this truth is of, as reverberator.py did
+		if name == rv.__file__ or os.path.basename(name) == MODULE054:
 			return frame
 		if name.startswith(TESTS_DIR):
 			return None
@@ -339,8 +342,11 @@ def check_vaults(top):
 	for job_vault in job_vaults(top):
 		monitor = MONITORS.get(os.path.abspath(job_vault))
 		try:
+			# a vault on design R has no chain links to judge
+			if rv.recorded_layout(job_vault) == 'r':
+				continue
 			versions = [version for version in rv.list_versions(job_vault) if not os.path.islink(version.path)]
-		except OSError:
+		except (OSError, rv.sqlite3.Error):
 			TOTALS['skipped_vaults'] += 1
 			continue
 		if monitor is None:

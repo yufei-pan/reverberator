@@ -39,7 +39,7 @@ def _fast(poll_fast):
 
 
 @pytest.fixture
-def r_job(tmp_path, r_layout):
+def r_job(tmp_path):
 	job = create_job(str(tmp_path))
 	write_rule(job)
 	return job
@@ -231,7 +231,7 @@ def test_the_history_command_on_a_vault_of_forward_links(r_job, capsys):
 # --- restore ---
 
 @needs_root
-def test_restore_a_file_from_every_version_gives_the_oracle_bytes_and_meta(tmp_path, r_layout):
+def test_restore_a_file_from_every_version_gives_the_oracle_bytes_and_meta(tmp_path):
 	job = create_job(str(tmp_path))
 	expected = build_base(job)
 	write_rule(job)
@@ -262,7 +262,7 @@ def test_restore_a_folder_that_forwards_gives_a_real_tree(r_job, tmp_path):
 
 
 @needs_root
-def test_restore_whole_job_from_every_version_equals_its_view(tmp_path, r_layout):
+def test_restore_whole_job_from_every_version_equals_its_view(tmp_path):
 	job = create_job(str(tmp_path))
 	expected = build_base(job)
 	write_rule(job)
@@ -574,7 +574,7 @@ def test_a_restore_under_its_lock_meeting_a_missing_path_with_a_batch_waiting_do
 # --- a cut batch, with the monitored disk gone ---
 
 @pytest.fixture
-def crash_vault(r_layout, tmp_path_factory):
+def crash_vault(tmp_path_factory):
 	'''The crash vault on design R, as batch 2 left it. Outside tmp_path, whose vaults the ground truth plugins read: they see no fork's links.'''
 	if 'vault' not in PREPARED:
 		place = os.environ.get('REVERB_CRASH_ROOT')

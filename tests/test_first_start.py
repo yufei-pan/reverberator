@@ -124,7 +124,20 @@ def locks_held(job):
 	return {kind: lock_held(job, kind) for kind in ('backup', 'restore')}
 
 
-def test_a_054_vault_converts_at_its_first_start_under_the_locks(small, r_layout, monkeypatch):
+def test_a_054_vault_at_start_is_converted(small):
+	# nothing asks for it but the default: a vault 0.54 wrote is on R once its job has started
+	assert rv.NEW_VAULT_LAYOUT == 'r'
+	before = expected(small)
+	assert any(plain_links(small).values())
+	control = control_of(small)
+	thread = start(small, control)
+	layout_is_r(small)
+	stop(control, thread)
+	assert check_vault(small.job_vault, before, set()) == []
+	assert not any(plain_links(small).values())
+
+
+def test_a_054_vault_converts_at_its_first_start_under_the_locks(small, monkeypatch):
 	before = expected(small)
 	assert any(plain_links(small).values())
 	held = before_the_conversion(monkeypatch, lambda: locks_held(small))
@@ -146,7 +159,7 @@ def test_a_054_vault_converts_at_its_first_start_under_the_locks(small, r_layout
 	assert check_vault(small.job_vault, {**before, 3: expected(small)[3]}, set()) == []
 
 
-def test_the_conversion_runs_at_the_start_and_only_there(small, r_layout, monkeypatch):
+def test_the_conversion_runs_at_the_start_and_only_there(small, monkeypatch):
 	calls = before_the_conversion(monkeypatch, lambda: None)
 	control = control_of(small)
 	thread = start(small, control)
@@ -161,6 +174,7 @@ def test_the_conversion_runs_at_the_start_and_only_there(small, r_layout, monkey
 	assert calls == [None]
 
 
+@pytest.mark.old_writer
 def test_no_conversion_while_new_vaults_are_054(small, monkeypatch):
 	calls = before_the_conversion(monkeypatch, lambda: None)
 	put_text(small.monitor, 'new.txt', 'new')
@@ -171,7 +185,7 @@ def test_no_conversion_while_new_vaults_are_054(small, monkeypatch):
 	assert calls == [] and rv.recorded_layout(small.job_vault) is None
 
 
-def test_a_new_vault_is_no_conversion(tmp_path, r_layout, monkeypatch):
+def test_a_new_vault_is_no_conversion(tmp_path, monkeypatch):
 	job = create_job(str(tmp_path))
 	os.makedirs(job.job_vault)
 	seed_monitor(job, {'a.txt': 'a'})
@@ -184,7 +198,7 @@ def test_a_new_vault_is_no_conversion(tmp_path, r_layout, monkeypatch):
 
 
 @pytest.mark.parametrize('cut', ['orphan', 'manifest', 'swap'])
-def test_the_054_rules_run_first(tmp_path, v054, r_layout, monkeypatch, cut):
+def test_the_054_rules_run_first(tmp_path, v054, monkeypatch, cut):
 	if cut == 'orphan':
 		job = create_job(str(tmp_path))
 		v054.build(job, SMALL, keep_n_versions=9)
@@ -224,7 +238,7 @@ def cut_prune(job, marker):
 	return v0, v1
 
 
-def test_a_pool_prune_marker_is_finished_before_the_conversion(small, r_layout, monkeypatch):
+def test_a_pool_prune_marker_is_finished_before_the_conversion(small, monkeypatch):
 	wanted = expected(small)
 	del wanted[0]
 	on_a_pool(monkeypatch)
@@ -239,7 +253,7 @@ def test_a_pool_prune_marker_is_finished_before_the_conversion(small, r_layout, 
 	assert not os.path.lexists(os.path.join(small.job_vault, rv.PRUNE_MARKER_FILE_NAME))
 
 
-def test_an_unreadable_marker_on_a_pool_removes_no_version(small, r_layout, monkeypatch):
+def test_an_unreadable_marker_on_a_pool_removes_no_version(small, monkeypatch):
 	# a write of the marker torn by a power loss: it is flushed before the walk and cleared after the flush, so no link is left to repair
 	before = expected(small)
 	on_a_pool(monkeypatch)
@@ -258,7 +272,7 @@ def test_an_unreadable_marker_on_a_pool_removes_no_version(small, r_layout, monk
 
 
 @pytest.mark.parametrize('names', ['nothing', 'another'])
-def test_a_marker_naming_no_cut_prune_of_the_oldest_removes_no_version(small, r_layout, monkeypatch, names):
+def test_a_marker_naming_no_cut_prune_of_the_oldest_removes_no_version(small, monkeypatch, names):
 	before = expected(small)
 	on_a_pool(monkeypatch)
 	rv.write_prune_marker(small.job_vault, None if names == 'nothing' else os.path.basename(committed_versions(small)[1]))
@@ -269,7 +283,7 @@ def test_a_marker_naming_no_cut_prune_of_the_oldest_removes_no_version(small, r_
 	assert check_vault(small.job_vault, before, set()) == []
 
 
-def test_a_marker_off_a_pool_finishes_no_prune(small, r_layout):
+def test_a_marker_off_a_pool_finishes_no_prune(small):
 	before = expected(small)
 	rv.write_prune_marker(small.job_vault, os.path.basename(committed_versions(small)[0]))
 	control = control_of(small)
@@ -279,7 +293,7 @@ def test_a_marker_off_a_pool_finishes_no_prune(small, r_layout):
 	assert check_vault(small.job_vault, before, set()) == []
 
 
-def test_a_cut_prune_that_cannot_finish_holds_the_conversion_back(small, r_layout, monkeypatch):
+def test_a_cut_prune_that_cannot_finish_holds_the_conversion_back(small, monkeypatch):
 	# history is reading: the prune is postponed, and converting now would lose what its marker says is to be repaired
 	wanted = expected(small)
 	del wanted[0]
@@ -341,7 +355,7 @@ def row_of(job, rel):
 
 
 @pytest.mark.parametrize('sync_attributes', [False, True])
-def test_a_referenced_row_counts_as_different(tmp_path, v054, r_layout, sync_attributes):
+def test_a_referenced_row_counts_as_different(tmp_path, v054, sync_attributes):
 	job = create_job(str(tmp_path))
 	v054.build(job, SMALL, keep_one_complete_backup=False, keep_n_versions=9, only_sync_attributes=sync_attributes)
 	# a comparison reads the rows of the referenced copy, which it wrote unread: no change, so no version
@@ -377,7 +391,7 @@ def test_a_referenced_row_stays_the_same_on_054(tmp_path, v054):
 
 
 @pytest.mark.parametrize('failure', [OSError(5, 'Input/output error'), rv.JobFailure('a step of the conversion failed'), rv.VaultScanError('the vault cannot be read')])
-def test_one_job_failing_its_conversion_leaves_the_others_running(tmp_path, v054, r_layout, monkeypatch, failure):
+def test_one_job_failing_its_conversion_leaves_the_others_running(tmp_path, v054, monkeypatch, failure):
 	bad = create_job(str(tmp_path / 'bad'), 'bad')
 	good = create_job(str(tmp_path / 'good'), 'good')
 	for job in (bad, good):
@@ -418,7 +432,7 @@ def job_record(tmp_path):
 		return {}
 
 
-def test_status_shows_a_conversion_in_progress(small, r_layout, tmp_path, monkeypatch):
+def test_status_shows_a_conversion_in_progress(small, tmp_path, monkeypatch):
 	rv.STATUS_BOARD = rv.StatusBoard(str(tmp_path / 'state'), small.rule_path)
 	running, go_on = threading.Event(), threading.Event()
 	real = rv.migrate_job_vault
@@ -440,7 +454,7 @@ def test_status_shows_a_conversion_in_progress(small, r_layout, tmp_path, monkey
 	stop(control, thread)
 
 
-def test_a_stop_during_the_conversion_ends_the_attempt_before_any_batch(small, r_layout, monkeypatch):
+def test_a_stop_during_the_conversion_ends_the_attempt_before_any_batch(small, monkeypatch):
 	before = expected(small)
 	control = control_of(small)
 	real = rv.materialize_version
@@ -463,7 +477,7 @@ def test_a_stop_during_the_conversion_ends_the_attempt_before_any_batch(small, r
 	assert rv.recorded_layout(small.job_vault) == 'r'
 
 
-def test_a_conversion_that_failed_goes_on_at_the_next_attempt_after_the_r_scan(small, r_layout, monkeypatch):
+def test_a_conversion_that_failed_goes_on_at_the_next_attempt_after_the_r_scan(small, monkeypatch):
 	# what the first attempt did stands: the staging it made gives the vault the R scan, which empties what it left there
 	before = expected(small)
 	real = rv.materialize_version
@@ -488,7 +502,7 @@ def test_a_conversion_that_failed_goes_on_at_the_next_attempt_after_the_r_scan(s
 	assert not any(plain_links(small).values())
 
 
-def test_the_first_batch_reads_the_sizes_the_conversion_left(small, r_layout, monkeypatch):
+def test_the_first_batch_reads_the_sizes_the_conversion_left(small, monkeypatch):
 	put_text(small.monitor, 'new.txt', 'new')
 	# as the batch begins, as it goes on to change what it is given
 	seen = batches(monkeypatch, lambda entries, vaultInfo, **kwargs: ({number: (entry.size, entry.inode) for number, entry in vaultInfo.vault_info_dict.items()},
@@ -503,7 +517,7 @@ def test_the_first_batch_reads_the_sizes_the_conversion_left(small, r_layout, mo
 	assert (vault_size, vault_inodes) == (sum(size for size, _ in sizes.values()), sum(inodes for _, inodes in sizes.values()))
 
 
-def test_a_lost_manifest_on_r_gets_its_layout_before_any_batch(tmp_path, r_layout, monkeypatch):
+def test_a_lost_manifest_on_r_gets_its_layout_before_any_batch(tmp_path, monkeypatch):
 	# the batch reads links by the manifest's layout (record_dirty_entries(), compare_scopes()): a link of the user's with a chain link's text
 	# must stay the link, which the rows of VaultMoves would not say on a vault still 'converting'
 	job = create_job(str(tmp_path))
@@ -527,7 +541,7 @@ def test_a_lost_manifest_on_r_gets_its_layout_before_any_batch(tmp_path, r_layou
 	assert os.readlink(os.path.join(committed_versions(job)[-1], 'user.lnk')) == text
 
 
-def test_a_lost_manifest_with_a_cut_tree_rolls_forward_after_the_start(tmp_path, r_layout, monkeypatch):
+def test_a_lost_manifest_with_a_cut_tree_rolls_forward_after_the_start(tmp_path, monkeypatch):
 	job = create_job(str(tmp_path))
 	wanted = build_base(job, **KEPT)
 	tree = cut_batch(job)

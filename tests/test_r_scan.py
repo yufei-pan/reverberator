@@ -28,7 +28,7 @@ class Cut(BaseException):
 
 
 @pytest.fixture
-def r_job(tmp_path, r_layout):
+def r_job(tmp_path):
 	return create_job(str(tmp_path))
 
 

@@ -138,6 +138,14 @@ def write_incomplete_version(job: JobPaths, version: int, tree: dict,
 	return version_dir
 
 
+def write_scan_leftover(job: JobPaths) -> str:
+	'''What only a scan of a design R vault takes away, a file left in its staging folder: its path, gone once the job's scan ran.'''
+	path = os.path.join(job.job_vault, rv.STAGING_NAME, 'leftover')
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	open(path, 'w').close()
+	return path
+
+
 def write_pending(job: JobPaths, events: list) -> str:
 	os.makedirs(job.job_vault, exist_ok=True)
 	path = os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME)

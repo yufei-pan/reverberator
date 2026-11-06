@@ -61,18 +61,18 @@ def prepared(key, tmp_path_factory, **options):
 
 
 @pytest.fixture(params=[False, True], ids=['attributes_copied', 'only_sync_attributes'])
-def r_vault(request, r_layout, tmp_path_factory):
+def r_vault(request, tmp_path_factory):
 	'''The crash vault on design R, batch 3 with its chmod of top.txt whose mtime did not move: under Only Sync Attributes that goes on the shared inode.'''
 	return prepared(('r', request.param), tmp_path_factory, only_sync_attributes=request.param)
 
 
 @pytest.fixture
-def osa_r_vault(r_layout, tmp_path_factory):
+def osa_r_vault(tmp_path_factory):
 	return prepared(('r', True), tmp_path_factory, only_sync_attributes=True)
 
 
 @pytest.fixture
-def plain_r_vault(r_layout, tmp_path_factory):
+def plain_r_vault(tmp_path_factory):
 	return prepared(('r', False), tmp_path_factory, only_sync_attributes=False)
 
 
@@ -215,7 +215,7 @@ def test_free_file_meta_still_compares_a_file_nothing_shares_and_the_newest_whol
 	assert check_vault(job_vault, osa_r_vault.expected, set(), free_file_meta=True) != []
 
 
-def test_free_file_meta_loosens_the_newest_listed_version_while_a_tree_is_cut(tmp_path, r_layout):
+def test_free_file_meta_loosens_the_newest_listed_version_while_a_tree_is_cut(tmp_path):
 	# f was rewritten in version 1, so version 0 keeps its own copy and only version 1 reads the inode it shares with the tree; the batch
 	# after it puts a chmod on that inode. Cut after that, version 1 reads the tree's f with the new mode
 	job = create_job(str(tmp_path))
@@ -278,7 +278,7 @@ def test_a_backward_link_in_the_newest_version_of_an_r_vault_is_damage(plain_r_v
 	assert any("'r.txt'" in line and 'daemon link' in line for line in problems), problems
 
 
-def test_a_device_replaced_by_another_is_damage(tmp_path, r_layout):
+def test_a_device_replaced_by_another_is_damage(tmp_path):
 	job = create_job(str(tmp_path))
 	put_text(job.monitor, 'f', 'one')
 	device = os.path.join(job.monitor, 'dev1')
@@ -598,7 +598,7 @@ def cut_tree_of(job, new_name='V3--2030-01-01_00-00-00_-0800'):
 	return new_name
 
 
-def test_a_roll_forward_always_commits(tmp_path, r_layout):
+def test_a_roll_forward_always_commits(tmp_path):
 	job = create_job(str(tmp_path))
 	base = build_base(job)
 	name = cut_tree_of(job)
@@ -609,7 +609,7 @@ def test_a_roll_forward_always_commits(tmp_path, r_layout):
 	assert view_truth.wrong_lists(job.job_vault) == []
 
 
-def test_a_roll_forward_never_prunes_the_previous_version(tmp_path, r_layout):
+def test_a_roll_forward_never_prunes_the_previous_version(tmp_path):
 	job = create_job(str(tmp_path))
 	base = build_base(job)
 	cut_tree_of(job)
@@ -813,7 +813,7 @@ SAVED_ENTRIES = {
 
 
 @pytest.mark.parametrize('scenario', SAVED_ENTRIES)
-def test_a_cut_batch_is_rolled_forward_with_its_saved_entries_given_again(tmp_path, r_layout, scenario):
+def test_a_cut_batch_is_rolled_forward_with_its_saved_entries_given_again(tmp_path, scenario):
 	# a stop cuts the batch at each step; the tree changes while the daemon is down (or not); the next start is given the saved
 	# entries again. The comparison says what the tree is, and of the entries only a plain file's change it cannot see is added
 	change, events, after = SAVED_ENTRIES[scenario]
@@ -919,7 +919,7 @@ def test_a_normal_stop_mid_batch_is_finished_at_the_next_start(plain_r_vault, mo
 	assert wrong_after_retry(vault) == []
 
 
-def test_a_forward_link_whose_tree_entry_is_gone_goes_in_a_roll_forward(tmp_path, r_layout, monkeypatch):
+def test_a_forward_link_whose_tree_entry_is_gone_goes_in_a_roll_forward(tmp_path, monkeypatch):
 	job = create_job(str(tmp_path))
 	base = build_base(job)
 	name = cut_tree_of(job)

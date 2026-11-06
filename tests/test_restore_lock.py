@@ -299,13 +299,13 @@ def test_pruning_holds_the_history_lock_while_the_oldest_version_is_removed(job,
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
 	_state()
 	seen = []
-	real = rv.decrement_stepper
+	real = rv.prune_tree_version
 	def stepping(vault_info_dict, *args, **kwargs):
 		# what history or a restore starting now finds: the lock taken, so it waits for this removal
 		seen.append('free' if _free('history') else 'held')
 		return real(vault_info_dict, *args, **kwargs)
-	monkeypatch.setattr(rv, 'decrement_stepper', stepping)
-	assert rv.prune_oldest(info, 'job', job.monitor) != (0, 0)
+	monkeypatch.setattr(rv, 'prune_tree_version', stepping)
+	assert rv.prune_oldest(info, 'job', job.monitor, on_tree=True) != (0, 0)
 	assert seen == ['held'] and _numbers(job) == [1, 2]
 	# and released afterwards
 	with rv.JobLock('job'):

@@ -650,7 +650,7 @@ def test_the_conversion_runs_no_batch_of_its_own(small, monkeypatch):
 	assert migrate(small) is True
 
 
-def test_a_vault_with_a_lost_manifest_is_no_conversion_to_refuse(tmp_path, r_layout):
+def test_a_vault_with_a_lost_manifest_is_no_conversion_to_refuse(tmp_path):
 	# only a vault whose manifest says a conversion began waits for it: the scan and the roll-forward read one whose manifest is lost
 	job = create_job(str(tmp_path))
 	os.makedirs(job.job_vault)

@@ -202,13 +202,13 @@ def sweep(only_sync, tmp_name, flush_step=None):
 
 
 @needs_f2fs
-def test_every_step_survives_a_power_loss(r_layout, only_sync):
+def test_every_step_survives_a_power_loss(only_sync):
 	sweep(only_sync, 'power-loss')
 
 
 @needs_f2fs
 @pytest.mark.parametrize('flush_step', [lambda step: max(1, step // 2), lambda step: max(1, step - 1)], ids=['midway', 'just_before'])
-def test_every_step_survives_a_power_loss_after_a_checkpoint(r_layout, only_sync, flush_step):
+def test_every_step_survives_a_power_loss_after_a_checkpoint(only_sync, flush_step):
 	# with no checkpoint the run mostly rolls back to before the batch: here the state at an earlier step is on the disk, and what came after it is lost
 	sweep(only_sync, 'power-loss-checkpoint', flush_step)
 
@@ -227,7 +227,7 @@ def keeping_the_placement_and_losing_the_rename(job_vault):
 
 
 @needs_f2fs
-def test_a_power_loss_that_keeps_the_placement_and_loses_the_rename_is_finished(r_layout):
+def test_a_power_loss_that_keeps_the_placement_and_loses_the_rename_is_finished():
 	# a kernel may keep them in either order, as nothing syncs between them: this f2fs never showed this one by itself
 	with LoopImage(os.path.join(SCRATCH, 'power-loss-order'), IMAGE_MIB) as image:
 		root = tempfile.mkdtemp(prefix='reverb-crash-', dir=image.mount_point)
