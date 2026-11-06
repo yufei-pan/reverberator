@@ -1075,24 +1075,21 @@ def test_a_skipped_pre_record_flush_is_caught(request):
 	assert caught('mixed-2', request, control_runs, '-control-pre-record', cut_fault=no_pre_record_flush)
 
 
-def syncing_one_disk(module):
-	"""A flush that reaches the first disk of the pool only, as a regression in the real helper's choice of disks would make it."""
-	real = module.syncfs_folder
-	def syncfs(folder):
-		if os.sep + 'd1' + os.sep not in folder:
-			real(folder)
-	module.syncfs_folder = syncfs
-
-
 def last_disk_unsynced(trace: list, disks: int) -> list:
 	"""control_runs() with the last disk coming back from its template, which a flush that skipped it leaves it at: its own sync is the first step."""
 	return sorted({(kill, *cuts[:-1], 0) for kill, *cuts in control_runs(trace, disks)})
 
 
 @needs_mergerfs
-def test_a_flush_of_one_disk_of_two_is_caught(request):
-	# the plan puts a disk's own sync at or after the last flush, as a flush takes every disk: so it takes runs where that sync comes first
-	assert caught('mixed-2', request, last_disk_unsynced, '-control-one-disk', cut_fault=syncing_one_disk)
+def test_the_flush_reaches_every_disk(request):
+	# the real helper, no fault: in runs where the last disk comes back from its template, a flush that skipped it leaves a version wrong (the plan puts a disk's own sync
+	# at or after the last flush, as a flush takes every disk, so only these runs show it)
+	shape = built_shape('mixed-2', request)
+	trace, held = steps_of(shape)
+	runs = last_disk_unsynced(trace, shape.disks)
+	wrong = run_all(shape, runs, held, '-every-disk')
+	print(f'-every-disk: {len(wrong)} of {len(runs)} runs wrong')
+	assert not wrong, f'{len(wrong)} of {len(runs)} runs wrong: {wrong[:3]}'
 
 
 def skipping(name: str):
