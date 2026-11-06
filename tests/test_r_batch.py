@@ -849,13 +849,32 @@ def move_and_modify(m):
 	return [(True, 'move', 'e', 'a/sub'), (False, 'modify', 'e/m.txt', None)]
 
 
-# a moved row is unverified, so the comparison reads it back and syncs before the batch's copies are flushed
-@pytest.mark.parametrize('item, options, before', [(create_file, {}, []), (create_folder_of_files, {}, []), (modify_file, {}, []), (move_and_modify, {}, ['sync']),
-	(chmod_file, {'only_sync_attributes': False}, [])], ids=['create', 'folder_of_files', 'modify', 'move_and_modify', 'attrib_copied'])
-def test_a_batch_that_copied_flushes_before_its_change_list_and_commit_point(r_job, commit_steps, item, options, before):
+@pytest.mark.parametrize('item, options', [(create_file, {}), (create_folder_of_files, {}), (modify_file, {}), (chmod_file, {'only_sync_attributes': False})],
+	ids=['create', 'folder_of_files', 'modify', 'attrib_copied'])
+def test_a_batch_that_copied_flushes_before_its_change_list_and_commit_point(r_job, commit_steps, item, options):
 	build_base(r_job, **KEPT)
 	backup_events(r_job, item(r_job.monitor), **KEPT, **options)
-	assert commit_steps == before + ['flush', 'list', 'commit']
+	assert commit_steps == ['flush', 'list', 'commit']
+
+
+def test_a_comparison_that_synced_after_the_last_copy_leaves_nothing_to_flush(r_job, commit_steps):
+	build_base(r_job, **KEPT)
+	# the moved row is unverified, so the comparison reads it back and syncs, after every copy of the batch is in place
+	backup_events(r_job, move_and_modify(r_job.monitor), **KEPT)
+	assert commit_steps == ['sync', 'list', 'commit']
+	assert open(at(newest_version(r_job), 'e/m.txt')).read() == 'new'
+
+
+def test_a_comparison_whose_sync_failed_leaves_the_flush(r_job, commit_steps, monkeypatch):
+	build_base(r_job, **KEPT)
+	counted = rv.sync_vault_filesystems
+	def sync(job_vault):
+		first = not commit_steps
+		counted(job_vault)
+		return {'/dev/fake': OSError(errno.EIO, 'input/output error')} if first else {}
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', sync)
+	backup_events(r_job, move_and_modify(r_job.monitor), **KEPT)
+	assert commit_steps == ['sync', 'flush', 'list', 'commit']
 
 
 def test_a_verification_fix_is_a_copy_too(r_job, commit_steps):

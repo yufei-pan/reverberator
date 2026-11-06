@@ -6005,15 +6005,17 @@ def do_backup(backup_entries:dict,
 		# the change list's rows are absolute paths: which monitored path they are read under
 		manifest.note_monitor_path(this_version_number,monitor_path)
 		# on design R a commit says its copies are on the disk (spec section 2.6). they are flushed before the change list is written, as the
-		# list's fsync is a checkpoint, which keeps a new file's size and not its data. a roll-forward always flushes: it commits what the
-		# cut batch left in the tree, whose rows went with that batch, and nothing tells which of those copies are on the disk yet.
+		# list's fsync is a checkpoint, which keeps a new file's size and not its data. a comparison's clean sync after the last copy
+		# flushed them already (manifest.copies_unsynced). a roll-forward always flushes: it commits what the cut batch left in the tree,
+		# whose copies' rows went with that batch, and nothing tells which of them are on the disk yet
 		# so does a batch of two renames: a disk's own order says nothing of the manifest's on another, whatever the batch changed
-		if on_tree and (tree is not None or manifest.holds_copies_of(this_version_number) or (writer is not None and writer.two_renames)):
+		if on_tree and (tree is not None or manifest.copies_unsynced or (writer is not None and writer.two_renames)):
 			try:
 				flush_copies(job_vault,job_name,backup_folder)
 			except JobFailure:
 				manifest.rollback()
 				raise
+		manifest.copies_unsynced = False
 		# the change list's rows first, written whole and synced in its private folder: the slow part, before either record
 		# names this version, so a crash there leaves an orphan at the link + 1, which the next scan removes. then the
 		# manifest, current_version, and the list's rename into place, the commit point, last: neither record ever
@@ -7927,6 +7929,8 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 					if not os.path.lexists(copy.dest_path):
 						manifest.discard(os.path.relpath(copy.dest_path, version_path))
 			done += 1
+		if copied:
+			manifest.copies_unsynced = True
 		version = vault_version_number(os.path.basename(os.path.normpath(version_path)))
 		if version is not None:
 			manifest.set_copy_version(copied, version)
@@ -8732,6 +8736,9 @@ class VaultManifest:
 	def __init__(self, job_vault:str):
 		self.path = os.path.join(job_vault, MANIFEST_FILE_NAME)
 		self._tracking = False
+		# whether a copy placed in the version being written may not be on the disk yet: finish_copies() sets it, a comparison's
+		# clean sync of the vault and the commit's flush (do_backup()) clear it. a batch commits only copies that are on the disk
+		self.copies_unsynced = False
 		try:
 			self._open()
 		except sqlite3.OperationalError as e:
@@ -9163,13 +9170,6 @@ class VaultManifest:
 	def set_copy_version(self, rels, version:int):
 		'''Record that the version numbered version holds the copy of each file of rels; the caller holds the transaction.'''
 		self.conn.executemany('UPDATE entries SET copy_version = ? WHERE path = ?', ((version, storable_name(rel)) for rel in rels))
-
-	def holds_copies_of(self, version:int) -> bool:
-		'''
-		Whether a row leads to a copy made for the version numbered version (set_copy_version()). Asked of the version a batch is
-		writing, that is whether the batch placed a copy that is still in the version.
-		'''
-		return self.conn.execute('SELECT EXISTS (SELECT 1 FROM entries WHERE copy_version = ?)', (version,)).fetchone()[0] == 1
 
 	def take_dirty(self, limit:int) -> list:
 		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty LIMIT ?', (limit,))]
@@ -11151,6 +11151,9 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 						synced = True
 						try:
 							bad_disks = check_vault_sync(os.path.dirname(os.path.abspath(version_path)), job_name)
+							if not bad_disks:
+								# every copy placed so far is on the disks: only a copy placed after this sync still needs the commit's flush
+								manifest.copies_unsynced = False
 							if bad_disks:
 								sync_failed = True
 								backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed since boot on {", ".join(disk + (" (remembered only until reverberator stops: its marker could not be written)" if disk in UNRECORDED_FAILED_DISKS else "") for disk in bad_disks)}, so this comparison\'s copies read back stay unchecked')
