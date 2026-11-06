@@ -1,9 +1,9 @@
 '''
 Round 20: a read of an older version while a batch records under it (spec section 4.2). The batch runs in a forked child and
-makes one change of the vault each time the reader is about to look at something; the reader reads every file and link of
-versions 1 and 2, from each starting point of the batch. Every read must be what the version held, read by the oracle before
-the batch: the reader holds no lock the batch needs, so only the recheck of the links it followed can give that. The second
-test takes the recheck away, to show this one can fail.
+makes one change of the vault each time the reader is about to look at something; the reader walks every file and link of
+versions 1 and 2, from each starting point of the batch. Every walk must land on what the version held, as the oracle read it
+before the batch: the reader holds no lock the batch needs, so only the recheck of the links it followed can give that. The
+second test takes the recheck away, to show this one can fail.
 
 REVERB_CRASH_FULL=1 starts at every change of the batch; by default a stride of them.
 '''
@@ -17,7 +17,6 @@ import time
 import pytest
 
 import reverberator as rv
-from tests import vault_oracle
 from tests.crash_batches import batch3_of, prepare, restore
 from tests.crash_child import KillPoints, in_child, kill_run, run_do_backup
 from tests.vault_oracle import entry_view
@@ -107,43 +106,54 @@ class Lockstep:
 		assert self.outcome.committed is True
 
 
+def landing(walked) -> tuple:
+	'''What a reader that holds no lock takes from a walk: its kind and its lstat, never what its path holds by then, as the batch may have moved that. An inode stands for its data, as a batch never changes a version's inode.'''
+	st = walked.st
+	return walked.kind, None if st is None else (st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_size, st.st_mtime_ns)
+
+
 def wrong_reads(vault, offset, monkeypatch) -> list:
-	'''The reads of versions 1 and 2 that differ from the oracle, the batch started offset changes before the first.'''
+	'''The walks of versions 1 and 2 that land elsewhere than in the quiet vault, whose walks the oracle checks first, the batch started offset changes before the first.'''
 	restore(vault)
+	reading = rv.VaultReading(False, None, None)
+	wrong = []
+	wanted = {}
+	for number in (1, 2):
+		for rel, want in sorted(vault.base[number].items()):
+			if want.kind not in ('f', 'l'):
+				continue
+			walked = rv.read_walked(vault.job.job_vault, number, rel, reading)
+			got = None if walked.kind in ('missing', 'dangling') else entry_view(walked.path)
+			if want.kind == 'l':
+				# a link's own time and owner are not what a version promises
+				same = got is not None and (got.kind, got.data) == (want.kind, want.data)
+			else:
+				same = got == want
+			if not same:
+				wrong.append((number, rel, got, want))
+			wanted[number, rel] = landing(walked)
 	lockstep = Lockstep(vault.job)
 	lockstep.start()
 	for _ in range(offset):
 		lockstep.advance()
-	wrong = []
-	real_lstat, real_readlink, real_sha = os.lstat, os.readlink, vault_oracle.sha256_of
+	real_lstat, real_readlink = os.lstat, os.readlink
 	def stepping(real):
 		def call(*args, **kwargs):
 			lockstep.advance()
 			return real(*args, **kwargs)
 		return call
-	reading = rv.VaultReading(False, None, None)
 	try:
 		with monkeypatch.context() as patched:
 			patched.setattr(os, 'lstat', stepping(real_lstat))
 			patched.setattr(os, 'readlink', stepping(real_readlink))
-			patched.setattr(vault_oracle, 'sha256_of', stepping(real_sha))
-			for number in (1, 2):
-				for rel, want in sorted(vault.base[number].items()):
-					if want.kind not in ('f', 'l'):
-						continue
-					try:
-						walked = rv.read_walked(vault.job.job_vault, number, rel, reading)
-						got = None if walked.kind in ('missing', 'dangling') else entry_view(walked.path)
-					except OSError as e:
-						wrong.append((number, rel, e, want))
-						continue
-					if want.kind == 'l':
-						# a link's own time and owner are not what a version promises
-						same = got is not None and (got.kind, got.data) == (want.kind, want.data)
-					else:
-						same = got == want
-					if not same:
-						wrong.append((number, rel, got, want))
+			for (number, rel), want in wanted.items():
+				try:
+					got = landing(rv.read_walked(vault.job.job_vault, number, rel, reading))
+				except OSError as e:
+					wrong.append((number, rel, e, want))
+					continue
+				if got != want:
+					wrong.append((number, rel, got, want))
 	finally:
 		# a failed read must not leave the child stopped at a change, or the run waits for it for ever
 		lockstep.end()
