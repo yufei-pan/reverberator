@@ -354,6 +354,7 @@ def test_a_file_written_before_the_watch_of_a_folder_read_before_the_take_is_in_
 		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
 		os.mkdir(data)
 		wait_until(lambda: any(e.event == 'create' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no create of the folder')
+		wait_until(flag.is_set, message='watcher did not signal the backuper')
 		if how == 'made':
 			os.mkdir(sub)
 		else:
@@ -367,6 +368,36 @@ def test_a_file_written_before_the_watch_of_a_folder_read_before_the_take_is_in_
 		assert open(os.path.join(latest_version(job).path, 'data', 'sub', 'z')).read() == 'z'
 	finally:
 		go.set()
+		_stop(thread)
+
+
+def test_a_file_written_before_the_watch_of_a_folder_renamed_at_once_is_in_the_next_batch(job, poll_fast, monkeypatch):
+	# mkdir d; mv d e read together: e has no watch until the walk after its move. a take during that walk leaves the move
+	# for the next batch, as its copy could pass e before the watch, and a file written then raises no event
+	seed_monitor(job, {'keep': 'k'})
+	skip_list = rv.SkipList(job.monitor, [])
+	run_backup(job, skip_list=skip_list)
+	made, moved = os.path.join(job.monitor, 'd'), os.path.join(job.monitor, 'e')
+	hold, held, read_go = _hold_reads(monkeypatch)
+	at, walk_go = _hold_walk(monkeypatch, moved)
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, [], flag)
+	try:
+		wait_until(flag.is_set, message='watcher did not signal the backuper')
+		hold.set()
+		assert held.wait(10)
+		os.mkdir(made)
+		os.rename(made, moved)
+		read_go.set()
+		assert at.wait(10)
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		open(os.path.join(moved, 'z'), 'w').write('z')
+		walk_go.set()
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		assert open(os.path.join(latest_version(job).path, 'e', 'z')).read() == 'z'
+	finally:
+		read_go.set()
+		walk_go.set()
 		_stop(thread)
 
 

@@ -3127,7 +3127,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# what moved away from the destination is gone before the move lands on its name, or its late
 						# delete would remove the moved-in entry
 						queue_pending_move_from_at(eventPath,monTime)
-						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,cookie_value.path))
 						if isDir:
 							# we need to update wdDic to reflect the new path,
 							# including all descendant watches of the moved directory.
@@ -3156,6 +3155,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							# the old path. this walk hands each folder watched already its own watch back and watches the
 							# rest; one gone again (renamed on) is walked when that rename is handled
 							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
+						# after the walk, as a create is: a take during it would copy the folder before its watches are in place
+						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'move',eventPath,cookie_value.path))
 					else:
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Cookie not found for {event.cookie}')
