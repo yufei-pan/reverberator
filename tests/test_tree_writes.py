@@ -7,6 +7,7 @@ import ast
 import os
 
 import reverberator as rv
+from tests.harness import copy_now
 
 # what writes the filesystem directly
 WRITE_CALLS = {'os.rename', 'os.replace', 'os.remove', 'os.unlink', 'os.mkdir', 'os.makedirs', 'os.rmdir', 'os.symlink', 'os.link',
@@ -121,7 +122,7 @@ def test_helpers_that_write_the_tree_are_used_only_by_named_functions():
 
 def test_the_writer_is_where_the_writes_are():
 	writer = {name: node for name, node in module_functions(source_tree()).items() if name.startswith('TreeWriter.')}
-	verbs = ('make_folders', 'make_folder', 'copy', 'copy_now', 'place', 'discard_temp', 'remove_now', 'remove_queued', 'rename',
+	verbs = ('make_folders', 'make_folder', 'copy', 'place', 'discard_temp', 'remove_now', 'remove_queued', 'rename',
 		'folder_times', 'folder_meta', 'file_meta', 'root_meta')
 	assert [verb for verb in verbs if f'TreeWriter.{verb}' not in writer] == []
 	# the writes are here, so the lists above hold because they moved, not because a reading missed them
@@ -169,17 +170,17 @@ def test_a_rename_takes_the_place_of_what_is_there(tmp_path):
 	assert writer.rename('b', 'folder') is True and (tmp_path / 'folder').read_text() == 'a'
 
 
-def test_copy_now_makes_the_folders_and_puts_the_copy_in_place(tmp_path):
+def test_a_copy_run_now_makes_the_folders_and_puts_the_copy_in_place(tmp_path):
 	source = tmp_path / 'source'
 	source.write_text('new')
 	tree = tmp_path / 'tree'
 	tree.mkdir()
 	writer = rv.TreeWriter(str(tree))
-	assert writer.copy_now(str(source), 'a/b/f') == 0
+	assert copy_now(writer, str(source), 'a/b/f') == 0
 	assert (tree / 'a' / 'b' / 'f').read_text() == 'new'
 	assert os.listdir(tree / 'a' / 'b') == ['f']
 	# a source already gone makes nothing
-	assert writer.copy_now(str(tmp_path / 'gone'), 'c/f') is False and not (tree / 'c').exists()
+	assert copy_now(writer, str(tmp_path / 'gone'), 'c/f') is False and not (tree / 'c').exists()
 
 
 def test_a_copy_never_makes_its_folders_through_a_link(tmp_path):
@@ -191,7 +192,7 @@ def test_a_copy_never_makes_its_folders_through_a_link(tmp_path):
 	tree.mkdir()
 	os.symlink(outside, tree / 'link')
 	try:
-		rv.TreeWriter(str(tree)).copy_now(str(source), 'link/sub/f')
+		copy_now(rv.TreeWriter(str(tree)), str(source), 'link/sub/f')
 	except rv.NotARealFolder:
 		pass
 	else:

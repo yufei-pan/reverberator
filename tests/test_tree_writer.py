@@ -17,6 +17,7 @@ import pytest
 import reverberator as rv
 from tests import vault_oracle
 from tests.crash_child import in_child
+from tests.harness import copy_now
 from tests.scratch_images import SCRATCH, f2fs_mount, needs_f2fs
 from tests.vault_oracle import landing, read_view, snapshot_tree
 
@@ -339,14 +340,14 @@ def test_a_file_replacing_a_folder_keeps_the_folder_until_placed(tmp_path, monke
 	source = source_file(str(tmp_path))
 	# the copy fails: the tree still has the folder, and so has version 1
 	monkeypatch.setattr(rv, 'copy_command', lambda source_path, dest_path: ['false'])
-	assert writer.copy_now(source, 'd') == 1
+	assert copy_now(writer, source, 'd') == 1
 	tree = writer.tree
 	assert is_folder(os.path.join(tree, 'd')) and (tmp_path / 'vault' / V2 / 'd' / 'sub' / 'y').read_text() == 'old y'
 	assert read_view(job_vault, V1) == before
 	assert not os.path.islink(os.path.join(writer.previous, 'd'))
 	monkeypatch.undo()
 	# the copy works: the file takes the folder's place in the tree only
-	assert writer.copy_now(source, 'd') == 0
+	assert copy_now(writer, source, 'd') == 0
 	assert (tmp_path / 'vault' / V2 / 'd').read_text() == 'new'
 	assert read_view(job_vault, V1) == before
 	assert staging_of(job_vault) == []
@@ -364,11 +365,11 @@ def test_a_folder_copied_over_itself_records_per_entry(tmp_path, monkeypatch):
 	assert read_view(job_vault, V1) == before
 	previous, tree = writer.previous, writer.tree
 	assert is_folder(os.path.join(previous, 'd')) and os.path.islink(os.path.join(previous, 'd', 'copied'))
-	assert writer.copy_now(source, 'd/copied') == 0
-	assert writer.copy_now(bad, 'd/unreadable') == 1
+	assert copy_now(writer, source, 'd/copied') == 0
+	assert copy_now(writer, bad, 'd/unreadable') == 1
 	assert writer.make_folder('d/sub') is True
 	assert os.path.islink(os.path.join(previous, 'd', 'sub', 'deep2'))
-	assert writer.copy_now(source, 'd/sub/deep') == 0
+	assert copy_now(writer, source, 'd/sub/deep') == 0
 	assert read_view(job_vault, V1) == before
 	# the copy that failed keeps the last copy in both versions
 	assert read_through(job_vault, V2, 'd/unreadable') == b'old unreadable'
@@ -386,7 +387,7 @@ def test_a_move_records_by_hard_link(tmp_path):
 	assert os.lstat(os.path.join(previous, 'd', 'x')).st_ino == inode == os.lstat(os.path.join(tree, 'e', 'x')).st_ino
 	assert read_view(job_vault, V1) == before
 	# mv d e; echo new > e/x: version 1 never held e, so nothing is recorded, and the new copy leaves the old inode in P/d/x
-	assert writer.copy_now(source_file(str(tmp_path)), 'e/x') == 0
+	assert copy_now(writer, source_file(str(tmp_path)), 'e/x') == 0
 	assert os.lstat(os.path.join(tree, 'e', 'x')).st_ino != inode
 	assert os.lstat(os.path.join(previous, 'd', 'x')).st_ino == inode
 	assert read_view(job_vault, V1) == before
@@ -527,7 +528,7 @@ def test_a_forward_text_too_long_is_recorded_real(tmp_path):
 	previous, tree = writer.previous, writer.tree
 	source = source_file(str(tmp_path))
 	# all the way down: the folders unfold while their entries' texts fit, and below that the entries are real
-	assert writer.copy_now(source, deepest + '/f') == 0
+	assert copy_now(writer, source, deepest + '/f') == 0
 	first_real = None
 	for level in range(1, levels + 1):
 		rel = '/'.join(['d'] * level) + '/f'
@@ -597,8 +598,8 @@ def test_records_are_idempotent(tmp_path, do):
 def test_a_merge_records_what_still_forwards_and_nothing_else(tmp_path):
 	writer, job_vault, before = handed_over(str(tmp_path), {'d/old': 'old', 'd/kept': 'kept', 'd/sub/x': 'x'})
 	# P/d is real, one entry recorded: the removal of the folder records the others one by one
-	assert writer.copy_now(source_file(str(tmp_path)), 'd/old') == 0
-	assert writer.copy_now(source_file(str(tmp_path)), 'd/born') == 0
+	assert copy_now(writer, source_file(str(tmp_path)), 'd/old') == 0
+	assert copy_now(writer, source_file(str(tmp_path)), 'd/born') == 0
 	writer.remove_now('d')
 	assert not os.path.lexists(os.path.join(writer.tree, 'd'))
 	assert read_view(job_vault, V1) == before
@@ -636,7 +637,7 @@ def test_unfold_gives_times_back_on_f2fs():
 		assert read_view(job_vault, V1) == before
 		parent_mtime = before['d'].mtime_ns
 		# an unfold into its parent, and that parent's own, and a folder exchanged in, and a hard-link tree
-		assert writer.copy_now(source_file(mount_point), 'd/sub/x') == 0
+		assert copy_now(writer, source_file(mount_point), 'd/sub/x') == 0
 		assert os.lstat(os.path.join(newest, 'd')).st_mtime_ns == parent_mtime
 		assert os.lstat(os.path.join(newest, 'd', 'sub')).st_mtime_ns == before['d/sub'].mtime_ns
 		assert read_view(job_vault, V1) == before
@@ -646,7 +647,7 @@ def test_unfold_gives_times_back_on_f2fs():
 		assert writer.rename('moved', 'moved2') is True
 		assert os.lstat(os.path.join(newest, 'moved', 'a')).st_mtime_ns == before['moved/a'].mtime_ns
 		assert read_view(job_vault, V1) == before
-		assert writer.copy_now(source_file(mount_point), 'top') == 0
+		assert copy_now(writer, source_file(mount_point), 'top') == 0
 		assert os.lstat(newest).st_mtime_ns == st.st_mtime_ns
 		assert writer.make_folder('made') is True
 		writer.folder_times('made', os.lstat(newest))

@@ -47,6 +47,14 @@ def write_tree(root: str, tree: dict) -> None:
 			f.write(content)
 
 
+def copy_now(writer, source: str, rel: str):
+	"""A copy of source to rel of the writer's tree, made and put in place now, as the replay queues and ends it: cp's exit code, or False when nothing is copied."""
+	writer.record(rel, True)
+	writer.flush_if_needed()
+	writer._folders_for_copy(source, rel)
+	return rv.cp_af_copy_path(source_path=source, dest_path=writer.path(rel))
+
+
 def seed_monitor(job: JobPaths, tree: dict) -> None:
 	write_tree(job.monitor, tree)
 

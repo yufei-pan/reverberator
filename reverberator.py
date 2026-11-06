@@ -7494,13 +7494,12 @@ def copy_command(source_path:str, dest_path:str) -> list:
 	'''
 	return ['env', 'LC_ALL=C', 'cp', '-af', '--reflink=auto', '--sparse=always', source_path, dest_path]
 
-def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...,pending:list = None,writer:'TreeWriter' = None):
+def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = ...,pending:list = None):
 	'''
 	Copy source_path to dest_path with cp -a, written under partial_copy_path(dest_path): dest_path stays as it is until
 	the copy succeeded, so a failed copy never loses what the version held there.
 
-	Without mcae the copy runs now, takes dest_path's place through writer (TreeWriter.place(); by default one on
-	dest_path's folder) when it succeeded, and its exit code is returned. On mcae it is queued, appended to pending as a
+	Without mcae the copy runs now, takes dest_path's place (TreeWriter.place(), on dest_path's folder) when it succeeded, and its exit code is returned. On mcae it is queued, appended to pending as a
 	PendingCopy and its task returned; finish_copies() puts it in place. Returns False when nothing is copied. A version's
 	replay comes through TreeWriter.copy(), which has made dest_path's folders; only V0 and a restore can find them missing.
 	'''
@@ -7536,8 +7535,7 @@ def cp_af_copy_path(source_path:str,dest_path:str,mcae:multiCMD.AsyncExecutor = 
 		task = mcae.run_command(command)
 		pending.append(PendingCopy(task, source_path, temp_path, dest_path))
 		return task
-	if writer is None:
-		writer = TreeWriter(os.path.dirname(dest_path))
+	writer = TreeWriter(os.path.dirname(dest_path))
 	try:
 		returncode = multiCMD.run_command(command,quiet=True,return_code_only=True,wait_for_return=True)
 		if returncode == 0:
@@ -12768,13 +12766,6 @@ class TreeWriter:
 		self.flush_if_needed()
 		self._folders_for_copy(source, rel)
 		return cp_af_copy_path(source_path=source,dest_path=self.path(rel),mcae=mcae,pending=pending)
-
-	def copy_now(self, source:str, rel:str) -> int:
-		'''Copy source to rel and put it in place, now (cp_af_copy_path()): cp's exit code, or False when nothing is copied.'''
-		self.record(rel, True)
-		self.flush_if_needed()
-		self._folders_for_copy(source, rel)
-		return cp_af_copy_path(source_path=source,dest_path=self.path(rel),writer=self)
 
 	def place(self, temp:str, dest_rel:str) -> None:
 		'''Put the finished copy at temp in the place of dest_rel (replace_entry()).'''

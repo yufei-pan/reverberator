@@ -16,7 +16,7 @@ import pytest
 import reverberator as rv
 from tests.crash_batches import OPTIONS, UNREADABLE, apply_batch1, apply_batch2, apply_batch3, batch3_of, build_base, expected_of, put_text, raw_events, seed_base
 from tests.crash_child import failing_copy_command
-from tests.harness import create_job
+from tests.harness import copy_now, create_job
 from tests.test_r_batch import ITEMS, each_item, take_wrong
 from tests.test_tree_writer import V2, deep_vault, source_file
 from tests.vault_oracle import check_vault, sizes_by_newest_holder, snapshot_tree, version_number
@@ -402,7 +402,7 @@ def test_a_forward_text_too_long_counts_what_is_held_real(tmp_path):
 	job_vault, newest = deep_vault(str(tmp_path), levels)
 	deepest = '/'.join(['d'] * levels)
 	writer = rv.hand_over(job_vault, newest, os.path.join(job_vault, V2))
-	assert writer.copy_now(source_file(str(tmp_path)), deepest + '/f') == 0
+	assert copy_now(writer, source_file(str(tmp_path)), deepest + '/f') == 0
 	assert writer.sizes.result() == sizes_by_newest_holder(job_vault)[1]
 
 
