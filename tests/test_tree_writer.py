@@ -555,13 +555,14 @@ def test_a_forward_text_too_long_is_recorded_real(tmp_path):
 
 
 def p_state(previous):
-	'''All of P as stored, nothing followed: a record run again must change none of it.'''
+	'''All of P as stored, nothing followed: a record run again must change none of it. A link's access time is left out: reading its text here moves it (relatime).'''
 	state = {}
 	for folder, names, files in os.walk(previous):
 		for name in ['.'] + names + files:
 			path = os.path.normpath(os.path.join(folder, name))
 			st = os.lstat(path)
-			state[path] = (st.st_mode, st.st_ino, st.st_mtime_ns, st.st_atime_ns, os.readlink(path) if stat.S_ISLNK(st.st_mode) else None)
+			link = stat.S_ISLNK(st.st_mode)
+			state[path] = (st.st_mode, st.st_ino, st.st_mtime_ns, None if link else st.st_atime_ns, os.readlink(path) if link else None)
 	return state
 
 
