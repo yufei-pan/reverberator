@@ -37,7 +37,7 @@ from tests.crash_child import in_child, KillPoints, retry, run_do_backup
 from tests.harness import create_job, run_backup, seed_monitor, write_rule
 from tests.scratch_images import flush_scratch, LoopImage, SCRATCH, shut_down_scratch
 from tests.test_migration import cli_differences, expected as views_by_number, folders_of, migrate, plain_links, SMALL
-from tests.test_pool_writer import MERGERFS_OPTIONS, needs_mergerfs
+from tests.test_pool_writer import MERGERFS_OPTIONS, needs_mergerfs, pool_writer
 from tests.test_tree_writer import a_vault as a_vault_of_two_names
 from tests.vault_oracle import check_vault, read_view, recorded_design_r, sha256_of, snapshot_tree, version_number
 
@@ -1024,6 +1024,9 @@ def no_pre_record_flush(module):
 		self.flush_if_needed = lambda: None
 		real(self, ops, poll)
 		del self.flush_if_needed
+		# what flush() does besides the sync: the fault takes the flush away and nothing else
+		for folder, times in self.saved.items():
+			os.utime(self.kept_path(folder), ns=times, follow_symlinks=False)
 		self.needs_flush = False
 	module.TreeWriter.pre_record = pre_record
 
@@ -1043,6 +1046,28 @@ def caught(name: str, request, plan, tag: str, cut_fault=None, retry_fault=None)
 		if wrong:
 			return True
 	return False
+
+
+def test_the_pre_record_fault_takes_away_the_flush_and_nothing_else(tmp_path, fake_pool, monkeypatch):
+	# flush() also gives a real folder its times back: without that, a folder a pool made on a disk keeps the time of the record in a run with no cut at all (Review 3b's N6)
+	writer, job_vault, newest = pool_writer(tmp_path, fake_pool, {'d/f': 'x', 'd/e/g': 'y'})
+	flushes = []
+	monkeypatch.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: flushes.append(1) or [])
+	monkeypatch.setattr(rv.TreeWriter, 'pre_record', rv.TreeWriter.pre_record)
+	real_ensure_real = rv.TreeWriter.ensure_real
+	def ensure_real(self, *args, **kwargs):
+		made = real_ensure_real(self, *args, **kwargs)
+		# as a pool does on a disk that had no such folder: the next one made there moves this one's time
+		for folder in self.saved:
+			os.utime(self.kept_path(folder))
+		return made
+	monkeypatch.setattr(rv.TreeWriter, 'ensure_real', ensure_real)
+	no_pre_record_flush(rv)
+	wanted = os.lstat(os.path.join(writer.tree, 'd')).st_mtime_ns
+	writer.pre_record([(rv.FOLDER_OP, 'd')])
+	assert flushes == [] and not writer.needs_flush
+	assert not os.path.islink(os.path.join(newest, 'd'))
+	assert os.lstat(os.path.join(newest, 'd')).st_mtime_ns == wanted
 
 
 @needs_mergerfs
