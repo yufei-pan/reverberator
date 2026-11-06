@@ -7,6 +7,7 @@ An audit hook counts each mutating call under the job vault; VaultManifest.commi
 event sees, count through wrappers. The kill goes to the child's own process group, so the cp and rm it started die with it,
 and the parent waits until the group is gone, so nothing races the retry.
 '''
+import errno
 import itertools
 import json
 import os
@@ -35,10 +36,16 @@ WRITING_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 
 
 class KillPoints:
-	'''Counts the mutating calls under job_vault, by kind; kills the process group before the kill_at-th.'''
-	def __init__(self, job_vault: str, kill_at: int = None):
+	'''
+	Counts the mutating calls under job_vault, by kind; kills the process group before the kill_at-th, once before_kill()
+	has run: a power loss model shuts the filesystem down there. flush_at, (step, call), makes that model's checkpoint: call runs
+	before that step.
+	'''
+	def __init__(self, job_vault: str, kill_at: int = None, before_kill = None, flush_at: tuple = None):
 		self.prefix = os.path.abspath(job_vault) + '/'
 		self.kill_at = kill_at
+		self.before_kill = before_kill
+		self.flush_at = flush_at
 		self.steps = itertools.count(1)
 		self.lock = threading.Lock()
 		self.counts = Counter()
@@ -46,7 +53,11 @@ class KillPoints:
 	def step(self, kind: str) -> None:
 		with self.lock:
 			number = next(self.steps)
+			if self.flush_at is not None and number == self.flush_at[0]:
+				self.flush_at[1]()
 			if number == self.kill_at:
+				if self.before_kill is not None:
+					self.before_kill()
 				os.killpg(0, signal.SIGKILL)
 			self.counts[kind] += 1
 
@@ -96,6 +107,19 @@ def failing_copy_command(real):
 	return command
 
 
+def enospc_at(number: int, job_vault: str) -> None:
+	'''From now on in this child, the number-th link, symlink or mkdir under job_vault fails as a full disk fails it.'''
+	prefix = os.path.abspath(job_vault) + '/'
+	calls = itertools.count(1)
+	def failing(real, at):
+		def call(*args, **kwargs):
+			if (os.path.abspath(os.fsdecode(args[at])) + '/').startswith(prefix) and next(calls) == number:
+				raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), args[at])
+			return real(*args, **kwargs)
+		return call
+	os.link, os.symlink, os.mkdir = failing(os.link, 1), failing(os.symlink, 1), failing(os.mkdir, 0)
+
+
 def reset_module_state() -> None:
 	'''The module as a process started just now has it: no thread of the parent runs here, and nothing is remembered.'''
 	rv.GREEN_LIGHT.set()
@@ -115,10 +139,12 @@ def reset_module_state() -> None:
 	rv.BACKUP_SEMAPHORE = threading.Semaphore(2 * os.cpu_count())
 
 
-def in_child(job, kill_at, work, fault=None) -> Outcome:
+def in_child(job, kill_at, work, fault=None, before_kill=None, flush_at=None) -> Outcome:
 	'''
 	Run work(), which gives do_backup's committed answer, in a forked child that dies before its kill_at-th mutating call
-	under the job vault. fault, when given, is called in the child with the module, to patch what the run must meet.
+	under the job vault. fault, when given, is called in the child with the module, to patch what the run must meet;
+	'enospc:<n>' makes the n-th link, symlink or mkdir under the job vault fail with ENOSPC. before_kill runs in the child
+	just before it dies, flush_at as KillPoints has it.
 	'''
 	# a real syncfs would flush the live filesystem under /tmp: only isolated_runtime()'s fixture makes a fork safe
 	assert rv.sync_vault_filesystems is not REAL_SYNC_VAULT_FILESYSTEMS, 'a kill run outside isolated_runtime()'
@@ -133,13 +159,15 @@ def in_child(job, kill_at, work, fault=None) -> Outcome:
 		try:
 			os.close(reader)
 			os.setpgid(0, 0)
-			points = KillPoints(job.job_vault, kill_at)
+			points = KillPoints(job.job_vault, kill_at, before_kill, flush_at)
 			reset_module_state()
 			rv.copy_command = failing_copy_command(rv.copy_command)
 			rv.VaultManifest.commit = points.counted('commit', rv.VaultManifest.commit)
 			if hasattr(rv, 'rename_exchange'):
 				rv.rename_exchange = points.counted('exchange', rv.rename_exchange)
-			if fault is not None:
+			if isinstance(fault, str):
+				enospc_at(int(fault.partition(':')[2]), job.job_vault)
+			elif fault is not None:
 				fault(rv)
 			sys.addaudithook(points.hook)
 			committed = work()
@@ -174,20 +202,20 @@ def in_child(job, kill_at, work, fault=None) -> Outcome:
 	return Outcome(False, result['committed'], result['steps'], result['counts'], result['error'])
 
 
-def run_do_backup(job, entries, **kwargs) -> bool:
-	_, manifest, committed = rv.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, **OPTIONS, **kwargs)
+def run_do_backup(job, entries, options=None, **kwargs) -> bool:
+	_, manifest, committed = rv.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, **{**OPTIONS, **(options or {})}, **kwargs)
 	manifest.close()
 	return committed
 
 
-def kill_run(job, kill_at=None, fault=None) -> Outcome:
-	'''Batch 3, as the backuper runs a fresh batch, killed before its kill_at-th mutating call; uncut when None.'''
+def kill_run(job, kill_at=None, fault=None, options=None, before_kill=None, flush_at=None) -> Outcome:
+	'''Batch 3, as the backuper runs a fresh batch, killed before its kill_at-th mutating call; uncut when None. options go over OPTIONS.'''
 	def work():
 		entries, touched = batch3_of(job)
-		return run_do_backup(job, entries, touched=touched, matched_since=time.time_ns())
-	return in_child(job, kill_at, work, fault)
+		return run_do_backup(job, entries, options, touched=touched, matched_since=time.time_ns())
+	return in_child(job, kill_at, work, fault, before_kill, flush_at)
 
 
-def retry(job, kill_at=None) -> Outcome:
+def retry(job, kill_at=None, fault=None, options=None) -> Outcome:
 	'''What the daemon's restart runs: the scan, then a full comparison and a backup of what differs.'''
-	return in_child(job, kill_at, lambda: run_do_backup(job, OrderedDict(), matched_since=time.time_ns()))
+	return in_child(job, kill_at, lambda: run_do_backup(job, OrderedDict(), options, matched_since=time.time_ns()), fault)

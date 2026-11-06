@@ -4587,7 +4587,7 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 	compared with the latest version, and what that finds replaces the batch's entries at or under it. A folder inside
 	another scanned one is compared with it, and one in a paused inner mount compares nothing.
 	Returns (vaultInfo, manifest, full_comparison): full_comparison asks for the whole tree instead, for a scan of the
-	monitored path itself or a vault with no version yet. JobFailure is raised, before anything is compared, when the
+	monitored path itself, a vault with no version yet or a cut batch to roll forward. JobFailure is raised, before anything is compared, when the
 	monitored path no longer shows the filesystem root_mount fingerprints. reported holds the unreadable paths this batch
 	already logged. pool_guard goes to each comparison (delta_generate_backup_entries()). With no vaultInfo the vault is
 	scanned, which can change it, so under the job's locks: job (a JobControl) is whose wait that is, and a stop during it
@@ -4609,8 +4609,8 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 			vaultInfo = get_vault_info(job_vault_path=job_vault,manifest=manifest)
 		finally:
 			locks.release()
-	if not vaultInfo.vault_info_dict:
-		# nothing to compare with: the first backup copies the whole tree
+	if not vaultInfo.vault_info_dict or vaultInfo.tree is not None:
+		# nothing to compare with: the first backup copies the whole tree. a cut batch's tree is compared whole by its roll-forward
 		return vaultInfo, manifest, True
 	# a manifest opened here is closed here if the comparison raises, as the caller never gets it back
 	opened_manifest = manifest is None
@@ -4698,7 +4698,9 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		# copy left in it goes now, though the path may be long in coming back. a scan that fails fails the attempt
 		job_vault = os.path.join(vault_path,job_name)
 		def scan():
-			# the scan can change the vault: under the job's backup and restore locks, so no restore reads it meanwhile.
+			# the scan can change the vault: under the job's backup and restore locks, so no restore reads it meanwhile. they
+			# go before the wait for the monitored path: a disk that died is when a restore is wanted, and the versions
+			# read exact from here on, as the scan prepared a cut batch's roll-forward (prepare_roll_forward()).
 			# None when the job stops while it waits for them
 			locks = BackupLocks(job_name, job=job)
 			if not locks.take(running):
@@ -5568,6 +5570,8 @@ def do_backup(backup_entries:dict,
 	# chain_length: the job's Chain Length, 0 for no limit, None for DEFAULT_CHAIN_LENGTH; it sets when a file is copied again ( recopy_hops() )
 	# copy_threads: the job's Copy threads, the threads of the referenced copy and the prune, None for REFERENCED_COPY_THREADS
 	# job: the job's JobControl, None outside the daemon: the wait for the locks shows in its status and ends when it stops running
+	# a vaultInfo with a tree (design R) holds a cut batch's tree: this backup rolls it forward, a batch with no hand-over that
+	# compares the whole tree and always commits (spec section 3, plan S4); what is given is merged with that comparison
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -5629,6 +5633,8 @@ def do_backup(backup_entries:dict,
 		vault_info_dict = vaultInfo.vault_info_dict
 		vault_size = vaultInfo.vault_size
 		vault_inodes = vaultInfo.vault_inodes
+		# a batch cut after its hand-over, which this backup finishes
+		tree = vaultInfo.tree
 		# design R: the newest version is the one real tree, and a batch hands it over (hand_over()). only a vault that reads
 		# as 0.54 gets the referenced copy: the 0.54 rules must never run again on one with staging (vault_layout())
 		on_tree = vault_layout(job_vault,manifest) != '0.54'
@@ -5742,13 +5748,27 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name,f'Finishing the prune of {vault_info_dict[next(iter(vault_info_dict))].path}, which was cut off before its flush, before backing up')
 					monitor_paths = manifest_monitor_paths(manifest)
 					remove_oldest()
-			if backup_entries and manifest.describes(latest_version_info.path):
+			if tree is None and backup_entries and manifest.describes(latest_version_info.path):
 				# a delete of what the vault holds no path of would make a version with no change. dropping it is safe: deletes
 				# replay first, onto a version that holds only the tracked rows, so such a delete would remove nothing
 				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path)
 				if dropped:
 					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
-			if not backup_entries:
+			if tree is not None:
+				backuperTeeLogToTl(job_name,f'Rolling forward {tree}, the tree of a batch that was cut')
+				rolled = roll_forward_entries(vaultInfo,manifest,monitor_path,backup_entries,skip=None if skip_list is None else skip_list.skips,paused=paused,job_name=job_name,reported=reported,
+					changed_since_wall=full_comparison_since(vault_info_dict,manifest.matched),pool_guard=pool_guard)
+				if not GREEN_LIGHT.is_set():
+					# the tree stays, and the next attempt compares it whole again
+					manifest.rollback()
+					backuperTeeLogToTl(job_name,f'The comparison of {tree} was interrupted: the next attempt finishes it',error=True)
+					return vaultInfo, manifest, False
+				backup_entries = rolled
+				paused = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
+				# the cut batch may have left anything in the tree, whose root is always real in the previous version: the
+				# verification compares and sweeps all of it, through the writer
+				touched = TouchedScopes([''],[])
+			elif not backup_entries:
 				if touched is None:
 					backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
 				else:
@@ -5773,7 +5793,7 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name,f'Dropped {dropped} backup entries in unmounted inner mounts')
 					if not backup_entries:
 						backuperTeeLogToTl(job_name,'No backup entries left outside unmounted inner mounts',ok=True)
-			if not backup_entries:
+			if not backup_entries and tree is None:
 				backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
 				# no differences after a complete walk, or none left outside paused folders: the tree matches the
 				# manifest under this skip list, if every disk of both pools was there all along
@@ -5790,8 +5810,10 @@ def do_backup(backup_entries:dict,
 			# pruning, the chains of the re-copy and those of the attribute changes that copy tell their links by them
 			monitor_paths = manifest_monitor_paths(manifest)
 			# an attribute change copies its file where the vault's copy holds other contents ( do_reverb_backup() )
-			attrib_copies = attribs_to_copy(backup_entries,manifest,monitor_path,job_vault,latest_version_info.path,TREE_LINKS if on_tree else VaultMoves(job_vault,monitor_path,monitor_paths)) if only_sync_attributes else frozenset()
-			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies)
+			# what the size limit counts is against the tree, wherever it is now
+			tree_now = latest_version_info.path if tree is None else tree
+			attrib_copies = attribs_to_copy(backup_entries,manifest,monitor_path,job_vault,tree_now,TREE_LINKS if on_tree else VaultMoves(job_vault,monitor_path,monitor_paths)) if only_sync_attributes else frozenset()
+			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = tree_now,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies)
 			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
 			this_version_number = latest_version_info.version_number + 1
 			# the files whose link chains would pass their threshold are copied again from the vault, so the size limit
@@ -5826,7 +5848,10 @@ def do_backup(backup_entries:dict,
 			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
 			# from the prunes on, the vault changes
 			if not locks.take():
-				return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
+				if tree is not None:
+					# what the comparison read of the tree stands only if the version commits
+					manifest.rollback()
+				return VaultInfo(vault_info_dict, vault_size, vault_inodes, tree), manifest, False
 			if backup_limit_size:
 				while vault_size + estimated_backup_size + recopies_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size + recopies_size} exceeds backup size limit {backup_limit_size}')
@@ -5850,7 +5875,12 @@ def do_backup(backup_entries:dict,
 				recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
-			if on_tree:
+			if tree is not None:
+				# it is handed over already, and what it recorded stands, so a record only acts where a forward link still does
+				backup_folder = tree
+				this_timestamp = os.path.basename(tree).partition('--')[2]
+				writer = TreeWriter(tree,previous=latest_version_info.path,job_vault=job_vault,manifest=manifest)
+			elif on_tree:
 				# the rows are read from the tree while it still has the latest version's name: once it is handed over, that name holds links
 				manifest.begin()
 				if not manifest.describes(latest_version_info.path):
@@ -5874,8 +5904,12 @@ def do_backup(backup_entries:dict,
 				pool_guard=pool_guard,unsynced=unsynced,sizes=copied,threads=copy_threads,writer=writer)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
-			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
 			manifest.rollback()
+			if writer is not None:
+				# the tree stays, and what is told here of the vault is old: with no versions in it, any next call scans
+				backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}: the next attempt finishes it', error=True)
+				return VaultInfo({}, 0, 0), manifest, False
+			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
 			if vaultInfo is None:
 				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 			return vaultInfo, manifest, False
@@ -5888,7 +5922,8 @@ def do_backup(backup_entries:dict,
 		if writer is not None:
 			# what was the newest version holds only what the tree let go in this batch, and its list is named for that from
 			# this commit on, as the size limit counts it. the numbers are the batch's, not its old whole tree's
-			previous_size, previous_inodes = writer.sizes.result()
+			# a roll-forward's counters know nothing of what the cut batch did
+			previous_size, previous_inodes = writer.sizes.result() if tree is None else measure_previous(latest_version_info.path,tree)
 			previous_entry = latest_version_info._replace(size=previous_size,inode=previous_inodes)
 			vault_size += previous_size - latest_version_info.size
 			vault_inodes += previous_inodes - latest_version_info.inode
@@ -6663,6 +6698,155 @@ def give_back_folder_times(previous:str, manifest:'VaultManifest') -> list:
 		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
 	return recorded
 
+def unlink_self_named(tree:str, rel:str) -> None:
+	'''
+	The link at rel in the version folder at tree, when its text names its own place: a folder's exchange into the previous version
+	(TreeWriter.exchange_in()) leaves it in the folder's place for one call, and nothing is to be read or written through it. Anything else there stays. Raises OSError.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     tree = os.path.join(folder, 'V1--x')
+		...     os.makedirs(os.path.join(tree, 'd'))
+		...     os.symlink(forward_text('d/own', 'V1--x'), os.path.join(tree, 'd', 'own'))
+		...     os.symlink('elsewhere', os.path.join(tree, 'other'))
+		...     for rel in ('d/own', 'other', 'd', 'missing', 'other/under'): unlink_self_named(tree, rel)
+		...     sorted(os.listdir(tree)), os.listdir(os.path.join(tree, 'd'))
+		(['d', 'other'], [])
+	'''
+	path = os.path.join(tree, rel)
+	try:
+		text = os.readlink(path)
+	except OSError as e:
+		if e.errno in (errno.EINVAL, errno.ENOENT, errno.ENOTDIR):
+			return
+		raise
+	if text == forward_text(rel, os.path.basename(os.path.normpath(tree))):
+		os.unlink(path)
+
+def prepare_roll_forward(job_vault:str, info:VaultInfo, manifest:'VaultManifest') -> None:
+	'''
+	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4), so the versions read exact
+	from here on, and a restore can run before the monitored path is back. Each real folder of the previous version gets its
+	times back (give_back_folder_times()), a link a cut exchange left in a recorded folder's place in the tree goes, and the
+	files recorded are marked unchecked, in a transaction of its own, as the tree may hold another copy now where the row
+	still says version n's: the comparison reads them there. Idempotent: a cut here repeats it. Raises OSError or sqlite3.Error.
+	'''
+	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
+	recorded = give_back_folder_times(previous, manifest)
+	for rel in recorded:
+		if rel.endswith('/'):
+			unlink_self_named(info.tree, rel[:-1])
+	manifest.begin()
+	manifest.mark_unchecked(rel for rel in recorded if not rel.endswith('/'))
+	manifest.commit()
+
+def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
+	'''
+	The rows of version n as far as they say what is in the tree of a cut batch: each row's mode and owner, a folder's mtime and a
+	link's text are read from the tree, and a row whose entry is gone or of another kind has no record, which the comparison
+	treats as a new entry. That batch may have changed any of them, and the monitored tree may have gone back since: a
+	comparison with the old row would say nothing differs. A file's contents are left to its unchecked mark
+	(prepare_roll_forward()). The caller holds the transaction, as these rows stand only if the version commits: a repeated
+	roll-forward needs version n's folder times again. One look at each row, on a path that a crash alone takes.
+	'''
+	changed = []
+	for rel in list(manifest.iter_folders()) + list(manifest.iter_files()):
+		record = manifest.lookup(rel)
+		if record is None or record.kind is None:
+			continue
+		path = os.path.join(tree, rel.rstrip('/'))
+		try:
+			st = os.lstat(path)
+		except OSError:
+			changed.append((rel, None))
+			continue
+		if entry_kind(st.st_mode) != record.kind:
+			changed.append((rel, None))
+			continue
+		found = record._replace(mode=st.st_mode, uid=st.st_uid, gid=st.st_gid)
+		if record.kind == 'd':
+			found = found._replace(mtime_ns=st.st_mtime_ns)
+		elif record.kind == 'l':
+			found = found._replace(link=os.readlink(path))
+		if found != record:
+			changed.append((rel, found))
+	manifest.set_records(changed)
+
+def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:str, given:dict, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None,
+		changed_since_wall:int = None, pool_guard:'PoolGuard' = None) -> OrderedDict:
+	'''
+	What the roll-forward of the tree info.tree replays (plan S4): the entries given, as pending events resume them, and what a full comparison finds
+	between the monitored tree and that tree, which wins where both name a path. delta_generate_backup_entries() is never
+	called on it, as it commits naming the version it compares, and it would name the tree. All of it is in a transaction
+	the commit of the version ends, or a cut rolls back; a manifest that does not describe the previous version, as a lost one,
+	lists the tree first. A stop leaves the comparison partial, for the caller to throw away. JobFailure rolls back and goes on up.
+	skip, paused, job_name, reported and changed_since_wall are compare_scopes()'s; pool_guard's pools must have stayed whole.
+	'''
+	manifest.begin()
+	try:
+		if not manifest.describes(info.vault_info_dict[next(reversed(info.vault_info_dict))].path):
+			backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe the version before {info.tree}, listing the tree')
+			manifest.rebuild(info.vault_info_dict[next(reversed(info.vault_info_dict))].path,tree_path=info.tree)
+		read_rows_from_tree(manifest, info.tree)
+		found = OrderedDict()
+		compare_scopes(found, manifest, info.tree, monitor_path, TouchedScopes([''], [], None, changed_since_wall), skip=skip, paused=paused, job_name=job_name, reported=reported, folder_times=True)
+		if pool_guard is not None:
+			pool_guard.require()
+	except JobFailure:
+		manifest.rollback()
+		raise
+	merged = OrderedDict(given)
+	merged.update(found)
+	return merged
+
+def measure_previous(previous:str, tree:str) -> tuple:
+	'''
+	(bytes, inodes) of what the previous version alone holds (spec section 6), from the two folders, for a roll-forward whose
+	counters (BatchSizes) know nothing of the cut batch: each file not shared with the tree counts its size and an inode,
+	each real folder 4 KiB and an inode, each link an inode. The version's root is no row of it. Raises OSError.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     tree, kept = os.path.join(folder, 'V2--x'), os.path.join(folder, 'V1--x')
+		...     for path in (tree, kept, os.path.join(kept, 'd')): os.mkdir(path)
+		...     for path, text in ((os.path.join(tree, 'shared'), '123'), (os.path.join(kept, 'd', 'own'), '12345')):
+		...         with open(path, 'w') as f: _ = f.write(text)
+		...     os.link(os.path.join(tree, 'shared'), os.path.join(kept, 'shared'))
+		...     os.symlink(forward_text('other', 'V2--x'), os.path.join(kept, 'other'))
+		...     measure_previous(kept, tree)
+		(4101, 3)
+	'''
+	shared = set()
+	pending = [tree]
+	while pending:
+		with os.scandir(pending.pop()) as entries:
+			for entry in entries:
+				if entry.is_dir(follow_symlinks=False):
+					pending.append(entry.path)
+				elif not entry.is_symlink():
+					st = entry.stat(follow_symlinks=False)
+					if st.st_nlink > 1:
+						shared.add(st.st_ino)
+	size = inodes = 0
+	pending = [previous]
+	while pending:
+		with os.scandir(pending.pop()) as entries:
+			for entry in entries:
+				if entry.is_dir(follow_symlinks=False):
+					size += FOLDER_BYTES
+					inodes += 1
+					pending.append(entry.path)
+				elif entry.is_symlink():
+					inodes += 1
+				else:
+					st = entry.stat(follow_symlinks=False)
+					if st.st_ino not in shared:
+						# a file held twice here counts once
+						shared.add(st.st_ino)
+						size += st.st_size
+						inodes += 1
+	return size, inodes
+
 def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> VaultInfo:
 	'''
 	The scan of a vault on design R (spec section 3, plan S3), whose caller holds the job's locks. A version folder with no list
@@ -6670,7 +6854,7 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	names is finished. Then the private list folders and staging are emptied. Of the one orphan there may be, at the one
 	after the newest version: a skeleton, empty or holding only links that name their own place (is_skeleton()), goes, with
 	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
-	the tree, kept and returned in VaultInfo.tree for the next attempt. A lone V0 orphan goes. Any other orphan is an error, before
+	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt. A lone V0 orphan goes. Any other orphan is an error, before
 	anything is removed. A lost manifest names nothing: its private list goes, and the orphan is judged the same way, so a cut tree stays.
 	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54.
 	Raises VaultScanError, or PoolNotReady with a disk of the vault's pool missing, as get_vault_info() does.
@@ -6714,7 +6898,13 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	remove_stale_change_lists(job_vault, listing, guard)
 	move_current_version_forward(job_vault, listing)
 	vault_info_dict = OrderedDict(sorted(listing.versions.items()))
-	return VaultInfo(vault_info_dict, sum(entry.size for entry in vault_info_dict.values()), sum(entry.inode for entry in vault_info_dict.values()), tree)
+	info = VaultInfo(vault_info_dict, sum(entry.size for entry in vault_info_dict.values()), sum(entry.inode for entry in vault_info_dict.values()), tree)
+	if tree is not None:
+		try:
+			prepare_roll_forward(job_vault, info, manifest)
+		except (OSError, sqlite3.Error) as e:
+			raise VaultScanError(f'cannot make the tree {tree} ready for its roll-forward: {e}')
+	return info
 
 def read_vault_whole(job_vault_path:str, guard:PoolGuard, judge_orphans:bool = True) -> 'VaultListing | None':
 	'''
@@ -13055,40 +13245,48 @@ class TreeWriter:
 		if self.previous is None:
 			return
 		pending = [rel.rstrip('/')]
-		while pending:
-			here = pending.pop()
-			parent = os.path.dirname(here)
-			if not self.ensure_real(parent):
-				continue
-			if self.forwards(here):
-				kind, tree_path = self.held_in_tree(here), self.path(here)
-				if kind is None:
+		try:
+			while pending:
+				here = pending.pop()
+				parent = os.path.dirname(here)
+				if not self.ensure_real(parent):
 					continue
-				if kind != 'd':
-					if keep:
+				if self.forwards(here):
+					kind, tree_path = self.held_in_tree(here), self.path(here)
+					if kind is None:
+						continue
+					if kind != 'd':
+						if keep:
+							staged = self.staged()
+							self.keep_entry(tree_path, staged, here)
+							os.rename(staged, self.kept_path(here))
+							# the forward link it took the place of
+							self.sizes.record_dropped(0, -1)
+						else:
+							# its inode takes the forward link's place in the count
+							self.sizes.record_dropped(0 if kind == 'l' else os.lstat(tree_path).st_size, 0)
+							os.rename(tree_path, self.kept_path(here))
+						self.give_back_times(parent)
+					elif keep:
 						staged = self.staged()
-						self.keep_entry(tree_path, staged, here)
-						os.rename(staged, self.kept_path(here))
-						# the forward link it took the place of
+						st = os.lstat(tree_path)
+						self.hard_link_tree(tree_path, staged, here)
+						self.exchange_in(here, st, staged)
 						self.sizes.record_dropped(0, -1)
 					else:
-						# its inode takes the forward link's place in the count
-						self.sizes.record_dropped(0 if kind == 'l' else os.lstat(tree_path).st_size, 0)
-						os.rename(tree_path, self.kept_path(here))
-					self.give_back_times(parent)
-				elif keep:
-					staged = self.staged()
-					st = os.lstat(tree_path)
-					self.hard_link_tree(tree_path, staged, here)
-					self.exchange_in(here, st, staged)
-					self.sizes.record_dropped(0, -1)
-				else:
-					# the folder takes the forward link's place in the count, and all of it left the tree
-					size, inodes = self.folder_usage(here, rows)
-					self.exchange_in(here, os.lstat(tree_path), tree_path)
-					self.sizes.record_dropped(size + FOLDER_BYTES, inodes)
-			elif kind_at(self.kept_path(here)) == 'd' and kind_at(self.path(here)) == 'd':
-				pending.extend(f'{here}/{name}' for name in os.listdir(self.path(here)))
+						# the folder takes the forward link's place in the count, and all of it left the tree
+						size, inodes = self.folder_usage(here, rows)
+						self.exchange_in(here, os.lstat(tree_path), tree_path)
+						self.sizes.record_dropped(size + FOLDER_BYTES, inodes)
+				elif kind_at(self.kept_path(here)) == 'd' and kind_at(self.path(here)) == 'd':
+					try:
+						pending.extend(f'{here}/{name}' for name in os.listdir(self.path(here)))
+					except (FileNotFoundError, NotADirectoryError):
+						# the rm of a removal queued before this one is at it (remove_queued()): its record ran, so nothing below needs one
+						pass
+		except OSError as e:
+			# a full disk, say: nothing goes on as if the old state were kept, and the next attempt rolls forward
+			raise JobFailure(f'recording {rel} in {self.previous} failed: {e}')
 
 	def hl_record(self, rel:str) -> None:
 		'''A move's source: version n's entry at rel in the previous version by hard links, as the tree keeps it to rename it.'''
@@ -13114,6 +13312,10 @@ class TreeWriter:
 				self.ensure_real(rel)
 				return True
 			self.record(rel, False)
+			if not make_real_folder(self.path(rel)):
+				# a version with a new tree's folder left out would read as if it went: the next attempt finishes it
+				raise JobFailure(f'making the folder {self.path(rel)} in the version failed')
+			return True
 		return make_real_folder(self.path(rel))
 
 	def _folders_for_copy(self, source:str, rel:str) -> None:
@@ -13780,6 +13982,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					# its own target is copied now, by a folder above it too ( copy_untracked_folder() )
 					move_targets.discard(event_relative_path + ('/' if isDir else ''))
 					delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
+				except JobFailure:
+					# a record that failed, or a disk that dropped: no copy instead, as the next attempt finishes it
+					raise
 				except NotRenamed:
 					# its source or the folder it goes into is not in the version, as the batch's collapse cannot tell ( a copy
 					# a live move outran, or a folder the version holds elsewhere ). nothing is wrong, so no traceback

@@ -4,6 +4,7 @@ else lives there. Keep REVERB_SCRATCH private; a tmpfs folder such as /dev/shm/r
 '''
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -43,3 +44,93 @@ def f2fs_mount(tmp: str, size_mib: int):
 		shutil.rmtree(work)
 		with contextlib.suppress(OSError):
 			os.rmdir(tmp)
+
+
+class NotOurLoopImage(Exception):
+	'''A flush or a shutdown asked of anything but a loop image this test process attached under REVERB_SCRATCH.'''
+
+
+# the loop devices this process attached: device -> its image
+ATTACHED = {}
+
+
+def our_mount_point(path: str) -> str:
+	'''
+	The mount point holding path, as long as path is under REVERB_SCRATCH and findmnt says its source is a /dev/loop* this
+	process attached (ATTACHED), its backing file being the image it attached there. NotOurLoopImage, with nothing done,
+	otherwise: this host holds many live f2fs mounts, and a shutdown of one takes a production backup filesystem down.
+	'''
+	scratch = os.environ.get('REVERB_SCRATCH')
+	if not scratch or not os.path.isabs(scratch):
+		raise NotOurLoopImage(f'REVERB_SCRATCH is {scratch!r}, no absolute path')
+	root = os.path.realpath(scratch) + '/'
+	real = os.path.realpath(path)
+	if not (real + '/').startswith(root):
+		raise NotOurLoopImage(f'{real} is not under {root}')
+	found = subprocess.run(['findmnt', '-n', '-r', '-o', 'SOURCE,TARGET', '--target', real], capture_output=True, text=True)
+	source, _, target = found.stdout.strip().partition(' ')
+	if found.returncode != 0 or not re.fullmatch(r'/dev/loop[0-9]+', source):
+		raise NotOurLoopImage(f'{real} is on {source or "nothing findmnt names"}, no loop device')
+	if source not in ATTACHED:
+		raise NotOurLoopImage(f'{source} was not attached by this test')
+	backing = subprocess.run(['losetup', '-n', '-O', 'BACK-FILE', source], capture_output=True, text=True).stdout.strip()
+	if backing != ATTACHED[source] or not backing.startswith(root) or not target.startswith(root):
+		raise NotOurLoopImage(f'{source} holds {backing!r} mounted at {target!r}, not the image this test attached')
+	return target
+
+
+def flush_scratch(path: str) -> None:
+	'''syncfs of the loop image holding path (our_mount_point()), the only way a test flushes a filesystem by itself.'''
+	subprocess.run(['sync', '-f', our_mount_point(path)], check=True)
+
+
+def shut_down_scratch(path: str) -> None:
+	'''
+	f2fs_io shutdown 2 of the loop image holding path (our_mount_point()): the filesystem stops with no checkpoint, and what
+	it held dirty is lost, as at a power loss. The only way a test calls f2fs_io.
+	'''
+	subprocess.run(['f2fs_io', 'shutdown', '2', our_mount_point(path)], check=True, stdout=subprocess.DEVNULL)
+
+
+class LoopImage:
+	'''A new f2fs of size_mib on a loop device this process attached, as f2fs_mount() has it, which can be mounted again after a shutdown.'''
+	def __init__(self, tmp: str, size_mib: int):
+		self.tmp = tmp
+		self.size_mib = size_mib
+
+	def mount(self) -> None:
+		subprocess.run(['mount', '-t', 'f2fs', '-o', F2FS_OPTIONS.removeprefix('loop,'), self.device, self.mount_point], check=True)
+
+	def remount(self) -> None:
+		subprocess.run(['umount', self.mount_point], check=True)
+		self.mount()
+
+	def __enter__(self) -> 'LoopImage':
+		os.makedirs(self.tmp, exist_ok=True)
+		self.work = tempfile.mkdtemp(prefix='f2fs-', dir=self.tmp)
+		self.image, self.mount_point = os.path.join(os.path.realpath(self.work), 'image'), os.path.join(self.work, 'mnt')
+		self.device = None
+		try:
+			with open(self.image, 'wb') as f:
+				f.truncate(self.size_mib << 20)
+			subprocess.run(['mkfs.f2fs', '-q', '-f', '-O', F2FS_FEATURES, self.image], check=True, stdout=subprocess.DEVNULL)
+			os.mkdir(self.mount_point)
+			self.device = subprocess.run(['losetup', '-f', '--show', self.image], check=True, capture_output=True, text=True).stdout.strip()
+			ATTACHED[self.device] = self.image
+			self.mount()
+		except BaseException:
+			self.__exit__()
+			raise
+		return self
+
+	def __exit__(self, *_) -> None:
+		try:
+			if os.path.ismount(self.mount_point):
+				subprocess.run(['umount', self.mount_point], check=True)
+		finally:
+			if self.device is not None:
+				ATTACHED.pop(self.device, None)
+				subprocess.run(['losetup', '-d', self.device], check=True)
+			shutil.rmtree(self.work)
+			with contextlib.suppress(OSError):
+				os.rmdir(self.tmp)

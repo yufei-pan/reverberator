@@ -429,8 +429,24 @@ def test_another_link_error_fails_the_record_and_keeps_version_n(tmp_path, monke
 	def full(*args, **kwargs):
 		raise OSError(errno.ENOSPC, 'No space left on device')
 	monkeypatch.setattr(os, 'link', full)
-	with pytest.raises(OSError):
+	# no caller goes on as if the old state were kept
+	with pytest.raises(rv.JobFailure, match='No space left'):
 		writer.record('x', True)
+	assert read_view(job_vault, V1) == before
+
+
+def test_a_folder_an_rm_is_removing_needs_no_record(tmp_path, monkeypatch):
+	# deletes run deepest first and their rm runs beside the replay: the record of a folder above can look at one the rm then takes
+	writer, job_vault, before = handed_over(str(tmp_path), {'d/sub/x': 'x', 'd/y': 'y'})
+	writer.record('d/sub/x', True)
+	real_listdir = os.listdir
+	def gone(path):
+		if os.path.normpath(path).endswith('d/sub'):
+			raise FileNotFoundError(errno.ENOENT, 'gone', path)
+		return real_listdir(path)
+	with monkeypatch.context() as patch:
+		patch.setattr(os, 'listdir', gone)
+		writer.record('d', False)
 	assert read_view(job_vault, V1) == before
 
 

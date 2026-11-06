@@ -211,10 +211,11 @@ def after_retries(job_vault: str, expected: dict) -> dict:
 	return {number: expected[min(number, 3)] for number in range(newest - KEEP + 1, newest + 1)}
 
 
-CrashVault = namedtuple('CrashVault', ['job', 'template', 'base', 'expected'])
+# options: what every batch of this vault runs with, over OPTIONS
+CrashVault = namedtuple('CrashVault', ['job', 'template', 'base', 'expected', 'options'], defaults=[{}])
 
 
-def prepare(root: str) -> CrashVault:
+def prepare(root: str, **options) -> CrashVault:
 	'''
 	The crash vault under root (on a mount of REVERB_CRASH_ROOT's, when the caller chose it): built by the real daemon, in
 	this process, under isolated_runtime(), so call it from a test, not from a fixture wider than a test's. base is what
@@ -222,15 +223,26 @@ def prepare(root: str) -> CrashVault:
 	left it: restore() puts back only the vault, so what a retry compares has the ctimes a real restart would see.
 	'''
 	job = create_job(root)
-	base = build_base(job)
+	base = build_base(job, **options)
 	template = os.path.join(root, 'template')
 	subprocess.run(['cp', '-a', job.vault, template], check=True)
 	apply_batch3(job)
+	subprocess.run(['cp', '-a', job.monitor, monitor_template(job)], check=True)
 	after = expected_of(snapshot_tree(job.monitor), base[2])
-	return CrashVault(job, template, base, {1: base[1], 2: base[2], 3: after})
+	return CrashVault(job, template, base, {1: base[1], 2: base[2], 3: after}, options)
+
+
+def monitor_template(job) -> str:
+	return os.path.join(job.root, 'monitor_template')
 
 
 def restore(vault: CrashVault) -> None:
 	'''The vault back as batch 2 left it.'''
 	shutil.rmtree(vault.job.vault)
 	subprocess.run(['cp', '-a', vault.template, vault.job.vault], check=True)
+
+
+def restore_monitor(vault: CrashVault) -> None:
+	'''The monitored tree back as batch 3 left it, for a test that changed it: its names, contents, modes and times, though not its ctimes.'''
+	shutil.rmtree(vault.job.monitor)
+	subprocess.run(['cp', '-a', monitor_template(vault.job), vault.job.monitor], check=True)
