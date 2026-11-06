@@ -231,11 +231,8 @@ def prune_before_a_batch(job: JobPaths, keep: int) -> None:
 	versions = rv.get_vault_info(job.job_vault).vault_info_dict
 	if not keep or len(versions) < keep:
 		return
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		monitor_paths = rv.manifest_monitor_paths(manifest)
-	finally:
-		manifest.close()
+	# read without opening the manifest: opening a 0.54 manifest would upgrade it
+	monitor_paths = rv.recorded_monitor_paths(job.job_vault)
 	postponed, salt = [], rv.vault_prune_salt(job.job_vault, job.job_name)
 	while len(versions) >= keep:
 		oldest = next(iter(versions))
