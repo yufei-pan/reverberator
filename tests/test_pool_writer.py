@@ -265,14 +265,15 @@ def test_a_hand_over_on_a_pool_refuses_a_taken_name_with_nothing_changed(tmp_pat
 	assert os.path.isfile(os.path.join(newest, 'f'))
 
 
-def test_a_failed_flush_in_the_hand_over_is_a_cut_the_scan_finishes(plain_vault, fake_pool):
+@pytest.mark.parametrize('failing_flush', [1, 2, 3, 4])
+def test_a_failed_flush_in_the_hand_over_is_a_cut_the_scan_finishes(plain_vault, fake_pool, failing_flush):
 	job = plain_vault.job
 	fake_pool.add(job.vault, ['a', 'b'])
 	flushes = []
 	def failing(module):
 		def flush(job_vault, job_name):
 			flushes.append(1)
-			return ['/dev/fake'] if len(flushes) == 2 else []
+			return ['/dev/fake'] if len(flushes) == failing_flush else []
 		module.flush_vault_disks = flush
 	failed = kill_run(job, fault=failing, options=plain_vault.options)
 	assert 'failed a sync' in failed.error
@@ -405,10 +406,33 @@ def test_a_batch_with_nothing_copied_flushes_on_a_pool_before_it_commits(tmp_pat
 			seen.append('commit')
 		return real_commit(self, *args, **kwargs)
 	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
+	monkeypatch.setattr(rv.VaultManifest, 'holds_copies_of', lambda self, number: False)
+	real_flush_copies = rv.flush_copies
+	# the commit's own flush, as the end of the batch's settling can flush just before it
+	monkeypatch.setattr(rv, 'flush_copies', lambda *args: seen.append('commit flush') or real_flush_copies(*args))
 	monkeypatch.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: seen.append('flush') or [])
 	os.remove(os.path.join(job.monitor, 'a.txt'))
 	run_backup(job, OrderedDict([event_entry(job, 'a.txt', 'delete')]))
-	assert seen[-2:] == ['flush', 'commit']
+	assert seen[-3:] == ['commit flush', 'flush', 'commit']
+
+
+def test_a_batch_on_a_pool_flushes_by_the_phase_not_by_the_entry(tmp_path, fake_pool, monkeypatch):
+	# each flush is a checkpoint on every disk: the replay's records go in one pass and the settling's in one, whatever the batch's size
+	job = create_job(str(tmp_path))
+	write_rule(job)
+	names = [f'd{number}/f.txt' for number in range(20)]
+	seed_monitor(job, {name: name for name in names})
+	run_backup(job)
+	seed_monitor(job, {'c.txt': 'c'})
+	run_backup(job, OrderedDict([event_entry(job, 'c.txt', 'create')]))
+	fake_pool.add(job.vault, ['x', 'y'])
+	flushes = []
+	monkeypatch.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: flushes.append(1) or [])
+	for name in names:
+		os.remove(os.path.join(job.monitor, name))
+	run_backup(job, OrderedDict(event_entry(job, name, 'delete') for name in names))
+	# the prune, the hand-over's three, the replay, the settling, the commit
+	assert 0 < len(flushes) <= 7
 
 
 def test_a_cut_between_a_records_renames_gets_its_link_back(plain_vault, fake_pool):
