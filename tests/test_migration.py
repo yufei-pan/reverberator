@@ -328,6 +328,24 @@ def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	assert cli_differences(job.job_vault, before) == []
 
 
+def test_a_version_counts_as_done_only_after_a_flush_of_its_folder_time(small, monkeypatch):
+	# including one that needs no plain tree (V0, or one a repair finished): its folder's time is set, and a second cut must not lose it
+	# for a version the manifest calls done
+	events = []
+	real_utime, real_flush, real_add = os.utime, rv.flush_vault_disks, rv.VaultManifest.add_migrated
+	def utime(path, *args, **kwargs):
+		events.append(('utime', os.path.basename(path)))
+		return real_utime(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'utime', utime)
+	monkeypatch.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: events.append('flush') or real_flush(job_vault, job_name))
+	monkeypatch.setattr(rv.VaultManifest, 'add_migrated', lambda self, name: events.append(('done', name)) or real_add(self, name))
+	assert migrate(small) is True
+	done = [number for number, event in enumerate(events) if isinstance(event, tuple) and event[0] == 'done']
+	assert len(done) == 3
+	for number in done:
+		assert events[number - 1] == 'flush' and events[number - 2] == ('utime', events[number][1])
+
+
 def test_folders_moved_aside_and_put_back_still_read_as_converting(small, tmp_path):
 	# a conversion begun, the version folders moved away for a look, a start, and the folders put back: the layout stays unset, so
 	# the conversion goes on and reads them as 0.54 trees (a scan that set 'r' while they were away would read their links as R's)

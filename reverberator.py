@@ -13059,10 +13059,10 @@ def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, sto
 			return False
 		# a swap across folders can move the folder's own mtime, as f2fs does, and one cut after its swap changes nothing more here
 		os.utime(versions[number].path, ns=tuple(times[name]), follow_symlinks=False)
-		if changed:
-			failed_disks = flush_vault_disks(job_vault, job_name)
-			if failed_disks:
-				raise JobFailure(f'the conversion of {job_vault} stops: {", ".join(failed_disks)} failed a sync')
+		# always: a version a repair finished, or one that needs no tree, still has this time to keep, and the manifest's word must not outlive it
+		failed_disks = flush_vault_disks(job_vault, job_name)
+		if failed_disks:
+			raise JobFailure(f'the conversion of {job_vault} stops: {", ".join(failed_disks)} failed a sync')
 		manifest.begin()
 		manifest.add_migrated(name)
 		manifest.commit()
