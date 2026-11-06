@@ -6109,8 +6109,11 @@ def scan_gets_r_rules(job_vault:str, manifest:'VaultManifest' = None) -> bool:
 	try:
 		return layout_known(job_vault, manifest.layout() if manifest is not None else recorded_layout(job_vault)) is not None
 	except (OSError, sqlite3.Error) as e:
-		backuperTeeLogToTl(job_vault, f'Cannot read the vault, nothing in it is removed: cannot tell its layout: {e}', error=True)
-		raise VaultScanError(f'cannot tell the layout of {job_vault}: {e}')
+		# the error first, as status cuts a reason at 40 characters; and what fixes it, as the open of the manifest would say it, for a
+		# manifest that cannot be opened keeps every attempt from getting that far
+		reason = f'{e}: cannot tell the layout of {job_vault} (if it stays, remove {os.path.join(job_vault, MANIFEST_FILE_NAME)}: only a listing of the vault is lost, unless a backup was cut off, whose folder times it holds)'
+		backuperTeeLogToTl(job_vault, f'Cannot read the vault, nothing in it is removed: {reason}', error=True)
+		raise VaultScanError(reason)
 
 def pending_transaction_rows(events) -> list:
 	'''
@@ -8426,7 +8429,7 @@ class VaultManifest:
 		except sqlite3.OperationalError as e:
 			# a lock held past the timeout, a failing disk or no file handle left says nothing of the file, and it stays as it is: after a
 			# cut batch it holds the only copy of version n's folder times. the attempt fails and the next one opens it again
-			raise JobFailure(f'cannot open the vault database {self.path}: {e} (if it stays, remove that file: only a listing of the vault is lost, unless a backup was cut off, whose folder times it holds)') from e
+			raise JobFailure(f'{e}: cannot open the vault database {self.path} (if it stays, remove that file: only a listing of the vault is lost, unless a backup was cut off, whose folder times it holds)') from e
 		except sqlite3.DatabaseError as e:
 			# a file that is no database says nothing the vault does not: start over, and delta generation reads the vault again
 			backuperTeeLogToTl(path=self.path,error=True,message=f'Discarding unreadable manifest: {e}')

@@ -574,6 +574,30 @@ def test_an_error_of_the_operation_keeps_the_manifest(job, monkeypatch, message)
 	reopened.close()
 
 
+def test_a_vault_whose_manifest_cannot_be_opened_says_so_first_and_what_fixes_it(job, monkeypatch):
+	# every open fails: the scan stops at the layout, before any open of the manifest of the backup itself, so the reason is the scan's
+	monkeypatch.setattr(rv, 'NEW_VAULT_LAYOUT', 'r')
+	seed_monitor(job, {'a.txt': 'hello'})
+	run_backup(job)
+	connect = sqlite3.connect
+	def failing(*args, **kwargs):
+		if rv.MANIFEST_FILE_NAME in str(args[0]):
+			raise sqlite3.OperationalError('unable to open database file')
+		return connect(*args, **kwargs)
+	monkeypatch.setattr(rv.sqlite3, 'connect', failing)
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, rv.ChangeEventQueue(job.monitor), threading.Lock(), job.monitor, job.vault, 'N/A', threading.Event()),
+		kwargs=dict(job=control), daemon=True)
+	thread.start()
+	thread.join(20)
+	assert not thread.is_alive() and control.failure is not None and not control.failure.permanent
+	reason = control.failure.reason
+	# the error first: a status card cuts the reason at 40 characters
+	assert reason[:40] == 'unable to open database file: cannot tel'
+	assert os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME) in reason and 'if it stays, remove' in reason
+
+
 def test_an_attempt_that_cannot_open_the_manifest_fails_and_the_next_one_commits(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
