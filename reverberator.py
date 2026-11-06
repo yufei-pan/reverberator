@@ -6004,6 +6004,16 @@ def do_backup(backup_entries:dict,
 		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
 		# the change list's rows are absolute paths: which monitored path they are read under
 		manifest.note_monitor_path(this_version_number,monitor_path)
+		# on design R a commit says its copies are on the disk (spec section 2.6). they are flushed before the change list is written, as the
+		# list's fsync is a checkpoint, which keeps a new file's size and not its data. a roll-forward always flushes: it commits what the
+		# cut batch left in the tree, whose rows went with that batch, and nothing tells which of those copies are on the disk yet.
+		# so does a batch of two renames: a disk's own order says nothing of the manifest's on another, whatever the batch changed
+		if on_tree and (tree is not None or manifest.holds_copies_of(this_version_number) or (writer is not None and writer.two_renames)):
+			try:
+				flush_copies(job_vault,job_name,backup_folder)
+			except JobFailure:
+				manifest.rollback()
+				raise
 		# the change list's rows first, written whole and synced in its private folder: the slow part, before either record
 		# names this version, so a crash there leaves an orphan at the link + 1, which the next scan removes. then the
 		# manifest, current_version, and the list's rename into place, the commit point, last: neither record ever
@@ -6015,11 +6025,6 @@ def do_backup(backup_entries:dict,
 		# a disk of either pool missing now, or mounted again since the batch began, fails the attempt before anything is
 		# committed: a copy may have landed on no disk of the vault, or a file of a missing monitored disk may read as deleted
 		try:
-			# on design R a commit says its copies are on the disk (spec section 2.6). a roll-forward always flushes: it commits what the
-			# cut batch left in the tree, whose rows went with that batch, and nothing tells which of those copies are on the disk yet.
-			# so does a batch of two renames: a disk's own order says nothing of the manifest's on another, whatever the batch changed
-			if on_tree and (tree is not None or manifest.holds_copies_of(this_version_number) or (writer is not None and writer.two_renames)):
-				flush_copies(job_vault,job_name,backup_folder)
 			pool_guard.require()
 		except JobFailure:
 			discard_change_list(prepared_list)

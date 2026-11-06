@@ -11,6 +11,7 @@ REVERB_CRASH_FULL=1 runs every step; by default a stride.
 import os
 import random
 import re
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -282,3 +283,48 @@ def test_a_committed_copy_survives_a_power_cut():
 		again = retry(job, fault=flushing_for_real)
 		assert again.error is None and again.committed is True, again
 		assert check_vault(job.job_vault, {1: base[1], 2: base[2], 3: wanted}, set()) == []
+
+
+@needs_f2fs
+def test_a_cut_after_the_change_list_is_written_keeps_every_copy_right():
+	# the list's fsync is a checkpoint, which keeps a new file's size and not its data: the copies must be flushed before it. a chmod
+	# with Only Sync Attributes off copies a file whose row does not change, so the retry compares its copy by size, mtime and tail
+	# and a copy of all NUL passes when the file ends in NUL
+	options = {'only_sync_attributes': False}
+	rel = 'probe.bin'
+	wanted = random.Random(1).randbytes(256 << 10) + bytes(128 << 10)
+	def power_goes_after_the_list(mount):
+		def fault(module):
+			flushing_for_real(module)
+			real_prepare = module.prepare_change_list
+			def prepare(*args, **kwargs):
+				prepared = real_prepare(*args, **kwargs)
+				shut_down_scratch(mount)
+				os.killpg(0, signal.SIGKILL)
+			module.prepare_change_list = prepare
+		return fault
+	with LoopImage(os.path.join(SCRATCH, 'power-loss-list'), 256) as image:
+		root = tempfile.mkdtemp(prefix='reverb-crash-', dir=image.mount_point)
+		job = create_job(root)
+		build_base(job, **options)
+		path = os.path.join(job.monitor, rel)
+		with open(path, 'wb') as f:
+			f.write(wanted)
+		raw = raw_events(job.monitor, [(False, 'create', rel, None)])
+		def batch(raw):
+			return lambda: run_do_backup(job, rv.change_events_to_backup_entries(deque(raw), job.monitor), options, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns())
+		first = in_child(job, None, batch(raw), flushing_for_real)
+		assert first.committed is True, first
+		os.chmod(path, 0o640)
+		raw = raw_events(job.monitor, [(False, 'attrib', rel, None)])
+		flush_scratch(root)
+		cut = in_child(job, None, batch(raw), power_goes_after_the_list(image.mount_point))
+		assert cut.killed, cut
+		image.remount()
+		again = retry(job, fault=flushing_for_real, options=options)
+		assert again.error is None and again.committed is True, again
+		newest = max(version_number(name) for name in os.listdir(job.job_vault) if version_number(name) is not None and os.path.isdir(os.path.join(job.job_vault, name)))
+		assert newest == 4
+		folder = next(name for name in os.listdir(job.job_vault) if version_number(name) == newest)
+		with open(os.path.join(job.job_vault, folder, rel), 'rb') as f:
+			assert f.read() == wanted

@@ -773,21 +773,33 @@ def test_a_folder_holding_a_path_near_the_limit_moves_as_one_row(r_job, spare):
 @pytest.fixture
 def commit_steps(monkeypatch):
 	'''
-	What a batch does from its change list to its commit point, in order, each sync_vault_filesystems() a flush. A verification's comparison syncs
-	before the list when it reads back an unchecked copy, which is no commit's flush.
+	What a batch does about the disk from its start to its commit point, in order: 'flush' for the sync of flush_copies(), 'sync' for any
+	other sync_vault_filesystems() (a verification's comparison reads back an unchecked copy), 'list' for the change list and 'commit'.
 	'''
 	steps = []
-	real_prepare, real_commit = rv.prepare_change_list, rv.VaultManifest.commit
+	flushing = []
+	real_do_backup, real_prepare, real_commit, real_flush = rv.do_backup, rv.prepare_change_list, rv.VaultManifest.commit, rv.flush_copies
+	def do_backup(*args, **kwargs):
+		steps.clear()
+		return real_do_backup(*args, **kwargs)
 	def prepare(*args, **kwargs):
-		steps[:] = ['list']
+		steps.append('list')
 		return real_prepare(*args, **kwargs)
 	def commit(self, version_path=None):
 		if version_path is not None:
 			steps.append('commit')
 		return real_commit(self, version_path)
+	def flush(*args, **kwargs):
+		flushing.append(True)
+		try:
+			return real_flush(*args, **kwargs)
+		finally:
+			flushing.pop()
+	monkeypatch.setattr(rv, 'do_backup', do_backup)
 	monkeypatch.setattr(rv, 'prepare_change_list', prepare)
 	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
-	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: steps.append('flush') or {})
+	monkeypatch.setattr(rv, 'flush_copies', flush)
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: steps.append('flush' if flushing else 'sync') or {})
 	return steps
 
 
@@ -837,12 +849,13 @@ def move_and_modify(m):
 	return [(True, 'move', 'e', 'a/sub'), (False, 'modify', 'e/m.txt', None)]
 
 
-@pytest.mark.parametrize('item, options', [(create_file, {}), (create_folder_of_files, {}), (modify_file, {}), (move_and_modify, {}), (chmod_file, {'only_sync_attributes': False})],
-	ids=['create', 'folder_of_files', 'modify', 'move_and_modify', 'attrib_copied'])
-def test_a_batch_that_copied_flushes_before_its_commit_point(r_job, commit_steps, item, options):
+# a moved row is unverified, so the comparison reads it back and syncs before the batch's copies are flushed
+@pytest.mark.parametrize('item, options, before', [(create_file, {}, []), (create_folder_of_files, {}, []), (modify_file, {}, []), (move_and_modify, {}, ['sync']),
+	(chmod_file, {'only_sync_attributes': False}, [])], ids=['create', 'folder_of_files', 'modify', 'move_and_modify', 'attrib_copied'])
+def test_a_batch_that_copied_flushes_before_its_change_list_and_commit_point(r_job, commit_steps, item, options, before):
 	build_base(r_job, **KEPT)
 	backup_events(r_job, item(r_job.monitor), **KEPT, **options)
-	assert commit_steps == ['list', 'flush', 'commit']
+	assert commit_steps == before + ['flush', 'list', 'commit']
 
 
 def test_a_verification_fix_is_a_copy_too(r_job, commit_steps):
@@ -853,14 +866,14 @@ def test_a_verification_fix_is_a_copy_too(r_job, commit_steps):
 	_, manifest, committed = rv.do_backup(rv.change_events_to_backup_entries(raw_events(r_job.monitor, events), r_job.monitor), job_name=r_job.job_name, monitor_path=r_job.monitor,
 		vault_path=r_job.vault, touched=rv.TouchedScopes(['a/'], []), matched_since=time.time_ns(), **{**OPTIONS, **KEPT})
 	manifest.close()
-	assert committed is True and commit_steps == ['list', 'flush', 'commit']
+	assert committed is True and commit_steps == ['sync', 'flush', 'list', 'commit']
 	assert open(at(newest_version(r_job), 'a/x.txt')).read() == 'not told'
 
 
 def test_a_first_version_flushes_before_its_commit_point(r_job, commit_steps):
 	put_text(r_job.monitor, 'a.txt', 'a')
 	run_backup(r_job, OrderedDict(), **KEPT)
-	assert commit_steps == ['list', 'flush', 'commit']
+	assert commit_steps == ['flush', 'list', 'commit']
 
 
 def test_a_first_version_of_folders_alone_does_not_flush(r_job, commit_steps):
@@ -869,12 +882,12 @@ def test_a_first_version_of_folders_alone_does_not_flush(r_job, commit_steps):
 	assert commit_steps == ['list', 'commit']
 
 
-@pytest.mark.parametrize('item, options', [(move_file, {}), (move_folder, {}), (delete_file, {}), (delete_folder, {}), (new_folder, {}), (chmod_folder, {}),
-	(chmod_file, {'only_sync_attributes': True})], ids=['move', 'folder_move', 'delete', 'folder_delete', 'new_folder', 'folder_attrib', 'attrib_in_place'])
-def test_a_batch_that_copied_nothing_does_not_flush(r_job, commit_steps, item, options):
+@pytest.mark.parametrize('item, options, before', [(move_file, {}, ['sync']), (move_folder, {}, ['sync']), (delete_file, {}, []), (delete_folder, {}, []), (new_folder, {}, []),
+	(chmod_folder, {}, []), (chmod_file, {'only_sync_attributes': True}, [])], ids=['move', 'folder_move', 'delete', 'folder_delete', 'new_folder', 'folder_attrib', 'attrib_in_place'])
+def test_a_batch_that_copied_nothing_does_not_flush(r_job, commit_steps, item, options, before):
 	build_base(r_job, **KEPT)
 	backup_events(r_job, item(r_job.monitor), **KEPT, **options)
-	assert commit_steps == ['list', 'commit']
+	assert commit_steps == before + ['list', 'commit']
 
 
 def test_a_copy_that_failed_is_no_copy_to_flush(r_job, commit_steps, monkeypatch):
