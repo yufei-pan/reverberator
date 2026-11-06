@@ -402,7 +402,6 @@ def test_a_batch_with_nothing_copied_flushes_on_a_pool_before_it_commits(tmp_pat
 			seen.append('commit')
 		return real_commit(self, *args, **kwargs)
 	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
-	monkeypatch.setattr(rv.VaultManifest, 'holds_copies_of', lambda self, number: False)
 	real_flush_copies = rv.flush_copies
 	# the commit's own flush, as the end of the batch's settling can flush just before it
 	monkeypatch.setattr(rv, 'flush_copies', lambda *args: seen.append('commit flush') or real_flush_copies(*args))
