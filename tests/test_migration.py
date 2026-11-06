@@ -246,8 +246,12 @@ def test_a_dangling_chain_stays_the_link(small):
 	assert migrate(small) is True
 	for number, text in texts.items():
 		assert os.readlink(os.path.join(small.job_vault, names[number], 'a.txt')) == text
-	assert expected(small) == before
 	# as a user's link from now on: the backward rule ended with the layout, and a restore gives the link
+	after = expected(small)
+	for number, text in texts.items():
+		assert (after[number]['a.txt'].kind, after[number]['a.txt'].data) == ('l', text)
+		after[number]['a.txt'] = before[number]['a.txt']
+	assert after == before
 	assert rv.walk_version(small.job_vault, 2, 'a.txt', False).kind == 'symlink'
 
 

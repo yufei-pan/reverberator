@@ -7,7 +7,7 @@ from collections import OrderedDict
 import pytest
 import reverberator as rv
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
-from tests.harness import create_job, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry
+from tests.harness import create_job, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry, reads_the_file_before
 from tests.test_names import contents, database, schema, schema_1_job
 
 pytestmark = pytest.mark.unit
@@ -461,7 +461,7 @@ def test_moved_folder_is_read_from_the_vault_again(job, monkeypatch):
 
 
 def test_folder_moved_to_another_depth_needs_no_copy(job):
-	# the links inside a folder moved to another depth are re-targeted, so they still reach the version holding the copies
+	# a folder moved to another depth keeps its files, whatever the depth, as the older version gets them by hard links
 	seed_monitor(job, {'sub/x.txt': 'x', 'deep/er/p.txt': 'p'})
 	run_backup(job)
 	os.rename(os.path.join(job.monitor, 'sub'), os.path.join(job.monitor, 'deep', 'er', 'sub'))
@@ -470,7 +470,7 @@ def test_folder_moved_to_another_depth_needs_no_copy(job):
 	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
 	assert entries == {}
 	copy = os.path.join(latest_version(job).path, 'deep', 'er', 'sub', 'x.txt')
-	assert os.path.islink(copy) and open(copy).read() == 'x'
+	assert reads_the_file_before(latest_version(job).path, 'deep/er/sub/x.txt', 'sub/x.txt') and open(copy).read() == 'x'
 
 
 def test_manifest_for_another_version_is_listed_again_from_the_vault(job):
@@ -827,10 +827,8 @@ def test_synchronous_stays_full(job):
 	manifest.close()
 
 
-def test_a_read_only_open_of_schema_2_reads_no_layout(job):
-	seed_monitor(job, {'a.txt': 'hello'})
-	run_backup(job)
-	as_schema_2(job)
+def test_a_read_only_open_of_schema_2_reads_no_layout(job, v054):
+	v054.build(job, [lambda monitor: seed_monitor(job, {'a.txt': 'hello'})])
 	before = contents(job)
 	# what a command does: it reads the file as it is, and only a job upgrades it
 	manifest = rv.VaultManifest.__new__(rv.VaultManifest)

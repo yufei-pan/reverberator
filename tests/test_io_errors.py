@@ -482,8 +482,15 @@ def test_stopped_copies_lose_their_partial_files_by_default(job):
 
 
 def _failing_rm(monkeypatch, job, rel, remove=False):
-	'''The rm of the version's rel runs a stand-in that fails as rm does (after removing the entry, with remove).'''
+	'''
+	The rm of the version's rel runs a stand-in that fails as rm does (after removing the entry, with remove). A record without keep
+	takes an entry out of the tree with no rm to fail, so here it keeps it, as a record earlier in the batch does.
+	'''
 	real = rv.multiCMD.AsyncExecutor.run_command
+	real_record = rv.TreeWriter.record
+	def record(self, recorded, keep, *args, **kwargs):
+		real_record(self, recorded, keep or recorded.rstrip('/') == rel, *args, **kwargs)
+	monkeypatch.setattr(rv.TreeWriter, 'record', record)
 	script = ('rm -rf -- "$1"; ' if remove else '') + 'echo "rm: cannot remove \'$1\': Operation not permitted" >&2; exit 1'
 	def run_command(self, command, *args, **kwargs):
 		if list(command[:1]) == ['rm'] and command[-1].startswith(job.job_vault + '/') and command[-1].endswith('/' + rel):

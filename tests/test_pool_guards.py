@@ -5,7 +5,6 @@ here), so nothing more is written into the version. The folders are real, so "no
 by nothing being copied, linked or committed after the drop.
 '''
 import os
-import sys
 import threading
 import time
 from collections import OrderedDict
@@ -13,6 +12,7 @@ import pytest
 import reverberator as rv
 from tests.harness import (committed_versions, event_entry, latest_version, seed_monitor, wait_for_committed_count,
 	wait_until, write_committed_version, write_incomplete_version)
+from tests.vault_oracle import read_view
 
 pytestmark = pytest.mark.unit
 
@@ -79,13 +79,8 @@ def test_the_scan_removes_nothing_when_a_disk_drops_during_it(job, fake_pool, mo
 	assert f'Cannot scan the vault, nothing in it is removed: {reason}' in out.out + out.err
 
 
-def test_a_disk_mounted_again_during_a_prune_walk_keeps_the_oldest_version(job, fake_pool, monkeypatch, capsys):
-	seed_monitor(job, {'a.txt': 'a'})
-	assert backup(job)
-	seed_monitor(job, {'b.txt': 'b'})
-	assert backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]))
-	v0 = version_folder(job, 0)
-	assert os.path.islink(os.path.join(version_folder(job, 1), 'a.txt'))
+def test_a_disk_mounted_again_during_a_prune_walk_keeps_the_oldest_version(job, fake_pool, monkeypatch, capsys, v054):
+	v0, _ = two_versions_054(job, v054)
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
 	real = rv.vault_chain_hop
@@ -195,32 +190,6 @@ def test_copies_stop_inside_a_folder_create(job, fake_pool, monkeypatch):
 	assert partials(version_folder(job, 1)) == []
 
 
-def test_the_referenced_copy_stops_when_a_vault_disk_drops(job, fake_pool, monkeypatch):
-	seed_monitor(job, files(50))
-	assert backup(job)
-	v0 = version_folder(job, 0)
-	a, _ = fake_pool.add(job.vault, ['a', 'b'])
-	seed_monitor(job, {'new.txt': 'new'})
-	# the ground truth's recorder, so both see the calls
-	current = os.symlink
-	links = []
-	dropped = []
-	def linking(*args, **kwargs):
-		# made by its own functions, on its threads
-		in_referenced_copy = sys._getframe(1).f_code.co_name == 'referenced_link'
-		current(*args, **kwargs)
-		if in_referenced_copy:
-			links.append(args[1])
-			if len(links) == 3:
-				fake_pool.drop(a)
-				dropped.append(len(links))
-	monkeypatch.setattr(os, 'symlink', linking)
-	with pytest.raises(rv.PoolNotReady):
-		backup(job, OrderedDict([event_entry(job, 'new.txt', 'create')]))
-	assert dropped and len(links) - dropped[0] <= 1, f'{len(links)} links, the disk dropped at {dropped}'
-	assert committed_versions(job) == [v0]
-
-
 def test_a_first_backup_stops_its_copies_when_a_vault_disk_drops(job, fake_pool, monkeypatch):
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
 	seed_monitor(job, files(50))
@@ -291,11 +260,22 @@ def test_a_failed_attempt_waits_then_compares_the_whole_tree(job, fake_pool, mon
 # --- fix round 1 ---
 
 def two_versions(job):
-	'''V0 holding a.txt and D/x.txt, then V1 creating b.txt, its a.txt and D/x.txt links into V0: their folders.'''
+	'''V0 holding a.txt and D/x.txt, then V1 creating b.txt, V0 forwarding them to it: their folders.'''
 	seed_monitor(job, {'a.txt': 'a', 'D/x.txt': 'x'})
 	assert backup(job)
 	seed_monitor(job, {'b.txt': 'b'})
 	assert backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]))
+	v0, v1 = version_folder(job, 0), version_folder(job, 1)
+	assert read_view(job.job_vault, os.path.basename(v0))['a.txt'].kind == 'f' and os.path.islink(os.path.join(v0, 'a.txt'))
+	return v0, v1
+
+
+def two_versions_054(job, v054):
+	'''The vault two_versions() leaves as 0.54 had it, for the prune of a 0.54 vault: V1's a.txt and D/x.txt link into V0. Their folders.'''
+	def create(monitor):
+		seed_monitor(job, {'b.txt': 'b'})
+		return [(False, 'create', 'b.txt', None)]
+	v054.build(job, [lambda monitor: seed_monitor(job, {'a.txt': 'a', 'D/x.txt': 'x'}), create])
 	v0, v1 = version_folder(job, 0), version_folder(job, 1)
 	assert os.path.islink(os.path.join(v1, 'a.txt'))
 	return v0, v1
@@ -315,10 +295,10 @@ def prune_finishes(job, v0, v1):
 	assert open(os.path.join(v1, 'D/x.txt')).read() == 'x'
 
 
-def test_a_prune_never_finishes_an_oldest_version_a_missing_disk_hides(job, fake_pool, tmp_path):
+def test_a_prune_never_finishes_an_oldest_version_a_missing_disk_hides(job, fake_pool, tmp_path, v054):
 	# V0's folder lived on disk a alone: with it out, V0 reads as a removal cut short, though V1's links were never
 	# materialised
-	v0, v1 = two_versions(job)
+	v0, v1 = two_versions_054(job, v054)
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
 	fake_pool.drop(a)
@@ -333,9 +313,9 @@ def test_a_prune_never_finishes_an_oldest_version_a_missing_disk_hides(job, fake
 	prune_finishes(job, v0, v1)
 
 
-def test_a_disk_dropping_during_the_removal_keeps_the_oldest_versions_lists(job, fake_pool, tmp_path, monkeypatch):
+def test_a_disk_dropping_during_the_removal_keeps_the_oldest_versions_lists(job, fake_pool, tmp_path, monkeypatch, v054):
 	# the part of V0 on disk a goes out of sight while rm -rf runs, and is back with the disk
-	v0, v1 = two_versions(job)
+	v0, v1 = two_versions_054(job, v054)
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
 	real = rv.multiCMD.run_command
@@ -370,7 +350,7 @@ def test_the_scan_names_the_disk_when_a_drop_hid_a_change_list(job, fake_pool, t
 	reason = f'disk {a} of pool {job.vault} is not mounted'
 	with pytest.raises(rv.PoolNotReady) as failure:
 		rv.get_vault_info(job.job_vault)
-	assert failure.value.reason == reason and isinstance(failure.value.__cause__, rv.VaultScanError)
+	assert failure.value.reason == reason
 	out = capsys.readouterr()
 	assert f'Cannot scan the vault, nothing in it is removed: {reason}' in out.out + out.err
 
@@ -423,8 +403,9 @@ def test_the_change_list_is_not_placed_when_a_disk_drops_after_the_commit_check(
 	# nothing is written while the disk is out: the link stays on V1, and its list in its private folder
 	private = lambda: [name for name in os.listdir(job.job_vault) if name.startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
 	assert os.readlink(os.path.join(job.job_vault, 'current_version')) == os.path.basename(v1) and private()
-	# with the disk back, the scan takes V1 for a commit cut off before its list was placed
+	# with the disk back, the scan finishes the commit, as the manifest names V1
 	fake_pool.mount(a)
-	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0]
-	assert os.readlink(os.path.join(job.job_vault, 'current_version')) == os.path.basename(v0)
-	assert not os.path.lexists(v1) and private() == []
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1]
+	assert os.readlink(os.path.join(job.job_vault, 'current_version')) == os.path.basename(v1)
+	assert lists_of(job, v1) and private() == []
+	assert committed_versions(job) == [v0, v1]

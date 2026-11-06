@@ -5,7 +5,8 @@ import tracemalloc
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_committed_version, write_tree, tracked_manifest
+from tests.harness import event_entry, latest_version, run_backup, seed_monitor, write_committed_version, write_tree, tracked_manifest
+from tests.vault_oracle import read_view
 
 pytestmark = pytest.mark.unit
 
@@ -40,24 +41,15 @@ def test_delta_new_and_deleted(job):
 
 
 def chained_versions(job, names):
-	# V0 holds real copies (cp -a keeps mtimes), V1 and V2 are referenced copies whose
-	# files are symlinks chained back to V0, like the vault after daily backups
-	v0 = os.path.join(job.job_vault, 'V0--2021-01-01_00-00-00_-0800')
-	for name in names:
-		rv.cp_af_copy_path(os.path.join(job.monitor, name), os.path.join(v0, name))
-	# its folders with the monitored ones' metadata, as a backup leaves them
-	for folder in {os.path.dirname(n) for n in names if '/' in n}:
-		rv.copy_file_meta(os.path.join(job.monitor, folder), os.path.join(v0, folder))
-	previous = v0
+	# V2 holds the real tree, and V0 and V1 forward to it, like the vault after daily backups
+	seed_monitor(job, {'stamp': '0'})
+	v0 = run_backup(job)[0]
 	for version in (1, 2):
-		current = os.path.join(job.job_vault, f'V{version}--2021-01-0{version + 1}_00-00-00_-0800')
-		os.makedirs(current)
-		manifest = tracked_manifest(job.job_vault, previous, names, sorted({os.path.dirname(n) + '/' for n in names if '/' in n}))
-		rv.do_referenced_copy(previous, current, manifest, relative=True)
-		manifest.close()
-		previous = current
-	assert all(os.path.islink(os.path.join(previous, name)) for name in names)
-	return v0, rv.VaultEntry(2, previous, 0, 1, 1)
+		seed_monitor(job, {'stamp': str(version)})
+		newest = run_backup(job, OrderedDict([event_entry(job, 'stamp', 'modify')]))[-1]
+	assert all(read_view(job.job_vault, os.path.basename(v0))[name].kind == 'f' and not os.path.islink(os.path.join(newest, name)) for name in names)
+	assert os.path.islink(os.path.join(v0, names[0].partition('/')[0]))
+	return v0, latest_version(job)
 
 
 def test_delta_unchanged_files_behind_chained_links_not_added(job):
@@ -79,10 +71,10 @@ def test_delta_changed_file_behind_chained_link_is_modify(job):
 
 def test_delta_same_size_and_mtime_new_content_behind_chained_link_is_modify(job):
 	seed_monitor(job, {'a.txt': 'hello'})
-	v0, latest = chained_versions(job, ['a.txt'])
+	_, latest = chained_versions(job, ['a.txt'])
 	source = os.path.join(job.monitor, 'a.txt')
 	open(source, 'w').write('jello')
-	vault_stat = os.lstat(os.path.join(v0, 'a.txt'))
+	vault_stat = os.lstat(os.path.join(latest.path, 'a.txt'))
 	os.utime(source, ns=(vault_stat.st_atime_ns, vault_stat.st_mtime_ns))
 	entries = OrderedDict()
 	rv.delta_generate_backup_entries(entries, latest, job.monitor)

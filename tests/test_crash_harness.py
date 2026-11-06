@@ -264,7 +264,7 @@ def test_a_loose_special_file_keeps_its_device_number_and_nothing_else(tmp_path)
 
 
 def test_a_backward_link_in_the_newest_version_of_an_r_vault_is_damage(plain_r_vault):
-	# 0.54 reads such a link as the file it leads to, and here its bytes and times are the same
+	# a walk reads such a link as a user's here, and the check names it all the same, as the monitored tree holds no such link
 	job_vault = plain_r_vault.job.job_vault
 	newest, older = (os.path.join(job_vault, folder_of(job_vault, number)) for number in (2, 1))
 	assert check_vault(job_vault, plain_r_vault.base, set()) == []
@@ -273,7 +273,7 @@ def test_a_backward_link_in_the_newest_version_of_an_r_vault_is_damage(plain_r_v
 	shutil.copy2(os.path.join(newest, 'r.txt'), os.path.join(older, 'r.txt'))
 	os.remove(os.path.join(newest, 'r.txt'))
 	os.symlink(os.path.join('..', folder_of(job_vault, 1), 'r.txt'), os.path.join(newest, 'r.txt'))
-	assert read_view(job_vault, folder_of(job_vault, 2))['r.txt'].kind == 'f'
+	assert read_view(job_vault, folder_of(job_vault, 2))['r.txt'].kind == 'l'
 	problems = check_vault(job_vault, plain_r_vault.base, set())
 	assert any("'r.txt'" in line and 'daemon link' in line for line in problems), problems
 

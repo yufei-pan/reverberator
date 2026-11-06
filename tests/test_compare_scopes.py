@@ -102,12 +102,10 @@ def test_it_leaves_the_transaction_open(job, monkeypatch):
 
 def test_it_reads_the_version_it_is_given(job, capsys):
 	v0, manifest = backed_up(job, {'D/x.txt': 'x', 'D/y.txt': 'y'})
-	# the batch's new version, a referenced copy of V0 whose D the replay renamed, as the tree's was
+	# the batch's new version, the tree handed over from V0, whose D the replay renamed
 	v1 = os.path.join(job.job_vault, f'V1--{T1}')
-	os.makedirs(v1)
 	manifest.begin()
-	assert rv.do_referenced_copy(v0, v1, manifest, relative=True)
-	os.rename(os.path.join(v1, 'D'), os.path.join(v1, 'D2'))
+	assert rv.hand_over(job.job_vault, v0, v1, manifest).rename('D', 'D2')
 	manifest.move_tree('D/', 'D2/')
 	os.rename(os.path.join(job.monitor, 'D'), os.path.join(job.monitor, 'D2'))
 	assert manifest.lookup('D2/x.txt').kind is None

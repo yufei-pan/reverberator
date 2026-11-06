@@ -4,8 +4,8 @@ import stat
 from collections import deque, OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import create_job, seed_monitor, run_backup, latest_version, write_tree as write_plain_tree
-from tests.test_long_chains import name_with_threshold, fast_forward_to_32
+from tests.harness import create_job, seed_monitor, run_backup, latest_version, reads_the_file_before, write_tree as write_plain_tree
+from tests.vault_oracle import compared, read_view
 
 pytestmark = pytest.mark.unit
 
@@ -388,7 +388,7 @@ def test_the_verification_syncs_attributes_the_replay_missed(tmp_path):
 	assert changes(job, version) == [('D2/', 'move'), ('D2/a.txt', 'attrib')]
 	assert stat.S_IMODE(os.lstat(os.path.join(v0, 'D/a.txt')).st_mode) == 0o600
 	assert stat.S_IMODE(os.lstat(os.path.join(v0, 'D/b.txt')).st_mode) == b_mode
-	assert os.path.islink(os.path.join(version.path, 'D2/a.txt'))
+	assert reads_the_file_before(version.path, 'D2/a.txt', 'D/a.txt')
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason='chown needs root')
@@ -413,38 +413,22 @@ def test_the_verification_syncs_an_owner_the_replay_missed_and_a_user_links_own(
 
 def older_versions(job, synced=()):
 	'''
-	(rel, kind, link target, mode, uid, gid, mtime_ns, ctime_ns, inode, size, hash of the bytes, extended attributes) of
-	everything in every version, by lstat: a link is never followed. The rels of synced (job vault rels) are the chain
-	ends an attribute sync may write: only their kind, link target, inode, size and bytes are listed.
+	{version folder: {rel: (what the version reads there, by the oracle's walk, which never follows a user's link, and the inode)}} of
+	every version. The rels of synced are the entries an attribute sync may write, which reaches every version sharing them (spec
+	section 2.4): only their kind, data and inode are compared.
 	'''
-	import hashlib
-	listing = []
+	listing = {}
 	for version in rv.list_versions(job.job_vault):
-		for folder, dirs, files in os.walk(version.path):
-			for name in sorted(dirs + files):
-				path = os.path.join(folder, name)
-				rel = os.path.relpath(path, job.job_vault)
-				st = os.lstat(path)
-				digest = None
-				if stat.S_ISREG(st.st_mode):
-					with open(path, 'rb') as f:
-						digest = hashlib.sha256(f.read()).hexdigest()
-				try:
-					xattrs = sorted((attr, os.getxattr(path, attr, follow_symlinks=False)) for attr in os.listxattr(path, follow_symlinks=False))
-				except OSError as e:
-					xattrs = type(e).__name__
-				meta = (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns, st.st_ctime_ns, xattrs)
-				if rel in synced:
-					meta = (None,) * len(meta)
-				listing.append((rel, stat.S_IFMT(st.st_mode), os.readlink(path) if stat.S_ISLNK(st.st_mode) else None,
-					*meta[:5], st.st_ino, st.st_size, digest, meta[5]))
-	return sorted(listing, key=lambda row: row[0])
+		inodes = {}
+		view = read_view(job.job_vault, version.name, inodes)
+		listing[version.name] = {rel: (compared(entry, True, rel in synced), inodes.get(rel)) for rel, entry in view.items()}
+	return listing
 
 
 def second_version(job):
 	'''
 	V1 of the tree with the times of keep.txt (or of its first file) changed, so that the version a batch then writes
-	chains through V1 to V0.
+	takes the tree from V1, which V0 forwards to.
 	'''
 	keep = os.path.join(job.monitor, 'keep.txt')
 	if not os.path.lexists(keep):
@@ -473,14 +457,13 @@ def attrib_after(job):
 
 
 # name: (before, between(job) making V1, after (or after(job)), raw events, after_tree(job) run on the made tree, the
-# job vault rels whose attributes the batch syncs onto chain ends)
+# rels whose attributes the batch syncs, in every version sharing them)
 GUARD_SEQUENCES = {
-	# D, D/old.txt and D/lnk given other attributes: they are synced onto the end of each chain, V0's copy of D/old.txt
-	# and V1's user link D/lnk, never what the link leads to
+	# D, D/old.txt and D/lnk given other attributes: they are synced onto the one shared copy of D/old.txt and the user
+	# link D/lnk, never what the link leads to
 	'attrib': (BASE, with_users_link, {**BASE, 'D/lnk': ('link', 'sub/deep.txt')},
 		[('attrib', 'D/old.txt', None, False), ('attrib', 'D', None, True), ('attrib', 'D/lnk', None, False)], attrib_after,
-		lambda job: {os.path.relpath(link_into_v0(job, 'D/old.txt'), job.job_vault),
-			os.path.join(rv.list_versions(job.job_vault)[1].name, 'D/lnk')}),
+		lambda job: {'D/old.txt', 'D/lnk'}),
 	# the folder D replaced by a user's link to V0's D, with an event of its old child after it: nothing of the version is
 	# written or removed through the link
 	'users_link_into_the_vault': (BASE, second_version, lambda job: {'keep.txt': 'keep', 'D': ('link', link_into_v0(job, 'D'))},
@@ -494,7 +477,7 @@ def test_older_versions_are_untouched(tmp_path, name):
 	if name in GUARD_SEQUENCES:
 		before, between, after, events_spec, after_tree, synced = GUARD_SEQUENCES[name]
 	else:
-		# V1 of the same tree first, so that the older versions hold chain links too
+		# V1 of the same tree first, so that the older versions hold forward links too
 		before, after, events_spec, _ = SEQUENCES[name]
 		between, after_tree, synced = second_version, None, lambda job: set()
 	job = create_job(str(tmp_path))
@@ -510,15 +493,15 @@ def test_older_versions_are_untouched(tmp_path, name):
 	run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
 	version = rv.list_versions(job.job_vault)[-1]
 	assert version.number == 2
-	assert [row for row in older_versions(job, synced) if not row[0].startswith(version.name + '/')] == older
+	now = older_versions(job, synced)
+	del now[version.name]
+	assert now == older
 	if name == 'attrib':
-		# the syncs were made, onto the ends of the chains
-		assert stat.S_IMODE(os.lstat(link_into_v0(job, 'D/old.txt')).st_mode) == 0o600
-		assert os.getxattr(link_into_v0(job, 'D/old.txt'), 'user.guard') == b'1'
-		assert os.lstat(os.path.join(rv.list_versions(job.job_vault)[1].path, 'D/lnk')).st_mtime_ns == 10 ** 18
-	else:
-		# attrib's D/lnk is a chain link to V1's, which assert_version_matches_tree() would follow
-		assert_version_matches_tree(job, version)
+		# the syncs were made, and every version sharing the entries reads them
+		v0, v1 = (read_view(job.job_vault, kept.name) for kept in rv.list_versions(job.job_vault)[:2])
+		assert v0['D/old.txt'].mode == 0o600 and ('user.guard', b'1') in v0['D/old.txt'].xattrs
+		assert v1['D/lnk'].mtime_ns == 10 ** 18
+	assert_version_matches_tree(job, version)
 
 
 @pytest.mark.parametrize('name', ['a', 'c'])
@@ -560,52 +543,14 @@ def test_interrupted_verification_commits_nothing(tmp_path, monkeypatch, name):
 		manifest.close()
 	incomplete = [name for name in os.listdir(job.job_vault) if name.startswith('V1--')]
 	assert incomplete
-	rv.get_vault_info(job.job_vault)
-	assert not [name for name in os.listdir(job.job_vault) if name.startswith('V1--')]
+	# the tree stays, and the next attempt finishes it
+	monkeypatch.undo()
+	info = rv.get_vault_info(job.job_vault)
+	assert info.tree is not None and os.path.basename(info.tree) == incomplete[0]
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
-
-
-@pytest.mark.parametrize('pattern', ['recreated_folder', 'git', 'git_alone'])
-def test_recopy_row_dropped_for_a_verified_delete(tmp_path, pattern):
-	job = create_job(str(tmp_path))
-	if pattern == 'git_alone':
-		# a due file replaced and deleted, and nothing else: the batch collapses to no entry, and goes through the backuper
-		due = name_with_threshold(32, 'g')
-		fast_forward_to_32(job, {due: 'x' * 1024})
-		backuper = RunningBackuper(job)
-		try:
-			lock = os.path.join(job.monitor, due + '.lock')
-			with open(lock, 'w') as f:
-				f.write('new')
-			os.rename(lock, os.path.join(job.monitor, due))
-			os.remove(os.path.join(job.monitor, due))
-			assert backuper.back_up(raw_events(job, [('create', due + '.lock', None, False), ('move', due, due + '.lock', False),
-				('delete', due, None, False)]))[0::2] == (0, True)
-		finally:
-			backuper.stop()
-	elif pattern == 'recreated_folder':
-		# a stale child of a folder moved out of the tree and made again, due to be copied again from the vault
-		due = name_with_threshold(32, 'e/f')
-		fast_forward_to_32(job, {due: 'x' * 1024})
-		shutil.rmtree(os.path.join(job.monitor, 'e'))
-		seed_monitor(job, {'e/new.txt': 'new'})
-		events = raw_events(job, [('delete', 'e', None, True), ('create', 'e', None, True)])
-	else:
-		# a due file the batch's collapsed entries do not name
-		due = name_with_threshold(32, 'g')
-		fast_forward_to_32(job, {due: 'x' * 1024})
-		os.remove(os.path.join(job.monitor, due))
-		seed_monitor(job, {'c.txt': 'c changed'})
-		events = raw_events(job, [('create', due + '.lock', None, False), ('move', due, due + '.lock', False), ('delete', due, None, False),
-			('modify', 'c.txt', None, False)])
-	if pattern != 'git_alone':
-		run_backup(job, rv.change_events_to_backup_entries(deque(events)), touched=rv.touched_scopes(events, job.monitor))
-	version = rv.list_versions(job.job_vault)[-1]
-	assert version.number == 33
-	assert not os.path.lexists(os.path.join(version.path, due))
-	rows = changes(job, version)
-	assert (due, 'delete') in rows and (due, 'recopy') not in rows
-	assert_version_matches_tree(job, version)
+	run_backup(job)
+	assert [version.number for version in rv.list_versions(job.job_vault)] == [0, 1]
+	assert_version_matches_tree(job, rv.list_versions(job.job_vault)[-1])
 
 
 def without_wall(scopes):
@@ -664,11 +609,12 @@ def test_the_sweep_never_follows_links(job):
 	run_backup(job)
 	v0 = latest_version(job).path
 	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
-	os.makedirs(v1)
 	manifest = rv.VaultManifest(job.job_vault)
 	manifest.begin()
 	try:
-		assert rv.do_referenced_copy(v0, v1, manifest, relative=True)
+		writer = rv.hand_over(job.job_vault, v0, v1, manifest)
+		# what is planted in D below does not reach V0 by its forward link
+		assert writer.ensure_real('D')
 		before = older_versions(job)
 		# untracked: a link to an older version's folder, a real folder holding a link, and a link where a parent folder is
 		os.symlink(os.path.join(v0, 'E'), os.path.join(v1, 'D/to_e'))
@@ -676,18 +622,18 @@ def test_the_sweep_never_follows_links(job):
 		os.symlink(os.path.join(v0, 'E/b.txt'), os.path.join(v1, 'D/stale/b.txt'))
 		os.symlink(os.path.join(v0, 'E'), os.path.join(v1, 'L'))
 		os.symlink(os.path.join(v0, 'E/b.txt'), os.path.join(v1, 'D', BAD))
-		removed, missing = rv.sweep_version_folder(manifest, v1, rv.TouchedScopes(['D/', 'L/x/', 'E/'], []))
+		removed, missing = rv.sweep_version_folder(manifest, v1, rv.TouchedScopes(['D/', 'L/x/', 'E/'], []), writer)
 		assert sorted(removed) == sorted([f'D/{BAD}', 'D/stale/', 'D/to_e']) and missing == []
 		# L is not a folder of the version, so nothing under it is looked at
 		assert os.path.islink(os.path.join(v1, 'L'))
 		os.remove(os.path.join(v1, 'L'))
-		assert [row for row in older_versions(job) if not row[0].startswith('V1--')] == [row for row in before if not row[0].startswith('V1--')]
-		assert read_tree(os.path.join(v0, 'E')) == {'b.txt': b'b'}
+		assert older_versions(job) == before
+		assert read_tree(os.path.join(v1, 'E')) == {'b.txt': b'b'}
 		# a tracked entry gone from the version is missing; the version itself is never removed
-		os.remove(os.path.join(v1, 'D/a.txt'))
-		assert rv.sweep_version_folder(manifest, v1, rv.TouchedScopes(['D/'], [])) == ([], ['D/a.txt'])
+		writer.record('D/a.txt', False)
+		assert rv.sweep_version_folder(manifest, v1, rv.TouchedScopes(['D/'], []), writer) == ([], ['D/a.txt'])
 		manifest.discard_many(['D/', 'D/a.txt', 'E/', 'E/b.txt', 'keep.txt'])
-		assert rv.sweep_version_folder(manifest, v1, rv.TouchedScopes([''], [])) == (['D/', 'E/', 'keep.txt'], [])
+		assert rv.sweep_version_folder(manifest, v1, rv.TouchedScopes([''], []), writer) == (['D/', 'E/', 'keep.txt'], [])
 		assert os.path.isdir(v1)
 	finally:
 		manifest.rollback()
@@ -720,7 +666,9 @@ def test_links_in_the_version_are_never_followed(tmp_path, kind):
 	assert os.readlink(os.path.join(version.path, 'P/A')) == target
 	assert_version_matches_tree(job, version)
 	assert not [row for row in manifest_rows(job) if row.startswith('P/A/')]
-	assert [row for row in older_versions(job) if not row[0].startswith(version.name)] == older
+	now = older_versions(job)
+	del now[version.name]
+	assert now == older
 
 
 def test_the_sweep_never_writes_through_links(job):
@@ -730,17 +678,16 @@ def test_the_sweep_never_writes_through_links(job):
 	outside = os.path.join(job.root, 'outside')
 	os.makedirs(os.path.join(outside, 'B'))
 	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
-	os.makedirs(v1)
 	manifest = rv.VaultManifest(job.job_vault)
 	manifest.begin()
 	try:
-		assert rv.do_referenced_copy(v0, v1, manifest, relative=True)
+		writer = rv.hand_over(job.job_vault, v0, v1, manifest)
 		# the version holds links at D/L and at L, while stale rows still name folders under them
 		os.symlink(outside, os.path.join(v1, 'D/L'))
 		os.symlink(outside, os.path.join(v1, 'L'))
 		for rel in ('D/L', 'D/L/', 'D/L/B/', 'D/L/B/x', 'L', 'L/', 'L/x/', 'L/x/y'):
 			manifest.add(rel)
-		removed, missing = rv.sweep_version_folder(manifest, v1, rv.TouchedScopes(['D/', 'L/x/'], []))
+		removed, missing = rv.sweep_version_folder(manifest, v1, rv.TouchedScopes(['D/', 'L/x/'], []), writer)
 		# a version cannot hold them there: their rows go, and nothing is copied through the links
 		assert missing == []
 		assert sorted(removed) == ['D/L/', 'D/L/B/', 'D/L/B/x', 'L/x/', 'L/x/y']
@@ -796,32 +743,6 @@ def test_the_root_mount_changed_during_the_verification_fails_the_job(tmp_path, 
 			keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', root_mount=root_mount,
 			touched=rv.touched_scopes(events, job.monitor))
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
-
-
-@pytest.mark.parametrize('how', ['moved', 'covered'])
-def test_recopies_keep_their_crash_check(tmp_path, how):
-	job = create_job(str(tmp_path))
-	due = name_with_threshold(32, 'D/f')
-	fast_forward_to_32(job, {due: 'x' * 1024})
-	if how == 'moved':
-		# the re-copy is renamed with its folder, so its row is unverified and read back from this version
-		os.rename(os.path.join(job.monitor, 'D'), os.path.join(job.monitor, 'D2'))
-		events = raw_events(job, [('move', 'D2', 'D', True)])
-		entries, touched, rel = rv.change_events_to_backup_entries(deque(events)), rv.touched_scopes(events, job.monitor), 'D2/' + due[2:]
-	else:
-		# a touched subtree over the re-copy that the batch's replay leaves alone
-		seed_monitor(job, {'c.txt': 'changed again'})
-		entries = OrderedDict([(os.path.join(job.monitor, 'c.txt'), rv.BackupEntryValues('t', 'modify', None))])
-		touched, rel = rv.TouchedScopes(['D/'], ['c.txt']), due
-	run_backup(job, entries, touched=touched)
-	version = rv.list_versions(job.job_vault)[-1]
-	assert version.number == 33 and not os.path.islink(os.path.join(version.path, rel))
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		record = manifest.lookup(rel)
-		assert record.kind == 'f' and record.unchecked == 1
-	finally:
-		manifest.close()
 
 
 def test_fixes_the_replay_could_not_apply_are_not_recorded(tmp_path, monkeypatch):
@@ -1161,17 +1082,6 @@ def test_the_manifest_and_the_referenced_copy_reject_the_root(job, monkeypatch):
 		for rel in ('', '.', './', '/', 'a/../b', 'a/./b', '/etc/x'):
 			manifest.add(rel)
 		assert manifest_rows_of(manifest) == {'a.txt'}
-		# a row a daemon before 0.43 wrote for the root's own attrib event
-		manifest.conn.execute("INSERT INTO entries(path) VALUES ('./'), ('')")
-		v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
-		os.makedirs(v1)
-		lines = spy_on_log(monkeypatch)
-		assert rv.do_referenced_copy(v0, v1, manifest, relative=True)
-		assert manifest_rows_of(manifest) == {'a.txt'}
-		assert sorted(os.listdir(v1)) == ['a.txt']
-		# the one-time cleanup of such rows is a warning
-		dropped = [(error, warning) for message, error, warning in lines if 'names no' in message]
-		assert dropped == [(False, True), (False, True)]
 	finally:
 		manifest.rollback()
 		manifest.close()
@@ -1248,12 +1158,17 @@ def test_attrib_never_syncs_through_a_users_symlink(tmp_path, kind):
 	assert entry_meta(victim, xattrs) == held
 	version = rv.list_versions(job.job_vault)[-1]
 	assert version.number == 1
-	# the version's L chains to the backed up link, which took the link's own owner and times. a link whose text changed
-	# under the attrib ( outside ) holds other contents than the backed up one, and is copied as a link instead
-	end = rv.chain_end(job.job_vault, version.path, 'L')
-	assert end.path == os.path.join(v0 if kind == 'into_vault' else version.path, 'L') and stat.S_ISLNK(end.st.st_mode)
-	assert os.readlink(end.path) == os.readlink(link)
-	assert (end.st.st_uid, end.st.st_mtime_ns) == (1111, 1_400_000_000_000_000_000)
+	# the version's L is the backed up link, which took the link's own owner and times, as V0 reads it too. a link whose text
+	# changed under the attrib ( outside ) holds other contents than the backed up one, and is copied as a link instead
+	end = os.path.join(version.path, 'L')
+	st = os.lstat(end)
+	assert stat.S_ISLNK(st.st_mode) and os.readlink(end) == os.readlink(link)
+	assert (st.st_uid, st.st_mtime_ns) == (1111, 1_400_000_000_000_000_000)
+	older = read_view(job.job_vault, os.path.basename(v0))['L']
+	if kind == 'into_vault':
+		assert (older.kind, older.uid, older.mtime_ns) == ('l', 1111, 1_400_000_000_000_000_000)
+	else:
+		assert older.data == os.path.join(outside, 'A')
 
 
 def test_copy_file_meta_gives_a_link_only_its_own_owner_and_times(tmp_path):
@@ -1456,20 +1371,6 @@ def test_the_other_kind_of_a_touched_name_is_compared(tmp_path, name):
 	assert_version_matches_tree(job, latest)
 
 
-def versions_meta(job, xattrs, but=None):
-	"""older_versions() of every version (but the one named but), with each regular file's extended attributes."""
-	rows = []
-	for row in older_versions(job):
-		if but is not None and row[0].startswith(but + '/'):
-			continue
-		path = os.path.join(job.job_vault, row[0])
-		held = None
-		if xattrs and stat.S_ISREG(row[1]):
-			held = {name: os.getxattr(path, name) for name in os.listxattr(path)}
-		rows.append((*row, held))
-	return rows
-
-
 def run_batch(job, spec):
 	events = raw_events(job, spec)
 	run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
@@ -1508,18 +1409,25 @@ def test_a_users_link_of_chain_form_never_redirects_an_attribute_sync(tmp_path, 
 	set_meta(decoy, 0o666, 4242, 1_500_000_000_000_000_000, b'decoy', xattrs)
 	run_batch(job, spec)
 	os.lchown(link, 4243, 4243)
-	held = versions_meta(job, xattrs)
-	own = f'{rv.list_versions(job.job_vault)[1].name}/{os.path.relpath(link, job.monitor)}'
-	own_link = os.path.join(job.job_vault, own)
+	rel = os.path.relpath(link, job.monitor)
+	held = older_versions(job, {rel})
+	secret_held = read_view(job.job_vault, v0.name)['D/secret']
+	decoy_held = os.lstat(decoy)
+	own_link = os.path.join(rv.list_versions(job.job_vault)[1].path, rel)
 	own_text, own_inode = os.readlink(own_link), os.lstat(own_link).st_ino
 	lines = spy_on_log(monkeypatch)
-	version = run_batch(job, [('attrib', os.path.relpath(link, job.monitor), None, False)])
+	version = run_batch(job, [('attrib', rel, None, False)])
 	assert version.number == 2
-	after = versions_meta(job, xattrs, but=version.name)
-	assert [row for row in after if row[0] != own] == [row for row in held if row[0] != own]
-	assert [row[4:6] for row in after if row[0] == own] == [(4243, 4243)]
-	# the link itself, its text and inode, as it was: only its owner and times are set
-	assert (os.readlink(own_link), os.lstat(own_link).st_ino) == (own_text, own_inode) == (f'../{rv.list_versions(job.job_vault)[0].name}/D/secret', own_inode)
+	after = older_versions(job, {rel})
+	del after[version.name]
+	assert after == held
+	assert read_view(job.job_vault, v0.name)['D/secret'] == secret_held
+	assert (os.lstat(decoy).st_uid, os.lstat(decoy).st_mode, os.lstat(decoy).st_mtime_ns) == (decoy_held.st_uid, decoy_held.st_mode, decoy_held.st_mtime_ns)
+	# the link itself, its text and inode, as it was, now the tree's: only its owner and times are set, and the version that holds it reads that
+	own_link = os.path.join(version.path, rel)
+	assert (os.readlink(own_link), os.lstat(own_link).st_ino) == (own_text, own_inode) == (f'../{v0.name}/D/secret', own_inode)
+	seen = read_view(job.job_vault, rv.list_versions(job.job_vault)[1].name)[rel]
+	assert (seen.kind, seen.uid, seen.gid) == ('l', 4243, 4243)
 	assert not [message for message, error, _ in lines if error and 'Not syncing the attributes' in message]
 
 
@@ -1544,9 +1452,8 @@ def test_an_attribute_sync_of_a_link_naming_a_folder_lands_on_the_link_alone(tmp
 	run_batch(job, [('attrib', 'U', None, False)])
 	st = os.stat(folder)
 	assert (st.st_mode, st.st_uid, st.st_mtime_ns) == (held.st_mode, held.st_uid, held.st_mtime_ns)
-	# since 0.44 a link naming a folder is the user's (the daemon links files only): the end of its chain, which gets
-	# the link's owner
-	assert os.lstat(os.path.join(rv.list_versions(job.job_vault)[1].path, 'U')).st_uid == 4243
+	# since 0.44 a link naming a folder is the user's (the daemon links files only), which gets the link's owner
+	assert read_view(job.job_vault, rv.list_versions(job.job_vault)[1].name)['U'].uid == 4243
 	assert not [message for message, error, _ in lines if error and 'ends at the folder' in message]
 
 
@@ -1736,30 +1643,26 @@ def test_a_sweep_removal_that_fails_fails_the_batch_and_the_retry_commits(job, m
 	seed_monitor(job, {'keep.txt': 'k', 'b.txt': 'b'})
 	run_backup(job)
 	v0 = committed_versions(job)[0]
+	# no row names it, so only the sweep finds it: a delete's record would take it out of the tree with no removal to fail
+	with open(os.path.join(v0, 'stray.txt'), 'w') as f:
+		f.write('s')
 	os.remove(os.path.join(job.monitor, 'b.txt'))
 	spec = [('delete', 'b.txt', None, False)]
 	def entries():
 		events = raw_events(job, spec)
-		return rv.change_events_to_backup_entries(deque(events), job.monitor), rv.touched_scopes(events, job.monitor)
-	real_run, real_remove = rv.multiCMD.AsyncExecutor.run_command, rv.remove_entry
-	def run_command(self, command, *args, **kwargs):
-		if list(command[:1]) == ['rm'] and command[-1].endswith('/b.txt'):
-			command = ['true']      # the rm succeeds and leaves the entry: only the sweep finds it
-		return real_run(self, command, *args, **kwargs)
+		return rv.change_events_to_backup_entries(deque(events), job.monitor), rv.TouchedScopes([''], [])
+	real_remove = rv.remove_entry
 	def remove_entry(path):
-		if path.endswith('/b.txt'):
+		if path.endswith('/stray.txt'):
 			raise PermissionError(errno.EPERM, os.strerror(errno.EPERM), path)
 		return real_remove(path)
 	with monkeypatch.context() as m:
-		m.setattr(rv.multiCMD.AsyncExecutor, 'run_command', run_command)
 		m.setattr(rv, 'remove_entry', remove_entry)
 		batch, touched = entries()
 		with pytest.raises(rv.JobFailure) as exc:
 			run_backup(job, batch, touched=touched)
-	assert 'b.txt' in exc.value.reason and 'Operation not permitted' in exc.value.reason
+	assert 'stray.txt' in exc.value.reason and 'Operation not permitted' in exc.value.reason
 	assert committed_versions(job) == [v0]
-	with monkeypatch.context() as m:
-		m.setattr(rv.multiCMD.AsyncExecutor, 'run_command', run_command)
-		batch, touched = entries()
-		run_backup(job, batch, touched=touched)
+	run_backup(job)                     # the next attempt finishes the tree
+	assert not os.path.lexists(os.path.join(committed_versions(job)[-1], 'stray.txt'))
 	assert not os.path.lexists(os.path.join(committed_versions(job)[-1], 'b.txt'))

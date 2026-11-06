@@ -24,15 +24,25 @@ def _fresh_folders():
 	rv.REAL_VAULT_FOLDERS.clear()
 
 
-def three_versions(tmp_path):
-	'''V0 holding D/secret and keep, then V1 and V2, each modifying keep: V1's D/secret links to V0's, V2's to V1's.'''
+def three_versions(tmp_path, v054=None):
+	'''V0 holding D/secret and keep, then V1 and V2, each modifying keep. On design R V0 and V1 forward D/secret to V2's, and with v054 a 0.54 vault: V1's D/secret links to V0's, V2's to V1's.'''
 	job = create_job(str(tmp_path))
-	seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
-	run_backup(job)
-	for i in (1, 2):
-		with open(os.path.join(job.monitor, 'keep'), 'w') as f:
-			f.write(f'v{i}')
-		run_backup(job, OrderedDict([event_entry(job, 'keep', 'modify')]))
+	def seed(monitor):
+		seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
+	def save(text):
+		def change(monitor):
+			with open(os.path.join(monitor, 'keep'), 'w') as f:
+				f.write(text)
+			return [(False, 'modify', 'keep', None)]
+		return change
+	if v054 is not None:
+		v054.build(job, [seed, save('v1'), save('v2')], keep_n_versions=0, backup_size_limit='0')
+	else:
+		seed(job.monitor)
+		run_backup(job)
+		for text in ('v1', 'v2'):
+			save(text)(job.monitor)
+			run_backup(job, OrderedDict([event_entry(job, 'keep', 'modify')]))
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0, 1, 2]
 	return job
 
@@ -1094,15 +1104,15 @@ def restart_and_scan(job):
 	return sorted(path for path in folders if not os.path.lexists(path)), scanned
 
 
-def commit_hooks(monkeypatch, kill_at=None, fail_place=False):
+def commit_hooks(monkeypatch, kill_at=None, fail_place=False, daemon=rv):
 	'''
 	The commit's steps, as the syscalls and calls that make them, recorded in order in the list returned, with a kill
 	(Killed) at kill_at: 'writing' (half way through the change list's rows, in its private folder), 'manifest' (just
 	after the manifest's commit), 'swap' (just after current_version is swapped in), 'placed' (just after the list's
-	rename into place); with fail_place, that rename fails with ENOSPC instead.
+	rename into place); with fail_place, that rename fails with ENOSPC instead. daemon: the module whose commit it is.
 	'''
 	steps = []
-	real_append, real_commit, real_replace = rv.TSVZ.appendLinesTabularFile, rv.VaultManifest.commit, os.replace
+	real_append, real_commit, real_replace = rv.TSVZ.appendLinesTabularFile, daemon.VaultManifest.commit, os.replace
 	def append(path, rows, *args, **kwargs):
 		if rv.CHANGE_LIST_FOLDER_PREFIX not in os.fspath(path):
 			return real_append(path, rows, *args, **kwargs)
@@ -1133,7 +1143,7 @@ def commit_hooks(monkeypatch, kill_at=None, fail_place=False):
 				raise Killed()
 		return result
 	monkeypatch.setattr(rv.TSVZ, 'appendLinesTabularFile', append)
-	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
+	monkeypatch.setattr(daemon.VaultManifest, 'commit', commit)
 	monkeypatch.setattr(rv.os, 'replace', replace)
 	return steps
 
@@ -1644,13 +1654,13 @@ def vault_on(request, job, where):
 	return request.getfixturevalue('fake_pool').add(job.vault, ['a', 'b'])[0]
 
 
-def cut_off_at_the_swap(job, step='swap', **backup_options):
-	'''A backup of three_versions' job killed at step of its commit, run with backup_options: the folder it left.'''
+def cut_off_at_the_swap(job, step='swap', v054=None, **backup_options):
+	'''A backup of three_versions' job killed at step of its commit, by the 0.54 daemon with v054, run with backup_options: the folder it left.'''
 	# a monkeypatch of its own: undoing the test's would undo a fake pool's too
 	with pytest.MonkeyPatch.context() as hooks:
-		commit_hooks(hooks, kill_at=step)
+		commit_hooks(hooks, kill_at=step, daemon=rv if v054 is None else v054.module)
 		with pytest.raises(Killed):
-			run_backup(job, keep_modified(job, 'cut'), **backup_options)
+			(run_backup if v054 is None else v054.backup)(job, keep_modified(job, 'cut'), **backup_options)
 	attempt = [name for name in os.listdir(job.job_vault) if name.startswith('V3--') and os.path.isdir(os.path.join(job.job_vault, name))]
 	assert len(attempt) == 1
 	return os.path.join(job.job_vault, attempt[0])

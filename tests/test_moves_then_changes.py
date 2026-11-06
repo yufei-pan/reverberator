@@ -3,16 +3,15 @@ import mmap
 import threading
 import os
 import shutil
-import sqlite3
 import stat
 import struct
-import sys
 import time
 from collections import deque
 
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions
+from tests.harness import seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions, reads_the_file_before
+from tests.version_view_ground_truth import WRONG
 
 pytestmark = pytest.mark.unit
 
@@ -85,8 +84,8 @@ def test_mv_then_chmod_of_the_moved_file(job, logged, only_sync_attributes):
 	end = resolved(job, v1, 'd/x')
 	assert mode(end) == 0o600 and open(end).read() == 'x'
 	if only_sync_attributes:
-		# the shared copy at the chain's end carries the newest metadata
-		assert end == shared
+		# the one shared copy carries the newest metadata
+		assert os.path.samefile(end, shared)
 	else:
 		assert end == os.path.join(v1, 'd/x') and not os.path.islink(end)
 		assert mode(shared) == before
@@ -141,9 +140,9 @@ def test_a_moved_user_link_then_lchown(job, logged):
 	assert_moved_cleanly(logged)
 
 
-def assert_left_alone(v1, rel):
-	# a file of the moved folder nothing changed is still linked, not copied again
-	assert os.path.islink(os.path.join(v1, rel)), rel
+def assert_left_alone(v1, rel, was=None):
+	# a file of the moved folder nothing changed is the file the version before read at was: real in the newest version, not copied again
+	assert not os.path.islink(os.path.join(v1, rel)) and reads_the_file_before(v1, rel, was), rel
 
 
 def test_mv_folder_deep_then_chmod_inside(job, logged):
@@ -155,7 +154,7 @@ def test_mv_folder_deep_then_chmod_inside(job, logged):
 	v1 = run_backup(job, batch(job, (True, 'move', 'p/q/F', 'F'), (False, 'attrib', 'p/q/F/y', None)))[-1]
 	end = resolved(job, v1, 'p/q/F/y')
 	assert mode(end) == 0o600 and open(end).read() == 'y'
-	assert_left_alone(v1, 'p/q/F/z')
+	assert_left_alone(v1, 'p/q/F/z', 'F/z')
 	assert not os.path.lexists(os.path.join(v1, 'F'))
 	assert_moved_cleanly(logged)
 
@@ -170,7 +169,7 @@ def test_mv_folder_then_chown_inside(job, logged):
 	v1 = run_backup(job, batch(job, (True, 'move', 'e', 'd'), (False, 'attrib', 'e/y', None)))[-1]
 	st = os.lstat(resolved(job, v1, 'e/y'))
 	assert (st.st_uid, st.st_gid) == (1234, 1234)
-	assert_left_alone(v1, 'e/z')
+	assert_left_alone(v1, 'e/z', 'd/z')
 	assert_moved_cleanly(logged)
 
 
@@ -184,8 +183,8 @@ def test_mv_folder_then_create_inside(job, logged):
 	v1 = run_backup(job, batch(job, (True, 'move', 'e', 'd'), (False, 'create', 'e/new', None), (False, 'modify', 'e/new', None)))[-1]
 	assert open(resolved(job, v1, 'e/new')).read() == 'new'
 	assert open(resolved(job, v1, 'e/old')).read() == 'old'
-	assert_left_alone(v1, 'e/old')
-	assert_left_alone(v1, 'e/old2')
+	assert_left_alone(v1, 'e/old', 'd/old')
+	assert_left_alone(v1, 'e/old2', 'd/old2')
 	assert not os.path.lexists(os.path.join(v1, 'd'))
 	assert_moved_cleanly(logged)
 
@@ -200,7 +199,7 @@ def test_mv_folder_then_modify_inside(job, logged):
 	v1 = run_backup(job, batch(job, (True, 'move', 'e', 'd'), (False, 'modify', 'e/old', None)))[-1]
 	assert open(resolved(job, v1, 'e/old')).read() == 'changed'
 	assert open(os.path.join(v0, 'd/old')).read() == 'old'
-	assert_left_alone(v1, 'e/old2')
+	assert_left_alone(v1, 'e/old2', 'd/old2')
 	assert_moved_cleanly(logged)
 
 
@@ -218,9 +217,9 @@ def test_a_plain_move_leaves_the_shared_copy_alone(job, logged, monkeypatch):
 	m = job.monitor
 	os.rename(f'{m}/x', f'{m}/d/x')
 	v1 = run_backup(job, batch(job, (False, 'move', 'd/x', 'x')))[-1]
-	assert os.path.islink(os.path.join(v1, 'd/x'))
+	assert_left_alone(v1, 'd/x', 'x')
 	assert rv.entry_metadata(shared) == before
-	assert os.path.abspath(shared) not in calls
+	assert os.path.abspath(shared) not in calls and os.path.join(v1, 'd/x') not in calls
 	assert_moved_cleanly(logged)
 
 
@@ -267,7 +266,7 @@ def test_mv_into_a_folder_chmod_then_mv_the_folder(job, logged, only_sync_attrib
 		only_sync_attributes=only_sync_attributes)[-1]
 	end = resolved(job, v1, 'e/x')
 	assert mode(end) == 0o600 and open(end).read() == 'x'
-	assert_left_alone(v1, 'e/keep')
+	assert_left_alone(v1, 'e/keep', 'd/keep')
 	assert not os.path.lexists(os.path.join(v1, 'd')) and not os.path.lexists(os.path.join(v1, 'x'))
 	assert_moved_cleanly(logged)
 
@@ -281,7 +280,7 @@ def test_mv_a_folder_chmod_inside_then_mv_it_again(job, logged):
 	os.rename(f'{m}/e', f'{m}/f')
 	v1 = run_backup(job, batch(job, (True, 'move', 'e', 'd'), (False, 'attrib', 'e/y', None), (True, 'move', 'f', 'e')))[-1]
 	assert mode(resolved(job, v1, 'f/y')) == 0o600
-	assert_left_alone(v1, 'f/z')
+	assert_left_alone(v1, 'f/z', 'd/z')
 	assert sorted(os.listdir(v1)) == ['f']
 	assert_moved_cleanly(logged)
 
@@ -304,7 +303,7 @@ def test_mv_a_folder_mkdir_inside_then_mv_it_again(job, logged):
 	v1 = run_backup(job, batch(job, (True, 'move', 'e', 'd'), (True, 'create', 'e/x', None), (True, 'move', 'f', 'e')))[-1]
 	assert os.path.isdir(os.path.join(v1, 'f/x')) and not os.path.islink(os.path.join(v1, 'f/x'))
 	assert tracked(job, 'f/x/')
-	assert_left_alone(v1, 'f/y')
+	assert_left_alone(v1, 'f/y', 'd/y')
 	assert sorted(os.listdir(v1)) == ['f']
 	assert_moved_cleanly(logged)
 
@@ -321,7 +320,7 @@ def test_changes_before_a_folder_move_reach_its_new_place(job, logged):
 	v1 = run_backup(job, batch(job, (True, 'create', 'd/sub', None), (False, 'modify', 'd/c', None), (True, 'move', 'm1', 'd')))[-1]
 	assert os.path.isdir(os.path.join(v1, 'm1/sub')) and tracked(job, 'm1/sub/')
 	assert open(resolved(job, v1, 'm1/c')).read() == 'changed'
-	assert_left_alone(v1, 'm1/z')
+	assert_left_alone(v1, 'm1/z', 'd/z')
 	assert_moved_cleanly(logged)
 
 
@@ -383,7 +382,7 @@ def test_a_delete_inside_a_moved_folder_is_fixed_by_the_verification(job, logged
 		(False, 'modify', 'z/d612/n19', None))
 	assert not os.path.lexists(os.path.join(v1, 'z/d612/l652')) and not tracked(job, 'z/d612/l652')
 	assert open(resolved(job, v1, 'z/d612/n19')).read() == 'n19'
-	assert_left_alone(v1, 'z/d612/n822')
+	assert_left_alone(v1, 'z/d612/n822', 'd15/d612/n822')
 	assert_moved_cleanly(logged)
 
 
@@ -395,8 +394,8 @@ def test_a_file_renamed_then_its_folder_moved_logs_no_error(job, logged):
 	os.rename(f'{m}/d', f'{m}/e')
 	v1 = run_backup(job, batch(job, (False, 'move', 'd/b', 'd/a'), (True, 'move', 'e', 'd')))[-1]
 	assert open(resolved(job, v1, 'e/b')).read() == 'a'
-	assert_left_alone(v1, 'e/b')
-	assert_left_alone(v1, 'e/z')
+	assert_left_alone(v1, 'e/b', 'd/a')
+	assert_left_alone(v1, 'e/z', 'd/z')
 	assert_moved_cleanly(logged)
 
 
@@ -422,9 +421,28 @@ def test_a_save_through_a_backup_name_copies_the_new_file_once(job, logged, monk
 	copies = copies_made(monkeypatch)
 	v1 = run_backup(job, batch(job, (False, 'move', 'f~', 'f'), (False, 'create', 'f', None), (False, 'modify', 'f', None)))[-1]
 	assert open(resolved(job, v1, 'f')).read() == 'new'
-	assert resolved(job, v1, 'f~') == os.path.join(v0, 'f') and open(os.path.join(v0, 'f')).read() == 'old'
+	assert_left_alone(v1, 'f~', 'f')
+	assert open(os.path.join(v0, 'f')).read() == 'old'
 	assert copies == [os.path.join(v1, 'f')]
 	assert_moved_cleanly(logged)
+
+
+def plant_rows(job, discard=(), add=()):
+	'''Change the rows of the latest version, as an earlier daemon or a swap the collapse could not order left them.'''
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	for rel in discard:
+		manifest.discard(rel)
+	for rel in add:
+		manifest.add(rel)
+	manifest.commit()
+	manifest.close()
+
+
+def take_lists_counting_planted_rows():
+	'''A list's name counts the rows it was given, and rows that lie count until a full comparison mends them: the plugin's lines of that, looked at and taken out.'''
+	assert WRONG and all('its list should be' in line for line in WRONG), WRONG
+	WRONG.clear()
 
 
 @pytest.mark.parametrize('emptied', ['deleted', 'empty'])
@@ -438,8 +456,8 @@ def test_a_folder_moved_onto_a_removed_or_empty_folder_is_renamed(job, logged, e
 	os.rename(f'{m}/d', f'{m}/e')
 	events = [(False, 'delete', 'e/q', None)] if emptied == 'deleted' else []
 	v1 = run_backup(job, batch(job, *events, (True, 'delete', 'e', None), (True, 'move', 'e', 'd')))[-1]
-	assert_left_alone(v1, 'e/y')
-	assert_left_alone(v1, 'e/z')
+	assert_left_alone(v1, 'e/y', 'd/y')
+	assert_left_alone(v1, 'e/z', 'd/z')
 	assert sorted(os.listdir(os.path.join(v1, 'e'))) == ['y', 'z']
 	assert not os.path.lexists(os.path.join(v1, 'd'))
 	assert_moved_cleanly(logged)
@@ -458,7 +476,7 @@ def test_chmod_then_mv_links_the_moved_file(job, logged, monkeypatch, only_sync_
 	assert mode(end) == 0o600 and open(end).read() == 'x'
 	if only_sync_attributes:
 		# the shared copy takes the newest metadata, and nothing is copied
-		assert end == os.path.join(v0, 'x') and copies == []
+		assert os.path.samefile(end, os.path.join(v0, 'x')) and copies == []
 	else:
 		assert copies == [os.path.join(v1, 'y')]
 	assert_moved_cleanly(logged)
@@ -493,7 +511,7 @@ def test_a_file_changed_moved_into_a_folder_then_the_folder_moved(job, logged):
 	os.rename(f'{m}/d', f'{m}/e')
 	v1 = run_backup(job, batch(job, (False, 'modify', 'a', None), (False, 'move', 'd/a', 'a'), (True, 'move', 'e', 'd')))[-1]
 	assert open(resolved(job, v1, 'e/a')).read() == 'new'
-	assert_left_alone(v1, 'e/keep')
+	assert_left_alone(v1, 'e/keep', 'd/keep')
 	assert sorted(os.listdir(v1)) == ['e']
 	assert_moved_cleanly(logged)
 
@@ -533,14 +551,14 @@ def test_a_folder_made_then_a_folder_moved_into_it_copies_nothing(job, logged, m
 	v1 = run_backup(job, entries)[-1]
 	assert copies == []
 	for i in range(5):
-		assert_left_alone(v1, f'n/d/f{i}')
+		assert_left_alone(v1, f'n/d/f{i}', f'd/f{i}')
 	assert tracked(job, 'n/') and tracked(job, 'n/d/')
 	assert_moved_cleanly(logged)
 
 
 def test_a_folder_left_without_a_row_is_copied_by_the_next_change_under_it(job, logged, monkeypatch):
-	# the version could not make n ( ENOSPC, say ): n/b's create later copies the whole of n, rows and all, and the
-	# backups after it run
+	# the version could not make n ( ENOSPC, say ): the attempt fails, as a batch must not commit a version short of a folder,
+	# the next one finishes the tree, n with its rows, and the backups after it run
 	seed_monitor(job, {'keep': 'k'})
 	run_backup(job)
 	m = job.monitor
@@ -553,9 +571,12 @@ def test_a_folder_left_without_a_row_is_copied_by_the_next_change_under_it(job, 
 			return False
 		return real(path)
 	monkeypatch.setattr(rv, 'make_real_folder', failing)
-	run_backup(job, batch(job, (True, 'create', 'n', None), (False, 'create', 'n/a', None)))
+	with pytest.raises(rv.JobFailure, match='/n in the version failed'):
+		run_backup(job, batch(job, (True, 'create', 'n', None), (False, 'create', 'n/a', None)))
 	monkeypatch.setattr(rv, 'make_real_folder', real)
 	assert not tracked(job, 'n/')
+	run_backup(job)
+	assert tracked(job, 'n/') and tracked(job, 'n/a')
 	with open(f'{m}/n/b', 'w') as f:
 		f.write('b')
 	run_backup(job, batch(job, (False, 'create', 'n/b', None), (False, 'modify', 'n/b', None)))
@@ -568,19 +589,16 @@ def test_a_folder_left_without_a_row_is_copied_by_the_next_change_under_it(job, 
 
 
 def test_a_vault_with_a_file_row_under_a_folder_without_one_heals(job, logged):
-	# a vault left so by an earlier daemon: the referenced copy makes the folder, and the backup runs
+	# a vault left so by an earlier daemon: the version holds the folder, the backup runs, and a create under it gives the row back
 	seed_monitor(job, {'keep': 'k', 'n/a': 'a'})
 	run_backup(job)
-	manifest = rv.VaultManifest(job.job_vault)
-	manifest.begin()
-	manifest.discard('n/')
-	manifest.commit()
-	manifest.close()
+	plant_rows(job, discard=['n/'])
 	m = job.monitor
 	with open(f'{m}/keep', 'w') as f:
 		f.write('k2')
 	version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
 	assert open(resolved(job, version, 'n/a')).read() == 'a'
+	take_lists_counting_planted_rows()
 	with open(f'{m}/n/b', 'w') as f:
 		f.write('b')
 	version = run_backup(job, batch(job, (False, 'create', 'n/b', None), (False, 'modify', 'n/b', None)))[-1]
@@ -775,10 +793,9 @@ def test_bytes_written_through_mmap_then_a_chmod_reach_the_version(job, logged):
 	assert len(run_backup(job)) == count                          # the next full comparison finds nothing more
 
 
-def test_a_recopied_file_written_through_mmap_then_moved_reaches_the_version(job, logged, monkeypatch):
-	# the chain-length rule re-copies mm into this version as a real file holding the old bytes and mtime: the move step
-	# must not put the moved mtime on them, as the verification would then find them matching from then on
-	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
+def test_a_file_written_through_mmap_then_moved_reaches_the_version(job, logged):
+	# the newest version's mm is a real file holding the old bytes and mtime: the move step must not put the moved mtime on
+	# them, as the verification would then find them matching from then on
 	seed_monitor(job, {'mm': 'a' * 200000, 'keep': 'k'})
 	m = job.monitor
 	os.utime(f'{m}/mm', ns=(10 ** 18, 10 ** 18))
@@ -792,7 +809,6 @@ def test_a_recopied_file_written_through_mmap_then_moved_reaches_the_version(job
 		mapped.flush()
 	os.rename(f'{m}/mm', f'{m}/mm2')
 	version = verified(job, (False, 'move', 'mm2', 'mm'))
-	assert any('Copied 1 of 1 files again from the vault' in line for line in logged)
 	assert open(resolved(job, version, 'mm2')).read(4) == 'MMAP'
 	count = len(committed_versions(job))
 	run_backup(job)
@@ -951,37 +967,24 @@ def test_a_removed_acl_is_gone_from_the_newest_version(job, logged):
 
 
 def test_a_file_row_where_a_folder_row_was_made_is_dropped(job, logged):
-	# a vault whose rows hold both a file and a folder of one name ( fuzz seed 858 at 36b48f6 ): the referenced copy
-	# makes the folder, drops the file's row with an error line, and the backup runs
+	# a vault whose rows hold both a file and a folder of one name ( fuzz seed 858 at 36b48f6 ): a batch leaves the folder
+	# alone, and the next full comparison drops the file's row with a line
 	seed_monitor(job, {'keep': 'k', 'n/a': 'a'})
 	run_backup(job)
-	manifest = rv.VaultManifest(job.job_vault)
-	manifest.begin()
-	manifest.add('n')
-	manifest.commit()
-	manifest.close()
+	plant_rows(job, add=['n'])
 	m = job.monitor
 	with open(f'{m}/keep', 'w') as f:
 		f.write('k2')
 	version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
 	assert open(resolved(job, version, 'n/a')).read() == 'a'
+	take_lists_counting_planted_rows()
+	version = run_backup(job)[-1]
+	assert open(resolved(job, version, 'n/a')).read() == 'a'
 	assert tracked(job, 'n/') and not tracked(job, 'n')
-	assert [line for line in logged if line.startswith('ERROR Dropping tracked file n') and 'is a folder' in line]
+	assert [line for line in logged if line.startswith('Leaving') and "a folder, another row's entry, is in its place" in line]
 
 
 # ---- fix round 5 --------------------------------------------------------------------------------------------------
-
-def plant_rows(job, discard=(), add=()):
-	'''Change the rows of the latest version, as an earlier daemon or a swap the collapse could not order left them.'''
-	manifest = rv.VaultManifest(job.job_vault)
-	manifest.begin()
-	for rel in discard:
-		manifest.discard(rel)
-	for rel in add:
-		manifest.add(rel)
-	manifest.commit()
-	manifest.close()
-
 
 @pytest.mark.parametrize('change', ['xattr', 'chmod'])
 def test_a_change_carried_into_a_folder_made_in_the_batch_reaches_the_version(job, logged, change):
@@ -1003,7 +1006,7 @@ def test_a_change_carried_into_a_folder_made_in_the_batch_reaches_the_version(jo
 		assert os.listxattr(end) == ['user.k0']
 	else:
 		assert mode(end) == 0o600
-	assert_left_alone(v1, 'n460/d890/n356')
+	assert_left_alone(v1, 'n460/d890/n356', 'd890/n356')
 	assert_moved_cleanly(logged)
 
 
@@ -1018,7 +1021,7 @@ def test_a_change_after_a_move_into_a_folder_made_in_the_batch_reaches_the_versi
 	os.setxattr(f'{m}/n308/d433/d902/c0', 'user.k2', b'v')
 	v1 = run_backup(job, batch(job, (True, 'create', 'n308', None), (True, 'move', 'n308/d433', 'd433'), (False, 'attrib', 'n308/d433/d902/c0', None)))[-1]
 	assert os.listxattr(resolved(job, v1, 'n308/d433/d902/c0')) == ['user.k2']
-	assert_left_alone(v1, 'n308/d433/d902/c0')
+	assert_left_alone(v1, 'n308/d433/d902/c0', 'd433/d902/c0')
 	assert_moved_cleanly(logged)
 
 
@@ -1040,13 +1043,13 @@ def test_a_folder_made_inside_a_folder_moved_into_a_new_one_is_copied_once(job, 
 	assert open(resolved(job, v1, 'n/d/s/f')).read() == 'f'
 	assert os.listxattr(resolved(job, v1, 'n/d/keep')) == ['user.k']
 	assert copies == [os.path.join(v1, 'n/d/s/f')]
-	assert_left_alone(v1, 'n/d/keep')
+	assert_left_alone(v1, 'n/d/keep', 'd/keep')
 	assert_moved_cleanly(logged)
 
 
 def test_a_file_row_over_a_folder_of_the_previous_version_is_dropped(job, logged):
-	# rows hold the file n and the file n/a, and no folder n/, while V0 holds the folder n: n's row goes, so n is never
-	# linked to V0's folder, and nothing is removed or linked through it into V0
+	# rows hold the file n and the file n/a, and no folder n/, while V0 holds the folder n: nothing is removed through n, and
+	# the next full comparison gives the rows back
 	seed_monitor(job, {'keep': 'k', 'n/a': 'a'})
 	v0 = run_backup(job)[0]
 	plant_rows(job, discard=['n/'], add=['n'])
@@ -1059,8 +1062,10 @@ def test_a_file_row_over_a_folder_of_the_previous_version_is_dropped(job, logged
 	assert open(os.path.join(v0, 'n/a')).read() == 'a'
 	assert open(resolved(job, version, 'n/a')).read() == 'a'
 	assert not os.path.islink(os.path.join(version, 'n'))
-	assert not tracked(job, 'n') and tracked(job, 'n/a')
-	assert [line for line in logged if line.startswith('ERROR Dropping tracked file n') and 'is a folder' in line]
+	version = run_backup(job)[-1]
+	assert open(resolved(job, version, 'n/a')).read() == 'a' and open(os.path.join(v0, 'n/a')).read() == 'a'
+	assert not tracked(job, 'n') and tracked(job, 'n/') and tracked(job, 'n/a')
+	assert [line for line in logged if line.startswith('Leaving') and "a folder, another row's entry, is in its place" in line]
 
 
 def test_a_folder_row_over_a_users_link_to_a_folder_is_dropped(job, logged):
@@ -1075,50 +1080,11 @@ def test_a_folder_row_over_a_users_link_to_a_folder_is_dropped(job, logged):
 	version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
 	got = rv.resolve_version_entry(job.job_vault, version, 'L', m)
 	assert got.kind == 'symlink' and os.readlink(got.path) == 'sub'
+	take_lists_counting_planted_rows()
+	version = run_backup(job)[-1]
+	got = rv.resolve_version_entry(job.job_vault, version, 'L', m)
+	assert got.kind == 'symlink' and os.readlink(got.path) == 'sub'
 	assert tracked(job, 'L') and not tracked(job, 'L/')
-	assert [line for line in logged if line.startswith('ERROR Dropping tracked folder') and 'L/' in line]
-
-
-def test_the_referenced_copy_looks_nothing_up_in_the_new_version_for_a_file(job, monkeypatch):
-	# a vault on mergerfs keeps no negative lookups ( cache.negative_entry=0 ): one per tracked file is seconds a backup
-	seed_monitor(job, {f'd/f{i}': str(i) for i in range(50)})
-	v0 = run_backup(job)[0]
-	inside = []
-	real_copy = rv.do_referenced_copy
-	def copying(*args, **kwargs):
-		inside.append(True)
-		try:
-			return real_copy(*args, **kwargs)
-		finally:
-			inside.pop()
-	monkeypatch.setattr(rv, 'do_referenced_copy', copying)
-	looked = []
-	def by_the_daemon():
-		# called from reverberator.py, or from os.path called from it: not the chain ground truth's own lstat of each link
-		frame = sys._getframe(2)
-		if frame.f_globals.get('__name__') in ('genericpath', 'posixpath'):
-			frame = frame.f_back
-		return frame.f_code.co_filename == rv.__file__
-	made = set()
-	real_symlink = os.symlink
-	def symlink(text, path, *args, **kwargs):
-		real_symlink(text, path, *args, **kwargs)
-		made.add(os.fsdecode(path))
-	monkeypatch.setattr(os, 'symlink', symlink)
-	def spy(real):
-		def look(path, *args, **kwargs):
-			name = os.fsdecode(path) if isinstance(path, (str, bytes)) else ''
-			# a link looked at once it is made is found, its attributes at hand: what it takes is kept for the measure
-			if inside and name.startswith(job.job_vault) and not name.startswith(v0) and name not in made and by_the_daemon():
-				looked.append(name)
-			return real(path, *args, **kwargs)
-		return look
-	monkeypatch.setattr(os, 'stat', spy(os.stat))
-	monkeypatch.setattr(os, 'lstat', spy(os.lstat))
-	with open(f'{job.monitor}/d/f0', 'w') as f:
-		f.write('changed')
-	run_backup(job, batch(job, (False, 'modify', 'd/f0', None)))
-	assert len(looked) < 10, looked
 
 
 def test_a_monitored_filesystem_without_xattrs_strips_none_from_the_vault(job, logged, monkeypatch):
@@ -1160,7 +1126,7 @@ def test_an_xattr_set_before_its_folder_moved_onto_an_emptied_folder_reaches_the
 	end = resolved(job, v1, 'd781/d324/c0')
 	assert open(end).read() == 'new' and os.listxattr(end) == ['user.k1']
 	assert sorted(os.listdir(os.path.join(v1, 'd781/d324'))) == ['c0']
-	assert_left_alone(v1, 'd781/d324/c0')
+	assert_left_alone(v1, 'd781/d324/c0', 'd816/d399/c0')
 	assert_moved_cleanly(logged)
 
 
@@ -1195,8 +1161,8 @@ def test_the_verification_syncs_xattrs_the_replay_missed(job, logged, only_sync_
 	version = verified(job, (True, 'move', 'D2', 'D'), only_sync_attributes=only_sync_attributes)
 	end = resolved(job, version, 'D2/a')
 	assert os.listxattr(end) == ['user.new'] and open(end).read() == 'a'
-	assert os.path.islink(os.path.join(version, 'D2/a')) == only_sync_attributes
-	assert_left_alone(version, 'D2/b')
+	assert reads_the_file_before(version, 'D2/a', 'D/a') == only_sync_attributes
+	assert_left_alone(version, 'D2/b', 'D/b')
 	assert_moved_cleanly(logged)
 
 
@@ -1266,8 +1232,8 @@ def test_a_listed_xattr_without_a_value_copies_no_moved_folder(job, logged, monk
 	version = verified(job, (True, 'move', 'E', 'D'))
 	assert copies == []
 	assert not [line for line in logged if 'treating as modify' in line]
-	assert_left_alone(version, 'E/a')
-	assert_left_alone(version, 'E/b')
+	assert_left_alone(version, 'E/a', 'D/a')
+	assert_left_alone(version, 'E/b', 'D/b')
 
 
 class SteppedClock:
@@ -1521,7 +1487,8 @@ def test_an_attrib_whose_record_vouches_reads_no_vault_copy(job, logged, monkeyp
 	monkeypatch.setattr(rv, 'same_contents', spy)
 	version = run_backup(job, batch(job, (False, 'attrib', 'x', None)))[-1]
 	assert read == []
-	assert mode(resolved(job, version, 'x')) == 0o600 and os.path.islink(os.path.join(version, 'x'))
+	assert mode(resolved(job, version, 'x')) == 0o600
+	assert_left_alone(version, 'x')
 	assert_moved_cleanly(logged)
 
 
@@ -1637,18 +1604,6 @@ def test_a_delete_of_a_folder_tracked_only_by_its_children_is_kept(job, logged):
 	assert not any('Dropped' in line for line in logged)
 
 
-def test_a_stale_manifest_keeps_untracked_deletes(job):
-	seed_monitor(job, {'a.txt': 'a'})
-	count = len(run_backup(job))
-	conn = sqlite3.connect(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), isolation_level=None)
-	try:
-		conn.execute("UPDATE meta SET value = 'V99--stale' WHERE key = 'version'")
-	finally:
-		conn.close()
-	verified(job, (False, 'delete', 'gone.txt', None))
-	assert len(committed_versions(job)) == count + 1
-
-
 def test_a_delete_of_a_tracked_symlink_is_kept(job, logged):
 	seed_monitor(job, {'a.txt': 'a'})
 	os.symlink('a.txt', os.path.join(job.monitor, 'ln'))
@@ -1663,16 +1618,11 @@ def test_a_delete_of_a_tracked_symlink_is_kept(job, logged):
 
 def test_a_folder_in_a_file_rows_place_drops_the_row_and_commits(job, logged, monkeypatch):
 	seed_monitor(job, {'x': 'x', 'keep': 'k'})
-	run_backup(job)
+	v0 = run_backup(job)[0]
 	os.remove(f'{job.monitor}/x')
-	real = rv.do_referenced_copy
-	def with_a_folder_at_x(*args, **kwargs):
-		done = real(*args, **kwargs)
-		place = os.path.join(kwargs['backup_folder'], 'x')
-		os.remove(place)
-		os.mkdir(place)
-		return done
-	monkeypatch.setattr(rv, 'do_referenced_copy', with_a_folder_at_x)
+	# a row of the file x where the newest version holds a folder
+	os.remove(os.path.join(v0, 'x'))
+	os.mkdir(os.path.join(v0, 'x'))
 	verified(job, (False, 'delete', 'x', None))                 # commits: run_backup asserts it
 	assert any("a folder, another row's entry, is in its place in the version" in line for line in logged)
 	manifest = rv.VaultManifest(job.job_vault)

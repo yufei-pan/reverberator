@@ -7,6 +7,7 @@ from datetime import datetime
 
 import TSVZ
 import reverberator as rv
+from tests.vault_oracle import VERSION_LIST, landing, read_view, version_number
 
 JobPaths = namedtuple('JobPaths', ['root', 'monitor', 'vault', 'job_name', 'job_vault', 'rule_path'])
 
@@ -157,21 +158,55 @@ def write_pending(job: JobPaths, events: list) -> str:
 
 
 def committed_versions(job: JobPaths) -> list:
+	'''The committed versions' folders, the oldest first: those with a change list, whatever its name counts, as a list on design R names no du of its folder.'''
 	if not os.path.isdir(job.job_vault):
 		return []
-	found = []
+	names = os.listdir(job.job_vault)
+	listed = {match[1] for match in map(VERSION_LIST.fullmatch, names) if match is not None}
 	# by version number, as V10 sorts before V9 as text
-	for name in sorted(os.listdir(job.job_vault), key=lambda name: (rv.vault_version_number(name) or 0, name)):
-		if not (name.startswith('V') and '--' in name):
-			continue
-		if rv.CONTENT_FILE_EXTENSION_NAME in name:
-			continue
-		path = os.path.join(job.job_vault, name)
-		if not os.path.isdir(path):
-			continue
-		if os.path.isfile(content_file_path(path)):
-			found.append(path)
-	return found
+	return [os.path.join(job.job_vault, name) for name in sorted(listed & set(names), key=lambda name: (rv.vault_version_number(name) or 0, name))
+		if os.path.isdir(os.path.join(job.job_vault, name))]
+
+
+def change_list_of(version_dir: str) -> str:
+	'''The path of the change list of the version in version_dir, whatever its name counts.'''
+	job_vault, name = os.path.split(version_dir)
+	lists = [other for other in os.listdir(job_vault) if (match := VERSION_LIST.fullmatch(other)) is not None and match[1] == name]
+	assert len(lists) == 1, lists
+	return os.path.join(job_vault, lists[0])
+
+
+def file_read_at(job_vault: str, folder_name: str, rel: str):
+	'''(device, inode) of what the version in folder_name reads at rel, by the oracle's own walk; None when it reads nothing there.'''
+	place = landing(job_vault, folder_name, rel)
+	if place is None:
+		return None
+	st = os.lstat(os.path.join(job_vault, *place))
+	return st.st_dev, st.st_ino
+
+
+def folder_before(version: str) -> str:
+	'''The name of the folder of the version before version.'''
+	job_vault, name = os.path.split(version)
+	return max((other for other in os.listdir(job_vault) if version_number(other) is not None and version_number(other) < version_number(name)), key=version_number)
+
+
+def reads_the_file_before(version: str, rel: str, was: str = None) -> bool:
+	'''
+	Whether rel of version is the very file the version before it reads at was (rel by default), as a file a batch moved or left
+	alone is: no copy of it was made. What 0.54 showed by a chain link, design R shows by the inode a forward or a hard link reaches.
+	'''
+	job_vault, name = os.path.split(version)
+	held = file_read_at(job_vault, name, rel)
+	return held is not None and held == file_read_at(job_vault, folder_before(version), rel if was is None else was)
+
+
+def carried_from_before(version: str, rel: str) -> bool:
+	'''Whether rel of version is a file the version before it reads anywhere: reads_the_file_before() with no path to name.'''
+	job_vault, name = os.path.split(version)
+	inodes = {}
+	read_view(job_vault, folder_before(version), inodes)
+	return file_read_at(job_vault, name, rel) in inodes.values()
 
 
 def run_backup(job: JobPaths, entries=None, **kwargs) -> list:
@@ -251,8 +286,10 @@ class FakePool:
 		self.write()
 
 	def write(self):
-		with open(self.mountinfo_path, 'w', encoding='utf-8') as f:
+		# whole or not at all, as the kernel's table reads: a job reading it half written would see the monitored filesystem change
+		with open(self.mountinfo_path + '.new', 'w', encoding='utf-8') as f:
 			f.write(self.ROOT_LINE + ''.join(line for _, line, _, _ in self.lines))
+		os.replace(self.mountinfo_path + '.new', self.mountinfo_path)
 		self.monitor.wake()
 
 	def named(self, branch:str) -> str:

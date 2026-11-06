@@ -12,14 +12,23 @@ from tests.harness import FakePool, create_job, reverberator_script
 # design R (REVERB_VIEW_GROUND_TRUTH=0)
 pytest_plugins = ['tests.chain_ground_truth', 'tests.version_usage_ground_truth', 'tests.version_view_ground_truth', 'tests.legacy054']
 
+# the test files on design R so far; a file not named here runs on 0.54 until the suite has moved (Task 13)
+R_FILES = {
+	'test_backup.py', 'test_backup_replay_ordering.py', 'test_moves_then_changes.py', 'test_rename_heavy_batches.py', 'test_replay_sequences.py',
+	'test_verify_replay.py', 'test_compare_scopes.py', 'test_delta.py', 'test_matched_time.py', 'test_inner_mounts.py', 'test_io_errors.py',
+	'test_pool_guards.py', 'test_vault_flush.py', 'test_manifest.py',
+}
+
 # the real helper, for the one test that runs it: isolated_runtime() replaces it for every test
 REAL_SYNC_VAULT_FILESYSTEMS = rv.sync_vault_filesystems
 
 
 @pytest.fixture(autouse=True)
-def restore_runtime_globals(tmp_path):
+def restore_runtime_globals(request, tmp_path):
 	# the isolation below has a monkeypatch of its own: a test's monkeypatch.undo() would otherwise drop it too
 	with pytest.MonkeyPatch.context() as isolation:
+		if request.path.name in R_FILES:
+			isolation.setattr(rv, 'NEW_VAULT_LAYOUT', 'r')
 		yield from isolated_runtime(tmp_path, isolation)
 
 

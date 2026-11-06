@@ -266,7 +266,7 @@ def test_a_watch_that_cannot_be_added_is_not_counted(tmp_path):
 
 
 from collections import OrderedDict
-from tests.harness import committed_versions, content_file_path, wait_for_committed_count
+from tests.harness import change_list_of, committed_versions, wait_for_committed_count
 
 
 def _backup(job, entries=None):
@@ -586,7 +586,7 @@ def test_inner_disk_unmounted_during_a_full_comparison_is_not_deleted(job, poll_
 	v1 = committed_versions(job)[1]
 	assert os.path.lexists(os.path.join(v1, 'disk', 'f.txt'))
 	assert open(os.path.join(v1, 'a.txt')).read() == 'changed'
-	assert os.path.join(job.monitor, 'disk') not in open(content_file_path(v1)).read()
+	assert os.path.join(job.monitor, 'disk') not in open(change_list_of(v1)).read()
 
 
 @pytest.mark.unit

@@ -31,7 +31,7 @@ def test_v0_complete_copy_is_not_symlink_into_monitor(job):
 	assert 'a.txt' in tracking.files
 
 
-def test_v0_referenced_copy_symlinks_into_monitor(job):
+def test_v0_is_a_complete_copy_whatever_the_rule_says(job):
 	seed_monitor(job, {'a.txt': 'hello'})
 	info, tracking, committed = rv.do_backup(
 		{}, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
@@ -40,8 +40,9 @@ def test_v0_referenced_copy_symlinks_into_monitor(job):
 	)
 	assert committed is True
 	dest = os.path.join(committed_versions(job)[0], 'a.txt')
-	assert os.path.islink(dest)
-	assert os.path.realpath(dest) == os.path.realpath(os.path.join(job.monitor, 'a.txt'))
+	# Keep 1 Complete Backup False made a link into the monitored tree on 0.54: on design R the first version is the tree
+	assert not os.path.islink(dest) and not os.path.samefile(dest, os.path.join(job.monitor, 'a.txt'))
+	assert open(dest).read() == 'hello'
 
 
 def test_journal_written_when_enabled(job):
@@ -147,21 +148,6 @@ def test_vanished_source_is_not_recorded_in_tracking(job):
 	# the rest of the backup must still succeed
 	assert os.path.isfile(os.path.join(v1, 'keep.txt'))
 	assert 'keep.txt' in result.files
-
-
-def test_referenced_copy_drops_tracked_file_missing_from_reference(job):
-	# a tracking list that lies about the referenced version must not produce
-	# a dangling link that every later version inherits
-	v0 = write_committed_version(job, 0, {'real.txt': 'r'})
-	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
-	os.makedirs(v1)
-	rv.GREEN_LIGHT.set()
-	manifest = tracked_manifest(job.job_vault, v0, ['real.txt', 'ghost.txt'])
-	assert rv.do_referenced_copy(source_path=v0, backup_folder=v1, manifest=manifest, relative=True)
-	assert not os.path.lexists(os.path.join(v1, 'ghost.txt'))
-	assert 'ghost.txt' not in manifest.files
-	assert os.path.lexists(os.path.join(v1, 'real.txt'))
-	assert 'real.txt' in manifest.files
 
 
 def test_copy_keeps_inherited_link_when_source_vanished(job):

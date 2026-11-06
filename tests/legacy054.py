@@ -82,6 +82,14 @@ class Legacy054:
 		manifest.close()
 		assert committed is True
 
+	def backup(self, job, entries=None, **options) -> None:
+		'''One committed backup of entries, as harness.run_backup() runs one on rv, with its options: empty entries compare the whole tree.'''
+		self.isolate()
+		try:
+			self.run(job, OrderedDict() if entries is None else entries, **{**dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0'), **options})
+		finally:
+			self.stop_monitor()
+
 	def build(self, job, batches, **options) -> None:
 		'''
 		A 0.54 vault in job: each of batches, a function of the monitored folder, changes that folder, and the first version is backed

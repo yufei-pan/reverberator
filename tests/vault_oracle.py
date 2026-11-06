@@ -5,16 +5,18 @@ own. It imports nothing from reverberator, so a wrong rule there cannot hide her
 A version is read through two kinds of daemon link, each by its exact text and nothing looser: the forward link of design
 R ('../'*(depth) + next version's folder name + '/' + its own path) and the backward link of 0.54 (the same ups, the
 previous version's folder name, and any path there, as a move keeps its old path). Any other link is a user's link and is
-read as a link.
+read as a link. A vault whose manifest says design R has no backward link left, nor does a walk that went forward meet one
+(spec section 4.3): a link of that form there is a user's.
 '''
 import base64
 import hashlib
 import json
 import os
 import re
-import sqlite3
 import stat
 from collections import Counter, namedtuple
+# a name of its own, as a test that fails the daemon's opens of the manifest patches the module's
+from sqlite3 import Error as SqliteError, connect as sqlite_connect
 
 # what a version holds at a path, or the monitored tree. kind: 'f', 'd', 'l', 'special', 'root', or 'dangling' for a daemon
 # link that leads nowhere. data: a file's sha256, a link's text, a dangling link's text, a special file's (type, device number). xattrs: sorted (name, value)
@@ -50,10 +52,10 @@ def version_number(name: str):
 	return None if match is None or name.endswith(LIST_SUFFIX) else int(match[1])
 
 
-def linked_place(folder_name: str, rel: str, text: str):
+def linked_place(folder_name: str, rel: str, text: str, backward: bool = True):
 	'''
-	(version folder name, path in it) the link at rel in folder_name leads to, when its text is exactly a forward or a
-	0.54 backward link's; else None, a user's link.
+	(version folder name, path in it) the link at rel in folder_name leads to, when its text is exactly a forward or, with
+	backward, a 0.54 backward link's; else None, a user's link.
 
 	Examples:
 		>>> linked_place('V2--x', 'a/b', '../../V3--y/a/b'), linked_place('V2--x', 'a/b', '../../V1--y/moved/from')
@@ -61,6 +63,8 @@ def linked_place(folder_name: str, rel: str, text: str):
 		>>> [linked_place('V2--x', 'a/b', text) for text in ('../V3--y/a/b', '../../../V3--y/a/b', '../../V3--y/a/c',
 		...     '../../V4--y/a/b', '../../V0--y/a/b', '../../V1--y/a/../b', '../../V1--y/', '../../V1--y', '/v/V3--y/a/b', 'a/x')]
 		[None, None, None, None, None, None, None, None, None, None]
+		>>> linked_place('V2--x', 'a/b', '../../V3--y/a/b', False), linked_place('V2--x', 'a/b', '../../V1--y/moved/from', False)
+		(('V3--y', 'a/b'), None)
 	'''
 	head = '../' * (rel.count('/') + 1)
 	if not text.startswith(head):
@@ -72,16 +76,19 @@ def linked_place(folder_name: str, rel: str, text: str):
 	own = version_number(folder_name)
 	if number == own + 1 and named == rel:
 		return name, named
-	if number == own - 1 and not any(part in ('', '.', '..') for part in named.split('/')):
+	if backward and number == own - 1 and not any(part in ('', '.', '..') for part in named.split('/')):
 		return name, named
 	return None
 
 
-def landing(job_vault: str, folder_name: str, rel: str):
+def landing(job_vault: str, folder_name: str, rel: str, backward: bool = None):
 	'''
 	(version folder name, path in it) that holds rel of folder_name once every daemon link on the way is followed, one
-	path part at a time; the entry there may be a user's link. None when it leads nowhere.
+	path part at a time; the entry there may be a user's link. None when it leads nowhere. backward: whether a 0.54 link
+	is one, by default as the manifest says; never once the walk went forward.
 	'''
+	if backward is None:
+		backward = not recorded_design_r(job_vault)
 	seen = set()
 	while True:
 		if (folder_name, rel) in seen:
@@ -96,12 +103,13 @@ def landing(job_vault: str, folder_name: str, rel: str):
 			except (FileNotFoundError, NotADirectoryError):
 				return None
 			if stat.S_ISLNK(mode):
-				place = linked_place(folder_name, here, os.readlink(path))
+				place = linked_place(folder_name, here, os.readlink(path), backward)
 				if place is None:
 					if count == len(parts):
 						return folder_name, rel
 					# nothing of a version is read through a user's link
 					return None
+				backward = backward and version_number(place[0]) < version_number(folder_name)
 				folder_name, rel = place[0], '/'.join((place[1], *parts[count:]))
 				break
 			if count < len(parts) and not stat.S_ISDIR(mode):
@@ -159,11 +167,12 @@ def read_view(job_vault: str, folder_name: str, inodes: dict = None) -> dict:
 	'''
 	view = {'': root_record_view(os.path.join(job_vault, folder_name))}
 	top = os.path.join(job_vault, folder_name)
+	backward = not recorded_design_r(job_vault)
 	pending = [(name, folder_name, name) for name in os.listdir(top)]
 	# a list, as a tree may be deeper than the interpreter's stack
 	while pending:
 		rel, version, at = pending.pop()
-		place = landing(job_vault, version, at)
+		place = landing(job_vault, version, at, backward)
 		if place is None:
 			text = os.readlink(os.path.join(job_vault, version, at)) if os.path.islink(os.path.join(job_vault, version, at)) else None
 			view[rel] = EntryView('dangling', text, None, None, None, None, ())
@@ -207,10 +216,10 @@ def recorded_design_r(job_vault: str) -> bool:
 	path = os.path.join(job_vault, '.reverberator_manifest.sqlite')
 	if not os.path.exists(path):
 		return False
-	conn = sqlite3.connect(f'file:{path}?immutable=1', uri=True)
+	conn = sqlite_connect(f'file:{path}?immutable=1', uri=True)
 	try:
 		row = conn.execute("SELECT value FROM meta WHERE key = 'layout'").fetchone()
-	except sqlite3.Error:
+	except SqliteError:
 		return False
 	finally:
 		conn.close()

@@ -4,7 +4,7 @@ import errno
 import os
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup
+from tests.harness import carried_from_before, seed_monitor, run_backup
 from tests.test_moves_then_changes import BAD_LINES, batch, logged, tracked, verified, assert_version_is_the_tree  # noqa: F401
 
 pytestmark = pytest.mark.unit
@@ -235,7 +235,7 @@ def test_a_file_made_in_the_batch_moved_through_folder_moves_is_copied_where_it_
 	if with_verification or name not in BARE_DIFFERS:
 		assert_version_is_the_tree(job, v)
 	if name in OLDER_MOVED_AWAY:
-		assert os.path.islink(os.path.join(v, OLDER_MOVED_AWAY[name])) and open(os.path.join(v, OLDER_MOVED_AWAY[name])).read() == 'OLD\n'
+		assert carried_from_before(v, OLDER_MOVED_AWAY[name]) and open(os.path.join(v, OLDER_MOVED_AWAY[name])).read() == 'OLD\n'
 
 
 def test_the_minimal_batch_copies_h_and_leaves_nothing_at_D_g(job, logged):
@@ -264,20 +264,20 @@ def test_a_file_the_version_holds_saved_twice_then_moved_through_a_moved_folder(
 	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
 	assert not fallbacks(logged), fallbacks(logged)
 	assert_version_is_the_tree(job, v)
-	assert os.path.islink(os.path.join(v, 'D/k'))
+	assert carried_from_before(v, 'D/k')
 	if then == 'moved_out':
 		assert open(os.path.join(v, 'h')).read() == 'save 2\n'
 
 
 @pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
-def test_a_file_the_version_holds_moved_the_same_way_stays_a_link(job, logged, with_verification):
+def test_a_file_the_version_holds_moved_the_same_way_is_not_copied(job, logged, with_verification):
 	seed_monitor(job, {'d/': None, 'f': 'old\n'})
 	run_backup(job)
 	apply(job.monitor, [('mv', 'f', 'd/g'), ('mv', 'd', 'D'), ('mv', 'D/g', 'h')])
 	del logged[:]
 	events = [(False, 'move', 'd/g', 'f'), (True, 'move', 'D', 'd'), (False, 'move', 'h', 'D/g')]
 	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
-	assert os.path.islink(os.path.join(v, 'h')) and open(os.path.join(v, 'h')).read() == 'old\n'
+	assert carried_from_before(v, 'h') and open(os.path.join(v, 'h')).read() == 'old\n'
 	assert not fallbacks(logged), fallbacks(logged)
 
 
@@ -380,7 +380,7 @@ def test_the_probe_batch_replays_without_a_rename_fallback(job, logged):
 # a folder of the version that a file or folder is moved out of and that is then removed ( mv d/g y; rm -r d ): its
 # delete replays after the moves out of it, so they rename what the version holds there
 EMPTIED = {
-	# name: (seed, steps, the watcher's events of the steps, the moved-out entries that keep their links)
+	# name: (seed, steps, the watcher's events of the steps, the moved-out entries, never copied)
 	'file_out': ({'d/g': 'G\n', 'd/k': 'K\n'}, [('mv', 'd/g', 'y'), ('rm', 'd/k'), ('rmdir', 'd')],
 		[(False, 'move', 'y', 'd/g'), (False, 'delete', 'd/k', None), (True, 'delete', 'd', None)], ['y']),
 	'folder_out': ({'d/s/a': 'A\n', 'd/k': 'K\n'}, [('mv', 'd/s', 'z'), ('rm', 'd/k'), ('rmdir', 'd')],
@@ -435,7 +435,7 @@ def test_a_folder_emptied_by_moves_then_removed_lets_them_rename(job, logged, na
 	assert not fallbacks(logged), fallbacks(logged)
 	assert_version_is_the_tree(job, v)
 	for rel in linked:
-		assert os.path.islink(os.path.join(v, rel)), rel
+		assert carried_from_before(v, rel), rel
 
 
 # a folder moved aside and made again, then a new file written in it at the old file's path and moved on: the old
@@ -475,7 +475,7 @@ ASIDE = {
 @pytest.mark.parametrize('form', FORMS)
 @pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
 @pytest.mark.parametrize('name', sorted(ASIDE))
-def test_a_new_file_at_the_path_of_an_old_one_its_folder_move_took_keeps_that_ones_link(job, logged, name, with_verification, form):
+def test_a_new_file_at_the_path_of_an_old_one_its_folder_move_took_keeps_that_one(job, logged, name, with_verification, form):
 	seed, steps, events, (old, text) = ASIDE[name]
 	events = watched(events, form)
 	seed_monitor(job, seed)
@@ -485,7 +485,7 @@ def test_a_new_file_at_the_path_of_an_old_one_its_folder_move_took_keeps_that_on
 	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
 	assert not fallbacks(logged), fallbacks(logged)
 	assert_version_is_the_tree(job, v)
-	assert os.path.islink(os.path.join(v, old)) and open(os.path.join(v, old)).read() == text
+	assert carried_from_before(v, old) and open(os.path.join(v, old)).read() == text
 
 
 @pytest.mark.parametrize('with_verification', [True, False], ids=['verified', 'bare'])
@@ -502,7 +502,7 @@ def test_a_delete_under_a_folder_moved_after_it_stays_at_the_front(job, logged, 
 	v = verified(job, *events) if with_verification else run_backup(job, batch(job, *events))[-1]
 	assert len(warned(logged)) == 1 and fallbacks(logged) == warned(logged)       # the rename of the chain merge finds nothing
 	assert_version_is_the_tree(job, v)
-	assert os.path.islink(os.path.join(v, 'D/k'))
+	assert carried_from_before(v, 'D/k')
 
 
 @pytest.mark.parametrize('is_dir', [False, True], ids=['file', 'folder'])

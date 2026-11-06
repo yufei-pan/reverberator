@@ -217,7 +217,7 @@ def test_the_change_list_and_the_salt_are_flushed_through_the_helper(tmp_path, m
 	assert flushed == [job_vault, job_vault]
 
 
-def test_a_failed_flush_after_the_swap_fails_the_attempt_and_the_next_scan_cleans_up(tmp_path, monkeypatch, capsys):
+def test_a_failed_flush_after_the_swap_fails_the_attempt_and_the_next_scan_finishes_it(tmp_path, monkeypatch, capsys):
 	# the list would be placed ahead of a link that is not on its disk: it stays in its private folder instead
 	job = three_versions(tmp_path)
 	state = []
@@ -238,13 +238,15 @@ def test_a_failed_flush_after_the_swap_fails_the_attempt_and_the_next_scan_clean
 	attempt = os.path.join(job.job_vault, state[0])
 	assert link_number(job) == 3 and os.path.isdir(attempt) and len(private_folders(job)) == 1
 	assert [kept.number for kept in rv.list_versions(job.job_vault)] == [0, 1, 2]
+	# the manifest committed, so the scan finishes the commit
 	removed, scanned = restart_and_scan(job)
-	assert removed == [attempt] and scanned == [0, 1, 2] and link_number(job) == 2 and private_folders(job) == []
+	assert attempt not in removed and scanned == [0, 1, 2, 3] and link_number(job) == 3 and private_folders(job) == []
 
 
-def test_the_undo_of_a_cut_off_commit_is_flushed_before_anything_is_removed(tmp_path, monkeypatch):
-	job = three_versions(tmp_path)
-	attempt = cut_off_at_the_swap(job)
+def test_the_undo_of_a_cut_off_commit_is_flushed_before_anything_is_removed(tmp_path, monkeypatch, v054):
+	# the undo is the 0.54 rule, for a vault's scan before its conversion
+	job = three_versions(tmp_path, v054)
+	attempt = cut_off_at_the_swap(job, v054=v054)
 	events = []
 	real_flush = rv.fsync_vault_folder
 	def flushing(path):
@@ -259,9 +261,9 @@ def test_the_undo_of_a_cut_off_commit_is_flushed_before_anything_is_removed(tmp_
 	assert events[0] == ('flush', 2) and events[1:] == [('remove_unfinished_change_lists',), ('remove_orphan',)]
 
 
-def test_an_undo_that_cannot_be_flushed_fails_the_scan_and_removes_nothing(tmp_path, monkeypatch):
-	job = three_versions(tmp_path)
-	attempt = cut_off_at_the_swap(job)
+def test_an_undo_that_cannot_be_flushed_fails_the_scan_and_removes_nothing(tmp_path, monkeypatch, v054):
+	job = three_versions(tmp_path, v054)
+	attempt = cut_off_at_the_swap(job, v054=v054)
 	def flushing(path):
 		raise OSError(errno.EIO, os.strerror(errno.EIO), path)
 	monkeypatch.setattr(rv, 'fsync_vault_folder', flushing)
