@@ -25,11 +25,13 @@ dependencies = [
 reverberator = "reverberator:main"
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pytest-xdist>=3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "reverberator.py"]
 addopts = ["--doctest-modules", "-ra"]
+# an xdist worker has threads of its own, and the crash tests fork from it: the child only runs a batch and is killed
+filterwarnings = ["ignore:This process .* is multi-threaded, use of fork:DeprecationWarning"]
 norecursedirs = [".venv", "dist", ".git"]
 pythonpath = ["."]
 markers = [
