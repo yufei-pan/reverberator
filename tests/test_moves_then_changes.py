@@ -844,16 +844,15 @@ def test_a_touch_is_counted_by_the_estimate(job):
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		latest = rv.list_versions(job.job_vault)[-1].path
-		copied = rv.attribs_to_copy(entries, manifest, m, job.job_vault, latest)
+		copied = rv.attribs_to_copy(entries, manifest, m, latest)
 		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
 	finally:
 		manifest.close()
 	assert copied == {f'{m}/big'} and size >= 300000
-	assert rv.batch_rewrites(entries, m, True, ['big'], copied)[0] == {'big'}
 
 
 def test_an_attrib_that_copies_is_counted_by_the_estimate(job, logged):
-	# the swap's stale link of E: the chmod of b copies it, and the estimate counts that copy
+	# the swap left E's other contents at b: the chmod of b copies it, and the estimate counts that copy
 	seed_monitor(job, {'a': 'a' * 200000, 'b': 'b' * 300000})
 	m = job.monitor
 	os.utime(f'{m}/a', ns=(10 ** 18, 10 ** 18))
@@ -868,10 +867,9 @@ def test_an_attrib_that_copies_is_counted_by_the_estimate(job, logged):
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		latest = rv.list_versions(job.job_vault)[-1].path
-		copied = rv.attribs_to_copy(entries, manifest, m, job.job_vault, latest)
+		copied = rv.attribs_to_copy(entries, manifest, m, latest)
 		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
 		assert copied == {f'{m}/b'} and size >= 200000
-		assert rv.batch_rewrites(entries, m, True, ['b'], copied)[0] == {'b'}
 	finally:
 		manifest.close()
 
@@ -879,8 +877,8 @@ def test_an_attrib_that_copies_is_counted_by_the_estimate(job, logged):
 # ---- fix round 4 --------------------------------------------------------------------------------------------------
 
 def test_an_attrib_after_chained_moves_is_counted_by_the_estimate(job):
-	# mv d x; mv x/m a; touch -m a/big: the latest version has a/big at d/m/big, two moves back, and its chain end there
-	# holds another mtime, so the attribute change copies it
+	# mv d x; mv x/m a; touch -m a/big: the latest version has a/big at d/m/big, two moves back, and it holds another
+	# mtime there, so the attribute change copies it
 	seed_monitor(job, {'d/m/big': 'b' * 300000, 'd/keep': 'k', 'keep': 'k'})
 	run_backup(job)
 	run_backup(job)
@@ -892,7 +890,7 @@ def test_an_attrib_after_chained_moves_is_counted_by_the_estimate(job):
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		latest = rv.list_versions(job.job_vault)[-1].path
-		copied = rv.attribs_to_copy(entries, manifest, m, job.job_vault, latest)
+		copied = rv.attribs_to_copy(entries, manifest, m, latest)
 		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
 	finally:
 		manifest.close()

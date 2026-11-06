@@ -1,5 +1,5 @@
 '''
-Users' symlinks whose text has the form of the vault's own chain links (round 8): pruning, the re-copy, history and
+Users' symlinks whose text has the form of the vault's own chain links (round 8): pruning, history and
 restore tell them from chain links by their version's moves (vault_chain_hop()), so the link stays a link, and no
 other file's copy moves, changes or disappears in any kept version. Most tests invert one of the investigation's
 repros, each of which passed while its bug was there.
@@ -18,6 +18,7 @@ import pytest
 import TSVZ
 import xxhash
 import reverberator as rv
+from tests import harness
 from tests.harness import create_job, seed_monitor, run_backup, event_entry, write_rule, write_committed_version
 from tests.test_log_text import alerting_lines
 from tests import chain_ground_truth
@@ -27,11 +28,6 @@ pytestmark = pytest.mark.unit
 
 T0 = '2021-01-01_00-00-00_-0800'
 T1 = '2021-01-02_00-00-00_-0800'
-
-
-@pytest.fixture(autouse=True)
-def _fresh_folders():
-	rv.REAL_VAULT_FOLDERS.clear()
 
 
 def fresh_job(tmp_path, tree=None):
@@ -333,7 +329,7 @@ def moved_job(tmp_path):
 	os.rename(os.path.join(job.monitor, 'a/x'), os.path.join(job.monitor, 'deep/er/x'))
 	run_backup(job, OrderedDict([event_entry(job, 'deep/er/x', 'move', 'a/x')]))
 	v0, v1 = rv.list_versions(job.job_vault)
-	if rv.NEW_VAULT_LAYOUT != 'r':
+	if harness.LEGACY is not None:
 		assert os.readlink(os.path.join(v1.path, 'deep/er/x')) == f'../../../{v0.name}/a/x'
 	assert read_view(job.job_vault, v1.name)['deep/er/x'].kind == 'f'
 	return job, v0, v1
@@ -391,38 +387,6 @@ def test_pruning_keeps_moved_copies_when_rows_cannot_be_used(tmp_path, pruning_k
 	assert len([warning for warning in warnings if v1.name in warning and 'text alone' in warning]) == 1
 
 
-@pytest.mark.old_writer
-def test_away_and_back_with_a_failed_retarget_survives_pruning(tmp_path, monkeypatch):
-	# mv x d/x; mv d e; mv e/x x, the last retarget failing: x sits at its own path with another depth's text, which
-	# the kernel cannot follow (so pruning_keeps() would see it change), while the vault's rule still names V0's x
-	job = create_job(str(tmp_path))
-	seed_monitor(job, {'x': 'x', 'd/keep': 'k', 'keep': 'k'})
-	run_backup(job)
-	m = job.monitor
-	os.rename(f'{m}/x', f'{m}/d/x')
-	os.rename(f'{m}/d', f'{m}/e')
-	os.rename(f'{m}/e/x', f'{m}/x')
-	E = rv.ChangeEvent
-	entries = rv.change_events_to_backup_entries(deque([E(1, False, 'move', f'{m}/d/x', f'{m}/x'), E(2, True, 'move', f'{m}/e', f'{m}/d'),
-		E(3, False, 'move', f'{m}/x', f'{m}/e/x')]), m)
-	real = rv.retarget_chain_link
-	calls = []
-	def flaky(job_vault, link_path, *args, **kwargs):
-		calls.append(link_path)
-		if link_path.endswith('/x') and len([c for c in calls if c.endswith('/x')]) == 2:
-			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
-		return real(job_vault, link_path, *args, **kwargs)
-	monkeypatch.setattr(rv, 'retarget_chain_link', flaky)
-	run_backup(job, entries)
-	monkeypatch.setattr(rv, 'retarget_chain_link', real)
-	v0, v1 = rv.list_versions(job.job_vault)
-	assert os.readlink(os.path.join(v1.path, 'x')) == f'../../{v0.name}/x'
-	bump(job, 1, keep_n_versions=2)
-	held = os.path.join(v1.path, 'x')
-	assert not os.path.exists(v0.path) and not os.path.islink(held) and open(held).read() == 'x'
-	assert open(os.path.join(v1.path, 'e/keep')).read() == 'k' and open(os.path.join(v1.path, 'keep')).read() == 'k'
-
-
 @pytest.mark.on_054
 def test_pruning_forgets_the_moves_of_the_version_it_removes(tmp_path):
 	job, v0, v1 = moved_job(tmp_path)
@@ -438,43 +402,6 @@ def test_pruning_forgets_the_moves_of_the_version_it_removes(tmp_path):
 	assert all(key[0] != v0.path for table in (rv.VERSION_MOVES, rv.VERSION_MOVES_WARNED) for key in table)
 	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert all(key[0] != v1.path for table in (rv.VERSION_MOVES, rv.VERSION_MOVES_WARNED) for key in table)
-
-
-# --- the re-copy ---
-
-def test_the_recopy_keeps_a_user_link_a_link(tmp_path, monkeypatch):
-	# repro test_r8_recopy: the re-copy followed the link on to D/secret and copied its bytes in the link's place
-	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
-	job = fresh_job(tmp_path)
-	text = chain_text(latest(job).name, 'D/secret')
-	add_user_link(job, 'a/U', text)
-	bump(job, 2)
-	v3 = latest(job)
-	held = os.path.join(v3.path, 'a/U')
-	assert os.path.islink(held) and os.readlink(held) == text
-	# every kept version holds the link, and D/secret as it was
-	for version in rv.list_versions(job.job_vault):
-		if version.number:
-			assert holds_user_link(job, version, 'a/U', text)
-		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
-		assert stat.S_IMODE(os.stat(os.path.join(version.path, 'D/secret')).st_mode) == 0o600
-	assert os.path.islink(os.path.join(job.monitor, 'a/U'))
-
-
-@pytest.mark.on_054
-def test_chain_end_stops_at_a_user_link(tmp_path):
-	job = fresh_job(tmp_path)
-	text = chain_text(latest(job).name, 'D/secret')
-	v1 = add_user_link(job, 'a/U', text)
-	bump(job, 1)
-	moves = rv.VaultMoves(job.job_vault, job.monitor)
-	end = rv.chain_end(job.job_vault, latest(job).path, 'a/U', moves)
-	assert end.number == 1 and end.path == os.path.join(v1.path, 'a/U') and stat.S_ISLNK(end.st.st_mode)
-	# a link of the chain form that the rows refuse is not learned from: the manifest's word would be the rows', and a
-	# re-copy would copy the link where no rule follows it, were it a chain link the rows cannot account for
-	assert rv.learn_copy_version(job.job_vault, latest(job).path, 'a/U', moves) is None
-	record = rv.read_vault_record(latest(job).path, 'a/U', job.monitor)
-	assert (record.kind, record.link) == ('l', text)
 
 
 # --- history and restore ---
@@ -596,11 +523,8 @@ def test_reading_follows_a_link_the_rows_cannot_tell_as_a_chain_link(job):
 	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp=T0, current=False)
 	v1 = write_committed_version(job, 1, {'deep/': None}, timestamp=T1, rows=[('other', 'modify', None)])
 	os.symlink(f'../../V0--{T0}/a/x', os.path.join(v1, 'deep/x'))
-	moves = rv.VaultMoves(job.job_vault, job.monitor)
 	resolved = rv.resolve_version_entry(job.job_vault, v1, 'deep/x', job.monitor)
 	assert (resolved.kind, resolved.path) == ('file', os.path.join(v0, 'a/x'))
-	assert rv.chain_end(job.job_vault, v1, 'deep/x', moves).path == os.path.join(v0, 'a/x')
-	assert rv.read_vault_record(v1, 'deep/x', job.monitor, moves).kind == 'f'
 
 
 # --- carried from Task 1's reviews ---
@@ -653,28 +577,6 @@ def test_a_locked_manifest_is_a_record_that_cannot_be_read(job):
 		assert rv.vault_chain_hop(job.job_vault, link, os.readlink(link), moves) == os.path.join(v0, 'proj/y')
 	finally:
 		locker.close()
-
-
-@pytest.mark.old_writer
-def test_the_daemon_reads_the_record_from_its_own_manifest(tmp_path, monkeypatch, pruning_keeps):
-	# a read of its own may find the manifest locked by the daemon's own write: the record comes from its connection
-	job, v0, v1 = moved_job(tmp_path)
-	read = []
-	monkeypatch.setattr(rv, 'recorded_monitor_paths', lambda job_vault: read.append(job_vault))
-	rows_read = []
-	real = rv.read_change_list_moves
-	def counting(path, monitor):
-		rows_read.append((os.path.basename(path).partition('--')[0], monitor))
-		return real(path, monitor)
-	monkeypatch.setattr(rv, 'read_change_list_moves', counting)
-	rv.VERSION_MOVES.clear()
-	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
-	pruning_keeps(job, {})
-	bump(job, 2, keep_n_versions=2)
-	assert read == []
-	# pruning V0 read the rows of V1, whose moved link names V0's a/x, under the recorded path
-	assert ('V1', job.monitor) in rows_read
-	assert open(os.path.join(rv.list_versions(job.job_vault)[0].path, 'deep/er/x')).read() == 'x'
 
 
 @pytest.mark.on_054
@@ -1896,91 +1798,14 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 	reads_right(job)
 
 
-@pytest.mark.on_054
-@pytest.mark.parametrize('restart', [True, False], ids=['restart', 'carried'])
-def test_after_an_aborted_prune_the_next_backup_removes_no_version_the_limit_keeps(tmp_path, monkeypatch, restart):
-	# review7 P2: the abort measured V0 and V1 again by du, each counting the copies they then shared, so a restart
-	# summed those twice, and removed versions 0 to 2 although the vault fit its limit
-	job = fresh_job(tmp_path, {'big': 'B' * 900_000, LONG: 'z', 'keep': 'k'})
-	bump(job, 3)
-	v0, v1 = rv.list_versions(job.job_vault)[:2]
-	inside = during_prune(monkeypatch)
-	real_link = os.link
-	def link(source, dest, *args, **kwargs):
-		if inside[0] and os.fspath(source) == os.path.join(v0.path, LONG):
-			raise eio(source)
-		return real_link(source, dest, *args, **kwargs)
-	monkeypatch.setattr(rv.os, 'link', link)
-	def backup(text, **kwargs):
-		with open(os.path.join(job.monitor, 'keep'), 'w') as f:
-			f.write(text)
-		options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
-		options.update(kwargs)
-		info, manifest, committed = rv.do_backup(OrderedDict([event_entry(job, 'keep', 'modify')]), job_name=job.job_name,
-			monitor_path=job.monitor, vault_path=job.vault, **options)
-		manifest.close()
-		assert committed
-		return info
-	# the prune aborts inside a backup, as the daemon runs it, and the backup goes on
-	carried = backup('aborted', keep_n_versions=4)
-	monkeypatch.undo()
-	assert [version.number for version in rv.list_versions(job.job_vault)] == [0, 1, 2, 3, 4]
-	assert os.lstat(os.path.join(v1.path, 'big')).st_ino == os.lstat(os.path.join(v0.path, 'big')).st_ino
-	real, books = du_versions(job), (recorded(job), (carried.vault_size, carried.vault_inodes))
-	# the next backup, under a limit the vault fits with room to spare
-	after = backup('next', backup_size_limit=str(real[0] + 300_000), **({} if restart else {'vaultInfo': carried}))
-	assert [version.number for version in rv.list_versions(job.job_vault)] == [0, 1, 2, 3, 4, 5]
-	assert books == (real, real)
-	assert (after.vault_size, after.vault_inodes) == du_versions(job) == recorded(job)
-
-
 # --- fix round 5 ---
 
 def numbers(job):
 	return [version.number for version in rv.list_versions(job.job_vault)]
 
 
-def keep_backup(job, text, **kwargs):
-	'''One do_backup() of keep set to text, as the daemon runs it: (the VaultInfo it returns, which a next one carries).'''
-	with open(os.path.join(job.monitor, 'keep'), 'w') as f:
-		f.write(text)
-	options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
-	options.update(kwargs)
-	info, manifest, committed = rv.do_backup(OrderedDict([event_entry(job, 'keep', 'modify')]), job_name=job.job_name,
-		monitor_path=job.monitor, vault_path=job.vault, **options)
-	manifest.close()
-	assert committed
-	return info
-
-
-@pytest.mark.on_054
-@pytest.mark.parametrize('carried', [True, False], ids=['carried', 'restart'])
-def test_after_finishing_a_removal_cut_short_the_next_backup_keeps_n_versions(tmp_path, monkeypatch, carried):
-	# review8 NB1: finishing frees what V0's record still holds, nothing once its folder went, and the loop took that
-	# for no progress: with the vault info carried, as the daemon carries it, the next backup kept 5 of keep 3
-	job = fresh_job(tmp_path)
-	bump(job, 3)
-	v0 = rv.list_versions(job.job_vault)[0]
-	real_run = rv.multiCMD.run_command
-	cut = []
-	def run(command, *args, **kwargs):
-		if command[0] == 'rm' and not cut:
-			# the folder went, its change list did not
-			cut.append(command)
-			shutil.rmtree(v0.path)
-			return 1
-		return real_run(command, *args, **kwargs)
-	monkeypatch.setattr(rv.multiCMD, 'run_command', run)
-	first = keep_backup(job, 'A', keep_n_versions=3)
-	monkeypatch.undo()
-	assert cut and numbers(job) == [1, 2, 3, 4] and list(first.vault_info_dict) == [0, 1, 2, 3, 4]
-	after = keep_backup(job, 'B', keep_n_versions=3, **({'vaultInfo': first} if carried else {}))
-	assert numbers(job) == [3, 4, 5] and list(after.vault_info_dict) == [3, 4, 5]
-	assert (after.vault_size, after.vault_inodes) == du_versions(job) == recorded(job)
-
-
 def big_two_links_job(tmp_path):
-	'''two_links_job() with a copy of five blocks, and V2 after it, so a removal of V0 alone fits a limit V1's would not.'''
+	'''two_links_job() with a copy of five blocks, and V2 after it.'''
 	job = fresh_job(tmp_path, {'D/secret': 'S' * 20000, 'keep': 'k'})
 	v0 = latest(job)
 	v1 = add_user_link(job, 'a/U', chain_text(v0.name, 'D/secret'))
@@ -2001,28 +1826,6 @@ def test_two_links_naming_one_copy_book_it_once(tmp_path):
 	assert freed[0] >= 0 and freed[1] >= 0
 	assert os.lstat(os.path.join(v1.path, 'D/secret')).st_ino == os.lstat(os.path.join(v1.path, 'a/U')).st_ino
 	assert_books(job, info.vault_info_dict, caller)
-
-
-@pytest.mark.on_054
-@pytest.mark.chain_ground_truth_allows('unusable_rows', rels=['a/U'], reason='the rows of V1 are cut to the header on purpose, so a/U goes by its text')
-def test_two_links_naming_one_copy_remove_no_version_the_limit_keeps(tmp_path):
-	# haiku8 p1: the prune's return took vault_size up by the copy, and the loop removed V1 too although the vault fit
-	job, v0, v1 = big_two_links_job(tmp_path)
-	v2 = latest(job)
-	# what the vault takes without V0: V1 and V2, V1's links into V0 replaced by the copies they name, one of them twice
-	links = sum(os.lstat(os.path.join(v1.path, rel)).st_blocks * 512 for rel in ('D/secret', 'a/U', 'keep'))
-	copies = sum(os.lstat(os.path.join(v0.path, rel)).st_blocks * 512 for rel in ('D/secret', 'keep'))
-	without_v0 = rv.get_path_size(v1.path, v2.path) - links + copies
-	with open(os.path.join(job.monitor, 'keep'), 'w') as f:
-		f.write('next')
-	entries = OrderedDict([event_entry(job, 'keep', 'modify')])
-	estimate = rv.get_backup_size_inode(backup_entries=entries, only_sync_attributes=True, last_vault_version_path=latest(job).path,
-		monitor_path=job.monitor, skip_list=None)[0]
-	info, manifest, committed = rv.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit=str(without_v0 + estimate))
-	manifest.close()
-	assert committed and numbers(job) == [1, 2, 3]
-	assert (info.vault_size, info.vault_inodes) == du_versions(job) == recorded(job)
 
 
 @pytest.mark.on_054
@@ -2121,48 +1924,6 @@ def test_a_version_folder_that_cannot_be_looked_at_is_kept_by_the_scan(tmp_path,
 	assert open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
 
 
-def during(monkeypatch, name):
-	'''A list whose first item is True while rv.<name>() runs.'''
-	inside = [False]
-	real = getattr(rv, name)
-	def running(*args, **kwargs):
-		inside[0] = True
-		try:
-			return real(*args, **kwargs)
-		finally:
-			inside[0] = False
-	monkeypatch.setattr(rv, name, running)
-	return inside
-
-
-@pytest.mark.on_054
-@pytest.mark.parametrize('what', ['D', 'D/secret'], ids=['folder', 'file'])
-def test_a_tracked_entry_that_cannot_be_looked_at_stays_tracked(tmp_path, monkeypatch, what):
-	# review8: the referenced copy took a tracked folder (or file) that could not be looked at for missing, and dropped
-	# its row: the new version lacked it
-	job = fresh_job(tmp_path)
-	v0 = latest(job)
-	inside = during(monkeypatch, 'do_referenced_copy')
-	real_lstat = os.lstat
-	failing = os.path.join(v0.path, what)
-	def lstat(path, *args, **kwargs):
-		if inside[0] and os.fspath(path).rstrip('/') == failing:
-			raise eio(path)
-		return real_lstat(path, *args, **kwargs)
-	monkeypatch.setattr(rv.os, 'lstat', lstat)
-	bump(job, 1)
-	monkeypatch.undo()
-	v1 = latest(job)
-	assert v1.number == 1 and os.path.isdir(os.path.join(v1.path, 'D'))
-	assert os.readlink(os.path.join(v1.path, 'D/secret')) == chain_text(v0.name, 'D/secret')
-	assert open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		assert 'D/' in manifest.folders and 'D/secret' in manifest.files
-	finally:
-		manifest.close()
-
-
 @pytest.mark.on_054
 def test_a_prune_makes_no_change_list_for_the_next_version(tmp_path, monkeypatch):
 	# review8 had the list made for a next version without one written whole; Task 2b: none is made, as the next
@@ -2197,22 +1958,6 @@ def rows_out_of_step(tmp_path, rows):
 		manifest.add(rel)
 	manifest.commit(v0)
 	return vault, v0, v1, manifest
-
-
-@pytest.mark.old_writer
-@pytest.mark.parametrize('rows', [('a/b', 'c'), ('a/', 'a/b', 'c')], ids=['file_row', 'folder_and_file_rows'])
-def test_a_row_below_a_file_is_missing_from_the_source(tmp_path, rows):
-	# review9 p5, p6: lstat of a/b, below V0's file a, gives ENOTDIR, which counted as "cannot be looked at": the row was
-	# kept, and the referenced copy either raised FileNotFoundError making its link (every backup failed), or left V1 a
-	# dangling a/b
-	vault, v0, v1, manifest = rows_out_of_step(tmp_path, rows)
-	try:
-		assert rv.do_referenced_copy(v0, v1, manifest, relative=True)
-		assert 'a/b' not in manifest.files and 'c' in manifest.files
-	finally:
-		manifest.close()
-	assert not os.path.lexists(os.path.join(v1, 'a', 'b'))
-	assert open(os.path.join(v1, 'c')).read() == 'c'
 
 
 @pytest.mark.on_054
@@ -2299,7 +2044,7 @@ def test_a_secret_made_whole_is_used_when_only_the_vaults_sync_fails(tmp_path, m
 	assert vault_salt(job) == secret
 
 
-# --- the version being written: the replay's applied moves, and copy_version for the latest version ---
+# --- the version being written ---
 
 def record_of(job, rel):
 	manifest = rv.VaultManifest(job.job_vault)
@@ -2336,39 +2081,6 @@ def backup_with_events(job, events):
 		rv.do_reverb_backup = real
 	assert committed is True
 	return verified
-
-
-@pytest.mark.on_054
-def test_links_moved_in_this_batch_are_chain_links_for_its_readers(tmp_path):
-	# a file and a folder moved to other depths in one batch, verified: the retarget, the move's metadata check and the
-	# verification read the links the batch renamed by its own moves, the one whose retarget is running included, so each
-	# reaches its copy by the kernel, nothing is copied again, and the next batch's attribute changes reach the copies
-	job = fresh_job(tmp_path, {'x': 'payload', 'F/y': 'why', 'deep/er/keep': 'k', 'p/q/keep': 'k', 'keep': 'k'})
-	v0 = latest(job)
-	copies = {rel: os.lstat(os.path.join(v0.path, rel)) for rel in ('x', 'F/y')}
-	m = job.monitor
-	os.rename(os.path.join(m, 'x'), os.path.join(m, 'deep/er/x'))
-	os.rename(os.path.join(m, 'F'), os.path.join(m, 'p/q/F'))
-	fixed = backup_with_events(job, [rv.ChangeEvent(1.0, False, 'move', os.path.join(m, 'deep/er/x'), os.path.join(m, 'x')),
-		rv.ChangeEvent(2.0, True, 'move', os.path.join(m, 'p/q/F'), os.path.join(m, 'F'))])
-	v1 = latest(job)
-	assert v1.number == 1 and fixed == []
-	assert [(os.path.relpath(row.path, m), row.event) for row in rv.iter_change_list(v1.change_list)] == [('deep/er/x', 'move'), ('p/q/F', 'move')]
-	for rel, text, payload in (('deep/er/x', f'../../../{v0.name}/x', 'payload'), ('p/q/F/y', f'../../../../{v0.name}/F/y', 'why')):
-		held = os.path.join(v1.path, rel)
-		# re-targeted: the kernel follows it to the copy, which stayed where it was
-		assert os.readlink(held) == text and open(held).read() == payload
-		record = record_of(job, rel)
-		assert (record.kind, record.link) == ('f', None) and record.hash == rv.hash_file(held, len(payload))
-	assert {rel: os.lstat(os.path.join(v0.path, rel)) for rel in copies} == copies
-	# the next batch's attribute changes go down the moved links to the copies, as the attribute sync has it
-	for rel in ('deep/er/x', 'p/q/F/y'):
-		os.chmod(os.path.join(m, rel), 0o640)
-	run_backup(job, OrderedDict([event_entry(job, 'deep/er/x', 'attrib'), event_entry(job, 'p/q/F/y', 'attrib')]))
-	for rel in ('x', 'F/y'):
-		st = os.lstat(os.path.join(v0.path, rel))
-		assert stat.S_IMODE(st.st_mode) == 0o640 and st.st_ino == copies[rel].st_ino
-	assert full_comparisons_make_no_version(job)
 
 
 @pytest.mark.parametrize('end', ['user_link', 'referenced'])
@@ -2452,79 +2164,6 @@ def test_a_users_link_made_where_a_folder_moved_from_is_never_retargeted(tmp_pat
 	assert open(os.path.join(v1.path, 'p/q/old')).read() == 'o'
 
 
-def refused_move_job(tmp_path):
-	'''
-	A job whose V1 moved D/secret to E/secret, with V1's rows changed so they refuse the chain link the move made: its
-	row is a create carrying the source, which renamed nothing. The manifest still says V0 holds the copy.
-	'''
-	job = create_job(str(tmp_path))
-	seed_monitor(job, {'D/secret': 'secret', 'E/keep': 'k', 'keep': 'k'})
-	run_backup(job)
-	os.rename(os.path.join(job.monitor, 'D/secret'), os.path.join(job.monitor, 'E/secret'))
-	run_backup(job, OrderedDict([event_entry(job, 'E/secret', 'move', 'D/secret')]))
-	v0, v1 = rv.list_versions(job.job_vault)
-	rewrite_text(v1, lambda text: text.replace('\0move\0', '\0create\0'))
-	rv.VERSION_MOVES.clear()
-	link = os.path.join(v1.path, 'E/secret')
-	assert os.readlink(link) == f'../../{v0.name}/D/secret'
-	assert rv.vault_chain_hop(job.job_vault, link, os.readlink(link), rv.VersionMoves.of_committed(job.job_vault, v1.path, job.monitor)) is None
-	return job, v0, v1
-
-
-def copy_version_of(job, rel):
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		return manifest.copy_version(rel)
-	finally:
-		manifest.close()
-
-
-@pytest.mark.old_writer
-@pytest.mark.chain_ground_truth_allows('refused_by_rows', rels=['E/secret'], reason='the rows of V1 are forged to refuse E/secret, which copy_version overrules')
-@pytest.mark.parametrize('reader', ['comparison', 'sync', 'recopy', 'learned'])
-def test_copy_version_is_authoritative_for_the_latest_version(tmp_path, monkeypatch, reader):
-	# a row whose copy_version names an older version is followed down to it, by the links' text, whatever the rows of
-	# the versions on the way say; a version learned from a chain is never one the rows refused a link on the way to
-	job, v0, v1 = refused_move_job(tmp_path)
-	copy = os.path.join(v0.path, 'D/secret')
-	copy_st = os.lstat(copy)
-	if reader == 'comparison':
-		# read from the vault as the copy it is, so nothing is copied again
-		assert full_comparisons_make_no_version(job)
-		record = record_of(job, 'E/secret')
-		assert (record.kind, record.hash) == ('f', rv.hash_file(copy, 6))
-	elif reader == 'sync':
-		os.chown(os.path.join(job.monitor, 'E/secret'), 4242, 4242)
-		run_backup(job, OrderedDict([event_entry(job, 'E/secret', 'attrib')]))
-		assert os.lstat(copy).st_uid == 4242 and os.lstat(copy).st_ino == copy_st.st_ino
-		assert os.readlink(os.path.join(v1.path, 'E/secret')) == f'../../{v0.name}/D/secret'
-	else:
-		monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
-		if reader == 'learned':
-			manifest = rv.VaultManifest(job.job_vault)
-			manifest.begin()
-			manifest.set_copy_version(['E/secret'], None)
-			manifest.commit()
-			manifest.close()
-		if reader == 'recopy':
-			# V2 is the first version whose chain from V0 passes the limit of one link
-			bump(job, 1)
-			held = os.path.join(latest(job).path, 'E/secret')
-			# the copy's bytes, never the link the rows refuse, which no rule would follow from V2
-			assert not os.path.islink(held) and open(held).read() == 'secret'
-			assert copy_version_of(job, 'E/secret') == 2
-		else:
-			# V3 would be the first to copy again a file whose copy V2 learned is in V1
-			bump(job, 2)
-			below, v3 = rv.list_versions(job.job_vault)[-2:]
-			held = os.path.join(v3.path, 'E/secret')
-			# not learned, so linked as ever: the chain still leads to the copy
-			assert os.readlink(held) == chain_text(below.name, 'E/secret') and open(held).read() == 'secret'
-			assert copy_version_of(job, 'E/secret') is None
-	for version in rv.list_versions(job.job_vault):
-		assert open(os.path.join(version.path, 'E/secret' if version.number else 'D/secret')).read() == 'secret'
-
-
 def test_a_setuid_file_keeps_its_bits_through_an_attribute_sync(tmp_path):
 	# chown after copystat cleared S_ISUID and S_ISGID, even for root: 0o6755 was stored as 0o755
 	job = create_job(str(tmp_path))
@@ -2542,9 +2181,8 @@ def test_a_setuid_file_keeps_its_bits_through_an_attribute_sync(tmp_path):
 	assert full_comparisons_make_no_version(job, 1)
 
 
-def test_a_fresh_copy_of_a_setuid_file_keeps_its_bits(tmp_path, monkeypatch):
-	# the re-copy makes a copy of its own, which the batch then moves: the move syncs the file's attributes onto it
-	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
+def test_a_moved_setuid_file_keeps_its_bits(tmp_path):
+	# the move syncs the file's attributes onto the copy it lands on
 	job = create_job(str(tmp_path))
 	seed_monitor(job, {'bin/tool': 'x', 'keep': 'k'})
 	tool = os.path.join(job.monitor, 'bin/tool')
@@ -2562,7 +2200,7 @@ def test_a_fresh_copy_of_a_setuid_file_keeps_its_bits(tmp_path, monkeypatch):
 	assert stat.S_IMODE(os.lstat(plain).st_mode) == 0o6755
 
 
-# --- final fix f: pruning a link the rows cannot tell, a copy pruning materialised, recopy_size's copy versions ---
+# --- final fix f: pruning a link the rows cannot tell ---
 
 T2 = '2021-01-03_00-00-00_-0800'
 
@@ -2588,110 +2226,3 @@ def test_pruning_keeps_the_copy_of_a_link_the_rows_cannot_tell_in_every_kept_ver
 			held = os.path.join({1: v1, 2: v2}[number], 'deep/x')
 			assert open(held).read() == 'x' and os.stat(held).st_ino == copy.st_ino
 	assert not os.path.islink(os.path.join(v2, 'deep/x'))
-
-
-@pytest.mark.old_writer
-@pytest.mark.parametrize('copy', ['file', 'user_link'])
-def test_a_copy_pruning_moved_above_its_recorded_copy_version_ends_the_chain_there(tmp_path, copy):
-	# the manifest says V0 holds the copy; V0 is pruned, and its copy materialised in V1, the oldest kept: the walk from
-	# the latest version ends there (for a user's link, at the link, whose own text names the version gone), the row is
-	# recorded right, and full comparisons make no version
-	job = create_job(str(tmp_path))
-	tree = {'D/secret': 'secret', 'keep': 'k', 'a/b': 'b'}
-	seed_monitor(job, tree)
-	text = None
-	if copy == 'user_link':
-		text = '../../somewhere/else'
-		os.symlink(text, os.path.join(job.monitor, 'a/U'))
-	run_backup(job)
-	rel = 'D/secret' if copy == 'file' else 'a/U'
-	assert copy_version_of(job, rel) == 0
-	bump(job, 3, keep_n_versions=3)
-	versions = rv.list_versions(job.job_vault)
-	assert [version.number for version in versions] == [1, 2, 3]
-	held = os.path.join(versions[0].path, rel)
-	assert os.path.islink(held) == (copy == 'user_link') and copy_version_of(job, rel) == 0
-	end = rv.chain_end(job.job_vault, versions[-1].path, rel, rv.VaultMoves(job.job_vault, job.monitor), 0)
-	assert (end.number, end.path) == (1, held)
-	record = record_of(job, rel)
-	if copy == 'file':
-		assert (record.kind, record.hash) == ('f', rv.hash_file(held, 6))
-	else:
-		assert (record.kind, record.link) == ('l', text) and os.readlink(held) == text
-	assert full_comparisons_make_no_version(job)
-	after = record_of(job, rel)
-	assert (after.kind, after.hash, after.link) == (record.kind, record.hash, record.link)
-
-
-@pytest.mark.old_writer
-@pytest.mark.chain_ground_truth_allows('refused_by_rows', rels=['E/secret'], reason='the rows of V1 are forged to refuse E/secret, which copy_version overrules')
-def test_recopy_size_counts_the_copy_its_copy_version_names(tmp_path, monkeypatch):
-	# the rows of V1 refuse E/secret's link, which the manifest's copy version overrules: the size counted is the copy's,
-	# as the re-copy follows it, not nothing for a link
-	job, v0, v1 = refused_move_job(tmp_path)
-	moves = rv.VaultMoves(job.job_vault, job.monitor)
-	assert rv.recopy_size(['E/secret'], job.job_vault, v1.path, moves, {'E/secret': copy_version_of(job, 'E/secret')}) == len('secret')
-	assert rv.recopy_size(['E/secret'], job.job_vault, v1.path, rv.VaultMoves(job.job_vault, job.monitor)) == 0
-	# and do_backup's size limit counts it so
-	monkeypatch.setattr(rv, 'DEFAULT_CHAIN_LENGTH', 3)
-	counted = []
-	real = rv.recopy_size
-	def counting(rels, *args, **kwargs):
-		counted.append((list(rels), real(rels, *args, **kwargs)))
-		return counted[-1][1]
-	monkeypatch.setattr(rv, 'recopy_size', counting)
-	bump(job, 1)
-	monkeypatch.undo()
-	# E/keep, linked from V0 as well, is due too
-	assert counted == [(['E/keep', 'E/secret'], len('k') + len('secret'))]
-	held = os.path.join(latest(job).path, 'E/secret')
-	assert not os.path.islink(held) and open(held).read() == 'secret'
-
-
-# --- final fix e: the verification and the records tell the version being written's links by the replay's moves ---
-
-def copy_versions_not_known(monkeypatch):
-	'''The rows' copy versions left unknown (None), as rows rebuilt from the vault have them: only the moves tell the links.'''
-	real = rv.VaultManifest.set_copy_version
-	monkeypatch.setattr(rv.VaultManifest, 'set_copy_version', lambda self, rels, version: real(self, rels, None))
-
-
-def test_the_records_tell_a_fresh_copy_of_a_users_link_by_the_replays_moves(tmp_path, monkeypatch):
-	# record_dirty_entries(..., applied=writing_moves): by the text alone, the link was recorded as the file it names
-	job = fresh_job(tmp_path)
-	text = f'../../{latest(job).name}/D/secret'
-	copy_versions_not_known(monkeypatch)
-	v1 = add_user_link(job, 'a/U', text)
-	monkeypatch.undo()
-	assert copy_version_of(job, 'a/U') is None and os.readlink(os.path.join(v1.path, 'a/U')) == text
-	record = record_of(job, 'a/U')
-	assert (record.kind, record.link) == ('l', text)
-
-
-def test_the_verification_tells_a_users_link_a_move_carried_by_the_replays_moves(tmp_path, monkeypatch):
-	# compare_scopes(..., applied=writing_moves): ln -s TEXT a/U; mv a p/q; mkdir a; ln -s TEXT a/U. the replay copies
-	# a/U, then moves a/ to p/q/, carrying the copy, which the move leaves unverified: the verification read it by the
-	# text alone, as the file it names, and fixed p/q/U by copying the link again
-	job = fresh_job(tmp_path, {'D/secret': 'secret', 'keep': 'k', 'a/old': 'o', 'p/x': 'x'})
-	v0 = latest(job)
-	m = job.monitor
-	text = f'../../{v0.name}/D/secret'
-	os.symlink(text, os.path.join(m, 'a/U'))
-	os.rename(os.path.join(m, 'a'), os.path.join(m, 'p/q'))
-	os.mkdir(os.path.join(m, 'a'))
-	os.symlink(text, os.path.join(m, 'a/U'))
-	copy_versions_not_known(monkeypatch)
-	E = rv.ChangeEvent
-	fixed = backup_with_events(job, [E(1.0, False, 'create', os.path.join(m, 'a/U'), None),
-		E(2.0, True, 'move', os.path.join(m, 'p/q'), os.path.join(m, 'a')), E(3.0, True, 'create', os.path.join(m, 'a'), None),
-		E(4.0, False, 'create', os.path.join(m, 'a/U'), None)])
-	monkeypatch.undo()
-	v1 = latest(job)
-	# the collapse carries the first a/U to p/q/U, after the move, and copies the new a/ after it too ( round 9 ): the
-	# verification finds both right
-	assert v1.number == 1 and fixed == []
-	for rel in ('p/q/U', 'a/U'):
-		assert os.readlink(os.path.join(v1.path, rel)) == text and copy_version_of(job, rel) is None
-		record = record_of(job, rel)
-		assert (record.kind, record.link) == ('l', text)
-	assert open(os.path.join(v1.path, 'p/q/old')).read() == 'o'

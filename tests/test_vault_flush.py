@@ -321,7 +321,8 @@ def test_the_journal_is_truncated_after_a_big_commit_and_stays(tmp_path):
 			manifest.add(rel)
 		manifest.commit(version)
 		manifest.begin()
-		manifest.discard_many(rels)
+		for rel in rels:
+			manifest.discard(rel)
 		manifest.commit(version)
 		assert os.path.getsize(os.path.join(job_vault, rv.MANIFEST_FILE_NAME)) > 1_000_000
 		assert os.path.getsize(journal_of(job_vault)) == 0

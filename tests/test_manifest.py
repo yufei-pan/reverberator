@@ -23,9 +23,9 @@ def count_vault_reads(monkeypatch):
 	reads = []
 	read = rv.read_vault_record
 
-	def counting(version_path, rel, monitor_path, *args):
+	def counting(version_path, rel, *args):
 		reads.append(rel)
-		return read(version_path, rel, monitor_path, *args)
+		return read(version_path, rel, *args)
 	monkeypatch.setattr(rv, 'read_vault_record', counting)
 	return reads
 
@@ -61,12 +61,12 @@ def test_mark_vouched_keeps_the_record_until_an_add(job):
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		manifest.begin()
-		record, copy_version = manifest.lookup_with_copy_version('a.txt')
+		record = manifest.lookup('a.txt')
 		manifest.mark_vouched('a.txt')
 		manifest.mark_vouched('untracked')
-		assert manifest.take_dirty_records(10) == [('a.txt', copy_version, record)]
+		assert manifest.take_dirty_records(10) == [('a.txt', record)]
 		manifest.add('a.txt', dirty=True)
-		assert manifest.take_dirty_records(10) == [('a.txt', copy_version, None)]
+		assert manifest.take_dirty_records(10) == [('a.txt', None)]
 	finally:
 		manifest.rollback()
 		manifest.close()
@@ -522,10 +522,9 @@ def test_the_real_sync_succeeds_on_the_test_filesystem(job):
 def test_copies_a_backup_wrote_stay_unchecked_without_any_patch(job):
 	seed_monitor(job, {'a.txt': 'hello'})
 	v0 = run_backup(job)[0]
-	assert rv.read_copied_record(v0, 'a.txt', job.monitor).unchecked == 1
-	assert rv.read_version_record(v0, 'a.txt', job.monitor, True).unchecked == 1
+	assert rv.read_copied_record(v0, 'a.txt').unchecked == 1
 	# read back from a committed version, a copy is checked, as the vault sync of the comparison stands behind it
-	assert rv.read_vault_record(v0, 'a.txt', job.monitor).unchecked == 0
+	assert rv.read_vault_record(v0, 'a.txt').unchecked == 0
 
 
 def test_unchecked_copy_missing_its_bytes_is_copied_again(job):

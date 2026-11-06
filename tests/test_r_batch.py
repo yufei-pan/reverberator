@@ -189,7 +189,7 @@ def test_vault_layout_answers(tmp_path):
 	job_vault = tmp_path / 'job'
 	job_vault.mkdir()
 	manifest = rv.VaultManifest(str(job_vault))
-	assert rv.vault_layout(str(job_vault), manifest) == rv.NEW_VAULT_LAYOUT == 'r'
+	assert rv.vault_layout(str(job_vault), manifest) == 'r'
 	(job_vault / 'V0--2021-01-01_00-00-00_-0800').mkdir()
 	assert rv.vault_layout(str(job_vault), manifest) == '0.54'
 	(job_vault / rv.STAGING_NAME).mkdir()
@@ -553,18 +553,8 @@ def test_a_users_link_in_the_tree_is_read_as_a_link_whatever_its_text_says(tmp_p
 	tree.mkdir()
 	(job_vault / f'V1--{stamp}' / 'a').write_text('old')
 	os.symlink(f'../V1--{stamp}/a', tree / 'a')
-	record = rv.read_vault_record(str(tree), 'a', str(tmp_path / 'monitor'), rv.TREE_LINKS, copy_version=0)
+	record = rv.read_vault_record(str(tree), 'a')
 	assert (record.kind, record.link) == ('l', f'../V1--{stamp}/a')
-
-
-def test_a_batch_on_r_makes_no_referenced_copy_and_retargets_no_link(r_job, monkeypatch):
-	build_base(r_job, **KEPT)
-	called = []
-	monkeypatch.setattr(rv, 'do_referenced_copy', lambda *args, **kwargs: called.append('copy'))
-	monkeypatch.setattr(rv, 'retarget_moved_links', lambda *args, **kwargs: called.append('retarget'))
-	# to another folder depth, which is what asks for a re-target on 0.54
-	backup_events(r_job, item_move_then_changes(r_job.monitor), **KEPT)
-	assert called == []
 
 
 def test_a_verification_reads_the_tree_with_no_daemon_link(r_job):
@@ -709,16 +699,32 @@ def test_a_users_link_with_the_text_of_a_daemon_link_is_no_daemon_link_in_the_ne
 
 # --- the plugin ---
 
-@pytest.mark.old_writer
-def test_the_plugin_reads_nothing_of_a_054_vault(tmp_path, monkeypatch):
+def test_a_tree_of_the_users_own_vault_is_backed_up_as_it_is(r_job, capsys):
+	# a vault the user keeps in the monitored tree: V1's a/x has the form of a 0.54 chain link, and on R it is only a user's link
+	stamp = '2020-01-01_00-00-00_-0800'
+	text = f'../../V0--{stamp}/a/x'
+	put_text(r_job.monitor, f'inner/job/V0--{stamp}/a/x', 'x')
+	os.makedirs(f'{r_job.monitor}/inner/job/V1--{stamp}/a')
+	os.symlink(text, f'{r_job.monitor}/inner/job/V1--{stamp}/a/x')
+	assert len(run_backup(r_job)) == 1
+	# nothing changed, so the comparisons read the user's link back as a link and commit nothing
+	assert len(run_backup(r_job)) == 1
+	assert 'Cannot read' not in capsys.readouterr().out
+	assert os.readlink(os.path.join(rv.list_versions(r_job.job_vault)[-1].path, f'inner/job/V1--{stamp}/a/x')) == text
+
+
+def test_a_054_vault_gets_no_batch_and_the_plugin_reads_nothing_of_it(tmp_path, monkeypatch, v054):
+	# one that showed only after the attempt's scan: the next attempt's start converts it
 	job = create_job(str(tmp_path))
 	put_text(job.monitor, 'a', 'a')
+	v054.backup(job)
 	read = []
 	monkeypatch.setattr(view_truth, 'read_view', lambda *args: read.append(args))
-	run_backup(job)
 	put_text(job.monitor, 'a', 'b')
-	run_backup(job)
-	assert read == []
+	before = sorted(os.listdir(job.job_vault))
+	with pytest.raises(rv.JobFailure, match='on 0.54'):
+		run_backup(job)
+	assert read == [] and sorted(os.listdir(job.job_vault)) == before
 
 
 def test_the_plugin_reads_the_versions_of_an_r_vault(r_job, monkeypatch):
@@ -760,7 +766,7 @@ def test_a_folder_holding_a_path_near_the_limit_moves_as_one_row(r_job, spare):
 	backup_events(r_job, [(True, 'move', 'e', 'd')], **KEPT)
 	versions = rv.list_versions(r_job.job_vault)
 	assert [version.number for version in versions] == [0, 1]
-	assert [(row.event, row.path) for row in rv.iter_change_list(versions[1].change_list) if row.event != 'recopy'] == [
+	assert [(row.event, row.path) for row in rv.iter_change_list(versions[1].change_list)] == [
 		('move', at(r_job.monitor, 'e') + '/')]
 	reading = rv.vault_reading(r_job.job_vault)
 	for number, long_path in ((0, rel), (1, 'e' + rel[1:])):

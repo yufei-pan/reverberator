@@ -148,8 +148,6 @@ def test_absolute_links_are_never_chain_links(job, tmp_path):
 	os.remove(rv.list_versions(job.job_vault)[1].change_list)
 	rv.VERSION_MOVES.clear()
 	assert hop(job, v1, 'a/x') is None
-	# nor does a version since removed make one dangling
-	assert rv.chain_form_missing_version(job.job_vault, f'{v1}/a/x', f'{job.job_vault}/V0--2020-01-01_00-00-00_-0800/a/x') is None
 
 
 @pytest.mark.parametrize('usable', [True, False])

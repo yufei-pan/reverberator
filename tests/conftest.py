@@ -8,20 +8,14 @@ import reverberator as rv
 from tests import harness
 from tests.harness import FakePool, create_job, reverberator_script
 
-# the chain-link ground truth over the whole suite (REVERB_CHAIN_GROUND_TRUTH=0 turns it off), and every version's size
-# record against a full measure (REVERB_USAGE_GROUND_TRUTH=0), and what each committed version reads around every batch on
-# design R (REVERB_VIEW_GROUND_TRUTH=0)
-pytest_plugins = ['tests.chain_ground_truth', 'tests.version_usage_ground_truth', 'tests.version_view_ground_truth', 'tests.legacy054']
+# the chain-link ground truth over the whole suite (REVERB_CHAIN_GROUND_TRUTH=0 turns it off), and what each committed version
+# reads around every batch on design R (REVERB_VIEW_GROUND_TRUTH=0)
+pytest_plugins = ['tests.chain_ground_truth', 'tests.version_view_ground_truth', 'tests.legacy054']
 
 # the 0.54 code that stays for a later release: tests/legacy054.py builds their vaults, as the product's writer no longer does
 STILL_054 = {
 	'test_prune_power_loss.py', 'test_prune_threads.py', 'test_vault_chain_hop.py', 'test_vault_chain_hop_oracle.py', 'test_restore_pool.py',
-}
-
-# the 0.54 writer's own tests, which go with it in Task 16: they run reverberator.py's writer and no other
-OLD_WRITER = {
-	'test_long_chains.py', 'test_referenced_copy.py', 'test_referenced_copy_oracle.py', 'test_copy_threads.py', 'test_version_usage.py',
-	'test_version_usage_oracle.py', 'test_chain_links.py',
+	'test_chain_links.py',
 }
 
 # the real helper, for the one test that runs it: isolated_runtime() replaces it for every test
@@ -33,10 +27,7 @@ def restore_runtime_globals(request, tmp_path):
 	# the isolation below has a monkeypatch of its own: a test's monkeypatch.undo() would otherwise drop it too
 	with pytest.MonkeyPatch.context() as isolation:
 		if request.node.get_closest_marker('on_054') is not None or request.path.name in STILL_054:
-			isolation.setattr(rv, 'NEW_VAULT_LAYOUT', '0.54')
 			isolation.setattr(harness, 'LEGACY', request.getfixturevalue('v054'))
-		elif request.node.get_closest_marker('old_writer') is not None or request.path.name in OLD_WRITER:
-			isolation.setattr(rv, 'NEW_VAULT_LAYOUT', '0.54')
 		yield from isolated_runtime(tmp_path, isolation)
 
 
@@ -200,7 +191,6 @@ def run_reverberator(tmp_path, process_env):
 
 
 def pytest_configure(config):
-	config.addinivalue_line('markers', 'old_writer: this test is of the 0.54 writer still in reverberator.py, which goes in Task 16: the tagged module cannot stand in for it')
 	config.addinivalue_line('markers', 'on_054: this test is of a vault on 0.54: run_backup() and the vaults it writes are the 0.54 daemon\'s (tests/legacy054.py)')
 
 

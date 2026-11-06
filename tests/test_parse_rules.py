@@ -247,7 +247,8 @@ def test_sample_rule_file_has_all_15_columns(tmp_path):
 	path.write_text(rv.SAMPLE_REVERB_RULE_FILE.strip() + '\n')
 	lines = path.read_text().splitlines()
 	assert [cell.strip() for cell in lines[0].split('\t')] == rv.REVERB_RULE_TSV_HEADER
-	assert [len(line.split('\t')) for line in lines[1:3]] == [15, 15]
+	# columns 14 and 15 are accepted with any value, and nothing reads them: they have no text
+	assert [len(line.split('\t')) for line in lines[1:3]] == [13, 13]
 	assert rv.upgrade_rule_file_header(str(path)) is False
 
 
@@ -434,14 +435,6 @@ def test_a_bad_full_comparison_interval_is_off_with_an_error(cell, capsys):
 	assert rv.read_full_comparison_interval(cell, 'j') == 0
 	out = capsys.readouterr().out
 	assert 'Full Comparison Interval' in out and '1d, 12h, 30m or 45s' in out
-
-
-@pytest.mark.parametrize('cell, links, error', [('', 40, False), ('auto', 40, False), ('40', 40, False), (' 20 ', 20, False),
-	('0', 0, False), ('00', 0, False), (' 00 ', 0, False), ('-0', 0, False), ('None', 0, False), ('3', 3, False), ('2', 3, True), ('1', 3, True), ('-4', 3, True), ('x', 40, True),
-	('20.5', 40, True)])
-def test_chain_length_cells(cell, links, error, capsys):
-	assert rv.read_chain_length(cell, 'j') == links
-	assert ('Chain Length' in capsys.readouterr().out) == error
 
 
 def _defaults_file(job, header, defaults, *rows):

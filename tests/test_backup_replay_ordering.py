@@ -5,7 +5,7 @@ from collections import OrderedDict, deque
 
 import reverberator as rv
 import pytest
-from tests.harness import tracked_manifest
+from tests.harness import create_job, run_backup, seed_monitor
 
 pytestmark = pytest.mark.unit
 
@@ -179,24 +179,15 @@ class TestReverbBackupNewTreeFileBeforeParent(unittest.TestCase):
 	def test_new_tree_succeeds_when_entries_list_files_before_dirs(self):
 		"""Regression: V27-style file-before-parent create lists must not ENOENT."""
 		with tempfile.TemporaryDirectory() as root:
-			monitor = os.path.join(root, 'mon')
-			vault = os.path.join(root, 'vault')
-			job_vault = os.path.join(vault, 'job')
-			v0 = os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800')
-			v1 = os.path.join(job_vault, 'V1--2021-01-02_00-00-00_-0800')
-			os.makedirs(v0)
-			os.makedirs(monitor)
-			os.makedirs(v1)
+			job = create_job(root)
+			monitor = job.monitor
 			# Prior version has no pkg/ tree
-			with open(os.path.join(monitor, 'keep.txt'), 'w') as f:
-				f.write('k')
-			with open(os.path.join(v0, 'keep.txt'), 'w') as f:
-				f.write('k')
+			seed_monitor(job, {'keep.txt': 'k'})
+			run_backup(job)
 			pkg = os.path.join(monitor, 'pkg', 'sub')
 			os.makedirs(pkg)
 			with open(os.path.join(pkg, 'a.py'), 'w') as f:
 				f.write('print(1)')
-			tracking = tracked_manifest(job_vault, v0, ['keep.txt'])
 			# Deliberately list file create before parent dir creates (buggy delta order)
 			entries = OrderedDict([
 				(os.path.join(pkg, 'a.py'), rv.BackupEntryValues('t1', 'create', None)),
@@ -204,14 +195,15 @@ class TestReverbBackupNewTreeFileBeforeParent(unittest.TestCase):
 				(os.path.join(monitor, 'pkg', 'sub') + '/', rv.BackupEntryValues('t3', 'create', None)),
 			])
 			rv.GREEN_LIGHT.set()
-			latest = rv.VaultEntry(0, v0, 0, 1, 1)
-			result = rv.do_reverb_backup(entries, v1, latest, True, tracking, monitor)
+			v1 = run_backup(job, entries)[-1]
 			dst = os.path.join(v1, 'pkg', 'sub', 'a.py')
 			self.assertTrue(os.path.isfile(dst), f'missing {dst}')
 			with open(dst) as f:
 				self.assertEqual(f.read(), 'print(1)')
+			result = rv.VaultManifest(job.job_vault)
 			self.assertIn('pkg/sub/a.py', result.files)
 			self.assertIn('pkg/', result.folders)
+			result.close()
 
 
 class TestChangeEventsParentOrdering(unittest.TestCase):

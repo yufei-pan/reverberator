@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import unittest
 from collections import deque
@@ -7,7 +8,7 @@ import threading
 
 import reverberator as rv
 import pytest
-from tests.harness import tracked_manifest
+from tests.harness import create_job, run_backup, seed_monitor, tracked_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -207,27 +208,14 @@ class TestDoBackupCommitGate(unittest.TestCase):
 class TestEmptyBackupSkip(unittest.TestCase):
 	def test_no_new_version_when_delta_empty(self):
 		with tempfile.TemporaryDirectory() as root:
-			monitor = os.path.join(root, 'mon')
-			vault = os.path.join(root, 'vault')
-			job = 'job'
-			os.makedirs(monitor)
-			with open(os.path.join(monitor, 'a.txt'), 'w') as f:
-				f.write('hi')
-			job_vault = os.path.join(vault, job)
-			v0 = os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800')
-			os.makedirs(v0)
-			with open(os.path.join(v0, 'a.txt'), 'w') as f:
-				f.write('hi')
+			paths = create_job(root)
+			monitor, vault, job, job_vault = paths.monitor, paths.vault, paths.job_name, paths.job_vault
+			seed_monitor(paths, {'a.txt': 'hi'})
+			v0 = run_backup(paths)[0]
 			original = rv.delta_generate_backup_entries
 			try:
 				rv.delta_generate_backup_entries = lambda backupEntries, latest_version_info, monitor_path, **_: None
-				vault_info = rv.VaultInfo(
-					OrderedDict([
-						(0, rv.VaultEntry(0, v0, 0, 1, 1))
-					]),
-					1,
-					1,
-				)
+				vault_info = rv.get_vault_info(job_vault)
 				rv.GREEN_LIGHT.set()
 				info, tracking, committed = rv.do_backup(
 					{},
@@ -243,7 +231,8 @@ class TestEmptyBackupSkip(unittest.TestCase):
 				)
 				self.assertTrue(committed)
 				versions = [p for p in os.listdir(job_vault) if p.startswith('V') and os.path.isdir(os.path.join(job_vault, p))]
-				self.assertEqual(versions, ['V0--2021-01-01_00-00-00_-0800'])
+				self.assertEqual(versions, [os.path.basename(v0)])
+				tracking.close()
 			finally:
 				rv.delta_generate_backup_entries = original
 
@@ -278,40 +267,20 @@ class TestCpAfCopyPathSymlinkDest(unittest.TestCase):
 class TestDeletePathSetUpdate(unittest.TestCase):
 	def test_dir_delete_updates_tracking_sets_without_runtime_error(self):
 		with tempfile.TemporaryDirectory() as root:
-			monitor = os.path.join(root, 'mon')
-			vault = os.path.join(root, 'vault')
-			job = 'job'
-			job_vault = os.path.join(vault, job)
-			v0 = os.path.join(job_vault, 'V0--2021-01-01_00-00-00_-0800')
-			os.makedirs(os.path.join(monitor, 'sub'))
-			os.makedirs(v0)
-			with open(os.path.join(monitor, 'sub', 'a.txt'), 'w') as f:
-				f.write('a')
-			with open(os.path.join(monitor, 'keep.txt'), 'w') as f:
-				f.write('k')
-			# Prior version referenced-copy inputs
-			os.makedirs(os.path.join(v0, 'sub'))
-			with open(os.path.join(v0, 'sub', 'a.txt'), 'w') as f:
-				f.write('a')
-			with open(os.path.join(v0, 'keep.txt'), 'w') as f:
-				f.write('k')
-			tracking = tracked_manifest(job_vault, v0, ['sub/a.txt', 'keep.txt'], ['sub/'])
+			job = create_job(root)
+			seed_monitor(job, {'sub/a.txt': 'a', 'keep.txt': 'k'})
+			run_backup(job)
+			shutil.rmtree(os.path.join(job.monitor, 'sub'))
 			entries = OrderedDict([
-				(os.path.join(monitor, 'sub') + '/', rv.BackupEntryValues('t', 'delete', None)),
+				(os.path.join(job.monitor, 'sub') + '/', rv.BackupEntryValues('t', 'delete', None)),
 			])
 			rv.GREEN_LIGHT.set()
-			latest = rv.VaultEntry(0, v0, 0, 1, 1)
-			result = rv.do_reverb_backup(
-				entries,
-				os.path.join(job_vault, 'V1--2021-01-02_00-00-00_-0800'),
-				latest,
-				True,
-				tracking,
-				monitor,
-			)
+			run_backup(job, entries)
+			result = rv.VaultManifest(job.job_vault)
 			self.assertNotIn('sub/a.txt', result.files)
 			self.assertNotIn('sub/', result.folders)
 			self.assertIn('keep.txt', result.files)
+			result.close()
 
 
 class TestDecrementStepperAbort(unittest.TestCase):

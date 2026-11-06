@@ -327,27 +327,6 @@ def test_no_temp_is_looked_at_beside_a_copy_without_a_cut(tmp_path, monkeypatch)
 
 # --- the backup finishes a cut prune first; the scan flushes before deleting a stale list ---
 
-def test_a_backup_finishes_a_cut_prune_before_its_comparison(tmp_path, monkeypatch):
-	job = three_versions(tmp_path)
-	as_pool(monkeypatch)
-	v0, v1 = (version.path for version in rv.list_versions(job.job_vault)[:2])
-	rv.write_prune_marker(job.job_vault, os.path.basename(v0))
-	os.remove(os.path.join(v1, 'a'))
-	compared = []
-	real_delta = rv.delta_generate_backup_entries
-	def delta(*args, **kwargs):
-		compared.append(os.path.isdir(v0))
-		return real_delta(*args, **kwargs)
-	monkeypatch.setattr(rv, 'delta_generate_backup_entries', delta)
-	# no limit asks for a prune (keep 0, no size limit)
-	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
-	manifest.close()
-	assert compared == [False] and committed
-	assert [version.number for version in rv.list_versions(job.job_vault)] == [1, 2]
-	assert open(os.path.join(v1, 'a')).read() == 'a'
-
-
 def test_a_backup_leaves_the_oldest_version_when_the_marker_names_none(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -424,9 +403,10 @@ PATTERNS = {
 
 def two_versions_of_tricky_batches(base):
 	'''
-	V0 backed up from a tree of the 11 patterns' folders, then one batch of them replayed into V1 by do_reverb_backup(),
+	V0 backed up from a tree of the 11 patterns' folders, then one batch of them replayed into V1 by the 0.54 do_reverb_backup(),
 	both committed with their change lists: (job vault, V0, V1, monitored path).
 	'''
+	m = daemon()
 	mon, job_vault = os.path.join(base, 'mon'), os.path.join(base, 'vault', 'job')
 	os.makedirs(job_vault)
 	v0, v1 = (os.path.join(job_vault, name) for name in V[:2])
@@ -438,17 +418,17 @@ def two_versions_of_tricky_batches(base):
 	for p in PATTERNS:
 		for rel in ('d/g', 'd/h', 'd/x', 'd/y', 'R', 'S', 'f/a', 'f/b', 'x', 'keep'):
 			mk(f'{p}/{rel}')
-	manifest = rv.VaultManifest(job_vault)
+	manifest = m.VaultManifest(job_vault)
 	t = datetime.datetime.now().isoformat()
 	def commit(number, rows):
 		path = os.path.join(job_vault, V[number])
-		size, inodes = rv.measure_version_usage(manifest, path)
-		name = rv.change_list_path(path, size, inodes)
+		size, inodes = m.measure_version_usage(manifest, path)
+		name = m.change_list_path(path, size, inodes)
 		manifest.note_monitor_path(number, mon)
-		prepared = rv.prepare_change_list(name, rows)
+		prepared = m.prepare_change_list(name, rows)
 		manifest.commit(path)
-		rv.swap_current_version(job_vault, V[number])
-		rv.place_change_list(name, prepared)
+		m.swap_current_version(job_vault, V[number])
+		m.place_change_list(name, prepared)
 	os.mkdir(v0)
 	manifest.begin()
 	for root, dirs, files in os.walk(mon):
@@ -461,12 +441,12 @@ def two_versions_of_tricky_batches(base):
 			rel = os.path.normpath(os.path.join(rel_root, name))
 			shutil.copy2(os.path.join(mon, rel), os.path.join(v0, rel))
 			manifest.add(rel)
-	commit(0, [rv.entry_row(os.path.join(mon, p) + '/', rv.BackupEntryValues(t, 'create', None)) for p in PATTERNS])
+	commit(0, [m.entry_row(os.path.join(mon, p) + '/', m.BackupEntryValues(t, 'create', None)) for p in PATTERNS])
 	entries = OrderedDict()
 	events = []
 	def ev(rel, event, src=None):
-		entries[os.path.join(mon, rel)] = rv.BackupEntryValues(t, event, None if src is None else os.path.join(mon, src))
-		events.append(rv.ChangeEvent(1.0 + len(events), rel.endswith('/'), event, os.path.join(mon, rel), None if src is None else os.path.join(mon, src)))
+		entries[os.path.join(mon, rel)] = m.BackupEntryValues(t, event, None if src is None else os.path.join(mon, src))
+		events.append(m.ChangeEvent(1.0 + len(events), rel.endswith('/'), event, os.path.join(mon, rel), None if src is None else os.path.join(mon, src)))
 	J = lambda *parts: os.path.join(mon, *parts)
 	os.rename(J('p1/d/g'), J('p1/y')); shutil.rmtree(J('p1/d')); ev('p1/y', 'move', 'p1/d/g'); ev('p1/d/', 'delete')
 	os.remove(J('p2/d/g')); os.rename(J('p2/d'), J('p2/e')); ev('p2/d/g', 'delete'); ev('p2/e/', 'move', 'p2/d/')
@@ -482,9 +462,9 @@ def two_versions_of_tricky_batches(base):
 	manifest.begin()
 	# with touched scopes, as a daemon's batch has them: the verification after the replay writes its rows too
 	verified = []
-	rv.do_reverb_backup(OrderedDict(entries), v1, rv.VaultEntry(0, v0, 0, 0, 0), False, manifest, mon, job_name='job',
-		touched=rv.touched_scopes(events, mon), verified=verified)
-	commit(1, [rv.entry_row(path, values) for path, values in entries.items()] + [rv.entry_row(path, values) for path, values in verified])
+	m.do_reverb_backup(OrderedDict(entries), v1, m.VaultEntry(0, v0, 0, 0, 0), False, manifest, mon, job_name='job',
+		touched=m.touched_scopes(events, mon), verified=verified)
+	commit(1, [m.entry_row(path, values) for path, values in entries.items()] + [m.entry_row(path, values) for path, values in verified])
 	manifest.close()
 	return job_vault, v0, v1, mon
 

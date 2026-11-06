@@ -57,58 +57,47 @@ def test_journal_written_when_enabled(job):
 
 def test_reverb_create_modify_delete_attrib_move_file_and_dir(job):
 	seed_monitor(job, {'keep.txt': 'k', 'old.txt': 'o', 'sub/x.txt': 'x'})
-	v0 = write_committed_version(job, 0, {'keep.txt': 'k', 'old.txt': 'o', 'sub/x.txt': 'x'})
+	run_backup(job)
 	os.makedirs(os.path.join(job.monitor, 'newdir'), exist_ok=True)
 	open(os.path.join(job.monitor, 'newdir', 'n.txt'), 'w').write('n')
 	open(os.path.join(job.monitor, 'keep.txt'), 'w').write('k2')
 	os.remove(os.path.join(job.monitor, 'old.txt'))
 	os.rename(os.path.join(job.monitor, 'sub'), os.path.join(job.monitor, 'moved'))
 	os.chmod(os.path.join(job.monitor, 'keep.txt'), 0o640)
-	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
-	os.makedirs(v1)
 	entries = OrderedDict([
 		(os.path.join(job.monitor, 'keep.txt'), rv.BackupEntryValues('t', 'modify', None)),
 		(os.path.join(job.monitor, 'old.txt'), rv.BackupEntryValues('t', 'delete', None)),
 		(os.path.join(job.monitor, 'newdir') + '/', rv.BackupEntryValues('t', 'create', None)),
 		(os.path.join(job.monitor, 'moved') + '/', rv.BackupEntryValues('t', 'move', os.path.join(job.monitor, 'sub') + '/')),
 	])
-	latest = rv.VaultEntry(0, v0, 0, 1, 1)
-	tracking = tracked_manifest(job.job_vault, v0, ['keep.txt', 'old.txt', 'sub/x.txt'], ['sub/'])
-	rv.GREEN_LIGHT.set()
-	result = rv.do_reverb_backup(entries, v1, latest, True, tracking, job.monitor)
+	v1 = run_backup(job, entries)[-1]
 	assert os.path.isfile(os.path.join(v1, 'keep.txt'))
 	assert open(os.path.join(v1, 'keep.txt')).read() == 'k2'
 	assert not os.path.lexists(os.path.join(v1, 'old.txt'))
 	assert os.path.isfile(os.path.join(v1, 'newdir', 'n.txt'))
 	assert os.path.lexists(os.path.join(v1, 'moved', 'x.txt'))
+	result = rv.VaultManifest(job.job_vault)
 	assert 'old.txt' not in result.files
 	assert 'keep.txt' in result.files
+	result.close()
 
 
-def test_attrib_only_sync_vs_copy(job):
+@pytest.mark.parametrize('only_sync', [True, False])
+def test_attrib_only_sync_vs_copy(job, only_sync):
 	seed_monitor(job, {'a.txt': 'same'})
-	v0 = write_committed_version(job, 0, {'a.txt': 'same'})
+	run_backup(job)
 	os.chmod(os.path.join(job.monitor, 'a.txt'), 0o600)
-	for only_sync, label in ((True, 'sync'), (False, 'copy')):
-		v = os.path.join(job.job_vault, f'V-{label}')
-		os.makedirs(v)
-		entries = OrderedDict([
-			(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues('t', 'attrib', None)),
-		])
-		latest = rv.VaultEntry(0, v0, 0, 1, 1)
-		manifest = tracked_manifest(job.job_vault, v0, ['a.txt'])
-		rv.do_reverb_backup(entries, v, latest, only_sync, manifest, job.monitor)
-		# the backup's changes stay uncommitted until the caller commits them with the version
-		manifest.close()
-		assert os.path.lexists(os.path.join(v, 'a.txt'))
+	entries = OrderedDict([
+		(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues('t', 'attrib', None)),
+	])
+	v1 = run_backup(job, entries, only_sync_attributes=only_sync)[-1]
+	assert os.lstat(os.path.join(v1, 'a.txt')).st_mode & 0o777 == 0o600
 
 
 def test_move_rename_failure_falls_back_to_copy_delete(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'data'})
-	v0 = write_committed_version(job, 0, {'a.txt': 'data'})
+	run_backup(job)
 	os.rename(os.path.join(job.monitor, 'a.txt'), os.path.join(job.monitor, 'b.txt'))
-	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
-	os.makedirs(v1)
 	real_rename = os.rename
 
 	def boom(src, dst):
@@ -120,10 +109,7 @@ def test_move_rename_failure_falls_back_to_copy_delete(job, monkeypatch):
 	entries = OrderedDict([
 		(os.path.join(job.monitor, 'b.txt'), rv.BackupEntryValues('t', 'move', os.path.join(job.monitor, 'a.txt'))),
 	])
-	rv.do_reverb_backup(
-		entries, v1, rv.VaultEntry(0, v0, 0, 1, 1), True,
-		tracked_manifest(job.job_vault, v0, ['a.txt']), job.monitor,
-	)
+	v1 = run_backup(job, entries)[-1]
 	assert os.path.isfile(os.path.join(v1, 'b.txt'))
 	assert open(os.path.join(v1, 'b.txt')).read() == 'data'
 
@@ -132,22 +118,21 @@ def test_vanished_source_is_not_recorded_in_tracking(job):
 	# a short-lived file (git's index.stash.<pid>) is gone by the time the
 	# backup replays its create event; it must not enter the tracking list
 	seed_monitor(job, {'keep.txt': 'k'})
-	v0 = write_committed_version(job, 0, {'keep.txt': 'k'})
-	v1 = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
-	os.makedirs(v1)
+	run_backup(job)
 	gone = os.path.join(job.monitor, '.git', 'index.stash.4242')
+	open(os.path.join(job.monitor, 'keep.txt'), 'w').write('k2')
 	entries = OrderedDict([
 		(gone, rv.BackupEntryValues('t', 'create', None)),
 		(os.path.join(job.monitor, 'keep.txt'), rv.BackupEntryValues('t', 'modify', None)),
 	])
-	latest = rv.VaultEntry(0, v0, 0, 1, 1)
-	rv.GREEN_LIGHT.set()
-	result = rv.do_reverb_backup(entries, v1, latest, True, tracked_manifest(job.job_vault, v0, ['keep.txt']), job.monitor)
+	v1 = run_backup(job, entries)[-1]
+	result = rv.VaultManifest(job.job_vault)
 	assert '.git/index.stash.4242' not in result.files
 	assert not os.path.lexists(os.path.join(v1, '.git', 'index.stash.4242'))
 	# the rest of the backup must still succeed
 	assert os.path.isfile(os.path.join(v1, 'keep.txt'))
 	assert 'keep.txt' in result.files
+	result.close()
 
 
 def test_copy_keeps_inherited_link_when_source_vanished(job):

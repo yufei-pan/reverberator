@@ -65,6 +65,5 @@ def test_get_vault_info_reads_the_sizes_a_list_names(job):
 	two_versions(job)
 	os.rename(os.path.join(job.job_vault, version_name(2)), os.path.join(job.root, 'out'))
 	sizes = sizes_by_newest_holder(job.job_vault)
-	for recalculate in (False, True):
-		info = rv.get_vault_info(job.job_vault, recalculate=recalculate)
-		assert {number: (entry.size, entry.inode) for number, entry in info.vault_info_dict.items()} == sizes
+	info = rv.get_vault_info(job.job_vault)
+	assert {number: (entry.size, entry.inode) for number, entry in info.vault_info_dict.items()} == sizes

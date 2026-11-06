@@ -376,8 +376,8 @@ def test_written_folders_follow_the_folder_moves():
 # --- the round 18 fix pass ---
 
 def test_a_move_to_the_top_never_names_the_version_folder_a_written_folder(tmp_path, monkeypatch):
-	# a file moved to the top re-targets its link there, in the version folder: retarget_moved_links() names it as '.',
-	# which is no written folder ( the version folder keeps the monitored root's by its own step )
+	# a file moved to the top lands in the version folder, named '.', which is no written folder ( the version folder
+	# keeps the monitored root's by its own step )
 	job = create_job(str(tmp_path))
 	seed_monitor(job, {'a/f': '1', 'keep': 'k'})
 	run_backup(job)
@@ -425,24 +425,6 @@ def test_settle_stops_when_the_pool_guard_says_a_disk_dropped(tmp_path):
 		folders.settle(str(version), str(monitor), [], poll=dropped)
 
 
-@pytest.mark.old_writer
-def test_the_referenced_copy_keeps_a_few_numbers_a_folder(tmp_path, monkeypatch):
-	job = create_job(str(tmp_path))
-	seed_monitor(job, {'d/e/f': 'x', 'keep': 'k'})
-	run_backup(job)
-	held = []
-	real = rv.copy_new_folder_meta
-	def spy(source, dest, st, failed=None):
-		held.append(st)
-		return real(source, dest, st, failed)
-	monkeypatch.setattr(rv, 'copy_new_folder_meta', spy)
-	with open(os.path.join(job.monitor, 'keep'), 'w') as f:
-		f.write('v1')
-	v1 = run_backup(job, OrderedDict([event_entry(job, 'keep', 'modify')]))[-1]
-	assert held and all(type(st) is rv.FolderMeta for st in held[:2])
-	assert version_folders_of(v1) == folders_of(job.monitor)
-
-
 def test_copy_new_folder_meta_never_follows_a_link_in_the_folders_place(tmp_path):
 	source, target, link = tmp_path / 's', tmp_path / 't', tmp_path / 'l'
 	source.mkdir(mode=0o700)
@@ -469,52 +451,6 @@ def test_a_prune_that_fails_mid_walk_gives_the_folder_times_back(tmp_path, monke
 		rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=b's' * 16)
 	assert not os.path.islink(os.path.join(v1, 'D/E/c'))
 	assert folders_of(v1) == before
-
-
-@pytest.mark.old_writer
-def test_folders_the_replay_makes_above_an_entry_get_their_own_metadata(tmp_path, monkeypatch):
-	# the referenced copy could not make D and D/E (say ENOSPC), whose rows stay: the replay's file in D/E makes both
-	job = create_job(str(tmp_path))
-	seed_monitor(job, {'D/E/old': 'o', 'keep': 'k'})
-	for rel in ('D/E', 'D'):
-		os.chmod(os.path.join(job.monitor, rel), 0o750)
-		os.utime(os.path.join(job.monitor, rel), ns=(OLD, OLD + 3))
-	run_backup(job)
-	real = rv.do_referenced_copy
-	def lost_folders(source_path, backup_folder, *args, **kwargs):
-		# what the links take is measured in full, as the links under D go too
-		done = real(source_path, backup_folder, *args, **{**kwargs, 'sizes': None})
-		shutil.rmtree(os.path.join(backup_folder, 'D'))
-		return done
-	monkeypatch.setattr(rv, 'do_referenced_copy', lost_folders)
-	with open(os.path.join(job.monitor, 'D/E/new'), 'w') as f:
-		f.write('n')
-	os.utime(os.path.join(job.monitor, 'D/E'), ns=(OLD, OLD + 5))
-	v1 = run_backup(job, OrderedDict([event_entry(job, 'D/E/new', 'create')]))[-1]
-	for rel in ('D', 'D/E'):
-		assert meta(os.path.join(v1, rel)) == meta(os.path.join(job.monitor, rel)), rel
-
-
-@pytest.mark.old_writer
-def test_a_retarget_that_writes_nothing_names_no_folder(tmp_path, monkeypatch):
-	folder = tmp_path / 'V1--x' / 'd'
-	folder.mkdir(parents=True)
-	link = folder / 'f'
-	os.symlink('../../V0--x/d/f', link)
-	def unreadable(*args):
-		raise OSError(errno.EIO, 'cannot tell')
-	monkeypatch.setattr(rv, 'vault_chain_hop', unreadable)
-	folders, errors = set(), []
-	rv.retarget_moved_links(str(tmp_path), str(link), rv.VersionMoves.applied([]), errors, folders)
-	assert errors and folders == set()
-	# one whose rename fails after its new link was made: the folder's times moved
-	monkeypatch.setattr(rv, 'vault_chain_hop', lambda *args: str(tmp_path / 'V0--x' / 'f'))
-	def no_replace(*args):
-		raise OSError(errno.EIO, 'cannot rename')
-	monkeypatch.setattr(os, 'replace', no_replace)
-	errors.clear()
-	rv.retarget_moved_links(str(tmp_path), str(link), rv.VersionMoves.applied([]), errors, folders)
-	assert errors and folders == {str(folder)}
 
 
 def test_a_full_comparison_gives_a_folder_whose_mtime_alone_moved_its_times(tmp_path, monkeypatch):

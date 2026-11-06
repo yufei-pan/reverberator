@@ -632,7 +632,8 @@ def test_the_sweep_never_follows_links(job):
 		# a tracked entry gone from the version is missing; the version itself is never removed
 		writer.record('D/a.txt', False)
 		assert rv.sweep_version_folder(manifest, v1, rv.TouchedScopes(['D/'], []), writer) == ([], ['D/a.txt'])
-		manifest.discard_many(['D/', 'D/a.txt', 'E/', 'E/b.txt', 'keep.txt'])
+		for rel in ('D/', 'D/a.txt', 'E/', 'E/b.txt', 'keep.txt'):
+			manifest.discard(rel)
 		assert rv.sweep_version_folder(manifest, v1, rv.TouchedScopes([''], []), writer) == (['D/', 'E/', 'keep.txt'], [])
 		assert os.path.isdir(v1)
 	finally:
@@ -1556,36 +1557,6 @@ def test_copy_file_meta_never_takes_a_links_target_onto_an_entry_that_is_not_one
 	assert (after.st_mode, after.st_uid, after.st_gid, after.st_mtime_ns, after.st_ctime_ns) == (before.st_mode, before.st_uid, before.st_gid, before.st_mtime_ns, before.st_ctime_ns)
 	assert os.listxattr(dest) == []
 	assert len([message for message, error, _ in lines if error]) == 1
-
-
-@pytest.mark.old_writer
-@pytest.mark.parametrize('how', ['returns', 'raises'])
-def test_a_version_being_written_is_forgotten_on_every_exit(job, monkeypatch, how):
-	seed_monitor(job, {'D/a.txt': 'a'})
-	run_backup(job)
-	latest = latest_version(job)
-	backup_folder = os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800')
-	os.makedirs(backup_folder)
-	# what a walk of the version being written learned before the referenced copy stopped
-	key = (os.path.abspath(backup_folder), os.path.join(os.path.abspath(backup_folder), 'D'))
-	rv.REAL_VAULT_FOLDERS[key] = True
-
-	def stopped(*args, **kwargs):
-		if how == 'raises':
-			raise OSError('the disk went')
-		return False
-	monkeypatch.setattr(rv, 'do_referenced_copy', stopped)
-	manifest = rv.VaultManifest(job.job_vault)
-	try:
-		if how == 'raises':
-			with pytest.raises(OSError):
-				rv.do_reverb_backup(OrderedDict(), backup_folder, latest, True, manifest, job.monitor)
-		else:
-			rv.do_reverb_backup(OrderedDict(), backup_folder, latest, True, manifest, job.monitor)
-	finally:
-		manifest.rollback()
-		manifest.close()
-	assert key not in rv.REAL_VAULT_FOLDERS
 
 
 @pytest.mark.parametrize('first', [True, False])

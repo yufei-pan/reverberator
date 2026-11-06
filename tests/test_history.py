@@ -788,8 +788,8 @@ def test_a_file_moved_to_another_depth_and_back_has_each_move_in_its_history(job
 	# V3 moved it back: at a.txt it is a move from deep, then what V2 took away, then its creation
 	assert moves(hist(job, 'a.txt')) == [(3, 'move', f'{job.monitor}/deep/er/a.txt'), (2, 'moved_away', f'{job.monitor}/deep/er/a.txt'), (1, 'create', None)]
 	assert moves(hist(job, 'deep/er/a.txt')) == [(3, 'moved_away', f'{job.monitor}/a.txt'), (2, 'move', f'{job.monitor}/a.txt')]
-	# the copy a read reaches is still V1's, through the links both moves kept
-	assert rv.read_vault_record(versions(job)[3].path, 'a.txt', job.monitor).size == 2
+	# the tree holds the one copy, which both moves carried
+	assert rv.read_vault_record(versions(job)[3].path, 'a.txt').size == 2
 
 
 def test_a_file_deleted_and_made_again_shows_both_lives(job):

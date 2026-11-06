@@ -20,24 +20,20 @@ WRITE_HELPERS = {'remove_entry', 'replace_entry', 'make_real_folder', 'copy_file
 THROUGH_THE_WRITER = ('do_reverb_backup', 'finish_copies', 'discard_copies', 'sweep_version_folder', 'sweep_entry', 'WrittenFolders.settle')
 # what the replay names that writes, and is no write of the tree. the look ends here
 NOT_FOLLOWED = {
-	# the 0.54 writers it still calls: they go in Task 16, and this line with them
-	'do_referenced_copy', 'retarget_moved_links', 'retarget_chain_link',
 	# a look unless made to make, which names_used() finds as real_folders_to(make)
 	'real_folders_to',
 	# the markers of failed syncs (check_vault_sync()): daemon state, in the state folder
 	'mark_failed_sync', 'failed_sync_disks',
 }
 
-# every function outside TreeWriter using a helper of WRITE_HELPERS, and which. Task 16 shrinks this
+# every function outside TreeWriter using a helper of WRITE_HELPERS, and which
 USERS = {
 	# V0 of a job: no previous version and nothing older to keep
 	'do_backup': {'copy_file_meta', 'cp_af_copy_path', 'record_root_meta'},
 	# the helpers themselves, on what their callers name
 	'cp_af_copy_path': {'mcae.run_command'},
 	'copy_new_folder_meta': {'copy_file_meta'},
-	# the 0.54 referenced copy, its links' re-target, and the prune
-	'do_referenced_copy': {'copy_new_folder_meta'},
-	'retarget_chain_link': {'remove_entry'},
+	# the prune of a 0.54 vault, the one a conversion finishes
 	'decrement_stepper': {'copy_file_meta'},
 	# the conversion from 0.54: a plain tree built in staging, with the metadata of the version it replaces
 	'materialize_version': {'copy_new_folder_meta'},

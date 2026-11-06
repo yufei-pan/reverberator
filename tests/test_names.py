@@ -114,7 +114,7 @@ def test_manifest_round_trips_bad_names(job):
 	manifest.move_tree('e/f/', 'g\udcfd/')
 	assert manifest.folders == ['g\udcfd/'] and list(manifest.iter_under('g\udcfd/')) == ['g\udcfd/x\udc80', 'g\udcfd/y.txt']
 	manifest.discard(name)
-	manifest.discard_many(['g\udcfd/x\udc80'])
+	manifest.discard('g\udcfd/x\udc80')
 	manifest.commit(version_path)
 	manifest.close()
 	reopened = rv.VaultManifest(job.job_vault)

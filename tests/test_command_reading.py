@@ -4,6 +4,7 @@ from collections import OrderedDict
 import pytest
 import TSVZ
 import reverberator as rv
+from tests import harness
 from tests.harness import seed_monitor, write_rule, rule_row, write_committed_version, run_backup, create_job, event_entry
 
 pytestmark = pytest.mark.unit
@@ -44,7 +45,7 @@ def either_layout(request):
 
 def far_ends(paths):
 	'''The version a reader starts its longest walk at, and the one that holds the real copy.'''
-	return (paths[0], paths[-1]) if rv.NEW_VAULT_LAYOUT == 'r' else (paths[-1], paths[0])
+	return (paths[0], paths[-1]) if harness.LEGACY is None else (paths[-1], paths[0])
 
 
 def test_read_only_parse_leaves_the_rule_file_unchanged(job):

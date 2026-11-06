@@ -14,6 +14,7 @@ from collections import OrderedDict
 import pytest
 
 import reverberator as rv
+from tests import harness
 from tests.crash_batches import put_text
 from tests.harness import create_job, run_backup, seed_monitor, wait_until, write_incomplete_version, write_rule
 from tests.test_r_scan import build_base, cut_batch, KEPT, kept_versions_wrong
@@ -126,7 +127,6 @@ def locks_held(job):
 
 def test_a_054_vault_at_start_is_converted(small):
 	# nothing asks for it but the default: a vault 0.54 wrote is on R once its job has started
-	assert rv.NEW_VAULT_LAYOUT == 'r'
 	before = expected(small)
 	assert any(plain_links(small).values())
 	control = control_of(small)
@@ -174,17 +174,6 @@ def test_the_conversion_runs_at_the_start_and_only_there(small, monkeypatch):
 	assert calls == [None]
 
 
-@pytest.mark.old_writer
-def test_no_conversion_while_new_vaults_are_054(small, monkeypatch):
-	calls = before_the_conversion(monkeypatch, lambda: None)
-	put_text(small.monitor, 'new.txt', 'new')
-	control = control_of(small)
-	thread = start(small, control)
-	wait_for_committed_count(small, 4)
-	stop(control, thread)
-	assert calls == [] and rv.recorded_layout(small.job_vault) is None
-
-
 def test_a_new_vault_is_no_conversion(tmp_path, monkeypatch):
 	job = create_job(str(tmp_path))
 	os.makedirs(job.job_vault)
@@ -205,10 +194,10 @@ def test_the_054_rules_run_first(tmp_path, v054, monkeypatch, cut):
 		left = write_incomplete_version(job, 3, {'a.txt': 'partial'})
 	else:
 		# 0.54's commit, cut after its manifest named the version: the manifest keeps that name when the 0.54 rules take the version away
-		monkeypatch.setattr(rv, 'NEW_VAULT_LAYOUT', '0.54')
-		job = three_versions(tmp_path)
-		left = cut_off_at_the_swap(job, cut)
-		monkeypatch.setattr(rv, 'NEW_VAULT_LAYOUT', 'r')
+		with pytest.MonkeyPatch.context() as on_054:
+			on_054.setattr(harness, 'LEGACY', v054)
+			job = three_versions(tmp_path)
+			left = cut_off_at_the_swap(job, cut)
 	seen = before_the_conversion(monkeypatch, lambda: (os.path.lexists(left), rv.recorded_latest_version(job.job_vault).number, os.path.lexists(rv.staging_path(job.job_vault))))
 	control = control_of(job)
 	thread = start(job, control)
@@ -381,13 +370,6 @@ def test_a_referenced_row_counts_as_different(tmp_path, v054, sync_attributes):
 	# copied once: the next comparison finds nothing
 	run_backup(job, only_sync_attributes=sync_attributes, keep_n_versions=9)
 	assert len(committed_versions(job)) == 4
-
-
-def test_a_referenced_row_stays_the_same_on_054(tmp_path, v054):
-	job = create_job(str(tmp_path))
-	v054.build(job, SMALL, keep_one_complete_backup=False, keep_n_versions=9)
-	run_backup(job, keep_n_versions=9)
-	assert len(committed_versions(job)) == 3
 
 
 @pytest.mark.parametrize('failure', [OSError(5, 'Input/output error'), rv.JobFailure('a step of the conversion failed'), rv.VaultScanError('the vault cannot be read')])
