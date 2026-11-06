@@ -239,22 +239,22 @@ def test_a_pool_prune_marker_is_finished_before_the_conversion(small, r_layout, 
 	assert not os.path.lexists(os.path.join(small.job_vault, rv.PRUNE_MARKER_FILE_NAME))
 
 
-def test_an_unreadable_marker_on_a_pool_is_a_cut_prune_too(small, r_layout, monkeypatch):
-	# a write of the marker torn by a power loss: a prune of the oldest was under way, and after the conversion nothing would look at it again
-	def torn(v0):
-		rv.write_prune_marker(small.job_vault, os.path.basename(v0))
-		with open(os.path.join(small.job_vault, rv.PRUNE_MARKER_FILE_NAME), 'w') as f:
-			f.write('{"walk')
-	wanted = expected(small)
-	del wanted[0]
+def test_an_unreadable_marker_on_a_pool_removes_no_version(small, r_layout, monkeypatch):
+	# a write of the marker torn by a power loss: it is flushed before the walk and cleared after the flush, so no link is left to repair
+	before = expected(small)
 	on_a_pool(monkeypatch)
-	v0, v1 = cut_prune(small, torn)
+	v0 = committed_versions(small)[0]
+	marker = os.path.join(small.job_vault, rv.PRUNE_MARKER_FILE_NAME)
+	rv.write_prune_marker(small.job_vault, os.path.basename(v0))
+	with open(marker, 'w') as f:
+		f.write('{"walk')
 	control = control_of(small)
 	thread = start(small, control)
 	layout_is_r(small)
 	stop(control, thread)
-	assert not os.path.lexists(v0)
-	assert check_vault(small.job_vault, wanted, set()) == []
+	assert os.path.lexists(v0)
+	assert check_vault(small.job_vault, before, set()) == []
+	assert not os.path.lexists(marker)
 
 
 @pytest.mark.parametrize('names', ['nothing', 'another'])

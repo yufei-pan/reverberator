@@ -13720,9 +13720,9 @@ def finish_cut_prune(job_vault:str, versions:OrderedDict, manifest:'VaultManifes
 	'''
 	One of the 0.54 rules (spec section 3.1), on a vault on a mergerfs pool: a prune of the oldest of versions cut off before its first
 	flush, which left the next version's links in any mix of states, is finished by decrement_stepper(), the one prune that repairs that, as
-	the conversion would make the mix the version's plain tree and take the marker away. A marker that cannot be read is
-	a write of it cut off, by a prune then under way: the stepper reads it the same way. Raises JobFailure while the oldest version
-	stays, so nothing is converted: the next attempt tries again.
+	the conversion would make the mix the version's plain tree and take the marker away. A marker that cannot be read removes no
+	version: it is flushed before the walk and cleared after the flush, so a write of it cut off leaves no link to repair. Raises
+	JobFailure while the oldest version stays, so nothing is converted: the next attempt tries again.
 	'''
 	if len(versions) < 2 or not PoolGuard([job_vault]).covers(job_vault):
 		return
@@ -13732,7 +13732,8 @@ def finish_cut_prune(job_vault:str, versions:OrderedDict, manifest:'VaultManifes
 		if read_prune_marker(job_vault) != os.path.basename(path):
 			return
 	except UnreadablePruneMarker as e:
-		backuperTeeLogToTl(job_name, f'{e}: taken for a prune of {path} cut off before its flush', error=True)
+		backuperTeeLogToTl(job_name, f'{e}: no version is removed for it', error=True)
+		return
 	backuperTeeLogToTl(job_name, f'Finishing the prune of {path}, which was cut off before its flush, before converting the vault')
 	prune_oldest(versions, job_name, monitor_path, [], monitor_paths=manifest_monitor_paths(manifest), prune_salt=vault_prune_salt(job_vault, job_name), threads=threads)
 	if oldest in versions:
