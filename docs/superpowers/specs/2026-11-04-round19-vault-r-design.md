@@ -194,6 +194,8 @@ Cost: one inode write per entry of a moved folder, and the same again at its pru
 
 If the manifest names V<N> but the list is missing from its private folder, the scan refuses, as today: a missing disk may be hiding it.
 
+**A commit says its copies are on the disk.** On f2fs a checkpoint keeps a new file's size and not its data, and a folder's fsync is a checkpoint: with no flush, a power cut within the writeback window (about 30 to 45 s) after a commit leaves every copy past the inline size all NUL in the committed version, on every commit, in 0.54 too. So a batch that placed a copy runs `flush_vault_disks()` once, before the commit point; a batch that placed none runs no flush. A disk whose sync fails has been marked and alerted by that call, and the attempt fails with nothing committed: the next one rolls forward. A cut before the commit point is §3's, and its copies stay unchecked.
+
 ### 2.7 Prune
 1. Rename V<k> into `.reverberator_staging/<name>`. It stops being a version in that one call.
 2. Remove its list.
