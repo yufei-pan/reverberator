@@ -101,10 +101,6 @@ def sweep(vault, fault=None, default=DEFAULT_KILL_POINTS):
 			wrong.append((point, 'the cut run', cut))
 			continue
 		again = retry(vault.job, fault=fault, options=options)
-		if again.error is not None and 'Bad file descriptor' in again.error:
-			# one lstat through mergerfs in about 600 retries answers EBADF, and the attempt fails: the daemon's next attempt goes on, as this one does
-			print(f'kill point {point}: EBADF from the pool, retrying')
-			again = retry(vault.job, fault=fault, options=options)
 		if again.error is not None or again.committed is not True:
 			wrong.append((point, 'the retry', again))
 			continue
@@ -158,10 +154,11 @@ def conversion_steps(job, fault):
 	return outcome
 
 
-def test_a_conversion_without_exchange_uses_two_renames(tmp_path, v054):
+def test_a_conversion_without_exchange_uses_two_renames(tmp_path, tmp_path_factory, v054):
 	job = create_job(str(tmp_path / 'job'))
 	v054.build(job, SMALL, keep_n_versions=9)
-	template = str(tmp_path / 'template')
+	# out of tmp_path: a link of this copy can get the inode of one the chain plugin saw made, and it would judge the copy as a vault of its links
+	template = str(tmp_path_factory.mktemp('template') / 'vault')
 	subprocess.run(['cp', '-a', job.vault, template], check=True)
 	before = expected(job)
 	times = {name: os.lstat(os.path.join(job.job_vault, name)).st_mtime_ns for name in folders_of(job).values()}
@@ -206,8 +203,7 @@ def test_a_one_version_vault_cut_between_the_two_renames_resumes(tmp_path, v054)
 	name = next(iter(folders_of(job).values()))
 	before = expected(job)
 	os.makedirs(os.path.join(job.job_vault, rv.STAGING_NAME))
-	built = os.path.join(job.job_vault, rv.STAGING_NAME, rv.CONVERTED_NAME)
-	os.rename(os.path.join(job.job_vault, name), built)
+	os.rename(os.path.join(job.job_vault, name), os.path.join(job.job_vault, rv.STAGING_NAME, rv.REPLACED_NAME))
 	assert migrate(job) is True
 	assert check_vault(job.job_vault, before, set()) == []
 

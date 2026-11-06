@@ -93,10 +93,17 @@ def shut_down_scratch(path: str) -> None:
 
 
 class LoopImage:
-	'''A new f2fs of size_mib on a loop device this process attached, as f2fs_mount() has it, which can be mounted again after a shutdown.'''
-	def __init__(self, tmp: str, size_mib: int):
+	'''
+	A new f2fs of size_mib on a loop device this process attached, as f2fs_mount() has it, which can be mounted again after a shutdown.
+	source, when given, is an image to start from, copied sparse, in place of a new one; mount_point, a folder of the caller's to mount it
+	at, in place of one beside the image. keep, set before the end, is where the image goes then, in place of being removed.
+	'''
+	def __init__(self, tmp: str, size_mib: int, source: str = None, mount_point: str = None):
 		self.tmp = tmp
 		self.size_mib = size_mib
+		self.source = source
+		self.given_mount_point = mount_point
+		self.keep = None
 
 	def mount(self) -> None:
 		subprocess.run(['mount', '-t', 'f2fs', '-o', F2FS_OPTIONS.removeprefix('loop,'), self.device, self.mount_point], check=True)
@@ -123,13 +130,16 @@ class LoopImage:
 	def __enter__(self) -> 'LoopImage':
 		os.makedirs(self.tmp, exist_ok=True)
 		self.work = tempfile.mkdtemp(prefix='f2fs-', dir=self.tmp)
-		self.image, self.mount_point = os.path.join(os.path.realpath(self.work), 'image'), os.path.join(self.work, 'mnt')
+		self.image, self.mount_point = os.path.join(os.path.realpath(self.work), 'image'), self.given_mount_point or os.path.join(self.work, 'mnt')
 		self.device = None
 		try:
-			with open(self.image, 'wb') as f:
-				f.truncate(self.size_mib << 20)
-			subprocess.run(['mkfs.f2fs', '-q', '-f', '-O', F2FS_FEATURES, self.image], check=True, stdout=subprocess.DEVNULL)
-			os.mkdir(self.mount_point)
+			if self.source is not None:
+				subprocess.run(['cp', '--sparse=always', self.source, self.image], check=True)
+			else:
+				with open(self.image, 'wb') as f:
+					f.truncate(self.size_mib << 20)
+				subprocess.run(['mkfs.f2fs', '-q', '-f', '-O', F2FS_FEATURES, self.image], check=True, stdout=subprocess.DEVNULL)
+			os.makedirs(self.mount_point, exist_ok=True)
 			self.attach()
 			self.mount()
 		except BaseException:
@@ -144,6 +154,8 @@ class LoopImage:
 		finally:
 			if self.device is not None:
 				self.detach()
+			if self.keep is not None:
+				os.replace(self.image, self.keep)
 			shutil.rmtree(self.work)
 			with contextlib.suppress(OSError):
 				os.rmdir(self.tmp)

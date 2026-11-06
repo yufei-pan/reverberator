@@ -139,12 +139,12 @@ def reset_module_state() -> None:
 	rv.BACKUP_SEMAPHORE = threading.Semaphore(2 * os.cpu_count())
 
 
-def in_child(job, kill_at, work, fault=None, before_kill=None, flush_at=None) -> Outcome:
+def in_child(job, kill_at, work, fault=None, before_kill=None, flush_at=None, points=None) -> Outcome:
 	'''
 	Run work(), which gives do_backup's committed answer, in a forked child that dies before its kill_at-th mutating call
 	under the job vault. fault, when given, is called in the child with the module, to patch what the run must meet;
 	'enospc:<n>' makes the n-th link, symlink or mkdir under the job vault fail with ENOSPC. before_kill runs in the child
-	just before it dies, flush_at as KillPoints has it.
+	just before it dies, flush_at as KillPoints has it. points, when given, counts in place of a KillPoints made of those.
 	'''
 	# a real syncfs would flush the live filesystem under /tmp: only isolated_runtime()'s fixture makes a fork safe
 	assert rv.sync_vault_filesystems is not REAL_SYNC_VAULT_FILESYSTEMS, 'a kill run outside isolated_runtime()'
@@ -159,7 +159,7 @@ def in_child(job, kill_at, work, fault=None, before_kill=None, flush_at=None) ->
 		try:
 			os.close(reader)
 			os.setpgid(0, 0)
-			points = KillPoints(job.job_vault, kill_at, before_kill, flush_at)
+			points = points or KillPoints(job.job_vault, kill_at, before_kill, flush_at)
 			reset_module_state()
 			rv.copy_command = failing_copy_command(rv.copy_command)
 			rv.VaultManifest.commit = points.counted('commit', rv.VaultManifest.commit)

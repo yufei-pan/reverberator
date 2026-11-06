@@ -41,6 +41,8 @@ USERS = {
 	'decrement_stepper': {'copy_file_meta'},
 	# the conversion from 0.54: a plain tree built in staging, with the metadata of the version it replaces
 	'materialize_version': {'copy_new_folder_meta'},
+	# a roll-forward's repair of a name left of two kinds across a pool's disks, directly on each disk, before any writer runs
+	'remove_mixed_names': {'remove_entry'},
 	# never the vault: a restore writes its destination
 	'finish_restore_copies': {'replace_entry'},
 	'restore_entry': {'cp_af_copy_path'},
