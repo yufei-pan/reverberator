@@ -225,7 +225,7 @@ There are three lock files in the state folder:
 **A lock that cannot be checked** (open or flock fails, other than a missing state folder) postpones the **whole backup**, not only the prune. This follows from "Backups wait". After the 15-minute grace it logs `FAILED: cannot check the restore lock <path>: <error>; backup postponed` and repeats hourly.
 
 **Lock scope.**
-- **At a job's start:** the locks are taken before the scan. They are held through a migration, through a roll-forward up to its commit, and otherwise released when the scan ends.
+- **At a job's start:** the locks are taken before the scan. They are held through a migration, and otherwise released when the scan ends, so a restore can run while the monitored path is gone. A roll-forward's comparison reads the tree without locks, as any batch; it takes them for its prunes and holds them to its commit.
 - **A normal batch:** takes them before its retention loops and releases them after its commit or its failure. The comparison before it reads the tree without locks.
 
 ## 3. Scan and roll-forward (R vaults). No deletion on inference.
@@ -243,11 +243,11 @@ There are three lock files in the state folder:
 1. Walk P's real part, through real folders only. These are the recorded paths.
 2. Give each real folder of P back the mtime that version n's manifest row records for it. A rename never moves atime.
    - A folder whose row holds no record keeps its current time. If a crash hit its one-call window, that is the backup's time (a tiny limitation proposed in §14).
-3. Unlink any self-named link left at T/<recorded folder> by a cut exchange.
+3. A self-named link a cut exchange left at T/<recorded folder> needs no step of its own: the comparison and the sweep take it.
 4. Mark the rows of every recorded path UNVERIFIED.
-5. Run a full comparison that **reads T = V<n+1>**. Pending or put-back events replay first. There is no hand-over.
+5. Run a full comparison that **reads T = V<n+1>**. It alone says what to replay: the entries a stop saved are not used, as it covers the whole tree, and a saved file entry where a folder stands now would fight what it finds. A move the cut batch had not applied becomes a delete and a copy, once. There is no hand-over.
 6. Run the same retention loops as a batch, after the comparison and before the first write into the tree, counting the tree as the version being made. Never prune P, never the last version.
-7. Sweep under P's real folders: tree entries that P does not hold and that no row tracks are removed through `delete()`.
+7. Sweep the whole tree: tree entries that P does not hold and that no row tracks are removed through `delete()`.
 8. **Always commit V<n+1>.** Once the hand-over has happened, the tree carries V<n+1>'s name and P is the forward-link folder. As soon as anything was recorded, the tree also differs from version n: old copies have moved into P and new ones are in place. Undoing this would need a second writer that moves every record back. Finishing the version is the only consistent way forward, at the cost of one version slot after a crash. (Only a cut that came before any record could be undone, by one exchange. That case is not special-cased.)
 
 ### 3.1 Vaults not yet migrated (`layout` ≠ 'r')
@@ -517,7 +517,7 @@ Line counts are measured with `ast` at HEAD 8a8bcb9, inclusive.
 
 **Rules the tests forced:**
 - folder times are set after every exchange;
-- the roll-forward unlinks self-named links;
+- the sweep takes the self-named links a cut exchange left;
 - P folder mtimes are restored from rows (otherwise 15 of 186 kill points left the batch's time);
 - a normal retry prunes only when it backs something up;
 - per-entry records for a folder created over an existing folder.
