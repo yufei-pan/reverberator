@@ -6872,6 +6872,7 @@ def finish_conversion_renames(job_vault:str, manifest:'VaultManifest', names:lis
 	What a conversion's renames left, names being what staging shows (materialize_version()), directly on each disk, as a rename may be on one and not on another:
 	- the old tree out on a disk or more and the tree not yet known to be out of all of them (CONVERTED_NAME shows, or the version shows no folder): it goes back, and the version is converted again;
 	- the converted tree ready (READY_NAME): it goes in, under the version's name, as the old tree is out on every disk. On its way it may be on either side.
+	  With no old tree beside it and the version showing it is a leftover of the first case, whose removal was cut off, and it goes with staging.
 	Whether anything moved. Raises OSError.
 	'''
 	going_in = READY_NAME in names and CONVERTED_NAME not in names
@@ -6879,8 +6880,8 @@ def finish_conversion_renames(job_vault:str, manifest:'VaultManifest', names:lis
 	if source not in names:
 		return False
 	name = version_being_converted(job_vault, manifest)
-	# with the tree gone from staging and the version there, it is in, and the old tree goes with staging
-	if name is None or (not going_in and CONVERTED_NAME not in names and os.path.lexists(os.path.join(job_vault, name))):
+	# with the version there and no tree to go in (m shows, or n with the old tree beside it), the tree is in, or what is in staging is a leftover of a repair, and it goes with staging
+	if name is None or (CONVERTED_NAME not in names and not (READY_NAME in names and REPLACED_NAME in names) and os.path.lexists(os.path.join(job_vault, name))):
 		return False
 	def finish(branch:str) -> None:
 		staged = os.path.join(staging_path(branch), source)

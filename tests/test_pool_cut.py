@@ -462,6 +462,37 @@ def test_a_conversion_split_in_the_middle_goes_back(tmp_path, fake_pool, flushes
 	assert flushes
 
 
+def test_a_lone_ready_tree_beside_the_version_is_a_leftover(tmp_path, fake_pool, flushes):
+	# a repair put old back and the removal of staging stopped after m: n is half of a tree already given up, and the version shows
+	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
+	try:
+		conversion_in_staging(job_vault, {rv.READY_NAME: 'x'})
+		on_disk(a, f'{V1}/whole')
+		on_disk(b, f'{rv.STAGING_NAME}/{rv.READY_NAME}/half')
+		rv.repair_pool_vault(job_vault, manifest)
+		assert rv.finish_conversion_renames(job_vault, manifest, [rv.READY_NAME]) is False
+	finally:
+		manifest.close()
+	assert os.path.isfile(os.path.join(a, V1, 'whole')) and os.path.isfile(os.path.join(b, rv.STAGING_NAME, rv.READY_NAME, 'half'))
+	assert not os.path.lexists(os.path.join(b, V1, 'half'))
+	assert flushes == []
+
+
+def test_a_lone_ready_tree_with_the_version_gone_goes_in(tmp_path, fake_pool, flushes):
+	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
+	try:
+		# the version's folder is out of every disk
+		shutil.rmtree(newest)
+		conversion_in_staging(job_vault, {rv.READY_NAME: 'x'})
+		on_disk(a, f'{rv.STAGING_NAME}/{rv.READY_NAME}/here')
+		on_disk(b, f'{rv.STAGING_NAME}/{rv.READY_NAME}/there')
+		rv.repair_pool_vault(job_vault, manifest)
+	finally:
+		manifest.close()
+	assert os.path.isfile(os.path.join(a, V1, 'here')) and os.path.isfile(os.path.join(b, V1, 'there'))
+	assert flushes == [1]
+
+
 def test_the_version_being_converted_is_the_newest_not_done(tmp_path):
 	job_vault, newest = a_vault(str(tmp_path), {'g': 'y'})
 	manifest = rv.VaultManifest(job_vault)
