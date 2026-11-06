@@ -3048,7 +3048,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					if isDir and not skipped and event.mask & (flags.CREATE | flags.MOVED_TO):
 						# the recursive copy holds this folder, but it still needs watches for later changes,
 						# and a folder moved in keeps its watches under its old path until they are added again here
-						initializeFolderWatchers(inotify_obj,os.path.join(wdDic[event.wd],event.name),wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
+						# a take since this read: its copy may have passed this folder before the watch above, so the next batch copies it
+						with to_process_lock:
+							if to_process.takes != seen_takes:
+								to_process.append(ChangeEvent(monTime,True,'create',eventPath,None))
 					if isDir and event.mask & flags.MOVED_TO and event.cookie in cookieDic:
 						# the source stays in cookieDic so it still expires into its delete; its old-path watches are stale now
 						remove_watches_under(inotify_obj,wdDic,irm,cookieDic[event.cookie].path)

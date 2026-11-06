@@ -324,6 +324,52 @@ def test_a_file_written_before_the_watcher_reaches_a_new_folder_is_in_the_next_b
 		_stop(thread)
 
 
+def _hold_walk(monkeypatch, folder):
+	'''The watcher stops before it walks folder (at is set then) until go is set.'''
+	real = rv.initializeFolderWatchers
+	at, go = threading.Event(), threading.Event()
+	def walk(inotify_obj, path, *args, **kwargs):
+		if path.rstrip('/') == folder:
+			at.set()
+			go.wait(20)
+		return real(inotify_obj, path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', walk)
+	return at, go
+
+
+@pytest.mark.parametrize('how', ['made', 'moved_in'])
+def test_a_file_written_before_the_watch_of_a_folder_read_before_the_take_is_in_the_next_batch(job, tmp_path, poll_fast, monkeypatch, how):
+	# the read holding the folder's event came before the take, so the event is discarded as the copy's, but the watch comes
+	# after the copy passed the folder: a file written between raises no event and is in no copy, unless the next batch copies it
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
+	seed_monitor(job, {'data/sub/x': 'x', '.trash/': None})
+	skip_list = rv.SkipList(job.monitor, ['.trash/'])
+	run_backup(job, skip_list=skip_list)
+	data = os.path.join(job.monitor, 'data')
+	sub = os.path.join(data, 'sub')
+	at, go = _hold_walk(monkeypatch, sub)
+	flag = threading.Event()
+	thread, to_process, lock = _start(job, ['.trash/'], flag)
+	try:
+		os.rename(data, os.path.join(job.monitor, '.trash', 'data'))
+		os.mkdir(data)
+		wait_until(lambda: any(e.event == 'create' and e.path.rstrip('/') == data for e in _events(to_process, lock)), message='no create of the folder')
+		if how == 'made':
+			os.mkdir(sub)
+		else:
+			os.mkdir(tmp_path / 'outside')
+			os.rename(tmp_path / 'outside', sub)
+		assert at.wait(10)
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		open(os.path.join(sub, 'z'), 'w').write('z')
+		go.set()
+		_back_up_batch(job, to_process, lock, flag, skip_list)
+		assert open(os.path.join(latest_version(job).path, 'data', 'sub', 'z')).read() == 'z'
+	finally:
+		go.set()
+		_stop(thread)
+
+
 def test_folder_moved_away_and_back_is_not_deleted_later(job, tmp_path, poll_fast, monkeypatch):
 	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 0.5)
 	outside = tmp_path / 'outside'
