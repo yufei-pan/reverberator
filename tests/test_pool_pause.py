@@ -471,3 +471,29 @@ def test_a_vault_path_that_cannot_be_made_fails_the_attempt(job, fake_pool, poll
 	thread = _run_backuper(job, control)
 	thread.join(timeout=5)
 	assert not thread.is_alive() and 'does not exist and cannot be created' in control.failure.reason
+
+
+@pytest.mark.parametrize('spelled', ['//', '/', '/./'])
+def test_the_guard_of_a_batch_answers_for_the_job_folder_however_the_vault_path_is_spelled(job, fake_pool, poll_fast, monkeypatch, spelled):
+	# the rule's vault path is not normalised: the guard is built on the job's folder as spelled and asked with the normal spelling (the prune), or the other way
+	seed_monitor(job, {'a.txt': 'a'})
+	_v0(job)
+	seed_monitor(job, {'b.txt': 'b'})
+	fake_pool.add(job.vault, ['a', 'b'])
+	control = _control(job)
+	guards = []
+	def do_backup(*args, **kwargs):
+		guards.append((kwargs['pool_guard'], kwargs['vault_path']))
+		control.fail('test done')
+		return kwargs['vaultInfo'], kwargs['manifest'], True
+	monkeypatch.setattr(rv, 'do_backup', do_backup)
+	job = job._replace(vault=job.vault + spelled)
+	thread = _run_backuper(job, control)
+	thread.join(timeout=5)
+	assert not thread.is_alive() and len(guards) == 1
+	guard, vault_path = guards[0]
+	assert vault_path == job.vault
+	plain = os.path.join(os.path.normpath(job.vault), job.job_name)
+	for asked in (plain, os.path.join(job.vault, job.job_name), plain + '/'):
+		assert guard.covers(asked), asked
+	assert not guard.covers(os.path.join(plain, 'other'))

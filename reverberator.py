@@ -4049,9 +4049,11 @@ class PoolGuard:
 	The mergerfs pools holding paths, as they were when a step began. require() fails the step with PoolNotReady once a
 	disk of one is missing or was mounted again since; poll() does so at most once every POOL_CHECK_SECONDS, so it can
 	run per entry. Paths on no pool are never checked; while the mount table cannot be read, each path counts as on one.
+	A path is held and asked in its normal spelling (os.path.normpath), as a rule's vault path is not normalised: a guard built on
+	vault// and asked about vault/job must agree.
 	'''
 	def __init__(self, paths, clock = time.monotonic):
-		self.states = [(path, state) for path, state in ((path, pool_state(path)) for path in paths) if state is not None]
+		self.states = [(path, state) for path, state in ((path, pool_state(path)) for path in map(os.path.normpath, paths)) if state is not None]
 		self.clock = clock
 		self.next_check = None
 		self.lock = threading.Lock()
@@ -4070,6 +4072,7 @@ class PoolGuard:
 
 	def covers(self, path:str) -> bool:
 		'''Whether path, one of the paths, was on a pool when the step began (or the mount table could not be read).'''
+		path = os.path.normpath(path)
 		return any(held == path for held, _ in self.states)
 
 	def poll(self) -> None:
