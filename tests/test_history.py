@@ -218,10 +218,10 @@ def test_history_of_versions_without_change_rows(job):
 	write_committed_version(job, 1, {'a': 'xy'}, timestamp=T1, current=False)
 	v2 = write_committed_version(job, 2, {}, timestamp=T2)
 	os.symlink(f'../V1--{T1}/a', os.path.join(v2, 'a'))
-	# a chain link to a path the version below does not hold
+	# a link of chain form to a path the version below does not hold reads as the link it may be: new in this version
 	os.symlink(f'../V1--{T1}/gone', os.path.join(v2, 'b'))
 	assert [(r.version.number, r.event, r.size) for r in hist(job, 'a')] == [(1, 'changed', 2), (0, 'oldest', 1)]
-	assert [(r.version.number, r.event, r.size) for r in hist(job, 'b')] == [(2, 'changed', None)]
+	assert [(r.version.number, r.event, r.size) for r in hist(job, 'b')] == [(2, 'create', None)]
 	assert rv.path_kind(job.job_vault, versions(job), job.monitor, 'b') == 'file'
 
 

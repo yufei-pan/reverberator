@@ -445,7 +445,6 @@ def test_the_recopy_keeps_a_user_link_a_link(tmp_path, monkeypatch):
 	for version in rv.list_versions(job.job_vault):
 		if version.number:
 			assert holds_user_link(job, version, 'a/U', text)
-			assert rv.resolve_version_entry(job.job_vault, version.path, 'a/U', job.monitor).kind == 'symlink'
 		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret'
 		assert stat.S_IMODE(os.stat(os.path.join(version.path, 'D/secret')).st_mode) == 0o600
 	assert os.path.islink(os.path.join(job.monitor, 'a/U'))
@@ -469,8 +468,9 @@ def test_chain_end_stops_at_a_user_link(tmp_path):
 # --- history and restore ---
 
 @pytest.mark.parametrize('form', ['one_up', 'right_depth'])
-def test_history_and_restore_show_a_user_link_as_a_symlink(tmp_path, capsys, form):
-	# repro test_r8_history_restore: history said "moved from D/secret", and restore gave its bytes
+def test_a_user_link_of_chain_form_reads_by_its_text_until_the_vault_is_migrated(tmp_path, capsys, form):
+	# spec 4.3: the commands read a vault not yet migrated as its conversion will make it, by the text alone (approved for
+	# the conversion); on design R the same link is a user's (test_version_walk). History's rows still say what happened
 	job = fresh_job(tmp_path)
 	v0 = latest(job)
 	text = {'one_up': f'../{v0.name}/D/secret', 'right_depth': chain_text(v0.name, 'D/secret')}[form]
@@ -478,7 +478,8 @@ def test_history_and_restore_show_a_user_link_as_a_symlink(tmp_path, capsys, for
 	bump(job, 1)
 	write_rule(job)
 	versions = rv.list_versions(job.job_vault)
-	assert [rv.resolve_version_entry(job.job_vault, version.path, 'a/U', job.monitor).kind for version in versions[1:]] == ['symlink', 'symlink']
+	kinds = [rv.resolve_version_entry(job.job_vault, version.path, 'a/U', job.monitor).kind for version in versions[1:]]
+	assert kinds == ['file', 'file']
 	code, out, err = command(tmp_path, capsys, 'history', os.path.join(job.monitor, 'a/U'))
 	assert (code, err) == (0, '')
 	assert 'moved' not in out and 'D/secret' not in out and 'created' in out
@@ -487,12 +488,12 @@ def test_history_and_restore_show_a_user_link_as_a_symlink(tmp_path, capsys, for
 	dest.mkdir()
 	code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'a/U'), str(dest), '--version', '2')
 	assert code == 0, err
-	assert os.path.islink(dest / 'U') and os.readlink(dest / 'U') == text
+	assert not os.path.islink(dest / 'U') and open(dest / 'U').read() == 'secret'
 	dest2 = tmp_path / 'out2'
 	dest2.mkdir()
 	code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'a'), str(dest2), '--version', '2')
 	assert code == 0, err
-	assert os.path.islink(dest2 / 'a/U') and os.readlink(dest2 / 'a/U') == text
+	assert not os.path.islink(dest2 / 'a/U') and open(dest2 / 'a/U').read() == 'secret'
 
 
 def test_restore_gives_a_user_link_naming_a_folder_as_the_link(tmp_path, capsys):
@@ -568,7 +569,8 @@ def test_a_chain_link_into_a_missing_version_is_dangling_only_by_the_rule(job):
 	os.symlink(f'../../../{gone}/b/x', os.path.join(v2, 'deep/er/x'))
 	moves = rv.VaultMoves(job.job_vault, job.monitor)
 	kinds = {rel: rv.resolve_version_entry(job.job_vault, v2, rel, job.monitor, moves).kind for rel in ('a/own', 'a/U', 'a/short', 'deep/er/x')}
-	assert kinds == {'a/own': 'dangling', 'a/U': 'symlink', 'a/short': 'symlink', 'deep/er/x': 'dangling'}
+	# by the text alone: a moved link's text names another path, so it is the symlink it may be, as the migration leaves it
+	assert kinds == {'a/own': 'dangling', 'a/U': 'symlink', 'a/short': 'symlink', 'deep/er/x': 'symlink'}
 	# with rows that cannot be used, only the text of the link's own place
 	rv.VERSION_MOVES.clear()
 	with open(rv.list_versions(job.job_vault)[-1].change_list, 'w') as f:
@@ -822,9 +824,8 @@ def test_the_history_and_restore_commands_read_each_change_list_once(tmp_path, c
 		code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'b/x'), str(dest), '--version', '3')
 		assert open(dest / 'x').read() == 'x'
 	assert code == 0, err
-	# a restore reads them once to pick its version, and once more under the restore lock, as a backup may have
-	# committed between the two
-	assert sorted(reads) == (['V1', 'V2'] if which == 'history' else ['V1', 'V1', 'V2', 'V2'])
+	# the walk reads no rows; only history's own moved_from still does, for the one link it asks about
+	assert sorted(reads) == (['V2'] if which == 'history' else [])
 
 
 # --- pruning keeps the oldest version when the next one cannot be looked at in full ---
@@ -965,7 +966,8 @@ def test_a_command_waits_for_the_manifest_and_then_judges_by_the_rows(tmp_path, 
 			dest = tmp_path / 'out'
 			dest.mkdir()
 			code, out, err = command(tmp_path, capsys, 'restore', os.path.join(job.monitor, 'a/U'), str(dest), '--version', str(latest(job).number))
-			assert os.readlink(dest / 'U') == text
+			# the commands read a vault not yet migrated by the text, as its conversion will
+			assert open(dest / 'U').read() == 'secret'
 		elapsed = time.monotonic() - start
 	finally:
 		releaser.join()
@@ -1022,16 +1024,19 @@ def test_a_folder_restore_waiting_for_the_manifest_stops_on_a_signal(tmp_path, c
 	job, v0, v1 = moved_job(tmp_path)
 	write_rule(job)
 	handlers = {each: signal.getsignal(each) for each in rv.RESTORE_STOP_SIGNALS}
-	real = rv.read_recorded_monitor_paths
+	real = rv.read_command_layout
 	tries, signalled = [], []
-	def read(job_vault, timeout=1):
+	def read(job_vault, timeout):
+		if signal.getsignal(sig) == handlers[sig]:
+			# the picking, before the copy's handlers: nothing is written yet, so a signal just ends the command
+			return None, 'read'
 		tries.append(timeout)
 		if len(tries) == 3:
 			signalled.append(time.monotonic())
 			os.kill(os.getpid(), sig)
 		assert len(tries) < 40, 'still waiting long after the signal'
-		return real(job_vault, timeout=min(timeout, 0.2))
-	monkeypatch.setattr(rv, 'read_recorded_monitor_paths', read)
+		return real(job_vault, min(timeout, 0.2))
+	monkeypatch.setattr(rv, 'read_command_layout', read)
 	dest = tmp_path / 'out'
 	dest.mkdir()
 	locker = lock_manifest(job)

@@ -9227,6 +9227,50 @@ def command_monitor_paths(job_vault:str, stream = None):
 		print("Note: the vault's record of monitored paths cannot be read; links are judged by their text", file=stream, flush=True)
 	return recorded
 
+def read_command_layout(job_vault:str, timeout:float) -> tuple:
+	'''
+	(layout, state) as a command reads the manifest of job_vault, read-only and waiting up to timeout seconds for a lock.
+	state is 'read', with layout the one recorded (None with no manifest, or one that is no database: it records nothing),
+	'locked' while a write holds the manifest, so a read later can succeed, or 'unread' when it gave no answer.
+	'''
+	path = os.path.join(job_vault, MANIFEST_FILE_NAME)
+	if not os.path.exists(path):
+		return None, 'read'
+	try:
+		# quoted as bytes, so a vault path that is not UTF-8 is opened as it is
+		conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=ro', uri=True, timeout=timeout)
+		try:
+			row = conn.execute("SELECT value FROM meta WHERE key = 'layout'").fetchone()
+		finally:
+			conn.close()
+		return (None if row is None else row[0]), 'read'
+	except sqlite3.DatabaseError as e:
+		if 'not a database' in str(e) or 'malformed' in str(e) or 'no such table' in str(e):
+			return None, 'read'
+		return None, 'locked' if isinstance(e, sqlite3.OperationalError) and ('locked' in str(e) or 'busy' in str(e)) else 'unread'
+	except OSError:
+		return None, 'unread'
+
+def read_vault_layout_for_command(job_vault:str, stream = None) -> 'str | None':
+	'''
+	The layout the manifest of job_vault records, for the history and restore commands, None when it records none: a vault not
+	yet migrated, or a manifest that is lost. Nothing in the vault is changed. While a write of the daemon holds the manifest it
+	waits, as command_monitor_paths() does, saying so once on stream (sys.stderr as it is now when None); None, said once too,
+	when it cannot be read for any other reason. Each try waits RESTORE_WAIT_SECONDS at most, so a stop signal a restore turned
+	into RESTORE_STOP ends the wait soon after, as a KeyboardInterrupt.
+	'''
+	stream = sys.stderr if stream is None else stream
+	layout, state = read_command_layout(job_vault, 0)
+	if state == 'locked':
+		print(f'Waiting for reverberator to finish writing the vault database of {job_vault}', file=stream, flush=True)
+	while state == 'locked':
+		if RESTORE_STOP.is_set():
+			raise KeyboardInterrupt
+		layout, state = read_command_layout(job_vault, RESTORE_WAIT_SECONDS)
+	if state == 'unread':
+		print("Note: the vault's layout cannot be read; links of either kind are followed by their text", file=stream, flush=True)
+	return layout
+
 def written_under(monitor_paths:list, number:int, monitor_path:str) -> str:
 	'''
 	The monitored path the version numbered number was written under: the last of monitor_paths ([first version,
@@ -9840,6 +9884,7 @@ class VaultMoves:
 		self.applied = applied
 		self._read_record = recorded_monitor_paths if read_record is None else read_record
 		self._record_read = monitor_paths is not None
+		self._backward = None
 		self._held = {}
 		self._lock = threading.Lock()
 		self._record_lock = threading.Lock()
@@ -9851,6 +9896,13 @@ class VaultMoves:
 				self.monitor_paths = self._read_record(self.job_vault)
 				self._record_read = True
 			return self.monitor_paths
+
+	def reads_backward(self) -> bool:
+		'''Whether this pass's walks follow 0.54 chain links (walk_version()): the vault's layout, read the first time it is asked for.'''
+		with self._record_lock:
+			if self._backward is None:
+				self._backward = read_vault_layout_for_command(self.job_vault) != 'r'
+			return self._backward
 
 	def of(self, version) -> VersionMoves:
 		'''The moves of version: a version folder's path, or anything with one as its path, such as a KeptVersion.'''
@@ -11442,6 +11494,26 @@ def job_lock_unchecked(job_name:str, kind:str, path:str, error:OSError, postpone
 def job_lock_checked(path:str) -> None:
 	'''The lock at path could be checked: a later failure starts a new grace (job_lock_unchecked()).'''
 	JOB_LOCK_UNCHECKED.pop(path, None)
+
+def backup_is_running(job_name:'str | None', state_dir:str = None) -> bool:
+	'''
+	Whether a batch of job_name holds its backup lock now: asked with a shared try that is let go at once, so a read never
+	holds a batch off. No lock file means none ever ran here, and None, a job not known, is not asked. Any other failure to
+	look is raised: it is no answer.
+	'''
+	if job_name is None:
+		return False
+	try:
+		fd = os.open(job_lock_path(job_name, 'backup', state_dir), os.O_RDONLY | os.O_NOFOLLOW)
+	except (FileNotFoundError, NotADirectoryError):
+		return False
+	try:
+		fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+		return False
+	except BlockingIOError:
+		return True
+	finally:
+		os.close(fd)
 
 class BackupLocks:
 	'''
@@ -14260,6 +14332,198 @@ def list_versions(job_vault:str) -> list:
 
 ResolvedEntry = namedtuple('ResolvedEntry', ['kind', 'path', 'detail'])
 
+# where a walk through a version ended. kind: 'file' (anything that is neither folder nor link), 'folder', 'symlink' (a user's;
+# detail is its text), 'missing', 'dangling' (a 0.54 chain link leading nowhere) or 'unreadable' (detail says why). path: the
+# entry, in the version holding it. st: its lstat, None when there is none. followed: [(link path, text)], every link the walk went through
+Walked = namedtuple('Walked', ['kind', 'path', 'st', 'followed', 'detail'], defaults=[''])
+
+def forward_name(text:str, rel:str, number:int) -> 'str | None':
+	'''
+	The folder name of the version after the one numbered number, when text is exactly the forward link at rel of that version;
+	else None, as for a user's link. The name comes from the text, so a walk needs no list of versions and goes through the tree
+	of a cut batch, which has no change list.
+
+	Examples:
+		>>> name = 'V4--2021-01-02_00-00-00_-0800'
+		>>> forward_name(f'../../{name}/a/b', 'a/b', 3), forward_name(f'../{name}/a', 'a', 3)
+		('V4--2021-01-02_00-00-00_-0800', 'V4--2021-01-02_00-00-00_-0800')
+		>>> [forward_name(text, 'a/b', 3) for text in (f'../{name}/a/b', f'../../../{name}/a/b', f'../../{name}/a/c', f'/v/{name}/a/b',
+		...     f'../../{name}/x/a/b', '../../V4--x/a/b', '../..//a/b', '../../a/b')]
+		[None, None, None, None, None, None, None, None]
+		>>> [forward_name(f'../../{name}/a/b', 'a/b', number) for number in (2, 4, None)]
+		[None, None, None]
+	'''
+	head, tail = '../' * (rel.count('/') + 1), '/' + rel
+	if number is None or len(text) <= len(head) + len(tail) or not text.startswith(head) or not text.endswith(tail):
+		return None
+	name = text[len(head):-len(tail)]
+	return name if name.startswith(f'V{number + 1}--') and is_version_folder_name(name) else None
+
+def walk_folder(job_vault:str, folder_name:str, rel:str, backward:bool) -> Walked:
+	'''
+	Where rel of the version in folder_name is (walk_version()). Each hop moves one version on, and a walk that went forward
+	never goes back, so it ends by itself at any number of versions: a link of chain form met after a forward link can only be a
+	user's, as a vault whose manifest was lost shows them beside forward links.
+	'''
+	vault = os.path.abspath(job_vault)
+	rel = os.path.normpath(rel) if rel else '.'
+	parts = [] if rel == '.' else rel.split('/')
+	if parts[:1] == ['..'] or rel.startswith('/'):
+		return Walked('missing', os.path.join(vault, folder_name, rel), None, [], f'{rel} is not in {folder_name}')
+	name, followed = folder_name, []
+	forward = False
+	# the last backward hop: (link path, its lstat, its text, whether the text is the one for its own path). The link is a user's
+	# if what it names cannot be a chain link's target
+	came_by = None
+	def users_link() -> Walked:
+		return Walked('symlink', came_by[0], came_by[1], followed[:-1], came_by[2])
+	def nowhere(detail:str = None) -> Walked:
+		path = os.path.join(vault, name, *parts)
+		if came_by is None:
+			return Walked('missing', path, None, followed, detail or f'{"/".join(parts)} is not in {name}')
+		if not came_by[3]:
+			# nothing is lost by showing any other text as the symlink it may be, while calling it dangling would refuse its restore
+			return users_link()
+		if not os.path.lexists(os.path.join(vault, name)):
+			return Walked('dangling', path, None, followed, f'{name} is missing')
+		return Walked('dangling', path, None, followed, f'{"/".join(parts)} is missing from {name}')
+	while True:
+		number = vault_version_number(name)
+		path = os.path.join(vault, name)
+		prefix = ''
+		hop = False
+		try:
+			st = os.lstat(path)
+			if not stat.S_ISDIR(st.st_mode):
+				return nowhere()
+			for index, part in enumerate(parts):
+				last = index == len(parts) - 1
+				path = f'{path}/{part}'
+				prefix = f'{prefix}/{part}' if prefix else part
+				st = os.lstat(path)
+				if stat.S_ISLNK(st.st_mode):
+					try:
+						text = os.readlink(path)
+					except OSError as e:
+						if e.errno != errno.EINVAL:
+							raise
+						# no link any more: a record turned it real after the lstat, so this version is walked again
+						hop = True
+						break
+					following = forward_name(text, prefix, number)
+					if following is not None:
+						followed.append((path, text))
+						name, forward, hop, came_by = following, True, True, None
+						break
+					# the daemon linked files only, so a 0.54 chain link is only ever the last part
+					chain = parse_chain_text(vault, text, path) if backward and last and not forward else None
+					if chain is not None:
+						followed.append((path, text))
+						came_by = (path, st, text, chain[1] == parts and chain[2] == len(parts))
+						name, parts, hop = chain[0], chain[1], True
+						break
+					if last:
+						return Walked('symlink', path, st, followed, text)
+					if came_by is not None:
+						return users_link()
+					return nowhere(f'{part} is a symlink in {name}')
+				if not last and not stat.S_ISDIR(st.st_mode):
+					return nowhere()
+		except (FileNotFoundError, NotADirectoryError):
+			return nowhere()
+		except OSError as e:
+			if e.errno == errno.ENAMETOOLONG:
+				# a name or path too long to use: the daemon reaches its copies by path, so none is behind it
+				return nowhere()
+			return Walked('unreadable', path, None, followed, str(e))
+		except ValueError as e:
+			return Walked('unreadable', path, None, followed, str(e))
+		if hop:
+			continue
+		if not stat.S_ISDIR(st.st_mode):
+			return Walked('file', path, st, followed)
+		if came_by is not None:
+			# the daemon linked files only, so what names a folder is a user's link
+			return users_link()
+		return Walked('folder', path, st, followed)
+
+def walk_version(job_vault:str, number:int, rel:str, backward:bool) -> Walked:
+	'''
+	Where rel of the version numbered number is, every path part looked at with lstat, from the version's root, so the kernel
+	follows nothing and its limit of 40 links does not apply:
+	- a real folder: on to the next part;
+	- a link whose text is exactly the forward link of the path so far (forward_name()): the whole path again from the root of
+	  the next version, as that may forward a folder above it. So on any layout, as a vault whose manifest was lost has them;
+	- with backward, as for a vault whose layout is not 'r', a last part that is a 0.54 chain link by its text alone (parse_chain_text()):
+	  the path it names from the root of the version below. A text naming a folder or a path through a link is a user's link, and
+	  so is one leading nowhere, unless its text names its own path: that one is 'dangling';
+	- any other link: the entry if it is the last part, else the path is missing, as nothing of a version lies behind a user's link.
+	A forward link leading nowhere reads as missing, as a version removed by hand leaves it.
+	'''
+	try:
+		with os.scandir(job_vault) as entries:
+			for entry in entries:
+				if vault_version_number(entry.name) == number and is_version_folder_name(entry.name):
+					return walk_folder(job_vault, entry.name, rel, backward)
+	except (FileNotFoundError, NotADirectoryError):
+		pass
+	except OSError as e:
+		return Walked('unreadable', job_vault, None, [], str(e))
+	return Walked('missing', os.path.join(job_vault, f'V{number}', rel), None, [], f'V{number} is not in {job_vault}')
+
+def followed_unchanged(followed:list) -> bool:
+	'''Whether each link of followed, [(path, text)], still reads text. A record only ever turns a link into a real entry.'''
+	for path, text in followed:
+		try:
+			if os.readlink(path) != text:
+				return False
+		except OSError:
+			return False
+	return True
+
+def wait_for_backup(job_name:'str | None', state_dir:str = None) -> bool:
+	'''Wait while a batch of job_name runs, saying so once, and return whether there was one. A stop signal a command turned into RESTORE_STOP ends the wait as a KeyboardInterrupt.'''
+	if not backup_is_running(job_name, state_dir):
+		return False
+	print(f'Waiting for reverberator to finish {JOB_LOCK_WAITS["backup"]} of {job_name}', file=sys.stderr, flush=True)
+	while backup_is_running(job_name, state_dir):
+		if RESTORE_STOP.wait(RESTORE_WAIT_SECONDS):
+			raise KeyboardInterrupt
+	return True
+
+def read_checked(job_vault:str, number:int, rel:str, read, job:str = None, backward:bool = None, state_dir:str = None):
+	'''
+	read(walked) of walk_version() of rel in the version numbered number, right while a batch records under the walk, as the
+	reader holds no lock a batch needs. read is given every Walked, a missing one too, and its answer is returned once the links
+	followed still read as they did: a batch only turns a link into a real entry, so what the links led to was the version's
+	all along. Else it walks again. An entry missing, a link leading nowhere or a read finding its entry gone, while
+	job's batch runs (backup_is_running()), can be a pool's two renames: it waits for the batch to end, then walks again. Raises
+	what read raises, an entry gone twice with nothing changed included. backward: as walk_version() has it, the vault's
+	layout when None; a caller reading many paths reads it once. A reader holding the restore lock passes no job: no batch
+	changes the vault then, and one waiting for that lock holds the backup lock. state_dir: where job's locks are, as a
+	command is told.
+	'''
+	if backward is None:
+		backward = read_vault_layout_for_command(job_vault) != 'r'
+	failed = None
+	while True:
+		walked = walk_version(job_vault, number, rel, backward)
+		if walked.kind in ('missing', 'dangling') and wait_for_backup(job, state_dir):
+			continue
+		try:
+			value = read(walked)
+		except OSError as e:
+			# ELOOP: the link a folder's record leaves in the tree for a moment, naming itself
+			if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+				raise
+			unchanged = followed_unchanged(walked.followed)
+			if not wait_for_backup(job, state_dir) and unchanged and walked.path == failed:
+				raise
+			failed = walked.path
+			continue
+		if followed_unchanged(walked.followed):
+			return value
+
 def chain_form_missing_version(job_vault:str, link_path:str, link_text:str, moves:VersionMoves = None):
 	'''
 	The name of the version folder a link names when the link is a chain link by the rule for its place but that
@@ -14309,74 +14573,23 @@ def chain_form_missing_version(job_vault:str, link_path:str, link_text:str, move
 
 def resolve_version_entry(job_vault:str, version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None) -> ResolvedEntry:
 	'''
-	Where the content of rel in the version at version_path really is, following the links that chain an unchanged entry
-	back to the version holding its copy (the rule read_vault_record() follows, however many versions back), each told
-	by the moves of its version (moves, a VaultMoves for the pass; one reading the manifest's record when None).
+	Where the content of rel in the version at version_path really is, by walk_folder(), on the vault's layout (moves, a
+	VaultMoves for the pass, reads it once; a VaultMoves for this one call when None).
 	The kind is 'file' or 'folder' (path is the real copy), 'symlink' (a user's symlink backed up as one; path is the
 	link), 'referenced' (a link to the monitored file itself; path is the link), 'missing' (the version has no such
-	entry), 'dangling' (a chain leads to nothing, or is too long) or 'unreadable' (a link or folder could not be
-	looked at); detail says what and where for the last two.
+	entry, or a forward link leads nowhere), 'dangling' (a 0.54 chain leads to nothing) or 'unreadable' (a link or folder
+	could not be looked at); detail says what and where for the last two.
 	'''
 	vault = os.path.abspath(job_vault)
 	if moves is None:
 		moves = VaultMoves(vault, monitor_path)
-	entry = os.path.abspath(os.path.join(version_path, rel))
-	hops = 0
-	# every hop goes down a version, so the walk ends by itself; this only bounds it should a link ever not
-	own_number = vault_version_number(os.path.basename(os.path.abspath(version_path)))
-	if own_number is None:
-		# a folder without a number (not one list_versions gives) can chain to any version in the vault
-		try:
-			own_number = len(os.listdir(vault))
-		except OSError as e:
-			return ResolvedEntry('unreadable', os.path.abspath(os.path.join(version_path, rel)), str(e))
-	max_hops = own_number + 1
-	# lstat follows the symlinks among rel's folders, so they must be real ones: a backed-up folder symlink holds no
-	# files of the version, and what lies behind it is the live file
-	version_top = os.path.abspath(version_path)
-	try:
-		# the version's own root has no folders above it in the version, and its lstat below checks it
-		real_folders = not rel or is_real_folder_under(version_top, os.path.dirname(entry))
-	except UncheckedVaultLink as e:
-		return ResolvedEntry('unreadable', entry, str(e))
-	if not real_folders:
-		path = version_top
-		for part in os.path.dirname(entry)[len(version_top) + 1:].split('/'):
-			path = os.path.join(path, part) if part else path
-			if os.path.islink(path):
-				return ResolvedEntry('missing', entry, f'{part} is a symlink in {os.path.basename(version_top)}')
-		return ResolvedEntry('missing', entry, f'{rel} is not in {os.path.basename(version_top)}')
-	while True:
-		# the entry's path in the version it is found in, which a move since the link was made may have changed
-		in_vault = entry.startswith(vault + '/')
-		entry_rel = entry[len(vault) + 1:].partition('/')[2] if in_vault else rel
-		try:
-			st = os.lstat(entry)
-		except (FileNotFoundError, NotADirectoryError):
-			if not hops:
-				return ResolvedEntry('missing', entry, f'{rel} is not in {os.path.basename(version_path)}')
-			return ResolvedEntry('dangling', entry, f'{entry_rel} is missing from {entry[len(vault) + 1:].partition("/")[0]}')
-		except OSError as e:
-			return ResolvedEntry('unreadable', entry, str(e))
-		if not stat.S_ISLNK(st.st_mode):
-			return ResolvedEntry('folder' if stat.S_ISDIR(st.st_mode) else 'file', entry, '')
-		try:
-			text = os.readlink(entry)
-			hop = moves.follow(entry, text)
-		except (OSError, UncheckedVaultLink) as e:
-			return ResolvedEntry('unreadable', entry, str(e))
-		if hop is None:
-			missing = chain_form_missing_version(vault, entry, text, moves.holding(entry))
-			if missing is not None:
-				return ResolvedEntry('dangling', entry, f'{missing} is missing')
-			# a rule keeps a monitored path that is missing as typed, so it is normalised as the link's text is
-			if os.path.isabs(text) and os.path.normpath(text) == os.path.abspath(os.path.join(monitor_path, entry_rel)):
-				return ResolvedEntry('referenced', entry, text)
-			return ResolvedEntry('symlink', entry, text)
-		hops += 1
-		if hops > max_hops:
-			return ResolvedEntry('dangling', entry, 'too many links in the chain')
-		entry = hop
+	walked = walk_folder(vault, os.path.basename(os.path.abspath(version_path)), rel, moves.reads_backward())
+	if walked.kind == 'symlink':
+		entry_rel = walked.path[len(vault) + 1:].partition('/')[2]
+		# a rule keeps a monitored path that is missing as typed, so it is normalised as the link's text is
+		if os.path.isabs(walked.detail) and os.path.normpath(walked.detail) == os.path.abspath(os.path.join(monitor_path, entry_rel)):
+			return ResolvedEntry('referenced', walked.path, walked.detail)
+	return ResolvedEntry(walked.kind, walked.path, walked.detail)
 
 ChangeRow = namedtuple('ChangeRow', ['path', 'iso_time', 'event', 'source_path'])
 
@@ -14854,9 +15067,10 @@ def history_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	if moves is None:
 		moves = VaultMoves(vault, monitor_path)
 	resolved = resolve_version_entry(job_vault, version.path, rel, monitor_path, moves)
-	if resolved.kind == 'missing' or not rel:
-		return resolved, None
 	entry = os.path.join(os.path.abspath(version.path), rel)
+	# a link the walk stopped at is a user's, whatever the rows would make of it
+	if resolved.kind == 'missing' or not rel or resolved.path == entry:
+		return resolved, None
 	try:
 		hop = moves.follow(entry, os.readlink(entry))
 	except (OSError, ValueError, UncheckedVaultLink):
