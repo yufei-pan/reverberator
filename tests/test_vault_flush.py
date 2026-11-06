@@ -9,6 +9,7 @@ import subprocess
 import sys
 from collections import OrderedDict
 import pytest
+import TSVZ
 import reverberator as rv
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.harness import committed_versions, event_entry, seed_monitor
@@ -420,3 +421,51 @@ def test_the_scan_and_a_restart_leave_the_journal_alone(tmp_path):
 	before = vault_names(job)
 	removed, scanned = restart_and_scan(job)
 	assert removed == [] and scanned == [0, 1, 2] and os.path.exists(journal) and vault_names(job) == before
+
+
+def test_a_new_change_list_is_synced_with_its_folder(job, monkeypatch):
+	seed_monitor(job, {'a': 'a'})
+	synced = []
+	real_fsync = os.fsync
+	def recording_fsync(fd):
+		synced.append(os.path.realpath(f'/proc/self/fd/{fd}'))
+		return real_fsync(fd)
+	monkeypatch.setattr(rv.os, 'fsync', recording_fsync)
+	run_backup(job)
+	change_list = rv.list_versions(job.job_vault)[-1].change_list
+	# the commit marker, synced in its private folder before it is renamed into place, then the folder holding its name
+	written = [path for path in synced if os.path.basename(path) == os.path.basename(change_list)
+		and os.path.basename(os.path.dirname(path)).startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
+	assert len(written) == 1
+	# (the folder is synced before too, when the manifest's journal first appears)
+	assert any(at > synced.index(written[0]) for at, path in enumerate(synced) if path == os.path.realpath(job.job_vault))
+
+
+def test_a_change_list_appears_whole_or_not_at_all(job, monkeypatch):
+	seed_monitor(job, {'a': 'a'})
+	run_backup(job)
+	written = []
+	real_append = TSVZ.appendLinesTabularFile
+	def recording_append(path, *args, **kwargs):
+		written.append(path)
+		return real_append(path, *args, **kwargs)
+	monkeypatch.setattr(TSVZ, 'appendLinesTabularFile', recording_append)
+	real_replace = os.replace
+	def crashing_replace(source, dest, *args, **kwargs):
+		if str(dest).endswith(rv.CONTENT_FILE_EXTENSION_NAME):
+			raise OSError(errno.EIO, os.strerror(errno.EIO), dest)
+		return real_replace(source, dest, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'replace', crashing_replace)
+	open(os.path.join(job.monitor, 'a'), 'w').write('a1')
+	with pytest.raises(OSError):
+		rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
+			keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+	monkeypatch.undo()
+	# rows go to a private folder, which no reader of the job vault looks in, so V1 shows no list until the rename
+	lists = [path for path in written if path.endswith(rv.CONTENT_FILE_EXTENSION_NAME)]
+	assert lists and all(os.path.basename(os.path.dirname(path)).startswith(rv.CHANGE_LIST_FOLDER_PREFIX) for path in lists)
+	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
+	# the manifest named V1 before the rename, so the next scan finishes the commit, with the whole list
+	assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [0, 1]
+	assert [row.event for row in rv.iter_change_list(rv.list_versions(job.job_vault)[1].change_list)] == ['modify']
+	assert [name for name in os.listdir(job.job_vault) if name.startswith(rv.CHANGE_LIST_FOLDER_PREFIX)] == []

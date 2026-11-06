@@ -21,6 +21,7 @@ import pytest
 import reverberator as rv
 from tests.harness import create_job, run_backup, seed_monitor, write_rule, committed_versions, event_entry
 from tests.test_restore import restore, destination
+from tests.vault_oracle import read_view
 
 pytestmark = pytest.mark.unit
 
@@ -178,7 +179,8 @@ def version_folders_of(version):
 	'''
 	if os.geteuid() != 0:
 		pytest.skip('trusted.* extended attributes need root')
-	found = folders_of(version)
+	job_vault, name = os.path.split(version)
+	found = {rel: (entry.mtime_ns, entry.mode, entry.uid, entry.gid, entry.xattrs) for rel, entry in read_view(job_vault, name).items() if entry.kind == 'd'}
 	st = os.lstat(version)
 	assert (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid) == (0o755, os.geteuid(), os.getegid())
 	assert [name for name in os.listxattr(version) if name.startswith('trusted.reverberator.')] == [rv.ROOT_META_XATTR]
@@ -260,7 +262,8 @@ def test_a_restored_folder_gets_its_own_times_back(tmp_path, capsys):
 		f.write('changed')
 	versions = run_backup(job, OrderedDict([event_entry(job, 'top', 'modify')]))
 	for version in versions:
-		assert [os.lstat(os.path.join(version, rel)).st_mtime_ns for rel in ('d', 'd/e')] == [OLD, OLD]
+		view = read_view(*os.path.split(version))
+		assert [view[rel].mtime_ns for rel in ('d', 'd/e')] == [OLD, OLD]
 	write_rule(job)
 	out = destination(tmp_path)
 	code, _, err = restore(tmp_path, capsys, f'{job.monitor}/d', out, '--version', '1')
@@ -282,6 +285,7 @@ def three_versions(tmp_path):
 	return job
 
 
+@pytest.mark.on_054
 def test_a_prune_leaves_the_next_versions_folder_times(tmp_path):
 	job = three_versions(tmp_path)
 	v1 = committed_versions(job)[1]
@@ -294,6 +298,7 @@ def test_a_prune_leaves_the_next_versions_folder_times(tmp_path):
 	assert folders_of(v1) == before
 
 
+@pytest.mark.on_054
 def test_a_prune_that_moves_its_copies_leaves_the_folder_times(tmp_path, monkeypatch):
 	# a filesystem without hard links: each copy is moved in place of its link
 	job = three_versions(tmp_path)
@@ -309,6 +314,7 @@ def test_a_prune_that_moves_its_copies_leaves_the_folder_times(tmp_path, monkeyp
 	assert folders_of(v1) == before
 
 
+@pytest.mark.on_054
 def test_the_cut_repair_leaves_the_next_versions_folder_times(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	monkeypatch.setattr(rv.PoolGuard, 'covers', lambda self, path: True)
@@ -419,6 +425,7 @@ def test_settle_stops_when_the_pool_guard_says_a_disk_dropped(tmp_path):
 		folders.settle(str(version), str(monitor), [], poll=dropped)
 
 
+@pytest.mark.old_writer
 def test_the_referenced_copy_keeps_a_few_numbers_a_folder(tmp_path, monkeypatch):
 	job = create_job(str(tmp_path))
 	seed_monitor(job, {'d/e/f': 'x', 'keep': 'k'})
@@ -447,6 +454,7 @@ def test_copy_new_folder_meta_never_follows_a_link_in_the_folders_place(tmp_path
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o755 and os.lstat(target).st_mtime_ns != OLD
 
 
+@pytest.mark.on_054
 def test_a_prune_that_fails_mid_walk_gives_the_folder_times_back(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	v1 = committed_versions(job)[1]
@@ -463,6 +471,7 @@ def test_a_prune_that_fails_mid_walk_gives_the_folder_times_back(tmp_path, monke
 	assert folders_of(v1) == before
 
 
+@pytest.mark.old_writer
 def test_folders_the_replay_makes_above_an_entry_get_their_own_metadata(tmp_path, monkeypatch):
 	# the referenced copy could not make D and D/E (say ENOSPC), whose rows stay: the replay's file in D/E makes both
 	job = create_job(str(tmp_path))
@@ -486,6 +495,7 @@ def test_folders_the_replay_makes_above_an_entry_get_their_own_metadata(tmp_path
 		assert meta(os.path.join(v1, rel)) == meta(os.path.join(job.monitor, rel)), rel
 
 
+@pytest.mark.old_writer
 def test_a_retarget_that_writes_nothing_names_no_folder(tmp_path, monkeypatch):
 	folder = tmp_path / 'V1--x' / 'd'
 	folder.mkdir(parents=True)

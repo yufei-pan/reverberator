@@ -512,6 +512,7 @@ class Killed(BaseException):
 	pass
 
 
+@pytest.mark.on_054
 def test_a_removal_cut_short_between_folder_and_list_leaves_a_list_the_scan_deletes(tmp_path, monkeypatch):
 	# the prune removes the folder first: killed before its change list goes, it leaves a stale list below the oldest
 	job = three_versions(tmp_path)
@@ -657,6 +658,7 @@ def strays_beside(job, kept):
 	return made
 
 
+@pytest.mark.on_054
 @pytest.mark.parametrize('how', ['whole', 'cut_short'])
 def test_the_prune_removes_only_the_versions_own_folder_and_list(tmp_path, monkeypatch, how):
 	# haiku10 O9, O10: the prune's glob of V0's path and * took V0--<ts>.stray and V0--<ts>-extra/ with it
@@ -942,6 +944,7 @@ def test_a_stale_list_not_below_the_oldest_fails_the_scan(tmp_path, number):
 	assert os.path.isfile(stale)
 
 
+@pytest.mark.on_054
 def test_an_rm_failure_inside_the_oldest_keeps_its_lists_and_the_next_prune_finishes(tmp_path, monkeypatch):
 	# the folder goes first, its lists only once it is gone: a removal cut short leaves the version committed
 	job = three_versions(tmp_path)
@@ -1017,6 +1020,7 @@ def test_the_daemons_own_commits_remember_the_vault(tmp_path, monkeypatch):
 	assert vault_names(job) == before
 
 
+@pytest.mark.on_054
 def test_the_prune_keeps_an_entry_named_like_a_list_that_is_no_file(tmp_path):
 	# review11 p3: a folder named V0--<ts>--<record>.nsv went with V0
 	job = three_versions(tmp_path)
@@ -1296,6 +1300,7 @@ def test_a_change_list_that_cannot_be_placed_is_cleaned_up_by_the_next_scan(tmp_
 	assert len(removed) == 1 and scanned == [0, 1, 2] and link_number(job) == 2 and private_folders(job) == []
 
 
+@pytest.mark.on_054
 def test_a_prune_that_finds_no_list_for_the_next_version_makes_none(tmp_path, monkeypatch, capsys):
 	# haiku12 F5: with V1's list out of the listing, the prune wrote an empty one, and the two wedged the job when the
 	# branch came back

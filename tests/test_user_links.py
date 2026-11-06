@@ -590,6 +590,7 @@ def test_a_chain_link_into_a_missing_version_is_dangling_only_by_the_rule(job):
 	assert [rv.resolve_version_entry(job.job_vault, v2, rel, job.monitor).kind for rel in ('a/own', 'deep/er/x')] == ['dangling', 'symlink']
 
 
+@pytest.mark.on_054
 def test_reading_follows_a_link_the_rows_cannot_tell_as_a_chain_link(job):
 	# no row of V1 lands on deep/x: it may be a chain link under rows of another monitored path
 	v0 = write_committed_version(job, 0, {'a/x': 'x'}, timestamp=T0, current=False)
@@ -626,6 +627,7 @@ def shifted_job(job):
 	return old_monitor, v0, v1, link
 
 
+@pytest.mark.on_054
 def test_rows_count_as_unusable_when_the_record_cannot_be_read(job, monkeypatch):
 	old_monitor, v0, v1, link = shifted_job(job)
 	record_pairs(job, [(0, old_monitor), (2, job.monitor)])
@@ -637,6 +639,7 @@ def test_rows_count_as_unusable_when_the_record_cannot_be_read(job, monkeypatch)
 	assert rv.VaultMoves(job.job_vault, job.monitor).follow(link, os.readlink(link)) == os.path.join(v0, 'proj/y')
 
 
+@pytest.mark.on_054
 def test_a_locked_manifest_is_a_record_that_cannot_be_read(job):
 	old_monitor, v0, v1, link = shifted_job(job)
 	record_pairs(job, [(0, old_monitor), (2, job.monitor)])
@@ -652,7 +655,7 @@ def test_a_locked_manifest_is_a_record_that_cannot_be_read(job):
 		locker.close()
 
 
-@pytest.mark.on_054
+@pytest.mark.old_writer
 def test_the_daemon_reads_the_record_from_its_own_manifest(tmp_path, monkeypatch, pruning_keeps):
 	# a read of its own may find the manifest locked by the daemon's own write: the record comes from its connection
 	job, v0, v1 = moved_job(tmp_path)
@@ -674,6 +677,7 @@ def test_the_daemon_reads_the_record_from_its_own_manifest(tmp_path, monkeypatch
 	assert open(os.path.join(rv.list_versions(job.job_vault)[0].path, 'deep/er/x')).read() == 'x'
 
 
+@pytest.mark.on_054
 def test_a_version_below_the_first_recorded_path_is_read_under_it(job):
 	# probe review3/pre044_then_change: V1 from before 0.44, then the path widened from M/proj to M
 	old_monitor, v0, v1, link = shifted_job(job)
@@ -1310,6 +1314,7 @@ def v1_change_lists(job):
 	return [name for name in os.listdir(job.job_vault) if name.startswith('V1--') and name.endswith(rv.CONTENT_FILE_EXTENSION_NAME)]
 
 
+@pytest.mark.on_054
 def test_an_abort_at_the_removal_makes_no_second_change_list(tmp_path, monkeypatch, capsys):
 	# review6: the next version's list was renamed for its new size before the removal failed; the retry found no list
 	# by the old name, and made another
@@ -1327,6 +1332,7 @@ def test_an_abort_at_the_removal_makes_no_second_change_list(tmp_path, monkeypat
 	assert len(v1_change_lists(job)) == 1 and list(info) == [1]
 
 
+@pytest.mark.on_054
 def test_a_removal_cut_short_is_finished_by_the_next_prune(tmp_path, monkeypatch):
 	job = fresh_job(tmp_path)
 	bump(job, 1)
@@ -1386,6 +1392,7 @@ def test_an_oldest_version_that_cannot_be_looked_at_is_kept(tmp_path, monkeypatc
 	assert os.path.islink(os.path.join(v1.path, 'D/secret')) and open(os.path.join(v1.path, 'D/secret')).read() == 'secret'
 
 
+@pytest.mark.on_054
 def test_an_error_from_statvfs_never_escapes_the_prune(tmp_path, monkeypatch):
 	# review7: the statvfs() of V0 for its block size raised out of decrement_stepper, with V0 popped from the dict; the
 	# books now go by st_blocks alone, so nothing asks for the block size
@@ -1677,6 +1684,7 @@ def test_a_kill_that_leaves_the_temp_is_cleaned_by_the_scan_and_never_taken_for_
 	assert len(vault_salt(job)) == 16
 
 
+@pytest.mark.on_054
 def test_pruning_without_the_vaults_secret_names_by_the_inode_and_says_so_once(tmp_path, monkeypatch):
 	job = fresh_job(tmp_path)
 	bump(job, 3)
@@ -2025,6 +2033,7 @@ def test_a_prune_never_gives_back_less_than_nothing(tmp_path, monkeypatch):
 	assert open(os.path.join(v1.path, 'a/U')).read() == 'S' * 20000
 
 
+@pytest.mark.on_054
 def test_the_root_is_never_removed_and_stays_the_oldest(tmp_path):
 	# with progress told by the oldest version changing, a skipped root must stay where it was
 	info = OrderedDict([(0, rv.VaultEntry(0, '/', 0, 1, 1)), (1, rv.VaultEntry(1, str(tmp_path), 0, 1, 1))])
@@ -2136,6 +2145,7 @@ def test_a_tracked_entry_that_cannot_be_looked_at_stays_tracked(tmp_path, monkey
 		manifest.close()
 
 
+@pytest.mark.on_054
 def test_a_prune_makes_no_change_list_for_the_next_version(tmp_path, monkeypatch):
 	# review8 had the list made for a next version without one written whole; Task 2b: none is made, as the next
 	# version's list may be only out of the listing, and the prune stops
@@ -2171,6 +2181,7 @@ def rows_out_of_step(tmp_path, rows):
 	return vault, v0, v1, manifest
 
 
+@pytest.mark.old_writer
 @pytest.mark.parametrize('rows', [('a/b', 'c'), ('a/', 'a/b', 'c')], ids=['file_row', 'folder_and_file_rows'])
 def test_a_row_below_a_file_is_missing_from_the_source(tmp_path, rows):
 	# review9 p5, p6: lstat of a/b, below V0's file a, gives ENOTDIR, which counted as "cannot be looked at": the row was
@@ -2186,6 +2197,7 @@ def test_a_row_below_a_file_is_missing_from_the_source(tmp_path, rows):
 	assert open(os.path.join(v1, 'c')).read() == 'c'
 
 
+@pytest.mark.on_054
 def test_a_link_whose_target_lies_below_a_file_is_left_as_dangling(tmp_path, capsys):
 	# review9 p6: V1's a/b links to V0's a/b, below V0's file a: the walk's lstat gave ENOTDIR and every prune of V0 aborted
 	vault, v0, v1, manifest = rows_out_of_step(tmp_path, ('a/', 'a/b', 'c'))
@@ -2537,6 +2549,7 @@ def test_a_fresh_copy_of_a_setuid_file_keeps_its_bits(tmp_path, monkeypatch):
 T2 = '2021-01-03_00-00-00_-0800'
 
 
+@pytest.mark.on_054
 def test_pruning_keeps_the_copy_of_a_link_the_rows_cannot_tell_in_every_kept_version(job):
 	# no row of V1 lands on deep/x (rows of another monitored path, say): the walk follows the hop its text names, as for
 	# a chain link (UnexplainedChainLink.target), so its copy is materialised before V0 goes, then into V2 when V1 goes

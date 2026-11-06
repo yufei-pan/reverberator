@@ -19,7 +19,7 @@ R_FILES = {
 	'test_backup.py', 'test_backup_replay_ordering.py', 'test_moves_then_changes.py', 'test_rename_heavy_batches.py', 'test_replay_sequences.py',
 	'test_verify_replay.py', 'test_compare_scopes.py', 'test_delta.py', 'test_matched_time.py', 'test_inner_mounts.py', 'test_io_errors.py',
 	'test_pool_guards.py', 'test_vault_flush.py', 'test_manifest.py',
-	'test_vault.py', 'test_retention.py', 'test_vault_scan.py',
+	'test_vault.py', 'test_retention.py', 'test_vault_scan.py', 'test_folder_times.py', 'test_crash_safety.py',
 }
 
 # the 0.54 code that stays for a later release: tests/legacy054.py builds their vaults, as the product's writer no longer does
