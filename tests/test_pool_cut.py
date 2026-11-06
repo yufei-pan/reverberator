@@ -767,8 +767,8 @@ class Conversion(Shape):
 		points.finished()
 		return done
 
-	def again(self, job, fault):
-		return in_child(job, None, lambda: migrate(job), fault)
+	def again(self, job, fault, points=None):
+		return in_child(job, None, lambda: migrate(job), fault, points=points)
 
 	def wrong(self, job) -> tuple:
 		wanted = self.wanted['views']
@@ -910,8 +910,9 @@ def worker_count(bytes_each: int) -> int:
 	return count
 
 
-def run_all(shape: Shape, runs: list, held: int, tag: str = '', cut_fault=None, retry_fault=None) -> list:
-	'''runs side by side; the JSONL lines of those that failed. Every line goes in <base>/<shape><tag>.jsonl.'''
+def run_all(shape: Shape, runs: list, held: int, tag: str = '', cut_fault=None, retry_fault=None, runner=None) -> list:
+	'''runs side by side, each by runner (one_run()); the JSONL lines of those that failed. Every line goes in <base>/<shape><tag>.jsonl.'''
+	runner = runner or one_run
 	count = min(len(runs), worker_count(2 * held))
 	results = os.path.join(shape.base, f'{shape.name}{tag}.jsonl')
 	if tag:
@@ -925,7 +926,7 @@ def run_all(shape: Shape, runs: list, held: int, tag: str = '', cut_fault=None, 
 				for kill, *cuts in runs[number::count]:
 					started = time.monotonic()
 					try:
-						lines = one_run(shape, work, kill, tuple(cuts), cut_fault, retry_fault)
+						lines = runner(shape, work, kill, tuple(cuts), cut_fault, retry_fault)
 					except Exception:
 						lines = [f'the rig: {traceback.format_exc()}']
 					f.write(json.dumps({'shape': shape.name, 'kill': kill, 'cuts': cuts, 'wrong': lines[:8], 'seconds': round(time.monotonic() - started, 3)}) + '\n')
@@ -1125,3 +1126,87 @@ def test_a_conversion_cut_after_the_version_moved_keeps_every_name(request):
 			bad.append(found)
 	print(f'forced-conversion-2: {len(bad)} of {FORCED_TRIES} tries wrong')
 	assert not bad, f'{len(bad)} of {FORCED_TRIES} tries wrong: {bad[:2]}'
+
+
+# --- the retry cut too (a second cut, in the conversion's repair or its go-on) ---
+
+DOUBLE_RUNS = 400
+DOUBLE_SAMPLE = 8
+
+
+def double_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, retry_fault=None) -> list:
+	"""
+	One run of (K, c_1..c_d, K2, c2_1..c2_d): the first cut as one_run() makes it, then the retry (the scan, its repairs and the go-on of the conversion) cut at its
+	step K2 with each disk at its own c2_i, then a third run, the oracle, and one file of each version read through the commands. What is wrong, as lines.
+	A retry that finishes before K2 is not cut, and is the single-cut run.
+	"""
+	first, second = cuts[:shape.disks], cuts[shape.disks:]
+	kill2, cuts2 = second[0], second[1:]
+	job = shape.job_paths()
+	lines = []
+	with Pool(shape.root, work, shape.disks, shape.template, shape.mergerfs_options) as pool:
+		at = {}
+		for disk, position in zip(pool.branches, first):
+			at.setdefault(position, []).append(disk)
+		points = CutPoints(job.job_vault, pool.branches, kill, at)
+		cut = in_child(job, None, lambda: shape.work(job, points), real_flushes(points), points=points)
+		if not cut.killed:
+			return [f'the first run: {cut.error or "it was not cut"}']
+		pool.power_back()
+		at2 = {}
+		for disk, position in zip(pool.branches, cuts2):
+			at2.setdefault(position, []).append(disk)
+		points2 = CutPoints(job.job_vault, pool.branches, kill2, at2)
+		second_run = shape.again(job, real_flushes(points2), points2)
+		if second_run.killed:
+			pool.power_back()
+		third = shape.again(job, real_flushes())
+		if third.error is not None or third.committed is not True:
+			lines.append(f'the third run: {third.error or third}')
+		else:
+			wrong, wanted = shape.wrong(job)
+			lines += wrong
+			if not wrong:
+				lines += shape.read_through_the_commands(job, wanted, work, random.Random(f'{kill} {cuts}'))
+		if lines and shape.keep_failed():
+			pool.keep_images(os.path.join(shape.base, 'failed', f'{shape.name}-double-{kill}-{"-".join(map(str, cuts))}'))
+	return lines
+
+
+def double_runs(trace: list, disks: int) -> list:
+	"""
+	Seeded: first cuts from the planned ones with a retry cut anywhere in its first steps or later, and the first cut at the middle rename of the conversion
+	(some disks have it, some do not) with the retry cut at each early step of the repair.
+	"""
+	rng = random.Random(f'double {disks}')
+	planned = planned_runs(trace, disks)
+	runs = []
+	for _ in range(DOUBLE_RUNS):
+		kill2 = rng.randint(1, 40) if rng.random() < 0.6 else rng.randint(41, 120)
+		runs.append((*rng.choice(planned), kill2, *(rng.randint(max(0, kill2 - 25), kill2) for _ in range(disks))))
+	flushes = flushes_of(trace)
+	for number, step in enumerate(trace, 1):
+		if step[0] == 'rename' and len(step) == 3 and step[1].endswith('/' + rv.CONVERTED_NAME) and step[2].endswith('/' + rv.READY_NAME):
+			f = max(position for position in flushes if position < number)
+			for kill2 in range(1, 41):
+				for gap in (0, 1, 2, 3):
+					c2 = max(0, kill2 - gap)
+					runs.append((number, number, f, kill2, kill2, c2) if disks == 2 else (number, number, f, f, kill2, kill2, c2, c2))
+					runs.append((number, f, number, kill2, c2, kill2) if disks == 2 else (number, f, number, number, kill2, c2, kill2, kill2))
+	return runs
+
+
+@needs_mergerfs
+@pytest.mark.parametrize('name', ['conversion-2', 'conversion-3'])
+def test_a_second_cut_in_the_retry_leaves_every_version_exact(name, request):
+	# the single cut passes what a second one finds: a repair that is not run again to the same state (Review 3's F2 and F5)
+	shape = built_shape(name, request)
+	started = time.monotonic()
+	trace, held = steps_of(shape)
+	runs = double_runs(trace, shape.disks)
+	total = len(runs)
+	if not FULL:
+		runs = random.Random(SEED).sample(runs, DOUBLE_SAMPLE)
+	wrong = run_all(shape, runs, held, '-double', runner=double_run)
+	print(f'{shape.name} with the retry cut too: {len(runs)} of {total} runs in {time.monotonic() - started:.0f} s; {len(wrong)} wrong')
+	assert not wrong, f'{len(wrong)} of {len(runs)} runs wrong: {wrong[:3]}'

@@ -430,6 +430,31 @@ def test_a_batch_on_a_pool_flushes_by_the_phase_not_by_the_entry(tmp_path, fake_
 	assert 0 < len(flushes) <= 7
 
 
+def test_entries_the_sweep_removes_in_many_folders_are_recorded_in_one_pass(tmp_path, fake_pool, monkeypatch):
+	# a verification's sweep removes what no row tracks, from folders the batch had no event in: the settling's pass records them all and flushes
+	# once. taken out, each removal records inline, with a flush before it: one per folder (Review 3's surviving mutant of the pass)
+	job = create_job(str(tmp_path))
+	write_rule(job)
+	folders = [f'd{number}' for number in range(20)]
+	seed_monitor(job, {f'{name}/f.txt': name for name in folders})
+	run_backup(job)
+	seed_monitor(job, {'c.txt': 'c'})
+	run_backup(job, OrderedDict([event_entry(job, 'c.txt', 'create')]))
+	fake_pool.add(job.vault, ['x', 'y'])
+	flushes = []
+	monkeypatch.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: flushes.append(1) or [])
+	newest = max((name for name in os.listdir(job.job_vault) if rv.is_version_folder_name(name)), key=rv.vault_version_number)
+	for name in folders:
+		with open(os.path.join(job.job_vault, newest, name, 'stray.txt'), 'w') as f:
+			f.write('no row tracks it')
+	seed_monitor(job, {'c2.txt': 'c'})
+	run_backup(job, OrderedDict([event_entry(job, 'c2.txt', 'create')]), touched=rv.TouchedScopes([f'{name}/' for name in folders], []), matched_since=time.time_ns())
+	newest = max((name for name in os.listdir(job.job_vault) if rv.is_version_folder_name(name)), key=rv.vault_version_number)
+	assert not any(os.path.lexists(os.path.join(job.job_vault, newest, name, 'stray.txt')) for name in folders)
+	# the prune, the hand-over's three, the replay, the settling, the commit
+	assert 0 < len(flushes) <= 7, len(flushes)
+
+
 def test_a_cut_between_a_records_renames_gets_its_link_back(plain_vault, fake_pool):
 	job = plain_vault.job
 	fake_pool.add(job.vault, ['a', 'b'])
