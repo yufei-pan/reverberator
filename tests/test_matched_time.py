@@ -170,6 +170,14 @@ def test_a_folder_left_unwatched_stops_the_watcher_publishing_read_times(job, po
 		return original(path)
 	monkeypatch.setattr(os, 'scandir', scandir)
 	calls = record_matched_since(monkeypatch)
+	compared = threading.Event()
+	recording = rv.do_backup
+	def comparing(*args, **kwargs):
+		try:
+			return recording(*args, **kwargs)
+		finally:
+			compared.set()
+	monkeypatch.setattr(rv, 'do_backup', comparing)
 	queue = rv.ChangeEventQueue(job.monitor)
 	thread, lock, flag = start_backuper(job, queue)
 	watching = threading.Event()
@@ -178,6 +186,8 @@ def test_a_folder_left_unwatched_stops_the_watcher_publishing_read_times(job, po
 	watcher.start()
 	try:
 		wait_until(watching.is_set, message='watches not in place')
+		# the comparison at the start takes a change made before its walk ends as its own, and this has to be a batch
+		wait_until(compared.is_set, message='the comparison at the start did not end')
 		# a fresh batch elsewhere, while bad/ is unwatched: changes in it raise no event, so its read time claims nothing
 		with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
 			f.write('b')

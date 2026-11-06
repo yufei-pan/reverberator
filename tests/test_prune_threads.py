@@ -147,6 +147,19 @@ class Killed(BaseException):
 	'''The daemon killed in the middle of a prune.'''
 
 
+class SteadyBlocks:
+	'''
+	A file's stat with the blocks its size takes. A prune sums blocks into its records, and ext4 can show a file being
+	written back as 0 blocks for an instant, so two builds of one vault could record different sizes.
+	'''
+	def __init__(self, st):
+		self.st = st
+		self.st_blocks = -(-st.st_size // 4096) * 8
+
+	def __getattr__(self, name):
+		return getattr(self.st, name)
+
+
 def inject(monkeypatch, failures, how):
 	'''The failures of build() and how's filesystem and pools, in place for one prune.'''
 	def eio(path):
@@ -154,7 +167,8 @@ def inject(monkeypatch, failures, how):
 	def lstat(path, *args, **kwargs):
 		if failures.get(os.fspath(path)) == 'lstat':
 			raise eio(path)
-		return real_lstat(path, *args, **kwargs)
+		st = real_lstat(path, *args, **kwargs)
+		return SteadyBlocks(st) if stat.S_ISREG(st.st_mode) else st
 	real_readlink, real_link, real_rename = os.readlink, os.link, os.rename
 	def readlink(path, *args, **kwargs):
 		if failures.get(os.fspath(path)) == 'readlink':
@@ -244,6 +258,20 @@ def run(stepper, root, seed, monkeypatch):
 	return (result, list(info.items()), snapshot(job.job_vault), lines, helper, failed), timed, how
 
 
+def differences(old, new):
+	'''Where two results of run() differ: {part: (old's, new's)}, the lines from the first that differs, the vault by path.'''
+	parts = ('result', 'dict', 'vault', 'lines', 'helper lines', 'FAILED')
+	differ = {parts[at]: (o, n) for at, (o, n) in enumerate(zip(old, new)) if o != n}
+	if 'lines' in differ:
+		o, n = differ['lines']
+		first = next(at for at in range(max(len(o), len(n))) if o[at:at + 1] != n[at:at + 1])
+		differ['lines'] = (o[first:first + 5], n[first:first + 5])
+	if 'vault' in differ:
+		o, n = differ['vault']
+		differ['vault'] = {rel: (o.get(rel), n.get(rel)) for rel in sorted(set(o) | set(n)) if o.get(rel) != n.get(rel)}
+	return differ
+
+
 def test_the_prune_on_threads_comes_out_as_the_walk_on_one_had_it(tmp_path, monkeypatch, small_chunks):
 	root = str(tmp_path / 'vaults')
 	seen = {'moved': 0, 'hard linked': 0, 'two links': 0, 'aborted': 0, 'pool': 0, 'removed': 0, 'dangling': 0, 'again': 0}
@@ -251,16 +279,7 @@ def test_the_prune_on_threads_comes_out_as_the_walk_on_one_had_it(tmp_path, monk
 		old, _, how = run(oracle_decrement_stepper, root, seed, monkeypatch)
 		new, timed, _ = run(rv.decrement_stepper, root, seed, monkeypatch)
 		if new != old:
-			parts = ('result', 'dict', 'vault', 'lines', 'helper lines', 'FAILED')
-			differ = {parts[at]: (o, n) for at, (o, n) in enumerate(zip(old, new)) if o != n}
-			if 'lines' in differ:
-				o, n = differ['lines']
-				first = next(at for at in range(max(len(o), len(n))) if o[at:at + 1] != n[at:at + 1])
-				differ['lines'] = (o[first:first + 5], n[first:first + 5])
-			if 'vault' in differ:
-				o, n = differ['vault']
-				differ['vault'] = {rel: (o.get(rel), n.get(rel)) for rel in sorted(set(o) | set(n)) if o.get(rel) != n.get(rel)}
-			pytest.fail(f'seed {seed}, {how}: the oracle and the new prune differ in (old, new) {differ}')
+			pytest.fail(f'seed {seed}, {how}: the oracle and the new prune differ in (old, new) {differences(old, new)}')
 		result, _, _, lines, _, failed = new
 		assert len(timed) == 1 and timed[0][0] == 'info', f'seed {seed}'
 		messages = ' '.join(message for _, message in lines)

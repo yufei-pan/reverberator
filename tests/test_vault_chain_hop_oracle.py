@@ -157,4 +157,4 @@ def test_the_prune_with_the_new_hop_comes_out_as_with_the_old(tmp_path, monkeypa
 	for seed in range(SEEDS):
 		old, _, how = test_prune_threads.run(old_prune, root, seed, monkeypatch)
 		new, _, _ = test_prune_threads.run(rv.decrement_stepper, root, seed, monkeypatch)
-		assert new == old, (seed, how)
+		assert new == old, (seed, how, test_prune_threads.differences(old, new))

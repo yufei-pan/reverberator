@@ -87,7 +87,7 @@ def test_the_vault_sync_on_a_pool_reaches_each_branch_holding_it(tmp_path, fake_
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
 	calls = recording_syncfs(monkeypatch)
 	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path)
-	assert calls == [os.path.join(a, 'job'), os.path.join(c, 'job')]
+	assert sorted(calls) == [os.path.join(a, 'job'), os.path.join(c, 'job')]
 	assert results == {a: None, c: None}
 
 
@@ -95,7 +95,7 @@ def test_the_vault_sync_on_a_pool_gives_each_branch_its_result(tmp_path, fake_po
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
 	calls = recording_syncfs(monkeypatch, failing=[os.path.join(a, 'job')])
 	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path)
-	assert calls == [os.path.join(a, 'job'), os.path.join(c, 'job')]
+	assert sorted(calls) == [os.path.join(a, 'job'), os.path.join(c, 'job')]
 	assert results[c] is None and results[a].errno == errno.EIO and set(results) == {a, c}
 
 
