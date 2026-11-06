@@ -1558,6 +1558,7 @@ def test_copy_file_meta_never_takes_a_links_target_onto_an_entry_that_is_not_one
 	assert len([message for message, error, _ in lines if error]) == 1
 
 
+@pytest.mark.old_writer
 @pytest.mark.parametrize('how', ['returns', 'raises'])
 def test_a_version_being_written_is_forgotten_on_every_exit(job, monkeypatch, how):
 	seed_monitor(job, {'D/a.txt': 'a'})

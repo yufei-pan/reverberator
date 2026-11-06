@@ -20,7 +20,7 @@ from collections import OrderedDict
 import pytest
 import reverberator as rv
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
-from tests.harness import create_job, event_entry, run_backup, seed_monitor
+from tests.harness import create_job, daemon, event_entry, run_backup, seed_monitor
 
 pytestmark = pytest.mark.unit
 
@@ -761,8 +761,9 @@ def test_every_cut_state_on_a_pool_loses_nothing_after_the_rerun(monkeypatch):
 	monkeypatch.setattr(rv, 'sync_vault_filesystems', REAL_SYNC_VAULT_FILESYSTEMS)
 	# the scratch folders are folders of one filesystem: each is its own disk to the prune, as a pool's SSDs are
 	monkeypatch.setattr(rv, 'mount_holding', lambda table, path: None)
-	# and folders, not mounts: the pool's check would take them for disks not mounted
-	monkeypatch.setattr(rv.PoolGuard, 'problem', lambda self: None)
+	# and folders, not mounts: the pool's check would take them for disks not mounted, in the daemon that builds the vault too
+	for module in (rv, daemon()):
+		monkeypatch.setattr(module.PoolGuard, 'problem', lambda self: None)
 	pool.mount()
 	try:
 		# the monitored tree off the pool, the vault on it
