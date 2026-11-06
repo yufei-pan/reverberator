@@ -350,7 +350,7 @@ def test_do_backup_closes_a_manifest_it_opened_when_it_raises(job, monkeypatch):
 	monkeypatch.setattr(rv, 'get_vault_info', broken)
 	def backup(manifest=None):
 		return rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-			keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', manifest=manifest)
+			only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', manifest=manifest)
 	with pytest.raises(OSError):
 		backup()
 	assert len(opened) == 1 and opened[0].conn is None

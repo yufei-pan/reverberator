@@ -688,7 +688,7 @@ def test_the_locks_are_free_between_the_scan_and_the_roll_forward(plain_r_vault,
 	to_process = rv.ChangeEventQueue(job.monitor)
 	to_process.append(rv.ChangeEvent(time.monotonic(), False, 'full_scan', job.monitor, None))
 	thread = threading.Thread(target=rv.backuper, args=(job.job_name, to_process, threading.Lock(), job.monitor, job.vault, 'N/A', threading.Event(), monitor_fs_flag),
-		kwargs=dict(keep_one_complete_backup=True, only_sync_attributes=False, keep_n_versions=3, backup_size_limit='0'), daemon=True)
+		kwargs=dict(only_sync_attributes=False, keep_n_versions=3, backup_size_limit='0'), daemon=True)
 	thread.start()
 	try:
 		# the monitored path is missing, and the scan has run: a restore goes ahead, and reads exact versions

@@ -271,7 +271,7 @@ from tests.harness import change_list_of, committed_versions, wait_for_committed
 
 def _backup(job, entries=None):
 	return rv.do_backup(OrderedDict() if entries is None else entries, job_name=job.job_name, monitor_path=job.monitor,
-		vault_path=job.vault, keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+		vault_path=job.vault, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 
 
 def _fake_mounts(monkeypatch, job, mounted):
@@ -629,7 +629,7 @@ def test_a_skipped_inner_mount_is_neither_paused_nor_remembered(job, poll_fast, 
 	skip_list = rv.SkipList(job.monitor, ['disk/', 'cache/'])
 	assert rv.paused_inner_mounts(job.monitor, ['disk/'], rv.current_mount_table(), skip_list.skips) == set()
 	_, manifest, _ = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', skip_list=skip_list)
+		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', skip_list=skip_list)
 	try:
 		assert manifest.inner_mounts == []
 	finally:

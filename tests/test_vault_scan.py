@@ -117,7 +117,7 @@ def backup_keeping_two(job):
 		f.write('v3')
 	try:
 		info, manifest, committed = rv.do_backup(OrderedDict([event_entry(job, 'keep', 'modify')]), job_name=job.job_name,
-			monitor_path=job.monitor, vault_path=job.vault, keep_one_complete_backup=True, only_sync_attributes=True,
+			monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=True,
 			keep_n_versions=2, backup_size_limit='0')
 	except rv.JobFailure as e:
 		return e

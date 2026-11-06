@@ -50,7 +50,7 @@ def _state(tmp_path, name='job'):
 
 def _v0(job):
 	_, manifest, _ = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 	manifest.close()
 
 

@@ -100,7 +100,7 @@ class Backup(threading.Thread):
 		self.start()
 
 	def run(self):
-		options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+		options = dict(only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 		options.update(self.kwargs)
 		if 'control' in options:
 			options['job'] = options.pop('control')

@@ -88,6 +88,8 @@ class Legacy054:
 
 	def run(self, job, entries, **kwargs) -> None:
 		kwargs.setdefault('matched_since', time.time_ns())
+		# the 0.54 do_backup() still takes it, and the current one no longer does
+		kwargs.setdefault('keep_one_complete_backup', True)
 		_, manifest, committed = self.module.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, **kwargs)
 		manifest.close()
 		assert committed is True
@@ -96,7 +98,7 @@ class Legacy054:
 		'''One committed backup of entries, as harness.run_backup() runs one on rv, with its options: empty entries compare the whole tree.'''
 		self.isolate()
 		try:
-			self.run(job, OrderedDict() if entries is None else entries, **{**dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0'), **options})
+			self.run(job, OrderedDict() if entries is None else entries, **{**dict(only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0'), **options})
 		finally:
 			self.stop_monitor()
 

@@ -1637,7 +1637,8 @@ def run_daemon():
 			tl.teeprint(log_text(f"Reverting to default value: {DEFAULT_MAX_DELAY}"))
 			max_shapshot_delay_seconds = DEFAULT_MAX_DELAY
 		vault_path = reverb_rule.vault_path
-		keep_one_complete_backup = read_keep_one_complete_backup(reverb_rule.keep_one_complete_backup, job_name)
+		# the cell has no say on design R, but a False in it gets its line
+		read_keep_one_complete_backup(reverb_rule.keep_one_complete_backup, job_name)
 		if reverb_rule.only_sync_attributes.lower() == 'none':
 			only_sync_attributes = DEFAULT_ONLY_SYNC_ATTRIBUTES
 		else:
@@ -1659,7 +1660,7 @@ def run_daemon():
 		# every attempt loads the skip list again once the job's filesystems are ready, then decides on resuming pending transactions
 		startup_args = (job_name, monitor_path, resolve_skip_list_path(reverb_rule.skip_list_file, args.rule_path), reverb_rule.skip_list_file.strip().lower() == 'none')
 		watcher_args = (monitor_fs_flag,monitor_path,to_process,to_process_lock,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds)
-		backuper_args = (job_name,to_process,to_process_lock,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,keep_one_complete_backup,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal)
+		backuper_args = (job_name,to_process,to_process_lock,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal)
 		gate = None
 		if not os.path.exists(monitor_path) and monitor_path_signature.strip().lower() in ('', 'auto'):
 			gate = MonitorGate(monitor_path, monitor_fs_flag, monitor_path_signature)
@@ -1667,7 +1668,7 @@ def run_daemon():
 			dict(full_comparison_interval=full_comparison_interval))
 		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
 		interval_text = f'{full_comparison_interval:.15g}s' if full_comparison_interval else 'off'
-		tl.info(log_text(f'Backup thread will keep one complete backup: {keep_one_complete_backup}, only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {interval_text}'))
+		tl.info(log_text(f'Backup thread will use only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {interval_text}'))
 		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
 		supervisor.start()
 		supervisors.append(supervisor)
@@ -4577,7 +4578,6 @@ def scan_events(scan_folders:list) -> list:
 
 def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,monitor_path:str,vault_path:str,vault_path_signature:str,
 			 to_process_flag:threading.Event,monitor_fs_flag:threading.Event=None,
-			 keep_one_complete_backup:bool = DEFAULT_KEEP_ONE_COMPLETE_BACKUP, 
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
 			 backup_size_limit:str = DEFAULT_BACKUP_SIZE_LIMIT, log_journal:bool = False, startup:JobStartup = None, job:JobControl = None,
 			 full_comparison_interval:float = 0):
@@ -4752,7 +4752,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				# carries. a batch handed back or resumed lost its raw events, and the read time says nothing of them
 				matched_since = time.time_ns() if full_comparison else None if round_tripped else to_process_temp.read_wall_ns
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
-					  keep_one_complete_backup=keep_one_complete_backup,only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
+					  only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
 					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since,job=job)
 				if not committed:
@@ -5478,7 +5478,6 @@ def check_walk_errors(job_name:str, monitor_path:str, errors:list, manifest:'Vau
 
 def do_backup(backup_entries:dict,
 			 job_name:str,monitor_path:str,vault_path:str,
-			 keep_one_complete_backup:bool, 
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
 			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,

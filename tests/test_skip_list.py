@@ -113,10 +113,10 @@ def test_skip_list_change(recorded, current, explicit_none, expected):
 	assert rv.skip_list_change(recorded, current, explicit_none) == expected
 
 
-def _backup(job, entries=None, skip_list=None, keep_one_complete_backup=True, backup_size_limit='0'):
+def _backup(job, entries=None, skip_list=None, backup_size_limit='0'):
 	return rv.do_backup(
 		OrderedDict() if entries is None else entries, job_name=job.job_name, monitor_path=job.monitor,
-		vault_path=job.vault, keep_one_complete_backup=keep_one_complete_backup, only_sync_attributes=True,
+		vault_path=job.vault, only_sync_attributes=True,
 		keep_n_versions=0, backup_size_limit=backup_size_limit, skip_list=skip_list,
 	)
 
@@ -138,14 +138,6 @@ def test_complete_v0_leaves_out_skipped(job, poll_fast):
 	v0 = committed_versions(job)[0]
 	assert os.path.isfile(os.path.join(v0, 'a.txt'))
 	assert not os.path.lexists(os.path.join(v0, 'cache')) and not os.path.lexists(os.path.join(v0, 'b.tmp'))
-
-
-def test_referenced_v0_leaves_out_skipped(job, poll_fast):
-	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x'})
-	_, manifest, committed = _backup(job, skip_list=rv.SkipList(job.monitor, ['cache/']), keep_one_complete_backup=False)
-	assert committed and manifest.files == ['a.txt']
-	manifest.close()
-	assert not os.path.lexists(os.path.join(committed_versions(job)[0], 'cache'))
 
 
 def test_skip_everything_still_commits_v0(job, poll_fast):

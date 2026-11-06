@@ -26,7 +26,7 @@ from tests.version_view_ground_truth import committed_folders
 pytestmark = pytest.mark.skipif(os.geteuid() != 0, reason='the root record is a trusted.* attribute, and a file is chowned')
 
 KEEP_LINE = 'Keep 1 Complete Backup is False for {}: from 0.55 its first version is always a complete copy'
-RULE = dict(keep_one_complete_backup=True, only_sync_attributes=False, keep_n_versions=9, backup_size_limit='0')
+RULE = dict(only_sync_attributes=False, keep_n_versions=9, backup_size_limit='0')
 
 
 @pytest.fixture(autouse=True)

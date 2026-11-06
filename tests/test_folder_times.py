@@ -195,8 +195,7 @@ def check(job, expected, why=''):
 		assert version_folders_of(version) == expected[version], (os.path.basename(version), why)
 
 
-@pytest.mark.parametrize('complete', [True, False])
-def test_every_version_keeps_the_folders_of_its_batch(tmp_path, monkeypatch, complete):
+def test_every_version_keeps_the_folders_of_its_batch(tmp_path, monkeypatch):
 	cases = {'verified': 0, 'full': 0, 'pruned': 0}
 	# the scope of each delta generation: a full mode's is the whole tree
 	compared = []
@@ -206,11 +205,11 @@ def test_every_version_keeps_the_folders_of_its_batch(tmp_path, monkeypatch, com
 		return real(*args, **kwargs)
 	monkeypatch.setattr(rv, 'delta_generate_backup_entries', delta)
 	for seed in range(SEEDS):
-		rng = random.Random(seed * 2 + complete)
+		rng = random.Random(seed * 2 + 1)
 		job = create_job(str(tmp_path / f's{seed}'))
 		seed_tree(rng, job)
 		keep = rng.choice([0, 3, 4])
-		run_backup(job, keep_one_complete_backup=complete, keep_n_versions=keep)
+		run_backup(job, keep_n_versions=keep)
 		expected = {committed_versions(job)[-1]: folders_of(job.monitor)}
 		check(job, expected)
 		for _ in range(BATCHES):
@@ -222,11 +221,11 @@ def test_every_version_keeps_the_folders_of_its_batch(tmp_path, monkeypatch, com
 			if mode == 'full':
 				# no entries: the whole tree is compared with the latest version, and what differs makes a version
 				compared.clear()
-				run_backup(job, keep_one_complete_backup=complete, keep_n_versions=keep)
+				run_backup(job, keep_n_versions=keep)
 				assert compared == [''], compared
 			else:
 				evs = raw(job.monitor, events)
-				run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), keep_one_complete_backup=complete, keep_n_versions=keep,
+				run_backup(job, rv.change_events_to_backup_entries(deque(evs), job.monitor), keep_n_versions=keep,
 					touched=rv.touched_scopes(evs, job.monitor))
 			versions = committed_versions(job)
 			if versions[-1] not in expected:
@@ -234,10 +233,6 @@ def test_every_version_keeps_the_folders_of_its_batch(tmp_path, monkeypatch, com
 				expected[versions[-1]] = folders_of(job.monitor)
 			cases['pruned'] += len(versions) <= before
 			check(job, expected, (seed, mode, events))
-		if not complete:
-			# a referenced backup's files are the live ones, which a restore does not copy out
-			shutil.rmtree(str(tmp_path / f's{seed}'))
-			continue
 		# a restore of the whole tree from the oldest kept version gives each folder its own times
 		write_rule(job)
 		oldest = committed_versions(job)[0]

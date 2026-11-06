@@ -16,7 +16,7 @@ from tests.vault_oracle import snapshot_tree, version_number
 KEEP = 3
 # every batch of a crash run, as a rule row gives them. no Only Sync Attributes, so batch 3's chmod of a file is copied (spec
 # section 9's non-OSA attrib): nothing changes a shared inode, and every version's file metadata stays exact
-OPTIONS = dict(keep_one_complete_backup=True, only_sync_attributes=False, keep_n_versions=KEEP, backup_size_limit='0')
+OPTIONS = dict(only_sync_attributes=False, keep_n_versions=KEEP, backup_size_limit='0')
 # a name ending so reads as not readable in the crash child (crash_child.failing_copy_command)
 UNREADABLE = '.unreadable'
 BATCH3_FILE = 'crash_batch3.pickle'

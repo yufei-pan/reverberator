@@ -624,7 +624,7 @@ def test_interrupted_backup_leaves_the_manifest_on_the_previous_version(job, mon
 	_, manifest, committed = rv.do_backup(
 		OrderedDict([(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues('t', 'modify', None))]),
 		job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0',
+		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0',
 	)
 	manifest.close()
 	assert committed is False

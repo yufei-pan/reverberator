@@ -16,7 +16,7 @@ from tests.vault_oracle import read_view
 
 pytestmark = pytest.mark.unit
 
-OPTIONS = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+OPTIONS = dict(only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 
 
 def backup(job, entries=None, **options):

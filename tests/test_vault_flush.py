@@ -188,7 +188,7 @@ def test_the_commit_flushes_the_job_vault_after_the_swap(job, monkeypatch):
 			return real(*args, **kwargs)
 		monkeypatch.setattr(owner, name, wrapper)
 	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 	manifest.close()
 	assert committed
 	seed_monitor(job, {'b.txt': 'b'})
@@ -196,7 +196,7 @@ def test_the_commit_flushes_the_job_vault_after_the_swap(job, monkeypatch):
 		recording(rv, name)
 	recording(rv.VaultManifest, 'commit')
 	_, manifest, committed = rv.do_backup(OrderedDict([event_entry(job, 'b.txt', 'create')]), job_name=job.job_name,
-		monitor_path=job.monitor, vault_path=job.vault, keep_one_complete_backup=True, only_sync_attributes=True,
+		monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=True,
 		keep_n_versions=0, backup_size_limit='0')
 	manifest.close()
 	assert committed
@@ -460,7 +460,7 @@ def test_a_change_list_appears_whole_or_not_at_all(job, monkeypatch):
 	open(os.path.join(job.monitor, 'a'), 'w').write('a1')
 	with pytest.raises(OSError):
 		rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-			keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+			only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 	monkeypatch.undo()
 	# rows go to a private folder, which no reader of the job vault looks in, so V1 shows no list until the rename
 	lists = [path for path in written if path.endswith(rv.CONTENT_FILE_EXTENSION_NAME)]

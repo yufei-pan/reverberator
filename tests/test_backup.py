@@ -18,7 +18,7 @@ def test_v0_complete_copy_is_not_symlink_into_monitor(job):
 	seed_monitor(job, {'a.txt': 'hello'})
 	info, tracking, committed = rv.do_backup(
 		{}, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True,
+		only_sync_attributes=True,
 		keep_n_versions=0, backup_size_limit='0',
 	)
 	assert committed is True
@@ -31,16 +31,16 @@ def test_v0_complete_copy_is_not_symlink_into_monitor(job):
 	assert 'a.txt' in tracking.files
 
 
-def test_v0_is_a_complete_copy_whatever_the_rule_says(job):
+def test_v0_is_a_complete_copy(job):
 	seed_monitor(job, {'a.txt': 'hello'})
 	info, tracking, committed = rv.do_backup(
 		{}, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=False, only_sync_attributes=True,
+		only_sync_attributes=True,
 		keep_n_versions=0, backup_size_limit='0',
 	)
 	assert committed is True
 	dest = os.path.join(committed_versions(job)[0], 'a.txt')
-	# Keep 1 Complete Backup False made a link into the monitored tree on 0.54: on design R the first version is the tree
+	# the first version is the tree, never a link into the monitored tree (a Keep 1 Complete Backup of False made one on 0.54)
 	assert not os.path.islink(dest) and not os.path.samefile(dest, os.path.join(job.monitor, 'a.txt'))
 	assert open(dest).read() == 'hello'
 
@@ -49,7 +49,7 @@ def test_journal_written_when_enabled(job):
 	seed_monitor(job, {'a.txt': 'hello'})
 	rv.do_backup(
 		{}, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True,
+		only_sync_attributes=True,
 		keep_n_versions=0, backup_size_limit='0', log_journal=True,
 	)
 	assert os.path.isfile(os.path.join(job.job_vault, 'journal.tsv'))
@@ -151,15 +151,14 @@ def test_copy_keeps_inherited_link_when_source_vanished(job):
 
 def test_current_version_is_swapped_atomically(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
-	rv.do_backup({}, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, keep_one_complete_backup=True,
-		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')[1].close()
+	rv.do_backup({}, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')[1].close()
 	link = os.path.join(job.job_vault, 'current_version')
 	first = os.readlink(link)
 	removed = []
 	monkeypatch.setattr(rv.os, 'remove', lambda path, *a, **k: removed.append(path) if path == link else os.unlink(path))
 	open(os.path.join(job.monitor, 'b.txt'), 'w').write('b')
 	rv.do_backup({os.path.join(job.monitor, 'b.txt'): rv.BackupEntryValues('t', 'create', None)}, job_name=job.job_name,
-		monitor_path=job.monitor, vault_path=job.vault, keep_one_complete_backup=True, only_sync_attributes=True,
+		monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=True,
 		keep_n_versions=0, backup_size_limit='0')[1].close()
 	assert link not in removed and os.readlink(link) != first
 	assert not os.path.lexists(os.path.join(job.job_vault, '.current_version.tmp'))

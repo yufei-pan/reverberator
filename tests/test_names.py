@@ -321,13 +321,6 @@ def test_first_full_backup_of_a_bad_name(job):
 	manifest = rv.VaultManifest(job.job_vault)
 	assert manifest.describes(v0) and manifest.folders == ['d\udcff/'] and sorted(manifest.files) == sorted(['bad\udcff.txt', 'd\udcff/x\udcfe', 'ok.txt'])
 	manifest.close()
-	# keep_one_complete_backup off reads as on: the first version is a complete copy under the same bytes
-	other = create_job(os.path.join(job.root, 'referenced'))
-	put(other.monitor, b'bad\xff.txt', 'bad')
-	put(other.monitor, b'd\xff/x\xfe', 'nested')
-	put(other.monitor, b'ok.txt', 'ok')
-	[v0] = backup(other, keep_one_complete_backup=False)
-	assert listing(v0) == expected and not is_link(v0, b'd\xff/x\xfe')
 
 
 def test_events_on_bad_names(job, poll_fast):

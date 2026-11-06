@@ -2074,7 +2074,7 @@ def backup_with_events(job, events):
 	rv.do_reverb_backup = keeping
 	try:
 		_, manifest, committed = rv.do_backup(rv.change_events_to_backup_entries(deque(events), job.monitor), job_name=job.job_name,
-			monitor_path=job.monitor, vault_path=job.vault, keep_one_complete_backup=True, only_sync_attributes=True,
+			monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=True,
 			keep_n_versions=0, backup_size_limit='0', touched=rv.touched_scopes(deque(events), job.monitor))
 		manifest.close()
 	finally:
@@ -2095,7 +2095,7 @@ def test_an_attribute_sync_of_a_users_link_lands_on_its_own_copy_and_records_the
 	else:
 		job = create_job(str(tmp_path))
 		seed_monitor(job, {'D/secret': 'secret', 'keep': 'k'})
-		run_backup(job, keep_one_complete_backup=False)
+		run_backup(job)
 		target_rel = 'D/secret'
 	before = latest(job)
 	target = os.path.join(before.path, target_rel)

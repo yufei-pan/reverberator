@@ -523,7 +523,7 @@ def test_the_rows_still_describe_the_newest(small):
 			assert link == os.readlink(path)
 	assert checked >= 4
 	# nothing differs: a whole comparison of the vault would make no version, and needs no row read again
-	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=small.job_name, monitor_path=small.monitor, vault_path=small.vault, only_sync_attributes=False, keep_one_complete_backup=True, keep_n_versions=9, backup_size_limit='0')
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=small.job_name, monitor_path=small.monitor, vault_path=small.vault, only_sync_attributes=False, keep_n_versions=9, backup_size_limit='0')
 	manifest.close()
 	assert committed is True
 	assert folders_of(small) == names
@@ -740,7 +740,7 @@ def a_batch_is_refused(job):
 	lists = lists_of(job)
 	put_text(job.monitor, 'b.txt', 'a change')
 	with pytest.raises(rv.JobFailure):
-		rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=False, keep_one_complete_backup=True, keep_n_versions=2, backup_size_limit='1')
+		rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=False, keep_n_versions=2, backup_size_limit='1')
 	assert views(job) == before
 	assert lists_of(job) == lists
 	return True
@@ -778,18 +778,18 @@ def test_a_vault_with_a_lost_manifest_is_no_conversion_to_refuse(tmp_path):
 	job = create_job(str(tmp_path))
 	os.makedirs(job.job_vault)
 	put_text(job.monitor, 'a.txt', 'a')
-	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=False, keep_one_complete_backup=True, keep_n_versions=3, backup_size_limit='0')
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=False, keep_n_versions=3, backup_size_limit='0')
 	manifest.close()
 	assert committed is True
 	os.remove(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME))
 	put_text(job.monitor, 'a.txt', 'b')
-	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=False, keep_one_complete_backup=True, keep_n_versions=3, backup_size_limit='0')
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=False, keep_n_versions=3, backup_size_limit='0')
 	manifest.close()
 	assert committed is True
 
 
 def run_options(keep):
-	return dict(only_sync_attributes=False, keep_one_complete_backup=True, keep_n_versions=keep, backup_size_limit='0')
+	return dict(only_sync_attributes=False, keep_n_versions=keep, backup_size_limit='0')
 
 
 def test_the_first_prune_after_conversion_keeps_the_others_exact(every_item):

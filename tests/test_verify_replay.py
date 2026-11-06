@@ -527,7 +527,7 @@ def test_interrupted_verification_commits_nothing(tmp_path, monkeypatch, name):
 	events = raw_events(job, events_spec)
 	try:
 		_, manifest, committed = rv.do_backup(rv.change_events_to_backup_entries(deque(events)), job_name=job.job_name, monitor_path=job.monitor,
-			vault_path=job.vault, keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0',
+			vault_path=job.vault, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0',
 			touched=rv.touched_scopes(events, job.monitor))
 		manifest.close()
 	finally:
@@ -741,7 +741,7 @@ def test_the_root_mount_changed_during_the_verification_fails_the_job(tmp_path, 
 	events = raw_events(job, [('delete', 'D', None, True), ('create', 'D', None, True)])
 	with pytest.raises(rv.JobFailure):
 		rv.do_backup(rv.change_events_to_backup_entries(deque(events)), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-			keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', root_mount=root_mount,
+			only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', root_mount=root_mount,
 			touched=rv.touched_scopes(events, job.monitor))
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0]
 
@@ -1593,7 +1593,7 @@ def test_a_version_folder_already_there_fails_the_attempt(job, monkeypatch, firs
 	lines = spy_on_log(monkeypatch)
 	entries = OrderedDict() if first else OrderedDict([event_entry_for(job, 'D/a.txt', 'modify')])
 	_, manifest, committed = rv.do_backup(entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 	manifest.close()
 	assert os.listdir(outside) == []
 	assert committed is False

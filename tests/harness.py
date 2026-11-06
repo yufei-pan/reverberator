@@ -258,7 +258,7 @@ def run_backup(job: JobPaths, entries=None, **kwargs) -> list:
 		prune_before_a_batch(job, kwargs.pop('keep_n_versions', 0))
 		LEGACY.backup(job, entries, **kwargs)
 		return committed_versions(job)
-	options = dict(keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+	options = dict(only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 	options.update(kwargs)
 	_, manifest, committed = rv.do_backup(
 		OrderedDict() if entries is None else entries, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, **options,

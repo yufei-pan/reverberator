@@ -255,9 +255,9 @@ def test_v0_makes_staging_and_records_the_layout_in_its_commit(r_job):
 	assert check_vault(r_job.job_vault, {0: snapshot_tree(r_job.monitor)}, set()) == []
 
 
-def test_v0_on_r_is_a_complete_copy_whatever_the_rule_says(r_job):
+def test_v0_on_r_is_a_complete_copy(r_job):
 	put_text(r_job.monitor, 'a/b', 'x')
-	run_backup(r_job, keep_one_complete_backup=False)
+	run_backup(r_job)
 	assert check_vault(r_job.job_vault, {0: snapshot_tree(r_job.monitor)}, set()) == []
 	assert not os.path.islink(os.path.join(r_job.job_vault, folder_of(r_job, 0), 'a', 'b'))
 
@@ -679,7 +679,7 @@ def test_a_paused_inner_mount_keeps_its_last_backed_up_contents_in_the_newest_ve
 	mounted()
 	put_text(r_job.monitor, 'a.txt', 'a1')
 	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=r_job.job_name, monitor_path=r_job.monitor, vault_path=r_job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=False, keep_n_versions=0, backup_size_limit='0')
+		only_sync_attributes=False, keep_n_versions=0, backup_size_limit='0')
 	try:
 		assert committed is True and manifest.inner_mounts == ['disk/']
 	finally:

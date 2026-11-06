@@ -18,7 +18,7 @@ def _skip_file(job, text):
 
 def _v0(job, skip_list=None):
 	_, manifest, _ = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
-		keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', skip_list=skip_list)
+		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', skip_list=skip_list)
 	manifest.close()
 
 

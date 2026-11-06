@@ -1344,7 +1344,7 @@ def test_a_killed_commit_then_a_restart_drops_an_xattr_the_user_removed(job, log
 		patched.setattr(rv, 'do_reverb_backup', killed)
 		with pytest.raises(Killed):
 			rv.do_backup(batch(job, (False, 'attrib', 'x', None)), job_name=job.job_name, monitor_path=m, vault_path=job.vault,
-				keep_one_complete_backup=True, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+				only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 	rv.VERSION_MOVES.clear()
 	rv.REAL_VAULT_FOLDERS.clear()
 	versions = run_backup(job)
@@ -1452,7 +1452,7 @@ def test_a_failed_batch_is_followed_by_a_full_comparison_in_the_job_loop(job, mo
 	to_process, lock, flag, ready = rv.ChangeEventQueue(m), threading.Lock(), threading.Event(), threading.Event()
 	ready.set()
 	start_attempt = rv.job_attempt_starter(job.job_name, (job.job_name, m), (ready, m, to_process, lock, flag, None, 1, 1),
-		(job.job_name, to_process, lock, m, job.vault, 'N/A', flag, ready, True, True, 0, '0', False))
+		(job.job_name, to_process, lock, m, job.vault, 'N/A', flag, ready, True, 0, '0', False))
 	control = rv.JobControl(job.job_name)
 	supervisor = threading.Thread(target=lambda: rv.run_job(control, start_attempt), daemon=True)
 	supervisor.start()
