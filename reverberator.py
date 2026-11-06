@@ -7905,7 +7905,8 @@ class VaultManifest:
 		...     reopened.close()
 		True ['d/'] ['c.txt', 'd/x.txt', 'd/y.txt']
 	'''
-	SCHEMA = '2'
+	# '3' adds meta keys only (layout, previous_list, migrated), so a schema '2' database needs only its value changed
+	SCHEMA = '3'
 	# the entries columns of schema '1', which schema '2' follows with copy_version
 	SCHEMA_1_COLUMNS = ('path TEXT PRIMARY KEY, kind TEXT, size INTEGER, mtime_ns INTEGER, mode INTEGER, uid INTEGER, gid INTEGER, '
 		'hash TEXT, link TEXT, unchecked INTEGER, dirty INTEGER NOT NULL DEFAULT 0')
@@ -7931,10 +7932,16 @@ class VaultManifest:
 		self.conn = sqlite3.connect(self.path, isolation_level=None)
 		try:
 			self.conn.execute(MANIFEST_JOURNAL_MODE)
+			# the journal's name on every disk of the vault before any transaction, an upgrade's among them: sqlite's own sync of
+			# the folder after it makes the journal reaches no disk of a mergerfs pool. a rollback or a kill leaves none, or one
+			# not flushed, so it is made empty when missing (sqlite keeps and uses it), and flushed at every open, once per attempt
+			with open(self.path + '-journal', 'ab'):
+				pass
+			fsync_vault_folder(os.path.dirname(self.path))
 			self.conn.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID')
 			schema = self.conn.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
-			if schema is not None and schema[0] == '1':
-				self._upgrade()
+			if schema is not None and schema[0] in ('1', '2'):
+				self._upgrade(schema[0])
 			elif schema is None or schema[0] != self.SCHEMA:
 				self.conn.execute('DROP TABLE IF EXISTS entries')
 				self.conn.execute('DELETE FROM meta')
@@ -7945,28 +7952,24 @@ class VaultManifest:
 			self.conn.execute('CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY) WITHOUT ROWID')
 			# the rows changed since track_changes(), each with whether a row was at its path then
 			self.conn.execute('CREATE TEMP TABLE IF NOT EXISTS changed(path TEXT PRIMARY KEY, existed INTEGER NOT NULL) WITHOUT ROWID')
-			# the journal's name on every disk of the vault before any transaction: sqlite's own sync of the folder after it makes
-			# the journal reaches no disk of a mergerfs pool. a rollback or a kill leaves none, or one not flushed, so it is made
-			# empty when missing (sqlite keeps and uses it), and flushed at every open, once per attempt
-			with open(self.path + '-journal', 'ab'):
-				pass
-			fsync_vault_folder(os.path.dirname(self.path))
 		except BaseException:
 			self.conn.close()
 			raise
 
-	def _upgrade(self):
+	def _upgrade(self, schema:str):
 		'''
-		Upgrade a schema '1' database in place, in one transaction: every row and what meta holds (the version described,
+		Upgrade an older schema's database in place, in one transaction: every row and what meta holds (the version described,
 		the skip list fingerprint, the inner mounts) stay, so no full comparison follows and nothing is read from the vault.
 		'''
 		try:
 			self.begin()
-			self._upgrade_from_schema_1()
+			if schema == '1':
+				self._upgrade_from_schema_1()
+			self.conn.execute("UPDATE meta SET value = ? WHERE key = 'schema'", (self.SCHEMA,))
 			self.commit()
 		except sqlite3.OperationalError as e:
 			# a locked, full or failing disk: closing the connection rolls the upgrade back, and the database stays at
-			# schema '1' for the job's next attempt instead of being discarded at the cost of a full comparison
+			# its old schema for the job's next attempt instead of being discarded at the cost of a full comparison
 			raise JobFailure(f'cannot upgrade the vault database {self.path}: {e}') from e
 
 	def _upgrade_from_schema_1(self):
@@ -7987,7 +7990,6 @@ class VaultManifest:
 		# json.dumps() wrote the inner mounts in ASCII, NAME_ESCAPE as the \u escapes of its UTF-16 pair
 		escape = json.dumps(NAME_ESCAPE)[1:-1]
 		self.conn.execute("UPDATE meta SET value = replace(value, ?, ?) WHERE key = 'inner_mounts'", (escape, escape * 2))
-		self.conn.execute("UPDATE meta SET value = ? WHERE key = 'schema'", (self.SCHEMA,))
 
 	def close(self):
 		if self.conn is not None:
@@ -8147,6 +8149,38 @@ class VaultManifest:
 		if not pairs or pairs[-1][1] != monitor_path:
 			pairs.append((version_number, monitor_path))
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('monitor_paths', ?)", (json.dumps([[number, storable_name(path)] for number, path in pairs]),))
+
+	def _meta_json(self, key:str):
+		'''The JSON meta value at key, or None when there is none.'''
+		row = self.conn.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+		return None if row is None else json.loads(row[0])
+
+	def _set_meta_json(self, key:str, value):
+		# ASCII JSON, which brings back a name that is not UTF-8 as it was
+		self.conn.execute('INSERT OR REPLACE INTO meta VALUES (?, ?)', (key, json.dumps(value)))
+
+	def layout(self):
+		'''The vault's recorded layout ('r' once it is design R), or None when none is recorded.'''
+		row = self.conn.execute("SELECT value FROM meta WHERE key = 'layout'").fetchone()
+		return None if row is None else row[0]
+
+	def set_layout(self, value:str):
+		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('layout', ?)", (value,))
+
+	def previous_list(self):
+		'''{'from': name, 'to': name}: the rename of the previous version's change list that the last commit calls for, or None.'''
+		return self._meta_json('previous_list')
+
+	def set_previous_list(self, old:str, new:str):
+		'''Record the rename of the previous version's change list, in the transaction of the commit that calls for it.'''
+		self._set_meta_json('previous_list', {'from': old, 'to': new})
+
+	def migrated(self) -> set:
+		'''The names of the version folders the migration from 0.54 has made plain trees.'''
+		return set(self._meta_json('migrated') or ())
+
+	def add_migrated(self, name:str):
+		self._set_meta_json('migrated', sorted(self.migrated() | {name}))
 
 	def describes(self, version_path:str) -> bool:
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
@@ -8329,6 +8363,19 @@ class VaultManifest:
 		'''(files, folders) tracked.'''
 		total, folders = self.conn.execute("SELECT count(*), total(substr(path, -1) = '/') FROM entries").fetchone()
 		return total - int(folders), int(folders)
+
+	# the size of a folder, in bytes: a row's own size is that of a file, none for a link and for a row with no record yet
+	FOLDER_BYTES = 4096
+	ROW_BYTES = f"coalesce(sum(CASE WHEN substr(path, -1) = '/' THEN {FOLDER_BYTES} ELSE size END), 0)"
+
+	def totals(self) -> tuple:
+		'''(bytes, inodes) of the rows: each file's size and 4 KiB per folder, each row an inode.'''
+		return self.conn.execute(f'SELECT {self.ROW_BYTES}, count(*) FROM entries').fetchone()
+
+	def size_under(self, folder:str) -> tuple:
+		'''(bytes, inodes) as totals() counts them of the rows strictly under folder: its own row is left out.'''
+		folder = storable_name(folder.rstrip('/') + '/')
+		return self.conn.execute(f'SELECT {self.ROW_BYTES}, count(*) FROM entries WHERE path > ? AND path < ?', (folder, folder_range_end(folder))).fetchone()
 
 	def clear_seen(self):
 		self.conn.execute('DELETE FROM temp.seen')

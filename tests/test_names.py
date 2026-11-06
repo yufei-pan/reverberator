@@ -173,7 +173,7 @@ def test_schema_1_upgrades_in_place(job):
 	assert manifest.folders == ['sub/'] and sorted(manifest.files) == sorted(['a.txt', 'sub/x' + escape + '\U0010ffff', 'n' + escape, 'n' + escape * 2, 'link'])
 	assert manifest.lookup('sub/x' + escape + '\U0010ffff') == unverified() and manifest.lookup('link').link == 'to' + escape + '\U0010ff80'
 	manifest.close()
-	assert schema(job) == '2' and copy_versions(job) == {None} and columns(job)[-1] == 'copy_version'
+	assert schema(job) == rv.VaultManifest.SCHEMA and copy_versions(job) == {None} and columns(job)[-1] == 'copy_version'
 	# the upgraded database is the one a new vault gets
 	os.makedirs(os.path.join(job.root, 'fresh'))
 	rv.VaultManifest(os.path.join(job.root, 'fresh')).close()
@@ -200,7 +200,7 @@ def test_failed_upgrade_leaves_schema_1(job, monkeypatch):
 	manifest = rv.VaultManifest(job.job_vault)
 	assert manifest.skip_fingerprint == 'abc' and manifest.lookup('a.txt').size == 5
 	manifest.close()
-	assert schema(job) == '2'
+	assert schema(job) == rv.VaultManifest.SCHEMA
 
 
 def test_schema_1_without_its_entries_table_upgrades(job):
@@ -214,7 +214,7 @@ def test_schema_1_without_its_entries_table_upgrades(job):
 	assert (manifest.files, manifest.folders) == ([], [])
 	assert manifest.describes(os.path.join(job.job_vault, VERSION)) and manifest.skip_fingerprint == 'abc' and manifest.inner_mounts == ['mnt/']
 	manifest.close()
-	assert schema(job) == '2' and columns(job)[-1] == 'copy_version'
+	assert schema(job) == rv.VaultManifest.SCHEMA and columns(job)[-1] == 'copy_version'
 
 
 def test_unknown_schema_is_started_over(job):
@@ -225,7 +225,7 @@ def test_unknown_schema_is_started_over(job):
 	manifest = rv.VaultManifest(job.job_vault)
 	assert manifest.files == [] and manifest.skip_fingerprint is None and manifest.inner_mounts == []
 	manifest.close()
-	assert schema(job) == '2'
+	assert schema(job) == rv.VaultManifest.SCHEMA
 
 
 def test_upgraded_database_reads_nothing_from_the_vault(job, monkeypatch):
@@ -242,7 +242,7 @@ def test_upgraded_database_reads_nothing_from_the_vault(job, monkeypatch):
 	entries = OrderedDict()
 	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
 	assert entries == OrderedDict() and reads == []
-	assert schema(job) == '2'
+	assert schema(job) == rv.VaultManifest.SCHEMA
 
 
 # --- names that are not UTF-8 through backups, change lists, pending transactions, the journal and the commands ---
@@ -377,7 +377,7 @@ def test_delta_generation_with_bad_names(job, poll_fast):
 	put(job.monitor, b'd\xff/y\xfd', 'deeper')
 	entries = OrderedDict()
 	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
-	assert schema(job) == '2'
+	assert schema(job) == rv.VaultManifest.SCHEMA
 	assert {path: values.event for path, values in entries.items()} == {os.path.join(job.monitor, 'bad\udcff.txt'): 'create',
 		os.path.join(job.monitor, 'sub/x\udcfe'): 'create', os.path.join(job.monitor, 'd\udcff/'): 'create', os.path.join(job.monitor, 'd\udcff/y\udcfd'): 'create',
 		# sub, which holds a new entry, has a new mtime: a full comparison compares it

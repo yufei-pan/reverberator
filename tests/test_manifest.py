@@ -1,11 +1,14 @@
 import errno
+import json
 import os
+import sqlite3
 import threading
 from collections import OrderedDict
 import pytest
 import reverberator as rv
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.harness import create_job, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry
+from tests.test_names import contents, database, schema, schema_1_job
 
 pytestmark = pytest.mark.unit
 
@@ -513,3 +516,224 @@ def test_unreadable_manifest_is_started_over(job):
 	manifest = rv.VaultManifest(job.job_vault)
 	assert manifest.files == [] and not manifest.describes(os.path.join(job.job_vault, 'V0--x'))
 	manifest.close()
+
+
+# --- schema 3: an in-place upgrade, and the keys design R reads ---
+
+def as_schema_2(job):
+	'''The job's manifest with the schema value 0.54 wrote: schema 3 changed only that value.'''
+	conn = database(job)
+	conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema'")
+	conn.close()
+
+
+def without_schema(meta):
+	return [pair for pair in meta if pair[0] != 'schema']
+
+
+def test_schema_2_upgrades_in_place_keeping_rows(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world', 'sub/c/d.txt': 'deep'})
+	run_backup(job)
+	# the second backup reads the copies back once, so every row is recorded and checked
+	run_backup(job)
+	as_schema_2(job)
+	rows, meta = contents(job)
+	assert len(rows) == 5 and all(row[1] is not None for row in rows) and dict(meta)['schema'] == '2'
+	inode = os.stat(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME)).st_ino
+	rv.VaultManifest(job.job_vault).close()
+	after_rows, after_meta = contents(job)
+	assert after_rows == rows and without_schema(after_meta) == without_schema(meta)
+	assert schema(job) == '3' == rv.VaultManifest.SCHEMA
+	assert os.stat(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME)).st_ino == inode
+	# the whole point: no live job reads its tree again
+	reads = []
+	read = rv.read_vault_record
+	monkeypatch.setattr(rv, 'read_vault_record', lambda *args: reads.append(args) or read(*args))
+	entries = OrderedDict()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	assert entries == OrderedDict() and reads == []
+
+
+def test_schema_1_upgrades_to_3(job):
+	schema_1_job(job)
+	rows, meta = contents(job)
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.layout() is None
+	manifest.close()
+	after_rows, after_meta = contents(job)
+	assert schema(job) == '3' and len(after_rows) == len(rows) and {key for key, _ in after_meta} == {key for key, _ in meta}
+	assert dict(after_meta)['skip_fingerprint'] == 'abc' and dict(after_meta)['version'] == dict(meta)['version']
+
+
+def test_schema_2_without_its_entries_table_upgrades(job):
+	# _open commits a new database's schema and its entries table one after the other: a crash between them left this
+	os.makedirs(job.job_vault)
+	conn = database(job)
+	conn.execute('CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID')
+	conn.execute("INSERT INTO meta VALUES ('schema', '2')")
+	conn.close()
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.counts() == (0, 0)
+	manifest.close()
+	assert schema(job) == '3'
+
+
+def test_a_schema_2_the_upgrade_cannot_write_stays_for_the_next_attempt(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'hello'})
+	run_backup(job)
+	as_schema_2(job)
+	before = contents(job)
+	holder = database(job)
+	holder.execute('BEGIN IMMEDIATE')
+	connect = sqlite3.connect
+	monkeypatch.setattr(rv.sqlite3, 'connect', lambda *args, **kwargs: connect(*args, **{**kwargs, 'timeout': 0}))
+	with pytest.raises(rv.JobFailure, match='cannot upgrade'):
+		rv.VaultManifest(job.job_vault)
+	holder.rollback()
+	holder.close()
+	assert contents(job) == before
+	rv.VaultManifest(job.job_vault).close()
+	assert contents(job)[0] == before[0] and schema(job) == '3'
+
+
+def test_the_journal_name_is_flushed_before_an_upgrade_writes(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'hello'})
+	run_backup(job)
+	# the plain connection of as_schema_2 removes the journal when it ends, as a kill can leave a vault with none
+	as_schema_2(job)
+	journal = os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME + '-journal')
+	assert not os.path.exists(journal)
+	calls = []
+	flush = rv.fsync_vault_folder
+	begin = rv.VaultManifest.begin
+
+	def flushing(path):
+		calls.append(('flush', os.path.exists(journal)))
+		return flush(path)
+
+	def beginning(manifest):
+		calls.append(('begin',))
+		return begin(manifest)
+	monkeypatch.setattr(rv, 'fsync_vault_folder', flushing)
+	monkeypatch.setattr(rv.VaultManifest, 'begin', beginning)
+	rv.VaultManifest(job.job_vault).close()
+	assert calls[:2] == [('flush', True), ('begin',)]
+
+
+def test_the_new_keys_roll_back_with_the_transaction(job):
+	os.makedirs(job.job_vault)
+	manifest = rv.VaultManifest(job.job_vault)
+	nothing = (None, None, set())
+	keys = lambda: (manifest.layout(), manifest.previous_list(), manifest.migrated())
+	assert keys() == nothing
+	manifest.begin()
+	manifest.set_layout('r')
+	manifest.set_previous_list('old.list', 'new.list')
+	manifest.add_migrated('V1--a')
+	whole = ('r', {'from': 'old.list', 'to': 'new.list'}, {'V1--a'})
+	assert keys() == whole
+	manifest.rollback()
+	assert keys() == nothing
+	manifest.begin()
+	manifest.set_layout('r')
+	manifest.set_previous_list('old.list', 'new.list')
+	manifest.add_migrated('V1--a')
+	manifest.add_migrated('V2--\udcff')
+	# redoing a version names it once
+	manifest.add_migrated('V1--a')
+	manifest.commit()
+	manifest.close()
+	manifest = rv.VaultManifest(job.job_vault)
+	assert keys() == ('r', {'from': 'old.list', 'to': 'new.list'}, {'V1--a', 'V2--\udcff'})
+	manifest.close()
+	conn = database(job)
+	assert json.loads(dict(conn.execute('SELECT * FROM meta'))['previous_list']) == {'from': 'old.list', 'to': 'new.list'}
+	conn.close()
+
+
+def manifest_of_rows(job, rows):
+	'''A manifest holding rows {path: record}, a path ending with / being a folder, a record of None unverified.'''
+	os.makedirs(job.job_vault, exist_ok=True)
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.begin()
+	for rel in rows:
+		manifest.add(rel)
+	manifest.set_records(rows.items())
+	manifest.commit()
+	return manifest
+
+
+def file_row(size):
+	return rv.ManifestRecord('f', size, 1, 0o100644, 0, 0, 'h', None, 0)
+
+
+LINK_ROW = rv.ManifestRecord('l', None, None, 0o120777, 0, 0, None, 'to', 0)
+FOLDER_ROW = rv.ManifestRecord('d', None, 1, 0o40755, 0, 0, None, None, 0)
+FOLDER_BYTES = 4096
+
+
+def test_totals_counts_files_and_folders(job):
+	manifest = manifest_of_rows(job, {'a.txt': file_row(5), 'd/': FOLDER_ROW, 'd/b.txt': file_row(7), 'd/l': LINK_ROW, 'd/e/': FOLDER_ROW})
+	# a link has no bytes and one inode, as sizes_by_newest_holder counts it
+	assert manifest.totals() == (5 + 7 + 2 * FOLDER_BYTES, 5)
+	big = 3 << 60
+	manifest.begin()
+	manifest.set_records([('a.txt', file_row(big))])
+	manifest.commit()
+	# exact, where a float sum would round
+	assert manifest.totals() == (big + 7 + 2 * FOLDER_BYTES, 5)
+	manifest.close()
+
+
+def test_totals_of_no_rows_is_zero_and_an_unverified_row_is_an_inode_of_no_bytes(job):
+	manifest = manifest_of_rows(job, {})
+	assert manifest.totals() == (0, 0)
+	assert manifest.size_under('d/') == (0, 0)
+	manifest.begin()
+	manifest.add('a.txt')
+	manifest.commit()
+	assert manifest.totals() == (0, 1)
+	manifest.close()
+
+
+def test_size_under_counts_only_below_the_folder(job):
+	escape = rv.NAME_ESCAPE
+	manifest = manifest_of_rows(job, {
+		# a name sorting between d and d/, one beside it sharing its prefix, and one above it
+		'd-': file_row(1000), 'de/': FOLDER_ROW, 'de/x': file_row(2000), 'top': file_row(4000), 'c/': FOLDER_ROW,
+		'd/': FOLDER_ROW, 'd/a': file_row(3), 'd/s/': FOLDER_ROW, 'd/s/b': file_row(4), 'd/l': LINK_ROW,
+		'd/' + escape + '\udcff': file_row(8),
+	})
+	assert manifest.size_under('d/') == (3 + 4 + 8 + FOLDER_BYTES, 5)
+	assert manifest.size_under('d') == manifest.size_under('d/')
+	assert manifest.size_under('d/s/') == (4, 1)
+	assert manifest.size_under('none/') == (0, 0)
+	manifest.close()
+
+
+def test_size_under_finds_a_name_that_is_not_utf8(job):
+	manifest = manifest_of_rows(job, {'b\udcff/': FOLDER_ROW, 'b\udcff/x': file_row(6)})
+	assert manifest.size_under('b\udcff/') == (6, 1)
+	manifest.close()
+
+
+def test_synchronous_stays_full(job):
+	# the manifest's commit is the commit point of a version
+	os.makedirs(job.job_vault)
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.conn.execute('PRAGMA synchronous').fetchone()[0] >= 2
+	manifest.close()
+
+
+def test_a_read_only_open_of_schema_2_reads_no_layout(job):
+	seed_monitor(job, {'a.txt': 'hello'})
+	run_backup(job)
+	as_schema_2(job)
+	before = contents(job)
+	# what a command does: it reads the file as it is, and only a job upgrades it
+	manifest = rv.VaultManifest.__new__(rv.VaultManifest)
+	manifest.conn = sqlite3.connect(f'file:{os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME)}?mode=ro', uri=True)
+	assert (manifest.layout(), manifest.previous_list(), manifest.migrated()) == (None, None, set())
+	manifest.conn.close()
+	assert rv.read_recorded_monitor_paths(job.job_vault)[0] == [(0, job.monitor)]
+	assert contents(job) == before and schema(job) == '2'
