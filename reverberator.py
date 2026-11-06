@@ -6590,7 +6590,9 @@ def give_back_folder_times(previous:str, manifest:'VaultManifest') -> list:
 def forget_pool_cache(path:str) -> None:
 	'''
 	The mergerfs pool holding path drops what it and the kernel hold of its entries, after a change made directly on a disk: for about a second an entry
-	would read as it was, and one of another kind as EIO. A mergerfs with no such command only reads late: an attempt that fails on that goes on at the next.
+	would read as it was, and one of another kind as EIO. A mergerfs with no such command (the error is ignored) does more than read late: in Review 3's runs
+	an attempt may fail on a stale answer and go on at the next, and an attempt may commit with a folder's time wrong (give_back_folder_times() sees the old
+	attribute match the time recorded, and mends nothing). No data is wrong.
 	'''
 	pool = mergerfs_mount(read_mount_table(), path)
 	if pool is not None:
