@@ -510,13 +510,18 @@ def test_fs_monitor_invalidate_clears_the_flag_and_rechecks(tmp_path, monkeypatc
 
 
 def test_fs_monitor_invalidate_sets_the_flag_again_when_the_check_passes(tmp_path, monkeypatch, poll_fast):
-	monkeypatch.setattr(rv, 'check_fs_signature', lambda path, signature: True)
+	# the check is held while the test looks: a fast pass would set the flag again first
+	checks = threading.Event()
+	checks.set()
+	monkeypatch.setattr(rv, 'check_fs_signature', lambda path, signature: checks.wait(5))
 	monitor = rv.fs_signature_monitor()
 	key = (str(tmp_path), 'UUID-X')
 	flag = monitor.register(*key)
 	wait_until(flag.is_set, timeout=3, message='first check')
+	checks.clear()
 	monitor.invalidate(*key)
 	assert not flag.is_set()
+	checks.set()
 	wait_until(flag.is_set, timeout=3, message='set again')
 
 

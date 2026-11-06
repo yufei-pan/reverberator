@@ -815,12 +815,17 @@ def test_a_stop_check_waits_for_all_copies_no_longer_than_one_period(job, tmp_pa
 	run_backup(job)
 	write_rule(job)
 	copy_command = rv.copy_command
-	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['sh', '-c', f'sleep 0.4; exec {" ".join(copy_command(source, dest))}'] if ' ' not in source + dest else copy_command(source, dest))
+	# each copy holds until a wait saw two running: on a busy machine they can start further apart than any fixed sleep
+	overlapped = tmp_path / 'overlapped'
+	held = f'i=0; until [ -e {overlapped} ] || [ $i -ge 500 ]; do sleep 0.01; i=$((i + 1)); done; '
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['sh', '-c', f'{held}exec {" ".join(copy_command(source, dest))}'] if ' ' not in source + dest else copy_command(source, dest))
 	waits = []
 	wait = rv.multiCMD.AsyncExecutor.wait
 
 	def recording(self, timeout=None, *args, **kwargs):
 		waits.append((timeout, len(self.runningThreads)))
+		if len(self.runningThreads) > 1:
+			overlapped.touch()
 		return wait(self, timeout, *args, **kwargs)
 	monkeypatch.setattr(rv.multiCMD.AsyncExecutor, 'wait', recording)
 	out = destination(tmp_path)

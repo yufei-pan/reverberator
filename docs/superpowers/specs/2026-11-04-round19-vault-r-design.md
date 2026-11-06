@@ -271,6 +271,7 @@ Links are judged by their text alone. A user's symlink in V<k> was backed up bef
 history holds no lock that a batch needs.
 - After reading an entry, it re-reads the forward links it followed. If any of them changed, it walks again. Records only ever turn links into real entries.
 - If a walk finds an entry missing or a forward link leading nowhere while the job's backup lock is held (checked with `LOCK_SH|LOCK_NB` and released at once), history waits for the backup to end and walks again. This covers a pool's two-rename moments, including the hand-over window (§5).
+  On an R vault this applies only to a walk that ended in one of the two newest versions: with a version numbered j+2 or higher in the vault, a walk that ended in V<j> has its answer, as no batch touches V<j>. Most paths are missing from some old version, and history would otherwise wait for the whole batch on nearly every path. A vault not yet migrated keeps the wait for every version, as a migration changes them all.
 - A change list renamed by a commit (ENOENT) is listed again.
 
 **Acceptance test** (prototype `recheck.py`, to become a repo test). The crash batch advances one vault change at each read of the walk, starting from each of 260 points in the backup. Every file of V1 and V2 is resolved (about 80 reads per start). Every read must equal the oracle.
