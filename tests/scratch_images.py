@@ -101,8 +101,23 @@ class LoopImage:
 	def mount(self) -> None:
 		subprocess.run(['mount', '-t', 'f2fs', '-o', F2FS_OPTIONS.removeprefix('loop,'), self.device, self.mount_point], check=True)
 
+	def attach(self) -> None:
+		self.device = subprocess.run(['losetup', '-f', '--show', self.image], check=True, capture_output=True, text=True).stdout.strip()
+		ATTACHED[self.device] = self.image
+
+	def detach(self) -> None:
+		ATTACHED.pop(self.device)
+		subprocess.run(['losetup', '-d', self.device], check=True)
+
 	def remount(self) -> None:
+		'''
+		The image, shut down, mounted again on a loop device of its own. A container started meanwhile holds a copy of the mount
+		until it ends, which keeps the stopped filesystem alive through the umount, and a mount of the same device gets that
+		one back, with no recovery and EIO from every fsync. Stopped, it writes nothing when it goes at last.
+		'''
 		subprocess.run(['umount', self.mount_point], check=True)
+		self.detach()
+		self.attach()
 		self.mount()
 
 	def __enter__(self) -> 'LoopImage':
@@ -115,8 +130,7 @@ class LoopImage:
 				f.truncate(self.size_mib << 20)
 			subprocess.run(['mkfs.f2fs', '-q', '-f', '-O', F2FS_FEATURES, self.image], check=True, stdout=subprocess.DEVNULL)
 			os.mkdir(self.mount_point)
-			self.device = subprocess.run(['losetup', '-f', '--show', self.image], check=True, capture_output=True, text=True).stdout.strip()
-			ATTACHED[self.device] = self.image
+			self.attach()
 			self.mount()
 		except BaseException:
 			self.__exit__()
@@ -129,8 +143,7 @@ class LoopImage:
 				subprocess.run(['umount', self.mount_point], check=True)
 		finally:
 			if self.device is not None:
-				ATTACHED.pop(self.device, None)
-				subprocess.run(['losetup', '-d', self.device], check=True)
+				self.detach()
 			shutil.rmtree(self.work)
 			with contextlib.suppress(OSError):
 				os.rmdir(self.tmp)

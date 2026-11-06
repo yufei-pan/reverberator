@@ -494,9 +494,10 @@ def test_many_atomic_saves_in_one_batch_collapse_quickly(job, monkeypatch):
 			rv.ChangeEvent(3.0 * k + 1, False, 'modify', f'{m}/app/state.tmp', None),
 			rv.ChangeEvent(3.0 * k + 2, False, 'move', f'{m}/app/state.json', f'{m}/app/state.tmp')))
 	import time
-	started = time.monotonic()
+	# its own CPU time: a busy machine stretches the wall clock, and a scan per event takes minutes either way
+	started = time.process_time()
 	entries = rv.change_events_to_backup_entries(events, m)
-	assert time.monotonic() - started < 3
+	assert time.process_time() - started < 3
 	assert f'{m}/app/state.json' in entries
 
 
