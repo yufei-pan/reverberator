@@ -162,16 +162,20 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### Size estimates leave out a version's own small blocks
 
 - **Kind:** known limitation.
-- **What the operator sees:** with a size limit, the estimate made before a backup leaves out the new version's own
-  folders, links and xattr blocks (a few KB, at most ~77 KB in testing) and a change kept under a folder moved into a
-  new folder (up to that file's size), so a vault can go over its limit by that much until the next prune. With an
+- **What the operator sees:** with a size limit, the estimate made before a backup leaves out the real folders the
+  batch makes in the previous version, about 4 KiB for each folder it touches and each folder above them (a chmod of
+  3,030 folders passed a limit by 11.64 MiB on the real daemon), the new version's links and xattr blocks (a few KB),
+  and a change under a folder moved into a new folder (up to that file's size), so a vault can go over its limit by
+  that much until the next prune. With an
   inode limit, the estimate leaves out the links the hand-over and unfolds make, so a batch can pass the limit by that
   many until the next prune: a folder of 100K entries that changes makes 100K links in that version. The sizes
   recorded after each backup are measured, each file by its size plus 4 KiB per folder, and each inode in the newest
   version that holds it, so later prunes are right.
-- **Why:** counting them would add estimates for a small, one-batch overshoot.
-- **Revisit when:** a vault's limit is tight enough for it to matter.
-- **Approved:** 2026-10-26, "Known limitation (Recommended)"; 2026-11-05, "Extend the entry (Recommended)".
+- **Why:** counting them means working out before each batch which folders and parents become real, on every job, for
+  an overshoot that lasts until the next prune.
+- **Revisit when:** a job sits at its limit and its batches touch thousands of folders.
+- **Approved:** 2026-10-26, "Known limitation (Recommended)"; 2026-11-05, "Extend the entry (Recommended)"; 2026-11-06,
+  "Change the text (Recommended)", for the measured overshoot of the folders.
 
 ### A vault down to its only version can pass its size limit
 
@@ -556,8 +560,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### status can show one version fewer during a hand-over
 
 - **Kind:** known limitation.
-- **What the operator sees:** while a batch swaps in the new tree, `status` can show one version fewer. history and
-  restore wait through it and read right.
+- **What the operator sees:** on a pool or a filesystem with no exchange, while a batch swaps in the new tree, `status`
+  can show one version fewer. history and restore wait through it and read right.
 - **Why:** a status that waits could hang behind a backup, and status is what is run when things look stuck.
 - **Revisit when:** something reads that count to make a decision.
 - **Approved:** 2026-11-06, "Accept (Recommended)".
@@ -565,9 +569,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### A kill can leave a version folder's own time moved
 
 - **Kind:** known limitation.
-- **What the operator sees:** f2fs moves a folder's mtime on a cross-folder exchange, so the hand-over sets it back. A
-  kill between the skeleton's rename and that call leaves the version folder's own mtime moved. No view of the version
-  shows it, and its contents and restores are right.
+- **What the operator sees:** on a pool or a filesystem with no exchange, the rename from staging can move the version
+  folder's mtime, so the hand-over sets it back. A kill between the skeleton's rename and that call leaves the version
+  folder's own mtime moved. No view of the version shows it, and its contents and restores are right.
 - **Why:** mending it at the scan is more code for a value nothing reads.
 - **Revisit when:** something reads that time.
 - **Approved:** 2026-11-06, "Accept (Recommended)".
@@ -641,3 +645,60 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   2.42.
 - **Why:** the proper fix is in mergerfs: upstream https://github.com/trapexit/mergerfs/issues/1693.
 - **Revisit when:** a mergerfs release carries the fix: then check whether `removing` is still worth keeping.
+
+### A folder moved into a new folder is copied whole
+
+- **Kind:** deferred.
+- **What the operator sees:** `mkdir new; mv big new/` inside one quiet time copies the folder, with no line in the log,
+  though the vault already holds it: 106.6 MB against 0.1 MB for a move into an existing folder. With a size limit, the
+  copy can prune older versions to make room: one such move left 2 of 6 versions, with keep 9. 0.54.2 does the same.
+- **Why:** the fix is in the watcher, which keeps a move-in to a new folder as a delete and a create. It should have its
+  own gates, not ride on a conversion that cannot be undone.
+- **Revisit when:** 0.55.1, started right after 0.55 ships. `carried_in` and `move_destinations` become the main path.
+
+### A batch with nothing to do still makes two commits
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost: a batch whose events collapsed makes two sqlite commits and 10 fdatasyncs,
+  in 321 syscalls. `delta_generate_backup_entries` commits even when it read nothing.
+- **Why:** a lightness item, older than 0.55. It need not ride on the conversion.
+- **Revisit when:** the lightness round after 0.55.1.
+
+### Two folder fsyncs a single-disk job does not need
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost: the fsyncs after `swap_current_version` and in `place_change_list` are
+  there for a pool's disks. Each is an f2fs checkpoint: 455 KiB and 5 checkpoints per one-file batch, 418 KiB and 3
+  without them.
+- **Why:** dropping them is safe by reasoning only, as `finish_r_commit()` finishes a lost swap and rename.
+- **Revisit when:** the lightness round after 0.55.1, with a power-loss run first.
+
+### A moved file is read back and syncs the vault
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost: a plain `mv` loses the file's row, so the comparison reads it back and
+  takes a syncfs. A rename of a folder of 2,000 files read 263.3 MB for a change that wrote 0.1 MB.
+- **Why:** keeping rows, and their unchecked mark, through a move is safe by reasoning only.
+- **Revisit when:** the lightness round after 0.55.1, with a power-loss run first.
+
+### Eight mount table reads in a one-file batch
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost: about 3.5 ms of a batch's 13 ms of CPU on 162 mounts.
+- **Why:** a lightness item; the reads sit in separate steps that need one table passed between them.
+- **Revisit when:** the lightness round after 0.55.1.
+
+### One du process per batch for the size estimate
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost: a process and 135 syscalls for what an lstat per path gives.
+- **Why:** a lightness item; the estimate stays, only the process can go.
+- **Revisit when:** the lightness round after 0.55.1.
+
+### The root's metadata is written every batch
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost: `record_root_meta` writes the xattr each batch, changed or not, 2
+  lsetxattr. A read and compare would leave it unwritten on nearly every batch.
+- **Why:** a lightness item.
+- **Revisit when:** the lightness round after 0.55.1.

@@ -62,7 +62,7 @@ Links point to the **next** version, not to the current one. A path that has not
 **A prune** renames the oldest version away and runs `rm -rf` on it. Nothing links into the oldest version.
 
 **Results:**
-- **Writes, work job:** today 2,678–2,711 MiB per cycle; R about 20–31 MiB.
+- **Writes, work job:** today 2,678–2,711 MiB per cycle; R measured at 24–36 MiB, and 59 MiB on the heaviest ordinary batch (Task 17).
 - **Crash test:** all 249 kill points pass, with every version exact, folder times included.
 - **Code:** planned at about −450 lines in 0.55; measured after the removal, the file is about 1,190 lines longer than at 8a8bcb9, as design R's own code came out larger than the estimate. About −2,400 once the 0.54 reader and scan go, in a later release (§8).
 
@@ -391,7 +391,7 @@ Then set `layout`='r' and remove the salt and marker files. Until the sizes pass
 **Crash-resumable.** Each version is swapped in one call, and redoing a version is idempotent. The rows stay valid (same inodes), so no full comparison is needed.
 
 **Cost (measured at the work job's shape):**
-- 906–942 MiB per version, for 4 versions: about 3.7 GiB, 22 s on scratch.
+- 906–942 MiB per version, for 4 versions: about 3.7 GiB, 22 s on scratch. Task 17 measured 901–993 MiB per version and 208–287 s for the four at 183,000 files per version, at load 25–50, and 1.76 GiB in 23–44 s on the vault as it now is, 80,000 files per version.
 - The next 4 prunes each remove a hard-link tree at 732 MiB: about 2.9 GiB over 4 hours.
 - Total about 6.6 GiB once.
 - docker_volumes about 0.1 GiB, passwords about 0.03 GiB, app_db negligible.
@@ -545,7 +545,7 @@ Line counts are measured with `ast` at HEAD 8a8bcb9, inclusive.
 | vault-writing calls | about 2.6M fs calls | 4.5–7.7K |
 | whole-tree folder event | | 961 MiB once |
 
-The work job goes from about 64 GiB/day to about 0.5–0.75 GiB/day. These numbers were not re-measured after this revision: the only writer change, per-entry records for a folder created over an existing folder, does not occur in the live batches.
+The work job goes from about 64 GiB/day to about 0.6–0.85 GiB/day, 24 hourly batches at Task 17's 24–36 MiB, GC left out. These numbers were not re-measured after this revision: the only writer change, per-entry records for a folder created over an existing folder, does not occur in the live batches.
 
 **Measured on the real code (Task 17, 2026-11-06).** On an f2fs loop image with live-shaped data, through the real `do_backup`, keep-N 5, with the user's OK to take these as the real figures:
 
