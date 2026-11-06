@@ -4,6 +4,8 @@ the batch whole, each version read by the independent oracle (tests/vault_oracle
 '''
 import os
 import shutil
+import stat
+from collections import OrderedDict
 import pytest
 
 import reverberator as rv
@@ -597,6 +599,97 @@ def test_a_missing_deep_unfold_fails_the_oracle(r_job, run_item, monkeypatch):
 	assert check_vault(r_job.job_vault, expected, set()) != []
 	# and the plugin reads the same version as broken, in the same batch
 	assert any('g/h/i/j.txt' in line for line in take_wrong())
+
+
+# --- the entries a backup leaves alone, and the attributes of a user's link ---
+
+def without(view, *prefixes):
+	'''view without the entries at or under the rels (folders without their /).'''
+	return {rel: entry for rel, entry in view.items() if not any(rel == prefix or rel.startswith(prefix + '/') for prefix in prefixes)}
+
+
+def test_a_skip_list_leaves_its_entries_out_of_the_newest_version_and_in_the_older(r_job):
+	for rel, text in (('a.txt', 'a0'), ('cache/x.bin', 'x'), ('cache/deep/y.bin', 'y'), ('noise.log', 'n'), ('sub/b.txt', 'b0'), ('sub/keep.log', 'k')):
+		put_text(r_job.monitor, rel, text)
+	first = snapshot_tree(r_job.monitor)
+	run_backup(r_job, only_sync_attributes=False, **KEPT)
+	# a list the vault has not met: a full comparison finds what it holds of the list's paths, and the next version leaves them out
+	put_text(r_job.monitor, 'a.txt', 'a1')
+	put_text(r_job.monitor, 'noise2.log', 'n2')
+	skip_list = rv.SkipList(r_job.monitor, ['cache/', '*.log', '!sub/keep.log'])
+	run_backup(r_job, only_sync_attributes=False, skip_list=skip_list, **KEPT)
+	second = without(snapshot_tree(r_job.monitor), 'cache', 'noise.log', 'noise2.log')
+	assert 'cache' not in second and 'sub/keep.log' in second
+	assert check_vault(r_job.job_vault, {0: first, 1: second}, set()) == []
+	# and the list holds from then on: a file it skips is not copied, the others are
+	put_text(r_job.monitor, 'cache/more.bin', 'm')
+	put_text(r_job.monitor, 'sub/b.txt', 'b1')
+	run_backup(r_job, only_sync_attributes=False, skip_list=skip_list, **KEPT)
+	third = without(snapshot_tree(r_job.monitor), 'cache', 'noise.log', 'noise2.log')
+	assert check_vault(r_job.job_vault, {0: first, 1: second, 2: third}, set()) == []
+
+
+def test_a_paused_inner_mount_keeps_its_last_backed_up_contents_in_the_newest_version(r_job, monkeypatch):
+	for rel, text in (('a.txt', 'a0'), ('disk/f.txt', 'f'), ('disk/sub/g.txt', 'g')):
+		put_text(r_job.monitor, rel, text)
+	def mounted(*rels):
+		table = [('/', ('1',))] + [(os.path.join(r_job.monitor, rel.rstrip('/')), (rel,)) for rel in rels]
+		monkeypatch.setattr(rv, 'current_mount_table', lambda: table)
+	mounted('disk/')
+	before = snapshot_tree(r_job.monitor)
+	run_backup(r_job, only_sync_attributes=False, **KEPT)
+	# the disk goes: its mount point looks like an empty folder, and the vault keeps what it held of it
+	shutil.rmtree(at(r_job.monitor, 'disk'))
+	os.mkdir(at(r_job.monitor, 'disk'))
+	mounted()
+	put_text(r_job.monitor, 'a.txt', 'a1')
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=r_job.job_name, monitor_path=r_job.monitor, vault_path=r_job.vault,
+		keep_one_complete_backup=True, only_sync_attributes=False, keep_n_versions=0, backup_size_limit='0')
+	try:
+		assert committed is True and manifest.inner_mounts == ['disk/']
+	finally:
+		manifest.close()
+	paused = {rel: entry for rel, entry in before.items() if rel == 'disk' or rel.startswith('disk/')}
+	after = {**without(snapshot_tree(r_job.monitor), 'disk'), **paused}
+	assert check_vault(r_job.job_vault, {0: before, 1: after}, set()) == []
+	# the disk is back, with another file: the next version holds what it holds
+	put_text(r_job.monitor, 'disk/h.txt', 'h')
+	mounted('disk/')
+	run_backup(r_job, only_sync_attributes=False, **KEPT)
+	third = snapshot_tree(r_job.monitor)
+	assert check_vault(r_job.job_vault, {0: before, 1: after, 2: third}, set(), folder_times=False) == []
+
+
+@pytest.mark.chain_ground_truth_allows('blind_spot', reason='the user link is made with the text of a chain link to the version before on purpose')
+def test_the_attributes_of_a_users_link_go_on_the_link_itself_in_the_tree(r_job, monkeypatch):
+	# Only Sync Attributes: a file's attributes go on the end of its chain, and in the tree of design R there is no chain: a link is a user's,
+	# also one whose text has the form of 0.54's chain link to the version before the one being made (../<that version>/<its own path>). To have
+	# the name of a version before it is made, every version folder gets the same time in its name; the plugin reads that link as a daemon
+	# link to nowhere, and no oracle can tell them apart, so the vault is looked at by hand
+	monkeypatch.setattr(rv, 'VAULT_TIMESTAMP_FORMAT', '2030-01-01_00-00-00_-0800')
+	rv.is_version_folder_name.cache_clear()
+	rv.is_previous_version_name.cache_clear()
+	try:
+		build_base(r_job, only_sync_attributes=True, **KEPT)
+		link = at(r_job.monitor, 'ulink')
+		text = '../V3--2030-01-01_00-00-00_-0800/ulink'
+		os.symlink(text, link)
+		backup_events(r_job, [(False, 'create', 'ulink', None)], only_sync_attributes=True, **KEPT)
+		os.chown(link, 1234, 1235, follow_symlinks=False)
+		os.utime(link, ns=(5 * 10 ** 18, 5 * 10 ** 18), follow_symlinks=False)
+		# no chain is followed from a link of the tree
+		followed = []
+		real = rv.vault_chain_hop
+		monkeypatch.setattr(rv, 'vault_chain_hop', lambda job_vault, link_path, *args: followed.append(link_path) or real(job_vault, link_path, *args))
+		backup_events(r_job, [(False, 'attrib', 'ulink', None)], only_sync_attributes=True, **KEPT)
+		assert [path for path in followed if path.endswith('/ulink')] == []
+		path = os.path.join(r_job.job_vault, folder_of(r_job, 4), 'ulink')
+		st = os.lstat(path)
+		assert (stat.S_ISLNK(st.st_mode), st.st_uid, st.st_gid, st.st_mtime_ns, os.readlink(path)) == (True, 1234, 1235, 5 * 10 ** 18, text)
+	finally:
+		take_wrong()
+		rv.is_version_folder_name.cache_clear()
+		rv.is_previous_version_name.cache_clear()
 
 
 # --- the plugin ---
