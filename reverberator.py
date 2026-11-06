@@ -6883,7 +6883,8 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
 	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt. A lone V0 orphan goes. Any other orphan is an error, before
 	anything is removed. A lost manifest names nothing: its private list goes, and the orphan is judged the same way, so a cut tree stays.
-	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54.
+	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54. A vault with no version and no orphan
+	is one started over: the manifest's version is forgotten (a conversion begun is no more to finish), and the next batch is V0.
 	Raises VaultScanError, or PoolNotReady with a disk of the vault's pool missing, as get_vault_info() does.
 	'''
 	guard = PoolGuard([job_vault])
@@ -6897,6 +6898,17 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	except OSError as e:
 		if e.errno == errno.EINVAL:
 			raise no_link_error(link)
+	if not listing.versions and not listing.orphans and (manifest.recorded_version() is not None or manifest.conversion_unfinished()):
+		# every version removed by hand, the hidden files kept: read_vault_whole() has shown it is no disk hiding them, and nothing
+		# is left to finish or to convert. the vault starts at V0, as 0.54's did
+		try:
+			manifest.begin()
+			manifest.forget_version()
+			if manifest.conversion_unfinished():
+				manifest.set_layout('r')
+			manifest.commit()
+		except (OSError, sqlite3.Error) as e:
+			raise VaultScanError(f'cannot forget the version the manifest of {job_vault} records, though the vault holds none: {e}')
 	try:
 		if finish_r_commit(job_vault, manifest, listing):
 			listing = read_vault_whole(job_vault, guard, judge_orphans=False)

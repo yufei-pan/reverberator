@@ -15,7 +15,7 @@ import pytest
 
 import reverberator as rv
 from tests.crash_batches import backup_events, build_base, put_text
-from tests.harness import create_job, write_committed_version, write_incomplete_version
+from tests.harness import create_job, run_backup, write_committed_version, write_incomplete_version
 from tests.vault_oracle import check_vault, compared, read_view, snapshot_tree, version_number
 
 STAMP = '2030-01-01_00-00-00_+0000'
@@ -503,6 +503,69 @@ def test_a_shown_empty_r_vault_is_no_new_vault(r_job):
 		shutil.rmtree(folder)
 	with pytest.raises(rv.VaultScanError):
 		rv.get_vault_info(r_job.job_vault)
+
+
+def start_over(job):
+	"""Every version, list and the current_version link removed by hand, the hidden files kept, the daemon stopped and started again."""
+	for name in os.listdir(job.job_vault):
+		path = os.path.join(job.job_vault, name)
+		if name.startswith('V') or name == 'current_version':
+			shutil.rmtree(path) if os.path.isdir(path) and not os.path.islink(path) else os.remove(path)
+	rv.VAULTS_WITH_VERSIONS.clear()
+
+
+def recorded_version_of(job):
+	manifest = opened_manifest(job)
+	try:
+		return manifest.recorded_version()
+	finally:
+		manifest.close()
+
+
+def test_a_vault_started_over_by_hand_goes_on_as_new(r_job):
+	# the manifest names a version no folder has: with nothing in the vault, it is a vault started over, not one with a lost list
+	build_base(r_job, **KEPT)
+	assert recorded_version_of(r_job) is not None
+	start_over(r_job)
+	assert dict(rv.get_vault_info(r_job.job_vault).vault_info_dict) == {}
+	assert recorded_version_of(r_job) is None
+	run_backup(r_job)
+	assert os.path.isdir(folder_of(r_job, 0)) and recorded_version_of(r_job) == os.path.basename(folder_of(r_job, 0))
+
+
+def test_a_vault_started_over_with_a_conversion_begun_goes_on_as_new(r_job):
+	build_base(r_job, **KEPT)
+	manifest = opened_manifest(r_job)
+	manifest.begin()
+	manifest.conn.execute("DELETE FROM meta WHERE key = 'layout'")
+	manifest.begin_migration({})
+	manifest.commit()
+	assert manifest.conversion_unfinished()
+	manifest.close()
+	start_over(r_job)
+	assert dict(rv.get_vault_info(r_job.job_vault).vault_info_dict) == {}
+	manifest = opened_manifest(r_job)
+	try:
+		assert not manifest.conversion_unfinished()
+	finally:
+		manifest.close()
+	run_backup(r_job)
+	assert os.path.isdir(folder_of(r_job, 0))
+
+
+def test_a_vault_shown_empty_by_a_missing_disk_is_still_refused(r_job, fake_pool, monkeypatch):
+	build_base(r_job, **KEPT)
+	start_over(r_job)
+	disk, _ = fake_pool.add(r_job.vault, ['a', 'b'])
+	real = rv.read_job_vault
+	def reading(*args, **kwargs):
+		listing = real(*args, **kwargs)
+		fake_pool.drop(disk)
+		return listing
+	monkeypatch.setattr(rv, 'read_job_vault', reading)
+	with pytest.raises(rv.PoolNotReady):
+		rv.get_vault_info(r_job.job_vault)
+	assert recorded_version_of(r_job) is not None
 
 
 def test_a_batch_on_a_vault_with_no_layout_leaves_it_to_the_migration(r_job):

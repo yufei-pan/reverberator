@@ -716,6 +716,24 @@ def test_a_vault_started_over_drops_the_pairs_of_its_old_versions(tmp_path):
 		manifest.close()
 
 
+def test_an_r_vault_started_over_drops_the_pairs_of_its_old_versions(tmp_path):
+	# probe review3/record_restart: every version gone by hand, the manifest kept
+	base = create_job(str(tmp_path))
+	a, b = (base._replace(monitor=os.path.join(base.monitor, name)) for name in ('a', 'b'))
+	seed_monitor(base, {'a/x': 'x', 'b/y': 'y'})
+	run_backup(a)
+	run_backup(b)
+	assert rv.recorded_monitor_paths(base.job_vault) == [(0, a.monitor), (1, b.monitor)]
+	for name in os.listdir(base.job_vault):
+		if name.startswith('V'):
+			path = os.path.join(base.job_vault, name)
+			shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+	# started over while the daemon was stopped: one that saw the versions would refuse an emptied vault
+	rv.VAULTS_WITH_VERSIONS.clear()
+	run_backup(b)
+	assert rv.recorded_monitor_paths(base.job_vault) == [(0, b.monitor)]
+
+
 def test_the_record_is_read_from_a_vault_path_that_is_not_utf8(tmp_path):
 	job = create_job(str(tmp_path / 'v\udcff'))
 	os.makedirs(job.job_vault)
