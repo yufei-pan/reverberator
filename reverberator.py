@@ -2124,10 +2124,10 @@ def prepare_change_list(content_file_name:str, rows:list) -> str:
 
 def place_change_list(content_file_name:str, temp_path:str) -> None:
 	'''
-	A change list prepare_change_list() wrote at temp_path renamed into place, the commit point of its version, then the
-	job vault fsynced and the private folder removed. A failed sync of the folder after the rename is only logged, as
-	the version is committed by then. A rename that fails raises, and leaves the list in its private folder: the job's
-	next scan tells the version's commit was cut off by it (read_job_vault()).
+	A change list prepare_change_list() wrote at temp_path renamed into place, the last step of its version's commit (the
+	commit point is the manifest's commit, spec section 2.6), then the job vault fsynced and the private folder removed. A
+	failed sync of the folder after the rename is only logged, as the version is committed by then. A rename that fails
+	raises, and leaves the list in its private folder: the job's next scan places it (finish_r_commit()).
 	'''
 	job_vault = os.path.dirname(os.path.abspath(content_file_name))
 	os.replace(temp_path,content_file_name)
@@ -5817,13 +5817,13 @@ def do_backup(backup_entries:dict,
 				manifest.rollback()
 				raise
 		manifest.copies_unsynced = False
-		# the change list's rows first, written whole and synced in its private folder: the slow part, before either record
-		# names this version, so a crash there leaves an orphan at the link + 1, which the next scan removes. then the
-		# manifest, current_version, and the list's rename into place, the commit point, last: neither record ever
-		# names a version before this one while this one's list is there, so the scan can take the version after the
-		# link for a leftover (read_job_vault()). one the records name without a list is taken for a commit cut off before
-		# its placement only while its list is still in its private folder, and no disk of the vault is missing
-		# (undo_cut_off_commit()); otherwise it is refused, as a missing disk may hide its list
+		# the change list's rows first, written whole and synced in its private folder: the slow part, before the manifest names
+		# this version, so a cut there leaves its list in a private folder, which the next scan removes, and the tree for the next
+		# attempt's roll-forward (a first version's alone is an orphan, removed). then the commit point, the manifest's commit (spec
+		# section 2.6): from it the version is committed, and what follows it (current_version, the previous list's rename, this list's
+		# placement) is finished by the next scan if a cut stops it (finish_r_commit()). the scan does that only while this list is
+		# still in its private folder and no disk of the vault is missing; a manifest naming a version whose list is nowhere is
+		# refused, as a missing disk may hide it
 		prepared_list = prepare_change_list(content_file_name,content_file_content)
 		# a disk of either pool missing now, or mounted again since the batch began, fails the attempt before anything is
 		# committed: a copy may have landed on no disk of the vault, or a file of a missing monitored disk may read as deleted
@@ -5833,10 +5833,10 @@ def do_backup(backup_entries:dict,
 			discard_change_list(prepared_list)
 			manifest.rollback()
 			raise
-		# from here on the records name this version. a failure, a kill, or a disk dropping leaves them and the list in its
-		# private folder as they are: nothing is written while a disk may be out (a link or a list could land in its
+		# from here on the manifest names this version. a failure, a kill, or a disk dropping leaves it, and the list in its
+		# private folder, as they are: nothing is written while a disk may be out (a link or a list could land in its
 		# empty folder on the root disk, and be hidden once it is back), and the job's next scan, once every disk is
-		# there, removes the version as the orphan at the link + 1, or as a commit cut off before its list was placed
+		# there, finishes the commit (finish_r_commit()), current_version and the list's placement, and the next attempt goes on
 		# the paused inner mounts as the verification left them
 		manifest.record_matched(backup_folder,matched_since if not paused and not reported and not unsynced else None,
 			None if latest_version_info is None else latest_version_info.path)
@@ -8859,7 +8859,7 @@ def parse_chain_text(job_vault:str, link_text:str, link_path:str):
 	one in job_vault holding link_path, and <rel> one or more parts, none of them '', '.' or '..', which could lead out
 	of that version. Any count of ../ has the form, as daemons before 0.39 kept the text when a move took the link to
 	another folder depth: vault_chain_hop() judges the count by the version's moves. Nothing on disk is looked at
-	either: vault_chain_hop() checks the folders on the way, chain_form_missing_version() the version.
+	either: vault_chain_hop() checks the folders on the way, and the walk (walk_folder()) that the version is there.
 
 	Examples:
 		>>> link_path = '/v/job/V4--2021-01-02_00-00-00_-0800/deep/x'
@@ -15561,8 +15561,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	Copy what version holds at rel ('' for the monitored path) to target, filling report in. Nothing in the vault is
 	written: it is only read from.
 
-	A file or a user's symlink is one checked copy of the entry its chain links lead to (cp -a copies a symlink as a
-	symlink), put at target only while nothing is there. A folder target is made by this restore alone (anything there
+	A file or a user's symlink is one checked copy of the entry the walk reaches through its forward links (and, on a vault not yet
+	converted, its 0.54 chain links; cp -a copies a symlink as a symlink), put at target only while nothing is there. A folder target is made by this restore alone (anything there
 	is a CommandError, naming aside, where a restore in place moved what was there) with mode 0700, or with resume is
 	the folder already there, made 0700: the unfinished output of an earlier run of this same restore, or for the whole
 	job in place the empty monitored path (the caller checks which). It is marked as this restore's own
