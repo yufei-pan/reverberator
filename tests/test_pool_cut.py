@@ -14,6 +14,7 @@ REVERB_POOL_CUT=full runs every run the spec names; by default a sample. Needs R
 seed and every run go in a JSONL under REVERB_SCRATCH; a failed run keeps its images beside it, one set of them.
 '''
 import contextlib
+import errno
 import json
 import os
 import pickle
@@ -31,6 +32,7 @@ import pytest
 import reverberator as rv
 from tests import chain_ground_truth, version_view_ground_truth as view_truth
 from tests.crash_batches import after_retries, apply_batch3, batch3_of, build_base, expected_of, UNREADABLE
+from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.crash_child import in_child, KillPoints, retry, run_do_backup
 from tests.harness import create_job, run_backup, seed_monitor, write_rule
 from tests.scratch_images import flush_scratch, LoopImage, SCRATCH, shut_down_scratch
@@ -92,15 +94,22 @@ class CutPoints(KillPoints):
 		self.step('end')
 
 
-def real_flushes(disks: list, points: CutPoints = None):
-	'''A crash child's fault: a flush of the vault is a real one of every disk, through the one helper, and a step of points.'''
+def real_flushes(points: CutPoints = None):
+	"""
+	A crash child's fault: a flush of the vault is the real helper (sync_vault_filesystems(): the disks of the pool, a thread and a lock for each, the record of
+	a failed sync), with the system call under it a syncfs of that folder's image (flush_scratch()), and one step of points for the whole flush. The step is
+	taken outside the helper's threads. What the helper takes as arguments is its own: nothing here repeats its signature.
+	"""
 	def fault(module):
-		def sync(job_vault, job_name):
+		def syncfs(folder):
+			if not os.path.isdir(folder):
+				raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), folder)
+			flush_scratch(folder)
+		def sync(*args, **kwargs):
 			if points is not None:
 				points.step('flush')
-			for disk in disks:
-				flush_scratch(disk)
-			return {}
+			return REAL_SYNC_VAULT_FILESYSTEMS(*args, **kwargs)
+		module.syncfs_folder = syncfs
 		module.sync_vault_filesystems = sync
 	return fault
 
@@ -790,7 +799,7 @@ def run_uncut(shape: Shape, work: str, cut_fault=None) -> tuple:
 				json.dump(points.trace, f)
 			return done
 		def fault(module):
-			real_flushes(pool.branches, points)(module)
+			real_flushes(points)(module)
 			if cut_fault is not None:
 				cut_fault(module)
 		outcome = in_child(job, None, batch, fault, points=points)
@@ -812,14 +821,14 @@ def one_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, ret
 			at.setdefault(position, []).append(disk)
 		points = CutPoints(job.job_vault, pool.branches, kill, at)
 		def fault(module):
-			real_flushes(pool.branches, points)(module)
+			real_flushes(points)(module)
 			if cut_fault is not None:
 				cut_fault(module)
 		cut = in_child(job, None, lambda: shape.work(job, points), fault, points=points)
 		if not cut.killed:
 			lines.append(f'the cut run: {cut.error or "it was not cut"}')
 		pool.power_back()
-		flushing = real_flushes(pool.branches)
+		flushing = real_flushes()
 		def fault_after(module):
 			flushing(module)
 			if retry_fault is not None:
@@ -1023,6 +1032,26 @@ def test_a_skipped_pre_record_flush_is_caught(request):
 	assert caught('mixed-2', request, control_runs, '-control-pre-record', cut_fault=no_pre_record_flush)
 
 
+def syncing_one_disk(module):
+	"""A flush that reaches the first disk of the pool only, as a regression in the real helper's choice of disks would make it."""
+	real = module.syncfs_folder
+	def syncfs(folder):
+		if os.sep + 'd1' + os.sep not in folder:
+			real(folder)
+	module.syncfs_folder = syncfs
+
+
+def last_disk_unsynced(trace: list, disks: int) -> list:
+	"""control_runs() with the last disk coming back from its template, which a flush that skipped it leaves it at: its own sync is the first step."""
+	return sorted({(kill, *cuts[:-1], 0) for kill, *cuts in control_runs(trace, disks)})
+
+
+@needs_mergerfs
+def test_a_flush_of_one_disk_of_two_is_caught(request):
+	# the plan puts a disk's own sync at or after the last flush, as a flush takes every disk: so it takes runs where that sync comes first
+	assert caught('mixed-2', request, last_disk_unsynced, '-control-one-disk', cut_fault=syncing_one_disk)
+
+
 def skipping(name: str):
 	def fault(module):
 		setattr(module, name, lambda *args: False)
@@ -1068,10 +1097,10 @@ def one_forced_try(shape: Shape, rename: int, flushed: int) -> dict:
 		version = os.path.join(job.job_vault, name)
 		found['before'] = sorted(os.listdir(version))
 		points = CutPoints(job.job_vault, pool.branches, rename, {max(flushed, 2): [d0], rename: [d1]})
-		cut = in_child(job, None, lambda: shape.work(job, points), real_flushes(pool.branches, points), points=points)
+		cut = in_child(job, None, lambda: shape.work(job, points), real_flushes(points), points=points)
 		found['cut'] = cut.killed
 		pool.power_back()
-		again = shape.again(job, real_flushes(pool.branches))
+		again = shape.again(job, real_flushes())
 		found['retry'] = (again.committed, again.error)
 		found['after'] = sorted(os.listdir(version)) if os.path.isdir(version) else None
 		found['wrong'] = [line[:110] for line in shape.wrong(job)[0]][:8]
