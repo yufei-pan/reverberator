@@ -683,6 +683,7 @@ def real_pool(size_mib=256):
 	A folder under REVERB_SCRATCH to make a job in, its vault a mergerfs over two new f2fs images, with the options the pool tests run with. The
 	monitored tree stays off the pool: a pool moves the mtime of folders above a new entry, and no event says so.
 	"""
+	os.makedirs(SCRATCH, exist_ok=True)
 	root = tempfile.mkdtemp(prefix='pool-writer-', dir=SCRATCH)
 	vault = os.path.join(root, 'vault')
 	os.mkdir(vault)

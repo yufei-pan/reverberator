@@ -95,7 +95,7 @@ class CutPoints(KillPoints):
 def real_flushes(disks: list, points: CutPoints = None):
 	'''A crash child's fault: a flush of the vault is a real one of every disk, through the one helper, and a step of points.'''
 	def fault(module):
-		def sync(job_vault):
+		def sync(job_vault, job_name):
 			if points is not None:
 				points.step('flush')
 			for disk in disks:
