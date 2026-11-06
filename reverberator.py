@@ -6409,6 +6409,7 @@ def remove_orphan(job_vault_path:str, path:str) -> 'str | None':
 	backuperTeeLogToTl(job_vault_path, f'Failed to remove the orphan {path}' + (f': {cause}' if cause else ''), error=True)
 	return cause or 'it is still there'
 
+# goes with the 0.54 reader
 def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 	'''
 	The records of listing.cut_off, a commit cut off before its list was placed, put back as they were before it, so
@@ -6869,12 +6870,14 @@ def finish_tree_rename(job_vault:str, name:str) -> bool:
 		forget_pool_cache(job_vault)
 	return bool(changed)
 
+# goes with the 0.54 reader
 def version_being_converted(job_vault:str, manifest:'VaultManifest') -> 'str | None':
 	'''The folder name of the version a conversion was at: the newest it has not done, as it goes newest first. A manifest lost has only a list with no folder to tell by. Raises OSError.'''
 	done = manifest.migrated()
 	waiting = [name for name in manifest.version_times() if name not in done]
 	return max(waiting, key=vault_version_number) if waiting else version_without_folder(job_vault)
 
+# goes with the 0.54 reader
 def finish_conversion_renames(job_vault:str, manifest:'VaultManifest', names:list) -> bool:
 	'''
 	What a conversion's renames left, names being what staging shows (materialize_version()), directly on each disk, as a rename may be on one and not on another:
@@ -7780,11 +7783,15 @@ def stop_copies(mcae:multiCMD.AsyncExecutor, pending:list, version_path:str, dis
 		pending.clear()
 
 # threads replacing a 0.54 prune's links and removing its top folders: on a single f2fs SSD (170K files) 2 was the lightest of the fast counts
+# goes with the 0.54 reader
 REFERENCED_COPY_THREADS = 2
 # entries a thread takes at once, and the chunks queued ahead of the one handled
+# goes with the 0.54 reader
 REFERENCED_COPY_CHUNK = 64
+# goes with the 0.54 reader
 REFERENCED_COPY_WINDOW = 32
 
+# goes with the 0.54 reader
 def in_row_order(pool:ThreadPoolExecutor, rows, work, handled, stop:threading.Event, check = None, alone = None) -> None:
 	'''
 	work(row) for each of rows on pool, REFERENCED_COPY_CHUNK rows a task, and handled(row, outcome) for each on the
@@ -8411,6 +8418,7 @@ class VaultManifest:
 			since = recorded[1]
 		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('matched', ?)", (json.dumps([os.path.basename(os.path.normpath(version_path)), since]),))
 
+	# goes with the 0.54 reader
 	@property
 	def monitor_paths(self) -> list:
 		'''
@@ -8420,6 +8428,7 @@ class VaultManifest:
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'monitor_paths'").fetchone()
 		return [] if row is None else [(int(number), stored_name(path)) for number, path in json.loads(row[0])]
 
+	# goes with the 0.54 reader
 	def note_monitor_path(self, version_number:int, monitor_path:str):
 		'''
 		Record that the version numbered version_number is written under monitor_path, when the last path recorded is
@@ -8755,6 +8764,7 @@ def is_version_folder_name(name:str) -> bool:
 REAL_VAULT_FOLDERS = OrderedDict()
 REAL_VAULT_FOLDERS_LOCK = threading.Lock()
 
+# goes with the 0.54 reader
 def forget_real_vault_folders(version_path:str):
 	'''
 	Drop the pairs REAL_VAULT_FOLDERS holds for the version folder version_path (absolute and normalised), as pruning
@@ -8772,6 +8782,7 @@ def forget_real_vault_folders(version_path:str):
 		for key in [key for key in REAL_VAULT_FOLDERS if key[1] == version_path or key[1].startswith(under)]:
 			del REAL_VAULT_FOLDERS[key]
 
+# goes with the 0.54 reader
 class UncheckedVaultLink(Exception):
 	'''
 	Whether a vault link is a chain link cannot be told, as a folder on the way to its target, or the target itself,
@@ -8779,6 +8790,7 @@ class UncheckedVaultLink(Exception):
 	never take it for a user's symlink. UnexplainedChainLink, raised when the version's rows cannot tell, is one too.
 	'''
 
+# goes with the 0.54 reader
 def is_real_folder_under(top:str, folder:str) -> bool:
 	'''
 	Whether a path through folder stays in top: top is a real folder, and folder is top or under it with no symlink
@@ -8838,6 +8850,7 @@ def is_real_folder_under(top:str, folder:str) -> bool:
 				REAL_VAULT_FOLDERS.popitem(last=False)
 	return True
 
+# goes with the 0.54 reader
 def parse_chain_text(job_vault:str, link_text:str, link_path:str):
 	'''
 	The version folder name and the parts of the path in it that the relative link at link_path with link_text names,
@@ -8882,6 +8895,7 @@ def parse_chain_text(job_vault:str, link_text:str, link_path:str):
 		return None
 	return name, rel, ups
 
+# goes with the 0.54 reader
 @functools.lru_cache(maxsize=1024)
 def is_previous_version_name(name:str, version_name:str) -> bool:
 	'''
@@ -8910,6 +8924,7 @@ VERSION_MOVES_ROWS_KEPT = 200000
 VERSION_MOVES_KEPT = 1024
 VERSION_MOVES_LOCK = threading.Lock()
 
+# goes with the 0.54 reader
 def remember_version_moves(table:OrderedDict, key:tuple, value) -> bool:
 	'''
 	Keep value for key in table, one of VERSION_MOVES (bounded by VERSION_MOVES_ROWS_KEPT rows in all) and
@@ -8928,6 +8943,7 @@ def remember_version_moves(table:OrderedDict, key:tuple, value) -> bool:
 			table.popitem(last=False)
 	return new
 
+# goes with the 0.54 reader
 def forget_version_moves(version_path:str) -> None:
 	'''Drop what VERSION_MOVES and VERSION_MOVES_WARNED hold for the version at version_path, as pruning removed it.'''
 	version_path = os.path.abspath(version_path)
@@ -8936,6 +8952,7 @@ def forget_version_moves(version_path:str) -> None:
 			for key in [key for key in table if key[0] == version_path]:
 				del table[key]
 
+# goes with the 0.54 reader
 def read_recorded_monitor_paths(job_vault:str, timeout:float = 1) -> tuple:
 	'''
 	(record, locked) for recorded_monitor_paths(), waiting up to timeout seconds for a lock on the manifest: locked
@@ -8960,6 +8977,7 @@ def read_recorded_monitor_paths(job_vault:str, timeout:float = 1) -> tuple:
 	except (OSError, ValueError, TypeError):
 		return None, False
 
+# goes with the 0.54 reader
 def recorded_monitor_paths(job_vault:str):
 	'''
 	The monitored paths the versions of job_vault were written under, as VaultManifest.monitor_paths records them,
@@ -8992,6 +9010,7 @@ def read_command_layout(job_vault:str, timeout:float) -> tuple:
 	except OSError:
 		return None, 'unread'
 
+# goes with the 0.54 reader
 def read_vault_layout_for_command(job_vault:str, stream = None) -> 'str | None':
 	'''
 	The layout the manifest of job_vault records, for the history and restore commands, None when it records none: a vault not
@@ -9012,6 +9031,7 @@ def read_vault_layout_for_command(job_vault:str, stream = None) -> 'str | None':
 		print("Note: the vault's layout cannot be read; links of either kind are followed by their text", file=stream, flush=True)
 	return layout
 
+# goes with the 0.54 reader
 def written_under(monitor_paths:list, number:int, monitor_path:str) -> str:
 	'''
 	The monitored path the version numbered number was written under: the last of monitor_paths ([first version,
@@ -9030,6 +9050,7 @@ def written_under(monitor_paths:list, number:int, monitor_path:str) -> str:
 			found = path
 	return found
 
+# goes with the 0.54 reader
 class VersionMoves:
 	'''
 	A version's move rows, applied in their order, and the rels its rows land on, which tell its chain links from
@@ -9317,6 +9338,7 @@ class VersionMoves:
 		parts = rel.split('/')
 		return any(hash('/'.join(parts[:depth]) + '/') in self._landed for depth in range(1, len(parts)))
 
+# goes with the 0.54 reader
 def change_list_rows_ended(change_list:str) -> tuple:
 	'''
 	(ended, complete_rows) of the change list at change_list: whether its last line ends with a line feed, and, when it
@@ -9333,6 +9355,7 @@ def change_list_rows_ended(change_list:str) -> tuple:
 		lines = sum(chunk.count(b'\n') for chunk in iter(lambda: f.read(1 << 20), b''))
 	return False, max(lines - 1, 0)
 
+# goes with the 0.54 reader
 def read_change_list_moves(change_list:str, monitor:str) -> tuple:
 	'''
 	(moves, landed, why, lasting, had_rows) for read_version_moves(), from the one change list at change_list, under
@@ -9372,6 +9395,7 @@ def read_change_list_moves(change_list:str, monitor:str) -> tuple:
 		return None, frozenset(), 'its change list has no rows', True, False
 	return moves, frozenset(landed), '', True, True
 
+# goes with the 0.54 reader
 def rows_dropping(change_list:str, monitor:str) -> tuple:
 	r"""
 	(deleted, landed) of the change list at change_list, read under monitor, the monitored path its version was written
@@ -9436,6 +9460,7 @@ def rows_dropping(change_list:str, monitor:str) -> tuple:
 			landed.add(rel)
 	return deleted, landed
 
+# goes with the 0.54 reader
 def read_version_moves(job_vault:str, version_path:str, monitor:str) -> tuple:
 	'''
 	(moves, landed, why, lasting) for VersionMoves.of_committed(): the move rows of the change list of the version at
@@ -9456,6 +9481,7 @@ def read_version_moves(job_vault:str, version_path:str, monitor:str) -> tuple:
 	moves, landed, why, _, _ = next((found for found in read if found[4]), read[0])
 	return moves, landed, why, all(found[3] for found in read)
 
+# goes with the 0.54 reader
 class UnexplainedChainLink(UncheckedVaultLink):
 	'''
 	A link of the chain form whose version's rows neither take it there nor account for it otherwise: no row lands on
@@ -9466,6 +9492,7 @@ class UnexplainedChainLink(UncheckedVaultLink):
 		super().__init__(message)
 		self.target = target
 
+# goes with the 0.54 reader
 def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMoves) -> 'str | None':
 	'''
 	Where the link at link_path with link_text leads if it is a chain link of its version, whose moves are moves; else
@@ -9569,8 +9596,10 @@ def vault_chain_hop(job_vault:str, link_path:str, link_text:str, moves:VersionMo
 	return target if verdict else None
 
 # the moves of a version none are read for: its links go by the text alone, with no warning
+# goes with the 0.54 reader
 BY_THE_TEXT = VersionMoves(moves=[], usable=False, why='its links are followed by their text')
 
+# goes with the 0.54 reader
 class CommittedMoves:
 	'''
 	VersionMoves.of_committed() of a version of vault (a VaultMoves), made when an answer first needs it, so a link
@@ -9595,6 +9624,7 @@ class CommittedMoves:
 	def __getattr__(self, name):
 		return getattr(self._get(), name)
 
+# goes with the 0.54 reader
 class VaultMoves:
 	'''
 	The VersionMoves of the versions of job_vault, each asked for once and held for a whole pass (a removal of the
@@ -10966,9 +10996,11 @@ PRUNE_SALT_TEMP_INFIX = '.tmp-'
 # cannot read it, was cut off before its flush, and checks the oldest version against the next (decrement_stepper())
 PRUNE_MARKER_FILE_NAME = '.reverberator_pruning'
 
+# goes with the 0.54 reader
 class UnreadablePruneMarker(Exception):
 	"""The job vault's PRUNE_MARKER_FILE_NAME is there but cannot be read, or holds no {"walking": name or null} line."""
 
+# goes with the 0.54 reader
 def read_prune_marker(job_vault:str) -> 'str | None':
 	"""
 	The version folder name the job vault's PRUNE_MARKER_FILE_NAME says a prune is walking, None when it says none or is
@@ -10996,6 +11028,7 @@ def read_prune_marker(job_vault:str) -> 'str | None':
 		raise UnreadablePruneMarker(f'{path} holds no prune marker (walking is {walking!r})')
 	return walking
 
+# goes with the 0.54 reader
 def write_prune_marker(job_vault:str, walking:'str | None') -> None:
 	"""
 	PRUNE_MARKER_FILE_NAME in the job vault written to say the prune walks the version folder walking (None: none), in
@@ -11026,6 +11059,7 @@ def write_prune_marker(job_vault:str, walking:'str | None') -> None:
 				os.remove(path)
 		raise
 
+# goes with the 0.54 reader
 def vault_prune_salt(job_vault:str, job_name:str):
 	'''
 	The job vault's secret for the names pruning hard links copies under (prune_link_path()): PRUNE_SALT_BYTES random
@@ -11117,6 +11151,7 @@ def vault_prune_salt(job_vault:str, job_name:str):
 		return without(str(e))
 	return secret
 
+# goes with the 0.54 reader
 def prune_link_path(link_path:str, copy_st:os.stat_result, salt:bytes) -> str:
 	'''
 	The name beside the chain link at link_path that pruning hard links the copy copy_st was read from under, before
@@ -11144,6 +11179,7 @@ def prune_link_path(link_path:str, copy_st:os.stat_result, salt:bytes) -> str:
 def same_inode(first:os.stat_result, second:os.stat_result) -> bool:
 	return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
+# goes with the 0.54 reader
 class PathHashes:
 	'''
 	A set of keys (paths, or (st_dev, st_ino) pairs) kept by their 64-bit hash() alone, in one array with open
@@ -11194,6 +11230,7 @@ class PathHashes:
 	def __len__(self) -> int:
 		return self._count
 
+# goes with the 0.54 reader
 def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:str, monitor_paths:list = None, clock = time.monotonic,
 		prune_salt:bytes = None, threads:int = None) -> tuple:
 	'''
@@ -12886,10 +12923,12 @@ def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManif
 		writer.flush()
 	return writer
 
+# goes with the 0.54 reader
 def is_chain_link(job_vault:str, path:str) -> bool:
 	'''Whether the link at path of a version is a 0.54 chain link: by its text alone, as the walk has it (parse_chain_text()).'''
 	return parse_chain_text(job_vault, os.readlink(path), path) is not None
 
+# goes with the 0.54 reader
 def needs_plain_tree(job_vault:str, name:str) -> bool:
 	'''Whether the version in folder name holds what a plain tree does not: a 0.54 chain link, or a prune's temp. Raises OSError.'''
 	version = os.path.join(job_vault, name)
@@ -12903,6 +12942,7 @@ def needs_plain_tree(job_vault:str, name:str) -> bool:
 					return True
 	return False
 
+# goes with the 0.54 reader
 def plain_tree_entry(job_vault:str, name:str, rel:str, path:str, is_link:bool) -> str:
 	'''
 	The path of the entry that rel of the version in folder name is in a plain tree, path being rel there and is_link whether it
@@ -12920,6 +12960,7 @@ def plain_tree_entry(job_vault:str, name:str, rel:str, path:str, is_link:bool) -
 		return path
 	raise JobFailure(f'cannot read {rel} of {name} to convert it: {walked.kind} {walked.detail}')
 
+# goes with the 0.54 reader
 def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 	'''
 	The version in folder name of job_vault becomes a plain tree (spec section 7): built in staging, real folders with the version's
@@ -12977,6 +13018,7 @@ def materialize_version(job_vault:str, name:str, stop = None) -> bool:
 	empty_staging(job_vault)
 	return True
 
+# goes with the 0.54 reader
 def sizes_pass(job_vault:str) -> None:
 	'''
 	Every change list of job_vault names what spec section 6 says its version holds: each inode counted once, in the newest version
@@ -12997,6 +13039,7 @@ def sizes_pass(job_vault:str) -> None:
 	# each time, as a cut pass may have left its renames unflushed, and the layout's commit must not outlive them
 	fsync_vault_folder(job_vault)
 
+# goes with the 0.54 reader
 def remove_054_files(job_vault:str) -> None:
 	'''Remove the files only the 0.54 prune had a use for. A failure is logged, and the next scan looks again: nothing reads them on design R.'''
 	for name in (PRUNE_SALT_FILE_NAME, PRUNE_MARKER_FILE_NAME):
@@ -13007,6 +13050,7 @@ def remove_054_files(job_vault:str) -> None:
 		except OSError as e:
 			backuperTeeLogToTl(job_vault, f'Cannot remove {name} for now: {e}', error=True)
 
+# goes with the 0.54 reader
 def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, stop = None) -> bool:
 	'''
 	Convert job_vault from 0.54 (spec section 7), the 0.54 rules or the R scan having run, under the job's locks. Each version
@@ -13069,6 +13113,7 @@ def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, sto
 	remove_054_files(job_vault)
 	return True
 
+# goes with the 0.54 reader
 def finish_cut_prune(job_vault:str, versions:OrderedDict, job_name:str, monitor_path:str) -> None:
 	'''
 	One of the 0.54 rules (spec section 3.1), on a vault on a mergerfs pool: a prune of the oldest of versions cut off before its first
@@ -13092,6 +13137,7 @@ def finish_cut_prune(job_vault:str, versions:OrderedDict, job_name:str, monitor_
 	if oldest in versions:
 		raise JobFailure(f'the prune of {path} cut off before its flush has not finished, so {job_vault} is not converted from 0.54 yet')
 
+# goes with the 0.54 reader
 def convert_at_start(job_vault:str, info:VaultInfo, job_name:str, monitor_path:str, running, job:JobControl = None) -> 'VaultInfo | None':
 	'''
 	The scan of a job's start once its vault is on design R, the job's locks held, and the 0.54 rules or the R scan having given info,
@@ -13895,6 +13941,7 @@ def walk_folder(job_vault:str, folder_name:str, rel:str, backward:bool) -> Walke
 						name, forward, hop, came_by = following, True, True, None
 						break
 					# the daemon linked files only, so a 0.54 chain link is only ever the last part
+					# goes with the 0.54 reader (the backward walk)
 					chain = parse_chain_text(vault, text, path) if backward and last and not forward else None
 					if chain is not None:
 						followed.append((path, text))
@@ -13999,6 +14046,7 @@ def newest_folder_number(job_vault:str) -> 'int | None':
 
 # how a command that holds no lock a batch needs reads a vault. backward: as walk_version() has it. job, state_dir: read_walked()'s,
 # so a read waits for that job's batch when it has to
+# goes with the 0.54 reader (its backward field)
 VaultReading = namedtuple('VaultReading', ['backward', 'job', 'state_dir'])
 
 def vault_reading(job_vault:str, job:str = None, state_dir:str = None) -> VaultReading:
@@ -15437,6 +15485,7 @@ def remove_stale_partials(folder:str, held:str) -> None:
 			if PARTIAL_COPY_NAME.fullmatch(entry.name) and not entry.is_dir(follow_symlinks=False) and not os.path.lexists(os.path.join(held, entry.name)):
 				os.unlink(entry.path)
 
+# goes with the 0.54 reader
 def is_prune_temp(job_vault:str, version_path:str, rel:str, monitor_path:str) -> bool:
 	'''
 	Whether rel in the version at version_path is the temporary a prune cut off between its hard link and its rename left
