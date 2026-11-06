@@ -223,7 +223,8 @@ def test_a_lost_manifest_on_r_lists_the_tree_before_the_hand_over(r_job):
 	backup_events(r_job, events, **KEPT)
 	assert check_vault(r_job.job_vault, expected, set()) == []
 	manifest = rv.VaultManifest(r_job.job_vault)
-	assert manifest.layout() == 'r' and manifest.lookup('b/y.txt') is not None
+	# the layout comes back through the migration's sizes pass (plan S1), never a batch
+	assert manifest.layout() is None and manifest.lookup('b/y.txt') is not None
 	manifest.close()
 
 

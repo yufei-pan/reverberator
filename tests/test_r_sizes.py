@@ -500,8 +500,8 @@ def test_the_commit_renames_the_previous_list_and_names_it_first(r_job, run, mon
 	assert order == [('commit', {'from': old_list, 'to': new_name}, True), 'swap', ('rename', new_name), 'place']
 
 
-def test_the_previous_list_is_on_the_disk_before_the_new_one_is_placed(r_job, run, monkeypatch):
-	# the scan finishes a commit only while its list is in its private folder: a placed list over an old name would stand for good, and the old name says the whole tree
+def test_the_commit_syncs_nothing_between_the_previous_list_and_the_new_one(r_job, run, monkeypatch):
+	# the scan renames the previous list whenever its old name is still there, so a power loss may keep the placement and lose the rename (tests/test_r_scan.py)
 	put_text(r_job.monitor, 'f', 'old')
 	put_text(r_job.monitor, 'other', 'other')
 	one = run(keep_n_versions=0)
@@ -526,7 +526,7 @@ def test_the_previous_list_is_on_the_disk_before_the_new_one_is_placed(r_job, ru
 	one.events([(False, 'modify', 'f', None)])
 	monkeypatch.undo()
 	at = order.index('rename')
-	assert order[at:at + 3] == ['rename', 'sync', 'place']
+	assert order[at:at + 2] == ['rename', 'place']
 
 
 def test_a_previous_list_that_is_gone_fails_the_attempt_before_the_commit(r_job, run):

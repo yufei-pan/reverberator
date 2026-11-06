@@ -97,7 +97,7 @@ REVERB_RULE_HEADER = ['job_name', 'mon_path','vault_path', 'mon_fs_signature',
 		'vault_fs_signature', 'skip_list_file', 'full_comparison_interval', 'chain_length', 'copy_threads']
 SKIP_LIST_COLUMN_DESCRIPTIONS = ('A gitignore style list of paths not to back up, matched relative to the monitored path', 'Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything')
 VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
-VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes']
+VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes', 'tree']
 VAULT_TIMESTAMP_FORMAT = '%Y-%m-%d_%H-%M-%S_%z'
 MANIFEST_RECORD_HEADER = ['kind','size','mtime_ns','mode','uid','gid','hash','link','unchecked']
 
@@ -1093,7 +1093,8 @@ def nameless_start(rule_path:str, rule):
 # the last three columns are optional: 12 positional cells still make a rule
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER, defaults=('', '', ''))
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
-VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER)
+# tree: on design R, the folder of a cut batch's tree, which the next attempt finishes (read_job_vault_r()); None with none
+VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER, defaults=[None])
 ManifestRecord = namedtuple('ManifestRecord', MANIFEST_RECORD_HEADER)
 # a copy queued on an executor, which finish_copies() puts in place
 PendingCopy = namedtuple('PendingCopy', ['task', 'source_path', 'temp_path', 'dest_path'])
@@ -4580,7 +4581,7 @@ FS_SIGNATURE_MONITOR = fs_signature_monitor()
 
 #%% ---- Backup ----
 def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,monitor_path:str,vault_path:str,vaultInfo:VaultInfo = None,
-			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,pool_guard:'PoolGuard' = None) -> tuple:
+			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,pool_guard:'PoolGuard' = None,job:JobControl = None) -> tuple:
 	'''
 	Fold a batch's scan events (scan_folders, the folders they name) into its backup_entries: each scanned folder is
 	compared with the latest version, and what that finds replaces the batch's entries at or under it. A folder inside
@@ -4588,7 +4589,9 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 	Returns (vaultInfo, manifest, full_comparison): full_comparison asks for the whole tree instead, for a scan of the
 	monitored path itself or a vault with no version yet. JobFailure is raised, before anything is compared, when the
 	monitored path no longer shows the filesystem root_mount fingerprints. reported holds the unreadable paths this batch
-	already logged. pool_guard goes to each comparison (delta_generate_backup_entries()).
+	already logged. pool_guard goes to each comparison (delta_generate_backup_entries()). With no vaultInfo the vault is
+	scanned, which can change it, so under the job's locks: job (a JobControl) is whose wait that is, and a stop during it
+	returns with nothing compared.
 	'''
 	scopes = scan_scopes(monitor_path,scan_folders)
 	if scopes == ['']:
@@ -4599,7 +4602,13 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 	check_monitored_mount(monitor_path,mount_table,root_mount)
 	job_vault = os.path.join(vault_path,job_name)
 	if not vaultInfo or not vaultInfo.vault_info_dict:
-		vaultInfo = get_vault_info(job_vault_path=job_vault)
+		locks = BackupLocks(job_name, job=job)
+		if not locks.take():
+			return vaultInfo, manifest, False
+		try:
+			vaultInfo = get_vault_info(job_vault_path=job_vault,manifest=manifest)
+		finally:
+			locks.release()
 	if not vaultInfo.vault_info_dict:
 		# nothing to compare with: the first backup copies the whole tree
 		return vaultInfo, manifest, True
@@ -4790,7 +4799,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			follow_up = False
 			if scan_folders and not full_comparison:
 				vaultInfo,manifest,full_comparison = compare_scanned_folders(backupEntries,scan_folders,job_name,monitor_path,vault_path,
-					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported,pool_guard=pool_guard)
+					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported,pool_guard=pool_guard,job=job)
 				if not running():
 					break
 				if full_comparison:
@@ -5616,7 +5625,7 @@ def do_backup(backup_entries:dict,
 			# the scan can change the vault: under the locks, which a vault with no version keeps for its first backup
 			if not locks.take():
 				return VaultInfo({}, 0, 0) if vaultInfo is None else vaultInfo, manifest, False
-			vaultInfo = get_vault_info(job_vault_path=job_vault)
+			vaultInfo = get_vault_info(job_vault_path=job_vault,manifest=manifest)
 		vault_info_dict = vaultInfo.vault_info_dict
 		vault_size = vaultInfo.vault_size
 		vault_inodes = vaultInfo.vault_inodes
@@ -5847,7 +5856,6 @@ def do_backup(backup_entries:dict,
 				if not manifest.describes(latest_version_info.path):
 					backuperTeeLogToTl(job_name,f'Manifest does not describe {latest_version_info.path}, listing it')
 					manifest.rebuild(latest_version_info.path)
-				manifest.set_layout('r')
 				try:
 					writer = hand_over(job_vault,latest_version_info.path,backup_folder,manifest)
 				except FileExistsError:
@@ -5941,13 +5949,9 @@ def do_backup(backup_entries:dict,
 		# a disk dropped since the check above
 		pool_guard.require()
 		if writer is not None:
-			# on its disk before the new list is placed: the scan finishes a commit only while that list is in its private
-			# folder, and an old name left standing would say the whole tree for good, and prune too much
+			# needs no sync of its own: a power loss may keep the new list and lose this, and the scan renames it whenever the
+			# old name is still there (finish_previous_list())
 			os.rename(previous_list,previous_new_list)
-			try:
-				fsync_vault_folder(job_vault)
-			except OSError as e:
-				raise JobFailure(f'cannot sync {job_vault} to disk after renaming the change list of {latest_version_info.path}: {e}; not placing the change list of {backup_folder}')
 		place_change_list(content_file_name,prepared_list)
 		# a vault this daemon committed to has versions: one that later shows none went away under it
 		VAULTS_WITH_VERSIONS.add(os.path.abspath(job_vault))
@@ -6003,12 +6007,67 @@ def vault_layout(job_vault:str, manifest:'VaultManifest') -> str:
 	batch's tree as an orphan, while staging is made before any such tree (hand_over()); '0.54' with neither and a version
 	folder there; NEW_VAULT_LAYOUT with no version folder. Raises OSError when the job vault cannot be listed.
 	'''
-	if manifest.layout() == 'r':
-		return 'r'
-	if os.path.lexists(staging_path(job_vault)):
-		return 'converting'
+	known = layout_known(job_vault, manifest.layout())
+	if known is not None:
+		return known
 	with os.scandir(job_vault) as entries:
 		return '0.54' if any(is_version_folder_name(entry.name) for entry in entries) else NEW_VAULT_LAYOUT
+
+def layout_known(job_vault:str, recorded:'str | None') -> 'str | None':
+	'''
+	The layout of a vault whose manifest records recorded, as far as the manifest and staging tell: 'r', 'converting', or None
+	when neither says it is on design R (vault_layout()). A look at staging that fails raises OSError: it is no
+	answer that staging is not there, and that answer can bring the 0.54 rules down on a cut batch's tree.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     layouts = [layout_known(folder, 'r'), layout_known(folder, None)]
+		...     os.mkdir(staging_path(folder))
+		...     layouts + [layout_known(folder, None)]
+		['r', None, 'converting']
+	'''
+	if recorded == 'r':
+		return 'r'
+	try:
+		os.lstat(staging_path(job_vault))
+		return 'converting'
+	except (FileNotFoundError, NotADirectoryError):
+		return None
+
+def recorded_layout(job_vault:str) -> 'str | None':
+	'''
+	The layout job_vault's manifest records, read as recorded_latest_version() reads it: creating nothing and discarding
+	nothing, as the 0.54 rules read that manifest as they find it. None with no manifest, or one that is no database (it
+	answered: it records nothing). Raises sqlite3.Error or OSError when it cannot be asked, as when locked or on a failing disk.
+	'''
+	path = os.path.join(job_vault, MANIFEST_FILE_NAME)
+	try:
+		os.lstat(path)
+	except (FileNotFoundError, NotADirectoryError):
+		return None
+	conn = sqlite3.connect(f'file:{urllib.parse.quote(os.fsencode(path))}?mode=rw', uri=True, timeout=1)
+	try:
+		row = conn.execute("SELECT value FROM meta WHERE key = 'layout'").fetchone()
+	except sqlite3.OperationalError as e:
+		if 'no such table' in str(e):
+			return None
+		raise
+	except sqlite3.DatabaseError:
+		return None
+	finally:
+		conn.close()
+	return None if row is None else row[0]
+
+def scan_gets_r_rules(job_vault:str, manifest:'VaultManifest' = None) -> bool:
+	'''
+	Whether the scan of job_vault is design R's, by vault_layout()'s own rows: a vault with neither has no cut tree, whatever a new
+	vault's layout is, and the 0.54 rules read it as they find it. Raises VaultScanError when it cannot be told, as no rule may then remove anything.
+	'''
+	try:
+		return layout_known(job_vault, manifest.layout() if manifest is not None else recorded_layout(job_vault)) is not None
+	except (OSError, sqlite3.Error) as e:
+		backuperTeeLogToTl(job_vault, f'Cannot read the vault, nothing in it is removed: cannot tell its layout: {e}', error=True)
+		raise VaultScanError(f'cannot tell the layout of {job_vault}: {e}')
 
 def pending_transaction_rows(events) -> list:
 	'''
@@ -6185,7 +6244,18 @@ def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 	recorded = None if row is None else str(row[0])
 	return LatestRecord(None if recorded is None else vault_version_number(recorded), has_link, True, recorded)
 
-def read_job_vault(job_vault_path:str) -> VaultListing:
+def unplaced_change_list(unfinished:list, name:str) -> 'str | None':
+	'''The path of the change list of the version folder name in a private folder of unfinished, as a commit cut off before its placement leaves it, or None; a folder that cannot be listed is no evidence.'''
+	for path in unfinished:
+		try:
+			for listed in os.listdir(path):
+				if change_list_names(listed, name):
+					return os.path.join(path, listed)
+		except OSError:
+			continue
+	return None
+
+def read_job_vault(job_vault_path:str, judge_orphans:bool = True) -> VaultListing:
 	'''
 	What job_vault_path holds, read whole before anything in it is deleted; None when there is no job vault (it is not
 	there: FileNotFoundError alone says so).
@@ -6219,6 +6289,9 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 	or one has two change lists; when an entry with a change list's name for no folder there is no regular file, or
 	names a version folder that cannot be told gone, or is not below the oldest committed version; when the committed
 	versions' numbers have a gap; and when an orphan may not go.
+
+	Without judge_orphans, for design R, whose scan has its own rules (read_job_vault_r()): every orphan is listed but one a
+	kept entry holds back, whatever the vault records, and cut_off stays None.
 	'''
 	try:
 		os.lstat(job_vault_path)
@@ -6318,16 +6391,6 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 		change_lists = {}
 		orphans = []
 		cut_off = None
-		def list_unplaced(name:str) -> bool:
-			# whether name's change list is in a private folder of one, as a commit cut off before its placement leaves it;
-			# one that cannot be listed is no evidence
-			for path in unfinished:
-				try:
-					if any(change_list_names(listed, name) for listed in os.listdir(path)):
-						return True
-				except OSError:
-					continue
-			return False
 		for number, name in sorted(numbered.items()):
 			if len(own[name]) > 1:
 				raise VaultScanError(f'the version folder {name} in {job_vault_path} has {len(own[name])} change lists: {", ".join(sorted(own[name]))}')
@@ -6347,10 +6410,12 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 		if orphans:
 			# a listing can leave out a change list with no error (a mergerfs branch out holds the lists while the
 			# folders it spreads still show): an orphan goes only on what the vault records of its latest commit
-			record = recorded_latest_version(job_vault_path)
+			record = recorded_latest_version(job_vault_path) if judge_orphans else None
 			for number, name in orphans:
 				if hold_all or number in held_back:
 					raise VaultScanError(f'{name} in {job_vault_path} has no change list, and {", ".join(sorted(kept))}, which name no folder there, may be its')
+				if not judge_orphans:
+					continue
 				if not record.link and record.manifest and record.recorded is None and not list_named and len(orphans) == 1 and number == 0:
 					# a first backup cut off before its manifest commit: the manifest it opened first records no version,
 					# and no link or list was ever made
@@ -6363,7 +6428,7 @@ def read_job_vault(job_vault_path:str) -> VaultListing:
 					# the record names it, and it is the newest committed version + 1: a commit cut off before its list was
 					# placed, unless a missing disk hides that list, which only the caller can tell
 					if (number == record.number and number == (max(versions) + 1 if versions else 0) and cut_off is None
-							and (record.manifest is None or not record.link) and list_unplaced(name)):
+							and (record.manifest is None or not record.link) and unplaced_change_list(unfinished, name) is not None):
 						cut_off = folders[name]
 						continue
 					if versions and number < min(versions):
@@ -6519,31 +6584,145 @@ def move_current_version_forward(job_vault_path:str, listing:VaultListing) -> No
 # vault to start at V0 in
 VAULTS_WITH_VERSIONS = set()
 
-def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
+def finish_previous_list(job_vault:str, manifest:'VaultManifest') -> bool:
 	'''
-	The versions job_vault_path holds, oldest first, each with the size and inodes its change list records, or with
-	recalculate, what du measures (the list renamed to record it). A job vault that is not there, or holds no committed
-	version, is an empty one, unless a scan of this daemon found committed versions in it (VAULTS_WITH_VERSIONS): it
-	fails then, before anything is deleted, as a backup would start a whole V0 beside them once they showed again.
+	The rename of the previous version's change list that the manifest's last commit calls for, when its old name is still
+	there: whether the new list was placed or not, as a power loss can keep that and lose the rename, and the old name
+	says the version holds the whole tree. Whether it renamed. Raises OSError, with nothing changed.
+	'''
+	names = manifest.previous_list()
+	if names is None or names['from'] == names['to'] or not os.path.lexists(os.path.join(job_vault, names['from'])):
+		return False
+	os.rename(os.path.join(job_vault, names['from']), os.path.join(job_vault, names['to']))
+	return True
 
-	The scan deletes only what it is certain of, once the whole vault was read (read_job_vault()): the change lists of
-	version folders that are not there, the private folders of change lists a crash cut off, and the version folders
-	without a change list that may go, the orphans of backups that did not commit and of removals cut short, and that of
-	a commit cut off before its list was placed, once its link is put back (undo_cut_off_commit()); the manifest's
-	matched key goes first when it names one of those folders (VaultManifest.matched). Then a
-	current_version left behind the newest committed version is moved forward (move_current_version_forward()). Raises
-	VaultScanError, having deleted nothing, when the vault cannot be read whole or for certain, and (after the
-	deletions) when an orphan cannot be removed, as the next backup would make a version of its number beside it. The caller's job then fails its attempt, with its FAILED marker: no
-	backup prunes or writes on a partial view. A disk of the vault's mergerfs pool missing once the vault was read, or
-	mounted again since the read began, raises PoolNotReady the same way, having deleted nothing.
+def finish_r_commit(job_vault:str, manifest:'VaultManifest', listing:VaultListing) -> bool:
 	'''
-	# job vault subfolder should follow: V{version}--{ISO8601ish time}
-	# ex. V0--2021-01-01_00-00-00_-0800
-	# a disk of the vault pool that drops while the vault is read hides what it holds: what the read shows is acted on
-	# only with every disk there all along
-	guard = PoolGuard([job_vault_path])
+	What a commit cut off after the manifest named its version has left to do, in the commit's own order (spec section 2.6):
+	current_version, the previous list's rename, the new list's placement. Whether anything changed, so the listing is
+	old. VaultScanError, with nothing changed, when the manifest names a version with no list in a private folder: a
+	missing disk may be hiding it. Raises OSError when a step fails; the next scan does what is left.
+	'''
+	named = manifest.recorded_version()
+	number = None if named is None else vault_version_number(named)
+	newest = max(listing.versions) if listing.versions else -1
+	private = None
+	if number is not None and number > newest:
+		if number == newest + 1 and named in {os.path.basename(path) for path in listing.orphans}:
+			private = unplaced_change_list(listing.unfinished, named)
+		if private is None:
+			raise VaultScanError(f'the manifest of {job_vault} records {named} as committed, but its change list is not there, nor in a private folder. If a disk is missing, it comes back at the next attempt; if the list is gone for good, removing {MANIFEST_FILE_NAME} from the job vault lets the next attempt read the tree and finish it')
+		swap_current_version(job_vault, named)
+		fsync_vault_folder(job_vault)
+	renamed = finish_previous_list(job_vault, manifest)
+	if private is None:
+		return renamed
+	place_change_list(os.path.join(job_vault, os.path.basename(private)), private)
+	return True
+
+def empty_staging(job_vault:str) -> None:
+	'''
+	Remove what staging holds: what a prune cut short left of a version that stopped being one at its rename, a record cut
+	before it reached the previous version, whose tree entry stands, and links swapped out. Nothing else leads there. A
+	failure is logged, and leaves it for the next scan, as nothing reads staging.
+	'''
+	staging = staging_path(job_vault)
 	try:
-		listing = read_job_vault(job_vault_path)
+		names = os.listdir(staging)
+	except FileNotFoundError:
+		return
+	except OSError as e:
+		backuperTeeLogToTl(job_vault, f'Cannot empty {staging} for now: {e}', error=True)
+		return
+	for name in names:
+		task = multiCMD.run_command(['rm', '-rf', os.path.join(staging, name)], quiet=True, return_object=True)
+		if task.returncode != 0:
+			backuperTeeLogToTl(job_vault, f'Cannot remove {os.path.join(staging, name)} for now: {rm_cause(task)}', error=True)
+
+def give_back_folder_times(previous:str, manifest:'VaultManifest') -> list:
+	'''
+	Each real folder of previous, the version a cut batch was recording into, gets the mtime its manifest row records, written
+	only where it differs, as version n's rows stand until the batch commits and a cut can fall between a change in a
+	folder and giving its times back. A rename never moves the atime. A folder with no row or a row with no record keeps
+	its time. Returns the recorded paths: what previous's real part holds, its forward links left out, folders ending
+	with /. Raises OSError when a folder cannot be read or given its time. Idempotent.
+	'''
+	number = vault_version_number(os.path.basename(os.path.normpath(previous)))
+	recorded = []
+	errors = []
+	for path, rel, is_dir in iter_tree_entries(previous, errors=errors):
+		if is_dir:
+			st = os.lstat(path)
+			record = manifest.lookup(rel)
+			if record is not None and record.mtime_ns is not None and record.mtime_ns != st.st_mtime_ns:
+				os.utime(path, ns=(st.st_atime_ns, record.mtime_ns), follow_symlinks=False)
+		elif forwards_to_version(path, rel, number + 1):
+			continue
+		recorded.append(rel)
+	if errors:
+		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
+	return recorded
+
+def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> VaultInfo:
+	'''
+	The scan of a vault on design R (spec section 3, plan S3), whose caller holds the job's locks. A version folder with no list
+	may be the only real tree of a cut batch, so nothing goes by inference: the manifest is read first, and a commit it
+	names is finished. Then the private list folders and staging are emptied. Of the one orphan there may be, at the one
+	after the newest version: a skeleton, empty or holding only links that name their own place (is_skeleton()), goes, with
+	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
+	the tree, kept and returned in VaultInfo.tree for the next attempt. A lone V0 orphan goes. Any other orphan is an error, before
+	anything is removed. A lost manifest names nothing: its private list goes, and the orphan is judged the same way, so a cut tree stays.
+	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54.
+	Raises VaultScanError, or PoolNotReady with a disk of the vault's pool missing, as get_vault_info() does.
+	'''
+	guard = PoolGuard([job_vault])
+	listing = read_vault_whole(job_vault, guard, judge_orphans=False)
+	if listing is None:
+		return VaultInfo({},0,0)
+	try:
+		if finish_r_commit(job_vault, manifest, listing):
+			listing = read_vault_whole(job_vault, guard, judge_orphans=False)
+	except OSError as e:
+		raise VaultScanError(f'cannot finish the last commit of {job_vault}: {e}')
+	for name in listing.kept:
+		backuperTeeLogToTl(job_name, f'Keeping {name}: it names no folder there, and its name does not say it is the change list of a version gone', error=True)
+	newest = max(listing.versions) if listing.versions else None
+	tree = skeleton = None
+	if listing.orphans:
+		orphan = listing.orphans[0]
+		number = vault_version_number(os.path.basename(orphan))
+		if len(listing.orphans) > 1 or number != (0 if newest is None else newest + 1):
+			raise VaultScanError(f'{", ".join(os.path.basename(path) for path in listing.orphans)} in {job_vault} have no change list, and only one, at the number after the newest version, can be a backup cut off (if it is still refused once every disk of the vault is there, move what is wrong out of the job vault, keeping it, and the job goes on)')
+		try:
+			if newest is None or is_skeleton(orphan):
+				skeleton = orphan
+			else:
+				tree = orphan
+		except OSError as e:
+			raise VaultScanError(f'cannot read {orphan}, nothing in the vault is removed: {e}')
+	remove_unfinished_change_lists(job_vault, listing)
+	empty_staging(job_vault)
+	if skeleton is not None:
+		if newest is not None:
+			try:
+				give_back_folder_times(listing.versions[newest].path, manifest)
+			except OSError as e:
+				raise VaultScanError(f'cannot give back the folder times of {listing.versions[newest].path}: {e}')
+		why = remove_orphan(job_vault, skeleton)
+		if why is not None:
+			raise VaultScanError(f'cannot remove the incomplete version {skeleton} ({why}), and a backup would make a version of its number beside it')
+	remove_stale_change_lists(job_vault, listing, guard)
+	move_current_version_forward(job_vault, listing)
+	vault_info_dict = OrderedDict(sorted(listing.versions.items()))
+	return VaultInfo(vault_info_dict, sum(entry.size for entry in vault_info_dict.values()), sum(entry.inode for entry in vault_info_dict.values()), tree)
+
+def read_vault_whole(job_vault_path:str, guard:PoolGuard, judge_orphans:bool = True) -> 'VaultListing | None':
+	'''
+	read_job_vault(), acted on only with every disk there all along (guard) and with no sign the vault went away under the
+	daemon. Raises VaultScanError or PoolNotReady, with an error line, having deleted nothing.
+	'''
+	try:
+		listing = read_job_vault(job_vault_path, judge_orphans)
 	except VaultScanError as e:
 		# what the read found wrong, as a change list missing, can be a disk's that dropped meanwhile
 		problem = guard.problem()
@@ -6563,7 +6742,7 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 			backuperTeeLogToTl(job_vault_path, f'Cannot read the vault: {reason}', error=True)
 			raise VaultScanError(reason)
 		backuperTeeLogToTl(job_vault_path, f'Job vault path {job_vault_path} does not exist', error=True)
-		return VaultInfo({},0,0)
+		return None
 	if listing.versions:
 		VAULTS_WITH_VERSIONS.add(os.path.abspath(job_vault_path))
 	elif os.path.abspath(job_vault_path) in VAULTS_WITH_VERSIONS:
@@ -6571,11 +6750,10 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 		reason = f'the vault {job_vault_path} shows no committed version, though this daemon found versions in it: not starting it again'
 		backuperTeeLogToTl(job_vault_path, f'Cannot read the vault, nothing in it is removed: {reason}', error=True)
 		raise VaultScanError(reason)
-	for name in listing.kept:
-		backuperTeeLogToTl(job_vault_path, f'Keeping {name}: it names no folder there, and its name does not say it is the change list of a version gone', error=True)
-	if listing.cut_off is not None:
-		# the guard above found every disk of the vault there all along
-		undo_cut_off_commit(job_vault_path, listing)
+	return listing
+
+def remove_stale_change_lists(job_vault_path:str, listing:VaultListing, guard:PoolGuard) -> None:
+	'''Remove listing.stale, the lists whose folders are gone. Raises PoolNotReady, having removed none, with a disk missing once they are flushed.'''
 	stale = listing.stale
 	if stale and guard.covers(job_vault_path):
 		# on a pool the folder's removal may not be on every disk yet: one that comes back from a cut with a part of it
@@ -6600,6 +6778,57 @@ def get_vault_info(job_vault_path:str,recalculate:bool=False) -> VaultInfo:
 			os.remove(path)
 		except Exception as e:
 			backuperTeeLogToTl(job_vault_path, f'Error deleting {path}: {e}', error=True)
+
+def get_vault_info(job_vault_path:str,recalculate:bool=False,manifest:'VaultManifest' = None) -> VaultInfo:
+	'''
+	The versions job_vault_path holds, oldest first, each with the size and inodes its change list records, or with
+	recalculate, what du measures (the list renamed to record it). A job vault that is not there, or holds no committed
+	version, is an empty one, unless a scan of this daemon found committed versions in it (VAULTS_WITH_VERSIONS): it
+	fails then, before anything is deleted, as a backup would start a whole V0 beside them once they showed again.
+
+	The scan deletes only what it is certain of, once the whole vault was read (read_job_vault()): the change lists of
+	version folders that are not there, the private folders of change lists a crash cut off, and the version folders
+	without a change list that may go, the orphans of backups that did not commit and of removals cut short, and that of
+	a commit cut off before its list was placed, once its link is put back (undo_cut_off_commit()); the manifest's
+	matched key goes first when it names one of those folders (VaultManifest.matched). Then a
+	current_version left behind the newest committed version is moved forward (move_current_version_forward()). Raises
+	VaultScanError, having deleted nothing, when the vault cannot be read whole or for certain, and (after the
+	deletions) when an orphan cannot be removed, as the next backup would make a version of its number beside it. The caller's job then fails its attempt, with its FAILED marker: no
+	backup prunes or writes on a partial view. A disk of the vault's mergerfs pool missing once the vault was read, or
+	mounted again since the read began, raises PoolNotReady the same way, having deleted nothing.
+
+	A vault whose manifest or staging says it is on design R (scan_gets_r_rules()) gets read_job_vault_r() instead, and its manifest, opened here unless the
+	caller has one open; recalculate means nothing there, as what du measures is not what a version's list records. Any scan that can reach
+	such a vault changes it: its caller holds the job's locks (BackupLocks).
+	'''
+	# job vault subfolder should follow: V{version}--{ISO8601ish time}
+	# ex. V0--2021-01-01_00-00-00_-0800
+	# a disk of the vault pool that drops while the vault is read hides what it holds: what the read shows is acted on
+	# only with every disk there all along
+	guard = PoolGuard([job_vault_path])
+	if scan_gets_r_rules(job_vault_path, manifest):
+		try:
+			guard.require()
+		except PoolNotReady as e:
+			backuperTeeLogToTl(job_vault_path, f'Cannot scan the vault, nothing in it is removed: {e.reason}', error=True)
+			raise
+		own_manifest = manifest is None
+		if own_manifest:
+			manifest = VaultManifest(job_vault_path)
+		try:
+			return read_job_vault_r(job_vault_path, manifest, os.path.basename(job_vault_path))
+		finally:
+			if own_manifest:
+				manifest.close()
+	listing = read_vault_whole(job_vault_path, guard)
+	if listing is None:
+		return VaultInfo({},0,0)
+	for name in listing.kept:
+		backuperTeeLogToTl(job_vault_path, f'Keeping {name}: it names no folder there, and its name does not say it is the change list of a version gone', error=True)
+	if listing.cut_off is not None:
+		# the guard above found every disk of the vault there all along
+		undo_cut_off_commit(job_vault_path, listing)
+	remove_stale_change_lists(job_vault_path, listing, guard)
 	remove_unfinished_change_lists(job_vault_path, listing)
 	if listing.orphans:
 		# a matched key naming an orphan, as a commit cut off leaves it, goes first: a commit later in the same second
@@ -8277,9 +8506,13 @@ class VaultManifest:
 	def add_migrated(self, name:str):
 		self._set_meta_json('migrated', sorted(self.migrated() | {name}))
 
-	def describes(self, version_path:str) -> bool:
+	def recorded_version(self) -> 'str | None':
+		'''The name of the version folder these rows describe, the last commit's; None when they describe none.'''
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
-		return row is not None and row[0] == os.path.basename(os.path.normpath(version_path))
+		return None if row is None else row[0]
+
+	def describes(self, version_path:str) -> bool:
+		return self.recorded_version() == os.path.basename(os.path.normpath(version_path))
 
 	def reset(self, version_path:str):
 		'''Drop every row: the manifest now describes an empty version_path.'''
@@ -12453,6 +12686,54 @@ def forward_text(rel:str, next_name:str) -> str:
 	'''
 	ups = rel.count('/') + 1
 	return f"{'../' * ups}{next_name}/{rel}"
+
+def forwards_to_version(path:str, rel:str, number:int) -> bool:
+	'''
+	Whether the entry at path, at rel of its version, is a forward link to the version numbered number, by its text alone: up
+	to the job vault, then a version folder's name of that number, then rel. Raises OSError when it cannot be read.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     os.symlink('../../V2--2021-01-01_00-00-00_-0800/a/b', os.path.join(folder, 'l'))
+		...     [forwards_to_version(os.path.join(folder, 'l'), rel, number) for rel, number in (('a/b', 2), ('a/b', 3), ('b', 2))] + [forwards_to_version(folder, 'x', 2)]
+		[True, False, False, False]
+	'''
+	try:
+		text = os.readlink(path)
+	except OSError as e:
+		if e.errno == errno.EINVAL:
+			return False
+		raise
+	prefix, suffix = '../' * (rel.count('/') + 1), f'/{rel}'
+	if not (text.startswith(prefix) and text.endswith(suffix)):
+		return False
+	name = text[len(prefix):-len(suffix)]
+	return is_version_folder_name(name) and vault_version_number(name) == number
+
+def is_skeleton(path:str) -> bool:
+	'''
+	Whether the version folder at path holds nothing a kept version can need: it is empty, or holds only links naming their
+	own place in it. A hand-over cut before its exchange leaves that, and so does a batch cut after a whole deleted tree
+	was recorded: by the invariant no forward link leads to an entry the tree does not hold, so what went is whole in the
+	previous version. Raises OSError when it cannot be read.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     path = os.path.join(folder, 'V1--x')
+		...     os.mkdir(path)
+		...     empty = is_skeleton(path)
+		...     os.symlink(forward_text('a', 'V1--x'), os.path.join(path, 'a'))
+		...     self_named = is_skeleton(path)
+		...     os.symlink('elsewhere', os.path.join(path, 'b'))
+		...     empty, self_named, is_skeleton(path)
+		(True, True, False)
+	'''
+	name = os.path.basename(os.path.normpath(path))
+	with os.scandir(path) as entries:
+		for entry in entries:
+			if not entry.is_symlink() or os.readlink(entry.path) != forward_text(entry.name, name):
+				return False
+	return True
 
 def tree_usage(path:str) -> tuple:
 	'''
