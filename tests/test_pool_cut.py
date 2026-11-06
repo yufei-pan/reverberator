@@ -811,6 +811,18 @@ def run_uncut(shape: Shape, work: str, cut_fault=None) -> tuple:
 		return json.load(f), held
 
 
+def judged(shape: Shape, job, work: str, seed: str) -> list:
+	'''
+	What is wrong in the vault after a run, as lines: the oracle's, and a file of each version read through the commands. Reading the vault is the
+	run's result: a vault wrong enough that a read of it fails (a link that shows a file and opens none) is a wrong run, never a failure of the rig.
+	'''
+	try:
+		wrong, wanted = shape.wrong(job)
+		return wrong or shape.read_through_the_commands(job, wanted, work, random.Random(seed))
+	except OSError as e:
+		return [f'the vault cannot be read: {type(e).__name__}: {e}']
+
+
 def one_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, retry_fault=None) -> list:
 	'''What is wrong after the run (kill, cuts), as lines. Empty means it passed.'''
 	job = shape.job_paths()
@@ -837,10 +849,7 @@ def one_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, ret
 		if again.error is not None or again.committed is not True:
 			lines.append(f'the retry: {again.error or again}')
 		else:
-			wrong, wanted = shape.wrong(job)
-			lines += wrong
-			if not wrong:
-				lines += shape.read_through_the_commands(job, wanted, work, random.Random(f'{kill} {cuts}'))
+			lines += judged(shape, job, work, f'{kill} {cuts}')
 		if lines and shape.keep_failed():
 			pool.keep_images(os.path.join(shape.base, 'failed', f'{shape.name}-{kill}-{"-".join(map(str, cuts))}'))
 	return lines
@@ -950,7 +959,8 @@ def run_all(shape: Shape, runs: list, held: int, tag: str = '', cut_fault=None, 
 						rigs.append(row)
 			os.remove(f'{results}.{number}')
 	shutil.rmtree(os.path.join(shape.base, 'work'), ignore_errors=True)
-	assert not rigs, f'the rig failed in {len(rigs)} of {len(runs)} runs, which are no runs gone wrong: {rigs[0]["rig"]}'
+	assert not rigs, (f'the rig failed (a mount or an image, before any reading of the vault) in {len(rigs)} of {len(runs)} runs; '
+		f'the first, run {rigs[0]["kill"]} {rigs[0]["cuts"]}, ended with {rigs[0]["rig"].strip().splitlines()[-1]}:\n{rigs[0]["rig"]}')
 	return wrong
 
 
@@ -1171,10 +1181,7 @@ def double_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, 
 		if third.error is not None or third.committed is not True:
 			lines.append(f'the third run: {third.error or third}')
 		else:
-			wrong, wanted = shape.wrong(job)
-			lines += wrong
-			if not wrong:
-				lines += shape.read_through_the_commands(job, wanted, work, random.Random(f'{kill} {cuts}'))
+			lines += judged(shape, job, work, f'{kill} {cuts}')
 		if lines and shape.keep_failed():
 			pool.keep_images(os.path.join(shape.base, 'failed', f'{shape.name}-double-{kill}-{"-".join(map(str, cuts))}'))
 	return lines
@@ -1217,3 +1224,25 @@ def test_a_second_cut_in_the_retry_leaves_every_version_exact(name, request):
 	wrong = run_all(shape, runs, held, '-double', runner=double_run)
 	print(f'{shape.name} with the retry cut too: {len(runs)} of {total} runs in {time.monotonic() - started:.0f} s; {len(wrong)} wrong')
 	assert not wrong, f'{len(wrong)} of {len(runs)} runs wrong: {wrong[:3]}'
+
+
+@needs_mergerfs
+@pytest.mark.parametrize('name, runner, plan', [('mixed-2', one_run, planned_runs), ('conversion-2', double_run, double_runs)], ids=['single', 'double'])
+def test_a_vault_the_oracle_cannot_read_is_a_wrong_run_and_no_failure_of_the_rig(name, runner, plan, request):
+	# a link that shows a file and opens none, as a cut can leave, makes the oracle's read raise: that is what a run looks for (Review 3b's N7)
+	shape = built_shape(name, request)
+	trace, held = steps_of(shape)
+	def unreadable(job):
+		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), os.path.join(job.job_vault, 'V2', 'b', 'y.txt'))
+	shape.wrong = unreadable
+	wrong = run_all(shape, plan(trace, shape.disks)[:2], held, '-unreadable', runner=runner)
+	assert len(wrong) == 2 and all('FileNotFoundError' in row['wrong'][0] and 'y.txt' in row['wrong'][0] for row in wrong), wrong
+
+
+@needs_mergerfs
+def test_a_failure_to_mount_or_make_an_image_stays_a_rig_row_that_says_what_failed(request):
+	shape = built_shape('mixed-2', request)
+	def no_mount(shape, work, kill, cuts, cut_fault, retry_fault):
+		raise OSError(errno.EBUSY, 'the mount point is busy', work)
+	with pytest.raises(AssertionError, match=r'the rig failed \(a mount or an image.*in 1 of 1 runs.*OSError: \[Errno 16\] the mount point is busy'):
+		run_all(shape, [(1, 0, 0)], 1 << 20, '-rig', runner=no_mount)
