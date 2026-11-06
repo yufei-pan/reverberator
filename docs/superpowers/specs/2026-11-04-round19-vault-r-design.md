@@ -89,7 +89,7 @@ Links point to the **next** version, not to the current one. A path that has not
 
   The scan empties it, after the pool repairs (§5). It is kept between backups.
 - **The manifest** still describes the newest version, now at schema 3:
-  - new meta keys: `layout`='r', `previous_list` (§2.6) and `migrated`;
+  - new meta keys: `layout`='r', `previous_list` (§2.6), `migrated` and `version_times` (the folder times a conversion puts back, as f2fs moves a folder's mtime on an exchange);
   - `copy_version` and `monitor_paths` are no longer used.
 - **Removed by the migration:** `.reverberator_prune_salt`, `.reverberator_pruning`, and the prune temps left beside links.
 
