@@ -328,6 +328,38 @@ def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	assert cli_differences(job.job_vault, before) == []
 
 
+def test_folders_moved_aside_and_put_back_still_read_as_converting(small, tmp_path):
+	# a conversion begun, the version folders moved away for a look, a start, and the folders put back: the layout stays unset, so
+	# the conversion goes on and reads them as 0.54 trees (a scan that set 'r' while they were away would read their links as R's)
+	before = expected(small)
+	manifest = rv.VaultManifest(small.job_vault)
+	rv.get_vault_info(small.job_vault, manifest=manifest)
+	assert rv.migrate_job_vault(small.job_vault, manifest, small.job_name, lambda: True) is False
+	assert manifest.conversion_unfinished() and manifest.layout() is None
+	manifest.close()
+	away = tmp_path / 'away'
+	away.mkdir()
+	moved = [name for name in os.listdir(small.job_vault) if name.startswith('V') or name == 'current_version']
+	assert moved
+	for name in moved:
+		os.rename(os.path.join(small.job_vault, name), away / name)
+	rv.VAULTS_WITH_VERSIONS.clear()
+	assert dict(rv.get_vault_info(small.job_vault).vault_info_dict) == {}
+	for name in moved:
+		os.rename(away / name, os.path.join(small.job_vault, name))
+	rv.VAULTS_WITH_VERSIONS.clear()
+	assert len(rv.get_vault_info(small.job_vault).vault_info_dict) == 3
+	assert layout_of(small) is None
+	manifest = rv.VaultManifest(small.job_vault)
+	try:
+		assert rv.vault_layout(small.job_vault, manifest) == 'converting'
+	finally:
+		manifest.close()
+	assert migrate(small) is True
+	assert layout_of(small) == 'r'
+	assert expected(small) == before
+
+
 def test_a_prune_temp_is_left_out(small):
 	names = folders_of(small)
 	top = os.path.join(small.job_vault, names[2])

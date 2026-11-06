@@ -544,13 +544,34 @@ def test_a_vault_started_over_with_a_conversion_begun_goes_on_as_new(r_job):
 	manifest.close()
 	start_over(r_job)
 	assert dict(rv.get_vault_info(r_job.job_vault).vault_info_dict) == {}
+	run_backup(r_job)
+	assert os.path.isdir(folder_of(r_job, 0))
 	manifest = opened_manifest(r_job)
 	try:
 		assert not manifest.conversion_unfinished()
 	finally:
 		manifest.close()
+
+
+def test_a_conversion_begun_with_no_staging_and_no_version_runs_v0(r_job):
+	# the cut between begin_migration()'s commit and the making of staging, then the versions removed: V0 is the way on
+	build_base(r_job, **KEPT)
+	manifest = opened_manifest(r_job)
+	manifest.begin()
+	manifest.conn.execute("DELETE FROM meta WHERE key = 'layout'")
+	manifest.begin_migration({})
+	manifest.commit()
+	manifest.close()
+	start_over(r_job)
+	shutil.rmtree(rv.staging_path(r_job.job_vault))
+	assert dict(rv.get_vault_info(r_job.job_vault).vault_info_dict) == {}
 	run_backup(r_job)
 	assert os.path.isdir(folder_of(r_job, 0))
+	manifest = opened_manifest(r_job)
+	try:
+		assert manifest.layout() == 'r' and not manifest.conversion_unfinished()
+	finally:
+		manifest.close()
 
 
 def test_a_vault_shown_empty_by_a_missing_disk_is_still_refused(r_job, fake_pool, monkeypatch):

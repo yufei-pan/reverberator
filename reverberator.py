@@ -5663,7 +5663,7 @@ def do_backup(backup_entries:dict,
 		# design R: the newest version is the one real tree, and a batch hands it over (hand_over()). only a vault that reads
 		# as 0.54 gets the referenced copy: the 0.54 rules must never run again on one with staging (vault_layout())
 		on_tree = vault_layout(job_vault,manifest) != '0.54'
-		if manifest.conversion_unfinished():
+		if vault_info_dict and manifest.conversion_unfinished():
 			# until the sizes pass ends, the versions are part converted and the lists hold 0.54's sizes, which the size limit would prune by
 			raise JobFailure(f'the conversion of {job_vault} from 0.54 has not ended: no backup or prune runs until it has, and the next start goes on with it')
 		# the files the new version copied again from the vault, and those of them its batch then wrote over
@@ -6898,14 +6898,13 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	except OSError as e:
 		if e.errno == errno.EINVAL:
 			raise no_link_error(link)
-	if not listing.versions and not listing.orphans and (manifest.recorded_version() is not None or manifest.conversion_unfinished()):
+	if not listing.versions and not listing.orphans and manifest.recorded_version() is not None:
 		# every version removed by hand, the hidden files kept: read_vault_whole() has shown it is no disk hiding them, and nothing
-		# is left to finish or to convert. the vault starts at V0, as 0.54's did
+		# is left to finish. the vault starts at V0, as 0.54's did. a conversion begun is not touched: V0 sets the layout and ends it,
+		# and folders put back before that still read as 0.54's (vault_layout())
 		try:
 			manifest.begin()
 			manifest.forget_version()
-			if manifest.conversion_unfinished():
-				manifest.set_layout('r')
 			manifest.commit()
 		except (OSError, sqlite3.Error) as e:
 			raise VaultScanError(f'cannot forget the version the manifest of {job_vault} records, though the vault holds none: {e}')
