@@ -6698,44 +6698,17 @@ def give_back_folder_times(previous:str, manifest:'VaultManifest') -> list:
 		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
 	return recorded
 
-def unlink_self_named(tree:str, rel:str) -> None:
-	'''
-	The link at rel in the version folder at tree, when its text names its own place: a folder's exchange into the previous version
-	(TreeWriter.exchange_in()) leaves it in the folder's place for one call, and nothing is to be read or written through it. Anything else there stays. Raises OSError.
-
-	Examples:
-		>>> with tempfile.TemporaryDirectory() as folder:
-		...     tree = os.path.join(folder, 'V1--x')
-		...     os.makedirs(os.path.join(tree, 'd'))
-		...     os.symlink(forward_text('d/own', 'V1--x'), os.path.join(tree, 'd', 'own'))
-		...     os.symlink('elsewhere', os.path.join(tree, 'other'))
-		...     for rel in ('d/own', 'other', 'd', 'missing', 'other/under'): unlink_self_named(tree, rel)
-		...     sorted(os.listdir(tree)), os.listdir(os.path.join(tree, 'd'))
-		(['d', 'other'], [])
-	'''
-	path = os.path.join(tree, rel)
-	try:
-		text = os.readlink(path)
-	except OSError as e:
-		if e.errno in (errno.EINVAL, errno.ENOENT, errno.ENOTDIR):
-			return
-		raise
-	if text == forward_text(rel, os.path.basename(os.path.normpath(tree))):
-		os.unlink(path)
-
-def prepare_roll_forward(job_vault:str, info:VaultInfo, manifest:'VaultManifest') -> None:
+def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> None:
 	'''
 	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4), so the versions read exact
 	from here on, and a restore can run before the monitored path is back. Each real folder of the previous version gets its
-	times back (give_back_folder_times()), a link a cut exchange left in a recorded folder's place in the tree goes, and the
-	files recorded are marked unchecked, in a transaction of its own, as the tree may hold another copy now where the row
-	still says version n's: the comparison reads them there. Idempotent: a cut here repeats it. Raises OSError or sqlite3.Error.
+	times back (give_back_folder_times()), and the files recorded are marked unchecked, in a transaction of its own, as the tree
+	may hold another copy now where the row still says version n's: the comparison reads them there. A link a cut exchange left
+	in a folder's place in the tree is no concern of it: the comparison and the sweep of the whole tree take it. Idempotent: a cut
+	here repeats it. Raises OSError or sqlite3.Error.
 	'''
 	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
 	recorded = give_back_folder_times(previous, manifest)
-	for rel in recorded:
-		if rel.endswith('/'):
-			unlink_self_named(info.tree, rel[:-1])
 	manifest.begin()
 	manifest.mark_unchecked(rel for rel in recorded if not rel.endswith('/'))
 	manifest.commit()
@@ -6899,7 +6872,7 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	info = VaultInfo(vault_info_dict, sum(entry.size for entry in vault_info_dict.values()), sum(entry.inode for entry in vault_info_dict.values()), tree)
 	if tree is not None:
 		try:
-			prepare_roll_forward(job_vault, info, manifest)
+			prepare_roll_forward(info, manifest)
 		except (OSError, sqlite3.Error) as e:
 			raise VaultScanError(f'cannot make the tree {tree} ready for its roll-forward: {e}')
 	return info

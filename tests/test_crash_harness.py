@@ -3,7 +3,7 @@ The crash harness and its oracle, proven on the 0.54 layout: the oracle finds ea
 and a batch killed before any of its changes of the vault is exact once retried. Everything of round 20 runs on these.
 
 On design R the same kill points run with Only Sync Attributes off and on, then a kill during the retry, the monitored tree
-changing after the crash, a full disk at each record, and three negative controls proving the oracle sees what each rule
+changing after the crash, a full disk at each record, and two negative controls proving the oracle sees what each rule
 of the roll-forward is there for. tests/test_crash_power_loss.py holds the power loss model.
 
 REVERB_CRASH_FULL=1 runs every kill point; by default a stride of them, keeping the test under a minute. REVERB_CRASH_ROOT
@@ -15,6 +15,7 @@ import os
 import random
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -25,7 +26,7 @@ import pytest
 
 import reverberator as rv
 from tests import version_view_ground_truth as view_truth
-from tests.crash_batches import after_retries, apply_batch3, batch3_of, build_base, expected_of, prepare, put_text, raw_events, restore, restore_monitor, UNREADABLE
+from tests.crash_batches import after_retries, apply_batch3, batch3_of, build_base, expected_of, OPTIONS, prepare, put_text, raw_events, restore, restore_monitor, UNREADABLE
 from tests.crash_child import failing_copy_command, in_child, kill_run, retry, run_do_backup
 from tests.harness import create_job
 from tests.vault_oracle import check_vault, forward_text, read_view, sizes_by_newest_holder, snapshot_tree, version_number
@@ -63,6 +64,11 @@ def prepared(key, tmp_path_factory, **options):
 def r_vault(request, r_layout, tmp_path_factory):
 	'''The crash vault on design R, batch 3 with its chmod of top.txt whose mtime did not move: under Only Sync Attributes that goes on the shared inode.'''
 	return prepared(('r', request.param), tmp_path_factory, only_sync_attributes=request.param)
+
+
+@pytest.fixture
+def osa_r_vault(r_layout, tmp_path_factory):
+	return prepared(('r', True), tmp_path_factory, only_sync_attributes=True)
 
 
 @pytest.fixture
@@ -147,8 +153,16 @@ def damage_root_record(job_vault):
 	os.setxattr(folder, ROOT_RECORD, json.dumps(record).encode())
 
 
+def damage_version_root_mode(job_vault):
+	os.chmod(os.path.join(job_vault, folder_of(job_vault, 1)), 0o700)
+
+
+def damage_version_root_owner(job_vault):
+	os.chown(os.path.join(job_vault, folder_of(job_vault, 1)), 1234, 1235)
+
+
 DAMAGE = [damage_content, damage_mode, damage_file_mtime, damage_folder_mtime, damage_dangling_link, damage_stray_partial,
-	damage_extra_version, damage_missing_list, damage_wrong_current_version, damage_root_record]
+	damage_extra_version, damage_missing_list, damage_wrong_current_version, damage_root_record, damage_version_root_mode, damage_version_root_owner]
 
 
 @pytest.mark.parametrize('damage', DAMAGE, ids=lambda damage: damage.__name__[len('damage_'):])
@@ -166,9 +180,74 @@ def test_the_oracles_switches_leave_out_only_what_they_name(crash_vault):
 	damage_file_mtime(job_vault)
 	damage_mode(job_vault)
 	assert check_vault(job_vault, crash_vault.base, set(), folder_times=False) != []
-	assert check_vault(job_vault, crash_vault.base, set(), folder_times=False, free_file_meta=True) == []
+
+
+def committed_osa(vault):
+	'''The Only Sync Attributes vault after batch 3, uncut: its chmod of top.txt went on the inode that versions 1 to 3 share.'''
+	restore(vault)
+	assert cut_batch(vault).committed is True
+	return vault.job.job_vault
+
+
+def test_free_file_meta_leaves_out_only_the_metadata_of_a_shared_inode(osa_r_vault):
+	job_vault = committed_osa(osa_r_vault)
+	expected = osa_r_vault.expected
+	assert check_vault(job_vault, expected, set()) != []
+	assert check_vault(job_vault, expected, set(), free_file_meta=True) == []
 	damage_content(job_vault)
-	assert check_vault(job_vault, crash_vault.base, set(), folder_times=False, free_file_meta=True) != []
+	assert check_vault(job_vault, expected, set(), free_file_meta=True) != []
+
+
+@pytest.mark.parametrize('tamper', [lambda path: os.chmod(path, 0o640), lambda path: os.utime(path, ns=(1, 1)), lambda path: os.chown(path, 1234, 1235),
+	lambda path: os.setxattr(path, 'user.tag', b'x')], ids=['mode', 'mtime', 'owner', 'xattr'])
+@pytest.mark.parametrize('where', ['newest', 'unshared'])
+def test_free_file_meta_still_compares_a_file_nothing_shares_and_the_newest_whole(osa_r_vault, where, tamper):
+	job_vault = committed_osa(osa_r_vault)
+	if where == 'newest':
+		# top.txt of the newest version is the inode versions 1 and 2 read too: the newest is where it is told
+		path = os.path.join(job_vault, folder_of(job_vault, 3), 'top.txt')
+	else:
+		# version 1's own copy of a file that later versions changed: no other version reads it
+		path = real_file(job_vault, 1, 'a/x.txt')
+		assert os.lstat(path).st_nlink == 1 and os.path.dirname(path).startswith(os.path.join(job_vault, folder_of(job_vault, 1)))
+	assert check_vault(job_vault, osa_r_vault.expected, set(), free_file_meta=True) == []
+	tamper(path)
+	assert check_vault(job_vault, osa_r_vault.expected, set(), free_file_meta=True) != []
+
+
+def test_a_backward_link_in_the_newest_version_of_an_r_vault_is_damage(plain_r_vault):
+	# 0.54 reads such a link as the file it leads to, and here its bytes and times are the same
+	job_vault = plain_r_vault.job.job_vault
+	newest, older = (os.path.join(job_vault, folder_of(job_vault, number)) for number in (2, 1))
+	assert check_vault(job_vault, plain_r_vault.base, set()) == []
+	assert os.path.islink(os.path.join(older, 'r.txt')) and not os.path.islink(os.path.join(newest, 'r.txt'))
+	os.remove(os.path.join(older, 'r.txt'))
+	shutil.copy2(os.path.join(newest, 'r.txt'), os.path.join(older, 'r.txt'))
+	os.remove(os.path.join(newest, 'r.txt'))
+	os.symlink(os.path.join('..', folder_of(job_vault, 1), 'r.txt'), os.path.join(newest, 'r.txt'))
+	assert read_view(job_vault, folder_of(job_vault, 2))['r.txt'].kind == 'f'
+	problems = check_vault(job_vault, plain_r_vault.base, set())
+	assert any("'r.txt'" in line and 'daemon link' in line for line in problems), problems
+
+
+def test_a_device_replaced_by_another_is_damage(tmp_path, r_layout):
+	job = create_job(str(tmp_path))
+	put_text(job.monitor, 'f', 'one')
+	device = os.path.join(job.monitor, 'dev1')
+	os.mknod(device, 0o600 | stat.S_IFCHR, os.makedev(1, 3))
+	expected = {0: snapshot_tree(job.monitor)}
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(), **OPTIONS)
+	manifest.close()
+	assert committed is True
+	path = os.path.join(job.job_vault, folder_of(job.job_vault, 0), 'dev1')
+	assert stat.S_ISCHR(os.lstat(path).st_mode)
+	assert check_vault(job.job_vault, expected, set()) == []
+	st = os.lstat(path)
+	os.remove(path)
+	os.mknod(path, 0o600 | stat.S_IFCHR, os.makedev(1, 5))
+	os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+	assert os.lstat(path).st_mode == st.st_mode and os.lstat(path).st_rdev != st.st_rdev
+	assert check_vault(job.job_vault, expected, set()) != []
 
 
 def test_a_number_in_allowed_new_may_be_missing_and_no_other(crash_vault):
@@ -549,7 +628,7 @@ def test_the_locks_are_free_between_the_scan_and_the_roll_forward(plain_r_vault,
 	real_prepare = rv.prepare_roll_forward
 	def preparing(*args):
 		real_prepare(*args)
-		prepared_scans.append(args[1].tree)
+		prepared_scans.append(args[0].tree)
 	monkeypatch.setattr(rv, 'prepare_roll_forward', preparing)
 	real_wait = rv.wait_for_path
 	waiting = threading.Event()
@@ -823,59 +902,6 @@ def test_no_unchecked_marks_fails_the_oracle(plain_r_vault):
 		rv.VaultManifest.mark_unchecked = lambda self, rels: None
 	found = first_wrong(vault, no_marks, change=lambda: put_a_file_back(vault))
 	assert found is not None and any("'a/x.txt'" in line for line in found[1]), found
-
-
-def self_named_links(job_vault):
-	'''The rels in the kept tree of a cut batch whose link names its own place.'''
-	tree = next((name for name in os.listdir(job_vault) if version_number(name) == 3), None)
-	if tree is None:
-		return []
-	found = []
-	for folder, names, files in os.walk(os.path.join(job_vault, tree)):
-		for name in names + files:
-			path = os.path.join(folder, name)
-			rel = os.path.relpath(path, os.path.join(job_vault, tree))
-			if os.path.islink(path) and os.readlink(path) == forward_text(rel, tree):
-				found.append(rel)
-	return found
-
-
-def test_no_self_named_unlink_fails_the_oracle(plain_r_vault):
-	# the sweep of the whole tree also takes such a link, so with it on no kill point tells the unlink's absence from its presence.
-	# with it off, each cut that leaves one shows: what the unlink alone does is seen, and nothing else is in the way
-	vault = plain_r_vault
-	job_vault = vault.job.job_vault
-	def no_sweep(rv):
-		rv.sweep_version_folder = lambda manifest, version_path, scopes, writer=None: ([], [])
-	def no_sweep_no_unlink(rv):
-		no_sweep(rv)
-		rv.unlink_self_named = lambda tree, rel: None
-	total, points = sweep_points(vault)
-	cuts = shown = 0
-	for point in points:
-		restore(vault)
-		cut_batch(vault, point)
-		links = self_named_links(job_vault)
-		if not links:
-			continue
-		cuts += 1
-		restore(vault)
-		cut_batch(vault, point)
-		assert retried(vault, fault=no_sweep).error is None
-		assert wrong_after_retry(vault) == [], (point, links)
-		restore(vault)
-		cut_batch(vault, point)
-		assert retried(vault, fault=no_sweep_no_unlink).error is None
-		problems = wrong_after_retry(vault)
-		if any(f"V3:{links[0]!r}" in line and "kind='l'" in line for line in problems):
-			shown += 1
-			if not os.environ.get('REVERB_CRASH_FULL'):
-				break
-		else:
-			# a copy or a move at its place replaces it anyway; a folder deleted has nothing that does
-			assert problems == [], (point, problems)
-	assert cuts > 0 and shown > 0, (cuts, shown)
-	print(f'{cuts} cuts left a self-named link, {shown} of them wrong without the unlink and the sweep')
 
 
 def test_no_folder_times_from_rows_fails_the_oracle(plain_r_vault):

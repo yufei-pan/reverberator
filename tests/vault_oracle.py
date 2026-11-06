@@ -12,11 +12,12 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
-from collections import namedtuple
+from collections import Counter, namedtuple
 
 # what a version holds at a path, or the monitored tree. kind: 'f', 'd', 'l', 'special', 'root', or 'dangling' for a daemon
-# link that leads nowhere. data: a file's sha256, a link's text, a dangling link's text. xattrs: sorted (name, value)
+# link that leads nowhere. data: a file's sha256, a link's text, a dangling link's text, a special file's (type, device number). xattrs: sorted (name, value)
 EntryView = namedtuple('EntryView', ['kind', 'data', 'mode', 'uid', 'gid', 'mtime_ns', 'xattrs'])
 
 ROOT_RECORD = 'trusted.reverberator.root'
@@ -137,7 +138,7 @@ def entry_view(path: str) -> EntryView:
 	elif stat.S_ISREG(st.st_mode):
 		kind, data = 'f', sha256_of(path)
 	else:
-		kind, data = 'special', stat.S_IFMT(st.st_mode)
+		kind, data = 'special', (stat.S_IFMT(st.st_mode), st.st_rdev)
 	return EntryView(kind, data, mode, st.st_uid, st.st_gid, st.st_mtime_ns, xattrs_of(path))
 
 
@@ -151,8 +152,11 @@ def root_record_view(version_path: str) -> EntryView:
 		return EntryView('root', f'no record: {e}', None, None, None, None, ())
 
 
-def read_view(job_vault: str, folder_name: str) -> dict:
-	'''{rel: EntryView} of the version in folder_name, read through its daemon links; '' is its root record.'''
+def read_view(job_vault: str, folder_name: str, inodes: dict = None) -> dict:
+	'''
+	{rel: EntryView} of the version in folder_name, read through its daemon links; '' is its root record. With inodes, a dict
+	to fill: {rel: (device, inode)} of each entry that is not a folder, as the links lead to it.
+	'''
 	view = {'': root_record_view(os.path.join(job_vault, folder_name))}
 	top = os.path.join(job_vault, folder_name)
 	pending = [(name, folder_name, name) for name in os.listdir(top)]
@@ -168,6 +172,9 @@ def read_view(job_vault: str, folder_name: str) -> dict:
 		view[rel] = entry_view(path)
 		if view[rel].kind == 'd':
 			pending.extend((f'{rel}/{name}', place[0], f'{place[1]}/{name}') for name in os.listdir(path))
+		elif inodes is not None:
+			st = os.lstat(path)
+			inodes[rel] = (st.st_dev, st.st_ino)
 	return view
 
 
@@ -184,15 +191,44 @@ def snapshot_tree(path: str) -> dict:
 	return view
 
 
-def compared(view: EntryView, folder_times: bool, free_file_meta: bool) -> EntryView:
-	'''view with what the check is told not to compare taken out.'''
+def compared(view: EntryView, folder_times: bool, loose: bool) -> EntryView:
+	'''view with what the check is told not to compare taken out; loose: a file or link of a shared inode, whose metadata is not compared.'''
 	if view is None:
 		return None
 	if view.kind == 'd' and not folder_times:
 		return view._replace(mtime_ns=None)
-	if view.kind in ('f', 'l') and free_file_meta:
+	if view.kind in ('f', 'l') and loose:
 		return view._replace(mode=None, uid=None, gid=None, mtime_ns=None, xattrs=None)
 	return view
+
+
+def recorded_design_r(job_vault: str) -> bool:
+	'''Whether the manifest of job_vault says its layout is design R (its meta row 'layout'), read as it lies, whatever a cut left in its journal.'''
+	path = os.path.join(job_vault, '.reverberator_manifest.sqlite')
+	if not os.path.exists(path):
+		return False
+	conn = sqlite3.connect(f'file:{path}?immutable=1', uri=True)
+	try:
+		row = conn.execute("SELECT value FROM meta WHERE key = 'layout'").fetchone()
+	except sqlite3.Error:
+		return False
+	finally:
+		conn.close()
+	return row is not None and row[0] == 'r'
+
+
+def daemon_links(job_vault: str, folder_name: str) -> list:
+	'''The rels of the links in the folder of a version whose text is a daemon link's (linked_place()), forward or backward.'''
+	found = []
+	top = os.path.join(job_vault, folder_name)
+	for folder, names, files in os.walk(top):
+		for name in names + files:
+			path = os.path.join(folder, name)
+			if os.path.islink(path):
+				rel = os.path.relpath(path, top)
+				if linked_place(folder_name, rel, os.readlink(path)) is not None:
+					found.append(rel)
+	return found
 
 
 def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: bool = True, free_file_meta: bool = False) -> list:
@@ -202,7 +238,11 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 	expected: {version number: its view (snapshot_tree() form)}, every version the vault may keep. A number in allowed_new
 	may be missing, as a batch cut before its commit leaves it; any other must be there, and no other may. folder_times
 	False leaves folder mtimes out; free_file_meta leaves out everything of a file but its contents, and of a user's link but
-	its text, as an Only Sync Attributes change reaches every version sharing it (spec section 2.4).
+	its text, as an Only Sync Attributes change reaches every version sharing it (spec section 2.4): in the versions before the
+	newest, and only for an inode that more than one version reads. A file no other version shares, and every file of the newest
+	version, are compared whole. A version's own folder must have the mode and owner of the job vault's (the daemon makes
+	both, and a version's root is recorded in its attribute instead). On design R the newest version is the real tree and
+	holds no daemon link, of 0.54's kind or any.
 	'''
 	problems = []
 	folders, lists = {}, {}
@@ -252,13 +292,26 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 		for name in names + files:
 			if name.endswith(PARTIAL_SUFFIX) or (name.startswith('.reverberator-change-list-') and folder != job_vault):
 				problems.append(f'left over: {os.path.join(folder, name)!r}')
+	vault_st = os.lstat(job_vault)
 	for number in kept:
-		if number not in expected:
-			continue
-		view, want = read_view(job_vault, folders[number]), expected[number]
+		st = os.lstat(os.path.join(job_vault, folders[number]))
+		if (stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid) != (stat.S_IMODE(vault_st.st_mode), vault_st.st_uid, vault_st.st_gid):
+			problems.append(f'V{number}: the version folder has mode {stat.S_IMODE(st.st_mode):o}, owner {st.st_uid}:{st.st_gid}, not the job vault\'s')
+	if kept and recorded_design_r(job_vault):
+		for rel in daemon_links(job_vault, folders[kept[-1]]):
+			problems.append(f'V{kept[-1]}:{rel!r}: a daemon link in the newest version of a design R vault')
+	views, inodes = {}, {}
+	for number in kept:
+		if number in expected:
+			inodes[number] = {}
+			views[number] = read_view(job_vault, folders[number], inodes[number])
+	readers = Counter(place for number in inodes for place in set(inodes[number].values()))
+	for number, view in views.items():
+		want = expected[number]
 		for rel in sorted(set(view) | set(want)):
-			held = compared(view.get(rel), folder_times, free_file_meta)
-			wanted = compared(want.get(rel), folder_times, free_file_meta)
+			loose = free_file_meta and number != kept[-1] and readers[inodes[number].get(rel)] > 1
+			held = compared(view.get(rel), folder_times, loose)
+			wanted = compared(want.get(rel), folder_times, loose)
 			if held != wanted:
 				problems.append(f'V{number}:{rel!r}: the vault holds {held}, expected {wanted}')
 	return problems
