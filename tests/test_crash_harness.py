@@ -15,17 +15,18 @@ import os
 import random
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
-from collections import OrderedDict
+from collections import deque, OrderedDict
 
 import pytest
 
 import reverberator as rv
 from tests import version_view_ground_truth as view_truth
-from tests.crash_batches import after_retries, apply_batch3, batch3_of, build_base, expected_of, prepare, put_text, restore, restore_monitor, UNREADABLE
-from tests.crash_child import failing_copy_command, kill_run, retry, run_do_backup
+from tests.crash_batches import after_retries, apply_batch3, batch3_of, build_base, expected_of, prepare, put_text, raw_events, restore, restore_monitor, UNREADABLE
+from tests.crash_child import failing_copy_command, in_child, kill_run, retry, run_do_backup
 from tests.harness import create_job
 from tests.vault_oracle import check_vault, forward_text, read_view, sizes_by_newest_holder, snapshot_tree, version_number
 
@@ -594,19 +595,64 @@ def test_a_comparison_of_scanned_folders_leaves_a_cut_batch_to_the_whole_compari
 	assert full is True and info.tree is not None and not entries
 
 
-def test_entries_given_to_a_roll_forward_are_merged_with_the_comparison(plain_r_vault):
-	# what the pending transactions of the cut batch give at the next start, its moves among them
+def test_a_cut_batch_that_held_moves_ends_exact_with_or_without_its_saved_entries(plain_r_vault):
+	# the comparison of the whole tree says what the roll-forward replays: the entries the pending transactions give at the next start
+	# change nothing, with or without them. batch 3 holds moves of files and folders, among them a swap
 	vault = plain_r_vault
-	job, job_vault = vault.job, vault.job.job_vault
+	job_vault = vault.job.job_vault
 	total = cut_batch(vault).steps
 	for point in (total // 3, total // 2, total - 3):
-		restore(vault)
-		assert cut_batch(vault, point).killed
-		outcome = cut_batch(vault)
-		assert outcome.error is None and outcome.committed is True, outcome
-		assert wrong_after_retry(vault) == [], point
-		folder = folder_of(job_vault, 3)
-		assert read_view(job_vault, folder)[f'w/x{UNREADABLE}'] == vault.base[2][f'w/x{UNREADABLE}']
+		for given in (True, False):
+			restore(vault)
+			assert cut_batch(vault, point).killed
+			outcome = cut_batch(vault) if given else retried(vault)
+			assert outcome.error is None and outcome.committed is True, outcome
+			assert wrong_after_retry(vault) == [], (point, given)
+			folder = folder_of(job_vault, 3)
+			assert read_view(job_vault, folder)[f'w/x{UNREADABLE}'] == vault.base[2][f'w/x{UNREADABLE}']
+
+
+def test_a_file_that_became_a_folder_after_a_cut_is_rolled_forward(tmp_path, r_layout):
+	# the cut batch held `create a/f1`; while the daemon was down a/f1 became a folder with a file in it. The next start is
+	# given the saved entry again, and the comparison alone says what the tree is: given with it, a file's copy would replace the folder
+	job = create_job(str(tmp_path))
+	base = build_base(job)
+	template = str(tmp_path / 'template')
+	subprocess.run(['cp', '-a', job.vault, template], check=True)
+	events = [(False, 'create', 'a/f1', None)]
+	raw = raw_events(job.monitor, events)
+	def work():
+		entries = rv.change_events_to_backup_entries(deque(raw), job.monitor)
+		return run_do_backup(job, entries, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns())
+	wrong = []
+	rolled = 0
+	for point in range(1, 200):
+		shutil.rmtree(job.vault)
+		subprocess.run(['cp', '-a', template, job.vault], check=True)
+		shutil.rmtree(os.path.join(job.monitor, 'a/f1'), ignore_errors=True)
+		put_text(job.monitor, 'a/f1', 'file')
+		cut = in_child(job, point, work)
+		if cut.error is not None:
+			wrong.append((point, cut))
+			continue
+		if not cut.killed:
+			break
+		if rv.get_vault_info(job.job_vault).tree is None:
+			continue
+		os.remove(os.path.join(job.monitor, 'a/f1'))
+		os.mkdir(os.path.join(job.monitor, 'a/f1'))
+		put_text(job.monitor, 'a/f1/in', 'inside')
+		again = in_child(job, None, work)
+		rolled += 1
+		if again.error is not None or again.committed is not True:
+			wrong.append((point, again))
+			continue
+		problems = check_vault(job.job_vault, {1: base[1], 2: base[2], 3: snapshot_tree(job.monitor)}, set()) + view_truth.wrong_lists(job.job_vault)
+		if problems:
+			wrong.append((point, problems[:4]))
+	assert rolled > 0
+	print(f'{rolled} cuts with a tree; {len(wrong)} wrong')
+	assert not wrong, [(point, (outcome.error or str(outcome)).strip().splitlines()[-1][:150] if hasattr(outcome, 'error') else outcome) for point, outcome in wrong[:5]]
 
 
 def test_enospc_at_every_record_call_keeps_every_version_exact(r_vault):
