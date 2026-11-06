@@ -337,14 +337,14 @@ Between steps 3 and 5, V<n> is missing: `current_version` and the older versions
 - **A hand-over's tree still under its old name on a disk:** it gets the new name there, directly on that disk, then every disk is flushed.
 - **A skeleton in staging and V<N> with no list:** redo the rename V<n>→V<N>, flush, rename the skeleton in, flush.
 - **A cut conversion on two renames** (§7), on a vault not yet on design R, directly on each disk. The version is the manifest's newest not yet converted, as one tree is built at a time and a list with no folder no longer tells it. `staging/m` showing, or no folder under the version's name: `staging/old` goes back on each disk and the version is converted again. `staging/n` showing with `staging/old`, or with no folder under the version's name: it goes in on each disk. `staging/n` alone with the version there is what a removal of staging left, and goes with staging.
-- **After a change made directly on a disk,** the pool is told to forget what it holds (mergerfs's `invalidate-all-nodes` command), as it reads the old entry for about a second, and an entry of another kind reads as EIO. A mergerfs without the command only reads late, and the attempt goes on at the next.
+- **After a change made directly on a disk,** the pool is told to forget what it holds (mergerfs's `invalidate-all-nodes` command), as it reads the old entry for about a second, and an entry of another kind reads as EIO. On a mergerfs without the command an attempt can fail once and go on at the next, and a folder in the last two versions can keep a wrong mtime (docs/limitations.md).
 
 **Roll-forward repairs, per disk:**
 - **A name that is a forward link on one disk and a real entry on another:** remove the link on its disk.
 - **A tree name that is a folder on one disk and a file on another** (an apply phase cut half way): the name goes on every disk and the comparison copies it again, leaving out what the previous version forwards. Through the pool a folder's chmod would otherwise reach the file, whose inode an older version shares.
 - **A version-n row missing under a real P folder while T holds the entry:** put a forward link back. T is unchanged there, because its apply phase had not begun.
 
-**Expected loss after the repair:** none of the previous version, as long as every disk comes back. The pool cut test covers this: 16,606 runs on 2 and 3 disks, 0 wrong.
+**Expected loss after the repair:** none of the previous version, as long as every disk comes back. The pool cut test covers this: about 16,000 runs on 2 and 3 disks, double cuts on the conversion shapes, and a shape with placement forced, 0 wrong. A lost manifest in the same cut is the exception (docs/limitations.md).
 
 **The pool cut test** (the build's gate):
 - Each branch is its own f2fs loop image under mergerfs.
@@ -546,6 +546,20 @@ Line counts are measured with `ast` at HEAD 8a8bcb9, inclusive.
 | whole-tree folder event | | 961 MiB once |
 
 The work job goes from about 64 GiB/day to about 0.5–0.75 GiB/day. These numbers were not re-measured after this revision: the only writer change, per-entry records for a folder created over an existing folder, does not occur in the live batches.
+
+**Measured on the real code (Task 17, 2026-11-06).** On an f2fs loop image with live-shaped data, through the real `do_backup`, keep-N 5, with the user's OK to take these as the real figures:
+
+| step | MiB |
+|---|---:|
+| conversion, per version of 183,000 files | 901 to 993 |
+| batch of 212 to 1,353 entries | 24 to 36 |
+| the V73 rows, 1,297 entries and about 17,000 changes | 59.3 |
+| whole-tree folder event | 1,030 |
+| prune of a converted version | 720 to 737 |
+| prune of a small unfolded version | 0.2 to 0.7 |
+| prune of the version the V73 rows made | 3.9 |
+
+The lines above came from the prototype, which skipped real deletes, the contents of created folders and move-source records. The V73 batch costs about one 4 KiB block per change. The prune's 3.9 MiB is 1.85 MiB over a fresh tree of the same shape, not explained. The commit flush took 20 to 105 ms per batch and added no bytes.
 
 ## 11. Review findings, settled
 **Opus:**

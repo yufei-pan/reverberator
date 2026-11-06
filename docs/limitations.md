@@ -2,17 +2,19 @@
 
 Each entry here has the user's OK. Reviewers read this file first and don't raise these entries again.
 
-### A user's link written as its own path's chain link
+### The conversion from 0.54 judges links by their text
 
 - **Kind:** known limitation.
-- **What the operator sees:** a symlink in the monitored tree whose text is exactly its own path's link to the previous
-  version (for example `a/U -> ../../V<n-1>--<timestamp>/a/U`) is taken for the vault's own link. Pruning and restore then
-  give a/U's own older copy in place of the link. Nothing beyond that one path is affected.
-- **Why:** the vault holds nothing that tells such a link from the daemon's own. Telling it would need a new per-version
-  record of user links, a new vault artifact.
-- **Revisit when:** someone needs to back up symlinks of that exact form, which requires typing the newest version's
-  folder name between two backups.
-- **Approved:** 2026-10-22, the user's choice "Leave it (Recommended)" on the round 8 design's blind spot.
+- **What the operator sees:** until a job's one-time conversion ends, and during it, a symlink of the user's whose
+  text has the shape of a 0.54 chain link (for example `a/U -> ../../V<n-1>--<timestamp>/a/U`) is taken for the
+  vault's own link. It reads, restores and converts as the file it names, not as a link. A vault whose manifest was
+  lost with a hot journal is read the same way and logs a Note; that case is by reading the code, not tested. Once a
+  job is converted, its versions are plain trees and no link is judged by its text.
+- **Why:** a 0.54 vault holds nothing that tells such a link from the daemon's own. Telling it would need a new
+  per-version record for a format that is going away.
+- **Revisit when:** the 0.54 reader goes, a release after 0.55; this entry goes with it.
+- **Approved:** 2026-10-22, "Leave it (Recommended)"; 2026-11-04, "Accept for the conversion"; 2026-11-06, "Accept
+  (Recommended)" for reading a vault before its conversion.
 
 ### World-readable vault database and change lists
 
@@ -35,17 +37,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a vault's size limit needs to be met exactly.
 - **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
 
-### User symlinks past 40 hops when keep-N is 40 or more
+### Versions more than 40 back cannot be browsed by hand
 
-- **Kind:** known limitation, already in 0.43.
-- **What the operator sees:** with keep-N at 40 or more, an unchanged user symlink is chained through more than 40 links
-  by way of `current_version/` (at 41 or more, through its own version folder too), so browsing the vault by hand through
-  the kernel gives "too many levels of symbolic links" for it. Restore gives it back correctly. The live jobs keep 3 to
-  5 versions.
-- **Why:** the re-copies every 32-38 hops at the default Chain Length of 40 that keep files under the kernel's limit apply
-  to files only.
-- **Revisit when:** a job keeps 40 or more versions and its vault is browsed by hand.
-- **Approved:** 2026-10-23, the user's choice "Known limitation (Recommended)".
+- **Kind:** known limitation.
+- **What the operator sees:** a path k versions older than the newest passes through up to k forward links, and every
+  symlink in the vault's own path counts as well. Past the kernel's 40 (about 20 while Docker changes mounts),
+  browsing by hand gives "too many levels of symbolic links". restore and history work. The live maximum keep-N is 14.
+- **Why:** re-pointing links would cost writes on every cycle.
+- **Revisit when:** a job keeps more than 20 versions and is browsed by hand.
+- **Approved:** 2026-11-04, "Known limitation".
 
 ### A SnapRAID fix while reverberator runs
 
@@ -137,7 +137,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   the move replays, because another change of the same batch (a move, a delete, or a folder made after it) replays in
   another order, logs one warning, `Not renaming … to …: its source or the folder it goes into is not in the version;
   copying it instead`, with no traceback (firewatcher does not alert on it), and the entry is copied once more: its files
-  are written to the vault again in full, losing their chain links. Some of these shapes also log a warning `Not tracking
+  are written to the vault again in full, a copy instead of a rename. Some of these shapes also log a warning `Not tracking
   <path>: source no longer exists` for a copy the batch left behind. Examples: `mv d e; mkdir e/sub; mv x e/sub/x` (x
   copied), `mv a/f g; mv a A; mv g h` (h copied), `mkdir x; mv old x/f; mv x y` (y/f copied), `mv D/sub t; rm -r D; mv t
   D` (D's files copied), `mv d D; mv D/k z; rm -r D` (z copied), and, with a new file f, `echo new > f; mv f d/g; mv d D;
@@ -163,12 +163,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** with a size limit, the estimate made before a backup leaves out the new version's own
-  folders, links and xattr blocks (a few KB, at most ~77 KB in testing) and a change kept under a folder moved into a new
-  folder (up to that file's size), so a vault can go over its limit by that much until the next prune. The sizes recorded
-  after each backup are measured, so later prunes are right.
+  folders, links and xattr blocks (a few KB, at most ~77 KB in testing) and a change kept under a folder moved into a
+  new folder (up to that file's size), so a vault can go over its limit by that much until the next prune. With an
+  inode limit, the estimate leaves out the links the hand-over and unfolds make, so a batch can pass the limit by that
+  many until the next prune: a folder of 100K entries that changes makes 100K links in that version. The sizes
+  recorded after each backup are measured, each file by its size plus 4 KiB per folder, and each inode in the newest
+  version that holds it, so later prunes are right.
 - **Why:** counting them would add estimates for a small, one-batch overshoot.
 - **Revisit when:** a vault's limit is tight enough for it to matter.
-- **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)".
+- **Approved:** 2026-10-26, "Known limitation (Recommended)"; 2026-11-05, "Extend the entry (Recommended)".
 
 ### A vault down to its only version can pass its size limit
 
@@ -195,12 +198,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### A copy whose start was lost after a power loss
 
 - **Kind:** known limitation.
-- **What the operator sees:** after a power loss, a vault copy whose first blocks were lost but whose last 64 KiB reached
-  the disk reads back with the right size, mtime and tail hash, so it is recorded checked and keeps the lost bytes.
-  Writeback usually loses a file's end, which is caught.
+- **What the operator sees:** a cut after a checkpoint of the disk (another job's commit, the kernel's periodic one, a
+  sync) and before the batch's flush ends can leave a copy all NUL in the tree. The roll-forward copies again every
+  file whose row differs. A copy whose row did not change, an attribute change with Only Sync Attributes off, is
+  compared by size, mtime and last 64 KiB, so one that ends in 64 KiB of NUL passes and stays all NUL in the newest
+  version. Older versions keep the right copy.
 - **Why:** the read-back hashes the tail only; a whole-file read would cost every check a full read.
-- **Revisit when:** such a loss is seen.
-- **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
+- **Revisit when:** such a loss is seen, or a job turns Only Sync Attributes off and holds files that end in zeros.
+- **Approved:** 2026-10-27, "Known limitation (Recommended)"; 2026-11-06, the text above, "Approve the text
+  (Recommended)".
 
 ### A clock set back after a read was stamped
 
@@ -297,19 +303,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** reading every unchecked copy whole at a restart costs a full read of everything copied since the last check.
 - **Revisit when:** a vault disk keeps working after write errors, so this is met.
 - **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
-
-### One lock for every comparison's vault sync
-
-- **Kind:** known limitation.
-- **What the operator sees:** all comparisons' vault syncs take one lock, and so do the two flushes of a prune on a
-  mergerfs pool (since 0.53), so a write error is marked before another job syncs that disk; a vault disk that hangs in a
-  sync (SCSI timeouts, a link-reset loop) stalls every job's checked records, every prune on a pool and the vault scan's
-  flush before it removes a stale change list on a pool, on any pool, not only the jobs on that disk.
-- **Why:** a lock per disk needs a lock table; on this host every vault is on /mnt/vaults.
-- **Revisit when:** a host keeps vaults on several pools.
-- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)". Widened to the prune's flushes on
-  2026-11-03, the user's choice "Widen the wording (Recommended)", and to the scan's flush on 2026-11-04, the user's
-  choice "Both (Recommended)".
 
 ### A failed sync that cannot be recorded, after a restart
 
@@ -436,7 +429,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** an entry moved into a new folder made at its own old place in one batch (`mv D x; mkdir D;
   mv x D/D`, or `mv site site.old; mv site.new site; mv site.old site/old`) logs one warning, `Not renaming … to …: its new
   place is inside its old one in the version; copying it instead`, and is copied: the next version holds full copies of
-  its files, not links to the older version, so a big folder costs its full size in the vault once. In the swap shape the
+  its files in full, so a big folder costs its full size in the vault once. In the swap shape the
   folder that took its old place (site.new) is copied whole too, as the copy replaces all of the version's `site`: both
   folders cost their size once, unless the replacing one was made in that batch (then it is copied anyway). The result is
   right.
@@ -469,39 +462,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   "Skip messages.db" for docker_volumes (in /etc/reverb_skip_docker_volumes.txt, with its -wal and -shm; restic's own
   copies still hold it) and "Leave restic as it is (Recommended)".
 
-### A prune cut off on a pool can bring back a file the next version had dropped
-
-- **Kind:** known limitation.
-- **What the operator sees:** after a power loss, a dropped disk or a stop in the middle of a prune on a mergerfs pool,
-  the next prune links back from the oldest version what the next version lost. In two batch shapes it also brings back
-  files that version had dropped, so a restore of that version shows files the tree did not have at that time: a file
-  deleted in or under a folder the same batch renamed (`mv D E; rm E/x`, or a folder moved into the old path and a file
-  deleted there, `mv D E; mv F D; rm D/w`; with `mv D E; rm -r E/sub; mkdir E/sub` every file E/sub held comes back),
-  and a file moved onto a new name that then left the watched tree while its move waited for its pair (the batch's
-  verification deleted it). A subfolder deleted and not made again does not come back. No copy is lost.
-- **Why:** the version's change list holds the move and then a delete that names the moved layout, the same rows it
-  holds when the delete named the old layout; reading such a delete back through the moves would make the repair miss
-  real files when it is read wrong, which loses copies. An extra file is the safer side.
-- **Revisit when:** such an extra file is seen after a repair, or the change list records which rows the verification
-  wrote.
-- **Approved:** 2026-11-03, the user's choice "Known limitation (Recommended)"; widened to the renamed-folder shapes
-  on 2026-11-04, the user's choice "Widen it (Recommended)".
-
-### A prune killed or cut by a power loss leaves bumped folder times
-
-- **Kind:** known limitation.
-- **What the operator sees:** a prune records the times of each folder of the next version before its first write
-  there and gives them back after the walk, even when the walk fails. A prune killed or cut by a power loss before that
-  leaves those folders with the time of the prune's writes, and the rerun gives back the times it finds, so a restore of
-  that version gives those folders that time. When that version is the newest (a vault kept to two versions, or one a
-  size limit brings down to one), later versions inherit it until a batch writes into or changes the folder; comparisons
-  do not see it, as records hold the monitored folders' times. Files and their times are untouched.
-- **Why:** keeping the old times through a kill would need them written to disk before the walk, for a rare case that
-  affects folder times only.
-- **Revisit when:** such times are seen after a crash, or the prune gets a journal for another reason.
-- **Approved:** 2026-11-04, the user's choice "All three (Recommended)"; reworded the same day, the user's choice
-  "Reword it (Recommended)".
-
 ### A folder whose extended attributes alone fail to copy keeps the wrong ones
 
 - **Kind:** known limitation.
@@ -516,23 +476,167 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### On a mergerfs pool, a folder cloned to another disk can lose setgid
 
 - **Kind:** known limitation.
-- **What the operator sees:** on a vault kept on a mergerfs pool, a folder that mergerfs clones onto another disk while
-  the replay or the prune writes into it can lose its setgid bit on that disk (a mergerfs bug: upstream
-  https://github.com/trapexit/mergerfs/issues/1689); the replay and the prune give such folders back their times only,
-  so the pool may show the folder without setgid, and a restore gives it back so. A version's folders the referenced
-  copy makes get their whole metadata after their entries, which repairs every clone.
-- **Why:** copying the whole metadata of every folder the replay or the prune writes into would cost requests on every
-  vault, for a bug of mergerfs that a vault on one disk never meets.
-- **Revisit when:** mergerfs fixes it, or a vault on a pool relies on setgid folders.
-- **Approved:** 2026-11-04, the user's choice "All three (Recommended)".
+- **What the operator sees:** on a vault kept on a mergerfs pool, a folder that mergerfs clones onto another disk
+  while a batch records into it or writes into it can lose its setgid bit on that disk (a mergerfs bug: upstream
+  https://github.com/trapexit/mergerfs/issues/1689); a batch gives such folders back their times only, so the pool may
+  show the folder without setgid, and a restore gives it back so.
+- **Why:** copying the whole metadata of every folder a batch writes into would cost requests on every vault, for a
+  bug of mergerfs that a vault on one disk never meets.
+- **Revisit when:** a mergerfs release carries the fix (the issue was closed as completed on 2026-11-05), or a vault
+  on a pool relies on setgid folders.
+- **Approved:** 2026-11-04, "All three (Recommended)"; narrowed 2026-11-05, "Apply as drafted (Recommended)".
 
-### Copy threads auto cannot tell the disks under btrfs or ZFS
+### After a crash, a folder whose row holds no record can keep the backup's time
+
+- **Kind:** known limitation.
+- **What the operator sees:** a crash in the one call between a change inside a folder of the previous version and
+  giving that folder its times back leaves the backup's time on it. The roll-forward restores it from the folder's
+  database row, except when that row holds no record (its vault entry could not be read when it was recorded, or the
+  manifest was lost). A restore of that version then gives that one folder that time. Files and other folders are not
+  affected.
+- **Why:** keeping the time elsewhere would need a durable write per folder.
+- **Revisit when:** it is seen.
+- **Approved:** 2026-11-04, "Known limitation".
+
+### Vaults on btrfs
+
+- **Kind:** known limitation.
+- **What the operator sees:** design R relies on the manifest's fsync also carrying earlier folder changes to the
+  disk. Power-cut tests confirm that on f2fs, and ext4 and xfs should hold by reasoning. btrfs should not (reasoned,
+  not run): on a btrfs vault, a power cut at the wrong moment could make the next start refuse the vault, or finish a
+  commit with a part-applied tree.
+- **Why:** a stronger flush before each commit, with its own tests on btrfs, for a filesystem no vault here uses.
+- **Revisit when:** a vault goes on btrfs.
+- **Approved:** 2026-11-05, "Known limitation (Recommended)".
+
+### A copy lost before the upgrade restores as a broken link
+
+- **Kind:** known limitation.
+- **What the operator sees:** a file whose copy was already lost before the conversion to 0.55 restores from the older
+  versions that held it as a broken link, with no FAILED line, where 0.54 printed FAILED. The conversion logs one
+  error line for each, `<path> of <version> is a chain that leads nowhere (...): its copy was lost before the
+  conversion, so it stays the link`. That line raises no alert: firewatcher's patterns do not match it.
+- **Why:** keeping the FAILED would mean carrying the 0.54 rule on design R for ever.
+- **Revisit when:** such files are found on a real vault.
+- **Approved:** 2026-11-06, "Accept, log line only (Recommended)".
+
+### The conversion runs on one thread
+
+- **Kind:** known limitation.
+- **What the operator sees:** at a job's first start on 0.55 its backups wait for a one-time conversion that does not
+  fill the machine: about 6 s per version and half a minute in all for 100,000 entries per version, measured on a loop
+  image on an SSD, and under 3 s for small jobs.
+- **Why:** it runs once, it is the riskiest step, and its code goes with the 0.54 reader a release later.
+- **Revisit when:** a job with far more entries is converted.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### history can name a place a file only passed through
+
+- **Kind:** known limitation.
+- **What the operator sees:** when one batch moves a folder and also moves a file in or out of it through a name that
+  same batch overwrote or removed, `history` can name a place the file passed through, not where it was. A name
+  created again between moves, and a target moved and removed in one batch, do the same. In a fuzz of hard batches
+  about 108 of 102,855 names read wrong. Restores are right.
+- **Why:** the change list keeps one row per chain and no true order, so a fix needs a change list format change.
+- **Revisit when:** someone meets it on a real tree, or the format changes for another reason.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### A comparison's failed sync does not fail the attempt
+
+- **Kind:** known limitation.
+- **What the operator sees:** when a comparison's sync of the vault disk fails, the attempt goes on. The disk is
+  marked and an alert goes out, the copies stay unchecked, and the next read-back copies them again. A batch's own
+  flush before its commit does fail the attempt.
+- **Why:** the kernel reports a write error once, so failing here would need the code to tell "failed now" from
+  "already marked", and a comparison with no copies should not fail.
+- **Revisit when:** an alert is ever missed.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### status can show one version fewer during a hand-over
+
+- **Kind:** known limitation.
+- **What the operator sees:** while a batch swaps in the new tree, `status` can show one version fewer. history and
+  restore wait through it and read right.
+- **Why:** a status that waits could hang behind a backup, and status is what is run when things look stuck.
+- **Revisit when:** something reads that count to make a decision.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### A kill can leave a version folder's own time moved
+
+- **Kind:** known limitation.
+- **What the operator sees:** f2fs moves a folder's mtime on a cross-folder exchange, so the hand-over sets it back. A
+  kill between the skeleton's rename and that call leaves the version folder's own mtime moved. No view of the version
+  shows it, and its contents and restores are right.
+- **Why:** mending it at the scan is more code for a value nothing reads.
+- **Revisit when:** something reads that time.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### A manifest lost in the same cut as a split on a pool
+
+- **Kind:** known limitation.
+- **What the operator sees:** on a pool, if the manifest is lost in the same power cut that left a folder record or a
+  conversion's rename on one disk and not on another, the repair cannot tell a removed entry from a new one. An older
+  version can lose an entry, or part of a version being converted can go with staging, with no error. Two faults at
+  once. Reasoned by reading the code, not run.
+- **Why:** a fix would need staged links that carry their path, a new format for a layout no vault here uses.
+- **Revisit when:** a vault goes back on a pool.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### A monitored tree on a pool: a clone's folder time comes with no event
+
+- **Kind:** known limitation.
+- **What the operator sees:** if a monitored tree sits on a mergerfs pool, mergerfs moves the mtime of folders above a
+  new entry when it clones the path, and sends no event. A batch can miss that folder time until the next full
+  comparison. Only a folder's time is affected.
+- **Why:** mergerfs sends no event, so nothing can react sooner.
+- **Revisit when:** mergerfs sends one.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### A first version of folders alone on a pool gets no commit flush
+
+- **Kind:** known limitation.
+- **What the operator sees:** on a pool, a job's V0 that holds only folders and no files has no copies, so its commit
+  does not flush; the job vault's own fsync on each branch follows it. A cut there could lose some of those empty
+  folders from V0, and the next comparison would make them again. That outcome is by reading the code, not run.
+- **Why:** there are no copies to protect.
+- **Revisit when:** a vault goes back on a pool and a first version loses a folder.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### A mergerfs with no forget command
+
+- **Kind:** known limitation.
+- **What the operator sees:** after a power cut, on a mergerfs that lacks `invalidate-all-nodes`, a folder in the last
+  two versions can show a wrong mtime, and it stays wrong; an attempt may also fail once and go on at the next. With
+  the command stubbed out on 2.42, 1 to 10 of 274 cut runs were wrong, and each wrong line looked at closely was a
+  folder's time alone. No file data was wrong.
+- **Why:** repairing it means reading each folder's time on every disk, for a version of mergerfs not in use here.
+- **Revisit when:** someone runs such a mergerfs.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### A FUSE vault with exchange and cached attributes
+
+- **Kind:** known limitation.
+- **What the operator sees:** on a vault on a FUSE filesystem that gives RENAME_EXCHANGE and keeps a name's attributes
+  for a second, link counts can read stale, so version sizes can read low and Backup Size Limit undercounts, with no
+  error. Reasoned, not run. Pools and filesystems with no exchange are covered.
+- **Why:** covering it means reading fresh link counts on every batch of every job.
+- **Revisit when:** a vault goes on such a filesystem.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### f2fs can keep a symlink with no text
 
 - **Kind:** deferred.
-- **What the operator sees:** with Copy threads (rule column 15) blank or auto, a vault on btrfs or ZFS gets 2 threads
-  with the reason "cannot tell (btrfs/ZFS)", even on hard disks, where more threads help; set a number in the column for
-  such a vault.
-- **Why:** btrfs and ZFS show device 0 in mountinfo, so the disk lookup that tells SSDs from hard disks finds no disk;
-  the lookup through the mount's own devices is left for later.
-- **Revisit when:** a vault is kept on btrfs or ZFS.
-- **Approved:** 2026-11-04, the user's choice "Both (Recommended)".
+- **What the operator sees:** nothing, today: `is_skeleton()` passes over a link `readlink` cannot read. A checkpoint
+  inside symlink(2) followed by a power cut keeps a link that lstat lists and readlink answers ENOENT for, and
+  fsck.f2fs does not see it. A later checkpoint heals it.
+- **Why:** the proper fix is in the kernel; a report is drafted for the f2fs list.
+- **Revisit when:** a kernel carries the fix: then that tolerance in `is_skeleton()` can go.
+
+### mergerfs answers EBADF to a lstat during an rm
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing, today: `TreeWriter.removing` keeps the writer's walks out of a folder whose
+  removal is queued. lstat of that folder or of a path below it can answer EBADF while `rm -rf` runs through mergerfs
+  2.42.
+- **Why:** the proper fix is in mergerfs: upstream https://github.com/trapexit/mergerfs/issues/1693.
+- **Revisit when:** a mergerfs release carries the fix: then check whether `removing` is still worth keeping.
