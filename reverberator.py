@@ -8429,8 +8429,12 @@ class VaultManifest:
 		self._tracking = False
 		try:
 			self._open()
+		except sqlite3.OperationalError as e:
+			# a lock held past the timeout, a failing disk or no file handle left says nothing of the file, and it stays as it is: after a
+			# cut batch it holds the only copy of version n's folder times. the attempt fails and the next one opens it again
+			raise JobFailure(f'cannot open the vault database {self.path}: {e} (if it stays, remove that file: only a listing of the vault is lost, unless a backup was cut off, whose folder times it holds)') from e
 		except sqlite3.DatabaseError as e:
-			# it only records what the vault holds: start over, and delta generation reads the vault again
+			# a file that is no database says nothing the vault does not: start over, and delta generation reads the vault again
 			backuperTeeLogToTl(path=self.path,error=True,message=f'Discarding unreadable manifest: {e}')
 			for suffix in ('', '-journal'):
 				try:

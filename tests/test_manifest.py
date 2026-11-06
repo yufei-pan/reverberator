@@ -518,6 +518,84 @@ def test_unreadable_manifest_is_started_over(job):
 	manifest.close()
 
 
+def test_a_malformed_manifest_is_started_over(job):
+	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
+	run_backup(job)
+	path = os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME)
+	size = os.path.getsize(path)
+	with open(path, 'r+b') as f:
+		# the pages after the first, where the rows are, are not a database's
+		f.seek(4096)
+		f.write(os.urandom(size - 4096))
+	manifest = rv.VaultManifest(job.job_vault)
+	assert manifest.files == [] and not manifest.describes(latest_version(job).path)
+	manifest.close()
+
+
+def test_a_lock_held_past_the_timeout_keeps_the_manifest(job, monkeypatch):
+	# the manifest of a cut batch holds the only copy of version n's folder times: a lock, a failing disk or a full table of
+	# file handles says nothing of the file, and it stays as it is
+	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
+	run_backup(job)
+	before = contents(job)
+	inode = os.stat(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME)).st_ino
+	holder = database(job)
+	holder.execute('BEGIN EXCLUSIVE')
+	connect = sqlite3.connect
+	monkeypatch.setattr(rv.sqlite3, 'connect', lambda *args, **kwargs: connect(*args, **{**kwargs, 'timeout': 0}))
+	with pytest.raises(rv.JobFailure, match='database is locked.*remove that file'):
+		rv.VaultManifest(job.job_vault)
+	holder.rollback()
+	holder.close()
+	assert contents(job) == before and os.stat(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME)).st_ino == inode
+	reopened = rv.VaultManifest(job.job_vault)
+	assert reopened.describes(latest_version(job).path) and reopened.files == ['a.txt', 'sub/b.txt']
+	reopened.close()
+
+
+@pytest.mark.parametrize('message', ['disk I/O error', 'unable to open database file', 'database or disk is full'])
+def test_an_error_of_the_operation_keeps_the_manifest(job, monkeypatch, message):
+	seed_monitor(job, {'a.txt': 'hello'})
+	run_backup(job)
+	before = contents(job)
+	connect = sqlite3.connect
+	failures = []
+	def failing(*args, **kwargs):
+		if not failures:
+			failures.append(message)
+			raise sqlite3.OperationalError(message)
+		return connect(*args, **kwargs)
+	monkeypatch.setattr(rv.sqlite3, 'connect', failing)
+	with pytest.raises(rv.JobFailure, match=message):
+		rv.VaultManifest(job.job_vault)
+	assert contents(job) == before
+	reopened = rv.VaultManifest(job.job_vault)
+	assert reopened.files == ['a.txt']
+	reopened.close()
+
+
+def test_an_attempt_that_cannot_open_the_manifest_fails_and_the_next_one_commits(job, monkeypatch):
+	seed_monitor(job, {'a.txt': 'hello'})
+	run_backup(job)
+	seed_monitor(job, {'b.txt': 'second'})
+	before = contents(job)
+	connect = sqlite3.connect
+	failures = []
+	def failing(*args, **kwargs):
+		if not failures:
+			failures.append(1)
+			raise sqlite3.OperationalError('disk I/O error')
+		return connect(*args, **kwargs)
+	monkeypatch.setattr(rv.sqlite3, 'connect', failing)
+	with pytest.raises(rv.JobFailure):
+		run_backup(job)
+	assert contents(job) == before
+	run_backup(job)
+	reopened = rv.VaultManifest(job.job_vault)
+	assert reopened.files == ['a.txt', 'b.txt'] and reopened.describes(latest_version(job).path)
+	reopened.close()
+
+
 # --- schema 3: an in-place upgrade, and the keys design R reads ---
 
 def as_schema_2(job):
