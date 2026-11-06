@@ -446,17 +446,43 @@ def test_a_metadata_copy_that_fails_fails_the_unfold_before_the_exchange(tmp_pat
 	assert read_view(job_vault, V1) == before
 
 
-def test_a_forwarded_entry_missing_from_the_tree_fails_the_attempt(tmp_path):
-	# a pool's disk gone, say: copying over it would make version 1 read the new copy
+def test_a_forwarded_entry_missing_from_the_tree_fails_the_attempt_on_a_pool(tmp_path, monkeypatch):
+	# a pool's disk gone: copying over it would make version 1 read the new copy, and it may come back
 	writer, job_vault, _ = handed_over(str(tmp_path), {'x': 'x', 'd/y': 'y'})
 	os.remove(os.path.join(writer.tree, 'x'))
 	shutil.rmtree(os.path.join(writer.tree, 'd'))
+	monkeypatch.setattr(rv, 'pool_state', lambda path, mount_table=None: (path,))
 	with pytest.raises(rv.JobFailure, match='x'):
 		writer.record('x', True)
 	with pytest.raises(rv.JobFailure, match='d'):
 		writer.record('d/y', True)
 	with pytest.raises(rv.JobFailure, match='d'):
 		writer.ensure_real('d')
+	assert os.path.islink(os.path.join(writer.previous, 'x')) and os.path.islink(os.path.join(writer.previous, 'd'))
+
+
+def test_a_forwarded_entry_missing_from_the_tree_goes_with_a_warning_on_one_filesystem(tmp_path, capsys):
+	# only a hand can have removed it, and the version already reads as missing there
+	writer, job_vault, before = handed_over(str(tmp_path), {'x': 'x', 'd/y': 'y', 'e/f/z': 'z', 'kept': 'k'})
+	os.remove(os.path.join(writer.tree, 'x'))
+	shutil.rmtree(os.path.join(writer.tree, 'd'))
+	os.remove(os.path.join(writer.tree, 'e/f/z'))
+	times = os.lstat(writer.previous).st_mtime_ns
+	writer.record('x', True)
+	writer.record('d/y', True)
+	assert writer.ensure_real('d') is False
+	writer.record('e/f/z', True)
+	out = capsys.readouterr().out
+	assert os.path.join(writer.previous, 'x') in out and os.path.join(writer.previous, 'd') in out
+	assert not os.path.lexists(os.path.join(writer.previous, 'x')) and not os.path.lexists(os.path.join(writer.previous, 'd'))
+	assert os.lstat(writer.previous).st_mtime_ns == times
+	# a copy put there later does not show in the version
+	with open(os.path.join(writer.tree, 'x'), 'w') as f:
+		f.write('new')
+	view = read_view(job_vault, V1)
+	assert sorted(set(before) - set(view)) == ['d', 'd/y', 'e/f/z', 'x']
+	# the hand's removal moved its folder's time, which the link still showed
+	assert [rel for rel in view if view[rel] != before[rel]] == ['e/f']
 
 
 def deep_vault(tmp, levels):

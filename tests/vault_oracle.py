@@ -190,7 +190,7 @@ def compared(view: EntryView, folder_times: bool, free_file_meta: bool) -> Entry
 		return None
 	if view.kind == 'd' and not folder_times:
 		return view._replace(mtime_ns=None)
-	if view.kind == 'f' and free_file_meta:
+	if view.kind in ('f', 'l') and free_file_meta:
 		return view._replace(mode=None, uid=None, gid=None, mtime_ns=None, xattrs=None)
 	return view
 
@@ -201,7 +201,8 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 
 	expected: {version number: its view (snapshot_tree() form)}, every version the vault may keep. A number in allowed_new
 	may be missing, as a batch cut before its commit leaves it; any other must be there, and no other may. folder_times
-	False leaves folder mtimes out; free_file_meta leaves out everything of a file but its contents (spec section 2.4).
+	False leaves folder mtimes out; free_file_meta leaves out everything of a file but its contents, and of a user's link but
+	its text, as an Only Sync Attributes change reaches every version sharing it (spec section 2.4).
 	'''
 	problems = []
 	folders, lists = {}, {}

@@ -44,7 +44,7 @@ def backup_events(job, events: list, **kwargs) -> None:
 	'''One batch of raw events, as the backuper runs a fresh one: collapsed, then verified by what they touched.'''
 	raw = raw_events(job.monitor, events)
 	_, manifest, committed = rv.do_backup(rv.change_events_to_backup_entries(deque(raw), job.monitor), job_name=job.job_name, monitor_path=job.monitor,
-		vault_path=job.vault, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns(), **OPTIONS, **kwargs)
+		vault_path=job.vault, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns(), **{**OPTIONS, **kwargs})
 	manifest.close()
 	assert committed is True
 
@@ -103,18 +103,18 @@ def expected_of(now: dict, prev: dict) -> dict:
 	return out
 
 
-def build_base(job) -> dict:
-	'''Batches 0-2 of the crash vault; {version number: what it must hold}.'''
+def build_base(job, **options) -> dict:
+	'''Batches 0-2 of the crash vault, options over OPTIONS; {version number: what it must hold}.'''
 	os.makedirs(job.job_vault, exist_ok=True)
 	seed_base(job.monitor)
 	expected = {0: snapshot_tree(job.monitor)}
-	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(), **OPTIONS)
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(), **{**OPTIONS, **options})
 	manifest.close()
 	assert committed is True
 	for number, apply_batch in ((1, apply_batch1), (2, apply_batch2)):
 		events = apply_batch(job.monitor)
 		expected[number] = snapshot_tree(job.monitor)
-		backup_events(job, events)
+		backup_events(job, events, **options)
 	return expected
 
 

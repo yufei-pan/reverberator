@@ -8,8 +8,9 @@ import reverberator as rv
 from tests.harness import FakePool, create_job, reverberator_script
 
 # the chain-link ground truth over the whole suite (REVERB_CHAIN_GROUND_TRUTH=0 turns it off), and every version's size
-# record against a full measure (REVERB_USAGE_GROUND_TRUTH=0)
-pytest_plugins = ['tests.chain_ground_truth', 'tests.version_usage_ground_truth']
+# record against a full measure (REVERB_USAGE_GROUND_TRUTH=0), and what each committed version reads around every batch on
+# design R (REVERB_VIEW_GROUND_TRUTH=0)
+pytest_plugins = ['tests.chain_ground_truth', 'tests.version_usage_ground_truth', 'tests.version_view_ground_truth']
 
 # the real helper, for the one test that runs it: isolated_runtime() replaces it for every test
 REAL_SYNC_VAULT_FILESYSTEMS = rv.sync_vault_filesystems
@@ -85,6 +86,12 @@ def stop_fs_signature_monitor():
 	rv.FS_SIGNATURE_MONITOR.wake()
 	thread.join(timeout=10)
 	assert not thread.is_alive(), 'the fs signature monitor did not stop'
+
+
+@pytest.fixture
+def r_layout(monkeypatch):
+	'''A new vault in this test is on design R; every other stays on 0.54 until the suite moves.'''
+	monkeypatch.setattr(rv, 'NEW_VAULT_LAYOUT', 'r')
 
 
 @pytest.fixture

@@ -5620,6 +5620,9 @@ def do_backup(backup_entries:dict,
 		vault_info_dict = vaultInfo.vault_info_dict
 		vault_size = vaultInfo.vault_size
 		vault_inodes = vaultInfo.vault_inodes
+		# design R: the newest version is the one real tree, and a batch hands it over (hand_over()). only a vault that reads
+		# as 0.54 gets the referenced copy: the 0.54 rules must never run again on one with staging (vault_layout())
+		on_tree = vault_layout(job_vault,manifest) != '0.54'
 		# the files the new version copied again from the vault, and those of them its batch then wrote over
 		recopied = []
 		recopies_rewritten = set()
@@ -5632,10 +5635,17 @@ def do_backup(backup_entries:dict,
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V0--{this_timestamp}')
 			latest_version_info = None
+			if on_tree:
+				# on the disk before V0's folder: a vault whose manifest is lost reads as design R by it (vault_layout())
+				os.makedirs(staging_path(job_vault),exist_ok=True)
+				fsync_vault_folder(job_vault)
 			if not make_version_folder(job_name,backup_folder):
 				return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 			manifest.begin()
-			if keep_one_complete_backup:
+			if on_tree:
+				manifest.set_layout('r')
+			# on design R the first version is always a complete copy: the tree must hold what a link only points at
+			if keep_one_complete_backup or on_tree:
 				backuperTeeLogToTl(job_name,f'Creating a complete backup of {monitor_path} to {backup_folder}',ok=True)
 				if log_journal:
 					log_to_journal(journalPath,monitor_path,'initial_complete_backup',backup_folder)
@@ -5768,7 +5778,7 @@ def do_backup(backup_entries:dict,
 			# pruning, the chains of the re-copy and those of the attribute changes that copy tell their links by them
 			monitor_paths = manifest_monitor_paths(manifest)
 			# an attribute change copies its file where the vault's copy holds other contents ( do_reverb_backup() )
-			attrib_copies = attribs_to_copy(backup_entries,manifest,monitor_path,job_vault,latest_version_info.path,VaultMoves(job_vault,monitor_path,monitor_paths)) if only_sync_attributes else frozenset()
+			attrib_copies = attribs_to_copy(backup_entries,manifest,monitor_path,job_vault,latest_version_info.path,TREE_LINKS if on_tree else VaultMoves(job_vault,monitor_path,monitor_paths)) if only_sync_attributes else frozenset()
 			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = latest_version_info.path,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies)
 			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
 			this_version_number = latest_version_info.version_number + 1
@@ -5780,6 +5790,9 @@ def do_backup(backup_entries:dict,
 			# says what the version did with it. the batch is read for that only when a file is due
 			def count_recopies():
 				oldest_kept = next(iter(vault_info_dict))
+				if on_tree:
+					# no chains, so nothing is ever copied again
+					return oldest_kept, [], set(), 0
 				# a pass each time: the chains are walked again after each removal
 				moves = VaultMoves(job_vault,monitor_path,monitor_paths)
 				rels = recopy_rels(manifest,this_version_number,oldest_kept,job_vault,latest_version_info.path,moves,chain_length)
@@ -5823,7 +5836,21 @@ def do_backup(backup_entries:dict,
 				recopies_oldest, recopies, recopies_rewritten, recopies_size = count_recopies()
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
-			if not make_version_folder(job_name,backup_folder):
+			writer = None
+			if on_tree:
+				# the rows are read from the tree while it still has the latest version's name: once it is handed over, that name holds links
+				manifest.begin()
+				if not manifest.describes(latest_version_info.path):
+					backuperTeeLogToTl(job_name,f'Manifest does not describe {latest_version_info.path}, listing it')
+					manifest.rebuild(latest_version_info.path)
+				manifest.set_layout('r')
+				try:
+					writer = hand_over(job_vault,latest_version_info.path,backup_folder)
+				except FileExistsError:
+					log_version_folder_taken(job_name,backup_folder)
+					manifest.rollback()
+					return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
+			elif not make_version_folder(job_name,backup_folder):
 				return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 			backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
 			def recheck_mounts(fixes):
@@ -5832,7 +5859,7 @@ def do_backup(backup_entries:dict,
 				paused = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,latest_version_info,only_sync_attributes,manifest,monitor_path,skip_list,job_name,reported,
 				recopy=recopies,recopied=recopied,touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,
-				pool_guard=pool_guard,unsynced=unsynced,sizes=copied,threads=copy_threads)
+				pool_guard=pool_guard,unsynced=unsynced,sizes=copied,threads=copy_threads,writer=writer)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
@@ -5929,9 +5956,29 @@ def make_version_folder(job_name:str, path:str) -> bool:
 	try:
 		os.mkdir(path)
 	except FileExistsError:
-		backuperTeeLogToTl(job_name,f'Not backing up into {path}: something is there already, left by an attempt that did not commit; this attempt fails and writes nothing',error=True)
+		log_version_folder_taken(job_name,path)
 		return False
 	return True
+
+def log_version_folder_taken(job_name:str, path:str) -> None:
+	backuperTeeLogToTl(job_name,f'Not backing up into {path}: something is there already, left by an attempt that did not commit; this attempt fails and writes nothing',error=True)
+
+# the layout of a vault with no version yet. '0.54' until the suite has moved to design R
+NEW_VAULT_LAYOUT = '0.54'
+
+def vault_layout(job_vault:str, manifest:'VaultManifest') -> str:
+	'''
+	Which rules job_vault gets, the one answer for the scan, the start and the CLI: 'r' when its manifest says so;
+	'converting' when it does not but staging is there, as a manifest can be lost and the 0.54 rules would remove a cut
+	batch's tree as an orphan, while staging is made before any such tree (hand_over()); '0.54' with neither and a version
+	folder there; NEW_VAULT_LAYOUT with no version folder. Raises OSError when the job vault cannot be listed.
+	'''
+	if manifest.layout() == 'r':
+		return 'r'
+	if os.path.lexists(staging_path(job_vault)):
+		return 'converting'
+	with os.scandir(job_vault) as entries:
+		return '0.54' if any(is_version_folder_name(entry.name) for entry in entries) else NEW_VAULT_LAYOUT
 
 def pending_transaction_rows(events) -> list:
 	'''
@@ -9703,7 +9750,13 @@ def attribs_to_copy(backup_entries:dict, manifest:'VaultManifest', monitor_path:
 			record = None
 		if record_vouches(record, path):
 			continue
-		end = chain_end(job_vault, version_path, rel, moves, copy_version)
+		if moves is TREE_LINKS:
+			try:
+				end = ChainEnd(None, os.path.join(version_path, rel), os.lstat(os.path.join(version_path, rel)))
+			except OSError:
+				end = None
+		else:
+			end = chain_end(job_vault, version_path, rel, moves, copy_version)
 		if end is None or stat.S_ISDIR(end.st.st_mode):
 			# the replay refuses it
 			continue
@@ -9777,6 +9830,9 @@ def recopy_size(rels:list, job_vault:str, latest_version_path:str, moves:'VaultM
 			total += end.st.st_size
 	return total
 
+# what stands for a VaultMoves on design R: the tree holds no daemon link, so every link in it is a user's, whatever its text says
+TREE_LINKS = object()
+
 def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultMoves' = None, copy_version:int = None, known:'ManifestRecord' = None, unchecked:int = 0):
 	'''
 	Record what version_path holds at rel, following the links that chain an unchanged entry back to its copy, each
@@ -9811,6 +9867,8 @@ def read_vault_record(version_path:str, rel:str, monitor_path:str, moves:'VaultM
 			if not stat.S_ISLNK(st.st_mode):
 				break
 			target = os.readlink(entry)
+			if moves is TREE_LINKS:
+				return ManifestRecord('l', None, None, st.st_mode, st.st_uid, st.st_gid, None, target, 0)
 			if copy_version is None:
 				resolved = moves.follow(entry, target)
 			elif number <= copy_version:
@@ -9854,7 +9912,7 @@ def record_dirty_entries(manifest:VaultManifest, version_path:str, monitor_path:
 	that record's unchecked flag, so a checked copy stays checked (its new metadata is read from the chain end), but only
 	while the chain end keeps the record's size and mtime: otherwise the row is hashed and recorded unchecked, as any other.
 	'''
-	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path,
+	moves = TREE_LINKS if manifest.layout() == 'r' else VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path,
 		applied=applied)
 	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
 		while GREEN_LIGHT.is_set():
@@ -10186,13 +10244,17 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	in a paused folder compares nothing. The vault's links are told by the moves of their versions (VaultMoves), by
 	the record of monitored paths on the manifest's own connection, those of a fresh version_path by applied, the moves
 	its replay applied (VersionMoves.applied(); by their text alone when None), and a row's copy version overrules them
-	(read_vault_record()).
+	(read_vault_record()). On design R (the manifest's layout) version_path is the tree, which holds no daemon link, and
+	a file there is no sign of a copy of this backup's, so neither moves nor fresh mean anything.
 	'''
 	start_time = time.monotonic()
 	xattrs_since = ctime_bound(scopes.changed_since, scopes.changed_since_wall)
 	skip = skip_paused(skip, paused)
-	moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path if fresh else None,
-		applied=applied if fresh else None)
+	if manifest.layout() == 'r':
+		moves, fresh = TREE_LINKS, False
+	else:
+		moves = VaultMoves(os.path.dirname(os.path.abspath(version_path)), monitor_path, manifest_monitor_paths(manifest), writing=version_path if fresh else None,
+			applied=applied if fresh else None)
 	subtrees = []
 	covered = set()
 	# outermost first, as a folder's rel is shorter than any rel under it
@@ -12332,7 +12394,8 @@ class TreeWriter:
 		self.staging_made = False
 		if previous is not None:
 			self.tree_name = os.path.basename(os.path.normpath(tree))
-			self.staging = staging_path(job_vault or os.path.dirname(os.path.normpath(tree)))
+			self.job_vault = job_vault or os.path.dirname(os.path.normpath(tree))
+			self.staging = staging_path(self.job_vault)
 
 	def path(self, rel:str) -> str:
 		'''Where rel is, never with a trailing /, which makes the kernel follow a link there.'''
@@ -12362,11 +12425,20 @@ class TreeWriter:
 		'''The real folder of the previous version, in which something just changed, as its version had it.'''
 		os.utime(self.kept_path(folder), ns=self.saved[folder], follow_symlinks=False)
 
-	def held_in_tree(self, rel:str) -> str:
-		'''The kind of the entry at rel in the tree, which the previous version forwards to; JobFailure when it is gone, as nothing is left to record.'''
+	def held_in_tree(self, rel:str) -> 'str | None':
+		'''
+		The kind of the entry at rel in the tree, which the previous version forwards to. None when it is gone: on one
+		filesystem only a hand can have removed it, the version already reads as missing there, and the link is unlinked
+		with a warning, or a later copy at rel would show through it in the older versions. On a mergerfs pool a missing
+		disk may be hiding it: JobFailure, and the next attempt looks again.
+		'''
 		kind = kind_at(self.path(rel))
 		if kind is None:
-			raise JobFailure(f'{self.kept_path(rel)} forwards to {self.path(rel)}, which is not there. If a disk is missing, it comes back at the next attempt; if the entry was removed by hand, removing that link lets backups go on')
+			if pool_state(self.job_vault) is not None:
+				raise JobFailure(f'{self.kept_path(rel)} forwards to {self.path(rel)}, which is not there. If a disk is missing, it comes back at the next attempt; if the entry was removed by hand, removing that link lets backups go on')
+			backuperTeeLogToTl(path=self.job_vault,warning=True,message=f'{self.kept_path(rel)} forwards to {self.path(rel)}, which is not there, as removed by hand: removing the link, so that version reads as holding nothing there')
+			os.unlink(self.kept_path(rel))
+			self.give_back_times(os.path.dirname(rel))
 		return kind
 
 	def ensure_real(self, folder:str) -> bool:
@@ -12503,6 +12575,8 @@ class TreeWriter:
 				continue
 			if self.forwards(here):
 				kind, tree_path = self.held_in_tree(here), self.path(here)
+				if kind is None:
+					continue
 				if kind != 'd':
 					if keep:
 						staged = self.staged()
@@ -12667,9 +12741,12 @@ def hand_over(job_vault:str, newest_path:str, new_path:str) -> TreeWriter:
 def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:VaultEntry,
 					 only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,skip_list:'SkipList' = None,job_name:str = None,reported:set = None,
 					 recopy:list = (),recopied:list = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
-					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,sizes:CopiedSizes = None,threads:int = None) -> VaultManifest:
+					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,sizes:CopiedSizes = None,threads:int = None,writer:TreeWriter = None) -> VaultManifest:
 	'''
 	Create backup_folder as a referenced copy of the latest version, then replay backup_entries onto it.
+
+	With writer, one with a previous version (hand_over(), design R), backup_folder already holds the tree, and the rows
+	describe it: there is no referenced copy, no re-copy and no link to re-target, and each change records first.
 
 	The files of recopy (rels, as recopy_rels() gives them) are copied again from the end of their chains in the latest
 	version, before the replay: the vault's copy, as it is there, never the monitored file, which may have changed
@@ -12719,7 +12796,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
 	# the links of the committed versions, on the chains the re-copy and the attribute sync follow, are told by their
 	# versions' moves, held for this backup
-	committed_moves = VaultMoves(os.path.dirname(os.path.abspath(backup_folder)),monitor_path,manifest_monitor_paths(manifest))
+	on_tree = writer is not None and writer.previous is not None
+	committed_moves = None if on_tree else VaultMoves(os.path.dirname(os.path.abspath(backup_folder)),monitor_path,manifest_monitor_paths(manifest))
 	# the moves this replay applied, in its order, as (source_rel, dest_rel, is_folder), a folder's rels ending with /:
 	# each is added once its rename is made, before anything reads the links it renamed ( the retarget, the move's
 	# metadata check, the attribute sync, the verification and the records ), and one that fell back to delete & copy,
@@ -12732,7 +12810,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	# the version's folders the replay writes into or gives metadata, which get the monitored folders' once it is done
 	written = WrittenFolders()
 	# every write into the version goes through it
-	writer = TreeWriter(backup_folder)
+	if writer is None:
+		writer = TreeWriter(backup_folder)
 	def make_folders_to(rel):
 		# real_folders_to( make=True ) in the version: each folder it makes gets all of the monitored one's metadata at the
 		# end, and its row ( one the referenced copy could not make the folder of ) is read again
@@ -12906,7 +12985,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 		# ( ../<the version before>/D/f ) is the chain's end. the end must be of the monitored entry's kind, which still
 		# guards a chain that ends anywhere else, such as a folder
 		entry = os.path.abspath(os.path.join(backup_folder,relative_path))
-		if not os.path.islink(entry):
+		# in the tree of design R a link is a user's, which gets its own owner and times
+		if on_tree or not os.path.islink(entry):
 			return entry
 		def refuse(why):
 			backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {source_real_path} onto {entry}: {why}')
@@ -13145,7 +13225,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					applied_moves.append((as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path),True) if isDir else
 						(link_source_relative_path,link_target_relative_path,False))
 					backuperTeeLogToTl(path=monitor_path,message=f'Moved {link_source_backup_real_path} to {link_target_backup_real_path}')
-					if link_source_relative_path.rstrip('/').count('/') != link_target_relative_path.rstrip('/').count('/'):
+					if not on_tree and link_source_relative_path.rstrip('/').count('/') != link_target_relative_path.rstrip('/').count('/'):
 						# the relative links moved to another folder depth no longer reach the versions holding the copies.
 						# the move stands when some cannot be rewritten: their text still names their versions, and the
 						# rows move_tree / move_file moved stay unverified, so the next comparison reads them ( and copies
@@ -13170,6 +13250,16 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 					if not os.path.lexists(event_source_real_path):
 						# moved on again in the batch ( mv d/a d/b; mv d e ): the later move, or the verification, takes it
 						pass
+					elif on_tree and not isDir:
+						# the moved entry shares its inode with the previous version's record (TreeWriter.rename()), so a change in
+						# place reaches that version: under Only Sync Attributes that is the rule (spec section 2.4), without it a
+						# new copy takes the new attributes and the old inode stays as it was. nothing is written when none differ
+						if only_attributes_differ(event_source_real_path,link_target_backup_real_path):
+							if only_sync_attributes:
+								writer.file_meta(event_source_real_path,link_target_relative_path,None,unsynced)
+							else:
+								writer.copy(event_source_real_path,link_target_relative_path,mcae,pending)
+								manifest.add(link_target_relative_path,dirty=True)
 					elif not isDir and os.path.islink(link_target_backup_real_path) and own_chain_hop(link_target_backup_real_path) is not None:
 						end = attribute_end(event_source_real_path,link_target_relative_path)
 						if isinstance(end,str) and only_attributes_differ(event_source_real_path,end):
@@ -13275,17 +13365,18 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,latest_version_info:V
 	removals = []
 	try:
 		manifest.begin()
-		if not manifest.describes(latest_version_info.path):
-			backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {latest_version_info.path}, listing it')
-			manifest.rebuild(latest_version_info.path)
-		# the folders whose metadata the copy could not take from the latest version get the monitored folders' at the end,
-		# as one that keeps what it has would pass it on to every later version
-		copy_unsynced = []
-		if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard,unsynced=copy_unsynced,
-				sizes=sizes,threads=threads):
-			return manifest
-		for path in copy_unsynced:
-			written.add(os.path.relpath(path,latest_version_info.path),whole=True)
+		if not on_tree:
+			if not manifest.describes(latest_version_info.path):
+				backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe {latest_version_info.path}, listing it')
+				manifest.rebuild(latest_version_info.path)
+			# the folders whose metadata the copy could not take from the latest version get the monitored folders' at the end,
+			# as one that keeps what it has would pass it on to every later version
+			copy_unsynced = []
+			if not do_referenced_copy(source_path=latest_version_info.path,backup_folder=backup_folder,manifest=manifest,relative=True,pool_guard=pool_guard,unsynced=copy_unsynced,
+					sizes=sizes,threads=threads):
+				return manifest
+			for path in copy_unsynced:
+				written.add(os.path.relpath(path,latest_version_info.path),whole=True)
 		backuperTeeLogToTl(path=monitor_path,message='Tracking {} files and {} folders'.format(*manifest.counts()))
 		mcae = multiCMD.AsyncExecutor(semaphore=BACKUP_SEMAPHORE,quiet=True)
 		if recopy:
