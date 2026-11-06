@@ -5579,7 +5579,7 @@ def do_backup(backup_entries:dict,
 	# copy_threads: the job's Copy threads, the threads of the referenced copy and the prune, None for REFERENCED_COPY_THREADS
 	# job: the job's JobControl, None outside the daemon: the wait for the locks shows in its status and ends when it stops running
 	# a vaultInfo with a tree (design R) holds a cut batch's tree: this backup rolls it forward, a batch with no hand-over that
-	# compares the whole tree and always commits (spec section 3, plan S4); the entries given are not used, as the comparison covers the whole tree
+	# compares the whole tree and always commits (spec section 3, plan S4); of the entries given only a plain file modify the comparison could not see is used (roll_forward_entries())
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -5764,7 +5764,7 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
 			if tree is not None:
 				backuperTeeLogToTl(job_name,f'Rolling forward {tree}, the tree of a batch that was cut')
-				rolled = roll_forward_entries(vaultInfo,manifest,monitor_path,skip=None if skip_list is None else skip_list.skips,paused=paused,job_name=job_name,reported=reported,
+				rolled = roll_forward_entries(vaultInfo,manifest,monitor_path,backup_entries,skip=None if skip_list is None else skip_list.skips,paused=paused,job_name=job_name,reported=reported,
 					changed_since_wall=full_comparison_since(vault_info_dict,manifest.matched),pool_guard=pool_guard)
 				if not GREEN_LIGHT.is_set():
 					# the tree stays, and the next attempt compares it whole again
@@ -6753,15 +6753,19 @@ def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 			changed.append((rel, found))
 	manifest.set_records(changed)
 
-def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:str, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None,
+def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:str, given:dict, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None,
 		changed_since_wall:int = None, pool_guard:'PoolGuard' = None) -> OrderedDict:
 	'''
 	What the roll-forward of the tree info.tree replays (plan S4): what a full comparison finds between the monitored tree and that
-	tree. Entries a stop saved are not used: the comparison covers the whole tree, and an entry it did not find (a file that became a folder
-	since) would only fight what it found. delta_generate_backup_entries() is never called on it, as it commits naming the version it
-	compares, and it would name the tree. All of it is in a transaction the commit of the version ends, or a cut rolls back; a manifest that does not
-	describe the previous version, as a lost one, lists the tree first. A stop leaves the comparison partial, for the caller to throw away.
-	JobFailure rolls back and goes on up. skip, paused, job_name, reported and changed_since_wall are compare_scopes()'s; pool_guard's pools must have stayed whole.
+	tree, and one thing more from the entries a stop saved (given): each plain file "modify" that the comparison did not find, under
+	either form of its key, while the monitored path is a regular file now. A file rewritten at its size, with its mtime set back,
+	looks the same to the comparison, and only the watcher saw it; a copy of an unchanged file is only a spare one. No other saved entry is
+	used (no folder, move, delete or attribute change): the comparison covers the whole tree, and an entry it did not find would fight what it
+	found, as a file that became a folder since would. delta_generate_backup_entries() is never called on it, as it commits naming the
+	version it compares, and it would name the tree. All of it is in a transaction the commit of the version ends, or a cut rolls back; a manifest
+	that does not describe the previous version, as a lost one, lists the tree first. A stop leaves the comparison partial, for the caller to
+	throw away. JobFailure rolls back and goes on up. skip, paused, job_name, reported and changed_since_wall are compare_scopes()'s;
+	pool_guard's pools must have stayed whole.
 	'''
 	manifest.begin()
 	try:
@@ -6776,6 +6780,15 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 	except JobFailure:
 		manifest.rollback()
 		raise
+	for path, values in given.items():
+		if values.event != 'modify' or path.endswith('/') or path in found or path + '/' in found:
+			continue
+		try:
+			if stat.S_ISREG(os.lstat(path).st_mode):
+				found[path] = values
+		except OSError:
+			# gone, or a parent of it is a file now: the comparison says what is there
+			pass
 	return found
 
 def measure_previous(previous:str, tree:str) -> tuple:

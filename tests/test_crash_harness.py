@@ -691,15 +691,72 @@ def test_a_cut_batch_that_held_moves_ends_exact_with_or_without_its_saved_entrie
 			assert read_view(job_vault, folder)[f'w/x{UNREADABLE}'] == vault.base[2][f'w/x{UNREADABLE}']
 
 
-def test_a_file_that_became_a_folder_after_a_cut_is_rolled_forward(tmp_path, r_layout):
-	# the cut batch held `create a/f1`; while the daemon was down a/f1 became a folder with a file in it. The next start is
-	# given the saved entry again, and the comparison alone says what the tree is: given with it, a file's copy would replace the folder
+BIG = 200 * 1024
+STAMP = 1700000000_000000000
+
+
+def canonical_monitor(monitor):
+	'''The monitored tree the saved-entry tests start from, every mtime fixed, so a version made of it matches it again at each cut point.'''
+	for rel in ('a.txt', 'dd', 'big.bin'):
+		path = os.path.join(monitor, rel)
+		if os.path.isdir(path) and not os.path.islink(path):
+			shutil.rmtree(path)
+		elif os.path.lexists(path):
+			os.remove(path)
+	put_text(monitor, 'a.txt', 'a0', STAMP)
+	put_text(monitor, 'dd/f', 'f0', STAMP + 1)
+	put_text(monitor, 'dd/g', 'g0', STAMP + 2)
+	with open(os.path.join(monitor, 'big.bin'), 'wb') as f:
+		f.write(b'x' * BIG)
+	os.utime(os.path.join(monitor, 'big.bin'), ns=(STAMP + 3, STAMP + 3))
+
+
+def rewrite_in_place(monitor):
+	'''big.bin changed in the middle at its size, its mtime put back: nothing but the watcher saw it, and a comparison reads only the end of a file.'''
+	path = os.path.join(monitor, 'big.bin')
+	with open(path, 'r+b') as f:
+		f.seek(10)
+		f.write(b'NEW')
+	os.utime(path, ns=(STAMP + 3, STAMP + 3))
+
+
+def file_becomes_folder(monitor):
+	os.remove(os.path.join(monitor, 'dd/f'))
+	put_text(monitor, 'dd/f/in', 'inside')
+
+
+def folder_becomes_file(monitor):
+	shutil.rmtree(os.path.join(monitor, 'dd'))
+	put_text(monitor, 'dd', 'a file now')
+
+
+def file_is_gone(monitor):
+	os.remove(os.path.join(monitor, 'dd/f'))
+
+
+# (what the batch changes, its events, what happens to the tree while the daemon is down); the saved entries are given again at the next start
+SAVED_ENTRIES = {
+	'rewrite': (lambda m: (put_text(m, 'a.txt', 'a1'), rewrite_in_place(m)), [(False, 'modify', 'a.txt', None), (False, 'modify', 'big.bin', None)], lambda m: None),
+	'created_file_becomes_folder': (lambda m: put_text(m, 'dd/new', 'n'), [(False, 'create', 'dd/new', None)],
+		lambda m: (os.remove(os.path.join(m, 'dd/new')), put_text(m, 'dd/new/in', 'inside'))),
+	'modified_file_becomes_folder': (lambda m: put_text(m, 'dd/f', 'f1'), [(False, 'modify', 'dd/f', None)], file_becomes_folder),
+	'parent_becomes_file': (lambda m: put_text(m, 'dd/g', 'g1'), [(False, 'modify', 'dd/g', None)], folder_becomes_file),
+	'modified_file_is_gone': (lambda m: put_text(m, 'dd/f', 'f1'), [(False, 'modify', 'dd/f', None)], file_is_gone),
+}
+
+
+@pytest.mark.parametrize('scenario', SAVED_ENTRIES)
+def test_a_cut_batch_is_rolled_forward_with_its_saved_entries_given_again(tmp_path, r_layout, scenario):
+	# a stop cuts the batch at each step; the tree changes while the daemon is down (or not); the next start is given the saved
+	# entries again. The comparison says what the tree is, and of the entries only a plain file modify it cannot see is added
+	change, events, after = SAVED_ENTRIES[scenario]
 	job = create_job(str(tmp_path))
-	base = build_base(job)
+	canonical_monitor(job.monitor)
+	before = snapshot_tree(job.monitor)
+	run_do_backup(job, OrderedDict(), matched_since=time.time_ns())
 	template = str(tmp_path / 'template')
 	subprocess.run(['cp', '-a', job.vault, template], check=True)
-	events = [(False, 'create', 'a/f1', None)]
-	raw = raw_events(job.monitor, events)
+	raw = None
 	def work():
 		entries = rv.change_events_to_backup_entries(deque(raw), job.monitor)
 		return run_do_backup(job, entries, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns())
@@ -708,8 +765,9 @@ def test_a_file_that_became_a_folder_after_a_cut_is_rolled_forward(tmp_path, r_l
 	for point in range(1, 200):
 		shutil.rmtree(job.vault)
 		subprocess.run(['cp', '-a', template, job.vault], check=True)
-		shutil.rmtree(os.path.join(job.monitor, 'a/f1'), ignore_errors=True)
-		put_text(job.monitor, 'a/f1', 'file')
+		canonical_monitor(job.monitor)
+		change(job.monitor)
+		raw = raw_events(job.monitor, events)
 		cut = in_child(job, point, work)
 		if cut.error is not None:
 			wrong.append((point, cut))
@@ -718,19 +776,17 @@ def test_a_file_that_became_a_folder_after_a_cut_is_rolled_forward(tmp_path, r_l
 			break
 		if rv.get_vault_info(job.job_vault).tree is None:
 			continue
-		os.remove(os.path.join(job.monitor, 'a/f1'))
-		os.mkdir(os.path.join(job.monitor, 'a/f1'))
-		put_text(job.monitor, 'a/f1/in', 'inside')
+		after(job.monitor)
 		again = in_child(job, None, work)
 		rolled += 1
 		if again.error is not None or again.committed is not True:
 			wrong.append((point, again))
 			continue
-		problems = check_vault(job.job_vault, {1: base[1], 2: base[2], 3: snapshot_tree(job.monitor)}, set()) + view_truth.wrong_lists(job.job_vault)
+		problems = check_vault(job.job_vault, {0: before, 1: snapshot_tree(job.monitor)}, set()) + view_truth.wrong_lists(job.job_vault)
 		if problems:
 			wrong.append((point, problems[:4]))
 	assert rolled > 0
-	print(f'{rolled} cuts with a tree; {len(wrong)} wrong')
+	print(f'{scenario}: {rolled} cuts with a tree; {len(wrong)} wrong')
 	assert not wrong, [(point, (outcome.error or str(outcome)).strip().splitlines()[-1][:150] if hasattr(outcome, 'error') else outcome) for point, outcome in wrong[:5]]
 
 
