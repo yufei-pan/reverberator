@@ -2074,7 +2074,7 @@ def check_vault_sync(job_vault:str, job_name:str) -> list:
 def flush_vault_disks(job_vault:str, job_name:str) -> list:
 	'''
 	Every disk holding the job vault written out (sync_vault_filesystems()), as a prune needs before it destroys the old
-	state: the sorted disks whose sync failed now, each marked and alerted as check_vault_sync() does it. A disk that failed
+	state, and a commit before it says its copies are there: the sorted disks whose sync failed now, each marked and alerted as check_vault_sync() does it. A disk that failed
 	a sync before and syncs now is not among them: what this sync wrote is on it. Raises OSError as
 	sync_vault_filesystems() does. Holds VAULT_SYNC_LOCK.
 	'''
@@ -5986,6 +5986,10 @@ def do_backup(backup_entries:dict,
 		# a disk of either pool missing now, or mounted again since the batch began, fails the attempt before anything is
 		# committed: a copy may have landed on no disk of the vault, or a file of a missing monitored disk may read as deleted
 		try:
+			# on design R a commit says its copies are on the disk (spec section 2.6). a roll-forward always flushes: it commits what the
+			# cut batch left in the tree, whose rows went with that batch, and nothing tells which of those copies are on the disk yet
+			if on_tree and (tree is not None or manifest.holds_copies_of(this_version_number)):
+				flush_copies(job_vault,job_name,backup_folder)
 			pool_guard.require()
 		except JobFailure:
 			discard_change_list(prepared_list)
@@ -6032,6 +6036,20 @@ def do_backup(backup_entries:dict,
 		raise
 	finally:
 		locks.release()
+
+def flush_copies(job_vault:str, job_name:str, version_path:str) -> None:
+	'''
+	The copies of the version at version_path written out before its commit (flush_vault_disks()). On f2fs a checkpoint keeps a
+	new file's size and not its data, and a folder's fsync in the commit is a checkpoint: a power cut within the writeback window
+	would leave those copies all NUL in a committed version. Raises JobFailure, the disk first as status cuts a reason short,
+	when a sync failed: the caller commits nothing.
+	'''
+	try:
+		failed_disks = flush_vault_disks(job_vault,job_name)
+	except OSError as e:
+		raise JobFailure(f'{e}: the disks of {job_vault} cannot be flushed, so {version_path} is not committed; the next attempt tries again')
+	if failed_disks:
+		raise JobFailure(f'{", ".join(failed_disks)} failed a sync, so {version_path} is not committed; the next attempt tries again')
 
 def swap_current_version(job_vault:str, text:str) -> None:
 	'''Point job_vault's current_version link at text, swapped in under a temporary name, so the link is never missing.'''
@@ -8907,6 +8925,13 @@ class VaultManifest:
 	def set_copy_version(self, rels, version:int):
 		'''Record that the version numbered version holds the copy of each file of rels; the caller holds the transaction.'''
 		self.conn.executemany('UPDATE entries SET copy_version = ? WHERE path = ?', ((version, storable_name(rel)) for rel in rels))
+
+	def holds_copies_of(self, version:int) -> bool:
+		'''
+		Whether a row leads to a copy made for the version numbered version (set_copy_version()). Asked of the version a batch is
+		writing, that is whether the batch placed a copy that is still in the version.
+		'''
+		return self.conn.execute('SELECT EXISTS (SELECT 1 FROM entries WHERE copy_version = ?)', (version,)).fetchone()[0] == 1
 
 	def take_dirty(self, limit:int) -> list:
 		return [stored_name(rel) for (rel,) in self.conn.execute('SELECT path FROM entries WHERE dirty LIMIT ?', (limit,))]
@@ -13052,7 +13077,8 @@ def is_skeleton(path:str) -> bool:
 	Whether the version folder at path holds nothing a kept version can need: it is empty, or holds only links naming their
 	own place in it. A hand-over cut before its exchange leaves that, and so does a batch cut after a whole deleted tree
 	was recorded: by the invariant no forward link leads to an entry the tree does not hold, so what went is whole in the
-	previous version. Raises OSError when it cannot be read.
+	previous version. A link with no text says nothing against that, and any real entry still makes the folder no skeleton.
+	Raises OSError when it cannot be read.
 
 	Examples:
 		>>> with tempfile.TemporaryDirectory() as folder:
@@ -13068,7 +13094,14 @@ def is_skeleton(path:str) -> bool:
 	name = os.path.basename(os.path.normpath(path))
 	with os.scandir(path) as entries:
 		for entry in entries:
-			if not entry.is_symlink() or os.readlink(entry.path) != forward_text(entry.name, name):
+			if not entry.is_symlink():
+				return False
+			try:
+				text = os.readlink(entry.path)
+			except FileNotFoundError:
+				# f2fs can keep a link whose text missed the checkpoint, one falling inside symlink(2): lstat works, readlink says ENOENT
+				continue
+			if text != forward_text(entry.name, name):
 				return False
 	return True
 

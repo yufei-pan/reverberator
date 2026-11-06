@@ -3,6 +3,7 @@ Round 20: the scan of a vault on design R and the rule for which layout a vault 
 version folder with no change list can be the only real tree of a cut batch, so the scan never deletes on inference, and a
 lost manifest must never bring the 0.54 rules down on it.
 '''
+import errno
 import fcntl
 import os
 import shutil
@@ -618,6 +619,35 @@ def test_is_skeleton(tmp_path):
 	(path / 'real').rmdir()
 	(path / 'file').write_text('x')
 	assert not rv.is_skeleton(str(path))
+
+
+def test_is_skeleton_passes_a_link_with_no_text(tmp_path, monkeypatch):
+	# no system call makes one: f2fs keeps it when a checkpoint falls inside symlink(2), and lstat works where readlink says ENOENT
+	path = tmp_path / f'V3--{STAMP}'
+	path.mkdir()
+	os.symlink(rv.forward_text('a', path.name), path / 'a')
+	os.symlink('text lost', path / 'b')
+	os.symlink(rv.forward_text('c', path.name), path / 'c')
+	real = os.readlink
+	raised = [FileNotFoundError(errno.ENOENT, 'no text')]
+	def readlink(link, *args, **kwargs):
+		if os.path.basename(link) == 'b':
+			raise raised[0]
+		return real(link, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'readlink', readlink)
+	assert rv.is_skeleton(str(path))
+	# any real entry beside it is still a tree, whichever comes first in the listing
+	(path / 'file').write_text('x')
+	assert not rv.is_skeleton(str(path))
+	os.remove(path / 'file')
+	os.symlink('elsewhere', path / 'd')
+	assert not rv.is_skeleton(str(path))
+	os.remove(path / 'd')
+	# any other error says nothing of the link, and refuses
+	raised[0] = OSError(errno.EIO, 'input/output error')
+	with pytest.raises(OSError) as refused:
+		rv.is_skeleton(str(path))
+	assert refused.value.errno == errno.EIO
 
 
 def test_give_back_folder_times_returns_the_recorded_paths_and_writes_only_what_differs(r_job, monkeypatch):

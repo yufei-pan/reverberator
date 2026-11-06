@@ -2,15 +2,17 @@
 Round 20: a real backup batch on design R, end to end through do_backup: every item of spec section 9's batch run alone, and
 the batch whole, each version read by the independent oracle (tests/vault_oracle.py) afterwards.
 '''
+import errno
 import os
 import shutil
 import stat
+import time
 from collections import OrderedDict
 import pytest
 
 import reverberator as rv
 from tests import version_view_ground_truth as view_truth
-from tests.crash_batches import (BAD_NAME, NEWLINE_NAME, OPTIONS, UNREADABLE, apply_batch3, backup_events, batch3_of, build_base, expected_of, put_text)
+from tests.crash_batches import (BAD_NAME, NEWLINE_NAME, OPTIONS, UNREADABLE, apply_batch3, backup_events, batch3_of, build_base, expected_of, put_text, raw_events)
 from tests.crash_child import failing_copy_command
 from tests.harness import create_job, event_entry, run_backup
 from tests.test_migration import long_rel, put_long
@@ -764,3 +766,173 @@ def test_a_folder_holding_a_path_near_the_limit_moves_as_one_row(r_job, spare):
 	for number, long_path in ((0, rel), (1, 'e' + rel[1:])):
 		walked = rv.read_walked(r_job.job_vault, number, long_path, reading)
 		assert (walked.kind, walked.st.st_size) == ('file', 4)
+
+
+# ---- a commit says its copies are on the disk (spec section 2.6)
+
+@pytest.fixture
+def commit_steps(monkeypatch):
+	'''
+	What a batch does from its change list to its commit point, in order, each sync_vault_filesystems() a flush. A verification's comparison syncs
+	before the list when it reads back an unchecked copy, which is no commit's flush.
+	'''
+	steps = []
+	real_prepare, real_commit = rv.prepare_change_list, rv.VaultManifest.commit
+	def prepare(*args, **kwargs):
+		steps[:] = ['list']
+		return real_prepare(*args, **kwargs)
+	def commit(self, version_path=None):
+		if version_path is not None:
+			steps.append('commit')
+		return real_commit(self, version_path)
+	monkeypatch.setattr(rv, 'prepare_change_list', prepare)
+	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault: steps.append('flush') or {})
+	return steps
+
+
+def chmod_file(m):
+	os.chmod(at(m, 'top.txt'), 0o640)
+	return [(False, 'attrib', 'top.txt', None)]
+
+def move_file(m):
+	os.rename(at(m, 'd/g'), at(m, 'y'))
+	return [(False, 'move', 'y', 'd/g')]
+
+def move_folder(m):
+	os.rename(at(m, 'a/sub'), at(m, 'e'))
+	return [(True, 'move', 'e', 'a/sub')]
+
+def delete_file(m):
+	os.remove(at(m, 'c/z.txt'))
+	return [(False, 'delete', 'c/z.txt', None)]
+
+def delete_folder(m):
+	shutil.rmtree(at(m, 'big'))
+	return [(True, 'delete', 'big', None)]
+
+def new_folder(m):
+	os.mkdir(at(m, 'empty'))
+	return [(True, 'create', 'empty', None)]
+
+def chmod_folder(m):
+	os.chmod(at(m, 'b'), 0o700)
+	return [(True, 'attrib', 'b', None)]
+
+def create_file(m):
+	put_text(m, 'n1.txt', 'n1')
+	return [(False, 'create', 'n1.txt', None)]
+
+def create_folder_of_files(m):
+	put_text(m, 'newf/a.txt', 'na')
+	return [(True, 'create', 'newf', None)]
+
+def modify_file(m):
+	put_text(m, 'a/x.txt', 'ax3')
+	return [(False, 'modify', 'a/x.txt', None)]
+
+def move_and_modify(m):
+	os.rename(at(m, 'a/sub'), at(m, 'e'))
+	put_text(m, 'e/m.txt', 'new')
+	return [(True, 'move', 'e', 'a/sub'), (False, 'modify', 'e/m.txt', None)]
+
+
+@pytest.mark.parametrize('item, options', [(create_file, {}), (create_folder_of_files, {}), (modify_file, {}), (move_and_modify, {}), (chmod_file, {'only_sync_attributes': False})],
+	ids=['create', 'folder_of_files', 'modify', 'move_and_modify', 'attrib_copied'])
+def test_a_batch_that_copied_flushes_before_its_commit_point(r_job, commit_steps, item, options):
+	build_base(r_job, **KEPT)
+	backup_events(r_job, item(r_job.monitor), **KEPT, **options)
+	assert commit_steps == ['list', 'flush', 'commit']
+
+
+def test_a_verification_fix_is_a_copy_too(r_job, commit_steps):
+	build_base(r_job, **KEPT)
+	# the event a batch has is a delete, and what the verification finds beside it is copied
+	events = delete_file(r_job.monitor)
+	put_text(r_job.monitor, 'a/x.txt', 'not told')
+	_, manifest, committed = rv.do_backup(rv.change_events_to_backup_entries(raw_events(r_job.monitor, events), r_job.monitor), job_name=r_job.job_name, monitor_path=r_job.monitor,
+		vault_path=r_job.vault, touched=rv.TouchedScopes(['a/'], []), matched_since=time.time_ns(), **{**OPTIONS, **KEPT})
+	manifest.close()
+	assert committed is True and commit_steps == ['list', 'flush', 'commit']
+	assert open(at(newest_version(r_job), 'a/x.txt')).read() == 'not told'
+
+
+def test_a_first_version_flushes_before_its_commit_point(r_job, commit_steps):
+	put_text(r_job.monitor, 'a.txt', 'a')
+	run_backup(r_job, OrderedDict(), **KEPT)
+	assert commit_steps == ['list', 'flush', 'commit']
+
+
+def test_a_first_version_of_folders_alone_does_not_flush(r_job, commit_steps):
+	os.mkdir(at(r_job.monitor, 'empty'))
+	run_backup(r_job, OrderedDict(), **KEPT)
+	assert commit_steps == ['list', 'commit']
+
+
+@pytest.mark.parametrize('item, options', [(move_file, {}), (move_folder, {}), (delete_file, {}), (delete_folder, {}), (new_folder, {}), (chmod_folder, {}),
+	(chmod_file, {'only_sync_attributes': True})], ids=['move', 'folder_move', 'delete', 'folder_delete', 'new_folder', 'folder_attrib', 'attrib_in_place'])
+def test_a_batch_that_copied_nothing_does_not_flush(r_job, commit_steps, item, options):
+	build_base(r_job, **KEPT)
+	backup_events(r_job, item(r_job.monitor), **KEPT, **options)
+	assert commit_steps == ['list', 'commit']
+
+
+def test_a_copy_that_failed_is_no_copy_to_flush(r_job, commit_steps, monkeypatch):
+	build_base(r_job, **KEPT)
+	monkeypatch.setattr(rv, 'copy_command', failing_copy_command(rv.copy_command))
+	put_text(r_job.monitor, f'never{UNREADABLE}', 'n')
+	backup_events(r_job, delete_file(r_job.monitor) + [(False, 'create', f'never{UNREADABLE}', None)], **KEPT)
+	assert commit_steps == ['list', 'commit']
+
+
+def newest_version(job):
+	return max((os.path.join(job.job_vault, name) for name in os.listdir(job.job_vault) if version_number(name) is not None and os.path.isdir(os.path.join(job.job_vault, name))),
+		key=lambda path: version_number(os.path.basename(path)))
+
+
+def failing_flush(failure):
+	'''A sync_vault_filesystems that fails as failure says: an OSError raised, or {disk: its OSError}.'''
+	def sync(job_vault):
+		if isinstance(failure, OSError):
+			raise failure
+		return failure
+	return sync
+
+
+@pytest.mark.parametrize('failure, named', [({'/dev/fake': OSError(errno.EIO, 'input/output error')}, '/dev/fake'), (OSError(errno.EIO, 'input/output error'), 'input/output error')],
+	ids=['a_disk_failed', 'the_sync_raised'])
+def test_a_failed_flush_commits_nothing(r_job, monkeypatch, failure, named):
+	expected = build_base(r_job, **KEPT)
+	events = item_create(r_job.monitor) + item_modify(r_job.monitor)
+	wanted = snapshot_tree(r_job.monitor)
+	lists_before = sorted(name for name in os.listdir(r_job.job_vault) if '--' in name and not os.path.isdir(at(r_job.job_vault, name)))
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'sync_vault_filesystems', failing_flush(failure))
+		with pytest.raises(rv.JobFailure) as failed:
+			backup_events(r_job, events, **KEPT)
+	assert named in failed.value.reason
+	# nothing names the new version: no record, no link, no list, placed or private
+	assert sorted(name for name in os.listdir(r_job.job_vault) if '--' in name and not os.path.isdir(at(r_job.job_vault, name))) == lists_before
+	assert not [name for name in os.listdir(r_job.job_vault) if name.startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
+	assert version_number(os.readlink(at(r_job.job_vault, 'current_version'))) == 2
+	# the tree stays and the next attempt rolls it forward, every version reading right
+	assert version_number(os.path.basename(newest_version(r_job))) == 3
+	flushes = []
+	monkeypatch.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: flushes.append(job_vault) or [])
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=r_job.job_name, monitor_path=r_job.monitor, vault_path=r_job.vault, matched_since=time.time_ns(), **{**OPTIONS, **KEPT})
+	manifest.close()
+	# the cut batch's copies were all there, and it flushes them all the same: nothing tells they are on the disk
+	assert committed is True and flushes == [r_job.job_vault]
+	assert check_vault(r_job.job_vault, {**expected, 3: wanted}, set()) == []
+
+
+def test_a_failed_flush_of_a_first_version_commits_nothing(r_job, monkeypatch):
+	put_text(r_job.monitor, 'a.txt', 'a')
+	wanted = snapshot_tree(r_job.monitor)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'sync_vault_filesystems', failing_flush({'/dev/fake': OSError(errno.EIO, 'input/output error')}))
+		with pytest.raises(rv.JobFailure) as failed:
+			run_backup(r_job, OrderedDict(), **KEPT)
+	assert '/dev/fake' in failed.value.reason
+	run_backup(r_job, OrderedDict(), **KEPT)
+	assert check_vault(r_job.job_vault, {version_number(os.path.basename(newest_version(r_job))): wanted}, set()) == []

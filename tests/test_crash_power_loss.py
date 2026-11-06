@@ -9,21 +9,24 @@ under REVERB_SCRATCH: this host holds many live f2fs mounts, and a shutdown of o
 REVERB_CRASH_FULL=1 runs every step; by default a stride.
 '''
 import os
+import random
 import re
 import sqlite3
 import subprocess
 import tempfile
-from collections import Counter
+import time
+from collections import Counter, deque
 
 import pytest
 
 import reverberator as rv
 from tests import scratch_images, version_view_ground_truth as view_truth
-from tests.crash_batches import after_retries, prepare, restore
-from tests.crash_child import kill_run, retry
+from tests.crash_batches import after_retries, build_base, prepare, raw_events, restore
+from tests.crash_child import in_child, kill_run, retry, run_do_backup
+from tests.harness import create_job
 from tests.scratch_images import flush_scratch, LoopImage, needs_f2fs, NotOurLoopImage, our_mount_point, SCRATCH, shut_down_scratch
 from tests.test_crash_harness import kill_points
-from tests.vault_oracle import check_vault, version_number
+from tests.vault_oracle import check_vault, snapshot_tree, version_number
 
 # the loop image of a run: a sparse file, so what the vault writes is all it takes of tmpfs
 IMAGE_MIB = 512
@@ -248,3 +251,34 @@ def test_a_power_loss_that_keeps_the_placement_and_loses_the_rename_is_finished(
 			manifest.close()
 		assert old_list not in os.listdir(job.job_vault)
 		assert check_vault(job.job_vault, vault.expected, set()) == [] and view_truth.wrong_lists(job.job_vault) == []
+
+
+@needs_f2fs
+def test_a_committed_copy_survives_a_power_cut():
+	# a plain batch, no outside checkpoint: a folder's fsync in the commit is a checkpoint, which keeps a new file's size and not its data
+	with LoopImage(os.path.join(SCRATCH, 'power-loss-commit'), IMAGE_MIB) as image:
+		root = tempfile.mkdtemp(prefix='reverb-crash-', dir=image.mount_point)
+		job = create_job(root)
+		base = build_base(job)
+		files = {'plain-8k.bin': 8 << 10, 'plain-1m.bin': 1 << 20, 'a/x.txt': 8 << 10}
+		data = {rel: random.Random(rel).randbytes(size) for rel, size in files.items()}
+		for rel, contents in data.items():
+			with open(os.path.join(job.monitor, rel), 'wb') as f:
+				f.write(contents)
+		wanted = snapshot_tree(job.monitor)
+		raw = raw_events(job.monitor, [(False, 'create', 'plain-8k.bin', None), (False, 'create', 'plain-1m.bin', None), (False, 'modify', 'a/x.txt', None)])
+		# the monitored tree shares the image, and the retry must find it
+		flush_scratch(root)
+		def batch():
+			return run_do_backup(job, rv.change_events_to_backup_entries(deque(raw), job.monitor), touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns())
+		cut = in_child(job, None, batch, flushing_for_real)
+		assert cut.error is None and cut.committed is True, cut
+		shut_down_scratch(image.mount_point)
+		image.remount()
+		version = next(name for name in os.listdir(job.job_vault) if version_number(name) == 3)
+		for rel, contents in data.items():
+			with open(os.path.join(job.job_vault, version, rel), 'rb') as f:
+				assert f.read() == contents, rel
+		again = retry(job, fault=flushing_for_real)
+		assert again.error is None and again.committed is True, again
+		assert check_vault(job.job_vault, {1: base[1], 2: base[2], 3: wanted}, set()) == []

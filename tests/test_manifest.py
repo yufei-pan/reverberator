@@ -351,7 +351,9 @@ def test_a_comparison_syncs_once_however_many_copies_it_checks(job, monkeypatch)
 	seed_monitor(job, {**{f'f{i}.txt': str(i) for i in range(6)}, 'sub/g.txt': 'g'})
 	calls = recording_sync(monkeypatch)
 	run_backup(job)
-	assert calls == [] and set(unchecked_flags(job).values()) == {1}
+	# the commit's flush, of the copies it placed: no comparison ran
+	assert calls == [job.job_vault] and set(unchecked_flags(job).values()) == {1}
+	calls.clear()
 	run_backup(job)                                   # the next start reads all seven back
 	assert calls == [job.job_vault]
 	assert set(unchecked_flags(job).values()) == {0}
@@ -383,7 +385,8 @@ def test_a_comparison_storing_no_checked_file_record_makes_no_sync(job, monkeypa
 	# a batch's own new copy is read back fresh, so it is recorded unchecked
 	seed_monitor(job, {'b.txt': 'b'})
 	run_backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]), touched=rv.TouchedScopes(['b.txt/'], ['b.txt'], None, None))
-	assert calls == []
+	# the commit's flush alone
+	assert calls == [job.job_vault]
 	assert unchecked_flags(job)['b.txt'] == 1
 
 
