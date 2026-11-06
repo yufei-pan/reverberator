@@ -338,6 +338,21 @@ def test_a_file_moved_out_of_a_folder_that_is_then_deleted_is_followed_to_where_
 	assert moves(hist(job, 'd/b'))[0][:2] == (1, 'delete')
 
 
+def test_a_folder_moved_out_of_a_folder_that_is_then_deleted_takes_its_files_to_where_it_went(job):
+	# mv d/s t; rm -r d; mv t u: the rows are the deletes of d/b and d/, and `u <- d/s`, whose source is the folder and not the file
+	m = job.monitor
+	write(job, 'd/s/f', 'F')
+	write(job, 'd/b', 'B')
+	run_backup(job)
+	os.rename(f'{m}/d/s', f'{m}/t')
+	shutil.rmtree(f'{m}/d')
+	os.rename(f'{m}/t', f'{m}/u')
+	backup_events(job, [(False, 'delete', 'd/b', None), (True, 'delete', 'd', None), (True, 'move', 'u', 'd/s')], keep_n_versions=0)
+	assert moves(hist(job, 'd/s/f'))[0] == (1, 'moved_away', f'{m}/u/f')
+	assert moves(hist(job, 'u/f'))[0] == (1, 'move', f'{m}/d/s/f')
+	assert moves(hist(job, 'd/b'))[0][:2] == (1, 'delete')
+
+
 def test_a_file_moved_into_a_folder_that_then_moves_is_followed_forward(job):
 	m = job.monitor
 	write(job, 'k', 'K')

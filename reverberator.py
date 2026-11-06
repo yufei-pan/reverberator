@@ -15881,15 +15881,15 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 	place and with the source its first move left, so the order is not that of the moves, and the name a row gives is not
 	always one a version held. follow_moves() reads them: moved_from undoes the rows newest first and moved_to applies them
 	oldest first, each taking the path's own row before the others. A move back to the same name reads none, and a delete of
-	the path, or of a folder above it that no row moved the path out of, ends what moved_to follows: a folder moved after that does
-	not take the path along.
+	the path ends what moved_to follows, as does a delete of a folder above it unless a row moved the path, or a folder holding it,
+	out of that folder: a folder moved after that does not take the path along.
 	'''
 	own = path.rstrip('/')
 	prefix = own + '/'
 	row_found = None
 	# (where it went to, where it came from) of each move row
 	move_rows = []
-	deleted_at = above_at = None
+	deleted_at = above_at = above = None
 	counts = dict.fromkeys(CHANGE_EVENTS, 0) if folder else None
 	files = [] if folder and list_files else None
 	recopied = False
@@ -15903,6 +15903,7 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 		elif row.event == 'delete' and above_at is None and row.path.endswith('/') and prefix.startswith(row.path):
 			# a folder above the path is gone, and one row stands for it: a file in it has no row of its own
 			above_at = len(move_rows)
+			above = row.path
 		if its_own:
 			row_found = row
 		elif folder and row.path.startswith(prefix) and row.event in counts:
@@ -15916,9 +15917,10 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 				files.append(('moved_away', row.source_path[len(prefix):]))
 		if row.event == 'move' and row.source_path:
 			move_rows.append((row.path, row.source_path))
-	# the folder's delete ends what moved_to follows only when no row moved the path out of it first: such a row has the path
-	# gone from the folder before the delete, and a later move of its destination takes it along
-	if deleted_at is None and above_at is not None and not any(source.rstrip('/') == own for _, source in move_rows):
+	# the folder's delete ends what moved_to follows only when no row moved the path out of it first: a row whose source is the path, or
+	# a folder holding it inside the deleted folder, has the path gone from there before the delete, and a later move of its destination
+	# takes it along
+	if deleted_at is None and above_at is not None and not any(source.startswith(above) and prefix.startswith(source.rstrip('/') + '/') for _, source in move_rows):
 		deleted_at = above_at
 	moved_from = follow_moves(own, move_rows[::-1])
 	moved_to = follow_moves(own, [(source, path) for path, source in move_rows[:deleted_at]])
