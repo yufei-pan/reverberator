@@ -107,7 +107,7 @@ class Lockstep:
 
 
 def landing(walked) -> tuple:
-	'''What a reader that holds no lock takes from a walk: its kind and its lstat, never what its path holds by then, as the batch may have moved that. An inode stands for its data, as a batch never changes a version's inode.'''
+	'''What a reader that holds no lock takes from a walk: its kind and its lstat, never what its path holds by then, as the batch may have moved that. An inode stands for its data, as a batch never replaces a version's inode or writes its data (a chmod does change its mode, which is compared too).'''
 	st = walked.st
 	return walked.kind, None if st is None else (st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_size, st.st_mtime_ns)
 
