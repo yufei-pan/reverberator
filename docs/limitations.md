@@ -524,8 +524,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** at a job's first start on 0.55 its backups wait for a one-time conversion that does not
-  fill the machine: about 6 s per version and half a minute in all for 100,000 entries per version, measured on a loop
-  image on an SSD, and under 3 s for small jobs.
+  fill the machine: about 6 s per version and half a minute in all for 100,000 entries per version, 3.5 to 5 minutes for
+  four versions of 183,000 files on a busier machine, and under 3 s for small jobs, all measured on a loop image on an
+  SSD.
 - **Why:** it runs once, it is the riskiest step, and its code goes with the 0.54 reader a release later.
 - **Revisit when:** a job with far more entries is converted.
 - **Approved:** 2026-11-06, "Accept (Recommended)".
