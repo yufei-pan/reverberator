@@ -14785,47 +14785,7 @@ def newest_folder_number(job_vault:str) -> 'int | None':
 	except OSError:
 		return None
 
-def read_checked(job_vault:str, number:int, rel:str, read, job:str = None, backward:bool = None, state_dir:str = None):
-	'''
-	read(walked) of walk_version() of rel in the version numbered number, right while a batch records under the walk, as the
-	reader holds no lock a batch needs. read is given every Walked, a missing one too, and its answer is returned once the links
-	followed still read as they did: a batch only turns a link into a real entry, so what the links led to was the version's
-	all along. Else it walks again. An entry missing or a link leading nowhere while job's batch runs (backup_is_running()) can be
-	a pool's two renames: it waits for the batch to end, then walks again. Not on a vault of layout 'r' when the walk ended in a
-	version numbered at least two below a version folder there, as a batch touches only the two newest, and most paths are
-	missing from some old version; a vault not yet migrated waits at any version, as a migration changes them all. A read finding
-	its entry gone waits the same way, at any version. Raises what read raises, an entry gone twice with nothing changed
-	included. backward: as walk_version() has it, the vault's layout when None; a caller reading many paths reads it once. A
-	reader holding the restore lock passes no job: no batch changes the vault then, and one waiting for that lock holds the
-	backup lock. state_dir: where job's locks are, as a command is told.
-	'''
-	if backward is None:
-		backward = read_vault_layout_for_command(job_vault) != 'r'
-	failed = None
-	while True:
-		# listed before the walk: one that is stale by then can only make the read wait more
-		newest = None if backward or job is None else newest_folder_number(job_vault)
-		walked = walk_version(job_vault, number, rel, backward)
-		if walked.kind in ('missing', 'dangling') and backup_is_running(job, state_dir):
-			ended = vault_version_number(os.path.relpath(walked.path, job_vault).partition('/')[0])
-			settled = newest is not None and ended is not None and ended + 2 <= newest
-			if not settled and wait_for_backup(job, state_dir):
-				continue
-		try:
-			value = read(walked)
-		except OSError as e:
-			# ELOOP: the link a folder's record leaves in the tree for a moment, naming itself
-			if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
-				raise
-			unchanged = followed_unchanged(walked.followed)
-			if not wait_for_backup(job, state_dir) and unchanged and walked.path == failed:
-				raise
-			failed = walked.path
-			continue
-		if followed_unchanged(walked.followed):
-			return value
-
-# how a command that holds no lock a batch needs reads a vault. backward: as walk_version() has it. job, state_dir: read_checked()'s,
+# how a command that holds no lock a batch needs reads a vault. backward: as walk_version() has it. job, state_dir: read_walked()'s,
 # so a read waits for that job's batch when it has to
 VaultReading = namedtuple('VaultReading', ['backward', 'job', 'state_dir'])
 
@@ -14834,8 +14794,29 @@ def vault_reading(job_vault:str, job:str = None, state_dir:str = None) -> VaultR
 	return VaultReading(read_vault_layout_for_command(job_vault) != 'r', job, state_dir)
 
 def read_walked(job_vault:str, number:int, rel:str, reading:VaultReading) -> Walked:
-	'''The walk of rel in the version numbered number, checked: read_checked(), the Walked being the read, as it holds the entry's lstat.'''
-	return read_checked(job_vault, number, rel, lambda walked: walked, reading.job, reading.backward, reading.state_dir)
+	'''
+	walk_version() of rel in the version numbered number, right while a batch records under the walk, as the reader holds no lock
+	a batch needs. It is returned once the links followed still read as they did: a batch only turns a link into a real entry, so
+	what the links led to was the version's all along. Else it walks again. An entry missing or a link leading nowhere while
+	reading.job's batch runs (backup_is_running()) can be a pool's two renames: it waits for the batch to end, whatever the wait
+	finds (the batch may end just before it), then walks again. Not on a vault of layout 'r' when the walk ended in a version
+	numbered at least two below a version folder there, as a batch touches only the two newest, and most paths are missing from
+	some old version; a vault not yet migrated waits at any version, as a migration changes them all. The Walked holds the
+	entry's lstat, and nothing opens the entry: no caller reads inside it. A reader holding the restore lock passes no job: no
+	batch changes the vault then, and one waiting for that lock holds the backup lock.
+	'''
+	backward, job, state_dir = reading
+	while True:
+		# listed before the walk: one that is stale by then can only make the read wait more
+		newest = None if backward or job is None else newest_folder_number(job_vault)
+		walked = walk_version(job_vault, number, rel, backward)
+		if walked.kind in ('missing', 'dangling') and backup_is_running(job, state_dir):
+			ended = vault_version_number(os.path.relpath(walked.path, job_vault).partition('/')[0])
+			if newest is None or ended is None or ended + 2 > newest:
+				wait_for_backup(job, state_dir)
+				continue
+		if followed_unchanged(walked.followed):
+			return walked
 
 def iter_folder_entries(job_vault:str, folder:Walked, rel:str, backward:bool, refused, errors:list):
 	'''iter_version_entries() below rel, the folder walked as folder: each entry is walked from the version folder landed in, as the links on the way there are behind it.'''

@@ -121,8 +121,7 @@ def wrong_reads(vault, offset, monkeypatch) -> list:
 			lockstep.advance()
 			return real(*args, **kwargs)
 		return call
-	def read(walked):
-		return None if walked.kind in ('missing', 'dangling') else entry_view(walked.path)
+	reading = rv.VaultReading(False, None, None)
 	try:
 		with monkeypatch.context() as patched:
 			patched.setattr(os, 'lstat', stepping(real_lstat))
@@ -133,7 +132,8 @@ def wrong_reads(vault, offset, monkeypatch) -> list:
 					if want.kind not in ('f', 'l'):
 						continue
 					try:
-						got = rv.read_checked(vault.job.job_vault, number, rel, read, backward=False)
+						walked = rv.read_walked(vault.job.job_vault, number, rel, reading)
+						got = None if walked.kind in ('missing', 'dangling') else entry_view(walked.path)
 					except OSError as e:
 						wrong.append((number, rel, e, want))
 						continue

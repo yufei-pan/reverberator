@@ -102,12 +102,12 @@ def expected(job):
 
 
 def walk_cli(job_vault, number, rel, backward):
-	return rv.read_checked(job_vault, number, rel, lambda walked: walked, None, backward)
+	return rv.read_walked(job_vault, number, rel, rv.VaultReading(backward, None, None))
 
 
 def cli_differences(job_vault, wanted):
 	'''
-	What the commands read differently from wanted, {version number: view}: each path by read_checked(), each version listed
+	What the commands read differently from wanted, {version number: view}: each path by read_walked(), each version listed
 	by iter_version_entries(), on the layout as a command reads it.
 	'''
 	backward = rv.read_vault_layout_for_command(job_vault) != 'r'

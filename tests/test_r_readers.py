@@ -409,14 +409,26 @@ def test_a_folder_that_cannot_be_listed_is_told(vault, monkeypatch):
 
 # --- while a batch runs ---
 
-def read_kind(walked):
-	return walked.kind
+def reading(backward, job=None):
+	return rv.VaultReading(backward, job, None)
 
 
 def waits_of(monkeypatch):
-	'''The waits read_checked asks for, none of them held: the batch is one the test keeps running.'''
+	"""The waits read_walked asks for, none of them held: the batch is one the test keeps running, and it ends at each wait."""
 	asked = []
-	monkeypatch.setattr(rv, 'wait_for_backup', lambda job, state_dir=None: asked.append(job) or False)
+	ended = []
+	real = rv.backup_is_running
+	def running(job, state_dir=None):
+		if ended:
+			ended.clear()
+			return False
+		return real(job, state_dir)
+	def wait(job, state_dir=None):
+		asked.append(job)
+		ended.append(True)
+		return False
+	monkeypatch.setattr(rv, 'backup_is_running', running)
+	monkeypatch.setattr(rv, 'wait_for_backup', wait)
 	return asked
 
 
@@ -426,11 +438,11 @@ def test_a_path_missing_from_an_old_version_does_not_wait_for_a_batch(vault, mon
 	fd = lock_backup()
 	try:
 		for number in (1, 2):
-			assert rv.read_checked(vault, number, 'nothing', read_kind, job='job', backward=False) == 'missing'
+			assert rv.read_walked(vault, number, 'nothing', reading(False, 'job')).kind == 'missing'
 		assert asked == []
 		# V4, the newest, and V3 below it are what a batch changes
 		for number in (3, 4):
-			assert rv.read_checked(vault, number, 'nothing', read_kind, job='job', backward=False) == 'missing'
+			assert rv.read_walked(vault, number, 'nothing', reading(False, 'job')).kind == 'missing'
 		assert asked == ['job', 'job']
 	finally:
 		os.close(fd)
@@ -445,7 +457,7 @@ def test_the_version_a_walk_ended_in_decides_the_wait_not_where_it_began(vault, 
 	asked = waits_of(monkeypatch)
 	fd = lock_backup()
 	try:
-		assert rv.read_checked(vault, 1, 'a', read_kind, job='job', backward=False) == 'missing'
+		assert rv.read_walked(vault, 1, 'a', reading(False, 'job')).kind == 'missing'
 		assert asked == ['job']
 	finally:
 		os.close(fd)
@@ -456,7 +468,7 @@ def test_a_vault_not_yet_migrated_waits_at_every_version(vault, monkeypatch):
 	asked = waits_of(monkeypatch)
 	fd = lock_backup()
 	try:
-		assert rv.read_checked(vault, 1, 'nothing', read_kind, job='job', backward=True) == 'missing'
+		assert rv.read_walked(vault, 1, 'nothing', reading(True, 'job')).kind == 'missing'
 		assert asked == ['job']
 	finally:
 		os.close(fd)
@@ -465,25 +477,8 @@ def test_a_vault_not_yet_migrated_waits_at_every_version(vault, monkeypatch):
 def test_no_batch_running_means_no_wait(vault, monkeypatch):
 	forward_chain(vault, 1, 2, {'a': 'held'})
 	asked = waits_of(monkeypatch)
-	assert rv.read_checked(vault, 2, 'nothing', read_kind, job='job', backward=False) == 'missing'
+	assert rv.read_walked(vault, 2, 'nothing', reading(False, 'job')).kind == 'missing'
 	assert asked == []
-
-
-def test_a_read_finding_its_entry_gone_waits_in_any_version(vault, monkeypatch):
-	forward_chain(vault, 1, 4, {'a': 'held'})
-	asked = waits_of(monkeypatch)
-	calls = []
-	def read(walked):
-		calls.append(walked.path)
-		if len(calls) == 1:
-			raise FileNotFoundError(2, 'gone', walked.path)
-		return walked.kind
-	fd = lock_backup()
-	try:
-		assert rv.read_checked(vault, 1, 'a', read, job='job', backward=False) == 'file'
-		assert asked == ['job']
-	finally:
-		os.close(fd)
 
 
 def test_history_of_a_path_older_versions_never_held_stalls_on_no_batch(r_job, monkeypatch):

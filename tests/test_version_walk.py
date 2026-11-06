@@ -357,78 +357,48 @@ def test_backup_is_running_asks_the_lock_and_lets_it_go():
 	os.close(fd)
 
 
-def read_text(walked):
+def text_of(walked):
 	if walked.kind != 'file':
 		return walked.kind
 	with open(walked.path) as f:
 		return f.read()
 
 
-def test_read_checked_reads_the_landing(vault):
+def read_text(vault, number, rel, reading):
+	return text_of(rv.read_walked(vault, number, rel, reading))
+
+
+def test_read_walked_reads_the_landing(vault):
 	forward_chain(vault, 1, 3, {'a/x': 'held'})
-	assert rv.read_checked(vault, 1, 'a/x', read_text, backward=False) == 'held'
-	assert rv.read_checked(vault, 1, 'nothing', read_text, backward=False) == 'missing'
+	assert read_text(vault, 1, 'a/x', rv.VaultReading(False, None, None)) == 'held'
+	assert read_text(vault, 1, 'nothing', rv.VaultReading(False, None, None)) == 'missing'
 
 
-def test_read_checked_finds_the_layout_itself(vault):
+def test_the_layout_a_pass_reads_is_the_vaults(vault):
 	chain_vault(vault)
-	assert rv.read_checked(vault, 3, 'a/x', read_text) == 'held'
+	assert read_text(vault, 3, 'a/x', rv.vault_reading(vault)) == 'held'
 	record_layout(vault, 'r')
-	assert rv.read_checked(vault, 3, 'a/x', read_text) == 'symlink'
+	assert read_text(vault, 3, 'a/x', rv.vault_reading(vault)) == 'symlink'
 
 
-def test_read_checked_walks_again_when_a_followed_link_changed(vault):
+def test_read_walked_walks_again_when_a_followed_link_changed(vault, monkeypatch):
 	# the batch records under the reader: V1's entry becomes real, and the tree's takes the new content
 	forward_chain(vault, 1, 2, {'a': 'old'})
-	reads = []
-	def read(walked):
-		text = read_text(walked)
-		reads.append(text)
-		if len(reads) == 1:
+	real = rv.walk_version
+	walks = []
+	def walking(*args, **kwargs):
+		walked = real(*args, **kwargs)
+		walks.append(text_of(walked))
+		if len(walks) == 1:
 			os.remove(at(vault, 1, 'a'))
 			with open(at(vault, 1, 'a'), 'w') as f:
 				f.write('old, recorded')
 			with open(at(vault, 2, 'a'), 'w') as f:
 				f.write('new')
-		return text
-	assert rv.read_checked(vault, 1, 'a', read, backward=False) == 'old, recorded'
-	assert reads == ['old', 'old, recorded']
-
-
-def test_read_checked_walks_again_when_a_read_finds_the_entry_gone(vault):
-	forward_chain(vault, 1, 2, {'a': 'held'})
-	calls = []
-	def read(walked):
-		calls.append(walked.path)
-		if len(calls) == 1:
-			os.remove(at(vault, 1, 'a'))
-			os.rename(at(vault, 2, 'a'), at(vault, 1, 'a'))
-			raise FileNotFoundError(errno.ENOENT, 'gone', walked.path)
-		return read_text(walked)
-	assert rv.read_checked(vault, 1, 'a', read, backward=False) == 'held'
-	assert calls == [at(vault, 2, 'a'), at(vault, 1, 'a')]
-
-
-def test_read_checked_walks_again_past_a_folders_link_to_itself(vault):
-	# a folder's record leaves a link naming itself in the tree for a moment, and the kernel gives ELOOP through it
-	forward_chain(vault, 1, 2, {'a/x': 'held'})
-	def read(walked):
-		if walked.path == at(vault, 2, 'a/x'):
-			os.remove(at(vault, 1, 'a'))
-			os.rename(at(vault, 2, 'a'), at(vault, 1, 'a'))
-			os.symlink(forward_text('a', version_name(2)), at(vault, 2, 'a'))
-			with open(walked.path):
-				pass
-		return read_text(walked)
-	assert rv.read_checked(vault, 1, 'a/x', read, backward=False) == 'held'
-
-
-def test_a_read_failing_the_same_way_again_is_raised(vault):
-	write_version(vault, 1, {'a': 'held'})
-	def read(walked):
-		raise FileNotFoundError(errno.ENOENT, 'a file the read itself wanted')
-	with pytest.raises(FileNotFoundError):
-		rv.read_checked(vault, 1, 'a', read, backward=False)
+		return walked
+	monkeypatch.setattr(rv, 'walk_version', walking)
+	assert text_of(rv.read_walked(vault, 1, 'a', rv.VaultReading(False, None, None))) == 'old, recorded'
+	assert walks == ['old', 'old, recorded']
 
 
 def test_a_missing_entry_waits_for_a_running_backup(vault, capsys):
@@ -437,7 +407,7 @@ def test_a_missing_entry_waits_for_a_running_backup(vault, capsys):
 	os.rename(at(vault, 1), at(vault, 1) + '.away')
 	fd = lock_backup()
 	got = []
-	reader = threading.Thread(target=lambda: got.append(rv.read_checked(vault, 1, 'a', read_text, job='j', backward=False)))
+	reader = threading.Thread(target=lambda: got.append(text_of(rv.read_walked(vault, 1, 'a', rv.VaultReading(False, 'j', None)))))
 	reader.start()
 	reader.join(0.3)
 	assert reader.is_alive() and not got
@@ -448,9 +418,24 @@ def test_a_missing_entry_waits_for_a_running_backup(vault, capsys):
 	assert capsys.readouterr().err.count('Waiting for reverberator to finish a backup of j') == 1
 
 
+def test_a_batch_ending_between_the_check_and_the_wait_gives_the_second_walk(vault, monkeypatch):
+	# backup_is_running() said yes, and the batch ended before the wait looked: the wait finds none, and the answer is still the walk after it
+	write_version(vault, 1, {'a': 'held'})
+	os.rename(at(vault, 1), at(vault, 1) + '.away')
+	monkeypatch.setattr(rv, 'backup_is_running', lambda job, state_dir=None: True)
+	waits = []
+	def ended(job, state_dir=None):
+		waits.append(job)
+		os.rename(at(vault, 1) + '.away', at(vault, 1))
+		return False
+	monkeypatch.setattr(rv, 'wait_for_backup', ended)
+	assert text_of(rv.read_walked(vault, 1, 'a', rv.VaultReading(False, 'j', None))) == 'held'
+	assert waits == ['j']
+
+
 def test_a_missing_entry_with_no_backup_running_is_missing_at_once(vault):
 	write_version(vault, 1, {'a': 'held'})
-	assert rv.read_checked(vault, 1, 'nothing', read_text, job='j', backward=False) == 'missing'
+	assert rv.read_walked(vault, 1, 'nothing', rv.VaultReading(False, 'j', None)).kind == 'missing'
 
 
 def test_a_link_leading_nowhere_waits_too(vault):
@@ -458,7 +443,7 @@ def test_a_link_leading_nowhere_waits_too(vault):
 	os.rename(at(vault, 2), at(vault, 2) + '.away')
 	fd = lock_backup()
 	got = []
-	reader = threading.Thread(target=lambda: got.append(rv.read_checked(vault, 1, 'a', read_text, job='j', backward=False)))
+	reader = threading.Thread(target=lambda: got.append(text_of(rv.read_walked(vault, 1, 'a', rv.VaultReading(False, 'j', None)))))
 	reader.start()
 	reader.join(0.3)
 	assert reader.is_alive()
@@ -484,7 +469,7 @@ def test_a_stop_ends_the_wait_for_a_backup(vault):
 	rv.RESTORE_STOP.set()
 	try:
 		with pytest.raises(KeyboardInterrupt):
-			rv.read_checked(vault, 1, 'a', read_text, job='j', backward=False)
+			text_of(rv.read_walked(vault, 1, 'a', rv.VaultReading(False, 'j', None)))
 	finally:
 		rv.RESTORE_STOP.clear()
 		os.close(fd)
