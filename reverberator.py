@@ -15359,6 +15359,35 @@ CHANGE_EVENTS = ('create', 'modify', 'attrib', 'move', 'delete')
 
 PathChanges = namedtuple('PathChanges', ['row', 'moved_from', 'moved_to', 'counts', 'files', 'recopied'])
 
+def follow_moves(name:str, moves:list) -> 'str | None':
+	'''
+	Where name goes by moves, a list of (from, to) in the order they apply: each one whose from is name, or a folder (ending with
+	'/') holding it, takes it to its to. None when it ends where it began. Rows that come back to a name already held are two moves
+	of one swap, which the batch's collapse leaves side by side, not one after the other: the walk ends before it.
+
+	Examples:
+		>>> follow_moves('/m/b/f/x', [('/m/b/f/', '/m/h/'), ('/m/h/x', '/m/b/b')])
+		'/m/b/b'
+		>>> follow_moves('/m/q', [('/m/q', '/m/p'), ('/m/p', '/m/q')])
+		'/m/p'
+		>>> follow_moves('/m/q', [('/m/z', '/m/p')]) is None
+		True
+	'''
+	current = name
+	seen = {name}
+	for source, destination in moves:
+		if source.rstrip('/') == current:
+			after = destination.rstrip('/')
+		elif source.endswith('/') and current.startswith(source):
+			after = destination.rstrip('/') + '/' + current[len(source):]
+		else:
+			continue
+		if after in seen:
+			break
+		seen.add(after)
+		current = after
+	return None if current == name else current
+
 def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool = True) -> PathChanges:
 	'''
 	What the change list at change_list says about path, an absolute monitored path, read once as it streams in: the
@@ -15368,12 +15397,16 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 	list_files). The folder's own row is not counted below it; a move out of the folder counts as a delete, listed as
 	('moved_away', the path it left). A file the version copied again from the vault is no change: its recopy row is
 	neither the path's row nor counted, and only sets recopied.
+
+	The move rows are kept in the list's order, which is the order of the moves where a folder move follows a move into it
+	(the rows name the folder as the first move left it). moved_from undoes the rows newest first and moved_to applies them
+	oldest first (follow_moves()), so each names a path a version held. A move back to the same name reads none.
 	'''
 	own = path.rstrip('/')
 	prefix = own + '/'
-	row_found = moved_from = moved_to = None
-	# the nearest folder above the path that moved tells where it went
-	from_depth = to_depth = 0
+	row_found = None
+	# (where it went to, where it came from) of each move row
+	move_rows = []
 	counts = dict.fromkeys(CHANGE_EVENTS, 0) if folder else None
 	files = [] if folder and list_files else None
 	recopied = False
@@ -15393,17 +15426,10 @@ def path_changes(change_list:str, path:str, folder:bool = False, list_files:bool
 			counts['delete'] += 1
 			if files is not None:
 				files.append(('moved_away', row.source_path[len(prefix):]))
-		if row.event != 'move' or not row.source_path:
-			continue
-		source = row.source_path
-		if its_own:
-			moved_from, from_depth = source.rstrip('/'), len(prefix)
-		elif row.path.endswith('/') and prefix.startswith(row.path) and len(row.path) > from_depth:
-			moved_from, from_depth = source.rstrip('/') + '/' + own[len(row.path):], len(row.path)
-		if source.rstrip('/') == own:
-			moved_to, to_depth = row.path.rstrip('/'), len(prefix)
-		elif source.endswith('/') and prefix.startswith(source) and len(source) > to_depth:
-			moved_to, to_depth = row.path.rstrip('/') + '/' + own[len(source):], len(source)
+		if row.event == 'move' and row.source_path:
+			move_rows.append((row.path, row.source_path))
+	moved_from = follow_moves(own, move_rows[::-1])
+	moved_to = follow_moves(own, [(source, path) for path, source in move_rows])
 	return PathChanges(row_found, moved_from, moved_to, counts, files, recopied)
 
 def listed_path_changes(job_vault:str, version:KeptVersion, path:str, folder:bool, list_files:bool, reading:VaultReading) -> PathChanges:

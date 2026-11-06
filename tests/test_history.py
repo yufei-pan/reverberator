@@ -5,6 +5,7 @@ from collections import OrderedDict
 import pytest
 import TSVZ
 import reverberator as rv
+from tests.crash_batches import backup_events
 from tests.harness import reads_the_file_before, seed_monitor, run_backup, event_entry, write_rule, rule_row, write_committed_version
 
 pytestmark = pytest.mark.unit
@@ -210,6 +211,46 @@ def test_folder_created_moved_and_deleted_whole(job):
 		f'V3  {at(job, 3)}  attributes changed',
 		f'V2  {at(job, 2)}  moved from {m}/proj',
 	]
+
+
+def test_a_move_then_a_folder_move_names_the_source_the_version_below_held(job):
+	# mv b/b h/x; mv h b/f: the list holds the two moves in the order they happened, and no version held h/x
+	m = job.monitor
+	write(job, 'b/b', 'payload')
+	os.makedirs(f'{m}/h')
+	run_backup(job)
+	os.rename(f'{m}/b/b', f'{m}/h/x')
+	os.rename(f'{m}/h', f'{m}/b/f')
+	backup_events(job, [(False, 'move', 'h/x', 'b/b'), (True, 'move', 'b/f', 'h')], keep_n_versions=0)
+	assert moves(hist(job, 'b/f/x')) == [(1, 'move', f'{m}/b/b')]
+	assert moves(hist(job, 'b/b')) == [(1, 'moved_away', f'{m}/b/f/x'), (0, 'oldest', None)]
+
+
+def test_a_swap_of_two_names_through_a_third_names_each_others(job):
+	m = job.monitor
+	write(job, 'p', 'P')
+	write(job, 'q', 'Q')
+	run_backup(job)
+	os.rename(f'{m}/p', f'{m}/t')
+	os.rename(f'{m}/q', f'{m}/p')
+	os.rename(f'{m}/t', f'{m}/q')
+	backup_events(job, [(False, 'move', 't', 'p'), (False, 'move', 'p', 'q'), (False, 'move', 'q', 't')], keep_n_versions=0)
+	# the collapse follows the third name, so the list holds the two moves side by side
+	changes = {name: rv.path_changes(versions(job)[1].change_list, f'{m}/{name}') for name in ('p', 'q')}
+	assert (changes['p'].moved_from, changes['p'].moved_to) == (f'{m}/q', f'{m}/q')
+	assert (changes['q'].moved_from, changes['q'].moved_to) == (f'{m}/p', f'{m}/p')
+
+
+def test_a_file_moved_into_a_folder_that_then_moves_is_followed_forward(job):
+	m = job.monitor
+	write(job, 'k', 'K')
+	os.makedirs(f'{m}/g')
+	run_backup(job)
+	os.rename(f'{m}/k', f'{m}/g/k')
+	os.rename(f'{m}/g', f'{m}/h')
+	backup_events(job, [(False, 'move', 'g/k', 'k'), (True, 'move', 'h', 'g')], keep_n_versions=0)
+	assert moves(hist(job, 'h/k')) == [(1, 'move', f'{m}/k')]
+	assert moves(hist(job, 'k'))[0] == (1, 'moved_away', f'{m}/h/k')
 
 
 def test_history_of_versions_without_change_rows(job):
