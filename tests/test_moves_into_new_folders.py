@@ -341,8 +341,9 @@ def test_a_file_written_in_a_moved_in_folder_right_after_the_move_is_in_a_versio
 	assert version_view(job) == live_view(job)
 
 
-def test_a_move_in_that_the_walk_saw_and_whose_event_comes_is_one_move(session, job, monkeypatch):
-	# the new folder has its watch and the walk has not listed it when the move comes: the walk finds it and its MOVED_TO comes too
+def test_a_move_in_that_the_walk_saw_and_whose_event_comes_is_a_copy(session, job, monkeypatch):
+	# the new folder has its watch and the walk has not listed it when the move comes: the walk finds it and re-points its watches, and
+	# its MOVED_TO comes too. the walk got there first, so the copy of the new folder holds it, as on 0.55: the event is discarded
 	one = session()
 	new, big = os.path.join(job.monitor, 'n'), os.path.join(job.monitor, 'big')
 	real = rv.iter_tree_entries
@@ -351,15 +352,14 @@ def test_a_move_in_that_the_walk_saw_and_whose_event_comes_is_one_move(session, 
 			os.rename(big, os.path.join(new, 'big'))
 		return real(path, *args, **kwargs)
 	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
-	inodes = inodes_of(job)
 	before = version_view(job)
 	previous = latest_version(job).path
 	os.mkdir(new)
 	batch = one.take()
-	assert [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch if e.event != 'attrib' and '.probe' not in e.path] == [('create', 'n'), ('move', 'n/big')]
+	assert [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch if e.event != 'attrib' and '.probe' not in e.path and e.event != 'delete'] == [('create', 'n')]
 	one.back_up(batch)
 	assert_held_as_the_tree(job, before, previous)
-	assert inodes_of(job)['n/big/a'] == inodes['big/a']
+	written_after(one, job, 'n/big/after')
 
 
 TAIL = 'T' * 70000
@@ -601,10 +601,10 @@ def test_a_write_kept_at_its_size_and_mtime_in_a_folder_the_walk_found_moved_in_
 
 
 @pytest.mark.parametrize('into', ['m/big', 'm/s/big'])
-def test_a_folder_moved_into_a_folder_from_outside_while_it_is_walked_keeps_its_events(session, job, tmp_path, monkeypatch, into):
+def test_a_folder_moved_into_a_folder_from_outside_while_it_is_walked_is_copied(session, job, tmp_path, monkeypatch, into):
 	# mv /out/d m; mv big m/big, the second after the watch of m (or m/s) and before m is listed: the walk of a move-in with no known
-	# source finds big under its old watch, and the move's own events carry big as a move. nothing copies it, so a write in it made
-	# so that only its event can show it (inside the file, its mtime set back) must be recorded
+	# source finds big under its old watch, and the move's own MOVED_TO is discarded, as the walk got there first. m's copy holds big,
+	# and a write in it made so that only its event can show it (inside the file, its mtime set back) is in that copy
 	one = session({**SEED, 'big/a': 'A' * 4096 + TAIL})
 	outside = tmp_path / 'd'
 	os.makedirs(outside / 's')
@@ -636,7 +636,7 @@ def test_a_folder_moved_into_a_folder_from_outside_while_it_is_walked_keeps_its_
 		f.write(b'WRITTEN')
 	os.utime(moved, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 	batch = one.take()
-	assert ('move', into) in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	assert not [e for e in batch if e.event == 'move']
 	one.back_up(batch)
 	assert version_view(job) == live_view(job)
 

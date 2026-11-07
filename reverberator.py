@@ -3013,7 +3013,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				skipped = skip_list is not None and skip_list.skips_path(eventPath,isDir)
 				# a batch's copy of a new folder holds what is in it, but for the moves of the batch into it, which arrive by
 				# those moves ( mkdir n; mv d n/d ): the version holds them already, and the copy leaves them out
-				if event.wd in newDirWDs and not (event.mask & flags.MOVED_TO and event.cookie in cookieDic):
+				# a folder the walk of the new folder already watches got there first, listed after its rename and re-pointed: the events it
+				# raised before the rename came at its new place already, and the copy holds it, as on 0.55
+				if event.wd in newDirWDs and not (event.mask & flags.MOVED_TO and event.cookie in cookieDic and not (isDir and (eventPath in wdDic.inverse or eventPath + '/' in wdDic.inverse))):
 					if event.wd not in discardLoggedWDs:
 						discardLoggedWDs.add(event.wd)
 						watcherTeeLogToTl(monitor_path,f'Discarding events for new recursive folder {wdDic[event.wd]} until its copy runs')

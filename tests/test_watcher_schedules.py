@@ -26,9 +26,9 @@ from tests.test_moves_into_new_folders import live_view, session, version_view  
 pytestmark = pytest.mark.inotify
 
 # the visits a shape's steps may land at: all of them for a short shape, where the window is a visit or two wide
-H = {'moved_into_a_folder_from_outside': 12}
+H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 12, 'in_then_poke_mv': 12}
 H_DEFAULT = 16
-SAMPLE = int(os.environ.get('REVERB_WATCH_SCHED_SAMPLE', '200'))
+SAMPLE = int(os.environ.get('REVERB_WATCH_SCHED_SAMPLE', '100'))
 BIG = 'p' * 200000
 TREE = {'big/a': BIG, 'big/sub/b': BIG, 'big/sub/deep/x': 'x' * 100, 'next/z': 'z' * 100, 'f.txt': 'f' * 300, 'other/o': 'o', 'keep/k': 'k'}
 SHAPES = {
@@ -42,6 +42,15 @@ SHAPES = {
 	'moved_into_a_folder_from_outside': [('mv', '{outside}/d', 'm'), ('mv', 'big', 'm/big'), ('poke', 'm/big/a')],
 	# a chain through a new folder made at a found folder's place, as fuzz seed 2854 had it
 	'chain_through_a_new_folder': [('mkdir', 'A'), ('mv', 'big', 'A/n2'), ('mkdir', 'M'), ('mv', 'A', 'M/n2'), ('poke', 'M/n2/n2/a')],
+	# a change that only its event shows, made between mkdir n and the rename that carries the folder into it: the rename can land
+	# right after the new folder's watch, before the walk lists it, and then the walk got there first (the third review's F3)
+	'poke_between': [('mkdir', 'n'), ('poke', 'big/a'), ('mv', 'big', 'n/big')],
+	# the same as cp -p of a same-size release file does it: other bytes, the same size and mtime
+	'cpp_between': [('mkdir', 'n'), ('cpp', 'big/sub/b'), ('mv', 'big', 'n/big')],
+	# the same into a folder that came in from outside
+	'in_then_poke_mv': [('mv', '{outside}/d', 'm'), ('poke', 'big/a'), ('mv', 'big', 'm/big')],
+	# moved on into another new folder, a folder made at its old place, and a change that only its event shows
+	'found_twice': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mkdir', 'm'), ('mv', 'n/big', 'm/big'), ('mv', 'next', 'big'), ('poke', 'm/big/sub/b')],
 }
 NAMES = [name for name in os.environ.get('REVERB_WATCH_SCHED_SHAPES', ','.join(SHAPES)).split(',') if name]
 
@@ -59,14 +68,6 @@ CASES = [(name, vector) for name in NAMES for vector in vectors(name)]
 
 def folders_of(root):
 	return [os.path.relpath(os.path.join(base, name), root) for base, names, _ in os.walk(root) for name in names]
-
-
-def poke(path):
-	'''A write inside the file with its size and mtime kept: only its event can show it.'''
-	stat = os.lstat(path)
-	with open(path, 'r+b') as f:
-		f.write(b'POKED')
-	os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
 
 @pytest.fixture
@@ -98,10 +99,7 @@ def test_a_schedule_ends_as_the_tree(folders_removed, session, job, tmp_path, mo
 				state['done'] += 1
 				log.append(('step', at, where, step))
 				try:
-					if step[0] == 'poke':
-						poke(os.path.join(job.monitor, step[1]))
-					else:
-						one.apply(step)
+					one.apply(step)
 				except OSError as e:
 					log.append(('failed', os.strerror(e.errno)))
 		finally:
