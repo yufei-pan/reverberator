@@ -698,19 +698,22 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** a lightness item.
 - **Revisit when:** the lightness round after 0.55.1.
 
-### A file moved into a new folder before the watcher reaches it is copied once
+### A folder or file moved into a new folder before the watcher reaches it is copied once
 
 - **Kind:** known limitation.
-- **What the operator sees:** a file moved into a folder made in the same batch, before the watcher has reached that
-  folder, is copied again with no line in the log, though the vault already holds it. Under a size limit that copy can
-  prune older versions. A shell's `mkdir n; mv f n/` lost that race 3 times in 2,400; a program making the folder and
-  renaming into it back to back loses it about 97% of the time. A folder moved the same way is told by its watch and
-  costs no copy.
+- **What the operator sees:** a folder or file moved into a folder made in the same batch, before the watcher has
+  reached that folder or while it is still listing it, is copied again with no line in the log, though the vault already
+  holds it. Under a size limit that copy can prune older versions. A shell's `mkdir n; mv f n/` lost that race 3 times
+  in 2,400; a program making the folder and renaming into it back to back loses it about 97% of the time, and for a
+  100 MB folder that cost 102 MB on the real daemon, where a gap of 0.2 s cost 0.04 MB. One moved in after the watcher
+  has reached the new folder is a move and costs no copy.
 - **Why:** a file has no watch, so only its name would say it is the same file, and pairing by name left a version
-  holding the wrong bytes for good when a review tried it. A miss costs one copy of one file, as every version before
-  this one paid.
+  holding the wrong bytes for good when a review tried it. A folder has a watch, and 0.55.1's first build paired it by
+  its watch's own move event; three reviews each found another order of events where that kept the wrong bytes for good
+  (a same-size write between `mkdir n` and `mv app n/app` was wrong 4 times in 6 on the real daemon, 0 in 6 on 0.55).
+  A miss costs one copy of what moved, as every version before this one paid.
 - **Revisit when:** size limits start pruning because of it, or rows come to hold the monitored inode for another reason.
-- **Approved:** 2026-11-06, "Accept (Recommended)".
+- **Approved:** 2026-11-06, "Accept (Recommended)" for files; widened to folders 2026-11-07, "Widen it (Recommended)".
 
 ### A size record too low after a rename falls back to a copy
 
