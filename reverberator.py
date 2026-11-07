@@ -2859,7 +2859,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 		if cookie_value.isDir:
 			forget_unwatched_under(unwatched,cookie_value.path)
 		if cookie_value.wds:
-			remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
+			remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.wds,watch_flags)
 	def queue_pending_move_from_at(path:str,monTime:float):
 		# something new is at the path a folder or file moved away from: that move was not a deletion that can wait,
 		# or the delete it expires into would land after this create and remove what is there
@@ -3456,14 +3456,13 @@ def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,moun
 		queued += 1
 	return queued
 
-def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str,wds,watch_flags:int) -> int:
+def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,wds,watch_flags:int) -> int:
 	'''
 	Remove the watches a folder took along when it moved away and its move never paired; returns how many were removed.
-	Of wds, the watches at or below folder_path when it moved, only those still mapped there go, and not one that inotify
-	hands back for the folder now at its path: a folder moved back brings its old watches, a folder created there has new ones.
+	Of wds, the watches at or below its path when it moved, each one still held goes unless inotify hands it back for the
+	folder now at the path it is mapped to: a folder moved back brings its old watches, a folder created there has new ones,
+	and a parent renamed since re-pointed them all, to a place where the folder outside the tree does not live.
 	'''
-	folder_norm = folder_path.rstrip('/')
-	prefix = folder_norm + '/'
 	removed = 0
 	raise_queue_limit_for_removals(irm,len(wds))
 	for wd in wds:
@@ -3471,8 +3470,6 @@ def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,ir
 		if wd_path is None:
 			continue
 		wd_norm = wd_path.rstrip('/')
-		if wd_norm != folder_norm and not wd_norm.startswith(prefix):
-			continue
 		try:
 			# watching a folder that already has a watch returns that watch, unchanged with the same flags
 			current_wd = inotify_obj.add_watch(wd_norm, watch_flags | inotify_simple.flags.ONLYDIR | inotify_simple.flags.DONT_FOLLOW)

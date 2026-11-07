@@ -539,6 +539,21 @@ def kernel_merges(first, second):
 		yield [next(b) if i in at else next(a) for i in range(len(first) + len(second))]
 
 
+def test_a_folder_moved_out_of_the_tree_before_its_parent_is_renamed_keeps_no_watch(session, job, tmp_path):
+	# keep/s/n2 leaves the tree and keep is renamed before that move-out expires: the rename re-points the watch of the folder now
+	# outside to c/keep2/s/n2, where nothing lives, and it must still go with the move-out's delete
+	one = session({'keep/s/n2/h': 'h', 'c/g': 'g'})
+	with one.unread():
+		os.rename(os.path.join(job.monitor, 'keep/s/n2'), tmp_path / 'x')
+		one.apply(('mv', 'keep', 'c/keep2'))
+	one.back_up_next()
+	one.back_up_next()
+	(tmp_path / 'x' / 'written_outside').write_text('w')
+	one.apply(('write', 'c/g2', 'x'))
+	batch = one.take()
+	assert {os.path.relpath(e.path, job.monitor) for e in batch if '.probe' not in e.path} == {'c/g2'}
+
+
 def test_a_folder_found_moved_from_a_path_that_once_held_a_deleted_folder_is_a_move(session, job):
 	# tmp once held a folder that was removed: its watch's path stayed in the watches' index, which says a folder is watched at tmp,
 	# so the folder moved there later and on into a new folder was copied whole
