@@ -7,6 +7,7 @@ import contextlib
 import errno
 import os
 import shutil
+import sys
 import threading
 import time
 
@@ -19,9 +20,10 @@ from tests.vault_oracle import read_view, snapshot_tree
 pytestmark = pytest.mark.inotify
 
 SEED = {'big/a': 'a' * 5000, 'big/sub/b': 'b' * 5000, 'f.txt': 'f' * 5000, 'g.txt': 'g' * 5000, 'other/': None}
-# how the steps of a batch meet the watcher. apart: each read and handled on its own. at_once: as fast as Python goes.
-# unread: all done before the watcher reads any, so a new folder has no watch yet and a move into it raises no MOVED_TO
-TIMINGS = ('apart', 'at_once', 'unread')
+# how the steps of a batch meet the watcher. apart: each read and handled on its own. unread: all done before the watcher reads any,
+# so a new folder has no watch yet and a move into it raises no MOVED_TO. at_once, as fast as Python goes, is a race between those two
+# and has a stress test of its own
+TIMINGS = ('apart', 'unread')
 
 
 class Session:
@@ -247,9 +249,16 @@ SHAPES = [
 ]
 
 
-@pytest.mark.parametrize('only_sync_attributes', [True, False], ids=['osa', 'no_osa'])
-@pytest.mark.parametrize('timing', TIMINGS)
-@pytest.mark.parametrize('name,steps,kept,kept_unread', SHAPES, ids=[shape[0] for shape in SHAPES])
+# the shapes that no change of the watcher made fail while the review's mutants were run over the whole matrix: what the old code got
+# right too, kept as cover, at one timing. Only Sync Attributes is the backuper's, and matters where a chmod comes: both ways there
+NEVER_FAILED = {'file_written_after', 'file_chmod_after', 'file_replaced', 'out_of_the_tree', 'new_folder_removed', 'new_folder_moved_on', 'from_outside',
+	'a_file_made_in_the_batch', 'a_folder_made_in_the_batch', 'moved_inside_a_new_folder', 'moved_out_of_a_new_folder', 'its_own_old_place'}
+MATRIX = [pytest.param(*shape, timing, osa, id=f'{shape[0]}-{timing}-{"osa" if osa else "no_osa"}')
+	for shape in SHAPES for timing in (TIMINGS[:1] if shape[0] in NEVER_FAILED else TIMINGS)
+	for osa in ((True, False) if any(step[0] == 'chmod' for step in shape[1]) else (True,))]
+
+
+@pytest.mark.parametrize('name,steps,kept,kept_unread,timing,only_sync_attributes', MATRIX)
 def test_a_batch_of_moves_into_new_folders_ends_as_the_tree(session, job, tmp_path, name, steps, kept, kept_unread, timing, only_sync_attributes):
 	outside = tmp_path / 'outside'
 	os.makedirs(outside / 'kept')
@@ -269,6 +278,43 @@ def test_a_batch_of_moves_into_new_folders_ends_as_the_tree(session, job, tmp_pa
 	if timing == 'apart' or kept_unread:
 		after = inodes_of(job)
 		assert {new: after[new] for new in kept.values()} == {new: inodes[old] for old, new in kept.items()}
+
+
+def test_moves_into_new_folders_as_fast_as_they_go_end_as_the_tree(session, job):
+	# at_once is a race between the two paths: a new folder is watched in time for the move into it or it is not. sixty of each shape in one
+	# batch, in the order of one tool, and whatever the race gave must end as the tree, and in a watch for what changes after
+	count = 60
+	one = session({**SEED, **{f'src{i}/a': 'a' * 3000 for i in range(count)}, **{f'f{i}': 'f' * 3000 for i in range(count)}})
+	steps = []
+	for i in range(count):
+		steps += [('mkdir', f'n{i}'), ('mv', f'src{i}', f'n{i}/src{i}'), ('mv', f'f{i}', f'n{i}/f{i}'), ('write', f'n{i}/src{i}/z', 'z'), ('mkdir', f'm{i}'),
+			('mv', f'n{i}/src{i}', f'm{i}/src{i}'), ('append', f'n{i}/f{i}', 'more')]
+	one.run(steps, 'at_once')
+	one.back_up_next()
+	assert version_view(job) == live_view(job)
+	for i in range(count):
+		one.apply(('write', f'm{i}/src{i}/after', 'after'))
+	one.back_up_next()
+	assert version_view(job) == live_view(job)
+
+
+def test_what_a_walk_found_and_paired_is_emptied_by_a_take(session, job, monkeypatch):
+	# the old paths of the folders a walk found moved in, and the cookies of their move-outs, are kept for the batch: a take empties
+	# both, or a quiet daemon would hold one for each folder it ever found
+	kept = {}
+	real = rv.initializeFolderWatchers
+	def walk(*args, **kwargs):
+		caller = sys._getframe(1).f_locals
+		kept.update(found=caller['foundMoved'], paired=caller['pairedCookies'])
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', walk)
+	one = session()
+	with one.unread():
+		one.run([('mkdir', 'n'), ('mv', 'big', 'n/big')], 'at_once')
+	one.settle()
+	assert kept['found'] and kept['paired']
+	one.take()
+	wait_until(lambda: not kept['found'] and not kept['paired'], message='the take did not empty what the walk found')
 
 
 @pytest.mark.parametrize('timing', TIMINGS)
@@ -482,6 +528,63 @@ def test_a_folder_moved_into_a_new_folder_made_after_its_parents_walk_listed_it_
 	assert inodes_of(job)['p/q/big/a'] == inodes['big/a']
 	# 400 KB would be a copy
 	assert vault_bytes(job) - size < 200000
+
+
+def test_a_folder_found_moved_in_is_moved_on_in_a_later_read(session, job, monkeypatch):
+	# the walk of n finds big under its old watch, and what moves it on later is in a folder the batch made: recorded, so the folder
+	# is a move to n2 and not a copy
+	one = session()
+	new, big = os.path.join(job.monitor, 'n'), os.path.join(job.monitor, 'big')
+	one.apply(('mkdir', 'n2'))
+	real = rv.iter_tree_entries
+	def walk(path, *args, **kwargs):
+		if path.rstrip('/') == new and os.path.lexists(big):
+			os.rename(big, os.path.join(new, 'big'))
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
+	inodes = inodes_of(job)
+	before = version_view(job)
+	previous = latest_version(job).path
+	os.mkdir(new)
+	one.settle()
+	one.apply(('mv', 'n/big', 'n2/big'))
+	one.back_up_next()
+	assert_held_as_the_tree(job, before, previous)
+	assert inodes_of(job)['n2/big/a'] == inodes['big/a']
+
+
+def test_a_move_out_waiting_at_the_place_a_folder_is_found_moved_to_is_its_delete_first(session, job, tmp_path):
+	# n/big leaves the tree and n is renamed away, a new n is made and big moved into it, before the watcher reads any: the move-out
+	# of the old n/big waits for a pair, and its delete, expiring after the move landed on that name, would remove the moved-in folder
+	one = session({**SEED, 'n/big/old': 'old'})
+	before = version_view(job)
+	previous = latest_version(job).path
+	with one.unread():
+		os.rename(os.path.join(job.monitor, 'n', 'big'), tmp_path / 'oldbig')
+		one.run([('mv', 'n', 'n_old'), ('mkdir', 'n'), ('mv', 'big', 'n/big')], 'at_once')
+	batch = one.take()
+	events = [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	assert events.index(('delete', 'n/big')) < events.index(('move', 'n/big'))
+	one.back_up(batch)
+	assert_held_as_the_tree(job, before, previous)
+
+
+def test_a_folder_found_moved_in_takes_its_unwatched_subfolder_off_the_old_path(session, job, monkeypatch):
+	# big/sub could not be read when it was watched, so the watcher claims no read time while that stands; moved to n/big, where it is read
+	# and watched, it is not unwatched at the old path any more
+	state = {'fail': True}
+	bad = os.path.join(job.monitor, 'big', 'sub')
+	real = os.scandir
+	def scandir(path='.'):
+		if state['fail'] and os.path.abspath(path) == bad and threading.current_thread() is not threading.main_thread():
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return real(path)
+	monkeypatch.setattr(os, 'scandir', scandir)
+	one = session()
+	state['fail'] = False
+	with one.unread():
+		one.run([('mkdir', 'n'), ('mv', 'big', 'n/big')], 'at_once')
+	assert one.take().read_wall_ns is not None
 
 
 def hold_walk(monkeypatch, folder):
