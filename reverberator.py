@@ -3277,7 +3277,11 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			irm.decreaseUserWatches()
 		else:
 			added.add(wd)
-		if found_moved is not None and held_at is not None and held_at.rstrip('/') != folder.rstrip('/'):
+		if held_at is not None and held_at.rstrip('/') == folder.rstrip('/'):
+			# held here already: in newDirWds if a walk of a new folder put it there, and not if that walk found it moved here, as
+			# its move carries it and no copy holds it
+			pass
+		elif found_moved is not None and held_at is not None:
 			found_moved[held_at.rstrip('/')] = folder.rstrip('/')
 		elif newDirWds is not None:
 			newDirWds.add(wd)

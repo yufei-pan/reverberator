@@ -425,6 +425,38 @@ def test_a_folder_renamed_onto_the_place_of_one_moved_in_from_it_and_moved_on_is
 	written_after(one, job, 'x/sub/y')
 
 
+def test_a_folder_found_moved_in_is_not_a_new_folder_when_its_parent_is_walked_again(session, job, monkeypatch):
+	# a/b is made and big moved into it while a is walked: that walk finds big under its old watch, and a's next read, the create of
+	# a/b, walks a/b again. big is carried by its move and nothing copies it, so a write in it, made so that only its event can
+	# show it (inside the file, its mtime set back), must still be recorded
+	one = session({**SEED, 'big/a': 'A' * 4096 + TAIL})
+	new, big = os.path.join(job.monitor, 'a'), os.path.join(job.monitor, 'big')
+	real = rv.iter_tree_entries
+	def walk(path, *args, **kwargs):
+		if path.rstrip('/') == new and os.path.lexists(big):
+			os.mkdir(os.path.join(new, 'b'))
+			os.rename(big, os.path.join(new, 'b', 'big'))
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
+	inodes = inodes_of(job)
+	before = version_view(job)
+	previous = latest_version(job).path
+	os.mkdir(new)
+	one.settle()
+	moved = os.path.join(new, 'b', 'big', 'a')
+	stat = os.lstat(moved)
+	with open(moved, 'r+b') as f:
+		f.seek(100)
+		f.write(b'WRITTEN')
+	os.utime(moved, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+	batch = one.take()
+	assert ('move', 'a/b/big') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	assert ('modify', 'a/b/big/a') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	one.back_up(batch)
+	assert version_view(job) == live_view(job)
+	assert inodes_of(job)['a/b/big/sub/b'] == inodes['big/sub/b']
+
+
 def hold_walk(monkeypatch, folder):
 	'''The watcher stops before it walks folder (at is set then) until go is set.'''
 	real = rv.initializeFolderWatchers
