@@ -64,7 +64,7 @@ Links point to the **next** version, not to the current one. A path that has not
 **Results:**
 - **Writes, work job:** today 2,678–2,711 MiB per cycle; R measured at 24–36 MiB, and 59 MiB on the heaviest ordinary batch (Task 17).
 - **Crash test:** all 249 kill points pass, with every version exact, folder times included.
-- **Code:** planned at about −450 lines in 0.55; measured after the removal, the file is about 1,190 lines longer than at 8a8bcb9, as design R's own code came out larger than the estimate. About −2,400 once the 0.54 reader and scan go, in a later release (§8).
+- **Code:** planned at about −450 lines in 0.55; measured after the removal, the file is about 1,235 lines longer than at 8a8bcb9, as design R's own code came out larger than the estimate. About −2,400 once the 0.54 reader and scan go, in a later release (§8).
 
 ## 1. Vault layout (API change)
 - **Version folders.** Named `V<n>--<ts>/` as today.
@@ -464,11 +464,11 @@ Line counts are measured with `ast` at HEAD 8a8bcb9, inclusive.
   | UnreadablePruneMarker | 2 |
 
 - Also kept: `vault_prune_salt` (90).
-- The migration and CLI reader: `parse_chain_text` 43, `is_prune_temp` 31, `is_previous_version_name` 14, `same_inode` 2.
+- The migration and CLI reader: `parse_chain_text` 43, `is_prune_temp` 32, `is_previous_version_name` 14, `same_inode` 2.
 
 **Shrinks, about −400:**
 - `do_reverb_backup` 688 → about 520;
-- `do_backup` 358 → about 300;
+- `do_backup` 358 → about 300 (it came out at 395, with the flush, the hand-over and the pool steps);
 - VaultManifest 487 → about 430;
 - the read_vault_record / read_copied_record / attribs_to_copy group (126) → about 70;
 - `resolve_version_entry` 70 → about 65;
@@ -490,7 +490,7 @@ Line counts are measured with `ast` at HEAD 8a8bcb9, inclusive.
 | pools (pre-record passes, per-disk repair) | 80 |
 | Keep 1 Complete Backup / 'r' rows | 5 |
 
-**Net:** planned at about −450 lines in 0.55, and about −2,400 once the kept parts go. Measured with `ast` after the removal: 14,943 lines at 8a8bcb9, 16,128 now, +1,185, with 1,336 lines removed in that one step.
+**Net:** planned at about −450 lines in 0.55, and about −2,400 once the kept parts go. Measured with `ast` after the removal: 14,943 lines at 8a8bcb9, 16,178 at the end of the round, +1,235, with 1,336 lines removed in the removal's one step.
 
 **Tests:** 29 files (16,967 lines) touch these parts. The prune tests stay until the later release. The crash harness and the history recheck test become repo tests.
 
