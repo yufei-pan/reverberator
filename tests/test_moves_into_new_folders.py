@@ -53,15 +53,19 @@ class Session:
 		with self.lock:
 			return list(self.queue)
 
+	def settle(self):
+		'''The watcher has read, and handled, everything done so far: a probe's event says so. The probe stays, as an entry of every version.'''
+		probe = os.path.join(self.job.monitor, f'.probe_{time.monotonic_ns()}')
+		open(probe, 'w').close()
+		wait_until(lambda: any(e.event == 'create' and e.path == probe for e in self.events()), message='watcher not ready')
+
 	def take(self):
 		'''
 		The batch of everything done so far, as the backuper takes it once the watcher signals: a probe's event says all before it
 		is read, and a signal after it that the tree went quiet, each move-out held by then expired. The probe stays, as an
 		entry of every version (content_view() leaves it out).
 		'''
-		probe = os.path.join(self.job.monitor, f'.probe_{time.monotonic_ns()}')
-		open(probe, 'w').close()
-		wait_until(lambda: any(e.event == 'create' and e.path == probe for e in self.events()), message='watcher not ready')
+		self.settle()
 		self.flag.clear()
 		wait_until(self.flag.is_set, message='watcher did not signal the backuper')
 		with self.lock:
@@ -376,6 +380,49 @@ def test_what_a_walk_found_ends_with_the_take(session, job, tmp_path):
 	assert sorted((e.event, os.path.relpath(e.path, job.monitor)) for e in batch if e.event in ('move', 'delete')) == [('delete', 'big/sub'), ('delete', 'g.txt')]
 	one.back_up(batch)
 	assert version_view(job) == live_view(job)
+
+
+def written_after(one, job, rel):
+	'''A write in a folder, as a later batch holds it: the folder must still be watched, or no event comes and the version never gets it.'''
+	one.apply(('write', rel, 'after'))
+	one.back_up_next()
+	assert version_view(job) == live_view(job)
+	assert rel in version_view(job)
+
+
+def test_a_folder_moved_out_after_another_took_its_place_is_not_the_one_the_walk_found(session, job):
+	# blue-green: the old release is archived in a new folder, the new one renamed into place, and its subfolder moved out. the walk
+	# of the new folder, before any of it is handled, found the old release and its sub under the watches of 'big' and 'big/sub',
+	# and the sub of the release now at 'big' is another folder that must not be taken for it
+	one = session({**SEED, 'next/sub/c': 'c', 'next/keep': 'k'})
+	before = version_view(job)
+	previous = latest_version(job).path
+	with one.unread():
+		one.run([('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'next', 'big'), ('mv', 'big/sub', 'other/sub')], 'at_once')
+	batch = one.take()
+	assert ('move', 'other/sub') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	one.back_up(batch)
+	assert_held_as_the_tree(job, before, previous)
+	written_after(one, job, 'other/sub/y')
+
+
+def test_a_folder_renamed_onto_the_place_of_one_moved_in_from_it_and_moved_on_is_not_that_one(session, job, tmp_path):
+	# the move-out of big is read before the walk that finds it in n/big: its watches stay under 'big' until its delete expires.
+	# another folder renamed onto big and moved on is not the one the walk found
+	one = session({**SEED, 'next/sub/c': 'c', 'next/keep': 'k'})
+	before = version_view(job)
+	previous = latest_version(job).path
+	os.rename(os.path.join(job.monitor, 'big'), tmp_path / 'big')
+	one.settle()
+	with one.unread():
+		os.mkdir(os.path.join(job.monitor, 'n'))
+		os.rename(tmp_path / 'big', os.path.join(job.monitor, 'n', 'big'))
+		one.run([('mv', 'next', 'big'), ('mv', 'big', 'x')], 'at_once')
+	batch = one.take()
+	assert ('move', 'x') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	one.back_up(batch)
+	assert_held_as_the_tree(job, before, previous)
+	written_after(one, job, 'x/sub/y')
 
 
 def hold_walk(monkeypatch, folder):

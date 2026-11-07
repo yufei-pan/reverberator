@@ -3074,7 +3074,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						continue
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move from event detected for {eventPath}')
-					landed = foundMoved.pop(eventPath,None) if isDir else None
+					# a watch held at this path says the folder leaving it is not the one the walk found: that one's watch went
+					# with it, and this is another folder renamed here since, whose key must not take its move
+					landed = foundMoved.pop(eventPath,None) if isDir and eventPath not in wdDic.inverse and eventPath + '/' not in wdDic.inverse else None
 					if landed is not None:
 						# its move-in may never come, as the new folder had no watch yet ( mkdir n; mv d n/d, faster than the
 						# watcher ). the walk that found it there gave it its watches. queued here, before anything read
