@@ -3282,14 +3282,12 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			if unwatched is not None and not gone:
 				unwatched.add(folder.rstrip('/') or '/')
 			return None
-		held_at = wdDic.get(wd)
-		if held_at is not None:
+		if wd in wdDic:
 			# held already: a folder made while its parent's walk ran is in the walk and raises its create too
 			irm.decreaseUserWatches()
 		else:
 			added.add(wd)
-		if held_at is None and newDirWds is not None:
-			# watched for the first time: this walk's copy holds it
+		if newDirWds is not None:
 			newDirWds.add(wd)
 		wdDic[wd] = folder
 		return wd
