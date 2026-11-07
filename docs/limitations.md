@@ -20,7 +20,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** any local user can read `.reverberator_manifest.sqlite` and the `V<n>--…modified_contents.nsv`
-  change lists in a job vault. Together they list every backed-up file name and its size, the passwords job's included.
+  change lists in a job vault. Together they list every backed-up file name and its size, the names in a job that holds secrets included.
 - **Why:** making them root-only (0600) would leave only root able to run status, history and restore. The user chose to
   keep them readable.
 - **Revisit when:** a vault is shared with users who must not see other jobs' file names.
