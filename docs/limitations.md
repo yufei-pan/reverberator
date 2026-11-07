@@ -164,18 +164,23 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** with a size limit, the estimate made before a backup leaves out the real folders the
   batch makes in the previous version, about 4 KiB for each folder it touches and each folder above them (a chmod of
-  3,030 folders passed a limit by 11.64 MiB on the real daemon), the new version's links and xattr blocks (a few KB),
-  and a change under a folder moved into a new folder (up to that file's size), so a vault can go over its limit by
-  that much until the next prune. With an
+  3,030 folders passed a limit by 11.64 MiB on the real daemon), the version's xattr blocks (a few KB), and a change
+  under a folder moved into a new folder (up to that file's size), so a vault can go over its limit by that much until
+  the next prune. The links a batch makes are in no size record, so neither `status` nor the limit sees their bytes:
+  about 4 KiB each on f2fs, so one file changed in a folder of 5,000 entries took 20.6 MB of disk while the records
+  rose 4 KiB, until that version is pruned. With an
   inode limit, the estimate leaves out the links the hand-over and unfolds make, so a batch can pass the limit by that
   many until the next prune: a folder of 100K entries that changes makes 100K links in that version. The sizes
-  recorded after each backup are measured, each file by its size plus 4 KiB per folder, and each inode in the newest
+  recorded after each backup are counted, each file by its size plus 4 KiB per folder, and each inode in the newest
   version that holds it, so later prunes are right.
-- **Why:** counting them means working out before each batch which folders and parents become real, on every job, for
-  an overshoot that lasts until the next prune.
-- **Revisit when:** a job sits at its limit and its batches touch thousands of folders.
+- **Why:** counting folders means working out before each batch which folders and parents become real, on every job,
+  for an overshoot that lasts until the next prune. A link's bytes differ by filesystem, so counting them needs a
+  figure for each one.
+- **Revisit when:** a job sits at its limit and its batches touch thousands of folders, or a vault's disk fills ahead of
+  its limit.
 - **Approved:** 2026-10-26, "Known limitation (Recommended)"; 2026-11-05, "Extend the entry (Recommended)"; 2026-11-06,
-  "Change the text (Recommended)", for the measured overshoot of the folders.
+  "Change the text (Recommended)", for the measured overshoot of the folders; 2026-11-06, "Correct the text
+  (Recommended)", for the links' bytes.
 
 ### A vault down to its only version can pass its size limit
 
@@ -698,7 +703,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### The root's metadata is written every batch
 
 - **Kind:** deferred.
-- **What the operator sees:** nothing but cost: `record_root_meta` writes the xattr each batch, changed or not, 2
-  lsetxattr. A read and compare would leave it unwritten on nearly every batch.
+- **What the operator sees:** nothing but cost: `record_root_meta` writes the xattr each batch, changed or not. A read
+  and compare would leave that one unwritten on nearly every batch. The second lsetxattr of a batch, `hand_over`'s, gives
+  the new folder its record and stays.
 - **Why:** a lightness item.
 - **Revisit when:** the lightness round after 0.55.1.

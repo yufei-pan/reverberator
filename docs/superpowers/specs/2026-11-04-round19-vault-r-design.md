@@ -64,7 +64,7 @@ Links point to the **next** version, not to the current one. A path that has not
 **Results:**
 - **Writes, work job:** today 2,678–2,711 MiB per cycle; R measured at 24–36 MiB, and 59 MiB on the heaviest ordinary batch (Task 17).
 - **Crash test:** all 249 kill points pass, with every version exact, folder times included.
-- **Code:** planned at about −450 lines in 0.55; measured after the removal, the file is about 1,235 lines longer than at 8a8bcb9, as design R's own code came out larger than the estimate. About −2,400 once the 0.54 reader and scan go, in a later release (§8).
+- **Code:** planned at about −450 lines in 0.55; measured after the removal, the file is about 1,245 lines longer than at 8a8bcb9, as design R's own code came out larger than the estimate. About −2,400 once the 0.54 reader and scan go, in a later release (§8).
 
 ## 1. Vault layout (API change)
 - **Version folders.** Named `V<n>--<ts>/` as today.
@@ -194,7 +194,7 @@ Cost: one inode write per entry of a moved folder, and the same again at its pru
 
 If the manifest names V<N> but the list is missing from its private folder, the scan refuses, as today: a missing disk may be hiding it.
 
-**A commit says its copies are on the disk.** On f2fs a checkpoint keeps a new file's size and not its data. A folder's fsync is always a checkpoint, and a file's is one in the cases the kernel's `need_do_checkpoint()` lists, such as a new file in a new folder or a file with hard links: with no flush, a power cut within the writeback window (about 30 to 45 s) after a commit leaves every copy past the inline size all NUL in the committed version, on every commit, in 0.54 too. So a batch that placed a copy runs `flush_vault_disks()` once, before step 1, as the list's own fsync is a checkpoint; a batch that placed none runs no flush, and neither does one whose comparison's sync came back clean after its last copy, as that sync flushed them. A roll-forward always flushes: the cut batch's rows went with it, so nothing tells which of its copies are on the disk. If this flush's sync fails, the disk is marked and alerted and the attempt fails with nothing committed: the next one rolls forward. A failure a comparison's sync met is not seen here, as the kernel reports it once.
+**A commit says its copies are on the disk.** On f2fs a checkpoint keeps a new file's size and not its data. A folder's fsync is always a checkpoint, and a file's is one in the cases the kernel's `need_do_checkpoint()` lists, such as a new file in a new folder or a file with hard links: with no flush, a power cut within the writeback window (about 30 to 45 s) after a commit leaves every copy past the inline size all NUL in the committed version, on every commit, in 0.54 too. So a batch that placed a copy runs `flush_vault_disks()` once, before step 1, as the list's own fsync is a checkpoint; a batch that placed none and made no record by a copy runs no flush, and neither does one whose comparison's sync came back clean after its last copy, as that sync flushed them. A roll-forward always flushes: the cut batch's rows went with it, so nothing tells which of its copies are on the disk. If this flush's sync fails, the disk is marked and alerted and the attempt fails with nothing committed: the next one rolls forward. A failure a comparison's sync met is not seen here, as the kernel reports it once.
 
 A cut before the flush ends is §3's: the roll-forward copies again every file whose row differs. A copy whose row did not change, an attribute change with Only Sync Attributes off, is judged by size, mtime and its last 64 KiB, so a copy lost to an outside checkpoint that ends in 64 KiB of NUL passes.
 
@@ -490,7 +490,7 @@ Line counts are measured with `ast` at HEAD 8a8bcb9, inclusive.
 | pools (pre-record passes, per-disk repair) | 80 |
 | Keep 1 Complete Backup / 'r' rows | 5 |
 
-**Net:** planned at about −450 lines in 0.55, and about −2,400 once the kept parts go. Measured with `ast` after the removal: 14,943 lines at 8a8bcb9, 16,178 at the end of the round, +1,235, with 1,336 lines removed in the removal's one step.
+**Net:** planned at about −450 lines in 0.55, and about −2,400 once the kept parts go. Measured with `ast` after the removal: 14,943 lines at 8a8bcb9, 16,189 at the end of the round, +1,246, with 1,336 lines removed in the removal's one step.
 
 **Tests:** 29 files (16,967 lines) touch these parts. The prune tests stay until the later release. The crash harness and the history recheck test become repo tests.
 

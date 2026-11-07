@@ -1295,12 +1295,14 @@ COMPARE_THREADS = 32
 # its version's time too ( full_comparison_since() )
 VERIFY_CTIME_MARGIN_SECONDS = 10
 # vault folders known to be real, kept so the many links through one folder look at it once
+# goes with the 0.54 reader
 REAL_VAULT_FOLDERS_KEPT = 16384
 # manifest rows written or read per statement: enough to amortise sqlite calls, little to hold
 MANIFEST_BATCH_SIZE = 10000
 # a copy is written under a name of its own with this suffix, in its destination's folder, until it succeeded
 PARTIAL_COPY_SUFFIX = '.reverberator-partial'
 # the length of the vault's secret for the names pruning links copies under (vault_prune_salt())
+# goes with the 0.54 reader
 PRUNE_SALT_BYTES = 16
 # how long a failed backup waits for its stopped copies before it gives up on them
 COPY_STOP_WAIT_SECONDS = 60
@@ -2108,8 +2110,8 @@ def prepare_change_list(content_file_name:str, rows:list) -> str:
 	'''
 	The slow part of writing a change list: its rows written whole into a private folder of its own in the job vault
 	(mkdtemp(), CHANGE_LIST_FOLDER_PREFIX), under its own name, and fsynced. Returns that file's path, for
-	place_change_list() (or discard_change_list()). A crash leaves the private folder, which the job's next scan removes;
-	an error removes it, and raises.
+	place_change_list() (or discard_change_list()). A crash before the manifest's commit leaves the private folder, which the job's next scan
+	removes; after it the scan places the list (finish_r_commit()). An error removes it, and raises.
 	'''
 	job_vault = os.path.dirname(os.path.abspath(content_file_name))
 	private = tempfile.mkdtemp(prefix=CHANGE_LIST_FOLDER_PREFIX,dir=job_vault)
@@ -5800,8 +5802,8 @@ def do_backup(backup_entries:dict,
 			previous_new_list = change_list_path(previous_entry.path,previous_size,previous_inodes)
 		content_file_content = [entry_row(path,values) for path,values in backup_entries.items()]
 		content_file_content += [entry_row(path,values) for path,values in verified]
-		# commit before the content file: without one the version is removed by the job's vault scan, and a manifest
-		# describing a removed version is listed again from the vault
+		# commit before the content file: with no commit a first version is removed by the job's vault scan, a later one's
+		# tree waits for the roll-forward, and a list naming neither would describe a version the manifest does not hold
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 		# a disk mounted while this backup walked is remembered too
 		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
@@ -6120,12 +6122,14 @@ VaultListing = namedtuple('VaultListing', ['versions', 'change_lists', 'orphans'
 # under way for, by the current_version link, or failing that by the manifest; link, whether a current_version entry is
 # there; manifest, whether a manifest file is there, and recorded, the version folder name it records (None when it
 # records none, or was not read as the link gave the number)
+# goes with the 0.54 reader
 LatestRecord = namedtuple('LatestRecord', ['number', 'link', 'manifest', 'recorded'])
 
 def no_link_error(link:str) -> VaultScanError:
 	# never the daemon's own: it makes the entry by a link's swap alone
 	return VaultScanError(f'{link} is no link, which the daemon\'s own never is: it is left as it is (move it away and the job goes on)')
 
+# goes with the 0.54 reader
 def recorded_latest_version(job_vault_path:str) -> LatestRecord:
 	'''
 	The latest version a commit got under way for, as job_vault_path records it: by the text of its current_version
@@ -6438,6 +6442,7 @@ def undo_cut_off_commit(job_vault_path:str, listing:VaultListing) -> None:
 	except (OSError, sqlite3.Error) as e:
 		raise VaultScanError(f'cannot undo the records of {name}, a commit cut off before its list was placed ({where}): {e}')
 
+# goes with the 0.54 reader
 def forget_manifest_meta(job_vault_path:str, version:bool = True, gone:set = frozenset()) -> None:
 	'''
 	The version job_vault_path's manifest records forgotten (with version), and its matched key when it names one of the
@@ -8266,7 +8271,7 @@ class VaultManifest:
 
 	def __init__(self, job_vault:str):
 		self.path = os.path.join(job_vault, MANIFEST_FILE_NAME)
-		# whether a copy placed in the version being written may not be on the disk yet: finish_copies() sets it, a comparison's
+		# whether a copy placed in the version being written may not be on the disk yet: finish_copies() and a record made by a copy set it, a comparison's
 		# clean sync of the vault and the commit's flush (do_backup()) clear it. a batch commits only copies that are on the disk
 		self.copies_unsynced = False
 		try:
@@ -8470,17 +8475,21 @@ class VaultManifest:
 		'''Record the rename of the previous version's change list, in the transaction of the commit that calls for it.'''
 		self._set_meta_json('previous_list', {'from': old, 'to': new})
 
+	# goes with the 0.54 reader
 	def migrated(self) -> set:
 		'''The names of the version folders the migration from 0.54 has made plain trees.'''
 		return set(self._meta_json('migrated') or ())
 
+	# goes with the 0.54 reader
 	def add_migrated(self, name:str):
 		self._set_meta_json('migrated', sorted(self.migrated() | {name}))
 
+	# goes with the 0.54 reader
 	def version_times(self) -> dict:
 		'''{version folder name: [atime_ns, mtime_ns]} of the version folders as a conversion from 0.54 found them.'''
 		return self._meta_json('version_times') or {}
 
+	# goes with the 0.54 reader
 	def begin_migration(self, times:dict):
 		'''
 		Say a conversion from 0.54 has begun, keeping the versions it did, so no batch runs until it ends (conversion_unfinished()).
@@ -8761,7 +8770,9 @@ def is_version_folder_name(name:str) -> bool:
 # folders only. only those answers are kept, as the daemon alone writes a version's folders and never uses a version
 # folder's name again, while a folder missing or refused now may be a version's real folder later. pruning a version
 # drops its pairs ( forget_real_vault_folders() ), as a link naming it is no chain link from then on
+# goes with the 0.54 reader
 REAL_VAULT_FOLDERS = OrderedDict()
+# goes with the 0.54 reader
 REAL_VAULT_FOLDERS_LOCK = threading.Lock()
 
 # goes with the 0.54 reader
@@ -8918,10 +8929,15 @@ def is_previous_version_name(name:str, version_name:str) -> bool:
 # it may be there later. kept by how many rows they hold in all (a big list's rels cost tens of MB), the least
 # recently used going first, though never the last one kept: a pass holds its own (VaultMoves). VERSION_MOVES_WARNED
 # holds the versions a warning was logged for, as their rows cannot be used
+# goes with the 0.54 reader
 VERSION_MOVES = OrderedDict()
+# goes with the 0.54 reader
 VERSION_MOVES_WARNED = OrderedDict()
+# goes with the 0.54 reader
 VERSION_MOVES_ROWS_KEPT = 200000
+# goes with the 0.54 reader
 VERSION_MOVES_KEPT = 1024
+# goes with the 0.54 reader
 VERSION_MOVES_LOCK = threading.Lock()
 
 # goes with the 0.54 reader
@@ -8986,6 +9002,7 @@ def recorded_monitor_paths(job_vault:str):
 	'''
 	return read_recorded_monitor_paths(job_vault)[0]
 
+# goes with the 0.54 reader
 def read_command_layout(job_vault:str, timeout:float) -> tuple:
 	'''
 	(layout, state) as a command reads the manifest of job_vault, read-only and waiting up to timeout seconds for a lock.
@@ -9676,19 +9693,6 @@ class VaultMoves:
 		'''Drop what is held for version (as of() takes it), once the pass will not ask for it again.'''
 		with self._lock:
 			self._held.pop(os.path.abspath(getattr(version, 'path', version)), None)
-
-	def holding(self, path:str) -> 'VersionMoves | None':
-		'''The moves of the version folder of job_vault that holds path, None when no folder of job_vault does.'''
-		path = os.path.abspath(path)
-		if not path.startswith(self.job_vault + '/'):
-			return None
-		return self.of(os.path.join(self.job_vault, path[len(self.job_vault) + 1:].partition('/')[0]))
-
-	def hop(self, link_path:str, link_text:str) -> 'str | None':
-		'''vault_chain_hop() of the link at link_path with link_text, by the moves of the version holding it.'''
-		# an absolute link, or one outside the vault, is never a chain link: no rows to read for it
-		moves = None if os.path.isabs(link_text) else self.holding(link_path)
-		return None if moves is None else vault_chain_hop(self.job_vault, link_path, link_text, moves)
 
 def same_contents(source_path:str, path:str) -> bool:
 	'''
@@ -10874,8 +10878,10 @@ class BackupLocks:
 
 # job name -> when the FAILED marker saying decrement_stepper() cannot remove its oldest version is next due, by the
 # clock it is given, while it cannot. each job's backuper alone sets its own key
+# goes with the 0.54 reader
 PRUNE_ABORTED = {}
 # the jobs decrement_stepper() has warned that it names its temps without the vault's secret
+# goes with the 0.54 reader
 PRUNE_SALT_MISSING = set()
 
 def version_change_list(job_vault:str, entry:VaultEntry) -> 'str | None':
@@ -10994,6 +11000,7 @@ PRUNE_SALT_TEMP_INFIX = '.tmp-'
 # {"walking": null}. made once (with a flush of the job vault folder) and kept, as a name made and removed per prune would
 # need a folder flush each time; written in place and fsynced. A prune that finds it naming its oldest version, or
 # cannot read it, was cut off before its flush, and checks the oldest version against the next (decrement_stepper())
+# goes with the 0.54 reader
 PRUNE_MARKER_FILE_NAME = '.reverberator_pruning'
 
 # goes with the 0.54 reader
@@ -12180,9 +12187,12 @@ class NotRenamed(Exception):
 STAGING_NAME = '.reverberator_staging'
 # in staging, on two renames: a hand-over's skeleton, skel-<the version it will stand for>, and a conversion's tree and the tree it replaces
 SKELETON_PREFIX = 'skel-'
+# goes with the 0.54 reader
 CONVERTED_NAME = 'm'
+# goes with the 0.54 reader
 REPLACED_NAME = 'old'
 # the converted tree once the tree it replaces has left the version on every disk: its name says so to the scan
+# goes with the 0.54 reader
 READY_NAME = 'n'
 # renameat2(2): the folder a relative path starts from, and the flag that swaps two names in one call
 AT_FDCWD = -100
@@ -13050,7 +13060,8 @@ def remove_054_files(job_vault:str) -> None:
 		except OSError as e:
 			backuperTeeLogToTl(job_vault, f'Cannot remove {name} for now: {e}', error=True)
 
-# goes with the 0.54 reader
+# goes with the 0.54 reader: a lost manifest then needs its layout set another way, and vault_layout(), layout_known(),
+# recorded_layout(), scan_gets_r_rules(), conversion_unfinished() and do_backup()'s two guards change with it
 def migrate_job_vault(job_vault:str, manifest:'VaultManifest', job_name:str, stop = None) -> bool:
 	'''
 	Convert job_vault from 0.54 (spec section 7), the 0.54 rules or the R scan having run, under the job's locks. Each version
