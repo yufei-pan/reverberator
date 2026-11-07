@@ -164,9 +164,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** with a size limit, the estimate made before a backup leaves out the real folders the
   batch makes in the previous version, about 4 KiB for each folder it touches and each folder above them (a chmod of
-  3,030 folders passed a limit by 11.64 MiB on the real daemon), the version's xattr blocks (a few KB), and a change
-  under a folder moved into a new folder (up to that file's size), so a vault can go over its limit by that much until
-  the next prune. The links a batch makes are in no size record, so neither `status` nor the limit sees their bytes:
+  3,030 folders passed a limit by 11.64 MiB on the real daemon) and the version's xattr blocks (a few KB), so a vault can
+  go over its limit by that much until the next prune. The links a batch makes are in no size record, so neither `status` nor the limit sees their bytes:
   about 4 KiB each on f2fs, so one file changed in a folder of 5,000 entries took 20.6 MB of disk while the records
   rose 4 KiB, until that version is pruned. With an
   inode limit, the estimate leaves out the links the hand-over and unfolds make, so a batch can pass the limit by that
