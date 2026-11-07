@@ -2896,8 +2896,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 		'''
 		move_out = None if cookie is None else pendingMoveFromEvents.get(cookie)
 		landed = wdDic.get(wd,'').rstrip('/')
-		# a watch held at the old path says the folder leaving it is another one: the found folder's watch is at its new path
-		if move_out is None or not move_out.is_dir or move_out.path.rstrip('/') != old_path or not landed or landed == old_path or old_path in wdDic.inverse or old_path + '/' in wdDic.inverse:
+		# cookie is only ever a folder's move-out. a watch held at the old path says the folder leaving it is another one, as the walk
+		# put the found folder's watch at its new path. for another folder's move-out to come right before this MOVE_SELF, the found
+		# folder's own would have to be missing, its old parent unwatched: no order of real events builds that, and this keeps it a copy
+		if move_out is None or move_out.path.rstrip('/') != old_path or not landed or old_path in wdDic.inverse or old_path + '/' in wdDic.inverse:
 			return
 		cookieDic.pop(cookie,None)
 		pop_pending_move_from(cookie)
