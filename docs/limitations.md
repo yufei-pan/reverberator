@@ -730,3 +730,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** it needs the queue to overflow, and the fix is a walk of the tree at an overflow, which belongs with the next
   change to the watcher.
 - **Revisit when:** the next round that changes the watcher.
+
+### A flat bulk write into a folder a move landed in is recorded event by event
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost: after `mkdir new; mv big new/big`, a write of a million files straight
+  into `new` in the same quiet time queues three million events, and the batch's collapse takes about 17 s and 800 MiB,
+  where 0.55 queued four. It costs what such a write into any existing folder costs, on both versions; only the landing
+  folder's own level pays, as folders made in it later are still held by their copy.
+- **Why:** the landing folder leaves the set of new folders so that its move is recorded with what happens to it after.
+- **Revisit when:** the lightness round after 0.55.1: a landing folder could keep discarding the file events its copy
+  holds and record only its moves.
+
