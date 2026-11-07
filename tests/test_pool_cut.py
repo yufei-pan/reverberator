@@ -973,7 +973,26 @@ SHAPES = {'mixed-2': (MixedBatch, 2), 'mixed-3': (MixedBatch, 3), 'mixed-2-only-
 FORCED = {'forced-conversion-2': (ForcedConversion, 2)}
 
 
+def refuse_under_xdist(environ=os.environ) -> None:
+	'''
+	The gate's workers share <scratch>/pool-cut and <scratch>/pool-cut/work/<shape>-<n>, and every run_all() ends in an rmtree of the latter, so two pytest
+	workers delete each other's images and fail a correct tree. It also fills the machine and the scratch folder's limit by itself. Never skipped: a skipped gate reads as a passed one.
+	'''
+	if environ.get('PYTEST_XDIST_WORKER'):
+		pytest.fail('the pool cut gate must run without -n: its own workers fill the machine, and two pytest workers would share (and delete) its scratch folders. '
+			'Run it alone: pytest -p no:cacheprovider tests/test_pool_cut.py', pytrace=False)
+
+
+def test_the_gate_fails_under_xdist_and_runs_alone_otherwise(monkeypatch):
+	monkeypatch.setenv('PYTEST_XDIST_WORKER', 'gw0')
+	with pytest.raises(pytest.fail.Exception, match='must run without -n'):
+		refuse_under_xdist()
+	monkeypatch.delenv('PYTEST_XDIST_WORKER')
+	assert refuse_under_xdist() is None
+
+
 def built_shape(name: str, request) -> Shape:
+	refuse_under_xdist()
 	kind, *arguments = {**SHAPES, **FORCED}[name]
 	made = kind(*arguments)
 	os.makedirs(made.base, exist_ok=True)
