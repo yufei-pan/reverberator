@@ -3260,8 +3260,7 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	what unwatched held there before goes first ( a folder made again, or a disk mounted again, is watched in full ).
 	A folder whose watch is held at another path has moved here, as only the inode has that watch: it goes into found_moved
 	when given (its watch -> the old path, with no trailing /), and not into newDirWds, as nothing says this walk's copy holds it.
-	Every other folder the walk watches for the first time goes into newDirWds when given; one held at its own path already stays
-	as it is, in newDirWds if an earlier walk put it there and not if that walk found it moved.
+	Only a folder the walk watches for the first time goes into newDirWds when given; one held already stays as it is.
 	'''
 	if not os.path.exists(monitor_path):
 		return -1
@@ -3290,14 +3289,15 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			irm.decreaseUserWatches()
 		else:
 			added.add(wd)
-		if held_at is not None and held_at.rstrip('/') == folder.rstrip('/'):
-			# held here already: in newDirWds if a walk of a new folder put it there, and not if that walk found it moved here, as
-			# its move carries it and no copy holds it
-			pass
-		elif found_moved is not None and held_at is not None:
+		if held_at is None:
+			# watched for the first time: this walk's copy holds it
+			if newDirWds is not None:
+				newDirWds.add(wd)
+		elif found_moved is not None and held_at.rstrip('/') != folder.rstrip('/'):
 			found_moved[wd] = held_at.rstrip('/')
-		elif newDirWds is not None:
-			newDirWds.add(wd)
+		# a folder held already is left as it is: at its own path, in newDirWds if a walk of a new folder put it there, and not if
+		# that walk found it moved here; at another path, it moved here, and its move carries it ( found, or its own MOVED_TO ) or a
+		# copy holds it with its events recorded, which costs nothing
 		wdDic[wd] = folder
 		return wd
 	watcherTeeLogToTl(monitor_path,f'Adding watch for {monitor_path}')

@@ -602,6 +602,47 @@ def test_a_folder_found_moved_in_is_not_a_new_folder_when_its_parent_is_walked_a
 	assert inodes_of(job)['a/b/big/sub/b'] == inodes['big/sub/b']
 
 
+@pytest.mark.parametrize('into', ['m/big', 'm/s/big'])
+def test_a_folder_moved_into_a_folder_from_outside_while_it_is_walked_keeps_its_events(session, job, tmp_path, monkeypatch, into):
+	# mv /out/d m; mv big m/big, the second after the watch of m (or m/s) and before m is listed: the walk of a move-in with no known
+	# source finds big under its old watch, and the move's own events carry big as a move. nothing copies it, so a write in it made
+	# so that only its event can show it (inside the file, its mtime set back) must be recorded
+	one = session({**SEED, 'big/a': 'A' * 4096 + TAIL})
+	outside = tmp_path / 'd'
+	os.makedirs(outside / 's')
+	(outside / 'x').write_text('x')
+	m, big = os.path.join(job.monitor, 'm'), os.path.join(job.monitor, 'big')
+	landing = os.path.dirname(os.path.join(job.monitor, into))
+	real = rv.iter_tree_entries
+	def walk(path, *args, **kwargs):
+		if path.rstrip('/') == m and os.path.lexists(big):
+			if landing == m:
+				os.rename(big, os.path.join(job.monitor, into))
+				return real(path, *args, **kwargs)
+			return rename_at(landing, real(path, *args, **kwargs))
+		return real(path, *args, **kwargs)
+	def rename_at(folder, entries):
+		# the watch of m/s is added as the walk reaches it, and the rename lands right after, before m/s is listed
+		for entry in entries:
+			yield entry
+			if entry[0].rstrip('/') == folder and os.path.lexists(big):
+				os.rename(big, os.path.join(job.monitor, into))
+	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
+	os.rename(outside, m)
+	one.settle()
+	monkeypatch.setattr(rv, 'iter_tree_entries', real)
+	moved = os.path.join(job.monitor, into, 'a')
+	stat = os.lstat(moved)
+	with open(moved, 'r+b') as f:
+		f.seek(100)
+		f.write(b'WRITTEN')
+	os.utime(moved, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+	batch = one.take()
+	assert ('move', into) in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	one.back_up(batch)
+	assert version_view(job) == live_view(job)
+
+
 def test_a_folder_moved_into_a_new_folder_made_after_its_parents_walk_listed_it_is_a_move(session, job, monkeypatch):
 	# mkdir -p p/q; mv big p/q/big, with p walked before q exists: q's create is read after that walk, and q's own walk, in the
 	# discard of a folder p's copy holds, is the one that finds big under its old watch
