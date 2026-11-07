@@ -2878,10 +2878,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	# the folders of newDirWDs whose discarded events were logged: one line per folder until a take clears both, as one
 	# busy new folder (a test run's traces) wrote hundreds of thousands of lines
 	discardLoggedWDs = set()
-	# the paths in those folders that a move landed on: the folder's copy leaves them to their moves, so their events are
-	# recorded as any other's, and one that went again costs a kept duplicate. what is below a moved-in folder needs no
-	# entry here: its watches are not in newDirWDs
-	movedInPaths = set()
 	# the folders a new folder's walk found there under a watch held at another path (old path -> new path): moved before
 	# the new folder had a watch, so no MOVED_TO may come, and only the watch tells where they went
 	foundMoved = {}
@@ -2936,7 +2932,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				# may come after the copy passed its entry, and is kept (a kept duplicate costs nothing)
 				newDirWDs.clear()
 				discardLoggedWDs.clear()
-				movedInPaths.clear()
 				foundMoved.clear()
 				pairedCookies.clear()
 				lastProcessTime = time.monotonic()
@@ -3027,7 +3022,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				skipped = skip_list is not None and skip_list.skips_path(eventPath,isDir)
 				# a batch's copy of a new folder holds what is in it, but for the moves of the batch into it, which arrive by
 				# those moves ( mkdir n; mv d n/d ): the version holds them already, and the copy leaves them out
-				if event.wd in newDirWDs and eventPath not in movedInPaths and not (event.mask & flags.MOVED_TO and event.cookie in cookieDic):
+				if event.wd in newDirWDs and not (event.mask & flags.MOVED_TO and event.cookie in cookieDic):
 					if event.wd not in discardLoggedWDs:
 						discardLoggedWDs.add(event.wd)
 						watcherTeeLogToTl(monitor_path,f'Discarding events for new recursive folder {wdDic[event.wd]} until its copy runs')
@@ -3083,7 +3078,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# after this event in the folder; any watch still at the old path is one the skip list left out there
 						pairedCookies.add(event.cookie)
 						queue_pending_move_from_at(landed,monTime)
-						movedInPaths.add(landed)
+						# the folder it landed in is no new folder to the copy any more: what happens there after is recorded, as it
+						# is in any folder, and one that goes again ( a chain ) is a move and not a copy
+						for parent in (os.path.dirname(landed),os.path.dirname(landed) + '/'):
+							newDirWDs.difference_update(wdDic.inverse.get(parent,()))
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,True,'move',landed,eventPath))
 						remove_watches_under(inotify_obj,wdDic,irm,eventPath)
 						forget_unwatched_under(unwatched,eventPath)
@@ -3124,8 +3122,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# what moved away from the destination is gone before the move lands on its name, or its late
 						# delete would remove the moved-in entry
 						queue_pending_move_from_at(eventPath,monTime)
-						if event.wd in newDirWDs:
-							movedInPaths.add(eventPath)
+						# the same for a move read as such: the folder it landed in is recorded from here
+						newDirWDs.discard(event.wd)
 						# a take waits for the move and its walk: between them it would copy the folder before its watches are in
 						# place (mkdir d; mv d e), so a file written then raises no event, and with the move queued after the walk it
 						# would hold the folder's changes without their move, and its comparison would drop them as gone
@@ -3249,6 +3247,8 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	what unwatched held there before goes first ( a folder made again, or a disk mounted again, is watched in full ).
 	A folder whose watch is held at another path has moved here, as only the inode has that watch: it goes into found_moved
 	when given (old path -> this path, both with no trailing /), and not into newDirWds, as nothing says this walk's copy holds it.
+	Every other folder the walk watches for the first time goes into newDirWds when given; one held at its own path already stays
+	as it is, in newDirWds if an earlier walk put it there and not if that walk found it moved.
 	'''
 	if not os.path.exists(monitor_path):
 		return -1
