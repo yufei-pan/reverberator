@@ -1201,9 +1201,6 @@ ARG_MAX = os.sysconf('SC_ARG_MAX')
 ARGUMENT_LIMIT = (ARG_MAX - 4096) // 2048
 
 COOKIE_DICT_MAX_SIZE = 16384
-# the most file names a job's watcher keeps from the walks of new folders until a take: a folder just made holds few, and
-# a walk can also meet a whole tree moved in from outside, of millions
-FOUND_FILES_MAX = 16384
 # queued change events are kept zlib compressed in blocks of this many, about 15 bytes an event instead of about 210
 QUEUE_BLOCK_EVENTS = 4096
 QUEUED_EVENT_BYTES = 210
@@ -2876,13 +2873,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 		if cookie_value is not None:
 			# gone before its delete is queued
 			forget_moved_away(cookie_value)
-		change_event = pop_pending_move_from(cookie)
-		landed = None if change_event.is_dir else foundFiles.pop(os.path.basename(change_event.path),None)
-		if landed is not None:
-			# no pair came, and a new folder's walk found a file of its name: most likely this one, moved before the folder had a
-			# watch. a file has no watch to tell it by, but a wrong guess costs nothing: the comparison reads a moved file back
-			change_event = ChangeEvent(change_event.monotonic_time,False,'move',landed,change_event.path)
-		append_change_event(to_process, to_process_lock, change_event)
+		append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	newDirWDs = set()
 	# the folders of newDirWDs whose discarded events were logged: one line per folder until a take clears both, as one
 	# busy new folder (a test run's traces) wrote hundreds of thousands of lines
@@ -2896,8 +2887,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	foundMoved = {}
 	# the cookies of the move-outs paired through foundMoved, whose MOVED_TO, if one comes, has nothing left to say
 	pairedCookies = set()
-	# the files such a walk found (name -> path), up to FOUND_FILES_MAX: a file has no watch, so its name is all that tells it
-	foundFiles = {}
 	# the folders that exist and that this watcher should watch but does not (unreadable, or their watch failed): no event
 	# reports a change in them, so while it holds one, for its whole life, it publishes no read time
 	unwatched = set()
@@ -2950,7 +2939,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				movedInPaths.clear()
 				foundMoved.clear()
 				pairedCookies.clear()
-				foundFiles.clear()
 				lastProcessTime = time.monotonic()
 			with mount_table_lock:
 				mount_table, latest_mount_table[0] = latest_mount_table[0], None
@@ -3047,7 +3035,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# the recursive copy holds this folder, but it still needs watches for later changes,
 						# and a folder moved in from a place whose events were discarded keeps its watches under its old
 						# path until they are added again here
-						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found_moved=foundMoved,found_files=foundFiles)
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found_moved=foundMoved)
 						# a take since this read: its copy may have passed this folder before the watch above, so the next batch compares it
 						with to_process_lock:
 							if to_process.takes != seen_takes:
@@ -3065,7 +3053,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						watcherTeeLogToTl(monitor_path,f'Create event detected for {eventPath}')
 					queue_pending_move_from_at(eventPath,monTime)
 					if isDir:
-						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found_moved=foundMoved,found_files=foundFiles)
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found_moved=foundMoved)
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.DELETE:
 					if DEBUG:
@@ -3175,7 +3163,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							watcherTeeLogToTl(monitor_path,f'Treating move as create event for {eventPath}')
 						queue_pending_move_from_at(eventPath,monTime)
 						if isDir:
-							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found_moved=foundMoved,found_files=foundFiles)
+							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found_moved=foundMoved)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.MODIFY:
 					if DEBUG:
@@ -3247,7 +3235,7 @@ class bidict(dict):
 			del self.inverse[self[key]]
 		super(bidict, self).__delitem__(key)
 
-def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None,found_moved:dict = None,found_files:dict = None):
+def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None,found_moved:dict = None):
 	'''
 	Watch monitor_path and every folder under it that the skip list keeps; returns monitor_path's watch, or -1 without one.
 	Each folder's watch is added as the walk reaches it, before the walk reads the folder: a folder made in it afterwards
@@ -3259,7 +3247,6 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	what unwatched held there before goes first ( a folder made again, or a disk mounted again, is watched in full ).
 	A folder whose watch is held at another path has moved here, as only the inode has that watch: it goes into found_moved
 	when given (old path -> this path, both with no trailing /), and not into newDirWds, as nothing says this walk's copy holds it.
-	Each file found goes into found_files when given (name -> path, the first of a name), up to FOUND_FILES_MAX.
 	'''
 	if not os.path.exists(monitor_path):
 		return -1
@@ -3306,8 +3293,6 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			wd = watch(folder)
 			if wd is not None:
 				watched[folder.rstrip('/')] = wd
-		elif found_files is not None and len(found_files) < FOUND_FILES_MAX:
-			found_files.setdefault(os.path.basename(folder),folder)
 	for rel, error in errors:
 		folder = unreadable_path(monitor_path, rel[len(rel_base):])
 		if unwatched is not None and getattr(error,'errno',None) not in (errno.ENOENT, errno.ENOTDIR):

@@ -205,11 +205,11 @@ def test_a_folder_moved_keeps_its_inodes_and_the_vault_grows_by_no_copy(session,
 
 
 # name, steps, what keeps its inode (old rel -> new rel), and whether that holds with the moves done as fast as they go or before
-# the watcher reads: a second rename then may have no event either, and a file moved in under another name has nothing to tell
-# it by, so the entry is copied
+# the watcher reads: a file moved in then has no watch to tell it by and a second rename may have no event either, so the entry
+# is copied (a folder has its watch, which says where it went)
 SHAPES = [
 	('folder', [('mkdir', 'n'), ('mv', 'big', 'n/big')], {'big/a': 'n/big/a', 'big/sub/b': 'n/big/sub/b'}, True),
-	('file', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt')], {'f.txt': 'n/f.txt'}, True),
+	('file', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt')], {'f.txt': 'n/f.txt'}, False),
 	('file_renamed', [('mkdir', 'n'), ('mv', 'f.txt', 'n/renamed')], {'f.txt': 'n/renamed'}, False),
 	('nested', [('mkdir', 'p/q/r'), ('mv', 'big', 'p/q/r/big')], {'big/a': 'p/q/r/big/a'}, True),
 	('folder_written_in', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('write', 'n/big/z', 'z'), ('append', 'n/big/a', 'more')], {'big/sub/b': 'n/big/sub/b'}, True),
@@ -305,32 +305,45 @@ def test_a_move_in_that_the_walk_saw_and_whose_event_comes_is_one_move(session, 
 	assert inodes_of(job)['n/big/a'] == inodes['big/a']
 
 
-def test_a_file_that_only_shares_its_name_with_a_file_moved_away_is_right(session, job, tmp_path):
-	# the watcher takes it for the file moved in, the replay renames the old one there, and the comparison copies the new one
-	one = session()
+TAIL = 'T' * 70000
+
+
+@pytest.mark.parametrize('only_sync_attributes', [True, False], ids=['osa', 'no_osa'])
+def test_a_file_moved_out_is_not_taken_for_a_new_folders_file_of_its_name(session, job, tmp_path, only_sync_attributes):
+	# same name, size, mtime and last 64 KiB, other bytes before: no comparison tells them apart, so the version must get the new file's
+	# bytes from a copy, not from the old file by a guess of the name ( mkdir stage; cp -p fw.img stage; mv fw.img /archive )
+	one = session({**SEED, 'f.bin': 'A' * 4096 + TAIL}, only_sync_attributes=only_sync_attributes)
 	before = version_view(job)
 	previous = latest_version(job).path
+	old = os.path.join(job.monitor, 'f.bin')
+	stat = os.lstat(old)
 	with one.unread():
-		os.rename(os.path.join(job.monitor, 'f.txt'), tmp_path / 'f.txt')
+		os.rename(old, tmp_path / 'f.bin')
 		os.mkdir(os.path.join(job.monitor, 'n'))
-		open(os.path.join(job.monitor, 'n', 'f.txt'), 'w').write('another file')
+		new = os.path.join(job.monitor, 'n', 'f.bin')
+		with open(new, 'w') as f:
+			f.write('B' * 4096 + TAIL)
+		os.utime(new, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 	one.back_up_next()
 	assert_held_as_the_tree(job, before, previous)
 
 
-def test_a_file_of_a_new_folder_does_not_take_the_move_of_a_file_of_its_name(session, job):
-	# the pair of a.txt's move comes: the name found in the new folder says nothing of it
-	one = session({**SEED, 'a.txt': 'a'})
-	before = version_view(job)
-	previous = latest_version(job).path
+@pytest.mark.parametrize('where', ['file_moved_in_at_gap_0', 'folder_moved_in_at_gap_0'])
+def test_a_write_with_its_mtime_set_back_in_a_moved_in_file_is_in_a_version(session, job, where):
+	# nothing tells a comparison of this write but the event, so what holds the file must be a copy made after it
+	one = session({**SEED, 'f.bin': 'A' * 4096 + TAIL, 'd/f.bin': 'A' * 4096 + TAIL})
+	rel = 'n/f.bin' if where == 'file_moved_in_at_gap_0' else 'n/d/f.bin'
 	with one.unread():
 		os.mkdir(os.path.join(job.monitor, 'n'))
-		open(os.path.join(job.monitor, 'n', 'a.txt'), 'w').write('new')
-		os.rename(os.path.join(job.monitor, 'a.txt'), os.path.join(job.monitor, 'other', 'a.txt'))
-	batch = one.take()
-	assert ('move', 'other/a.txt') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
-	one.back_up(batch)
-	assert_held_as_the_tree(job, before, previous)
+		os.rename(os.path.join(job.monitor, 'f.bin' if where == 'file_moved_in_at_gap_0' else 'd'), os.path.join(job.monitor, rel if where == 'file_moved_in_at_gap_0' else 'n/d'))
+	path = os.path.join(job.monitor, rel)
+	stat = os.lstat(path)
+	with open(path, 'r+b') as f:
+		f.seek(100)
+		f.write(b'WRITTEN')
+	os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+	one.back_up_next()
+	assert version_view(job)[rel][1] == live_view(job)[rel][1]
 
 
 def test_events_in_a_folder_the_walk_found_moved_in_are_recorded(session, job):
@@ -346,7 +359,7 @@ def test_events_in_a_folder_the_walk_found_moved_in_are_recorded(session, job):
 
 
 def test_what_a_walk_found_ends_with_the_take(session, job, tmp_path):
-	# a found subfolder has no move-out of its own, and a found file none here: left over, they would take a later move-out at those paths
+	# a found subfolder has no move-out of its own here: left over, it would take a later move-out at that path
 	one = session()
 	with one.unread():
 		one.apply(('mkdir', 'n'))
@@ -561,7 +574,10 @@ def test_on_a_filesystem_with_no_exchange(session, job, monkeypatch, timing):
 	one.back_up_next()
 	assert_held_as_the_tree(job, before, previous)
 	after = inodes_of(job)
-	assert (after['n/big/a'], after['n/f.txt']) == (inodes['big/a'], inodes['f.txt'])
+	assert after['n/big/a'] == inodes['big/a']
+	# a file moved in before the watcher reached the folder is copied
+	if timing == 'apart':
+		assert after['n/f.txt'] == inodes['f.txt']
 	assert tried
 
 
