@@ -732,6 +732,48 @@ def test_a_folder_found_moved_in_is_moved_on_in_a_later_read(session, job, monke
 	assert inodes_of(job)['n2/big/a'] == inodes['big/a']
 
 
+def test_a_folder_found_moved_into_a_subfolder_of_a_walk_is_moved_on_as_a_move(session, job):
+	# mkdir -p p/q; mv big p/q/big before the watcher reads any: p's walk watches q as p/q/ and finds big there. q is no new folder
+	# to the discard once big landed in it, so big moved on in the same batch is a move and not a copy
+	one = session({**SEED, **{f'big/f{i}': f'{i}' * 100000 for i in range(4)}})
+	inodes = inodes_of(job)
+	before = version_view(job)
+	previous = latest_version(job).path
+	one.run([('mkdir', 'p/q'), ('mv', 'big', 'p/q/big')], 'unread')
+	one.settle()
+	size = vault_bytes(job)
+	one.apply(('mv', 'p/q/big', 'other/big'))
+	batch = one.take()
+	assert ('move', 'other/big') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	one.back_up(batch)
+	assert_held_as_the_tree(job, before, previous)
+	assert inodes_of(job)['other/big/f0'] == inodes['big/f0']
+	# 400 KB would be a copy
+	assert vault_bytes(job) - size < 200000
+
+
+def test_a_folder_moved_into_a_folder_from_outside_before_its_subfolder_is_listed_is_copied(session, job, tmp_path, monkeypatch):
+	# mv /out/d m; mv big m/s/big, the second after m is listed and before m/s is watched: the walk of a move-in with no known source finds
+	# big under its old watch and records nothing, so big is copied with m, as on 0.55, and its move-out is its delete
+	one = session()
+	outside = tmp_path / 'd'
+	os.makedirs(outside / 's')
+	m, big = os.path.join(job.monitor, 'm'), os.path.join(job.monitor, 'big')
+	real = rv.iter_tree_entries
+	def walk(path, *args, **kwargs):
+		for entry in real(path, *args, **kwargs):
+			if path.rstrip('/') == m and entry[0].rstrip('/') == os.path.join(m, 's') and os.path.lexists(big):
+				os.rename(big, os.path.join(m, 's', 'big'))
+			yield entry
+	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
+	os.rename(outside, m)
+	batch = one.take()
+	assert not [e for e in batch if e.event == 'move']
+	one.back_up(batch)
+	assert version_view(job) == live_view(job)
+	written_after(one, job, 'm/s/big/after')
+
+
 def test_a_move_out_waiting_at_the_place_a_folder_is_found_moved_to_is_its_delete_first(session, job, tmp_path):
 	# n/big leaves the tree and n is renamed away, a new n is made and big moved into it, before the watcher reads any: the move-out
 	# of the old n/big waits for a pair, and its delete, expiring after the move landed on that name, would remove the moved-in folder
