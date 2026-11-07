@@ -703,8 +703,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** a folder or file moved into a folder made in the same batch, before the watcher has
   reached that folder or while it is still listing it, is copied again with no line in the log, though the vault already
-  holds it. Under a size limit that copy can prune older versions. A shell's `mkdir n; mv f n/` lost that race 3 times
-  in 2,400; a program making the folder and renaming into it back to back loses it about 97% of the time, and for a
+  holds it. Under a size limit that copy can prune older versions. A shell's `mkdir n; mv f n/` was copied 3 times in
+  2,400; a program making the folder and renaming into it back to back is copied about 97% of the time, and for a
   100 MB folder that cost 102 MB on the real daemon, where a gap of 0.2 s cost 0.04 MB. One moved in after the watcher
   has reached the new folder is a move and costs no copy.
 - **Why:** a file has no watch, so only its name would say it is the same file, and pairing by name left a version
@@ -714,6 +714,30 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   A miss costs one copy of what moved, as every version before this one paid.
 - **Revisit when:** size limits start pruning because of it, or rows come to hold the monitored inode for another reason.
 - **Approved:** 2026-11-06, "Accept (Recommended)" for files; widened to folders 2026-11-07, "Widen it (Recommended)".
+
+### A folder renamed twice into a folder whose move is being walked can keep old bytes
+
+- **Kind:** deferred.
+- **What the operator sees:** a change that keeps a file's size and mtime (`cp -p` of a same-size file), then its folder
+  moved into a folder whose own move the watcher is still walking, and renamed again in it after the walk listed the first
+  name (`mv other o2; mv big o2/x; mv o2/x o2/big`), can leave the version holding the file's old bytes for good, with no
+  line in the log; a restart's comparison does not see it. Seen in forced orders of events only, 225 of 1,365 on 0.55 and
+  0.55.1 alike, and never on the real daemon in 8 tries: the second rename has to land while the walk of a big folder has
+  not yet passed the first name.
+- **Why:** older than 0.55.1, which also reaches it in an old folder moved into a new one (2 of 1,200 forced orders). The
+  fix, a folder move whose watch a walk re-pointed before its move-out was read is copied wherever it lands, changes what
+  is recorded for a folder that never had a watch, so it needs its own design and gates.
+- **Revisit when:** the round after 0.55.1 that changes the watcher.
+
+### A folder moved out of the tree from a new folder keeps its watch
+
+- **Kind:** deferred.
+- **What the operator sees:** no wrong version. After `mkdir n; mkdir n/x; mv n/x /elsewhere/x` in one batch, the watch of
+  `/elsewhere/x` stays mapped at `n/x` for as long as that folder exists, so changes there come as deletes, moves and writes
+  under `n/x` that cost extra work, and the check after the batch puts the version right. Older than 0.55.1.
+- **Why:** the folder's move-out comes on the watch of a new folder and is discarded, so no expiry removes its watches. The
+  fix belongs in that discard branch, with a check of the watch map at the end of the watcher's schedule tests.
+- **Revisit when:** the round after 0.55.1 that changes the watcher, with the event queue overflow's unwatched folder.
 
 ### A size record too low after a rename falls back to a copy
 
