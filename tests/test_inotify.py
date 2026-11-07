@@ -580,7 +580,7 @@ def test_an_unreadable_folder_gives_its_watch_back_and_is_left_unwatched(tmp_pat
 	root, k, u = str(tmp_path), str(tmp_path / 'k'), str(tmp_path / 'u')
 	_fail_scandir(monkeypatch, u)
 	irm = rv.inotify_resource_manager()
-	wdDic, unwatched = rv.bidict(), set()
+	wdDic, unwatched = {}, set()
 	with rv.inotify_simple.INotify() as inotify_obj:
 		assert rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched) != -1
 		# nothing can be told about what is in u: neither it nor v is watched
@@ -605,7 +605,7 @@ def test_a_folder_whose_watch_fails_is_left_unwatched_unless_it_is_gone(tmp_path
 		def rm_watch(self, wd):
 			return self.inner.rm_watch(wd)
 	irm = rv.inotify_resource_manager()
-	wdDic, unwatched = rv.bidict(), set()
+	wdDic, unwatched = {}, set()
 	with rv.inotify_simple.INotify() as inotify_obj:
 		rv.initializeFolderWatchers(Failing(inotify_obj), root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
 		assert f not in {path.rstrip('/') for path in wdDic.values()}
@@ -616,7 +616,7 @@ def test_a_folder_whose_watch_fails_is_left_unwatched_unless_it_is_gone(tmp_path
 def test_a_folder_watched_twice_is_counted_once(tmp_path):
 	os.makedirs(tmp_path / 'k' / 's')
 	irm = rv.inotify_resource_manager()
-	wdDic = rv.bidict()
+	wdDic = {}
 	with rv.inotify_simple.INotify() as inotify_obj:
 		rv.initializeFolderWatchers(inotify_obj, str(tmp_path), wdDic, irm, WATCH_FLAGS)
 		# a folder made while its parent's walk ran is in the walk and raises its create, which watches it again
@@ -631,7 +631,7 @@ def test_a_walk_tells_again_what_under_its_folder_is_unwatched(tmp_path, monkeyp
 	real = os.scandir
 	_fail_scandir(monkeypatch, u)
 	irm = rv.inotify_resource_manager()
-	wdDic, unwatched = rv.bidict(), set()
+	wdDic, unwatched = {}, set()
 	with rv.inotify_simple.INotify() as inotify_obj:
 		rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
 		assert unwatched == {u}
@@ -899,7 +899,7 @@ def test_a_watch_failing_for_a_folder_that_is_gone_logs_info(tmp_path, monkeypat
 	lines = []
 	monkeypatch.setattr(rv, 'watcherTeeLogToTl', lambda monitor_path, message, error=False, ok=False: lines.append((message, error)))
 	unwatched = set()
-	rv.initializeFolderWatchers(FakeINotify(), str(monitor), rv.bidict(), FakeIrm(), 0, unwatched=unwatched)
+	rv.initializeFolderWatchers(FakeINotify(), str(monitor), {}, FakeIrm(), 0, unwatched=unwatched)
 	failed = [(message, is_error) for message, is_error in lines if 'Failed to add watch' in message]
 	assert failed == [(f'Failed to add watch for {gone}/: [Errno {error}] {os.strerror(error)}', logged_as_error)] or \
 		failed == [(f'Failed to add watch for {gone}: [Errno {error}] {os.strerror(error)}', logged_as_error)], lines

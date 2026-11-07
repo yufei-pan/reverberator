@@ -64,40 +64,6 @@ def test_slugify_dirty_and_unicode():
 	assert rv.slugify('café', allow_unicode=True) == 'café'
 
 
-def test_bidict_overwrite_and_delete():
-	d = rv.bidict({1: '/a', 2: '/b'})
-	assert d.inverse['/a'] == [1]
-	d[1] = '/c'
-	assert '/a' not in d.inverse
-	assert d.inverse['/c'] == [1]
-	del d[2]
-	assert '/b' not in d.inverse
-
-
-def inverse_of(d):
-	inverse = {}
-	for key, value in d.items():
-		inverse.setdefault(value, []).append(key)
-	return inverse
-
-
-def test_bidict_keeps_its_index_through_every_way_to_change_it():
-	# the watcher's DELETE_SELF removed a watch with pop, which left its path in the index for the daemon's whole life
-	d = rv.bidict({1: '/a', 2: '/b', 3: '/a'})
-	assert d.pop(1) == '/a' and d.pop(9, None) is None and d.inverse == inverse_of(d) == {'/a': [3], '/b': [2]}
-	with pytest.raises(KeyError):
-		d.pop(9)
-	key, value = d.popitem()
-	assert d.inverse == inverse_of(d) and value not in [v for k, v in d.items() if k != key] and key not in d
-	assert d.setdefault(4, '/c') == '/c' and d.setdefault(4, '/d') == '/c' and d.inverse == inverse_of(d)
-	d.update({5: '/e', 4: '/f'}, x='/g')
-	d |= {6: '/e'}
-	assert d.inverse == inverse_of(d) and '/c' not in d.inverse and d.inverse['/e'] == [5, 6]
-	d.clear()
-	assert not d and d.inverse == {}
-	assert rv.bidict.fromkeys([1, 2], '/z').inverse == {'/z': [1, 2]}
-
-
 def test_get_args_defaults_and_flags():
 	args, _ = rv.get_args([])
 	assert args.rule_path == 'reverb_rule.tsv'

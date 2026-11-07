@@ -91,7 +91,7 @@ def test_a_walk_of_the_root_tells_again_what_is_unwatched_in_an_inner_mount(tmp_
 			return real(path)
 		monkeypatch.setattr(os, 'scandir', scandir)
 		irm = rv.inotify_resource_manager()
-		wdDic, unwatched = rv.bidict(), set()
+		wdDic, unwatched = {}, set()
 		with rv.inotify_simple.INotify() as inotify_obj:
 			rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, rv.inotify_simple.flags.CREATE, unwatched=unwatched)
 			assert inner + '/' in wdDic.values() and unwatched == {u}
@@ -261,7 +261,7 @@ def test_a_watch_that_cannot_be_added_is_not_counted(tmp_path):
 		def add_watch(self, path, mask):
 			raise OSError(13, 'Permission denied')
 	irm = rv.inotify_resource_manager()
-	assert rv.initializeFolderWatchers(Refusing(), str(tmp_path), rv.bidict(), irm, 0) == -1
+	assert rv.initializeFolderWatchers(Refusing(), str(tmp_path), {}, irm, 0) == -1
 	assert irm.current_user_watches == 0
 
 

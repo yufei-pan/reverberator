@@ -750,7 +750,7 @@ def test_removing_many_watches_raises_the_queue_limit_first():
 	class FakeINotify:
 		def rm_watch(self, wd):
 			pass
-	wd_dic = rv.bidict({i: f'/m/d/{i}/' for i in range(30)})
+	wd_dic = {i: f'/m/d/{i}/' for i in range(30)}
 	wd_dic[100] = '/m/d'
 	irm = FakeIrm()
 	assert rv.remove_watches_under(FakeINotify(), wd_dic, irm, '/m/d') == 31
@@ -810,7 +810,7 @@ def test_file_bind_mount_is_not_an_inner_mount(tmp_path):
 			pass
 		def add_watch(self, path, mask):
 			return 1
-	rv.follow_inner_mounts(FakeINotify(), str(monitor), table[:2], inner, rv.bidict(), rv.inotify_resource_manager(), 0, queue, threading.Lock())
+	rv.follow_inner_mounts(FakeINotify(), str(monitor), table[:2], inner, {}, rv.inotify_resource_manager(), 0, queue, threading.Lock())
 	assert inner == {} and len(queue) == 0
 
 

@@ -2836,7 +2836,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	watch_flags = flags.MODIFY | flags.ATTRIB | flags.MOVED_FROM | flags.MOVED_TO | flags.CREATE | flags.DELETE | flags.DELETE_SELF | flags.MOVE_SELF | flags.UNMOUNT | flags.Q_OVERFLOW
 	selfDestructMask = flags.UNMOUNT | flags.DELETE_SELF | flags.MOVE_SELF
 	cookieDic = OrderedDict()
-	wdDic = bidict()
+	wdDic = {}
 	pendingMoveFromEvents = OrderedDict()
 	# the same move-outs by normalized path (path -> {cookie: None}, oldest first), so a create finds those at its path
 	# without going through all of them. a path can have more than one: a folder renamed in brings another entry there
@@ -3111,11 +3111,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							if isDir:
 								# we need to update wdDic to reflect the new path,
 								# including all descendant watches of the moved directory.
-								# iterate over a snapshot as wdDic mutates its inverse mapping on assignment
 								old_path_norm = cookie_value.path.rstrip('/')
 								old_prefix = old_path_norm + '/'
 								new_path_norm = eventPath.rstrip('/')
-								for wd, wd_path in list(wdDic.items()):
+								for wd, wd_path in wdDic.items():
 									wd_path_norm = wd_path.rstrip('/')
 									if wd_path_norm == old_path_norm:
 										new_wd_path = new_path_norm
@@ -3173,86 +3172,6 @@ def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
 		tl.teeprint(message,callerStackDepth=4)
 	else:
 		tl.info(message,callerStackDepth=4)
-
-class bidict(dict):
-	'''
-	Bidirectional dict mapping keys to values with an inverse index (value -> [keys], in the order they were set).
-	Every way dict has to change it keeps the index: an overwrite, del, pop, popitem, setdefault, update, |= and clear.
-	copy() is a plain dict, with no index.
-
-	Examples:
-		>>> d = bidict({1: '/a', 2: '/b'})
-		>>> d.inverse['/a']
-		[1]
-		>>> d[1] = '/c'
-		>>> '/a' in d.inverse
-		False
-		>>> d.inverse['/c']
-		[1]
-		>>> del d[2]
-		>>> '/b' in d.inverse
-		False
-		>>> d.pop(1)
-		'/c'
-		>>> d.inverse
-		{}
-	'''
-	# Credit: https://stackoverflow.com/users/1422096/basj
-	# https://stackoverflow.com/questions/3318625/how-to-implement-an-efficient-bidirectional-hash-table
-	_missing = object()
-
-	def __init__(self, *args, **kwargs):
-		super(bidict, self).__init__(*args, **kwargs)
-		self.inverse = {}
-		for key, value in self.items():
-			self.inverse.setdefault(value, []).append(key)
-
-	def _unindex(self, key, value):
-		keys = self.inverse[value]
-		keys.remove(key)
-		if not keys:
-			del self.inverse[value]
-
-	def __setitem__(self, key, value):
-		if key in self:
-			self._unindex(key, self[key])
-		super(bidict, self).__setitem__(key, value)
-		self.inverse.setdefault(value, []).append(key)
-
-	def __delitem__(self, key):
-		self._unindex(key, self[key])
-		super(bidict, self).__delitem__(key)
-
-	def pop(self, key, default=_missing):
-		if key in self:
-			value = self[key]
-			del self[key]
-			return value
-		if default is bidict._missing:
-			raise KeyError(key)
-		return default
-
-	def popitem(self):
-		key, value = super(bidict, self).popitem()
-		self._unindex(key, value)
-		return key, value
-
-	def setdefault(self, key, default=None):
-		if key not in self:
-			self[key] = default
-		return self[key]
-
-	def update(self, *args, **kwargs):
-		for key, value in dict(*args, **kwargs).items():
-			self[key] = value
-
-	def __ior__(self, other):
-		self.update(other)
-		return self
-
-	def clear(self):
-		super(bidict, self).clear()
-		self.inverse.clear()
 
 def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None):
 	'''
@@ -3334,7 +3253,7 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	watcherTeeLogToTl(monitor_path,f'Watching {len(watched)} sub folders')
 	return parentWatchDescriptor
 
-def watches_under(wdDic:bidict,folder_path:str) -> tuple:
+def watches_under(wdDic:dict,folder_path:str) -> tuple:
 	'''The watch descriptors mapped to folder_path or below it.'''
 	folder_norm = folder_path.rstrip('/')
 	prefix = folder_norm + '/'
@@ -3345,7 +3264,7 @@ def raise_queue_limit_for_removals(irm:inotify_resource_manager,count:int):
 	if count > irm.max_queued_events / 2:
 		irm.increaseInotifyMaxQueueEvents(max(irm.max_queued_events * 2, count * 2))
 
-def remove_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,wds) -> int:
+def remove_watches(inotify_obj:inotify_simple.INotify,wdDic:dict,irm:inotify_resource_manager,wds) -> int:
 	'''Remove the watches wds, each one held in wdDic; returns how many were removed.'''
 	raise_queue_limit_for_removals(irm,len(wds))
 	for wd in wds:
@@ -3357,7 +3276,7 @@ def remove_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_r
 		irm.decreaseUserWatches()
 	return len(wds)
 
-def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,folder_path:str) -> int:
+def remove_watches_under(inotify_obj:inotify_simple.INotify,wdDic:dict,irm:inotify_resource_manager,folder_path:str) -> int:
 	'''Remove the watch on folder_path and every watch below it; returns how many were removed.'''
 	return remove_watches(inotify_obj,wdDic,irm,watches_under(wdDic,folder_path))
 
@@ -3379,7 +3298,7 @@ def forget_unwatched_under(unwatched:set,folder_path:str) -> None:
 		prefix = folder_norm.rstrip('/') + '/'
 		unwatched.difference_update([folder for folder in unwatched if folder == folder_norm or folder.startswith(prefix)])
 
-def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:bidict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None) -> int:
+def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None) -> int:
 	'''
 	Bring the watches in line with a new mount table. Each inner mount mounted, unmounted or replaced since inner_mounts
 	(path -> fingerprint, updated here) is watched again from what is there now, and gets a 'scan' event so the backuper
@@ -3411,7 +3330,7 @@ def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,moun
 		queued += 1
 	return queued
 
-def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,irm:inotify_resource_manager,wds,watch_flags:int) -> int:
+def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:dict,irm:inotify_resource_manager,wds,watch_flags:int) -> int:
 	'''
 	Remove the watches a folder took along when it moved away and its move never paired; returns how many were removed.
 	Of wds, the watches at or below its path when it moved, each one still held goes unless inotify hands it back for the
@@ -3447,7 +3366,7 @@ def remove_moved_away_watches(inotify_obj:inotify_simple.INotify,wdDic:bidict,ir
 		removed += 1
 	return removed
 
-def remove_newly_skipped_watches(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:bidict,irm:inotify_resource_manager,skip_list:'SkipList') -> int:
+def remove_newly_skipped_watches(inotify_obj:inotify_simple.INotify,folder_path:str,wdDic:dict,irm:inotify_resource_manager,skip_list:'SkipList') -> int:
 	'''After a folder moved, remove the watches below it on folders the skip list leaves out at the new location, or that
 	are in one it leaves out; returns how many were removed. The walk of the moved folder watches those it wants there.'''
 	folder_norm = folder_path.rstrip('/')
