@@ -5,6 +5,7 @@ Each batch runs as the backuper runs it: collapsed, replayed, compared with what
 '''
 import contextlib
 import errno
+import itertools
 import os
 import shutil
 import sys
@@ -298,23 +299,23 @@ def test_moves_into_new_folders_as_fast_as_they_go_end_as_the_tree(session, job)
 	assert version_view(job) == live_view(job)
 
 
-def test_what_a_walk_found_and_paired_is_emptied_by_a_take(session, job, monkeypatch):
-	# the old paths of the folders a walk found moved in, and the cookies of their move-outs, are kept for the batch: a take empties
-	# both, or a quiet daemon would hold one for each folder it ever found
+def test_what_a_walk_found_is_emptied_by_a_take(session, job, monkeypatch):
+	# the old paths of the folders a walk found moved in are kept for the batch, a subfolder's until it moves itself: a take empties
+	# them, or a quiet daemon would hold one for each folder it ever found
 	kept = {}
 	real = rv.initializeFolderWatchers
 	def walk(*args, **kwargs):
 		caller = sys._getframe(1).f_locals
-		kept.update(found=caller['foundMoved'], paired=caller['pairedCookies'])
+		kept.update(found=caller['foundMoved'])
 		return real(*args, **kwargs)
 	monkeypatch.setattr(rv, 'initializeFolderWatchers', walk)
 	one = session()
 	with one.unread():
 		one.run([('mkdir', 'n'), ('mv', 'big', 'n/big')], 'at_once')
 	one.settle()
-	assert kept['found'] and kept['paired']
+	assert kept['found']
 	one.take()
-	wait_until(lambda: not kept['found'] and not kept['paired'], message='the take did not empty what the walk found')
+	wait_until(lambda: not kept['found'], message='the take did not empty what the walk found')
 
 
 @pytest.mark.parametrize('timing', TIMINGS)
@@ -469,6 +470,104 @@ def test_a_folder_renamed_onto_the_place_of_one_moved_in_from_it_and_moved_on_is
 	one.back_up(batch)
 	assert_held_as_the_tree(job, before, previous)
 	written_after(one, job, 'x/sub/y')
+
+
+# a folder with no watch yet at the old path of one a walk found: made or renamed there and moved on before its create's walk added
+# a watch, so no watch tells it from the found folder. each, all unread so the walk of n comes first, must leave the folder moved out
+# in the version and watched
+UNWATCHED_AT_THE_OLD_PATH = {
+	'made_at_a_subfolder': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'next', 'big'), ('mkdir', 'big/sub'), ('write', 'big/sub/x', 'x'),
+		('mv', 'big/sub', 'other/sub')],
+	'made_before_its_parent_was_renamed_there': [('mkdir', 'next/sub'), ('write', 'next/sub/x', 'x'), ('mkdir', 'n'), ('mv', 'big', 'n/big'),
+		('mv', 'next', 'big'), ('mv', 'big/sub', 'other/sub')],
+	'made_after_the_walk': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mkdir', 'next/sub'), ('write', 'next/sub/x', 'x'), ('mv', 'next', 'big'),
+		('mv', 'big/sub', 'other/sub')],
+	'made_at_a_top_path_read_out_first': [('mv', 'big', '{outside}/big'), ('mkdir', 'n'), ('mv', '{outside}/big', 'n/big'), ('mkdir', 'big'),
+		('write', 'big/x', 'x'), ('mv', 'big', 'other/sub')],
+	# the found folder's own rename was read before the walk that found it (its new folder moved on into another), and a folder made
+	# at its old path leaves right before it moves again
+	'found_after_its_move_was_read': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mkdir', 'q'), ('mv', 'n', 'q/n'), ('mkdir', 'big'), ('write', 'big/x', 'x'),
+		('mv', 'big', '{outside}/e'), ('mv', 'q/n/big', 'other/sub')],
+}
+
+
+@pytest.mark.parametrize('steps', UNWATCHED_AT_THE_OLD_PATH.values(), ids=UNWATCHED_AT_THE_OLD_PATH)
+def test_a_folder_with_no_watch_yet_at_a_found_folders_old_path_is_not_that_folder(session, job, tmp_path, steps):
+	outside = tmp_path / 'outside'
+	os.makedirs(outside)
+	one = session({**SEED, 'big/sub/deep/x': 'x' * 100, 'next/z': 'z' * 100})
+	before = version_view(job)
+	previous = latest_version(job).path
+	one.run([tuple(arg.replace('{outside}', str(outside)) for arg in step) for step in steps], 'unread')
+	one.back_up_next()
+	assert_held_as_the_tree(job, before, previous)
+	written_after(one, job, 'other/sub/after')
+
+
+@pytest.mark.parametrize('timing', TIMINGS)
+def test_the_order_of_fuzz_seed_2854(session, job, tmp_path, timing):
+	# keep/s/n2 leaves the tree and keep is renamed before that move-out expires, which kept the watch of the folder outside mapped at
+	# c/keep2/s/n2. the folder comes back, a new folder is made at that path, and a chain moves it on: no key of the found folder may
+	# take another folder's move
+	outside = tmp_path / 'outside'
+	os.makedirs(outside)
+	one = session({'keep/s/n2/b/h': 'h' * 100, 'x/n1/y': 'y', 'x/z': 'z', 'c/b/f': 'f', 'c/s/g': 'g', 'other/o': 'o'})
+	with one.unread():
+		os.rename(os.path.join(job.monitor, 'keep/s/n2'), outside / 'x16')
+		one.apply(('mv', 'keep', 'c/keep2'))
+	one.back_up_next()
+	one.back_up_next()
+	at, chain = 'c/keep2/s/n2', 'c/b/n1'
+	one.run([('mv', str(outside / 'x16'), 'c/b/n2'), ('mkdir', at), ('mv', 'x', at + '/n2'), ('mkdir', chain), ('mv', at, chain + '/n2')], timing)
+	one.back_up_next()
+	one.back_up_next()
+	for base, folders, _ in os.walk(job.monitor):
+		for folder in folders:
+			open(os.path.join(base, folder, 'mark'), 'w').close()
+	one.back_up_next()
+	assert version_view(job) == live_view(job)
+
+
+def kernel_merges(first, second):
+	'''Every order of two renames' events another CPU can give: each rename's own events stay in their order.'''
+	for at in itertools.combinations(range(len(first) + len(second)), len(second)):
+		a, b = iter(first), iter(second)
+		yield [next(b) if i in at else next(a) for i in range(len(first) + len(second))]
+
+
+@pytest.mark.parametrize('order', range(6))
+def test_another_folders_move_out_between_a_found_folders_rename_events_is_a_copy(session, job, tmp_path, monkeypatch, order):
+	# mkdir n; mv big n/big, and on another CPU mv other/y outside/y, which takes no lock of the two folders big's rename holds: its
+	# MOVED_FROM and MOVE_SELF can land anywhere among big's. big pairs only when its MOVE_SELF comes right after its own MOVED_FROM;
+	# in any other order the move-out of big is a delete and n is copied, never a move from other/y
+	one = session({**SEED, 'other/y/z': 'z' * 100})
+	before = version_view(job)
+	previous = latest_version(job).path
+	real_read, flags = rv.inotify_simple.INotify.read, rv.inotify_simple.flags
+	waiting, go = threading.Event(), threading.Event()
+	def read(inotify, *args, **kwargs):
+		waiting.set()
+		go.wait(10)
+		events = real_read(inotify, *args, **kwargs)
+		monkeypatch.setattr(rv.inotify_simple.INotify, 'read', real_read)
+		# one process: create n, then each rename's MOVED_FROM and its folder's MOVE_SELF, as read
+		assert [(event.mask & ~flags.ISDIR, event.name) for event in events[:5]] == [(flags.CREATE, 'n'), (flags.MOVED_FROM, 'big'), (flags.MOVE_SELF, ''),
+			(flags.MOVED_FROM, 'y'), (flags.MOVE_SELF, '')]
+		return events[:1] + list(kernel_merges(events[1:3], events[3:5]))[order] + events[5:]
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+	assert waiting.wait(10)
+	os.mkdir(os.path.join(job.monitor, 'n'))
+	os.rename(os.path.join(job.monitor, 'big'), os.path.join(job.monitor, 'n', 'big'))
+	os.rename(os.path.join(job.monitor, 'other', 'y'), tmp_path / 'y')
+	go.set()
+	batch = one.take()
+	moves = [(os.path.relpath(e.path, job.monitor), os.path.relpath(e.moved_from, job.monitor)) for e in batch if e.event == 'move']
+	adjacent = list(kernel_merges(range(2), range(2, 4)))[order]
+	adjacent = adjacent.index(1) == adjacent.index(0) + 1
+	assert moves == ([('n/big', 'big')] if adjacent else [])
+	one.back_up(batch)
+	assert_held_as_the_tree(job, before, previous)
+	written_after(one, job, 'n/big/after')
 
 
 def test_a_folder_found_moved_in_is_not_a_new_folder_when_its_parent_is_walked_again(session, job, monkeypatch):
