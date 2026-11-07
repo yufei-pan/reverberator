@@ -26,7 +26,7 @@ from tests.test_moves_into_new_folders import live_view, session, version_view  
 pytestmark = pytest.mark.inotify
 
 # the visits a shape's steps may land at: all of them for a short shape, where the window is a visit or two wide
-H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 12, 'in_then_poke_mv': 12}
+H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 12, 'in_then_poke_mv': 12, 'twice_in_new': 12, 'twice_in_new_sub': 12}
 H_DEFAULT = 16
 SAMPLE = int(os.environ.get('REVERB_WATCH_SCHED_SAMPLE', '100'))
 BIG = 'p' * 200000
@@ -51,6 +51,11 @@ SHAPES = {
 	'in_then_poke_mv': [('mv', '{outside}/d', 'm'), ('poke', 'big/a'), ('mv', 'big', 'm/big')],
 	# moved on into another new folder, a folder made at its old place, and a change that only its event shows
 	'found_twice': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mkdir', 'm'), ('mv', 'n/big', 'm/big'), ('mv', 'next', 'big'), ('poke', 'm/big/sub/b')],
+	# renamed again inside the new folder: the walk can list the folder at its last name and re-point its own watch there before
+	# the first rename's events are read, so the change's event is discarded and the first move must not be kept (the fourth review's F1)
+	'twice_in_new': [('mkdir', 'n'), ('poke', 'big/a'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'n/c')],
+	# the same in a subfolder of the new folder
+	'twice_in_new_sub': [('mkdir', 'n'), ('mkdir', 'n/s'), ('poke', 'big/a'), ('mv', 'big', 'n/s/big'), ('mv', 'n/s/big', 'n/s/c')],
 }
 NAMES = [name for name in os.environ.get('REVERB_WATCH_SCHED_SHAPES', ','.join(SHAPES)).split(',') if name]
 
