@@ -10554,26 +10554,22 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	path_pending_to_get_inode_del = []
 	# du would count skipped caches the copy leaves out, and the size limit would prune history to make room for them
 	walk_folders = bool(skip_list)
+	def copies(entry, event):
+		# what the replay copies: a create or a modify, and a file's attrib unless Only Sync Attributes vouches for the vault's
+		# copy. a folder's attrib copies nothing: the replay gives the folder its metadata alone
+		return event in ('create', 'modify') or (event == 'attrib' and not entry.endswith('/') and (not only_sync_attributes or entry in copied))
+	# a folder create holds the inodes below it, in du and in the walks: a full comparison queues an entry for every folder
+	# and file of a new tree, so a create inside a created folder adds none of its own
+	created_folders = {entry for entry, values in backup_entries.items() if values.event == 'create' and entry.endswith('/')}
+	# entries lie below the monitored folder, so only parents from it down can hold them
+	parents_from = len(monitor_path.rstrip('/'))
 	if walk_folders:
-		# du counts an argument inside another only once, and so must the walks: a full comparison queues an entry for
-		# every folder and file of a new tree. a folder create holds the bytes and inodes below it, a sized folder
-		# modify only the bytes
-		sized_folders = set()
-		created_folders = set()
-		for entry, values in backup_entries.items():
-			if entry.endswith('/'):
-				if values.event == 'create':
-					created_folders.add(entry)
-					sized_folders.add(entry)
-				elif values.event == 'modify':
-					# a folder's attrib copies nothing: the replay gives the folder its metadata alone
-					sized_folders.add(entry)
-		# entries lie below the monitored folder, so only parents from it down can hold them
-		parents_from = len(monitor_path.rstrip('/'))
+		# du counts an argument inside another only once, and so must the walks. a sized folder modify holds only the bytes
+		sized_folders = created_folders | {entry for entry, values in backup_entries.items() if values.event == 'modify' and entry.endswith('/')}
 	for entry in backup_entries:
 		if walk_folders and backup_entries[entry].event != 'delete':
 			event = backup_entries[entry].event
-			if event in ('create', 'modify') or (event == 'attrib' and not entry.endswith('/') and (not only_sync_attributes or entry in copied)):
+			if copies(entry, event):
 				count_size = not inside_folders(entry, sized_folders, parents_from)
 				# we do not count inode change for attrib / modify / move events
 				count_inodes = event == 'create' and not inside_folders(entry, created_folders, parents_from)
@@ -10587,10 +10583,9 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 			if entry.endswith('/'):
 				# this is a directory
 				path_pending_to_get_inode_add.append(entry)
-			else:
+			elif not inside_folders(entry, created_folders, parents_from):
 				total_inode_change += 1
-		elif backup_entries[entry].event == 'modify' or (backup_entries[entry].event == 'attrib' and not entry.endswith('/') and (not only_sync_attributes or entry in copied)):
-			# a folder's attrib copies nothing
+		elif copies(entry, backup_entries[entry].event):
 			path_pending_to_get_size.append(entry)
 			# we do not count inode change for attrib / modify / move events
 		elif backup_entries[entry].event == 'delete':
@@ -10618,16 +10613,16 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	if path_pending_to_get_inode_del:
 		total_inode_change -= get_path_inodes(*path_pending_to_get_inode_del)
 	# what a move lands on inside a created folder arrives by the move, and its create copies it not ( mkdir n; mv d n/d )
-	created = {entry for entry, values in backup_entries.items() if values.event == 'create' and entry.endswith('/')}
-	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and created and inside_folders(entry, created)]
+	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and created_folders and inside_folders(entry, created_folders)]
 	# one inside another is taken out with it ( mv d n/d; mv y n/d/y )
 	carried_folders = {entry for entry in carried_in if entry.endswith('/')}
 	carried_in = [entry for entry in carried_in if not inside_folders(entry, carried_folders)]
-	# what the batch wrote under a carried folder is copied, and went out with the folder: the new folder's walk counted it, and
-	# so did the folder just taken out. put back as the walks count: the bytes of each entry not inside a folder of these that is
-	# walked, the inodes of each create
-	written = {entry: values.event for entry, values in backup_entries.items() if values.event in ('create', 'modify') and inside_folders(entry, carried_folders)}
+	# what the batch copies under a carried folder went out with the folder: the new folder's walk counted it, and so did the
+	# folder just taken out. put back as the walks count: the bytes of each entry not inside a folder of these that is walked,
+	# the inodes of each create not inside a folder of these that is made
+	written = {entry: values.event for entry, values in backup_entries.items() if copies(entry, values.event) and inside_folders(entry, carried_folders)}
 	written_folders = {entry for entry in written if entry.endswith('/')}
+	made_folders = {entry for entry in written_folders if written[entry] == 'create'}
 	if carried_in and walk_folders:
 		for entry in carried_in:
 			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list)
@@ -10635,20 +10630,22 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 			total_inode_change -= entry_inodes
 		for entry, event in written.items():
 			count_size = not inside_folders(entry, written_folders)
-			if count_size or event == 'create':
-				entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, count_size, event == 'create')
+			count_inodes = event == 'create' and not inside_folders(entry, made_folders)
+			if count_size or count_inodes:
+				entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, count_size, count_inodes)
 				total_size += entry_size
 				total_inode_change += entry_inodes
 	else:
 		for start in range(0, len(carried_in), ARGUMENT_LIMIT):
 			total_size -= get_path_size(*carried_in[start:start + ARGUMENT_LIMIT])
 			total_inode_change -= get_path_inodes(*carried_in[start:start + ARGUMENT_LIMIT])
-		# du counts each once, whatever lies in what; a file created is counted one by one above, so only the folders are put back
-		put_back, made = list(written), [entry for entry in written_folders if written[entry] == 'create']
+		# du counts each once, whatever lies in what: the folders made with what is in them, and each file made outside them
+		put_back, made = list(written), list(made_folders)
 		for start in range(0, len(put_back), ARGUMENT_LIMIT):
 			total_size += get_path_size(*put_back[start:start + ARGUMENT_LIMIT])
 		for start in range(0, len(made), ARGUMENT_LIMIT):
 			total_inode_change += get_path_inodes(*made[start:start + ARGUMENT_LIMIT])
+		total_inode_change += sum(1 for entry, event in written.items() if event == 'create' and not entry.endswith('/') and not inside_folders(entry, made_folders))
 	return total_size, total_inode_change
 
 def get_path_fs_info(path:str):

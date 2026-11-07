@@ -136,6 +136,10 @@ class Session:
 			shutil.rmtree(at(args[0]))
 		elif verb == 'chmod':
 			os.chmod(at(args[0]), args[1])
+		elif verb == 'touch':
+			# a new mtime, as touch gives: the file is copied under either Only Sync Attributes setting
+			stat = os.lstat(at(args[0]))
+			os.utime(at(args[0]), ns=(stat.st_atime_ns, stat.st_mtime_ns + 5 * 10**9))
 		else:
 			raise AssertionError(verb)
 
@@ -990,3 +994,31 @@ def test_the_size_estimate_counts_what_is_written_under_a_folder_moved_into_a_ne
 	grew = vault_bytes(job) - size
 	assert written <= estimates[0][0] <= grew
 	assert estimates[0][1] == made
+
+
+ATTRIB_ROWS = [
+	('three files touched', [('touch', f'n/big/{name}') for name in ('h1', 'h2', 'h3')], (True, False)),
+	('three files chmodded', [('chmod', f'n/big/{name}', 0o600) for name in ('h1', 'h2', 'h3')], (False,)),
+]
+
+
+@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['du', 'walk'])
+@pytest.mark.parametrize('row,changes,only_sync_attributes', [(row, changes, osa) for row, changes, settings in ATTRIB_ROWS for osa in settings],
+	ids=[f'{row}-{"osa" if osa else "no_osa"}' for row, _, settings in ATTRIB_ROWS for osa in settings])
+def test_the_size_estimate_counts_the_attribute_copies_under_a_folder_moved_into_a_new_one(session, job, monkeypatch, patterns, row, changes, only_sync_attributes):
+	# an attrib that copies the file (a new mtime, or any change without Only Sync Attributes) is counted as the same change in an
+	# existing folder is: a limit makes room for the 15 MiB
+	one = session({**SEED, **{f'big/{name}': name * (5 << 19) for name in ('h1', 'h2', 'h3')}}, patterns=patterns, only_sync_attributes=only_sync_attributes)
+	estimates = []
+	real = rv.get_backup_size_inode
+	def spy(*args, **kwargs):
+		estimates.append(real(*args, **kwargs))
+		return estimates[-1]
+	monkeypatch.setattr(rv, 'get_backup_size_inode', spy)
+	size = vault_bytes(job)
+	one.run([('mkdir', 'n'), ('mv', 'big', 'n/big')] + changes, 'apart')
+	one.back_up_next()
+	assert len(estimates) == 1
+	grew = vault_bytes(job) - size
+	assert 15 << 20 <= estimates[0][0] <= grew
+	assert estimates[0][1] == 2

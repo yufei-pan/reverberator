@@ -776,6 +776,42 @@ def test_the_estimate_puts_back_what_is_written_under_a_folder_it_took_out(job, 
 	assert (size, inodes) == (sum(os.lstat(f'{m}/{rel}').st_blocks * 512 for rel in ('n', 'n/d/s', 'n/d/s/z', 'n/d/s/old')), 2)
 
 
+@pytest.mark.parametrize('skip', ['du', 'walk'])
+@pytest.mark.parametrize('carried', [True, False], ids=['carried', 'no_move'])
+def test_the_estimate_counts_a_file_made_in_a_made_folder_once(job, skip, carried):
+	# mkdir n; mv d n/d; mkdir n/d/s; echo > n/d/s/f, or a full comparison's creates of a new tree (mkdir n; mkdir n/s; echo > n/s/f):
+	# the folder's walk or du counts what is in it, so the file's own create adds no inode again
+	seed_monitor(job, {'d/old': 'o' * 100000, 'keep': 'k'})
+	run_backup(job)
+	m = job.monitor
+	os.mkdir(f'{m}/n')
+	base = 'n/d' if carried else 'n'
+	if carried:
+		os.rename(f'{m}/d', f'{m}/n/d')
+	os.mkdir(f'{m}/{base}/s')
+	with open(f'{m}/{base}/s/f', 'w') as f:
+		f.write('f' * 200000)
+	events = [(True, 'create', 'n', None)] + ([(True, 'move', 'n/d', 'd')] if carried else []) + [(True, 'create', f'{base}/s', None), (False, 'create', f'{base}/s/f', None)]
+	size, inodes = rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
+	assert (size, inodes) == (sum(os.lstat(f'{m}/{rel}').st_blocks * 512 for rel in ('n', f'{base}/s', f'{base}/s/f')), 3)
+
+
+@pytest.mark.parametrize('skip', ['du', 'walk'])
+@pytest.mark.parametrize('only_sync_attributes,copied', [(False, False), (True, True), (True, False)], ids=['copies', 'copies_by_its_record', 'vouched'])
+def test_the_estimate_counts_an_attribute_copy_under_a_folder_moved_into_a_new_one(job, skip, only_sync_attributes, copied):
+	# mkdir n; mv d n/d; chmod n/d/h: the attrib copies the file unless Only Sync Attributes vouches for the vault's copy
+	seed_monitor(job, {'d/h': 'h' * 300000, 'd/k': 'k'})
+	run_backup(job)
+	m = job.monitor
+	os.mkdir(f'{m}/n')
+	os.rename(f'{m}/d', f'{m}/n/d')
+	os.chmod(f'{m}/n/d/h', 0o600)
+	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'), (False, 'attrib', 'n/d/h', None))
+	size, inodes = rv.get_backup_size_inode(entries, only_sync_attributes, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None,
+		copied={f'{m}/n/d/h'} if copied else frozenset())
+	assert (size, inodes) == (os.lstat(f'{m}/n').st_blocks * 512 + (os.lstat(f'{m}/n/d/h').st_blocks * 512 if copied or not only_sync_attributes else 0), 1)
+
+
 def test_touching_a_file_copies_it(job, logged, monkeypatch):
 	# touch -m, three times: the mtime moved, as an mmap write moves it, so the file is copied each time, and the older
 	# versions keep their copy's mtime
