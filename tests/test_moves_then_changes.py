@@ -758,6 +758,24 @@ def test_the_estimate_leaves_a_move_inside_another_out_once(job):
 	assert (size, inodes) == (os.lstat(f'{m}/n/own').st_blocks * 512 + os.lstat(f'{m}/n').st_blocks * 512, 2)
 
 
+@pytest.mark.parametrize('skip', ['du', 'walk'])
+def test_the_estimate_puts_back_what_is_written_under_a_folder_it_took_out(job, skip):
+	# mkdir n; mv d n/d; then a file created and one appended under n/d/s, which is modified itself: n and n/d/s are all of it that
+	# the version does not hold already, and the two files are counted once, not once under n/d/s and again by themselves
+	seed_monitor(job, {'d/s/old': 'o' * 100000, 'd/keep': 'k' * 100000})
+	run_backup(job)
+	m = job.monitor
+	os.mkdir(f'{m}/n')
+	os.rename(f'{m}/d', f'{m}/n/d')
+	with open(f'{m}/n/d/s/z', 'w') as f:
+		f.write('z' * 200000)
+	with open(f'{m}/n/d/s/old', 'a') as f:
+		f.write('m' * 50000)
+	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'), (True, 'modify', 'n/d/s', None), (False, 'create', 'n/d/s/z', None), (False, 'modify', 'n/d/s/old', None))
+	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
+	assert (size, inodes) == (sum(os.lstat(f'{m}/{rel}').st_blocks * 512 for rel in ('n', 'n/d/s', 'n/d/s/z', 'n/d/s/old')), 2)
+
+
 def test_touching_a_file_copies_it(job, logged, monkeypatch):
 	# touch -m, three times: the mtime moved, as an mmap write moves it, so the file is copied each time, and the older
 	# versions keep their copy's mtime

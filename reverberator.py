@@ -10610,15 +10610,32 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	# one inside another is taken out with it ( mv d n/d; mv y n/d/y )
 	carried_folders = {entry for entry in carried_in if entry.endswith('/')}
 	carried_in = [entry for entry in carried_in if not inside_folders(entry, carried_folders)]
+	# what the batch wrote under a carried folder is copied, and went out with the folder: the new folder's walk counted it, and
+	# so did the folder just taken out. put back as the walks count: the bytes of each entry not inside a folder of these that is
+	# walked, the inodes of each create
+	written = {entry: values.event for entry, values in backup_entries.items() if values.event in ('create', 'modify') and inside_folders(entry, carried_folders)}
+	written_folders = {entry for entry in written if entry.endswith('/')}
 	if carried_in and walk_folders:
 		for entry in carried_in:
 			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list)
 			total_size -= entry_size
 			total_inode_change -= entry_inodes
+		for entry, event in written.items():
+			count_size = not inside_folders(entry, written_folders)
+			if count_size or event == 'create':
+				entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, count_size, event == 'create')
+				total_size += entry_size
+				total_inode_change += entry_inodes
 	else:
 		for start in range(0, len(carried_in), ARGUMENT_LIMIT):
 			total_size -= get_path_size(*carried_in[start:start + ARGUMENT_LIMIT])
 			total_inode_change -= get_path_inodes(*carried_in[start:start + ARGUMENT_LIMIT])
+		# du counts each once, whatever lies in what; a file created is counted one by one above, so only the folders are put back
+		put_back, made = list(written), [entry for entry in written_folders if written[entry] == 'create']
+		for start in range(0, len(put_back), ARGUMENT_LIMIT):
+			total_size += get_path_size(*put_back[start:start + ARGUMENT_LIMIT])
+		for start in range(0, len(made), ARGUMENT_LIMIT):
+			total_inode_change += get_path_inodes(*made[start:start + ARGUMENT_LIMIT])
 	return total_size, total_inode_change
 
 def get_path_fs_info(path:str):

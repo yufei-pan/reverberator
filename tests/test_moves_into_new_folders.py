@@ -718,3 +718,32 @@ def test_a_moved_in_folder_a_location_pattern_now_leaves_out_part_of(session, jo
 	one.apply(('write', 'n/big/logs/y', 'y'))
 	one.apply(('write', 'other/marker', 'm'))
 	assert not [e for e in one.take() if '/logs' in e.path]
+
+
+# the rows of the review: what a batch writes under a folder moved into a new one, its bytes and the inodes it makes (the new
+# folder, what is made, and the probe file of the session)
+ESTIMATE_ROWS = [
+	('one file rewritten', [('write', 'n/big/a', 'x' * (5 << 20))], 5 << 20, 2),
+	('three new files', [('write', f'n/big/{name}', name * (5 << 20)) for name in 'pqr'], 15 << 20, 5),
+	('a new folder of two files', [('mkdir', 'n/big/new'), ('write', 'n/big/new/p', 'p' * (5 << 20)), ('write', 'n/big/new/q', 'q' * (5 << 20))], 10 << 20, 5),
+]
+
+
+@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['du', 'walk'])
+@pytest.mark.parametrize('row,writes,written,made', ESTIMATE_ROWS, ids=[row[0] for row in ESTIMATE_ROWS])
+def test_the_size_estimate_counts_what_is_written_under_a_folder_moved_into_a_new_one(session, job, monkeypatch, patterns, row, writes, written, made):
+	# the folder is taken out of the new folder's size, with what is written in it: that is copied, and a limit would make no room
+	one = session(patterns=patterns)
+	estimates = []
+	real = rv.get_backup_size_inode
+	def spy(*args, **kwargs):
+		estimates.append(real(*args, **kwargs))
+		return estimates[-1]
+	monkeypatch.setattr(rv, 'get_backup_size_inode', spy)
+	size = vault_bytes(job)
+	one.run([('mkdir', 'n'), ('mv', 'big', 'n/big')] + writes, 'apart')
+	one.back_up_next()
+	assert len(estimates) == 1
+	grew = vault_bytes(job) - size
+	assert written <= estimates[0][0] <= grew
+	assert estimates[0][1] == made
