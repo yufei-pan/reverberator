@@ -697,3 +697,36 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   the new folder its record and stays.
 - **Why:** a lightness item.
 - **Revisit when:** the lightness round after 0.55.1.
+
+### A file moved into a new folder before the watcher reaches it is copied once
+
+- **Kind:** known limitation.
+- **What the operator sees:** a file moved into a folder made in the same batch, before the watcher has reached that
+  folder, is copied again with no line in the log, though the vault already holds it. Under a size limit that copy can
+  prune older versions. A shell's `mkdir n; mv f n/` lost that race 3 times in 2,400; a program making the folder and
+  renaming into it back to back loses it about 97% of the time. A folder moved the same way is told by its watch and
+  costs no copy.
+- **Why:** a file has no watch, so only its name would say it is the same file, and pairing by name left a version
+  holding the wrong bytes for good when a review tried it. A miss costs one copy of one file, as every version before
+  this one paid.
+- **Revisit when:** size limits start pruning because of it, or rows come to hold the monitored inode for another reason.
+- **Approved:** 2026-11-06, "Accept (Recommended)".
+
+### A size record too low after a rename falls back to a copy
+
+- **Kind:** deferred.
+- **What the operator sees:** when a whole-tree comparison lands between a rename and the watcher's read of it, the
+  version before can keep a change list that says too little (16.00 KiB and 11 inodes where 22.93 KiB and 13 are right),
+  so `status` and the limits undercount it by the moved folder until that version is pruned. Contents are right.
+- **Why:** older than 0.55.1, which reaches it more often. The fix is in the fallback; the cause is read, not verified:
+  `manifest.move_tree()` runs before the rename, so the rows of what the version already holds at the target are gone.
+- **Revisit when:** the lightness round after 0.55.1. Then `tests/test_watcher_fuzz.py` stops leaving this fault out.
+
+### An event queue overflow can leave a new folder unwatched
+
+- **Kind:** deferred.
+- **What the operator sees:** an overflow of the kernel's event queue that loses a new folder's create: the full scan
+  copies the folder, but nothing walks it, so later writes in it raise no event until a restart.
+- **Why:** it needs the queue to overflow, and the fix is a walk of the tree at an overflow, which belongs with the next
+  change to the watcher.
+- **Revisit when:** the next round that changes the watcher.
