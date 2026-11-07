@@ -457,6 +457,33 @@ def test_a_folder_found_moved_in_is_not_a_new_folder_when_its_parent_is_walked_a
 	assert inodes_of(job)['a/b/big/sub/b'] == inodes['big/sub/b']
 
 
+def test_a_folder_moved_into_a_new_folder_made_after_its_parents_walk_listed_it_is_a_move(session, job, monkeypatch):
+	# mkdir -p p/q; mv big p/q/big, with p walked before q exists: q's create is read after that walk, and q's own walk, in the
+	# discard of a folder p's copy holds, is the one that finds big under its old watch
+	one = session({**SEED, **{f'big/f{i}': f'{i}' * 100000 for i in range(4)}})
+	new, big = os.path.join(job.monitor, 'p'), os.path.join(job.monitor, 'big')
+	real = rv.iter_tree_entries
+	def walk(path, *args, **kwargs):
+		listed = list(real(path, *args, **kwargs))
+		if path.rstrip('/') == new and os.path.lexists(big):
+			os.makedirs(os.path.join(new, 'q'))
+			os.rename(big, os.path.join(new, 'q', 'big'))
+		return iter(listed)
+	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
+	inodes = inodes_of(job)
+	before = version_view(job)
+	previous = latest_version(job).path
+	size = vault_bytes(job)
+	os.mkdir(new)
+	batch = one.take()
+	assert ('move', 'p/q/big') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	one.back_up(batch)
+	assert_held_as_the_tree(job, before, previous)
+	assert inodes_of(job)['p/q/big/a'] == inodes['big/a']
+	# 400 KB would be a copy
+	assert vault_bytes(job) - size < 200000
+
+
 def hold_walk(monkeypatch, folder):
 	'''The watcher stops before it walks folder (at is set then) until go is set.'''
 	real = rv.initializeFolderWatchers
