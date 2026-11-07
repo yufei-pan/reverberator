@@ -36,11 +36,13 @@ class Session:
 		self.thread = None
 
 	def start(self):
+		watching = threading.Event()
 		self.thread = threading.Thread(target=rv.watchFolder, kwargs=dict(monitor_path=self.job.monitor, to_process=self.queue,
 			to_process_lock=self.lock, to_process_flag=self.flag, irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=0.15,
-			max_shapshot_delay_seconds=60, skip_list=self.skip_list), daemon=True)
+			max_shapshot_delay_seconds=60, skip_list=self.skip_list, watching=watching), daemon=True)
 		self.thread.start()
-		self.settle()
+		assert watching.wait(10), 'the watcher did not start'
+		self.take()
 
 	def stop(self):
 		rv.GREEN_LIGHT.clear()
@@ -51,23 +53,16 @@ class Session:
 		with self.lock:
 			return list(self.queue)
 
-	def settle(self):
-		'''Wait until the watcher has read everything so far, its probe's event queued, and empty the queue.'''
-		probe = os.path.join(self.job.monitor, f'.probe_{time.monotonic_ns()}')
-		def seen():
-			if os.path.exists(probe):
-				os.remove(probe)
-			open(probe, 'w').close()
-			return any(e.event == 'create' and e.path == probe for e in self.events())
-		wait_until(seen, message='watcher not ready')
-		os.remove(probe)
-		wait_until(self.flag.is_set, message='watcher did not signal the backuper')
-		with self.lock:
-			self.queue.take()
-		self.flag.clear()
-
 	def take(self):
-		'''The batch the watcher signals, as the backuper takes it.'''
+		'''
+		The batch of everything done so far, as the backuper takes it once the watcher signals: a probe's event says all before it
+		is read, and a signal after it that the tree went quiet, each move-out held by then expired. The probe stays, as an
+		entry of every version (content_view() leaves it out).
+		'''
+		probe = os.path.join(self.job.monitor, f'.probe_{time.monotonic_ns()}')
+		open(probe, 'w').close()
+		wait_until(lambda: any(e.event == 'create' and e.path == probe for e in self.events()), message='watcher not ready')
+		self.flag.clear()
 		wait_until(self.flag.is_set, message='watcher did not signal the backuper')
 		with self.lock:
 			batch = self.queue.take()
@@ -156,12 +151,12 @@ def session(job, poll_fast, monkeypatch):
 
 
 def content_view(views: dict) -> dict:
-	'''What a version must hold: each entry's kind and contents.'''
-	return {rel: (view.kind, view.data) for rel, view in views.items() if rel}
+	'''What a version must hold: each entry's kind, contents and metadata, a folder's times among them.'''
+	return {rel: (view.kind, view.data, view.mode, view.uid, view.gid, view.mtime_ns if view.kind == 'd' else None, view.xattrs) for rel, view in views.items() if rel and not rel.startswith('.probe')}
 
 
 def live_view(job) -> dict:
-	return content_view({rel: view for rel, view in snapshot_tree(job.monitor).items() if not rel.startswith('.probe')})
+	return content_view(snapshot_tree(job.monitor))
 
 
 def version_view(job, version: str = None, inodes: dict = None) -> dict:
@@ -175,9 +170,9 @@ def inodes_of(job) -> dict:
 
 
 def assert_held_as_the_tree(job, before: dict, previous: str) -> None:
-	'''The newest version is the tree, and the version before it what it was.'''
+	'''The newest version is the tree, and the version before it holds what it held: under Only Sync Attributes a chmod reaches a file's shared inode there.'''
 	assert version_view(job) == live_view(job)
-	assert version_view(job, previous) == before
+	assert {rel: view[:2] for rel, view in version_view(job, previous).items()} == {rel: view[:2] for rel, view in before.items()}
 
 
 def vault_bytes(job) -> int:
@@ -304,7 +299,7 @@ def test_a_move_in_that_the_walk_saw_and_whose_event_comes_is_one_move(session, 
 	previous = latest_version(job).path
 	os.mkdir(new)
 	batch = one.take()
-	assert [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch if e.event != 'attrib'] == [('create', 'n'), ('move', 'n/big')]
+	assert [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch if e.event != 'attrib' and '.probe' not in e.path] == [('create', 'n'), ('move', 'n/big')]
 	one.back_up(batch)
 	assert_held_as_the_tree(job, before, previous)
 	assert inodes_of(job)['n/big/a'] == inodes['big/a']
