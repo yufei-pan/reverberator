@@ -539,6 +539,26 @@ def kernel_merges(first, second):
 		yield [next(b) if i in at else next(a) for i in range(len(first) + len(second))]
 
 
+def test_a_folder_found_moved_from_a_path_that_once_held_a_deleted_folder_is_a_move(session, job):
+	# tmp once held a folder that was removed: its watch's path stayed in the watches' index, which says a folder is watched at tmp,
+	# so the folder moved there later and on into a new folder was copied whole
+	one = session({**SEED, 'big/f': 'x' * 2000000})
+	one.apply(('mkdir', 'tmp'))
+	one.apply(('write', 'tmp/x', 'x'))
+	one.back_up_next()
+	one.apply(('rmtree', 'tmp'))
+	one.back_up_next()
+	one.apply(('mv', 'big', 'tmp'))
+	one.back_up_next()
+	size = vault_bytes(job)
+	one.run([('mkdir', 'n'), ('mv', 'tmp', 'n/moved')], 'unread')
+	batch = one.take()
+	assert ('move', 'n/moved') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	one.back_up(batch)
+	assert version_view(job) == live_view(job)
+	assert vault_bytes(job) - size < 200000
+
+
 @pytest.mark.parametrize('order', range(6))
 def test_another_folders_move_out_between_a_found_folders_rename_events_is_a_copy(session, job, tmp_path, monkeypatch, order):
 	# mkdir n; mv big n/big, and on another CPU mv other/y outside/y, which takes no lock of the two folders big's rename holds: its

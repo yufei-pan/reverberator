@@ -3210,7 +3210,9 @@ def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
 
 class bidict(dict):
 	'''
-	Bidirectional dict mapping keys to values with an inverse index.
+	Bidirectional dict mapping keys to values with an inverse index (value -> [keys], in the order they were set).
+	Every way dict has to change it keeps the index: an overwrite, del, pop, popitem, setdefault, update, |= and clear.
+	copy() is a plain dict, with no index.
 
 	Examples:
 		>>> d = bidict({1: '/a', 2: '/b'})
@@ -3224,29 +3226,67 @@ class bidict(dict):
 		>>> del d[2]
 		>>> '/b' in d.inverse
 		False
+		>>> d.pop(1)
+		'/c'
+		>>> d.inverse
+		{}
 	'''
 	# Credit: https://stackoverflow.com/users/1422096/basj
 	# https://stackoverflow.com/questions/3318625/how-to-implement-an-efficient-bidirectional-hash-table
+	_missing = object()
+
 	def __init__(self, *args, **kwargs):
 		super(bidict, self).__init__(*args, **kwargs)
 		self.inverse = {}
 		for key, value in self.items():
-			self.inverse.setdefault(value, []).append(key) 
+			self.inverse.setdefault(value, []).append(key)
+
+	def _unindex(self, key, value):
+		keys = self.inverse[value]
+		keys.remove(key)
+		if not keys:
+			del self.inverse[value]
 
 	def __setitem__(self, key, value):
 		if key in self:
-			old = self[key]
-			self.inverse[old].remove(key)
-			if not self.inverse[old]:
-				del self.inverse[old]
+			self._unindex(key, self[key])
 		super(bidict, self).__setitem__(key, value)
-		self.inverse.setdefault(value, []).append(key) 
+		self.inverse.setdefault(value, []).append(key)
 
 	def __delitem__(self, key):
-		self.inverse.setdefault(self[key], []).remove(key)
-		if self[key] in self.inverse and not self.inverse[self[key]]: 
-			del self.inverse[self[key]]
+		self._unindex(key, self[key])
 		super(bidict, self).__delitem__(key)
+
+	def pop(self, key, default=_missing):
+		if key in self:
+			value = self[key]
+			del self[key]
+			return value
+		if default is bidict._missing:
+			raise KeyError(key)
+		return default
+
+	def popitem(self):
+		key, value = super(bidict, self).popitem()
+		self._unindex(key, value)
+		return key, value
+
+	def setdefault(self, key, default=None):
+		if key not in self:
+			self[key] = default
+		return self[key]
+
+	def update(self, *args, **kwargs):
+		for key, value in dict(*args, **kwargs).items():
+			self[key] = value
+
+	def __ior__(self, other):
+		self.update(other)
+		return self
+
+	def clear(self):
+		super(bidict, self).clear()
+		self.inverse.clear()
 
 def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None,found_moved:dict = None):
 	'''
