@@ -121,8 +121,15 @@ def jitter(monkeypatch, r):
 	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
 
 
+@pytest.fixture
+def folders_removed(tmp_path):
+	'''Asked for before session, so torn down after its watcher stopped: a seed's folders go with it, as thousands of seeds leave millions of inodes.'''
+	yield
+	shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 @pytest.mark.parametrize('seed', range(FIRST, FIRST + SEEDS))
-def test_random_batches_end_as_the_tree(session, job, tmp_path, monkeypatch, seed):
+def test_random_batches_end_as_the_tree(folders_removed, session, job, tmp_path, monkeypatch, seed):
 	r = random.Random(seed)
 	outside = str(tmp_path / 'outside')
 	os.makedirs(outside)
