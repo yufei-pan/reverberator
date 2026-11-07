@@ -1217,8 +1217,10 @@ MEMORY_STALL_PERCENT = 10.0
 MEMORY_LOW_FRACTION = 0.05
 QUEUE_MEMORY_SHARE = 0.25
 MEMORY_CHECK_SECONDS = 30
+# held: the folder's own watch was still mapped at its old path when its move-out was read, so no walk of a new folder had found
+# it at another name and re-pointed that watch first (always true for a file, which has none)
 # wds: for a folder, the watches at or below it when it moved away, so they can go if its move never pairs
-COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir','wds'],defaults=((),))
+COOKIE_VALUE = namedtuple('COOKIE_VALUE',['held','path','isDir','wds'],defaults=((),))
 
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
@@ -3013,9 +3015,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				skipped = skip_list is not None and skip_list.skips_path(eventPath,isDir)
 				# a batch's copy of a new folder holds what is in it, but for the moves of the batch into it, which arrive by
 				# those moves ( mkdir n; mv d n/d ): the version holds them already, and the copy leaves them out
-				# a folder the walk of the new folder already watches got there first, listed after its rename and re-pointed: the events it
-				# raised before the rename came at its new place already, and the copy holds it, as on 0.55
-				if event.wd in newDirWDs and not (event.mask & flags.MOVED_TO and event.cookie in cookieDic and not (isDir and (eventPath in wdDic.inverse or eventPath + '/' in wdDic.inverse))):
+				# a folder the walk of the new folder got to first, listed after its rename at whatever name it had by then, re-pointed its
+				# own watch before its move-out was read: the events it raised before came at its new place already, and the copy holds
+				# it, as on 0.55
+				if event.wd in newDirWDs and not (event.mask & flags.MOVED_TO and event.cookie in cookieDic and cookieDic[event.cookie].held):
 					if event.wd not in discardLoggedWDs:
 						discardLoggedWDs.add(event.wd)
 						watcherTeeLogToTl(monitor_path,f'Discarding events for new recursive folder {wdDic[event.wd]} until its copy runs')
@@ -3061,7 +3064,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						continue
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move from event detected for {eventPath}')
-					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir,watches_under(wdDic,eventPath) if isDir else ())
+					wds = watches_under(wdDic,eventPath) if isDir else ()
+					cookieDic[event.cookie] = COOKIE_VALUE(not isDir or any(wdDic[wd].rstrip('/') == eventPath for wd in wds),eventPath,isDir,wds)
 					while len(cookieDic) > COOKIE_DICT_MAX_SIZE:
 						watcherTeeLogToTl(monitor_path,'Cookie dictionary is full, popping oldest item')
 						evicted_cookie,cookie_value = cookieDic.popitem(last=False)

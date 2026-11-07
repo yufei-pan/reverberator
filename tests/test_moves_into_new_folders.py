@@ -524,8 +524,8 @@ def test_a_folder_moved_out_of_the_tree_before_its_parent_is_renamed_keeps_no_wa
 
 
 def test_a_folder_moved_to_a_path_that_once_held_a_deleted_folder_is_a_move(session, job):
-	# n/moved once held a folder that was removed: its watch's path stayed in the watches' index, which says a folder is watched at
-	# n/moved, so the check for a walk that got there first took the folder moved there later for found and copied it whole
+	# n/moved once held a folder that was removed, and a folder moved there later, after the watcher reached the new folder n, is a
+	# move: nothing the removed folder left behind makes the folder's move read as one a walk got to first, which copies it whole
 	one = session({**SEED, 'big/f': 'x' * 2000000})
 	one.run([('mkdir', 'n'), ('mkdir', 'n/moved')], 'apart')
 	one.back_up_next()
@@ -538,6 +538,32 @@ def test_a_folder_moved_to_a_path_that_once_held_a_deleted_folder_is_a_move(sess
 	one.back_up(batch)
 	assert version_view(job) == live_view(job)
 	assert vault_bytes(job) - size < 200000
+
+
+TWICE_TREE = {'big/a': 'p' * 200000, 'big/sub/b': 'p' * 200000, 'keep/k': 'k', 'other/o': 'o'}
+TWICE_SHAPES = {
+	# a change only its event shows (a poke keeps the size and mtime, cp -p of a same-size file does too), then the folder moved into
+	# a new folder (or into a folder moved there first) and renamed again, all before the watcher reads any of it
+	'twice': [('mkdir', 'n'), ('mv', 'keep', 'n/keep'), ('poke', 'big/a'), ('mv', 'big', 'n/keep/app.tmp'), ('mv', 'n/keep/app.tmp', 'n/keep/app')],
+	'twice_cpp': [('mkdir', 'n'), ('mv', 'keep', 'n/keep'), ('cpp', 'big/sub/b'), ('mv', 'big', 'n/keep/app.tmp'), ('mv', 'n/keep/app.tmp', 'n/keep/app')],
+	'once': [('mkdir', 'n'), ('mv', 'keep', 'n/keep'), ('poke', 'big/a'), ('mv', 'big', 'n/keep/app')],
+	'twice_poke_first': [('poke', 'big/a'), ('mkdir', 'n'), ('mv', 'keep', 'n/keep'), ('mv', 'big', 'n/keep/app.tmp'), ('mv', 'n/keep/app.tmp', 'n/keep/app')],
+	'twice_in_old': [('mv', 'keep', 'other/keep'), ('poke', 'big/a'), ('mv', 'big', 'other/keep/app.tmp'), ('mv', 'other/keep/app.tmp', 'other/keep/app')],
+}
+
+
+@pytest.mark.parametrize('name', TWICE_SHAPES)
+def test_a_folder_renamed_twice_in_a_new_folder_before_the_walk_lists_it_keeps_its_changed_bytes(session, job, name):
+	# the walk of the new folder lists the folder at its last name and re-points its own watch there, so the change's event is
+	# discarded with the new folder's and the copy holds it: the first move, read after that walk, is no move to keep, whatever name
+	# the folder had when it landed
+	one = session(TWICE_TREE)
+	with one.unread():
+		for step in TWICE_SHAPES[name]:
+			one.apply(step)
+	batch = one.take()
+	one.back_up(batch)
+	assert version_view(job) == live_view(job), [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch if '.probe' not in e.path]
 
 
 @pytest.mark.parametrize('order', range(6))
