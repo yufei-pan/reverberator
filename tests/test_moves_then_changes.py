@@ -1700,3 +1700,25 @@ def test_a_deleted_files_chain_link_is_never_followed_by_the_folder_check(job, l
 	monkeypatch.setattr(os.path, 'isdir', isdir)
 	verified(job, (False, 'delete', 'x', None))
 	assert followed == []
+
+
+@pytest.mark.parametrize('skip', ['du', 'walk'])
+def test_the_estimate_of_a_batch_with_nothing_carried_in_and_no_folder_made_asks_no_folder_question_for_the_put_back(job, skip, monkeypatch):
+	# the put-back and the inode of a file create look at each entry's parents only where a folder was carried in or made: a batch of file
+	# creates and modifies pays for neither. the walk branch asks in its first loop, as it did on 0.55: once for each entry's bytes, and
+	# once more for each create's inode
+	seed_monitor(job, {f'd/f{i}': 'o' * 1000 for i in range(20)})
+	run_backup(job)
+	m = job.monitor
+	for i in range(20):
+		with open(f'{m}/d/f{i}', 'a') as f:
+			f.write('m')
+	for i in range(20):
+		with open(f'{m}/d/new{i}', 'w') as f:
+			f.write('n')
+	events = [(False, 'modify', f'd/f{i}', None) for i in range(20)] + [(False, 'create', f'd/new{i}', None) for i in range(20)]
+	asked = []
+	real = rv.inside_folders
+	monkeypatch.setattr(rv, 'inside_folders', lambda *args: asked.append(args[0]) or real(*args))
+	rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
+	assert len(asked) == (len(events) + 20 if skip == 'walk' else 0)

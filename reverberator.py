@@ -10571,7 +10571,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 			if entry.endswith('/'):
 				# this is a directory
 				path_pending_to_get_inode_add.append(entry)
-			elif not inside_folders(entry, created_folders, parents_from):
+			elif not (created_folders and inside_folders(entry, created_folders, parents_from)):
 				total_inode_change += 1
 		elif copies(entry, backup_entries[entry].event):
 			path_pending_to_get_size.append(entry)
@@ -10607,8 +10607,8 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	carried_in = [entry for entry in carried_in if not inside_folders(entry, carried_folders)]
 	# what the batch copies under a carried folder went out with the folder: the new folder's walk counted it, and so did the
 	# folder just taken out. put back as the walks count: the bytes of each entry not inside a folder of these that is walked,
-	# the inodes of each create not inside a folder of these that is made
-	written = {entry: values.event for entry, values in backup_entries.items() if copies(entry, values.event) and inside_folders(entry, carried_folders)}
+	# the inodes of each create not inside a folder of these that is made. a batch that carried no folder in looks at no entry
+	written = {entry: values.event for entry, values in backup_entries.items() if copies(entry, values.event) and inside_folders(entry, carried_folders)} if carried_folders else {}
 	written_folders = {entry for entry in written if entry.endswith('/')}
 	made_folders = {entry for entry in written_folders if written[entry] == 'create'}
 	if carried_in and walk_folders:
