@@ -61,7 +61,8 @@ def seed_base(monitor: str) -> None:
 		# only the commit's flush puts them on the disk, and a cut past the end shows a commit that did not
 		'f1.txt': past_inline('F1'), 'f2.txt': past_inline('F2'), 'q.txt': 'q0', 'r.txt': 'r0', 'rr/inside.txt': 'rr0', 'chain1.txt': 'c0', 'top.txt': 't0',
 		'g/h/i/j.txt': 'j0', 'g/h/i/gone.txt': 'gone0', 'g/h/other.txt': 'o0', 'g/top.txt': 'gt0',
-		'w/old.txt': 'o0', f'w/x{UNREADABLE}': 'b0', 'w/sub/s.txt': 's0', 'attrs.txt': 'attrs0', 'owned.txt': 'owned0'}
+		'w/old.txt': 'o0', f'w/x{UNREADABLE}': 'b0', 'w/sub/s.txt': 's0', 'attrs.txt': 'attrs0', 'owned.txt': 'owned0',
+		'in1/k.txt': 'k0', 'in1/sub/l.txt': 'l0', 'in2.txt': 'i0'}
 	for i in range(6):
 		files[f'big/f{i}.txt'] = f'big{i}'
 	files['big/inner/f.txt'] = 'bi'
@@ -132,6 +133,10 @@ def change_batch3(monitor: str) -> list:
 	put_text(monitor, 'n1.txt', 'n1')
 	put_text(monitor, 'newf/a.txt', 'na')
 	put_text(monitor, 'newf/sub/b.txt', 'nb')
+	# moved into a folder of the batch, as the watcher records it since 0.55.1
+	os.mkdir(at('movein'))
+	os.rename(at('in1'), at('movein/in1'))
+	os.rename(at('in2.txt'), at('movein/in2.txt'))
 	put_text(monitor, 'a/x.txt', 'ax3')
 	put_text(monitor, 'b/y.txt', 'y3a')
 	put_text(monitor, 'b/y.txt', 'y3b')
@@ -174,7 +179,7 @@ def change_batch3(monitor: str) -> list:
 	put_text(monitor, 'w/new.txt', 'wn')
 	put_text(monitor, BAD_NAME, 'bad name')
 	put_text(monitor, NEWLINE_NAME, 'newline name')
-	return [(True, 'create', 'w', None),
+	return [(True, 'create', 'w', None), (True, 'create', 'movein', None), (True, 'move', 'movein/in1', 'in1'), (False, 'move', 'movein/in2.txt', 'in2.txt'),
 		(False, 'modify', 'g/h/i/j.txt', None), (False, 'delete', 'g/h/i/gone.txt', None), (False, 'create', 'g/h/i/new.txt', None),
 		(False, 'delete', 'c/z.txt', None), (True, 'delete', 'big', None),
 		(False, 'move', 'y', 'd/g'), (True, 'delete', 'd', None),

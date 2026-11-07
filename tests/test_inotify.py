@@ -407,7 +407,7 @@ def test_a_file_moved_into_a_new_folder_leaves_only_its_new_place(job, poll_fast
 		os.mkdir(os.path.join(job.monitor, 'd'))
 		os.rename(os.path.join(job.monitor, 'a.txt'), os.path.join(job.monitor, 'd', 'a.txt'))
 		batch = taken(to_process, lock, flag)
-	assert ('delete', 'a.txt') in rels(job, batch)
+	assert ('move', 'd/a.txt') in rels(job, batch)
 	version = run_backup(job, rv.change_events_to_backup_entries(batch, job.monitor), touched=rv.touched_scopes(batch, job.monitor))[-1]
 	assert not os.path.lexists(os.path.join(version, 'a.txt'))
 	assert open(os.path.join(version, 'd', 'a.txt')).read() == 'a'

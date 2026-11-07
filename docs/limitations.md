@@ -651,16 +651,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** the proper fix is in mergerfs: upstream https://github.com/trapexit/mergerfs/issues/1693.
 - **Revisit when:** a mergerfs release carries the fix: then check whether `removing` is still worth keeping.
 
-### A folder moved into a new folder is copied whole
-
-- **Kind:** deferred.
-- **What the operator sees:** `mkdir new; mv big new/` inside one quiet time copies the folder, with no line in the log,
-  though the vault already holds it: 106.6 MB against 0.1 MB for a move into an existing folder. With a size limit, the
-  copy can prune older versions to make room: one such move left 2 of 6 versions, with keep 9. 0.54.2 does the same.
-- **Why:** the fix is in the watcher, which keeps a move-in to a new folder as a delete and a create. It should have its
-  own gates, not ride on a conversion that cannot be undone.
-- **Revisit when:** 0.55.1, started right after 0.55 ships. `carried_in` and `move_destinations` become the main path.
-
 ### A batch with nothing to do still makes two commits
 
 - **Kind:** deferred.
