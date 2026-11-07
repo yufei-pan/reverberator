@@ -1,6 +1,7 @@
 '''
-A folder or file moved into a folder made in the same batch is a move, not a copy, driven through the real watchFolder on real
-inotify: hand-built events are why 0.55 and before copied each such folder whole with nobody seeing it.
+A folder or file moved into a folder made in the same batch, after the watcher has reached that folder, is a move and not a copy,
+driven through the real watchFolder on real inotify: hand-built events are why 0.55 and before copied each such folder whole with
+nobody seeing it. One moved in before the watcher reached the folder is copied once, as on 0.55.
 Each batch runs as the backuper runs it: collapsed, replayed, compared with what it touched.
 '''
 import contextlib
@@ -136,6 +137,20 @@ class Session:
 			shutil.rmtree(at(args[0]))
 		elif verb == 'chmod':
 			os.chmod(at(args[0]), args[1])
+		elif verb == 'poke':
+			# a write inside the file with its size and mtime kept: only its event can show it
+			stat = os.lstat(at(args[0]))
+			with open(at(args[0]), 'r+b') as f:
+				f.write(b'POKED')
+			os.utime(at(args[0]), ns=(stat.st_atime_ns, stat.st_mtime_ns))
+		elif verb == 'cpp':
+			# cp -p of a same-size file over it: other bytes, the same size and mtime
+			stat = os.lstat(at(args[0]))
+			with open(at(args[0]), 'r+b') as f:
+				data = f.read()
+				f.seek(0)
+				f.write(b'N' * 100 + data[100:])
+			os.utime(at(args[0]), ns=(stat.st_atime_ns, stat.st_mtime_ns))
 		elif verb == 'touch':
 			# a new mtime, as touch gives: the file is copied under either Only Sync Attributes setting
 			stat = os.lstat(at(args[0]))
@@ -190,9 +205,12 @@ def vault_bytes(job) -> int:
 	return rv.get_path_size(job.job_vault)
 
 
+EXISTING = [('mv', 'big', 'other/big')]
+
+
 @pytest.mark.parametrize('gap', [0, 0.2])
 @pytest.mark.parametrize('steps,rels', [
-	([('mv', 'big', 'other/big')], {'big/a': 'other/big/a', 'big/sub/b': 'other/big/sub/b'}),
+	(EXISTING, {'big/a': 'other/big/a', 'big/sub/b': 'other/big/sub/b'}),
 	([('mkdir', 'new'), ('mv', 'big', 'new/big')], {'big/a': 'new/big/a', 'big/sub/b': 'new/big/sub/b'}),
 	([('mkdir', 'p/q'), ('mv', 'big', 'p/q/big')], {'big/a': 'p/q/big/a', 'big/sub/b': 'p/q/big/sub/b'}),
 ], ids=['existing', 'new', 'nested'])
@@ -210,47 +228,50 @@ def test_a_folder_moved_keeps_its_inodes_and_the_vault_grows_by_no_copy(session,
 	one.back_up_next()
 	assert_held_as_the_tree(job, before, previous)
 	after = inodes_of(job)
-	assert {new: after[new] for new in rels.values()} == {new: inodes[old] for old, new in rels.items()}
-	# 400 KB would be a copy; what a batch itself adds is a few folders, links and lists
-	assert vault_bytes(job) - size < 200000
+	# a folder moved into a new one at gap 0 may be moved before the watcher reaches the new folder, and then it is copied once: the
+	# race has either result, so only a gap that lets the watcher reach the folder says it is a move
+	if gap or steps == EXISTING:
+		assert {new: after[new] for new in rels.values()} == {new: inodes[old] for old, new in rels.items()}
+		# 400 KB would be a copy; what a batch itself adds is a few folders, links and lists
+		assert vault_bytes(job) - size < 200000
 
 
-# name, steps, what keeps its inode (old rel -> new rel), and whether that holds with the moves done as fast as they go or before
-# the watcher reads: a file moved in then has no watch to tell it by and a second rename may have no event either, so the entry
-# is copied (a folder has its watch, which says where it went)
+# name, steps, and what keeps its inode (old rel -> new rel) when the watcher reads each step apart. Done before the watcher reads, a
+# folder or file moved into a new folder is copied once, as on 0.55: nothing says which entry went where, so no inode is expected
 SHAPES = [
-	('folder', [('mkdir', 'n'), ('mv', 'big', 'n/big')], {'big/a': 'n/big/a', 'big/sub/b': 'n/big/sub/b'}, True),
-	('file', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt')], {'f.txt': 'n/f.txt'}, False),
-	('file_renamed', [('mkdir', 'n'), ('mv', 'f.txt', 'n/renamed')], {'f.txt': 'n/renamed'}, False),
-	('nested', [('mkdir', 'p/q/r'), ('mv', 'big', 'p/q/r/big')], {'big/a': 'p/q/r/big/a'}, True),
-	('folder_written_in', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('write', 'n/big/z', 'z'), ('append', 'n/big/a', 'more')], {'big/sub/b': 'n/big/sub/b'}, True),
-	('folder_chmod_in', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('chmod', 'n/big', 0o700), ('chmod', 'n/big/a', 0o600)], {'big/sub/b': 'n/big/sub/b'}, True),
-	('folder_removed_from', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('rm', 'n/big/a')], {'big/sub/b': 'n/big/sub/b'}, True),
-	('changed_before', [('append', 'big/a', 'more'), ('mkdir', 'n'), ('mv', 'big', 'n/big')], {'big/sub/b': 'n/big/sub/b'}, True),
-	('changed_between', [('mkdir', 'n'), ('append', 'big/a', 'more'), ('mv', 'big', 'n/big')], {'big/sub/b': 'n/big/sub/b'}, True),
-	('file_written_after', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt'), ('append', 'n/f.txt', 'more')], {}, True),
-	('file_chmod_after', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt'), ('chmod', 'n/f.txt', 0o600)], {}, True),
-	('file_replaced', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt'), ('rm', 'n/f.txt'), ('write', 'n/f.txt', 'new')], {}, True),
-	('out_to_a_folder', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'other/big')], {'big/a': 'other/big/a'}, False),
-	('out_of_the_tree', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big', '{outside}/big')], {}, True),
-	('file_out_again', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt'), ('mv', 'n/f.txt', 'other/f.txt')], {'f.txt': 'other/f.txt'}, False),
-	('chain', [('mkdir', 'n'), ('mkdir', 'n2'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'n2/big')], {'big/a': 'n2/big/a'}, False),
-	('file_chain', [('mkdir', 'n'), ('mkdir', 'n2'), ('mv', 'f.txt', 'n/f.txt'), ('mv', 'n/f.txt', 'n2/f.txt')], {'f.txt': 'n2/f.txt'}, False),
-	('renamed_inside', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'n/big2')], {'big/a': 'n/big2/a'}, False),
-	('swap', [('mkdir', 'n'), ('mv', 'f.txt', 'n/t'), ('mv', 'g.txt', 'f.txt'), ('mv', 'n/t', 'g.txt')], {}, True),
-	('folder_swap', [('mkdir', 'n'), ('mv', 'big', 'n/t'), ('mv', 'other', 'big'), ('mv', 'n/t', 'other')], {}, True),
-	('new_folder_renamed', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n', 'm')], {}, True),
-	('new_folder_removed', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('rmtree', 'n')], {}, True),
-	('new_folder_moved_on', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n', 'other/n')], {}, True),
-	('folder_made_inside', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mkdir', 'n/big/s'), ('write', 'n/big/s/f', 'f')], {'big/a': 'n/big/a'}, True),
-	('beside_new_files', [('mkdir', 'n'), ('write', 'n/own', 'own'), ('mv', 'big', 'n/big'), ('write', 'n/own2', 'own2')], {'big/a': 'n/big/a'}, True),
-	('from_outside', [('mkdir', 'n'), ('mv', '{outside}/kept', 'n/kept')], {}, True),
-	('onto_a_moved_in_file', [('mkdir', 'n'), ('mv', 'f.txt', 'n/x'), ('mv', 'g.txt', 'n/x')], {'g.txt': 'n/x'}, False),
-	('a_file_made_in_the_batch', [('write', 'made', 'made'), ('mkdir', 'n'), ('mv', 'made', 'n/made')], {}, True),
-	('a_folder_made_in_the_batch', [('mkdir', 'd'), ('write', 'd/f', 'f'), ('mkdir', 'n'), ('mv', 'd', 'n/d')], {}, True),
-	('moved_inside_a_new_folder', [('mkdir', 'n'), ('write', 'n/a', 'a'), ('mv', 'n/a', 'n/b')], {}, True),
-	('moved_out_of_a_new_folder', [('mkdir', 'n'), ('write', 'n/a', 'a'), ('mv', 'n/a', 'other/a')], {}, True),
-	('its_own_old_place', [('mv', 'big', 'x'), ('mkdir', 'big'), ('mv', 'x', 'big/big')], {}, True),
+	('folder', [('mkdir', 'n'), ('mv', 'big', 'n/big')], {'big/a': 'n/big/a', 'big/sub/b': 'n/big/sub/b'}),
+	('file', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt')], {'f.txt': 'n/f.txt'}),
+	('file_renamed', [('mkdir', 'n'), ('mv', 'f.txt', 'n/renamed')], {'f.txt': 'n/renamed'}),
+	('nested', [('mkdir', 'p/q/r'), ('mv', 'big', 'p/q/r/big')], {'big/a': 'p/q/r/big/a'}),
+	('folder_written_in', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('write', 'n/big/z', 'z'), ('append', 'n/big/a', 'more')], {'big/sub/b': 'n/big/sub/b'}),
+	('folder_chmod_in', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('chmod', 'n/big', 0o700), ('chmod', 'n/big/a', 0o600)], {'big/sub/b': 'n/big/sub/b'}),
+	('folder_removed_from', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('rm', 'n/big/a')], {'big/sub/b': 'n/big/sub/b'}),
+	('changed_before', [('append', 'big/a', 'more'), ('mkdir', 'n'), ('mv', 'big', 'n/big')], {'big/sub/b': 'n/big/sub/b'}),
+	# a same-size write with its mtime kept: only its event shows it, and the copy of the folder must be made after it
+	('changed_between', [('mkdir', 'n'), ('poke', 'big/a'), ('mv', 'big', 'n/big')], {'big/sub/b': 'n/big/sub/b'}),
+	('file_written_after', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt'), ('append', 'n/f.txt', 'more')], {}),
+	('file_chmod_after', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt'), ('chmod', 'n/f.txt', 0o600)], {}),
+	('file_replaced', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt'), ('rm', 'n/f.txt'), ('write', 'n/f.txt', 'new')], {}),
+	('out_to_a_folder', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'other/big')], {'big/a': 'other/big/a'}),
+	('out_of_the_tree', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big', '{outside}/big')], {}),
+	('file_out_again', [('mkdir', 'n'), ('mv', 'f.txt', 'n/f.txt'), ('mv', 'n/f.txt', 'other/f.txt')], {'f.txt': 'other/f.txt'}),
+	('chain', [('mkdir', 'n'), ('mkdir', 'n2'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'n2/big')], {'big/a': 'n2/big/a'}),
+	('file_chain', [('mkdir', 'n'), ('mkdir', 'n2'), ('mv', 'f.txt', 'n/f.txt'), ('mv', 'n/f.txt', 'n2/f.txt')], {'f.txt': 'n2/f.txt'}),
+	('renamed_inside', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'n/big2')], {'big/a': 'n/big2/a'}),
+	('swap', [('mkdir', 'n'), ('mv', 'f.txt', 'n/t'), ('mv', 'g.txt', 'f.txt'), ('mv', 'n/t', 'g.txt')], {}),
+	('folder_swap', [('mkdir', 'n'), ('mv', 'big', 'n/t'), ('mv', 'other', 'big'), ('mv', 'n/t', 'other')], {}),
+	('new_folder_renamed', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n', 'm')], {}),
+	('new_folder_removed', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('rmtree', 'n')], {}),
+	('new_folder_moved_on', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n', 'other/n')], {}),
+	('folder_made_inside', [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mkdir', 'n/big/s'), ('write', 'n/big/s/f', 'f')], {'big/a': 'n/big/a'}),
+	('beside_new_files', [('mkdir', 'n'), ('write', 'n/own', 'own'), ('mv', 'big', 'n/big'), ('write', 'n/own2', 'own2')], {'big/a': 'n/big/a'}),
+	('from_outside', [('mkdir', 'n'), ('mv', '{outside}/kept', 'n/kept')], {}),
+	('onto_a_moved_in_file', [('mkdir', 'n'), ('mv', 'f.txt', 'n/x'), ('mv', 'g.txt', 'n/x')], {'g.txt': 'n/x'}),
+	('a_file_made_in_the_batch', [('write', 'made', 'made'), ('mkdir', 'n'), ('mv', 'made', 'n/made')], {}),
+	('a_folder_made_in_the_batch', [('mkdir', 'd'), ('write', 'd/f', 'f'), ('mkdir', 'n'), ('mv', 'd', 'n/d')], {}),
+	('moved_inside_a_new_folder', [('mkdir', 'n'), ('write', 'n/a', 'a'), ('mv', 'n/a', 'n/b')], {}),
+	('moved_out_of_a_new_folder', [('mkdir', 'n'), ('write', 'n/a', 'a'), ('mv', 'n/a', 'other/a')], {}),
+	('its_own_old_place', [('mv', 'big', 'x'), ('mkdir', 'big'), ('mv', 'x', 'big/big')], {}),
 ]
 
 
@@ -263,8 +284,8 @@ MATRIX = [pytest.param(*shape, timing, osa, id=f'{shape[0]}-{timing}-{"osa" if o
 	for osa in ((True, False) if any(step[0] == 'chmod' for step in shape[1]) else (True,))]
 
 
-@pytest.mark.parametrize('name,steps,kept,kept_unread,timing,only_sync_attributes', MATRIX)
-def test_a_batch_of_moves_into_new_folders_ends_as_the_tree(session, job, tmp_path, name, steps, kept, kept_unread, timing, only_sync_attributes):
+@pytest.mark.parametrize('name,steps,kept,timing,only_sync_attributes', MATRIX)
+def test_a_batch_of_moves_into_new_folders_ends_as_the_tree(session, job, tmp_path, name, steps, kept, timing, only_sync_attributes):
 	outside = tmp_path / 'outside'
 	os.makedirs(outside / 'kept')
 	(outside / 'kept' / 'x').write_text('x')
@@ -280,7 +301,7 @@ def test_a_batch_of_moves_into_new_folders_ends_as_the_tree(session, job, tmp_pa
 	one.apply(('write', 'other/marker', 'm'))
 	one.back_up_next()
 	assert version_view(job) == live_view(job)
-	if timing == 'apart' or kept_unread:
+	if timing == 'apart':
 		after = inodes_of(job)
 		assert {new: after[new] for new in kept.values()} == {new: inodes[old] for old, new in kept.items()}
 
@@ -301,25 +322,6 @@ def test_moves_into_new_folders_as_fast_as_they_go_end_as_the_tree(session, job)
 		one.apply(('write', f'm{i}/src{i}/after', 'after'))
 	one.back_up_next()
 	assert version_view(job) == live_view(job)
-
-
-def test_what_a_walk_found_is_emptied_by_a_take(session, job, monkeypatch):
-	# the old paths of the folders a walk found moved in are kept for the batch, a subfolder's until it moves itself: a take empties
-	# them, or a quiet daemon would hold one for each folder it ever found
-	kept = {}
-	real = rv.initializeFolderWatchers
-	def walk(*args, **kwargs):
-		caller = sys._getframe(1).f_locals
-		kept.update(found=caller['foundMoved'])
-		return real(*args, **kwargs)
-	monkeypatch.setattr(rv, 'initializeFolderWatchers', walk)
-	one = session()
-	with one.unread():
-		one.run([('mkdir', 'n'), ('mv', 'big', 'n/big')], 'at_once')
-	one.settle()
-	assert kept['found']
-	one.take()
-	wait_until(lambda: not kept['found'], message='the take did not empty what the walk found')
 
 
 @pytest.mark.parametrize('timing', TIMINGS)
@@ -401,38 +403,6 @@ def test_a_write_with_its_mtime_set_back_in_a_moved_in_file_is_in_a_version(sess
 	assert version_view(job)[rel][1] == live_view(job)[rel][1]
 
 
-def test_events_in_a_folder_the_walk_found_moved_in_are_recorded(session, job):
-	# nothing copies it: its move does, and what changes in it is recorded as in any moved folder
-	one = session()
-	with one.unread():
-		one.apply(('mkdir', 'n'))
-		one.apply(('mv', 'big', 'n/big'))
-	z = os.path.join(job.monitor, 'n', 'big', 'sub', 'z')
-	wait_until(lambda: any(e.event == 'move' for e in one.events()), message='no move')
-	one.apply(('write', 'n/big/sub/z', 'z'))
-	wait_until(lambda: any(e.event == 'create' and e.path == z for e in one.events()), message='no create of the file')
-
-
-def test_what_a_walk_found_ends_with_the_take(session, job, tmp_path):
-	# a found subfolder has no move-out of its own here: left over, it would take a later move-out at that path
-	one = session()
-	with one.unread():
-		one.apply(('mkdir', 'n'))
-		one.apply(('write', 'n/g.txt', 'another g'))
-		one.apply(('mv', 'big', 'n/big'))
-	one.back_up_next()
-	one.apply(('mkdir', 'big/sub'))
-	one.back_up_next()
-	one.apply(('mkdir', 'other/x'))
-	one.back_up_next()
-	os.rename(os.path.join(job.monitor, 'big', 'sub'), tmp_path / 'sub')
-	os.rename(os.path.join(job.monitor, 'g.txt'), tmp_path / 'g.txt')
-	batch = one.take()
-	assert sorted((e.event, os.path.relpath(e.path, job.monitor)) for e in batch if e.event in ('move', 'delete')) == [('delete', 'big/sub'), ('delete', 'g.txt')]
-	one.back_up(batch)
-	assert version_view(job) == live_view(job)
-
-
 def written_after(one, job, rel):
 	'''A write in a folder, as a later batch holds it: the folder must still be watched, or no event comes and the version never gets it.'''
 	one.apply(('write', rel, 'after'))
@@ -511,8 +481,7 @@ def test_a_folder_with_no_watch_yet_at_a_found_folders_old_path_is_not_that_fold
 @pytest.mark.parametrize('timing', TIMINGS)
 def test_the_order_of_fuzz_seed_2854(session, job, tmp_path, timing):
 	# keep/s/n2 leaves the tree and keep is renamed before that move-out expires, which kept the watch of the folder outside mapped at
-	# c/keep2/s/n2. the folder comes back, a new folder is made at that path, and a chain moves it on: no key of the found folder may
-	# take another folder's move
+	# c/keep2/s/n2. the folder comes back, a new folder is made at that path, and a chain moves it on: the version must end as the tree
 	outside = tmp_path / 'outside'
 	os.makedirs(outside)
 	one = session({'keep/s/n2/b/h': 'h' * 100, 'x/n1/y': 'y', 'x/z': 'z', 'c/b/f': 'f', 'c/s/g': 'g', 'other/o': 'o'})
@@ -554,19 +523,16 @@ def test_a_folder_moved_out_of_the_tree_before_its_parent_is_renamed_keeps_no_wa
 	assert {os.path.relpath(e.path, job.monitor) for e in batch if '.probe' not in e.path} == {'c/g2'}
 
 
-def test_a_folder_found_moved_from_a_path_that_once_held_a_deleted_folder_is_a_move(session, job):
-	# tmp once held a folder that was removed: its watch's path stayed in the watches' index, which says a folder is watched at tmp,
-	# so the folder moved there later and on into a new folder was copied whole
+def test_a_folder_moved_to_a_path_that_once_held_a_deleted_folder_is_a_move(session, job):
+	# n/moved once held a folder that was removed: its watch's path stayed in the watches' index, which says a folder is watched at
+	# n/moved, so the check for a walk that got there first took the folder moved there later for found and copied it whole
 	one = session({**SEED, 'big/f': 'x' * 2000000})
-	one.apply(('mkdir', 'tmp'))
-	one.apply(('write', 'tmp/x', 'x'))
+	one.run([('mkdir', 'n'), ('mkdir', 'n/moved')], 'apart')
 	one.back_up_next()
-	one.apply(('rmtree', 'tmp'))
-	one.back_up_next()
-	one.apply(('mv', 'big', 'tmp'))
+	one.apply(('rmtree', 'n'))
 	one.back_up_next()
 	size = vault_bytes(job)
-	one.run([('mkdir', 'n'), ('mv', 'tmp', 'n/moved')], 'unread')
+	one.run([('mkdir', 'n'), ('mv', 'big', 'n/moved')], 'apart')
 	batch = one.take()
 	assert ('move', 'n/moved') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
 	one.back_up(batch)
@@ -575,10 +541,10 @@ def test_a_folder_found_moved_from_a_path_that_once_held_a_deleted_folder_is_a_m
 
 
 @pytest.mark.parametrize('order', range(6))
-def test_another_folders_move_out_between_a_found_folders_rename_events_is_a_copy(session, job, tmp_path, monkeypatch, order):
-	# mkdir n; mv big n/big, and on another CPU mv other/y outside/y, which takes no lock of the two folders big's rename holds: its
-	# MOVED_FROM and MOVE_SELF can land anywhere among big's. big pairs only when its MOVE_SELF comes right after its own MOVED_FROM;
-	# in any other order the move-out of big is a delete and n is copied, never a move from other/y
+def test_another_folders_move_out_among_a_folders_rename_events_is_never_its_move(session, job, tmp_path, monkeypatch, order):
+	# mkdir n; mv big n/big before the watcher reads n, and on another CPU mv other/y outside/y, which takes no lock of the two folders
+	# big's rename holds: its MOVED_FROM and MOVE_SELF can land anywhere among big's. nothing pairs big with a move-out by its
+	# MOVE_SELF: in every order the move-out of big is a delete and n is copied, never a move from other/y
 	one = session({**SEED, 'other/y/z': 'z' * 100})
 	before = version_view(job)
 	previous = latest_version(job).path
@@ -601,18 +567,16 @@ def test_another_folders_move_out_between_a_found_folders_rename_events_is_a_cop
 	go.set()
 	batch = one.take()
 	moves = [(os.path.relpath(e.path, job.monitor), os.path.relpath(e.moved_from, job.monitor)) for e in batch if e.event == 'move']
-	adjacent = list(kernel_merges(range(2), range(2, 4)))[order]
-	adjacent = adjacent.index(1) == adjacent.index(0) + 1
-	assert moves == ([('n/big', 'big')] if adjacent else [])
+	assert moves == []
 	one.back_up(batch)
 	assert_held_as_the_tree(job, before, previous)
 	written_after(one, job, 'n/big/after')
 
 
-def test_a_folder_found_moved_in_is_not_a_new_folder_when_its_parent_is_walked_again(session, job, monkeypatch):
+def test_a_write_kept_at_its_size_and_mtime_in_a_folder_the_walk_found_moved_in_is_in_a_version(session, job, monkeypatch):
 	# a/b is made and big moved into it while a is walked: that walk finds big under its old watch, and a's next read, the create of
-	# a/b, walks a/b again. big is carried by its move and nothing copies it, so a write in it, made so that only its event can
-	# show it (inside the file, its mtime set back), must still be recorded
+	# a/b, walks a/b again. a's copy holds big, and a write in it, made so that only its event can show it (inside the file, its mtime
+	# set back), is in that copy: its events are discarded until the copy runs
 	one = session({**SEED, 'big/a': 'A' * 4096 + TAIL})
 	new, big = os.path.join(job.monitor, 'a'), os.path.join(job.monitor, 'big')
 	real = rv.iter_tree_entries
@@ -622,9 +586,6 @@ def test_a_folder_found_moved_in_is_not_a_new_folder_when_its_parent_is_walked_a
 			os.rename(big, os.path.join(new, 'b', 'big'))
 		return real(path, *args, **kwargs)
 	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
-	inodes = inodes_of(job)
-	before = version_view(job)
-	previous = latest_version(job).path
 	os.mkdir(new)
 	one.settle()
 	moved = os.path.join(new, 'b', 'big', 'a')
@@ -634,11 +595,9 @@ def test_a_folder_found_moved_in_is_not_a_new_folder_when_its_parent_is_walked_a
 		f.write(b'WRITTEN')
 	os.utime(moved, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 	batch = one.take()
-	assert ('move', 'a/b/big') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
-	assert ('modify', 'a/b/big/a') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	assert not [e for e in batch if e.event == 'move']
 	one.back_up(batch)
 	assert version_view(job) == live_view(job)
-	assert inodes_of(job)['a/b/big/sub/b'] == inodes['big/sub/b']
 
 
 @pytest.mark.parametrize('into', ['m/big', 'm/s/big'])
@@ -682,9 +641,10 @@ def test_a_folder_moved_into_a_folder_from_outside_while_it_is_walked_keeps_its_
 	assert version_view(job) == live_view(job)
 
 
-def test_a_folder_moved_into_a_new_folder_made_after_its_parents_walk_listed_it_is_a_move(session, job, monkeypatch):
+def test_a_folder_moved_into_a_new_folder_made_after_its_parents_walk_listed_it_is_copied(session, job, monkeypatch):
 	# mkdir -p p/q; mv big p/q/big, with p walked before q exists: q's create is read after that walk, and q's own walk, in the
-	# discard of a folder p's copy holds, is the one that finds big under its old watch
+	# discard of a folder p's copy holds, is the one that finds big under its old watch. no MOVED_TO comes, as q had no watch: p's copy
+	# holds big, as on 0.55
 	one = session({**SEED, **{f'big/f{i}': f'{i}' * 100000 for i in range(4)}})
 	new, big = os.path.join(job.monitor, 'p'), os.path.join(job.monitor, 'big')
 	real = rv.iter_tree_entries
@@ -695,23 +655,18 @@ def test_a_folder_moved_into_a_new_folder_made_after_its_parents_walk_listed_it_
 			os.rename(big, os.path.join(new, 'q', 'big'))
 		return iter(listed)
 	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
-	inodes = inodes_of(job)
 	before = version_view(job)
 	previous = latest_version(job).path
-	size = vault_bytes(job)
 	os.mkdir(new)
 	batch = one.take()
-	assert ('move', 'p/q/big') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
+	assert not [e for e in batch if e.event == 'move']
 	one.back_up(batch)
 	assert_held_as_the_tree(job, before, previous)
-	assert inodes_of(job)['p/q/big/a'] == inodes['big/a']
-	# 400 KB would be a copy
-	assert vault_bytes(job) - size < 200000
+	written_after(one, job, 'p/q/big/after')
 
 
-def test_a_folder_found_moved_in_is_moved_on_in_a_later_read(session, job, monkeypatch):
-	# the walk of n finds big under its old watch, and what moves it on later is in a folder the batch made: recorded, so the folder
-	# is a move to n2 and not a copy
+def test_a_folder_the_walk_found_moved_in_and_moved_on_in_a_later_read_ends_as_the_tree(session, job, monkeypatch):
+	# the walk of n finds big under its old watch, and it is moved on later, out of the new folder n whose copy holds it
 	one = session()
 	new, big = os.path.join(job.monitor, 'n'), os.path.join(job.monitor, 'big')
 	one.apply(('mkdir', 'n2'))
@@ -721,7 +676,6 @@ def test_a_folder_found_moved_in_is_moved_on_in_a_later_read(session, job, monke
 			os.rename(big, os.path.join(new, 'big'))
 		return real(path, *args, **kwargs)
 	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
-	inodes = inodes_of(job)
 	before = version_view(job)
 	previous = latest_version(job).path
 	os.mkdir(new)
@@ -729,27 +683,7 @@ def test_a_folder_found_moved_in_is_moved_on_in_a_later_read(session, job, monke
 	one.apply(('mv', 'n/big', 'n2/big'))
 	one.back_up_next()
 	assert_held_as_the_tree(job, before, previous)
-	assert inodes_of(job)['n2/big/a'] == inodes['big/a']
-
-
-def test_a_folder_found_moved_into_a_subfolder_of_a_walk_is_moved_on_as_a_move(session, job):
-	# mkdir -p p/q; mv big p/q/big before the watcher reads any: p's walk watches q as p/q/ and finds big there. q is no new folder
-	# to the discard once big landed in it, so big moved on in the same batch is a move and not a copy
-	one = session({**SEED, **{f'big/f{i}': f'{i}' * 100000 for i in range(4)}})
-	inodes = inodes_of(job)
-	before = version_view(job)
-	previous = latest_version(job).path
-	one.run([('mkdir', 'p/q'), ('mv', 'big', 'p/q/big')], 'unread')
-	one.settle()
-	size = vault_bytes(job)
-	one.apply(('mv', 'p/q/big', 'other/big'))
-	batch = one.take()
-	assert ('move', 'other/big') in [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
-	one.back_up(batch)
-	assert_held_as_the_tree(job, before, previous)
-	assert inodes_of(job)['other/big/f0'] == inodes['big/f0']
-	# 400 KB would be a copy
-	assert vault_bytes(job) - size < 200000
+	written_after(one, job, 'n2/big/after')
 
 
 def test_a_folder_moved_into_a_folder_from_outside_before_its_subfolder_is_listed_is_copied(session, job, tmp_path, monkeypatch):
@@ -774,9 +708,9 @@ def test_a_folder_moved_into_a_folder_from_outside_before_its_subfolder_is_liste
 	written_after(one, job, 'm/s/big/after')
 
 
-def test_a_move_out_waiting_at_the_place_a_folder_is_found_moved_to_is_its_delete_first(session, job, tmp_path):
+def test_a_move_out_waiting_at_the_place_a_folder_is_moved_to_is_its_delete_first(session, job, tmp_path):
 	# n/big leaves the tree and n is renamed away, a new n is made and big moved into it, before the watcher reads any: the move-out
-	# of the old n/big waits for a pair, and its delete, expiring after the move landed on that name, would remove the moved-in folder
+	# of the old n/big waits for a pair, and its delete, expiring after the folder landed on that name, must not remove the copied one
 	one = session({**SEED, 'n/big/old': 'old'})
 	before = version_view(job)
 	previous = latest_version(job).path
@@ -784,8 +718,6 @@ def test_a_move_out_waiting_at_the_place_a_folder_is_found_moved_to_is_its_delet
 		os.rename(os.path.join(job.monitor, 'n', 'big'), tmp_path / 'oldbig')
 		one.run([('mv', 'n', 'n_old'), ('mkdir', 'n'), ('mv', 'big', 'n/big')], 'at_once')
 	batch = one.take()
-	events = [(e.event, os.path.relpath(e.path, job.monitor)) for e in batch]
-	assert events.index(('delete', 'n/big')) < events.index(('move', 'n/big'))
 	one.back_up(batch)
 	assert_held_as_the_tree(job, before, previous)
 
@@ -849,7 +781,6 @@ def test_a_take_between_the_mkdir_and_the_mv(session, job):
 
 def test_a_take_before_the_watcher_reads_the_mkdir(session, job):
 	one = session()
-	inodes = inodes_of(job)
 	with one.unread():
 		one.apply(('mkdir', 'n'))
 		one.apply(('mv', 'big', 'n/big'))
@@ -858,7 +789,6 @@ def test_a_take_before_the_watcher_reads_the_mkdir(session, job):
 	one.apply(('write', 'n/big/z', 'z'))
 	one.back_up_next()
 	assert version_view(job) == live_view(job)
-	assert inodes_of(job)['n/big/a'] == inodes['big/a']
 
 
 def test_a_take_and_its_copy_between_the_mv_and_its_read(session, job):
@@ -935,8 +865,7 @@ def test_a_take_waits_for_the_walk_of_a_folder_moved_into_a_new_folder(session, 
 	assert inodes_of(job)['n/big/a'] == inodes['big/a']
 
 
-@pytest.mark.parametrize('timing', TIMINGS)
-def test_a_move_into_a_new_folder_prunes_no_version(session, job, timing):
+def test_a_move_into_a_new_folder_the_watcher_has_reached_prunes_no_version(session, job):
 	big = {f'big/f{i}': f'{i}' * 200000 for i in range(5)}
 	one = session(big, keep_n_versions=9, backup_size_limit='0')
 	for i in range(5):
@@ -946,7 +875,7 @@ def test_a_move_into_a_new_folder_prunes_no_version(session, job, timing):
 	assert len(versions) == 6
 	# room for this batch and more, but not for a copy of big
 	one.options['backup_size_limit'] = str(rv.get_vault_info(job.job_vault).vault_size + 500000)
-	one.run([('mkdir', 'new'), ('mv', 'big', 'new/big')], timing)
+	one.run([('mkdir', 'new'), ('mv', 'big', 'new/big')], 'apart')
 	one.back_up_next()
 	assert committed_versions(job)[:-1] == versions
 	assert version_view(job) == live_view(job)
@@ -1003,10 +932,10 @@ def test_on_a_filesystem_with_no_exchange(session, job, monkeypatch, timing):
 	one.run([('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'f.txt', 'n/f.txt'), ('write', 'n/big/z', 'z')], timing)
 	one.back_up_next()
 	assert_held_as_the_tree(job, before, previous)
-	after = inodes_of(job)
-	assert after['n/big/a'] == inodes['big/a']
-	# a file moved in before the watcher reached the folder is copied
+	# a folder or file moved in before the watcher reached the new folder is copied
 	if timing == 'apart':
+		after = inodes_of(job)
+		assert after['n/big/a'] == inodes['big/a']
 		assert after['n/f.txt'] == inodes['f.txt']
 	assert tried
 
