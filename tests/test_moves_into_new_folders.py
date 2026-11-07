@@ -508,19 +508,46 @@ def kernel_merges(first, second):
 		yield [next(b) if i in at else next(a) for i in range(len(first) + len(second))]
 
 
-def test_a_folder_moved_out_of_the_tree_before_its_parent_is_renamed_keeps_no_watch(session, job, tmp_path):
-	# keep/s/n2 leaves the tree and keep is renamed before that move-out expires: the rename re-points the watch of the folder now
-	# outside to c/keep2/s/n2, where nothing lives, and it must still go with the move-out's delete
-	one = session({'keep/s/n2/h': 'h', 'c/g': 'g'})
-	with one.unread():
-		os.rename(os.path.join(job.monitor, 'keep/s/n2'), tmp_path / 'x')
-		one.apply(('mv', 'keep', 'c/keep2'))
+class StagedReads:
+	'''The watcher reads once per stage, and stands before its next read in between: a stage runs its steps while the watcher waits to read, lets it read and handle everything, and returns when it waits again.'''
+	def __init__(self, monkeypatch):
+		self.real = rv.inotify_simple.INotify.read
+		self.waiting, self.permit, self.open = threading.Event(), threading.Semaphore(0), False
+		def read(inotify, *args, **kwargs):
+			if not self.open:
+				self.waiting.set()
+				assert self.permit.acquire(timeout=20), 'the stage did not come'
+			return self.real(inotify, *args, **kwargs)
+		monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+
+	def stage(self, one, steps):
+		assert self.waiting.wait(20), 'the watcher did not come back to read'
+		for step in steps:
+			one.apply(step)
+		self.waiting.clear()
+		self.permit.release()
+		assert self.waiting.wait(20), 'the watcher did not come back to read'
+
+	def end(self):
+		self.open = True
+		self.permit.release()
+
+
+def test_a_subfolder_taken_back_from_a_folder_moved_out_keeps_its_watch_when_the_move_out_expires(session, job, tmp_path, monkeypatch):
+	# X leaves the tree and takes its watches along, and one of them, X/sub, is moved back (the stale watch of X reports it as a move
+	# from X/sub), which re-points that watch to sub. the read that holds the rename sub -> sub2 and a same-size write in it also finds
+	# the move-out of X past the pair timeout of a tree that is never quiet: the watch is a live folder's, though its path has no folder
+	# yet to the watcher, and removing it loses the write, which only its event shows
+	monkeypatch.setattr(rv, 'MOVE_PAIR_TIMEOUT_SECONDS', 1.0)
+	one = session({'X/g': 'g' * 100, 'X/sub/f': 'f' * 200000, 'X/sub/deep/h': 'h' * 100, 'other/o': 'o'})
+	reads = StagedReads(monkeypatch)
+	reads.stage(one, [('mv', 'X', str(tmp_path / 'out'))])
+	reads.stage(one, [('mv', str(tmp_path / 'out' / 'sub'), 'sub')])
+	time.sleep(1.1)
+	reads.stage(one, [('mv', 'sub', 'sub2'), ('poke', 'sub2/f')])
+	reads.end()
 	one.back_up_next()
-	one.back_up_next()
-	(tmp_path / 'x' / 'written_outside').write_text('w')
-	one.apply(('write', 'c/g2', 'x'))
-	batch = one.take()
-	assert {os.path.relpath(e.path, job.monitor) for e in batch if '.probe' not in e.path} == {'c/g2'}
+	assert version_view(job) == live_view(job)
 
 
 def test_a_folder_moved_to_a_path_that_once_held_a_deleted_folder_is_a_move(session, job):
