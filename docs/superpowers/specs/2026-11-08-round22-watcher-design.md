@@ -14,10 +14,13 @@ new copy, the only question.
   run the background. so every little bit will sum up to a lot over days month years." "simpler and smarter is better".
   "one of the core for reverberator is reuse existing linux features and easy browse / restore."
 - 2026-11-07, on these three entries: "Next round, right after 0.55.1 (Recommended)".
-- 2026-11-07, round 21 ("Drop the feature (Recommended)"): when the watcher cannot be sure, it errs toward a copy, never
-  toward wrong bytes.
+- 2026-11-07, round 21, when another order kept wrong bytes through the move into a new folder: "Drop the feature
+  (Recommended)", so every such move is copied, as on 0.55.
 - 2026-11-08, on section 12's question: "Known limitation (Recommended)", widening the approved entry "A move that
   another change of the batch outran is copied".
+
+Not the user's words, but the rule this design follows from round 21's rulings: when the watcher cannot be sure, it
+errs toward a copy, never toward wrong bytes.
 
 ## 0. In short
 
