@@ -728,14 +728,19 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   not yet passed the first name. A move into a new folder does not reach it: that is copied.
 - **Why:** older than 0.55.1. The fix, a folder move whose watch a walk re-pointed before its move-out was read is copied
   wherever it lands, changes what is recorded for a folder that never had a watch, so it needs its own design and gates.
-- **Revisit when:** the round after 0.55.1 that changes the watcher.
+- **Revisit when:** the round right after 0.55.1, as the user decided on 2026-11-07.
 
 ### A folder moved out of the tree from a new folder keeps its watch
 
 - **Kind:** deferred.
-- **What the operator sees:** no wrong version. After `mkdir n; mkdir n/x; mv n/x /elsewhere/x` in one batch, the watch of
-  `/elsewhere/x` stays mapped at `n/x` for as long as that folder exists, so changes there come as deletes, moves and writes
-  under `n/x` that cost extra work, and the check after the batch puts the version right. In the same way, a folder moved
+- **What the operator sees:** after `mkdir n; mkdir n/x; mv n/x /elsewhere/x` in one batch, the watch of `/elsewhere/x`
+  stays mapped at `n/x` for as long as that folder exists, so changes there come as deletes, moves and writes under `n/x`
+  that cost extra work, and the check after the batch mostly puts the version right. It does not when another folder now at
+  `n/x` holds two files of one size, mtime and last 64 KiB (a `tar x` of two same-size files padded alike) and a rename in
+  `/elsewhere/x` goes from one of their names to the other: the version renames its file onto the other name, the check
+  finds nothing to tell them apart, and that version and every later one keep the wrong bytes for that file, with no line
+  in the log; a restart's comparison does not see it either (forced in-process, 3 of 3 on 0.55 and 0.55.1 alike; right
+  when the last bytes differ). In the same way, a folder moved
   out of the tree whose old parent is renamed before its move-out expires (`mv keep/s/n2 /out/x; mv keep c/keep2`) keeps
   its watch, re-pointed to `c/keep2/s/n2` where nothing lives, so a write in `/out/x` is recorded there and found gone.
   Both are older than 0.55.1.
@@ -745,7 +750,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   check of the watch map at the end of the watcher's schedule tests. The no-copy move into a new folder tried during
   0.55.1 kept wrong bytes through the first watch (a folder made at `n/x` and moved into a new folder looked like the
   folder that left), one reason it went.
-- **Revisit when:** the round after 0.55.1 that changes the watcher, with the event queue overflow's unwatched folder, and
+- **Revisit when:** the round right after 0.55.1, with "A folder renamed twice into a folder whose move is being walked
+  can keep old bytes", as both can keep wrong bytes; the event queue overflow's unwatched folder goes with them, and both
   before the no-copy move into a new folder.
 
 ### A size record too low after a rename falls back to a copy
