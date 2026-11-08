@@ -133,7 +133,7 @@ def change_batch3(monitor: str) -> list:
 	put_text(monitor, 'n1.txt', 'n1')
 	put_text(monitor, 'newf/a.txt', 'na')
 	put_text(monitor, 'newf/sub/b.txt', 'nb')
-	# moved into a folder of the batch, as the watcher records it since 0.55.1
+	# moved into a folder of the batch, as the watcher records it when a take lands between the folder's create and the move
 	os.mkdir(at('movein'))
 	os.rename(at('in1'), at('movein/in1'))
 	os.rename(at('in2.txt'), at('movein/in2.txt'))
