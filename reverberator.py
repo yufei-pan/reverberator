@@ -1217,10 +1217,10 @@ MEMORY_STALL_PERCENT = 10.0
 MEMORY_LOW_FRACTION = 0.05
 QUEUE_MEMORY_SHARE = 0.25
 MEMORY_CHECK_SECONDS = 30
-# held: the folder's own watch was still mapped at its old path when its move-out was read, so no walk of a new folder had found
-# it at another name and re-pointed that watch first (always true for a file, which has none)
+# own: for a folder, its own watch, the one mapped at its old path when its move-out was read; a walk of a new folder that finds the
+# folder at another name re-points it, which says the walk got there first
 # wds: for a folder, the watches at or below it when it moved away, so they can go if its move never pairs
-COOKIE_VALUE = namedtuple('COOKIE_VALUE',['held','path','isDir','wds'],defaults=((),))
+COOKIE_VALUE = namedtuple('COOKIE_VALUE',['own','path','isDir','wds'],defaults=((),()))
 
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
@@ -2862,6 +2862,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			forget_unwatched_under(unwatched,cookie_value.path)
 		if cookie_value.wds:
 			remove_moved_away_watches(inotify_obj,wdDic,irm,cookie_value.path,cookie_value.wds,watch_flags)
+	def held_at_old(cookie_value):
+		# the moved folder's own watch is still mapped at the place it moved from: no walk found the folder at another name and
+		# re-pointed it first. read when its move lands, as a walk can come between the move-out and the move
+		return any(wdDic.get(wd,'').rstrip('/') == cookie_value.path for wd in cookie_value.own)
 	def queue_pending_move_from_at(path:str,monTime:float):
 		# something new is at the path a folder or file moved away from: that move was not a deletion that can wait,
 		# or the delete it expires into would land after this create and remove what is there
@@ -3018,7 +3022,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				# a folder the walk of the new folder got to first, listed after its rename at whatever name it had by then, re-pointed its
 				# own watch before its move-out was read: the events it raised before came at its new place already, and the copy holds
 				# it, as on 0.55
-				if event.wd in newDirWDs and not (event.mask & flags.MOVED_TO and event.cookie in cookieDic and cookieDic[event.cookie].held):
+				if event.wd in newDirWDs and not (event.mask & flags.MOVED_TO and event.cookie in cookieDic and (not cookieDic[event.cookie].isDir or held_at_old(cookieDic[event.cookie]))):
 					if event.wd not in discardLoggedWDs:
 						discardLoggedWDs.add(event.wd)
 						watcherTeeLogToTl(monitor_path,f'Discarding events for new recursive folder {wdDic[event.wd]} until its copy runs')
@@ -3065,7 +3069,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move from event detected for {eventPath}')
 					wds = watches_under(wdDic,eventPath) if isDir else ()
-					cookieDic[event.cookie] = COOKIE_VALUE(not isDir or any(wdDic[wd].rstrip('/') == eventPath for wd in wds),eventPath,isDir,wds)
+					cookieDic[event.cookie] = COOKIE_VALUE(tuple(wd for wd in wds if wdDic[wd].rstrip('/') == eventPath),eventPath,isDir,wds)
 					while len(cookieDic) > COOKIE_DICT_MAX_SIZE:
 						watcherTeeLogToTl(monitor_path,'Cookie dictionary is full, popping oldest item')
 						evicted_cookie,cookie_value = cookieDic.popitem(last=False)
