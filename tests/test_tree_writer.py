@@ -17,7 +17,7 @@ import pytest
 import reverberator as rv
 from tests import vault_oracle
 from tests.crash_child import in_child
-from tests.harness import copy_now
+from tests.harness import copy_now, link_text_limit
 from tests.scratch_images import SCRATCH, f2fs_mount, needs_f2fs
 from tests.vault_oracle import landing, read_view, snapshot_tree
 
@@ -522,7 +522,9 @@ def test_a_forward_text_too_long_is_recorded_real(tmp_path):
 	levels = 1500
 	job_vault, newest = deep_vault(str(tmp_path), levels)
 	deepest = '/'.join(['d'] * levels)
-	assert len(rv.forward_text(deepest + '/f', V2)) > 4095
+	# the longest text the filesystem takes: 4,095 on ext4 and f2fs, 1,023 on XFS
+	limit = link_text_limit(str(tmp_path))
+	assert len(rv.forward_text(deepest + '/f', V2)) > limit
 	mtime = os.lstat(os.path.join(newest, deepest)).st_mtime_ns
 	writer = rv.hand_over(job_vault, newest, os.path.join(job_vault, V2))
 	previous, tree = writer.previous, writer.tree
@@ -539,7 +541,8 @@ def test_a_forward_text_too_long_is_recorded_real(tmp_path):
 			first_real = first_real or level
 			if level < levels:
 				assert kept.st_ino == os.lstat(os.path.join(tree, rel)).st_ino
-	assert first_real is not None and 700 < first_real < 900
+	# the first level whose forward text is over what the filesystem takes (about 800 levels on ext4, 200 on XFS)
+	assert first_real == next(level for level in range(1, levels + 1) if len(vault_oracle.forward_text('/'.join(['d'] * level) + '/f', V2)) > limit)
 	# what it read, the oracle reads: forward links down to there, real entries below it
 	for level in (1, 2, first_real - 1, first_real, first_real + 1, levels - 1):
 		assert read_through(job_vault, V1, '/'.join(['d'] * level) + '/f') == str(level).encode()
