@@ -1054,21 +1054,22 @@ def test_a_marker_that_would_not_go_is_not_rewritten_into_a_folder_being_handed_
 	rv.write_restore_marker(target, job.job_name, 'proj', versions(job)[0], ['proj/f00.txt'])
 	marker = os.path.join(target, rv.RESTORE_MARKER_NAME)
 	unlink, restore_folder_meta, write_restore_marker = os.unlink, rv.restore_folder_meta, rv.write_restore_marker
-	written = []
+	written, handed = [], []
 	def stuck(path, *args, **kwargs):
 		if os.fspath(path) == marker:
 			raise PermissionError(errno.EPERM, 'Operation not permitted', path)
 		return unlink(path, *args, **kwargs)
 	def stopped(source, dest, **kwargs):
+		handed.append(dest)
 		if dest == target:
 			raise KeyboardInterrupt
 		return restore_folder_meta(source, dest, **kwargs)
 	monkeypatch.setattr(os, 'unlink', stuck)
 	monkeypatch.setattr(rv, 'restore_folder_meta', stopped)
-	monkeypatch.setattr(rv, 'write_restore_marker', lambda *args, **kwargs: written.append(args[4:]) or write_restore_marker(*args, **kwargs))
+	monkeypatch.setattr(rv, 'write_restore_marker', lambda *args, **kwargs: written.append(len(handed)) or write_restore_marker(*args, **kwargs))
 	restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	# only the claim wrote it, before anything was handed over
-	assert len(written) == 1
+	# only the claim and the sync after the copies wrote it, before anything was handed over
+	assert written == [0, 0] and handed == [target]
 
 
 def xattrs(path):

@@ -2,8 +2,9 @@
 0.55.2: a restore syncs the target's filesystem before its marker goes (before the folders are handed over), and again
 after, before the command returns; a file target once, once it is in place. Off a pool the sync goes through the target
 as this run claimed it (a file target's folder, opened before the copy), so it reports every writeback error since; on
-a pool through each disk's branch. A sync that fails is a failure of the restore that names the disk; before the
-hand-over it is recorded in the marker, and the run again copies everything again while --accept is refused.
+a pool through each disk's branch. The marker says what the target holds is not known to be on disk until a sync
+succeeds; a sync that fails is a failure of the restore that names the disk, the record stays, and the run again copies
+everything again while --accept is refused. A pool branch the user cannot open is a warning, once per restore.
 '''
 import errno
 import json
@@ -189,7 +190,7 @@ def test_a_failed_sync_before_the_hand_over_keeps_the_marker_and_records_it(job,
 	assert code == rv.EXIT_COMMAND_FAILED
 	# nothing handed over: the marker stays, recording the failed sync, and the target stays private
 	assert [event[:3] for event in events] == [('sync', target, True)]
-	assert marker_of(target).get('sync_failed') is True
+	assert marker_of(target).get('unsynced') is True
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o700
 	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
 	assert len(failed) == 1 and failed[0].startswith('FAILED proj: ')
@@ -229,15 +230,15 @@ def test_accept_over_a_failed_sync_is_refused(job, tmp_path, capsys, monkeypatch
 	monkeypatch.setattr(rv, 'hand_over_folders', lambda *args, **kwargs: handed.append(args))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0', '--accept')
 	assert (code, stdout) == (rv.EXIT_USAGE, '')
-	assert 'write error' in err and 'copies everything again' in err
-	assert handed == [] and marker_of(target).get('sync_failed') is True
+	assert 'not known to be on disk' in err and 'copies everything again' in err
+	assert handed == [] and marker_of(target).get('unsynced') is True
 
 
 def test_a_marker_without_the_record_reads_as_before(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	target = unfinished(job, tmp_path, capsys, monkeypatch)
-	assert 'sync_failed' not in marker_of(target)
-	assert 'sync_failed' not in rv.read_restore_marker(target)
+	assert 'unsynced' not in marker_of(target)
+	assert 'unsynced' not in rv.read_restore_marker(target)
 	# a run again keeps what is there
 	made = copies(monkeypatch)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0')
@@ -278,7 +279,8 @@ def pool(tmp_path, monkeypatch, target, branches_of):
 			listed.append((disk, str(tmp_path / 'branches' / name / 'proj')))
 	vault_disks = rv.vault_disks
 	monkeypatch.setattr(rv, 'vault_disks', lambda path: (True, listed) if path == target else vault_disks(path))
-	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: pytest.fail('a pool synced through its own fd'))
+	syncfs_fd = rv.syncfs_fd
+	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: pytest.fail('a pool synced through its own path') if path == target else syncfs_fd(fd, path))
 	return {name: str(tmp_path / 'branches' / name / 'proj') for names in branches_of.values() for name in names}
 
 
@@ -298,30 +300,186 @@ def test_a_target_on_a_pool_syncs_each_disk_holding_it(job, tmp_path, capsys, mo
 	assert synced == [branch['one-b']] * 2
 
 
-def test_a_branch_the_user_cannot_open_is_a_warning(job, tmp_path, capsys, monkeypatch):
+def deny(monkeypatch, paths):
+	'''An open of a folder of paths (a callable, or a set) as a folder fails with EACCES, as for a user its mode shuts out.'''
+	real_open = os.open
+	shut = paths if callable(paths) else (lambda path: path in paths)
+
+	def opening(path, flags, *args, **kwargs):
+		if flags & os.O_DIRECTORY and shut(os.fspath(path)):
+			raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+		return real_open(path, flags, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', opening)
+
+
+def test_a_branch_the_user_cannot_open_is_a_warning_once(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
 	branch = pool(tmp_path, monkeypatch, target, {'one': ['one-a', 'one-b'], 'two': ['two']})
 	for name in branch:
 		os.mkdir(branch[name])
-	synced = []
-
-	def syncfs(path):
-		# disk one's first branch denied, its second fine; disk two's only branch denied
-		if path in (branch['one-a'], branch['two']):
-			raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
-		synced.append(path)
-	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
+	# disk one's first branch shut out, its second fine; disk two's only branch shut out: for the marker's fsync and for
+	# both syncs, all of which open the branches as they are
+	deny(monkeypatch, {branch['one-a'], branch['two']})
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == 0, stdout + err
 	warnings = [line for line in stdout.splitlines() if line.startswith('WARNING')]
-	# one per sync, for the disk none of whose branches could be opened
-	assert len(warnings) == 2 and len(set(warnings)) == 1
-	assert warnings[0].startswith(f'WARNING proj: could not sync {branch["two"]}: ') and os.strerror(errno.EACCES) in warnings[0]
-	assert warnings[0].endswith('; what was restored there is not known to be on disk')
-	assert synced == [branch['one-b']] * 2
+	assert [line.split(':')[0] for line in warnings] == ['WARNING proj'] * 2
+	assert sorted(line.split(' could not sync ')[1].split(':')[0] for line in warnings) == sorted([branch['one-a'], branch['two']])
+	assert all(os.strerror(errno.EACCES) in line and line.endswith('; what was restored there is not known to be on disk') for line in warnings)
+	assert 'FAILED' not in stdout
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
+
+
+def test_the_second_sync_on_a_pool_of_a_folder_shut_to_its_owner_is_a_warning(job, tmp_path, capsys, monkeypatch):
+	# the hand-over gives the target its own mode, here without the owner's read: the second sync reopens it on the branch
+	if os.geteuid() != 0:
+		pytest.skip("only root backs up a folder shut to its owner's reads, and restores out of it")
+	seed_monitor(job, {'proj/a.txt': 'a'})
+	os.chmod(os.path.join(job.monitor, 'proj'), 0o300)
+	run_backup(job)
+	write_rule(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	vault_disks = rv.vault_disks
+	monkeypatch.setattr(rv, 'vault_disks', lambda path: (True, [('one', target)]) if path == target else vault_disks(path))
+	# root opens it anyway: shut it out as the kernel does any other user, its owner included
+	deny(monkeypatch, lambda path: path == target and not os.stat(path).st_mode & stat.S_IRUSR)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == 0, stdout + err
+	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o300
+	warnings = [line for line in stdout.splitlines() if line.startswith('WARNING')]
+	assert len(warnings) == 1 and warnings[0].startswith(f'WARNING proj: could not sync {target}: ') and 'FAILED' not in stdout
+
+
+def test_a_target_on_none_of_its_pools_disks_fails(job, tmp_path, capsys, monkeypatch):
+	backed_up(job)
+	out = destination(tmp_path)
+	# the file's folder on no branch when its sync looks: what was restored there went with it
+	vault_disks = rv.vault_disks
+	monkeypatch.setattr(rv, 'vault_disks', lambda path: (True, [('one', str(tmp_path / 'nowhere' / 'out'))]) if path == out else vault_disks(path))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj/a.txt', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
+	assert len(failed) == 1 and failed[0].startswith(f'FAILED proj/a.txt: {out} is on none of the disks of its pool')
+
+
+def test_disks_that_cannot_be_listed_are_not_called_a_write_error(job, tmp_path, capsys, monkeypatch):
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	vault_disks = rv.vault_disks
+
+	def listing(path):
+		# for the sync: the marker's fsync, before it, lists them
+		if path == target and os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and not fsyncing:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), 'the branch list')
+		return vault_disks(path)
+	fsyncing = []
+	fsync_vault_folder = rv.fsync_vault_folder
+
+	def fsyncs(path, denied=None):
+		fsyncing.append(path)
+		try:
+			fsync_vault_folder(path, denied)
+		finally:
+			fsyncing.pop()
+	monkeypatch.setattr(rv, 'fsync_vault_folder', fsyncs)
+	monkeypatch.setattr(rv, 'vault_disks', listing)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
+	assert len(failed) == 1 and 'could not be listed' in failed[0]
+	assert 'write error' not in stdout
+	assert f'What {target} holds is not known to be on disk: run the same restore again, which copies everything again' in stdout
+
+
+def test_a_run_stopped_in_the_hand_over_after_a_recopy_is_finished_by_accept(job, tmp_path, capsys, monkeypatch):
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	record(monkeypatch, fail=lambda n: write_error(n) if n == 1 else None)
+	code, _, _ = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED and marker_of(target).get('unsynced') is True
+	# the run again recopies, its sync succeeds, and a signal comes while it hands the folders over
+	events = []
+	write_restore_marker = rv.write_restore_marker
+	monkeypatch.setattr(rv, 'write_restore_marker', lambda *args, **kwargs: events.append(('mark', kwargs.get('unsynced', False))) or write_restore_marker(*args, **kwargs))
+	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: events.append('sync'))
+	hand_over_folders = rv.hand_over_folders
+	monkeypatch.setattr(rv, 'hand_over_folders', lambda *args: events.append('hand over') or hand_over_folders(*args))
+	restore_folder_meta = rv.restore_folder_meta
+
+	def stopping(*args, **kwargs):
+		rv.RESTORE_STOP.set()
+		return restore_folder_meta(*args, **kwargs)
+	monkeypatch.setattr(rv, 'restore_folder_meta', stopping)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED and '--accept' in err
+	# synced, then the marker says so, then the hand-over: never handed over under a marker that refuses --accept
+	assert events[:4] == [('mark', True), 'sync', ('mark', False), 'hand over']
+	assert 'unsynced' not in marker_of(target)
+	monkeypatch.setattr(rv, 'restore_folder_meta', restore_folder_meta)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0', '--accept')
+	assert (code, err) == (0, ''), stdout
+	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
+
+
+def test_a_recopy_whose_sync_fails_beside_a_fixable_failure_offers_no_accept(job, tmp_path, capsys, monkeypatch):
+	backed_up(job)
+	out = destination(tmp_path)
+	record(monkeypatch, fail=lambda n: write_error(n))
+	copy_command = rv.copy_command
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['false'] if source.endswith('b.txt') else copy_command(source, dest))
+	code, stdout, _ = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert 'run the same restore again, which copies everything again' in stdout
+	assert '--accept' not in stdout and 'retry them' not in stdout
+
+
+def test_a_fixable_failure_with_a_good_sync_is_picked_up_and_can_be_accepted(job, tmp_path, capsys, monkeypatch):
+	backed_up(job)
+	target = unfinished(job, tmp_path, capsys, monkeypatch)
+	# the sync after the failed copy succeeded: the record is gone, and --accept keeps what is there
+	assert 'unsynced' not in marker_of(target)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
+	assert (code, err) == (0, ''), stdout
+
+
+def test_a_run_stopped_before_its_sync_syncs_on_the_way_out(job, tmp_path, capsys, monkeypatch):
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	synced = []
+	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(path))
+	copy_command = rv.copy_command
+
+	def stopping(source, dest):
+		rv.RESTORE_STOP.set()
+		return copy_command(source, dest)
+	monkeypatch.setattr(rv, 'copy_command', stopping)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED and 'run the same restore again to pick it up' in err
+	# what it copied is synced, so the marker drops the record and a run again picks it up
+	assert synced == [target] and 'unsynced' not in marker_of(target)
+
+
+def test_accept_whose_record_cannot_be_written_does_not_offer_a_run_again(job, tmp_path, capsys, monkeypatch):
+	backed_up(job)
+	target = unfinished(job, tmp_path, capsys, monkeypatch)
+	record(monkeypatch, fail=lambda n: write_error(n))
+	write_restore_marker = rv.write_restore_marker
+
+	def failing(*args, **kwargs):
+		if kwargs.get('unsynced'):
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+		return write_restore_marker(*args, **kwargs)
+	monkeypatch.setattr(rv, 'write_restore_marker', failing)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert any(line.startswith('FAILED proj: the failed sync could not be recorded') and 'out of the way' in line for line in stdout.splitlines())
+	assert 'run the same restore again' not in stdout
 
 
 def test_the_marker_is_on_disk_before_the_first_copy(job, tmp_path, capsys, monkeypatch):
@@ -331,9 +489,9 @@ def test_the_marker_is_on_disk_before_the_first_copy(job, tmp_path, capsys, monk
 	events = []
 	fsync_vault_folder = rv.fsync_vault_folder
 
-	def fsyncing(path):
+	def fsyncing(path, denied=None):
 		events.append(('fsync', path, os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))))
-		fsync_vault_folder(path)
+		fsync_vault_folder(path, denied)
 	monkeypatch.setattr(rv, 'fsync_vault_folder', fsyncing)
 	copy_command = rv.copy_command
 	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: events.append('copy') or copy_command(source, dest))

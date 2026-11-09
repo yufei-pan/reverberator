@@ -1870,14 +1870,14 @@ def fsync_path(path:str, folder:bool = False) -> None:
 	finally:
 		os.close(fd)
 
-def fsync_vault_folder(path:str) -> None:
+def fsync_vault_folder(path:str, denied:list = None) -> None:
 	'''
 	fsync the vault folder at path on the disks themselves. On a mergerfs pool, whose fsyncdir is ENOSYS (the kernel then
 	takes every later folder fsync through the pool for done), that is the folder on each branch holding it; a branch
 	without it is passed over, and the first other error is raised once every branch was tried. A branch list that cannot
-	be read raises its OSError. Off a pool it is fsync_path(path, folder=True).
+	be read raises its OSError. Off a pool it is fsync_path(path, folder=True). denied: on_vault_branches().
 	'''
-	on_vault_branches(path, lambda folder: fsync_path(folder, folder=True))
+	on_vault_branches(path, lambda folder: fsync_path(folder, folder=True), denied)
 
 def vault_disks(path:str) -> tuple:
 	'''
@@ -1898,11 +1898,12 @@ def vault_disks(path:str) -> tuple:
 	rel = os.path.relpath(os.path.realpath(path), pool)
 	return True, [(disk_of(branch), os.path.join(branch, rel)) for branch in read_pool_branches(pool)]
 
-def on_vault_branches(path:str, action) -> None:
+def on_vault_branches(path:str, action, denied:list = None) -> None:
 	'''
 	Run action(folder) on the folder at path on the disks themselves (vault_disks()). On a mergerfs pool that is the folder
 	on each branch holding it; a branch without it is passed over, and the first other OSError is raised once every
-	branch was tried. A branch list that cannot be read raises its OSError. Off a pool it is action(path).
+	branch was tried. A branch list that cannot be read raises its OSError. Off a pool it is action(path). With denied, a
+	list, a branch the user cannot open (PermissionError) is passed over too, appended to it as (branch, error).
 	'''
 	pooled, disks = vault_disks(path)
 	failure = None
@@ -1910,7 +1911,9 @@ def on_vault_branches(path:str, action) -> None:
 		try:
 			action(folder)
 		except OSError as e:
-			if not (pooled and isinstance(e, (FileNotFoundError, NotADirectoryError))):
+			if pooled and denied is not None and isinstance(e, PermissionError):
+				denied.append((folder, e))
+			elif not (pooled and isinstance(e, (FileNotFoundError, NotADirectoryError))):
 				failure = failure or e
 	if failure is not None:
 		raise failure
@@ -15079,8 +15082,10 @@ class RestoreReport:
 		# the entries (rels, in the order they came) kept or restored without all of their metadata, as far as a marker records
 		self.unset = {}
 		self.left_private = False
-		# set once a sync of the target's disks failed (sync_restore())
-		self.sync_failed = False
+		# whether the marker this run leaves says what the target holds is not known to be on disk (write_restore_marker())
+		self.unsynced = False
+		# the branches whose folder the user could not open to sync it, each warned of once
+		self.unsynced_branches = set()
 		# set once the folders began to be given their owners, which a stop leaves half done
 		self.handing_over = False
 		# set once the target itself began to be given its owner: nothing is written by its path after that
@@ -15120,6 +15125,12 @@ class RestoreReport:
 		if len(self.warnings) < RESTORE_SUMMARY_LINES:
 			self.warnings.append((rel, reason))
 		self.note('WARNING', rel, reason)
+
+	def cannot_sync(self, rel:str, branch:str, error:OSError) -> None:
+		'''Warn, once per restore, that branch could not be opened to sync it.'''
+		if branch not in self.unsynced_branches:
+			self.unsynced_branches.add(branch)
+			self.warn(rel, f'could not sync {branch}: {error}; what was restored there is not known to be on disk')
 
 	def note_unset(self, rel:str) -> None:
 		'''Remember rel as an entry without all of its metadata, for the marker, up to RESTORE_MARKER_UNSET_LIMIT of them.'''
@@ -15177,8 +15188,8 @@ class RestoreReport:
 		lines += [f'FAILED {rel or "."}: {reason}' for rel, reason in self.failures]
 		if self.failed > len(self.failures):
 			lines.append(f'{self.failed - len(self.failures)} more failed: shown above as they happened')
-		if self.sync_failed and self.marker is not None:
-			lines.append(f'The disk reported a write error, so what was restored may not be on it: run the same restore again, which copies everything again. {unfinished_note(self.target)}')
+		if self.unsynced and self.marker is not None:
+			lines.append(f'What {self.target} holds is not known to be on disk: run the same restore again, which copies everything again. {unfinished_note(self.target)}')
 		elif self.failed > self.final and self.marker is not None:
 			lines.append(f'{self.failed - self.final} failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {unfinished_note(self.target)}')
 		elif self.left_private:
@@ -15329,8 +15340,8 @@ def restore_folder_meta(source:str, dest:str, top:bool = False, warn = None):
 def read_restore_marker(target:str):
 	'''
 	What the marker of an unfinished folder restore at the top of target holds, {"job", "path", "version"}, "unset" when
-	it names any: the rels of the entries kept without all of their metadata, and "sync_failed" (True) when a sync of
-	the target's disks failed (an older marker has no such record, and reads as before); None when
+	it names any: the rels of the entries kept without all of their metadata, and "unsynced" (True) when what the target
+	holds is not known to be on disk (write_restore_marker(); an older marker has no such record, and reads as before); None when
 	target is not a folder (a symlink to one is not) or holds no marker. Picking a marker up lets a restore write into
 	the folder, so only one this user wrote counts: a marker in a folder another user owns or can write to, one that is
 	not a regular file of this user's, or one that cannot be read is a CommandError saying what was found.
@@ -15382,20 +15393,21 @@ def read_restore_marker(target:str):
 		if not isinstance(record['unset'], list) or not all(isinstance(rel, str) for rel in record['unset']):
 			raise unreadable('its list of entries without all of their metadata is not a list of paths')
 		found['unset'] = record['unset']
-	if record.get('sync_failed') is True:
-		found['sync_failed'] = True
+	if record.get('unsynced') is True:
+		found['unsynced'] = True
 	return found
 
-def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion, unset:list = (), sync_failed:bool = False, made:bool = False) -> str:
+def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion, unset:list = (), unsynced:bool = False, made:bool = False, denied:list = None) -> str:
 	'''
 	Mark target, the folder a restore of rel of job_name from version writes into, as its own unfinished output, and
 	return the marker's path. It is written under a partial name, readable by this user alone, and renamed into place,
 	so the marker is there whole or not at all. unset, the rels of the entries kept without all of their metadata, is
 	written as far as RESTORE_MARKER_UNSET_LIMIT of them and RESTORE_MARKER_UNSET_BYTES go; written again, the marker
-	replaces the one before. sync_failed records that a sync of the target's disks failed, so what is there may not be on
-	disk: a run again copies everything again, and --accept is refused. The marker's name is made durable with it: target
-	is fsynced after the rename, and with made (this restore made target) target's parent too, so a crash after the first
-	copy finds the marker.
+	replaces the one before. unsynced records that what is there is not known to be on disk, as no sync of the target's
+	disks succeeded since it was copied (a run stopped before its sync by a crash, or a sync that failed): a run again
+	copies everything again, and --accept is refused. The marker's name is made durable with it: target is fsynced after
+	the rename, and with made (this restore made target) target's parent too, so a crash after the first copy finds the
+	marker; on a pool a branch the user cannot open is passed over for denied (fsync_vault_folder()).
 	'''
 	marker = os.path.join(target, RESTORE_MARKER_NAME)
 	temp = partial_copy_path(marker)
@@ -15409,8 +15421,8 @@ def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion,
 		listed.append(entry)
 	if listed:
 		record['unset'] = listed
-	if sync_failed:
-		record['sync_failed'] = True
+	if unsynced:
+		record['unsynced'] = True
 	data = json.dumps(record).encode('ascii')
 	fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
 	try:
@@ -15424,9 +15436,9 @@ def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion,
 		with contextlib.suppress(OSError):
 			os.unlink(temp)
 		raise
-	fsync_vault_folder(target)
+	fsync_vault_folder(target, denied)
 	if made:
-		fsync_vault_folder(os.path.dirname(target))
+		fsync_vault_folder(os.path.dirname(target), denied)
 	return marker
 
 def move_aside(path:str) -> str:
@@ -15590,17 +15602,16 @@ def sync_restore(fd:int, folder:str, report:RestoreReport, rel:str) -> bool:
 	target), so what the restore reports done is on disk. Off a mergerfs pool that is syncfs_fd() of fd, the folder as this
 	run opened it before its first copy: it reports every writeback error since, even one another process's sync met
 	first. On a pool, whose own sync does not reach the disks, it is syncfs_folder() of the first branch of each disk that
-	holds folder (vault_disks(), sync_each_disk()); a branch the restoring user cannot open is a warning naming it, and
-	the disk's next branch is tried. Nothing is recorded, unlike sync_vault_filesystems(): a restore writes no vault
-	marker. A disk whose sync failed is a failure of rel, naming the disk, that no run again can fix as it is (the run
-	again of a folder restore copies everything again, write_restore_marker()); False then, once every disk was tried.
-	report.sync_failed is set.
+	holds folder (vault_disks(), sync_each_disk()); a branch the restoring user cannot open is a warning naming it, once
+	per restore (report.cannot_sync()), and the disk's next branch is tried. Nothing is recorded, unlike
+	sync_vault_filesystems(): a restore writes no vault marker. A disk whose sync failed, disks that cannot be listed, or a
+	folder on none of the pool's disks (gone, with what was restored in it) is a failure of rel that no run again fixes as
+	it is; False then, once every disk was tried.
 	'''
 	try:
 		pooled, disks = vault_disks(folder)
 	except OSError as e:
 		report.fail(rel, f'the disks holding {folder} could not be listed to write the restore out to them: {e}', rerun=False)
-		report.sync_failed = True
 		return False
 	if not pooled:
 		results = {disks[0][0]: None}
@@ -15626,15 +15637,16 @@ def sync_restore(fd:int, folder:str, report:RestoreReport, rel:str) -> bool:
 					return e
 			return denied
 		results = sync_each_disk(disks, sync)
+		if not results:
+			report.fail(rel, f'{folder} is on none of the disks of its pool: what was restored there went with it', rerun=False)
+			return False
 	synced = True
 	for disk, result in results.items():
 		if isinstance(result, tuple):
-			report.warn(rel, f'could not sync {result[0]}: {result[1]}; what was restored there is not known to be on disk')
+			report.cannot_sync(rel, *result)
 		elif result is not None:
 			report.fail(rel, f'the disk {disk} reported a write error as the restore was written out to it ({result}): what was restored may not be on it', rerun=False)
 			synced = False
-	if not synced:
-		report.sync_failed = True
 	return synced
 
 def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None, marked:bool = False) -> None:
@@ -15681,10 +15693,26 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	# what an earlier run's marker names as kept without all of its metadata, less what this run has met again
 	earlier = {}
 	written = []
-	# the earlier run's marker records a failed sync: what it left may not be on disk, so nothing there is kept
+	# the earlier run's marker says what it left is not known to be on disk: nothing there is kept
 	recopy = False
 	# a file target's folder, opened before the copy, for its sync to report every writeback error since (or why it could not be)
 	folder_fd = None
+	# set once this run tried its sync: one stopped before then tries it on its way out
+	tried_sync = False
+
+	def mark(unsynced:bool, made:bool = False):
+		# the marker as this run leaves it now: what it knows of, what it did not get to meet again, and whether what the
+		# target holds is known to be on disk
+		nonlocal written
+		unset = list(report.unset) + [entry for entry in earlier if entry not in report.unset]
+		denied = []
+		try:
+			report.marker = write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, unsynced=unsynced, made=made, denied=denied)
+		finally:
+			for branch, error in denied:
+				report.cannot_sync(rel, branch, error)
+		written = unset
+		report.unsynced = unsynced
 
 	def check_stop():
 		if RESTORE_STOP.is_set():
@@ -15752,7 +15780,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 					marker = held_marker(target, os.path.basename(job_vault), rel, version)
 					earlier = dict.fromkeys(marker.get('unset', ()))
 					written = list(earlier)
-					recopy = marker.get('sync_failed', False)
+					recopy = marker.get('unsynced', False)
 				lock = claim_restore_target(target, look_again if marked else None)
 			except OSError as e:
 				report.fail(rel, str(e))
@@ -15760,10 +15788,10 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			report.restored += 1
 			folders.append((resolved.path, target, rel))
 			try:
-				# the job vault's folder bears the job's name
-				report.marker = write_restore_marker(target, os.path.basename(job_vault), rel, version, written, sync_failed=recopy, made=not resume)
+				# not known to be on disk until this run's sync succeeds: a crash before then leaves a rerun that copies everything again
+				mark(True, made=not resume)
 			except OSError as e:
-				report.fail(rel, f"cannot mark it as this restore's output: {e}")
+				report.fail(rel, f"cannot mark it as this restore's output, written and on disk: {e}")
 				report.left_private = True
 				return
 			if resume:
@@ -15822,26 +15850,30 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			for entry_rel, error in errors:
 				report.fail(entry_rel, f'unreadable in the vault: {error}')
 		finish_batch()
-		if report.failed > report.final:
-			# a folder handed to its owner now could be swapped for a symlink before a re-run writes into it
-			report.left_private = bool(folders)
-			return
 		if not folders:
 			# a file target, in place with its metadata
 			if report.restored:
-				if isinstance(folder_fd, OSError):
+				if isinstance(folder_fd, (FileNotFoundError, NotADirectoryError)):
+					report.fail(rel, f'{os.path.dirname(target)} is gone: what was restored there went with it ({folder_fd})', rerun=False)
+				elif isinstance(folder_fd, OSError):
 					report.warn(rel, f'could not sync {os.path.dirname(target)}: {folder_fd}; what was restored there is not known to be on disk')
 				else:
 					sync_restore(folder_fd, os.path.dirname(target), report, rel)
 			return
-		# the copies on disk before the marker goes: a crash after must not leave a finished-looking target with empty files
-		if not sync_restore(lock, target, report, rel):
-			# a run again copies everything again: the record goes in the marker now, or the target is not to be picked up
+		# the copies on disk before the marker goes: a crash after must not leave a finished-looking target with empty files.
+		# synced, the marker says so before anything is handed over, so a run stopped among the hand-over can be finished
+		tried_sync = True
+		if sync_restore(lock, target, report, rel):
 			try:
-				write_restore_marker(target, os.path.basename(job_vault), rel, version, list(report.unset) + [entry for entry in earlier if entry not in report.unset], sync_failed=True)
+				mark(False)
 			except OSError as e:
-				report.fail(rel, f'the failed sync could not be recorded in its marker ({e}): move {target} out of the way and restore again', rerun=False)
-			recopy = True
+				report.fail(rel, f'its marker could not be rewritten after the sync: {e}', rerun=False)
+				return
+		if report.failed > report.final:
+			# a folder handed to its owner now could be swapped for a symlink before a re-run writes into it
+			report.left_private = True
+			return
+		if report.unsynced:
 			return
 		hand_over_folders(folders, report, check_stop)
 		# and the folders' metadata and the marker's removal, before the restore says it is done
@@ -15852,11 +15884,16 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			stop_copies(mcae, pending, target)
 		finally:
 			if report.marker is not None and not report.target_handing_over:
-				# the marker this run leaves: what it knows of, and what it did not get to meet again
+				if report.unsynced and not tried_sync and lock is not None:
+					# stopped before its sync: what it copied is synced now, so a run again picks it up rather than copying
+					# it all again
+					with contextlib.suppress(OSError):
+						if sync_restore(lock, target, report, rel):
+							mark(False)
 				unset = list(report.unset) + [entry for entry in earlier if entry not in report.unset]
 				if unset != written:
 					with contextlib.suppress(OSError):
-						write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, sync_failed=recopy)
+						mark(report.unsynced)
 			for sig, handler in handlers.items():
 				# None: a handler set from outside Python, which cannot be set back
 				signal.signal(sig, signal.SIG_DFL if handler is None else handler)
@@ -15909,7 +15946,7 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 	def look_again():
 		# the run whose output this was may have finished while this one waited for the lock
 		marker = held_marker(target, os.path.basename(job_vault), rel, version, accept=True)
-		refuse_accept_after_failed_sync(target, marker)
+		refuse_accept_unsynced(target, marker)
 		unset.extend(marker.get('unset', ()))
 	lock = claim_restore_target(target, look_again)
 	try:
@@ -15960,10 +15997,14 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 		# a killed run's copies may still be dirty: on disk before the marker goes
 		if not sync_restore(lock, target, report, rel):
 			# what it holds may not be on disk: a run again copies everything again, and a later --accept is refused
+			denied = []
 			try:
-				write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, sync_failed=True)
+				write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, unsynced=True, denied=denied)
+				report.unsynced = True
 			except OSError as e:
 				report.fail(rel, f'the failed sync could not be recorded in its marker ({e}): move {target} out of the way and restore again', rerun=False)
+			for branch, error in denied:
+				report.cannot_sync(rel, branch, error)
 			return
 		hand_over_folders(folders, report)
 		sync_restore(lock, target, report, rel)
@@ -16080,10 +16121,10 @@ def nothing_to_accept(target:str) -> CommandError:
 	'''The refusal of --accept where no unfinished restore of the same path and version is.'''
 	return CommandError(f'{target} holds no unfinished restore to keep: --accept keeps the result of a folder restore that did not complete, given the same path and version')
 
-def refuse_accept_after_failed_sync(target:str, marker:dict) -> None:
-	'''The refusal of --accept over the marker of a restore whose sync of the target's disks failed: kept as it is, what it holds may not be on disk.'''
-	if marker.get('sync_failed'):
-		raise CommandError(f"{target}: the target's disk reported a write error when a run of this restore wrote it out, so what it holds may not be on disk, and --accept would keep it as it is: run the same restore again without --accept, which copies everything again")
+def refuse_accept_unsynced(target:str, marker:dict) -> None:
+	'''The refusal of --accept over the marker of a restore whose copies are not known to be on disk: kept as it is, they may not be.'''
+	if marker.get('unsynced'):
+		raise CommandError(f"{target}: what it holds is not known to be on disk, as a run of this restore stopped before its sync, or the target's disk reported a write error, and --accept would keep it as it is: run the same restore again without --accept, which copies everything again")
 
 def check_marker_matches(target:str, marker:dict, job_name:str, rel:str, version:KeptVersion = None) -> None:
 	'''A CommandError unless marker, which read_restore_marker() read at target, is the one of a restore of rel of job_name (from version, once it is picked).'''
@@ -16136,7 +16177,7 @@ def check_target(target:str, job_name:str, rel:str, in_place:bool, version:KeptV
 	if marker is not None:
 		check_marker_matches(target, marker, job_name, rel, version)
 		if accept:
-			refuse_accept_after_failed_sync(target, marker)
+			refuse_accept_unsynced(target, marker)
 		return 'resume'
 	if accept:
 		raise nothing_to_accept(target)
@@ -16278,6 +16319,9 @@ def restore_command(args) -> int:
 			except KeyboardInterrupt:
 				if report.marker is None:
 					raise
+				if report.unsynced:
+					# stopped before its copies were on disk, and its sync on the way out did not make it so
+					raise CommandError(f'Interrupted: what {target} holds is not known to be on disk: run the same restore again, which copies everything again. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
 				if report.handing_over:
 					# the folders handed over are another user's now, which a run again refuses to write into
 					raise CommandError(f'Interrupted: the restore was stopped while giving its folders their owners; finish it by running the same restore again with --accept. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
