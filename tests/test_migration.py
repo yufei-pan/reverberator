@@ -364,6 +364,36 @@ def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	assert cli_differences(job.job_vault, before) == []
 
 
+@pytest.mark.parametrize('spare', [1, 12, 22])
+def test_a_new_file_at_a_path_near_the_limit_converts(tmp_path, v054, spare):
+	# on every filesystem, XFS included: a file new in the last batch is copied, not linked to an older version, so the path can be as long as a path
+	# can be whatever text the filesystem takes of a link. The tree of that version is built in staging, whose own name must not be longer than the version's
+	job = create_job(str(tmp_path))
+	rel = long_rel(4095 - len(os.path.join(job.job_vault, V0_FOLDER, '')) - spare)
+	def seed(monitor):
+		put_text(monitor, 'k', 'k')
+
+	def add(monitor):
+		put_text(monitor, 'z', 'z')
+		return [(False, 'create', 'z', None)]
+
+	def change(monitor):
+		put_long(monitor, rel, 'long')
+		put_text(monitor, 'z', 'z2')
+		return [(False, 'create', rel, None), (False, 'modify', 'z', None)]
+	v054.build(job, [seed, add, change], keep_n_versions=5)
+	names = folders_of(job)
+	newest = os.path.join(job.job_vault, names[max(names)], rel)
+	assert 4072 <= len(newest) <= 4094 and os.path.isfile(newest) and not os.path.islink(newest)
+	assert not any(os.path.lexists(os.path.join(job.job_vault, names[number], rel)) for number in names if number != max(names))
+	before = expected(job)
+	assert migrate(job) is True
+	assert not os.path.islink(newest) and open(newest).read() == 'long'
+	assert layout_of(job) == 'r'
+	assert expected(job) == before
+	assert cli_differences(job.job_vault, before) == []
+
+
 def test_a_version_counts_as_done_only_after_a_flush_of_its_folder_time(small, monkeypatch):
 	# including one that needs no plain tree (V0, or one a repair finished): its folder's time is set, and a second cut must not lose it
 	# for a version the manifest calls done
