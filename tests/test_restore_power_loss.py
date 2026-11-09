@@ -2,7 +2,8 @@
 0.55.2: a restore's sync against a real power loss, behind REVERB_SCRATCH: the restore writes onto a fresh f2fs loop image with
 the live disks' features and mount options, the filesystem stops with no checkpoint (f2fs_io shutdown 2), and is mounted again.
 A restore that returned holds every file whole and no marker; one cut after its copies and before its sync leaves its marker,
-and the same restore run again finishes it. The control shows the cut loses what no sync wrote out.
+whose copies are of a mount that is gone (the image is mounted again in the same boot), and the same restore run again copies
+everything again and finishes it. The control shows the cut loses what no sync wrote out.
 
 The real syncfs(2) binding runs here only around the restore, whose syncs reach the loop image alone (its target is on it). The
 shutdown and the flush go through tests/scratch_images.py, which refuses anything but a loop image this process attached under
@@ -114,8 +115,10 @@ def test_a_cut_before_the_first_sync_leaves_the_marker_and_a_run_again_finishes(
 	assert cut == [target]
 	monkeypatch.setattr(rv, 'sync_restore', sync_restore)
 	image.remount()
-	# the marker was on the disk before the first copy, saying nothing there is known to be on disk
-	assert rv.read_restore_marker(target).get('unsynced') is True
+	# the marker was on the disk before the first copy, saying its copies are not known to be on disk; made in a mount the
+	# cut ended, so a run again copies everything again
+	marker = rv.read_restore_marker(target)
+	assert 'unsynced' in marker and rv.marker_recopy(marker, rv.restore_mount_identity(target)) == 'cut'
 	copied = []
 	copy_command = rv.copy_command
 	monkeypatch.setattr(rv, 'copy_command', lambda source, dest_path: copied.append(source) or copy_command(source, dest_path))
