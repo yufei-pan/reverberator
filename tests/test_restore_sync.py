@@ -457,7 +457,7 @@ def test_a_fixable_failure_with_a_good_sync_is_picked_up_and_can_be_accepted(job
 	assert (code, err) == (0, ''), stdout
 
 
-def test_a_run_stopped_before_its_sync_syncs_on_the_way_out(job, tmp_path, capsys, monkeypatch):
+def test_a_run_stopped_before_its_sync_stops_at_once_and_leaves_its_record(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
@@ -470,9 +470,13 @@ def test_a_run_stopped_before_its_sync_syncs_on_the_way_out(job, tmp_path, capsy
 		return copy_command(source, dest)
 	monkeypatch.setattr(rv, 'copy_command', stopping)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	assert code == rv.EXIT_COMMAND_FAILED and 'run the same restore again to pick it up' in err
-	# what it copied is synced, so the marker drops the record and a run again picks it up
-	assert synced == [target] and 'unsynced' not in marker_of(target)
+	assert code == rv.EXIT_COMMAND_FAILED and 'run the same restore again to pick it up (after a reboot or a remount of its disk it copies everything again)' in err
+	# no sync on the way out: the record of this boot and these mounts stays, and a run again of them keeps what is there
+	assert synced == [] and marker_of(target).get('unsynced') == rv.restore_mount_identity(target)
+	monkeypatch.setattr(rv, 'copy_command', copy_command)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert (code, err) == (0, ''), stdout
+	assert synced[-2:] == [target, target]
 
 
 def test_accept_whose_record_cannot_be_written_does_not_offer_a_run_again(job, tmp_path, capsys, monkeypatch):
@@ -578,8 +582,15 @@ class Killed(BaseException):
 	'''A signal the restore cannot catch, SIGKILL: nothing of it runs after.'''
 
 
+def needs_unique_mount_ids(path):
+	'''Skip where the kernel names no mount for good (before 6.8): a record of a boot and mount is never made there.'''
+	if rv.statx_mount(str(path)) is None:
+		pytest.skip('no unique mount ids on this kernel')
+
+
 def killed_at_its_sync(job, tmp_path, capsys, monkeypatch):
 	'''A restore of proj into out killed after its copies, before its sync: the target, its marker of this boot and mount.'''
+	needs_unique_mount_ids(tmp_path)
 	backed_up(job)
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
@@ -637,41 +648,25 @@ def test_accept_in_another_boot_after_a_kill_is_refused(job, tmp_path, capsys, m
 	assert 'no sync of what it holds is known to have succeeded' in err and 'a sync of what it holds failed' not in err
 
 
-def test_a_file_targets_folder_gone_before_its_sync_fails_the_restore(job, tmp_path, capsys, monkeypatch):
-	backed_up(job)
-	out = destination(tmp_path)
-	# the folder cannot be opened, before the copy and after it: the file is not known to be on disk
-	deny_missing = os.open
-
-	def opening(path, flags, *args, **kwargs):
-		if os.fspath(path) == out and flags & os.O_DIRECTORY:
-			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
-		return deny_missing(path, flags, *args, **kwargs)
-	monkeypatch.setattr(os, 'open', opening)
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj/a.txt', out, '--version', '0')
-	assert code == rv.EXIT_COMMAND_FAILED
-	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
-	assert len(failed) == 1 and failed[0].startswith(f'FAILED proj/a.txt: {out} is not there now') and 'is not known to be on disk' in failed[0]
-
-
-def test_a_file_targets_folder_made_by_the_copy_is_synced_after_it(job, tmp_path, capsys, monkeypatch):
+def test_a_file_targets_folder_that_cannot_be_opened_is_a_warning(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
 	real_open = os.open
-	first = []
 
 	def opening(path, flags, *args, **kwargs):
-		# not there before the copy, there after it
-		if os.fspath(path) == out and flags & os.O_DIRECTORY and not first:
-			first.append(path)
-			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		if os.fspath(path) == out and flags & os.O_DIRECTORY:
+			raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
 		return real_open(path, flags, *args, **kwargs)
 	monkeypatch.setattr(os, 'open', opening)
 	synced = []
-	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append((path, os.fstat(fd).st_ino)))
+	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(path))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj/a.txt', out, '--version', '0')
-	assert (code, err) == (0, ''), stdout
-	assert synced == [(out, os.lstat(out).st_ino)]
+	# opened once, before the copy: restored, but not known to be on disk
+	assert code == 0 and synced == []
+	warnings = [line for line in stdout.splitlines() if line.startswith('WARNING')]
+	assert len(warnings) == 1 and warnings[0].startswith(f'WARNING proj/a.txt: could not open {out} to sync it: ')
+	assert warnings[0].endswith(f'{os.path.join(out, "a.txt")} is not known to be on disk')
+
 
 
 def test_a_record_that_cannot_be_written_takes_the_marker_away(job, tmp_path, capsys, monkeypatch):
@@ -716,6 +711,7 @@ def test_with_no_unique_mount_id_a_rerun_after_a_kill_copies_everything_again(jo
 
 @pytest.mark.parametrize('remounted', [False, True], ids=['same_branch_mounts', 'a_branch_remounted'])
 def test_a_remounted_branch_of_a_pool_target_reads_as_a_cut(job, tmp_path, capsys, monkeypatch, remounted):
+	needs_unique_mount_ids(tmp_path)
 	backed_up(job)
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')

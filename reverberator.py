@@ -15701,9 +15701,9 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	The syncs go through the target as claimed (or a file target's folder, opened before the copy). The marker's record of
 	what is on disk lives as follows. Written at the claim, before any copy, it holds "unsynced": this boot's id and the
 	target's mount (restore_mount_identity()). Once a sync of the target succeeds after the copies, the marker is rewritten without it, before
-	anything is handed over; so is it when a run stopped by a signal syncs on its way out. A run that finds "unsynced" of
-	this boot and mount first syncs the target: what is there is then kept as any resume keeps it. A sync that fails, at
-	any of these points, writes "recopy": 'sync failed' in its place; "unsynced" of another boot or mount (or none to tell)
+	anything is handed over; a run stopped by a signal leaves it as it is, and stops at once. A run that finds "unsynced"
+	of this boot and mount keeps what is there as any resume keeps it, and its own sync before the hand-over, through its
+	claim fd, covers it with the rest. A sync that fails writes "recopy": 'sync failed' in its place; "unsynced" of another boot or mount (or none to tell)
 	reads as recopy 'cut', as the cut that ended it may have lost bytes of what was copied. A run that finds a recopy keeps nothing
 	already there, copies everything again, and keeps the recopy in the marker until every entry was copied again and a
 	sync of them succeeded: a stop, or any failure a run again may fix, leaves it for the next run. --accept is refused
@@ -15732,8 +15732,6 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	record = (None, None)
 	# a file target's folder, opened before the copy, for its sync to report every writeback error since (or why it could not be)
 	folder_fd = None
-	# set once this run tried its sync: one stopped before then tries it on its way out
-	tried_sync = False
 
 	def mark(unsynced:str = None, recopy:str = None, made:bool = False):
 		# the marker as this run leaves it now: what it knows of, what it did not get to meet again, and what is on disk
@@ -15904,20 +15902,13 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			if report.restored:
 				folder = os.path.dirname(target)
 				if isinstance(folder_fd, OSError):
-					# not there to open before the copy, which made it: open it now, for the errors since
-					try:
-						folder_fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
-					except (FileNotFoundError, NotADirectoryError) as e:
-						report.fail(rel, f'{folder} is not there now ({e}), so it could not be synced: {target} was restored into it, and is not known to be on disk', rerun=False)
-					except OSError as e:
-						report.warn(rel, f'could not sync {folder}: {e}; what was restored there is not known to be on disk')
-				if isinstance(folder_fd, int):
+					report.warn(rel, f'could not open {folder} to sync it: {folder_fd}; {target} is not known to be on disk')
+				else:
 					sync_restore(folder_fd, folder, report, rel)
 			return
 		# the copies on disk before the marker goes: a crash after must not leave a finished-looking target with empty files.
 		# synced, the marker says so before anything is handed over, so a run stopped among the hand-over can be finished;
 		# a recopy is done only once every entry was copied again
-		tried_sync = True
 		if not sync_restore(lock, target, report, rel):
 			write_error()
 			report.left_private = True
@@ -15941,17 +15932,12 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			# however the restore ends, no copy is left writing into target, nor a partial file in it
 			stop_copies(mcae, pending, target)
 		finally:
+			# a stop leaves the record as it is: a run again of this boot and these mounts keeps what is there and syncs it with
+			# the rest, one after a reboot or a remount copies everything again
 			if report.marker is not None and not report.target_handing_over:
-				if not tried_sync and not recopy and lock is not None:
-					# stopped before its sync: what it copied is synced now, so a run again picks it up rather than copying
-					# it all again. a recopy is not done, and stays recorded
-					with contextlib.suppress(OSError):
-						if sync_restore(lock, target, report, rel):
-							mark()
-						else:
-							write_error()
 				unset = list(report.unset) + [entry for entry in earlier if entry not in report.unset]
-				if unset != written:
+				# report.marker is looked at again: drop_marker() may have just taken it away, and it is never written back
+				if unset != written and report.marker is not None:
 					with contextlib.suppress(OSError):
 						mark(*record)
 			for sig, handler in handlers.items():
@@ -16184,13 +16170,6 @@ def nothing_to_accept(target:str) -> CommandError:
 	'''The refusal of --accept where no unfinished restore of the same path and version is.'''
 	return CommandError(f'{target} holds no unfinished restore to keep: --accept keeps the result of a folder restore that did not complete, given the same path and version')
 
-def restore_boot_id() -> str:
-	'''This boot's id for a restore's marker, or '' when it cannot be read: a marker of '' is of no boot this one can tell for its own.'''
-	try:
-		return current_boot_id()
-	except OSError:
-		return ''
-
 def restore_mount_identity(target:str) -> str:
 	'''
 	What a restore's marker records for the copies it makes into the folder target until a sync of them succeeds: this
@@ -16200,7 +16179,10 @@ def restore_mount_identity(target:str) -> str:
 	read, a mount gives no unique id (a kernel before 6.8) or cannot be looked at: of no boot and mount this run can tell
 	for its own, so a run again copies everything again.
 	'''
-	boot = restore_boot_id()
+	try:
+		boot = current_boot_id()
+	except OSError:
+		return ''
 	if not boot:
 		return ''
 	try:
@@ -16433,7 +16415,7 @@ def restore_command(args) -> int:
 				if report.handing_over:
 					# the folders handed over are another user's now, which a run again refuses to write into
 					raise CommandError(f'Interrupted: the restore was stopped while giving its folders their owners; finish it by running the same restore again with --accept. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
-				raise CommandError(f'Interrupted: run the same restore again to pick it up, or again with --accept to keep what it restored as it is. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
+				raise CommandError(f'Interrupted: run the same restore again to pick it up (after a reboot or a remount of its disk it copies everything again), or again with --accept to keep what it restored as it is. {unfinished_note(target)}', EXIT_COMMAND_FAILED)
 			finally:
 				report.progress(sys.stderr, done=True)
 	print(report.summary())
