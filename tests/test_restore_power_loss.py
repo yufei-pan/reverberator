@@ -34,7 +34,6 @@ def _fast(poll_fast):
 @pytest.fixture
 def backed_up(tmp_path):
 	job = create_job(str(tmp_path / 'side'))
-	os.makedirs(job.monitor)
 	for rel, data in FILES.items():
 		path = os.path.join(job.monitor, rel)
 		os.makedirs(os.path.dirname(path), exist_ok=True)
