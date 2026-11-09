@@ -641,6 +641,23 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** the proper fix is in the kernel; a report is drafted for the f2fs list.
 - **Revisit when:** a kernel carries the fix: then that tolerance in `is_skeleton()` can go.
 
+### A symlink the vault's filesystem can't hold is left out
+
+- **Kind:** known limitation.
+- **What the operator sees:** a symlink in the monitored tree whose text or path is longer than the vault's filesystem
+  takes is in no version: on an XFS vault, a link text of 1,024 bytes and up (ext4 and f2fs take up to 4,095). Each
+  backup that meets it logs `reverberator job <name> NOT BACKED UP: <path>: a symlink whose text or path is longer than
+  the vault's filesystem takes; left out of this version`, which alerts, and the rest of the batch is backed up. A
+  version that held a link of that name before keeps it; the new version shows none. A restore that meets such a link
+  (from a vault on another filesystem to a target on XFS) restores everything else, names the link
+  (`FAILED <rel>: not restored: the target's filesystem cannot hold a link that long (its text or its path)`), finishes,
+  and exits 1.
+- **Why:** a version holds a link as itself, so a vault that cannot hold its text cannot keep it browsable. Before 0.55.2
+  the failed copy stopped every backup of the job until the link was gone. Keeping it another way (its text in a file
+  with a marker) would add code, and browsing would show a file where the link was.
+- **Revisit when:** someone needs such links kept on an XFS vault.
+- **Approved:** 2026-11-09, "Accept: leave it out, warn (Recommended)".
+
 ### mergerfs answers EBADF to a lstat during an rm
 
 - **Kind:** deferred.
@@ -701,12 +718,34 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** a lightness item; the reads sit in separate steps that need one table passed between them.
 - **Revisit when:** the lightness round after 0.55.1.
 
-### One du process per batch for the size estimate
+### One du process for a deleted folder's inodes
 
 - **Kind:** deferred.
-- **What the operator sees:** nothing but cost: a process and 135 syscalls for what an lstat per path gives.
-- **Why:** a lightness item; the estimate stays, only the process can go.
-- **Revisit when:** the lightness round after 0.55.1.
+- **What the operator sees:** nothing but cost: a batch that deletes a folder runs `du --inodes` on the vault's copy of
+  it, a process for what a walk gives. 0.55.2 took `du` out of the size estimate's bytes; this count is what is left.
+- **Why:** a walk counts each name of a hard-linked file, where `du` counts the file once, so the inode count would
+  change with it.
+- **Revisit when:** the lightness round.
+
+### A full comparison that meets only what it leaves out commits a version
+
+- **Kind:** deferred.
+- **What the operator sees:** a full comparison, such as the one at each start, whose only differences are entries it
+  leaves out (an unreadable file, a symlink the vault's filesystem can't hold) commits a version that changes nothing.
+  With Keep N Versions, each such version pushes the oldest one out: four comparisons made four versions in a probe.
+- **Why:** older than 0.55.2 for unreadable files; the link left out joins it. A batch whose every entry drops out should
+  commit nothing.
+- **Revisit when:** the round after 0.55.2.
+
+### Failures no rerun can fix still hold a folder restore's target
+
+- **Kind:** deferred.
+- **What the operator sees:** a folder restore that meets a broken chain in the vault, a link a referenced backup holds,
+  or a regular file whose target path is too long reports it as failed, keeps the target private (0700) with its
+  marker, and offers to run the same restore again, which can never succeed; `--accept` finishes it.
+- **Why:** older than 0.55.2, which made two such failures finish or say so: a link the target cannot hold, and a write
+  error at the restore's sync (lessons, 2026-11-09).
+- **Revisit when:** the round after 0.55.2: those kinds become failures no rerun can fix.
 
 ### The root's metadata is written every batch
 
