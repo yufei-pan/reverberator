@@ -246,17 +246,21 @@ def test_in_place_never_moves_a_vault_aside(job, tmp_path, capsys):
 
 
 def test_interrupted_restore_picks_up(job, tmp_path, capsys, monkeypatch):
+	if rv.statx_mount(str(tmp_path)) is None:
+		# a kernel before 6.8 names no mount for good: a run again copies everything again there
+		pytest.skip('no unique mount ids on this kernel')
 	files = twenty_files(job)
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
 	marker = os.path.join(target, rv.RESTORE_MARKER_NAME)
 	code, stdout, err = interrupted(tmp_path, capsys, monkeypatch, f'{job.monitor}/proj', out, '--version', '0', '--threads', '2')
 	assert (code, stdout) == (rv.EXIT_COMMAND_FAILED, '')
-	assert err == f'Interrupted: run the same restore again to pick it up, or again with --accept to keep what it restored as it is. {until_then(target)}\n'
-	# marked as this restore's own, written whole and private, and the output kept private
+	assert err == f'Interrupted: run the same restore again to pick it up (after a reboot or a remount of its disk it copies everything again), or again with --accept to keep what it restored as it is. {until_then(target)}\n'
+	# marked as this restore's own, written whole and private, and the output kept private; stopped before its sync, its
+	# copies of this boot and mount
 	with open(marker, encoding='utf-8') as f:
-		assert json.load(f) == {'job': job.job_name, 'path': 'proj', 'version': versions(job)[0].name}
-	assert rv.read_restore_marker(target) == {'job': job.job_name, 'path': 'proj', 'version': versions(job)[0].name}
+		assert json.load(f) == {'job': job.job_name, 'path': 'proj', 'version': versions(job)[0].name, 'unsynced': rv.restore_mount_identity(target)}
+	assert rv.read_restore_marker(target) == {'job': job.job_name, 'path': 'proj', 'version': versions(job)[0].name, 'unsynced': rv.restore_mount_identity(target)}
 	assert stat.S_IMODE(os.lstat(marker).st_mode) == 0o600
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o700
 	before = inodes(target)

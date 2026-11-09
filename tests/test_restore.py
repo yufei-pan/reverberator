@@ -525,7 +525,7 @@ def test_restore_stops_cleanly_on_a_signal(job, tmp_path, capsys, monkeypatch):
 	target = os.path.join(out, 'monitor')
 	assert (code, stdout) == (rv.EXIT_COMMAND_FAILED, '')
 	# what it left is marked for a re-run to pick up
-	assert err == f'Interrupted: run the same restore again to pick it up, or again with --accept to keep what it restored as it is. {rv.unfinished_note(target)}\n'
+	assert err == f'Interrupted: run the same restore again to pick it up (after a reboot or a remount of its disk it copies everything again), or again with --accept to keep what it restored as it is. {rv.unfinished_note(target)}\n'
 	assert signalled and raised_inside == []
 	# the batches put in place before it are whole, under their own names; nothing of the one under way is left
 	restored = {rel: text for rel, text in marked_tree(target).items() if text is not None}
