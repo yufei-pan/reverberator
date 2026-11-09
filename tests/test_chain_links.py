@@ -96,8 +96,10 @@ def test_pruning_leaves_a_chain_link_whose_folder_is_gone(job):
 # a thousand folders deep, which was past Python's default limit of 1000 frames for a check that went down a folder at a time. A link that deep needs a
 # text of 2,000 bytes and more, which ext4 and f2fs take (4,095) and XFS does not (1,023): there the link is as deep as its filesystem lets it be
 DEEP_FOLDERS = 1000
-# the frames the daemon's own calls under these tests need above the test's: the three tests below pass with 16 and fail with 14 (measured by lowering the limit)
-DAEMON_FRAMES = 16
+# the frames the daemon's own calls under these tests need above the test's: each test alone in a fresh process passes with 21 frames of room and fails with 20
+# (measured by lowering the limit; the chain test is the deepest, at its first regex compile in the re module's parser). It grows with what the process has
+# not compiled or imported yet, so run after others in one process 16 are enough, and 21 is the number for any order
+DAEMON_FRAMES = 21
 
 
 def folders_deep(prefix, *folders):
