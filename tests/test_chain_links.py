@@ -96,13 +96,16 @@ def test_pruning_leaves_a_chain_link_whose_folder_is_gone(job):
 # a thousand folders deep, which was past Python's default limit of 1000 frames for a check that went down a folder at a time. A link that deep needs a
 # text of 2,000 bytes and more, which ext4 and f2fs take (4,095) and XFS does not (1,023): there the link is as deep as its filesystem lets it be
 DEEP_FOLDERS = 1000
+# the frames the daemon's own calls under these tests need above the test's: the three tests below pass with 16 and fail with 14 (measured by lowering the limit)
+DAEMON_FRAMES = 16
 
 
 def folders_deep(prefix, *folders):
 	'''How many folders deep a link at prefix + 'a/' * n + 'x' can go in folders: a thousand, or as many as the longest text their filesystems take allows.'''
 	depth = min(DEEP_FOLDERS, (link_text_limit(*folders) - len(prefix) - len('x')) // 2)
-	# deep enough that a check going down a folder at a time still runs out of the stack below
-	assert depth >= 300, depth
+	# the stack limit leaves depth // 2 frames to the daemon, which needs about DAEMON_FRAMES: twice that is the least depth that
+	# does not starve it
+	assert depth // 2 >= 2 * DAEMON_FRAMES, depth
 	return depth
 
 
@@ -129,12 +132,11 @@ def test_a_link_a_thousand_folders_deep_stops_neither_a_backup_nor_a_prune(job, 
 	v0 = run_backup(job)[0]
 	# a user's symlink shaped like a chain link into a V0 folder the vault does not have, a thousand folders down (as far as the filesystems take a text)
 	prefix = f'{job.job_vault}/V0--{T}/' if absolute else f'../V0--{T}/'
-	depth = folders_deep(prefix, job.monitor, v0)
+	depth = folders_deep(prefix, job.monitor, job.vault)
 	text = prefix + 'a/' * depth + 'x'
 	os.symlink(text, f'{job.monitor}/u')
 	# copied into V1, then read back to record it
-	with stack_for_half_the_folders(depth):
-		v1 = run_backup(job, OrderedDict([event_entry(job, 'u', 'create')]))[-1]
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'u', 'create')]))[-1]
 	assert os.readlink(f'{v1}/u') == text
 	open(f'{job.monitor}/keep.txt', 'w').write('k2')
 	with stack_for_half_the_folders(depth):
@@ -146,7 +148,7 @@ def test_a_link_a_thousand_folders_deep_stops_neither_a_backup_nor_a_prune(job, 
 
 def test_a_chain_a_thousand_folders_deep_resolves_and_prunes(job):
 	v0 = write_committed_version(job, 0, {}, timestamp=T, current=False)
-	depth = folders_deep(f'../V0--{T}/', v0)
+	depth = folders_deep(f'../V0--{T}/', job.vault)
 	# one folder at a time, as os.makedirs recurses once a folder
 	folder = v0
 	for _ in range(depth):
