@@ -15050,6 +15050,8 @@ class RestoreReport:
 		self.bytes = 0
 		self.failures = []
 		self.failed = 0
+		# of those, the ones no run again can fix, which hold no folder target private for one
+		self.final = 0
 		self.warnings = []
 		self.warned = 0
 		# the entries (rels, in the order they came) kept or restored without all of their metadata, as far as a marker records
@@ -15079,9 +15081,11 @@ class RestoreReport:
 			# nowhere to write it: the summary has the first of them
 			pass
 
-	def fail(self, rel:str, reason:str) -> None:
-		'''Record that rel was not restored, and say so now.'''
+	def fail(self, rel:str, reason:str, rerun:bool = True) -> None:
+		'''Record that rel was not restored, and say so now. rerun False: a run again cannot fix it.'''
 		self.failed += 1
+		if not rerun:
+			self.final += 1
 		if len(self.failures) < RESTORE_SUMMARY_LINES:
 			self.failures.append((rel, reason))
 		self.note('FAILED', rel, reason)
@@ -15149,8 +15153,8 @@ class RestoreReport:
 		lines += [f'FAILED {rel or "."}: {reason}' for rel, reason in self.failures]
 		if self.failed > len(self.failures):
 			lines.append(f'{self.failed - len(self.failures)} more failed: shown above as they happened')
-		if self.failed and self.marker is not None:
-			lines.append(f'{self.failed} failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {unfinished_note(self.target)}')
+		if self.failed > self.final and self.marker is not None:
+			lines.append(f'{self.failed - self.final} failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {unfinished_note(self.target)}')
 		elif self.left_private:
 			lines.append(f'Left {self.target} private (mode 0700), as not everything was restored')
 		# the paths, details and cp's messages can quote monitored names
@@ -15538,6 +15542,40 @@ def claim_restore_target(target:str, check = None) -> int:
 		raise
 	return fd
 
+def sync_restore(folder:str, report:RestoreReport, rel:str) -> bool:
+	'''
+	Write out everything dirty on the disks holding the restore's folder (the folder target, or the folder holding a file
+	target), so what the restore reports done is on disk: syncfs_folder() of each disk, as vault_disks() finds a vault's.
+	On a mergerfs pool, whose own sync does not reach the disks, that is each branch holding folder, each disk once
+	through the first of its branches that does; off a pool, folder's own filesystem. Nothing is recorded, unlike
+	sync_vault_filesystems(): a restore writes no vault marker. A disk whose sync failed is a failure of rel, naming the
+	disk, that no run again can fix (it would keep what is there); False then, once every disk was tried.
+	'''
+	try:
+		pooled, disks = vault_disks(folder)
+	except OSError as e:
+		report.fail(rel, f'the disks holding {folder} could not be listed to write the restore out to them: {e}', rerun=False)
+		return False
+	folders = {}
+	for disk, path in disks:
+		folders.setdefault(disk, []).append(path)
+	synced = True
+	for disk, paths in folders.items():
+		for path in paths:
+			try:
+				syncfs_folder(path)
+			except (FileNotFoundError, NotADirectoryError) as e:
+				if pooled:
+					# a branch without it: the disk's next branch may hold it
+					continue
+				report.fail(rel, f'{folder} could not be written out to its disk: {e}', rerun=False)
+				synced = False
+			except OSError as e:
+				report.fail(rel, f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it', rerun=False)
+				synced = False
+			break
+	return synced
+
 def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None, marked:bool = False) -> None:
 	'''
 	Copy what version holds at rel ('' for the monitored path) to target, filling report in. Nothing in the vault is
@@ -15550,10 +15588,11 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	job in place the empty monitored path (the caller checks which). It is marked as this restore's own
 	(write_restore_marker()) before anything is copied, and the folder is walked in the version (iter_version_entries(), so
 	what a folder forwards to is restored as a real tree): its folders are made as they are met and its files copied, threads at a time, each copy put in place every RESTORE_COPY_BATCH of them. Once
-	all are, and nothing failed, the marker goes and each folder gets the vault folder's metadata, the ones inside it
-	first and the target last, so nothing copied into it changes its times afterwards. While anything failed, or when
-	the restore stops, the marker stays and every folder is left as this restore made it, the target 0700, for a run of
-	the same restore to pick up.
+	all are, and nothing failed, the target's disks are synced (sync_restore()), the marker goes and each folder gets the
+	vault folder's metadata, the ones inside it first and the target last, so nothing copied into it changes its times
+	afterwards, and the disks are synced again; a file target's folder is synced once the file is in place. While
+	anything failed that a run again may fix, or a sync failed before the hand-over, or when the restore stops, the marker
+	stays and every folder is left as this restore made it, the target 0700, for a run of the same restore to pick up.
 	A file of the walk that is a prune's temporary (is_prune_temp()) is passed over: not restored, counted or warned of.
 	A dangling chain, a link to the live file of a referenced backup, an entry that cannot be read, a failed copy or an
 	OSError is a failure of that entry alone; so is a folder whose place holds a symlink, something else or another
@@ -15709,11 +15748,22 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			for entry_rel, error in errors:
 				report.fail(entry_rel, f'unreadable in the vault: {error}')
 		finish_batch()
-		if report.failed:
+		if report.failed > report.final:
 			# a folder handed to its owner now could be swapped for a symlink before a re-run writes into it
 			report.left_private = bool(folders)
 			return
+		if not folders:
+			# a file target, in place with its metadata
+			if report.restored:
+				sync_restore(os.path.dirname(target), report, rel)
+			return
+		# the copies on disk before the marker goes: a crash after must not leave a finished-looking target with empty files
+		if not sync_restore(target, report, rel):
+			report.left_private = True
+			return
 		hand_over_folders(folders, report, check_stop)
+		# and the folders' metadata and the marker's removal, before the restore says it is done
+		sync_restore(target, report, rel)
 	finally:
 		try:
 			# however the restore ends, no copy is left writing into target, nor a partial file in it
@@ -15763,7 +15813,8 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 	'''
 	Keep the unfinished output of a folder restore of rel from version at target as it is (--accept), filling report
 	in: copy nothing, but give its folders the metadata the version's folders have and end the restore, its marker
-	removed (hand_over_folders()). The caller checks the marker. Only the real folders of this user's a restore leaves
+	removed (hand_over_folders()), with the target's disks synced before and after (sync_restore()), as a folder restore
+	has them. The caller checks the marker. Only the real folders of this user's a restore leaves
 	are handed over; anything else in a folder's place is left as it is with all under it, a warning saying so, as is
 	a folder already its vault folder's owner's, which a run stopped while handing them over left with all under it
 	handed over too. Partial files a killed run left are removed.
@@ -15820,7 +15871,12 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 			report.warn(entry_rel, f'{reason or "not one this restore made"}: left as it is')
 		for entry_rel, error in errors:
 			report.warn(entry_rel, f'unreadable in the vault: {error}; the folders under it keep what the restore gave them')
+		# a killed run's copies may still be dirty: on disk before the marker goes
+		if not sync_restore(target, report, rel):
+			report.left_private = True
+			return
 		hand_over_folders(folders, report)
+		sync_restore(target, report, rel)
 	finally:
 		os.close(lock)
 
