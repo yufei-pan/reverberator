@@ -15936,8 +15936,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			# the rest, one after a reboot or a remount copies everything again
 			if report.marker is not None and not report.target_handing_over:
 				unset = list(report.unset) + [entry for entry in earlier if entry not in report.unset]
-				# report.marker is looked at again: drop_marker() may have just taken it away, and it is never written back
-				if unset != written and report.marker is not None:
+				if unset != written:
 					with contextlib.suppress(OSError):
 						mark(*record)
 			for sig, handler in handlers.items():
