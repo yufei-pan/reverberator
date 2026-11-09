@@ -19,7 +19,7 @@ import TSVZ
 import xxhash
 import reverberator as rv
 from tests import harness
-from tests.harness import create_job, seed_monitor, run_backup, event_entry, write_rule, write_committed_version
+from tests.harness import create_job, seed_monitor, run_backup, event_entry, write_rule, write_committed_version, link_text_taking_a_block
 from tests.test_log_text import alerting_lines
 from tests import chain_ground_truth
 from tests.vault_oracle import read_view
@@ -1648,15 +1648,27 @@ def test_a_filesystem_that_gives_enosys_for_a_hard_link_moves_the_copy(tmp_path,
 
 
 # a rel whose chain link is too long to sit in its inode, so the link takes a block of its own
-LONG = 'a_folder_with_a_long_enough_name/and_a_file_name_long_enough_too.txt'
+LONG_FOLDER, LONG_FILE = 'a_folder_with_a_long_enough_name', 'and_a_file_name_long_enough_too.txt'
+
+
+def long_path(folder):
+	'''
+	A path whose link in V1 to V0's copy (../../V0--<timestamp>/ and the path) takes a block of the filesystem under folder, which a text that fits in
+	the inode does not: 60 bytes on ext4, and 337 on XFS with 512-byte inodes. Names stretch to the 255 bytes a name can have.
+	'''
+	need = link_text_taking_a_block(folder) - len('../../V0--2026-11-08_21-33-00_-0800/')
+	more = max(0, need - len(LONG_FOLDER) - 1 - len(LONG_FILE))
+	assert more <= 2 * 255 - len(LONG_FOLDER) - len(LONG_FILE), more
+	in_folder = min(more, 255 - len(LONG_FOLDER))
+	return f'{LONG_FOLDER}{"x" * in_folder}/{"y" * (more - in_folder)}{LONG_FILE}'
 
 
 def books_job(tmp_path, tree=None):
 	'''
-	V0, V1 and V2 of a job whose V1 links keep, D/secret (a link short enough to sit in its inode), LONG and b/x to
+	V0, V1 and V2 of a job whose V1 links keep, D/secret (a link short enough to sit in its inode), long_path() and b/x to
 	V0's copies, and copies b/y, which it modified.
 	'''
-	job = fresh_job(tmp_path, {'D/secret': 'secret' * 3000, 'b/x': 'x' * 20000, 'b/y': 'y', LONG: 'z' * 5000, 'keep': 'k'} if tree is None else tree)
+	job = fresh_job(tmp_path, {'D/secret': 'secret' * 3000, 'b/x': 'x' * 20000, 'b/y': 'y', long_path(tmp_path): 'z' * 5000, 'keep': 'k'} if tree is None else tree)
 	with open(os.path.join(job.monitor, 'b/y'), 'w') as f:
 		f.write('y' * 50000)
 	run_backup(job, OrderedDict([event_entry(job, 'b/y', 'modify')]))
@@ -1708,7 +1720,7 @@ def reads_right(job):
 	for version in rv.list_versions(job.job_vault):
 		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret' * 3000, version.name
 		assert open(os.path.join(version.path, 'b/x')).read() == 'x' * 20000, version.name
-		assert open(os.path.join(version.path, LONG)).read() == 'z' * 5000, version.name
+		assert open(os.path.join(version.path, long_path(job.root))).read() == 'z' * 5000, version.name
 		# modified in V1
 		assert open(os.path.join(version.path, 'b/y')).read() == ('y' if version.number == 0 else 'y' * 50000), version.name
 
@@ -1733,7 +1745,7 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 	# when a removal was cut short
 	job = books_job(tmp_path)
 	v0, v1, v2 = rv.list_versions(job.job_vault)
-	assert os.lstat(os.path.join(v1.path, LONG)).st_blocks and not os.lstat(os.path.join(v1.path, 'D/secret')).st_blocks
+	assert os.lstat(os.path.join(v1.path, long_path(job.root))).st_blocks and not os.lstat(os.path.join(v1.path, 'D/secret')).st_blocks
 	info = rv.get_vault_info(job.job_vault)
 	caller = [info.vault_size, info.vault_inodes]
 	assert_books(job, info.vault_info_dict, caller)
@@ -1759,7 +1771,7 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 		prune()
 		monkeypatch.undo()
 		assert list(info.vault_info_dict) == [0, 1, 2] and os.path.isdir(v0.path)
-		assert os.lstat(os.path.join(v1.path, LONG)).st_ino == os.lstat(os.path.join(v0.path, LONG)).st_ino
+		assert os.lstat(os.path.join(v1.path, long_path(job.root))).st_ino == os.lstat(os.path.join(v0.path, long_path(job.root))).st_ino
 		assert_books(job, info.vault_info_dict, caller)
 		reads_right(job)
 		prune()
