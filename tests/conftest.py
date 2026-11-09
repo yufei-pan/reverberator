@@ -18,20 +18,16 @@ STILL_054 = {
 	'test_chain_links.py',
 }
 
-# the real helpers, for the one test that runs them: isolated_runtime() replaces them for every test
+# the real helper and binding, for the tests that run them: isolated_runtime() replaces them for every test. the real
+# syncfs only ever on a scratch image's own mount (tests/scratch_images.py)
 REAL_SYNC_VAULT_FILESYSTEMS = rv.sync_vault_filesystems
-REAL_SYNCFS_FOLDER = rv.syncfs_folder
-REAL_SYNCFS_FD = rv.syncfs_fd
+REAL_LIBC_SYNCFS = rv.LIBC_SYNCFS
 
 
-def syncfs_stand_in(path:str) -> None:
-	'''syncfs_folder() without the syncfs: the folder is opened and closed, so a path that is no folder still raises as it does.'''
-	os.close(os.open(path, os.O_RDONLY | os.O_DIRECTORY))
-
-
-def syncfs_fd_stand_in(fd:int, path:str = None) -> None:
-	'''syncfs_fd() without the syncfs: an fd that is not open still raises.'''
+def syncfs_stand_in(fd:int) -> int:
+	'''The syncfs(2) binding without the syncfs: an fd that is not open raises, as the call would fail; else 0, done.'''
 	os.fstat(fd)
+	return 0
 
 
 @pytest.fixture(autouse=True)
@@ -68,9 +64,9 @@ def isolated_runtime(tmp_path, monkeypatch):
 	# a real syncfs would flush the whole (ext4) filesystem under /tmp for every comparison that checks a copy; tests that count
 	# or fail syncs patch it themselves
 	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault, job_name: {})
-	# nor anything else: a restore syncs its target, and the filesystem under a basetemp can hold live trees. never a real syncfs
-	monkeypatch.setattr(rv, 'syncfs_folder', syncfs_stand_in)
-	monkeypatch.setattr(rv, 'syncfs_fd', syncfs_fd_stand_in)
+	# nor anything else: a restore syncs its target, and the filesystem under a basetemp can hold live trees. never a real
+	# syncfs: the stand-in is the binding itself, so every function above it runs
+	monkeypatch.setattr(rv, 'LIBC_SYNCFS', syncfs_stand_in)
 	# and never reads the host's fstab: a missing file, which a test writes with write_fstab() when it means to
 	monkeypatch.setattr(rv, 'FSTAB_PATH', str(tmp_path / 'fstab'))
 	yield

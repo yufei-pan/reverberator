@@ -7,7 +7,8 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS, REAL_SYNCFS_FOLDER
+from tests.conftest import REAL_LIBC_SYNCFS, REAL_SYNC_VAULT_FILESYSTEMS
+from tests.scratch_images import LoopImage, needs_f2fs, SCRATCH
 from tests.harness import create_job, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry, reads_the_file_before
 from tests.test_names import contents, database, schema, schema_1_job
 
@@ -512,12 +513,16 @@ def test_a_comparison_storing_no_checked_file_record_makes_no_sync(job, monkeypa
 	assert unchecked_flags(job)['b.txt'] == 1
 
 
-def test_the_real_sync_succeeds_on_the_test_filesystem(job):
-	os.makedirs(job.job_vault, exist_ok=True)
-	# through the stand-in: a real syncfs of the filesystem under the basetemp is never made
-	assert REAL_SYNC_VAULT_FILESYSTEMS(job.job_vault, 'job') == {next(iter(rv.vault_disks(job.job_vault)[1]))[0]: None}
-	with pytest.raises(OSError):
-		REAL_SYNCFS_FOLDER(os.path.join(job.job_vault, 'not there'))
+@needs_f2fs
+def test_the_real_sync_succeeds_on_the_test_filesystem(monkeypatch):
+	# the real binding, on a scratch image's own mount: nothing else lives there
+	with LoopImage(os.path.join(SCRATCH, 'real-sync'), 64) as image:
+		job = create_job(image.mount_point)
+		os.makedirs(job.job_vault)
+		monkeypatch.setattr(rv, 'LIBC_SYNCFS', REAL_LIBC_SYNCFS)
+		assert REAL_SYNC_VAULT_FILESYSTEMS(job.job_vault, 'job') == {rv.vault_disks(job.job_vault)[1][0][0]: None}
+		with pytest.raises(FileNotFoundError):
+			rv.syncfs_folder(os.path.join(job.job_vault, 'not there'))
 
 
 def test_copies_a_backup_wrote_stay_unchecked_without_any_patch(job):
