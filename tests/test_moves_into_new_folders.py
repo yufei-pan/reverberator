@@ -1021,7 +1021,7 @@ ESTIMATE_ROWS = [
 ]
 
 
-@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['du', 'walk'])
+@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('row,writes,written,made', ESTIMATE_ROWS, ids=[row[0] for row in ESTIMATE_ROWS])
 def test_the_size_estimate_counts_what_is_written_under_a_folder_moved_into_a_new_one(session, job, monkeypatch, patterns, row, writes, written, made):
 	# the folder is taken out of the new folder's size, with what is written in it: that is copied, and a limit would make no room
@@ -1047,7 +1047,7 @@ ATTRIB_ROWS = [
 ]
 
 
-@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['du', 'walk'])
+@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('row,changes,only_sync_attributes', [(row, changes, osa) for row, changes, settings in ATTRIB_ROWS for osa in settings],
 	ids=[f'{row}-{"osa" if osa else "no_osa"}' for row, _, settings in ATTRIB_ROWS for osa in settings])
 def test_the_size_estimate_counts_the_attribute_copies_under_a_folder_moved_into_a_new_one(session, job, monkeypatch, patterns, row, changes, only_sync_attributes):

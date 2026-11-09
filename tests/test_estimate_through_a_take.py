@@ -50,7 +50,7 @@ def create_then_take(one, job, monkeypatch):
 	one.settle()
 
 
-@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['du', 'walk'])
+@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('row,writes,written,made', ROWS, ids=[row[0] for row in ROWS])
 def test_the_put_back_through_a_take(session, job, monkeypatch, patterns, row, writes, written, made):
 	one = session(patterns=patterns)
@@ -73,7 +73,7 @@ def test_the_put_back_through_a_take(session, job, monkeypatch, patterns, row, w
 	assert est_inodes == made + probes - 1, (est_inodes, made, probes)
 
 
-@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['du', 'walk'])
+@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('row,changes,only_sync_attributes', [(row, changes, osa) for row, changes, settings in ATTRIB_ROWS for osa in settings],
 	ids=[f'{row}-{"osa" if osa else "no_osa"}' for row, _, settings in ATTRIB_ROWS for osa in settings])
 def test_the_attrib_put_back_through_a_take(session, job, monkeypatch, patterns, row, changes, only_sync_attributes):
@@ -103,7 +103,7 @@ FILE_ROWS = [
 ]
 
 
-@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['du', 'walk'])
+@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('row,steps,written', FILE_ROWS, ids=[row[0] for row in FILE_ROWS])
 def test_file_rows_through_a_take(session, job, monkeypatch, patterns, row, steps, written):
 	one = session(patterns=patterns)

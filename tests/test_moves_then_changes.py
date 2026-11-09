@@ -758,7 +758,7 @@ def test_the_estimate_leaves_a_move_inside_another_out_once(job):
 	assert (size, inodes) == (charge(f'{m}/n/own', job.job_vault) + charge(f'{m}/n', job.job_vault), 2)
 
 
-@pytest.mark.parametrize('skip', ['du', 'walk'])
+@pytest.mark.parametrize('skip', ['no_skip_list', 'skip_list'])
 def test_the_estimate_puts_back_what_is_written_under_a_folder_it_took_out(job, skip):
 	# mkdir n; mv d n/d; then a file created and one appended under n/d/s, which is modified itself: n and n/d/s are all of it that
 	# the version does not hold already, and the two files are counted once, not once under n/d/s and again by themselves
@@ -772,15 +772,15 @@ def test_the_estimate_puts_back_what_is_written_under_a_folder_it_took_out(job, 
 	with open(f'{m}/n/d/s/old', 'a') as f:
 		f.write('m' * 50000)
 	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'), (True, 'modify', 'n/d/s', None), (False, 'create', 'n/d/s/z', None), (False, 'modify', 'n/d/s/old', None))
-	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
+	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None)
 	assert (size, inodes) == (sum(charge(f'{m}/{rel}', job.job_vault) for rel in ('n', 'n/d/s', 'n/d/s/z', 'n/d/s/old')), 2)
 
 
-@pytest.mark.parametrize('skip', ['du', 'walk'])
+@pytest.mark.parametrize('skip', ['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('carried', [True, False], ids=['carried', 'no_move'])
 def test_the_estimate_counts_a_file_made_in_a_made_folder_once(job, skip, carried):
 	# mkdir n; mv d n/d; mkdir n/d/s; echo > n/d/s/f, or a full comparison's creates of a new tree (mkdir n; mkdir n/s; echo > n/s/f):
-	# the folder's walk or du counts what is in it, so the file's own create adds no inode again
+	# the folder's walk counts what is in it, so the file's own create adds no inode again
 	seed_monitor(job, {'d/old': 'o' * 100000, 'keep': 'k'})
 	run_backup(job)
 	m = job.monitor
@@ -792,11 +792,11 @@ def test_the_estimate_counts_a_file_made_in_a_made_folder_once(job, skip, carrie
 	with open(f'{m}/{base}/s/f', 'w') as f:
 		f.write('f' * 200000)
 	events = [(True, 'create', 'n', None)] + ([(True, 'move', 'n/d', 'd')] if carried else []) + [(True, 'create', f'{base}/s', None), (False, 'create', f'{base}/s/f', None)]
-	size, inodes = rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
+	size, inodes = rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None)
 	assert (size, inodes) == (sum(charge(f'{m}/{rel}', job.job_vault) for rel in ('n', f'{base}/s', f'{base}/s/f')), 3)
 
 
-@pytest.mark.parametrize('skip', ['du', 'walk'])
+@pytest.mark.parametrize('skip', ['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('only_sync_attributes,copied', [(False, False), (True, True), (True, False)], ids=['copies', 'copies_by_its_record', 'vouched'])
 def test_the_estimate_counts_an_attribute_copy_under_a_folder_moved_into_a_new_one(job, skip, only_sync_attributes, copied):
 	# mkdir n; mv d n/d; chmod n/d/h: the attrib copies the file unless Only Sync Attributes vouches for the vault's copy
@@ -807,7 +807,7 @@ def test_the_estimate_counts_an_attribute_copy_under_a_folder_moved_into_a_new_o
 	os.rename(f'{m}/d', f'{m}/n/d')
 	os.chmod(f'{m}/n/d/h', 0o600)
 	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'), (False, 'attrib', 'n/d/h', None))
-	size, inodes = rv.get_backup_size_inode(entries, only_sync_attributes, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None,
+	size, inodes = rv.get_backup_size_inode(entries, only_sync_attributes, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None,
 		copied={f'{m}/n/d/h'} if copied else frozenset())
 	assert (size, inodes) == (charge(f'{m}/n', job.job_vault) + (charge(f'{m}/n/d/h', job.job_vault) if copied or not only_sync_attributes else 0), 1)
 
@@ -1710,7 +1710,7 @@ def test_a_deleted_files_chain_link_is_never_followed_by_the_folder_check(job, l
 	assert followed == []
 
 
-@pytest.mark.parametrize('skip', ['du', 'walk'])
+@pytest.mark.parametrize('skip', ['no_skip_list', 'skip_list'])
 def test_the_estimate_of_a_batch_with_nothing_carried_in_and_no_folder_made_asks_no_folder_question_for_the_put_back(job, skip, monkeypatch):
 	# the put-back and the inode of a file create look at each entry's parents only where a folder was carried in or made: a batch of file
 	# creates and modifies pays for neither. the walk asks in its first loop, as it did on 0.55, with a skip list or without one (0.55.2
@@ -1728,5 +1728,5 @@ def test_the_estimate_of_a_batch_with_nothing_carried_in_and_no_folder_made_asks
 	asked = []
 	real = rv.inside_folders
 	monkeypatch.setattr(rv, 'inside_folders', lambda *args: asked.append(args[0]) or real(*args))
-	rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
+	rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None)
 	assert len(asked) == len(events) + 20
