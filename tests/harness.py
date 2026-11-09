@@ -47,6 +47,55 @@ def write_tree(root: str, tree: dict) -> None:
 			f.write(content)
 
 
+def probe_link(folder: str, length: int):
+	'''The lstat of a symlink of length bytes of text made in folder and removed again, or None where the filesystem refuses a text so long.'''
+	path = os.path.join(folder, f'.link-probe-{os.getpid()}-{threading.get_ident()}')
+	try:
+		os.symlink('a' * length, path)
+	except OSError as e:
+		if e.errno == errno.ENAMETOOLONG:
+			return None
+		raise
+	try:
+		return os.lstat(path)
+	finally:
+		os.unlink(path)
+
+
+def link_text_limit(*folders: str) -> int:
+	'''
+	The longest symlink text, in bytes, that each of folders takes, as its filesystem answers: the kernel's 4095 on ext4 and f2fs, 1023 on XFS.
+	A test of a long link builds its link at the size this gives, not at a size one filesystem happens to take.
+	'''
+	limits = []
+	for folder in folders:
+		low, high = 1, 4095
+		while low < high:
+			middle = (low + high + 1) // 2
+			if probe_link(folder, middle) is None:
+				high = middle - 1
+			else:
+				low = middle
+		limits.append(low)
+	return min(limits)
+
+
+def link_text_taking_a_block(folder: str) -> int:
+	'''
+	The shortest symlink text, in bytes, whose link takes a block of folder's filesystem (st_blocks above 0): a short text sits in the inode, 59 bytes
+	or fewer on ext4 and well over 100 on XFS. A test that needs a link which takes space builds one at least this long.
+	'''
+	low, high = 1, link_text_limit(folder)
+	assert probe_link(folder, high).st_blocks, 'the longest link the filesystem takes sits in its inode too'
+	while low < high:
+		middle = (low + high) // 2
+		if probe_link(folder, middle).st_blocks:
+			high = middle
+		else:
+			low = middle + 1
+	return low
+
+
 def copy_now(writer, source: str, rel: str):
 	"""A copy of source to rel of the writer's tree, made and put in place now, as the replay queues and ends it: cp's exit code, or False when nothing is copied."""
 	writer.record(rel, True)

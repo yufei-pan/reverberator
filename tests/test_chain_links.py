@@ -2,12 +2,14 @@
 The links of a 0.54 vault as the code a 0.54 vault still needs reads them: vault_chain_hop() and the prune tell a chain link from a user's
 link. tests/legacy054.py writes the vaults, as the product's writer is gone.
 '''
+import contextlib
 import errno
 import os
+import sys
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_tree, write_committed_version, run_backup, latest_version, event_entry
+from tests.harness import seed_monitor, write_tree, write_committed_version, run_backup, latest_version, event_entry, link_text_limit
 
 pytestmark = pytest.mark.unit
 
@@ -91,21 +93,52 @@ def test_pruning_leaves_a_chain_link_whose_folder_is_gone(job):
 	assert os.readlink(f'{v1}/sub/x') == f'../../V0--{T}/sub/x'
 
 
-DEEP = 'a/' * 1000
+# a thousand folders deep, which was past Python's default limit of 1000 frames for a check that went down a folder at a time. A link that deep needs a
+# text of 2,000 bytes and more, which ext4 and f2fs take (4,095) and XFS does not (1,023): there the link is as deep as its filesystem lets it be
+DEEP_FOLDERS = 1000
+
+
+def folders_deep(prefix, *folders):
+	'''How many folders deep a link at prefix + 'a/' * n + 'x' can go in folders: a thousand, or as many as the longest text their filesystems take allows.'''
+	depth = min(DEEP_FOLDERS, (link_text_limit(*folders) - len(prefix) - len('x')) // 2)
+	# deep enough that a check going down a folder at a time still runs out of the stack below
+	assert depth >= 300, depth
+	return depth
+
+
+@contextlib.contextmanager
+def stack_for_half_the_folders(depth):
+	'''
+	A limit on the stack that gives the code under it half as many frames as the link has folders: a check that went down a folder at a time,
+	a frame for each, would fail on it, whatever depth its filesystem lets a link be.
+	'''
+	limit = sys.getrecursionlimit()
+	frames, frame = 0, sys._getframe()
+	while frame is not None:
+		frames, frame = frames + 1, frame.f_back
+	sys.setrecursionlimit(frames + depth // 2)
+	try:
+		yield
+	finally:
+		sys.setrecursionlimit(limit)
 
 
 @pytest.mark.parametrize('absolute', [False, True])
 def test_a_link_a_thousand_folders_deep_stops_neither_a_backup_nor_a_prune(job, absolute):
 	seed_monitor(job, {'keep.txt': 'k'})
 	v0 = run_backup(job)[0]
-	# a user's symlink shaped like a chain link into a V0 folder the vault does not have, a thousand folders down
-	text = (f'{job.job_vault}/V0--{T}/' if absolute else f'../V0--{T}/') + DEEP + 'x'
+	# a user's symlink shaped like a chain link into a V0 folder the vault does not have, a thousand folders down (as far as the filesystems take a text)
+	prefix = f'{job.job_vault}/V0--{T}/' if absolute else f'../V0--{T}/'
+	depth = folders_deep(prefix, job.monitor, v0)
+	text = prefix + 'a/' * depth + 'x'
 	os.symlink(text, f'{job.monitor}/u')
 	# copied into V1, then read back to record it
-	v1 = run_backup(job, OrderedDict([event_entry(job, 'u', 'create')]))[-1]
+	with stack_for_half_the_folders(depth):
+		v1 = run_backup(job, OrderedDict([event_entry(job, 'u', 'create')]))[-1]
 	assert os.readlink(f'{v1}/u') == text
 	open(f'{job.monitor}/keep.txt', 'w').write('k2')
-	run_backup(job, OrderedDict([event_entry(job, 'keep.txt', 'modify')]), keep_n_versions=2)
+	with stack_for_half_the_folders(depth):
+		run_backup(job, OrderedDict([event_entry(job, 'keep.txt', 'modify')]), keep_n_versions=2)
 	assert not os.path.exists(v0) and latest_version(job).version_number == 2
 	assert not os.path.islink(f'{v1}/keep.txt') and open(f'{v1}/keep.txt').read() == 'k'
 	assert os.readlink(f'{v1}/u') == text
@@ -113,16 +146,18 @@ def test_a_link_a_thousand_folders_deep_stops_neither_a_backup_nor_a_prune(job, 
 
 def test_a_chain_a_thousand_folders_deep_resolves_and_prunes(job):
 	v0 = write_committed_version(job, 0, {}, timestamp=T, current=False)
+	depth = folders_deep(f'../V0--{T}/', v0)
 	# one folder at a time, as os.makedirs recurses once a folder
 	folder = v0
-	for _ in range(DEEP.count('/')):
+	for _ in range(depth):
 		folder = os.path.join(folder, 'a')
 		os.mkdir(folder)
 	write_tree(folder, {'x': 'x'})
 	v1 = write_committed_version(job, 1, {}, timestamp=T)
 	# as an older daemon left it after moving the file to the top
-	os.symlink(f'../V0--{T}/{DEEP}x', f'{v1}/x')
-	rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
+	os.symlink(f'../V0--{T}/' + 'a/' * depth + 'x', f'{v1}/x')
+	with stack_for_half_the_folders(depth):
+		rv.decrement_stepper(rv.get_vault_info(job.job_vault).vault_info_dict, job.job_name, job.monitor)
 	assert not os.path.exists(v0)
 	assert not os.path.islink(f'{v1}/x') and open(f'{v1}/x').read() == 'x'
 
