@@ -7622,6 +7622,27 @@ def copy_failure_side(source_path:str, temp_path:str, lines:list) -> str:
 		return 'vanished'
 	return 'vault' if source_readable(source_path) else 'source'
 
+def link_too_long(source_path:str, temp_path:str, lines:list) -> bool:
+	'''
+	Whether a failed copy of source_path into temp_path is a symlink the filesystem written into refuses as too long, its
+	text or its path (on XFS a link text of 1,024 bytes and up), from the lines cp wrote: one names this copy's own partial
+	file and ends, after the last quoted path, with ENAMETOOLONG's message (cp runs with the C locale), and lstat shows
+	source_path a symlink. No run again can copy such a link there. A regular file with a path too long is not one.
+
+	Examples:
+		>>> temp = '/v/.0f.reverberator-partial'
+		>>> line = f"cp: cannot create symbolic link '{temp}': File name too long"
+		>>> link_too_long('/', temp, [line]), link_too_long('/', temp, ["cp: cannot stat '/x': File name too long"])
+		(False, False)
+	'''
+	temp_name = os.path.basename(temp_path)
+	if not any(temp_name in line and cp_error(line).endswith(os.strerror(errno.ENAMETOOLONG)) for line in lines):
+		return False
+	try:
+		return stat.S_ISLNK(os.lstat(source_path).st_mode)
+	except OSError:
+		return False
+
 def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_name:str, reported:set = None, unsynced:list = None, writer:'TreeWriter' = None) -> list:
 	'''
 	Put the copies of pending in place once the executor has finished them, and empty pending.
@@ -7633,8 +7654,10 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 	are relative to version_path. The source of a copy put in place without all of its metadata is appended to unsynced,
 	when given, as copy_file_meta() appends to failed. Each copy put in place is recorded in manifest as held by version_path, in the
 	transaction committing that version, and returned (as its path relative to version_path). When writing into the
-	vault is what failed, JobFailure is raised once every copy is dealt with. writer is the version's TreeWriter, by
-	default one on version_path.
+	vault is what failed, JobFailure is raised once every copy is dealt with, except for a symlink whose text or path the
+	vault's filesystem refuses as too long (link_too_long()): it is left out of the version, as a delete leaves an entry
+	out (TreeWriter.remove_now(), so the previous version keeps what it held there), its row goes, and a line says so
+	(once per backup, with reported). writer is the version's TreeWriter, by default one on version_path.
 	'''
 	if writer is None:
 		writer = TreeWriter(version_path)
@@ -7668,6 +7691,22 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 				else:
 					# it went with the folder it was made in, which a link or a file has replaced: removing it would reach through
 					backuperTeeLogToTl(path=copy.source_path,message=f'Leaving the partial copy {copy.temp_path}: a folder above it in the version is not a real folder')
+				if link_too_long(copy.source_path, copy.temp_path, lines):
+					rel = os.path.relpath(copy.dest_path, version_path)
+					try:
+						if os.path.lexists(copy.dest_path) and real_folders_to(version_path, rel, missing_ok=True):
+							# what the tree held there is the version before's: recorded there, and gone from this one
+							writer.remove_now(rel)
+					except OSError as e:
+						if failure is None:
+							failure = JobFailure(f'removing {copy.dest_path} from the version failed: {e}')
+					manifest.discard(rel)
+					if reported is None or copy.source_path not in reported:
+						if reported is not None:
+							reported.add(copy.source_path)
+						job_log(job_name, f'NOT BACKED UP: {copy.source_path}: a symlink whose text or path is longer than the vault\'s filesystem takes; left out of this version')
+					done += 1
+					continue
 				side = copy_failure_side(copy.source_path, copy.temp_path, lines)
 				if side == 'vault':
 					if failure is None:
@@ -15148,7 +15187,8 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 	Put the copies of pending in place once the executor has finished them, as finish_copies() does for a backup, and
 	empty pending. A copy that succeeded takes its destination's place and counts as restored, as does one for which cp
 	only reported metadata it could not keep (a warning says so); one that failed leaves no partial file and is a
-	failure saying what cp said. The report's target itself, a restored file or symlink in a folder anyone may write
+	failure saying what cp said, or for a symlink the target's filesystem refuses as too long (link_too_long()) a
+	failure saying so that no run again fixes. The report's target itself, a restored file or symlink in a folder anyone may write
 	in, never replaces what appeared there meanwhile (place_new_entry()); what is inside a folder target, which only
 	this restore can write in, takes its destination's place.
 	'''
@@ -15185,6 +15225,10 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 				if st is not None and stat.S_ISREG(st.st_mode):
 					# the contents restored: a symlink's text is no file's
 					report.bytes += st.st_size
+			elif copy.task.returncode != 0 and link_too_long(copy.source_path, copy.temp_path, lines):
+				discard_copies([copy])
+				# no run again can put it there: the restore goes on to its end without it
+				report.fail(rel, "not restored: the target's filesystem cannot hold a link that long (its text or its path)", rerun=False)
 			else:
 				report.fail(rel, error or f'cp exited with {copy.task.returncode}')
 				discard_copies([copy])
