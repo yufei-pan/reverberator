@@ -439,9 +439,13 @@ def plant_rows(job, discard=(), add=()):
 	manifest.close()
 
 
-def take_lists_counting_planted_rows():
-	'''A list's name counts the rows it was given, and rows that lie count until a full comparison mends them: the plugin's lines of that, looked at and taken out.'''
-	assert WRONG and all('its list should be' in line for line in WRONG), WRONG
+def take_lists_counting_planted_rows(sure=True):
+	'''
+	A list's name counts the rows it was given, and rows that lie count until a full comparison mends them: the plugin's lines of that, looked at and
+	taken out. With sure off the lines may be none: a file row planted over a folder counts the folder's st_size (the oracle counts 4 KiB), which is
+	4096 on ext4 and 15 for a small one on XFS.
+	'''
+	assert (WRONG or not sure) and all('its list should be' in line for line in WRONG), WRONG
 	WRONG.clear()
 
 
@@ -1111,6 +1115,8 @@ def test_a_file_row_over_a_folder_of_the_previous_version_is_dropped(job, logged
 		f.write('k2')
 	version = run_backup(job, batch(job, (False, 'modify', 'keep', None)))[-1]
 	after = os.lstat(os.path.join(v0, 'n/a'))
+	# the file row n counts the folder's st_size, 4096 on ext4 and not on XFS: the lists may be named by that until the full comparison mends it
+	take_lists_counting_planted_rows(sure=False)
 	assert stat.S_ISREG(after.st_mode) and after.st_ino == before.st_ino
 	assert open(os.path.join(v0, 'n/a')).read() == 'a'
 	assert open(resolved(job, version, 'n/a')).read() == 'a'
