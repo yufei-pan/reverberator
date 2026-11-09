@@ -21,7 +21,7 @@ import pytest
 import reverberator as rv
 from tests.crash_batches import apply_batch1, apply_batch2, backup_events, change_batch3, put_text, seed_base, T0
 from tests.crash_child import in_child
-from tests.harness import create_job
+from tests.harness import create_job, link_text_limit
 from tests.scratch_images import f2fs_mount, flush_scratch, LoopImage, needs_f2fs, SCRATCH, shut_down_scratch
 from tests.vault_oracle import check_vault, daemon_links, entry_view, read_view, recorded_design_r, sizes_by_newest_holder, snapshot_tree, version_number
 from tests.version_view_ground_truth import committed_folders, wrong_lists
@@ -313,12 +313,30 @@ def put_long(root, rel, text):
 	os.close(fd)
 
 
+V0_FOLDER = 'V0--2026-11-06_04-58-06_-0800'
+
+
+def rel_with_a_link_that_fits(room, limit):
+	'''
+	The longest relative path of at most room bytes whose 0.54 chain link, a ../ for each folder it is in and for the version, then the version's
+	folder and the path, has a text of at most limit bytes: the link is as long as the path and more, and a filesystem takes only so much text
+	(4,095 bytes on ext4 and f2fs, 1,023 on XFS).
+	'''
+	for length in range(room, 0, -1):
+		rel = long_rel(length)
+		if 3 * (rel.count('/') + 1) + len(V0_FOLDER) + 1 + len(rel) <= limit:
+			return rel
+
+
 @pytest.mark.parametrize('spare', [1, 12, 22])
 def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	# the tree is built in staging, whose own name must not be longer than the version's: a path that fits in a version converts
 	job = create_job(str(tmp_path))
-	room = 4095 - len(os.path.join(job.job_vault, 'V0--2026-11-06_04-58-06_-0800', '')) - spare
-	rel = long_rel(room)
+	room = 4095 - len(os.path.join(job.job_vault, V0_FOLDER, '')) - spare
+	# the path is as near the 4,095 of a path as the spare says, and where the filesystem takes less link text than that (XFS: 1,023 bytes, and the
+	# vault's own path stays under 512, which SQLite takes of a database's) it is as near the limit of a link's text, so the link is the longest one
+	text_room = link_text_limit(job.vault) - spare
+	rel = rel_with_a_link_that_fits(room, text_room)
 	def seed(monitor):
 		put_long(monitor, rel, 'long')
 
@@ -332,7 +350,12 @@ def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	v054.build(job, [seed, add, change], keep_n_versions=5)
 	names = folders_of(job)
 	newest = os.path.join(job.job_vault, names[max(names)], rel)
-	assert 4072 <= len(newest) <= 4094 and os.path.islink(newest)
+	assert os.path.islink(newest)
+	if len(rel) == room:
+		assert 4072 <= len(newest) <= 4094
+	else:
+		# one more byte of path, or one more folder, would not have fitted
+		assert text_room - 4 < len(os.readlink(newest)) <= text_room
 	before = expected(job)
 	assert migrate(job) is True
 	assert not os.path.islink(newest) and open(newest).read() == 'long'
