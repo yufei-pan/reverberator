@@ -10,7 +10,7 @@ from collections import deque
 
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions, reads_the_file_before
+from tests.harness import charge, seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions, reads_the_file_before
 from tests.version_view_ground_truth import WRONG
 
 pytestmark = pytest.mark.unit
@@ -755,7 +755,7 @@ def test_the_estimate_leaves_a_move_inside_another_out_once(job):
 	os.rename(f'{m}/y', f'{m}/n/d/y')
 	entries = batch(job, (True, 'create', 'n', None), (False, 'create', 'n/own', None), (True, 'move', 'n/d', 'd'), (False, 'move', 'n/d/y', 'y'))
 	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m))
-	assert (size, inodes) == (os.lstat(f'{m}/n/own').st_blocks * 512 + os.lstat(f'{m}/n').st_blocks * 512, 2)
+	assert (size, inodes) == (charge(f'{m}/n/own', job.job_vault) + charge(f'{m}/n', job.job_vault), 2)
 
 
 @pytest.mark.parametrize('skip', ['du', 'walk'])
@@ -773,7 +773,7 @@ def test_the_estimate_puts_back_what_is_written_under_a_folder_it_took_out(job, 
 		f.write('m' * 50000)
 	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'), (True, 'modify', 'n/d/s', None), (False, 'create', 'n/d/s/z', None), (False, 'modify', 'n/d/s/old', None))
 	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
-	assert (size, inodes) == (sum(os.lstat(f'{m}/{rel}').st_blocks * 512 for rel in ('n', 'n/d/s', 'n/d/s/z', 'n/d/s/old')), 2)
+	assert (size, inodes) == (sum(charge(f'{m}/{rel}', job.job_vault) for rel in ('n', 'n/d/s', 'n/d/s/z', 'n/d/s/old')), 2)
 
 
 @pytest.mark.parametrize('skip', ['du', 'walk'])
@@ -793,7 +793,7 @@ def test_the_estimate_counts_a_file_made_in_a_made_folder_once(job, skip, carrie
 		f.write('f' * 200000)
 	events = [(True, 'create', 'n', None)] + ([(True, 'move', 'n/d', 'd')] if carried else []) + [(True, 'create', f'{base}/s', None), (False, 'create', f'{base}/s/f', None)]
 	size, inodes = rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
-	assert (size, inodes) == (sum(os.lstat(f'{m}/{rel}').st_blocks * 512 for rel in ('n', f'{base}/s', f'{base}/s/f')), 3)
+	assert (size, inodes) == (sum(charge(f'{m}/{rel}', job.job_vault) for rel in ('n', f'{base}/s', f'{base}/s/f')), 3)
 
 
 @pytest.mark.parametrize('skip', ['du', 'walk'])
@@ -809,7 +809,7 @@ def test_the_estimate_counts_an_attribute_copy_under_a_folder_moved_into_a_new_o
 	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'), (False, 'attrib', 'n/d/h', None))
 	size, inodes = rv.get_backup_size_inode(entries, only_sync_attributes, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None,
 		copied={f'{m}/n/d/h'} if copied else frozenset())
-	assert (size, inodes) == (os.lstat(f'{m}/n').st_blocks * 512 + (os.lstat(f'{m}/n/d/h').st_blocks * 512 if copied or not only_sync_attributes else 0), 1)
+	assert (size, inodes) == (charge(f'{m}/n', job.job_vault) + (charge(f'{m}/n/d/h', job.job_vault) if copied or not only_sync_attributes else 0), 1)
 
 
 def test_touching_a_file_copies_it(job, logged, monkeypatch):
@@ -1713,8 +1713,8 @@ def test_a_deleted_files_chain_link_is_never_followed_by_the_folder_check(job, l
 @pytest.mark.parametrize('skip', ['du', 'walk'])
 def test_the_estimate_of_a_batch_with_nothing_carried_in_and_no_folder_made_asks_no_folder_question_for_the_put_back(job, skip, monkeypatch):
 	# the put-back and the inode of a file create look at each entry's parents only where a folder was carried in or made: a batch of file
-	# creates and modifies pays for neither. the walk branch asks in its first loop, as it did on 0.55: once for each entry's bytes, and
-	# once more for each create's inode
+	# creates and modifies pays for neither. the walk asks in its first loop, as it did on 0.55, with a skip list or without one (0.55.2
+	# has no du route): once for each entry's bytes, and once more for each create's inode
 	seed_monitor(job, {f'd/f{i}': 'o' * 1000 for i in range(20)})
 	run_backup(job)
 	m = job.monitor
@@ -1729,4 +1729,4 @@ def test_the_estimate_of_a_batch_with_nothing_carried_in_and_no_folder_made_asks
 	real = rv.inside_folders
 	monkeypatch.setattr(rv, 'inside_folders', lambda *args: asked.append(args[0]) or real(*args))
 	rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'walk' else None)
-	assert len(asked) == (len(events) + 20 if skip == 'walk' else 0)
+	assert len(asked) == len(events) + 20

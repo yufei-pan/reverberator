@@ -17,7 +17,7 @@ import time
 import pytest
 
 import reverberator as rv
-from tests.harness import committed_versions, latest_version, run_backup, seed_monitor, wait_until
+from tests.harness import get_path_size, committed_versions, latest_version, run_backup, seed_monitor, wait_until
 from tests.vault_oracle import read_view, snapshot_tree
 
 pytestmark = pytest.mark.inotify
@@ -203,7 +203,7 @@ def assert_held_as_the_tree(job, before: dict, previous: str) -> None:
 
 
 def vault_bytes(job) -> int:
-	return rv.get_path_size(job.job_vault)
+	return get_path_size(job.job_vault)
 
 
 EXISTING = [('mv', 'big', 'other/big')]

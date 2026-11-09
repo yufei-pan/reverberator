@@ -2,7 +2,7 @@ from collections import OrderedDict
 import os
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_tree, write_pending, committed_versions
+from tests.harness import charge, seed_monitor, write_tree, write_pending, committed_versions
 
 pytestmark = pytest.mark.unit
 
@@ -389,6 +389,8 @@ def _project_with_skipped_cache(job, cache_files=3, cache_file_size=1 << 20):
 
 
 def test_size_estimate_walks_around_skipped_content(job):
+	# the estimate reads the block size of the vault's filesystem
+	os.makedirs(job.job_vault)
 	proj = _project_with_skipped_cache(job)
 	entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'create', None)})
 	full_size, full_inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor)
@@ -397,13 +399,13 @@ def test_size_estimate_walks_around_skipped_content(job):
 	# proj/ and proj/src.c only
 	assert inodes == 2
 	assert 0 < size < 1 << 20
-	assert size == sum(os.lstat(path).st_blocks * 512 for path in (proj, os.path.join(proj, 'src.c')))
+	assert size == sum(charge(path, job.job_vault) for path in (proj, os.path.join(proj, 'src.c')))
 	# a folder modify is sized by the same walk; a folder attrib copies nothing, so it is not sized
 	for event, sized in (('modify', size), ('attrib', 0)):
 		entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', event, None)})
 		assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/'])) == (sized, 0)
 	entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'modify', None)})
-	# no patterns keeps du
+	# no patterns: the same walk, nothing left out
 	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, [])) == (full_size, 0)
 
 
@@ -427,9 +429,9 @@ def test_skipped_content_does_not_prune_history(job, poll_fast):
 	assert not os.path.lexists(os.path.join(versions[-1], 'proj', 'node_modules'))
 
 
-def _usage(paths):
-	'''Bytes and inodes of paths as the replay copies them: each name on its own.'''
-	return sum(os.lstat(path).st_blocks * 512 for path in paths), len(paths)
+def _usage(paths, vault):
+	'''Bytes and inodes of paths as the replay copies them into vault: each name on its own.'''
+	return sum(charge(path, vault) for path in paths), len(paths)
 
 
 def _nested_tree(root, depth=6):
@@ -449,12 +451,14 @@ def _tree_entries(root, sl, event):
 
 
 def test_size_estimate_counts_nested_creates_once(job):
+	# the estimate reads the block size of the vault's filesystem
+	os.makedirs(job.job_vault)
 	proj = os.path.join(job.monitor, 'proj')
 	_nested_tree(proj)
 	sl = rv.SkipList(job.monitor, ['node_modules/'])
 	entries = _tree_entries(proj, sl, 'create')
 	assert len(entries) == 10
-	expected = _usage([proj] + [path for path, _, _ in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips)])
+	expected = _usage([proj] + [path for path, _, _ in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips)], job.job_vault)
 	assert expected[0] >= 1 << 20 and expected[1] == 10
 	assert rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl) == expected
 	single = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'create', None)})
@@ -462,15 +466,17 @@ def test_size_estimate_counts_nested_creates_once(job):
 
 
 def test_size_estimate_counts_nested_folder_attribs_once(job):
+	# the estimate reads the block size of the vault's filesystem
+	os.makedirs(job.job_vault)
 	proj = os.path.join(job.monitor, 'proj')
 	_nested_tree(proj)
 	sl = rv.SkipList(job.monitor, ['node_modules/'])
 	# chmod -R: an attrib for every folder and file, each file sized when attributes are not only synced (a folder's
 	# attrib copies nothing)
 	entries = _tree_entries(proj, sl, 'attrib')
-	expected_size = _usage([path for path, _, is_dir in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips) if not is_dir])[0]
+	expected_size = _usage([path for path, _, is_dir in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips) if not is_dir], job.job_vault)[0]
 	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == (expected_size, 0)
-	# without patterns du gets the same size: it counts nested arguments once
+	# without patterns the same size: nested entries are counted once
 	no_cache = OrderedDict((path, values) for path, values in entries.items() if 'node_modules' not in path)
 	import shutil
 	shutil.rmtree(os.path.join(proj, 'd0', 'node_modules'))
@@ -478,6 +484,8 @@ def test_size_estimate_counts_nested_folder_attribs_once(job):
 
 
 def test_size_estimate_counts_creates_inside_a_sized_folder(job):
+	# the estimate reads the block size of the vault's filesystem
+	os.makedirs(job.job_vault)
 	proj = os.path.join(job.monitor, 'proj')
 	write_tree(proj, {'old.txt': 'o', 'new/f.txt': 'f'})
 	sl = rv.SkipList(job.monitor, ['*.tmp'])
@@ -487,18 +495,20 @@ def test_size_estimate_counts_creates_inside_a_sized_folder(job):
 		(os.path.join(proj, 'new', 'f.txt'), rv.BackupEntryValues('t', 'create', None)),
 	])
 	# the folder's attrib copies nothing: the new folder and its file are its bytes and its new inodes
-	size = _usage([os.path.join(proj, 'new'), os.path.join(proj, 'new', 'f.txt')])[0]
+	size = _usage([os.path.join(proj, 'new'), os.path.join(proj, 'new', 'f.txt')], job.job_vault)[0]
 	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == (size, 2)
 
 
 def test_size_estimate_counts_each_hard_link_name(job):
+	# the estimate reads the block size of the vault's filesystem
+	os.makedirs(job.job_vault)
 	# the replay copies each name with its own cp, so a file with four names takes four copies in the new version
 	new = os.path.join(job.monitor, 'new')
 	_write_random(os.path.join(new, 'n0.bin'), 1 << 20)
 	for i in range(1, 4):
 		os.link(os.path.join(new, 'n0.bin'), os.path.join(new, f'n{i}.bin'))
 	sl = rv.SkipList(job.monitor, ['*.tmp'])
-	expected = _usage([new] + [os.path.join(new, f'n{i}.bin') for i in range(4)])
+	expected = _usage([new] + [os.path.join(new, f'n{i}.bin') for i in range(4)], job.job_vault)
 	assert expected[0] >= 4 << 20 and expected[1] == 5
 	entries = _tree_entries(new, sl, 'create')
 	assert len(entries) == 5

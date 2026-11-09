@@ -1,5 +1,6 @@
 import errno
 import os
+import subprocess
 import threading
 import time
 from collections import namedtuple, OrderedDict
@@ -148,8 +149,27 @@ def write_rule(job: JobPaths, min_snapshot: str = '1', max_snapshot: str = '8640
 	return job.rule_path
 
 
+def get_path_size(*paths: str) -> int:
+	'''The bytes du gives paths, each inode counted once, as the vault's size records measure it.'''
+	out = subprocess.run(['du', '--block-size=1', '-csP', *paths], capture_output=True, text=True).stdout
+	last = out.rstrip('\n').rpartition('\n')[2].partition('\t')[0]
+	return int(last) if last.isdigit() else 0
+
+
+def charge(path: str, vault: str) -> int:
+	'''
+	What the size estimate charges for the entry at path, copied into vault: a regular file the smaller of its blocks and
+	its size rounded up to the vault filesystem's block, anything else its blocks.
+	'''
+	st = os.lstat(path)
+	if not os.path.isfile(path) or os.path.islink(path):
+		return st.st_blocks * 512
+	block = os.statvfs(vault).f_frsize
+	return min(st.st_blocks * 512, (st.st_size + block - 1) // block * block)
+
+
 def content_file_path(version_dir: str) -> str:
-	size_s = rv.format_bytes(rv.get_path_size(version_dir), use_1024_bytes=True, to_str=True).replace(' ', '_')
+	size_s = rv.format_bytes(get_path_size(version_dir), use_1024_bytes=True, to_str=True).replace(' ', '_')
 	ino_s = rv.format_bytes(rv.get_path_inodes(version_dir), use_1024_bytes=False, to_str=True).replace(' ', '')
 	return f'{version_dir}--{size_s}B-{ino_s}_ino{rv.CONTENT_FILE_EXTENSION_NAME}'
 

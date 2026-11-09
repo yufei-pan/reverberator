@@ -8,7 +8,7 @@ import threading
 
 import reverberator as rv
 import pytest
-from tests.harness import create_job, run_backup, seed_monitor, tracked_manifest
+from tests.harness import create_job, get_path_size, run_backup, seed_monitor, tracked_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -295,15 +295,15 @@ class TestDecrementStepperAbort(unittest.TestCase):
 		os.symlink(os.path.join('..', os.path.basename(v0), 'a.txt'), os.path.join(v1, 'a.txt'))
 		# content files with parseable names (use get_path_size after)
 		for path, ver in ((v0, 0), (v1, 1)):
-			sz = rv.get_path_size(path)
+			sz = get_path_size(path)
 			ino = rv.get_path_inodes(path)
 			sz_s = rv.format_bytes(sz, use_1024_bytes=True, to_str=True).replace(' ', '_')
 			ino_s = rv.format_bytes(ino, use_1024_bytes=False, to_str=True).replace(' ', '')
 			with open(f'{path}--{sz_s}B-{ino_s}_ino{rv.CONTENT_FILE_EXTENSION_NAME}', 'w') as f:
 				f.write('path\tiso_time\tevent\tsource_path\n')
 		d = OrderedDict([
-			(0, rv.VaultEntry(0, v0, 0, rv.get_path_size(v0), rv.get_path_inodes(v0))),
-			(1, rv.VaultEntry(1, v1, 1, rv.get_path_size(v1), rv.get_path_inodes(v1))),
+			(0, rv.VaultEntry(0, v0, 0, get_path_size(v0), rv.get_path_inodes(v0))),
+			(1, rv.VaultEntry(1, v1, 1, get_path_size(v1), rv.get_path_inodes(v1))),
 		])
 		return d, v0, v1
 
@@ -362,7 +362,7 @@ class TestDecrementStepperAbort(unittest.TestCase):
 			os.makedirs(v2)
 			# relative, as the daemon links: an absolute link is a user's symlink since 0.44
 			os.symlink(os.path.join('..', os.path.basename(v1), 'a.txt'), os.path.join(v2, 'a.txt'))
-			sz = rv.get_path_size(v2)
+			sz = get_path_size(v2)
 			ino = rv.get_path_inodes(v2)
 			sz_s = rv.format_bytes(sz, use_1024_bytes=True, to_str=True).replace(' ', '_')
 			ino_s = rv.format_bytes(ino, use_1024_bytes=False, to_str=True).replace(' ', '')

@@ -464,10 +464,9 @@ def test_a_full_comparison_gives_a_folder_whose_mtime_alone_moved_its_times(tmp_
 		return real(self, *args, **kwargs)
 	monkeypatch.setattr(rv.WrittenFolders, 'settle', spy)
 	sized = []
-	real_size = rv.get_path_size
-	monkeypatch.setattr(rv, 'get_path_size', lambda *paths: sized.extend(paths) or real_size(*paths))
+	real_size = rv.get_unskipped_size_inodes
+	monkeypatch.setattr(rv, 'get_unskipped_size_inodes', lambda path, *args: sized.append(path) or real_size(path, *args))
 	versions = run_backup(job)
-	sized = [path for path in sized if not os.path.basename(path).startswith('V')]
 	assert len(versions) == 2
 	# its times only, and nothing sized or copied for it
 	assert settled == [{'D': False}] and sized == []
