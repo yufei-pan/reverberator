@@ -15344,7 +15344,7 @@ def read_restore_marker(target:str):
 	What the marker of an unfinished folder restore at the top of target holds, {"job", "path", "version"}, "unset" when
 	it names any: the rels of the entries kept without all of their metadata, "unsynced" when its copies are not known to
 	be on disk: the boot and mount of the run that made them (restore_mount_identity(); '' when that cannot be told), and "recopy" when everything has to
-	be copied again: 'write error' or 'cut' (write_restore_marker(); a marker of 0.55.1 has neither, and reads as
+	be copied again: 'sync failed' or 'cut' (write_restore_marker(); a marker of 0.55.1 has neither, and reads as
 	before); None when
 	target is not a folder (a symlink to one is not) or holds no marker. Picking a marker up lets a restore write into
 	the folder, so only one this user wrote counts: a marker in a folder another user owns or can write to, one that is
@@ -15406,7 +15406,7 @@ def read_restore_marker(target:str):
 
 # why a marker says a run again copies everything again: a sync of the target's disks failed, or the copies were made in a
 # boot that a cut ended, before any sync of them succeeded (restore_entry())
-RESTORE_RECOPY_REASONS = ('write error', 'cut')
+RESTORE_RECOPY_REASONS = ('sync failed', 'cut')
 
 def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion, unset:list = (), unsynced:str = None, recopy:str = None, made:bool = False, denied:list = None) -> str:
 	'''
@@ -15663,6 +15663,15 @@ def sync_restore(fd:int, folder:str, report:RestoreReport, rel:str) -> bool:
 			synced = False
 	return synced
 
+def drop_marker(target:str, report:RestoreReport) -> None:
+	'''
+	Remove the marker of the restore at target, whose record of a failed sync could not be written: a run again then
+	refuses the target, as its name is taken, rather than keep what is there. One that cannot be removed either stays.
+	'''
+	with contextlib.suppress(OSError):
+		os.unlink(os.path.join(target, RESTORE_MARKER_NAME))
+		report.marker = None
+
 def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None, marked:bool = False) -> None:
 	'''
 	Copy what version holds at rel ('' for the monitored path) to target, filling report in. Nothing in the vault is
@@ -15694,7 +15703,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	target's mount (restore_mount_identity()). Once a sync of the target succeeds after the copies, the marker is rewritten without it, before
 	anything is handed over; so is it when a run stopped by a signal syncs on its way out. A run that finds "unsynced" of
 	this boot and mount first syncs the target: what is there is then kept as any resume keeps it. A sync that fails, at
-	any of these points, writes "recopy": 'write error' in its place; "unsynced" of another boot or mount (or none to tell)
+	any of these points, writes "recopy": 'sync failed' in its place; "unsynced" of another boot or mount (or none to tell)
 	reads as recopy 'cut', as the cut that ended it may have lost bytes of what was copied. A run that finds a recopy keeps nothing
 	already there, copies everything again, and keeps the recopy in the marker until every entry was copied again and a
 	sync of them succeeded: a stop, or any failure a run again may fix, leaves it for the next run. --accept is refused
@@ -15717,8 +15726,6 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	written = []
 	# why this run copies everything again, keeping nothing already there (marker_recopy()), or None
 	recopy = None
-	# the earlier run's copies are of this boot and not known to be on disk: synced before anything is kept
-	sync_first = False
 	# this boot and the target's mount, once the target is there (restore_mount_identity())
 	boot = ''
 	# the record of the marker on disk now: its "unsynced" (a boot id, or None) and its "recopy"
@@ -15743,11 +15750,13 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 		report.recopy = recopy
 
 	def write_error():
-		# a sync failed: what is there may not be on disk, in any boot. unrecorded, a run again of this boot would sync and keep it
+		# a sync failed: what is there may not be on disk, in any boot. unrecorded, a run again of this boot would keep it, so
+		# the marker goes: a run again then finds the name taken, and refuses it
 		try:
-			mark(recopy='write error')
+			mark(recopy='sync failed')
 		except OSError as e:
 			report.fail(rel, f'the failed sync could not be recorded in its marker ({e}): move {target} out of the way and restore again', rerun=False)
+			drop_marker(target, report)
 
 	def check_stop():
 		if RESTORE_STOP.is_set():
@@ -15811,13 +15820,12 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 						raise target_exists(target)
 				def look_again():
 					# the run whose output this was may have finished while this one waited for the lock
-					nonlocal earlier, written, recopy, sync_first, record, boot
+					nonlocal earlier, written, recopy, record, boot
 					marker = held_marker(target, os.path.basename(job_vault), rel, version)
 					boot = restore_mount_identity(target)
 					earlier = dict.fromkeys(marker.get('unset', ()))
 					written = list(earlier)
 					recopy = marker_recopy(marker, boot)
-					sync_first = recopy is None and 'unsynced' in marker
 					record = (marker.get('unsynced'), marker.get('recopy'))
 				lock = claim_restore_target(target, look_again if marked else None)
 			except OSError as e:
@@ -15827,14 +15835,6 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			folders.append((resolved.path, target, rel))
 			if not boot:
 				boot = restore_mount_identity(target)
-			if sync_first:
-				# an earlier run of this boot and mount, stopped before its sync: what it copied is kept once it is on disk
-				tried_sync = True
-				if not sync_restore(lock, target, report, rel):
-					write_error()
-					report.left_private = True
-					return
-				tried_sync = False
 			try:
 				# not known to be on disk until this run's sync succeeds: a crash before then leaves a run again in another
 				# boot that copies everything again. a recopy stays recorded as it is until it is done
@@ -16000,7 +16000,7 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 	a folder already its vault folder's owner's, which a run stopped while handing them over left with all under it
 	handed over too. Partial files a killed run left are removed. A marker whose copies must be copied again is refused
 	(refuse_accept_unsynced()); one whose copies are of this boot and not known to be on disk is kept once the sync before
-	the hand-over succeeds, and a sync that fails records recopy 'write error' in it.
+	the hand-over succeeds, and a sync that fails records recopy 'sync failed' in it.
 	'''
 	report.version, report.rel, report.target, report.accepted = version, rel, target, True
 	report.marker = os.path.join(target, RESTORE_MARKER_NAME)
@@ -16061,10 +16061,11 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 			# what it holds may not be on disk: a run again copies everything again, and a later --accept is refused
 			denied = []
 			try:
-				write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, recopy='write error', denied=denied)
-				report.recopy = 'write error'
+				write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, recopy='sync failed', denied=denied)
+				report.recopy = 'sync failed'
 			except OSError as e:
 				report.fail(rel, f'the failed sync could not be recorded in its marker ({e}): move {target} out of the way and restore again', rerun=False)
+				drop_marker(target, report)
 			for folder, error in denied:
 				report.cannot_sync(rel, folder, error)
 			return
@@ -16193,18 +16194,24 @@ def restore_boot_id() -> str:
 def restore_mount_identity(target:str) -> str:
 	'''
 	What a restore's marker records for the copies it makes into the folder target until a sync of them succeeds: this
-	boot's id and the unique id of the mount holding target, where statx gives one, so a remount within the boot (a
-	filesystem shut down and mounted again, a disk unplugged and plugged back) tells apart as surely as a reboot. '' when
-	the boot id cannot be read: of no boot and mount this run can tell for its own.
+	boot's id and the unique id (statx STATX_MNT_ID_UNIQUE) of the mount holding target and, on a mergerfs pool, of each
+	branch disk's mount, so a remount within the boot (a filesystem shut down and mounted again, a disk unplugged and
+	plugged back), of the pool or of one of its branches, tells apart as surely as a reboot. '' when the boot id cannot be
+	read, a mount gives no unique id (a kernel before 6.8) or cannot be looked at: of no boot and mount this run can tell
+	for its own, so a run again copies everything again.
 	'''
 	boot = restore_boot_id()
 	if not boot:
 		return ''
 	try:
-		mount = statx_mount(target)
+		pooled, disks = vault_disks(target)
+		mounts = [statx_mount(target)] + ([statx_mount(disk) for disk in dict.fromkeys(disk for disk, _ in disks)] if pooled else [])
 	except OSError:
-		mount = None
-	return boot if mount is None else f'{boot} mount {mount[0]}'
+		return ''
+	if any(mount is None for mount in mounts):
+		# a kernel before 6.8 names no mount for good: a remount within the boot could not be told
+		return ''
+	return f'{boot} mount ' + ','.join(str(mount[0]) for mount in mounts)
 
 def marker_recopy(marker:dict, boot:str) -> 'str | None':
 	'''
@@ -16222,10 +16229,10 @@ def marker_recopy(marker:dict, boot:str) -> 'str | None':
 def refuse_accept_unsynced(target:str, marker:dict) -> None:
 	'''The refusal of --accept over the marker of a restore whose copies must be copied again (marker_recopy()): kept as it is, they may not be on disk.'''
 	reason = marker_recopy(marker, restore_mount_identity(target))
-	if reason == 'write error':
-		raise CommandError(f"{target}: the target's disk reported a write error when a run of this restore wrote it out, so what it holds may not be on disk, and --accept would keep it as it is: run the same restore again without --accept, which copies everything again")
+	if reason == 'sync failed':
+		raise CommandError(f"{target}: a sync of what it holds failed when a run of this restore wrote it out (that run's FAILED line says why), so it may not be on disk, and --accept would keep it as it is: run the same restore again without --accept, which copies everything again")
 	if reason is not None:
-		raise CommandError(f"{target}: no sync of what it holds is known to have succeeded, as the run of this restore that copied it ended in an earlier boot or mount of its disk, and --accept would keep it as it is: run the same restore again without --accept, which copies everything again")
+		raise CommandError(f"{target}: no sync of what it holds is known to have succeeded since the run of this restore that copied it, and --accept would keep it as it is: run the same restore again without --accept, which copies everything again")
 
 def check_marker_matches(target:str, marker:dict, job_name:str, rel:str, version:KeptVersion = None) -> None:
 	'''A CommandError unless marker, which read_restore_marker() read at target, is the one of a restore of rel of job_name (from version, once it is picked).'''
