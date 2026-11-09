@@ -1654,21 +1654,30 @@ LONG_FOLDER, LONG_FILE = 'a_folder_with_a_long_enough_name', 'and_a_file_name_lo
 def long_path(folder):
 	'''
 	A path whose link in V1 to V0's copy (../../V0--<timestamp>/ and the path) takes a block of the filesystem under folder, which a text that fits in
-	the inode does not: 60 bytes on ext4, and 337 on XFS with 512-byte inodes. Names stretch to the 255 bytes a name can have.
+	the inode does not: 60 bytes on ext4, 337 on XFS with 512-byte inodes, about 3.4 KB on f2fs with inline_data. The stretch is a name of 255 bytes,
+	then as many folders of 255 bytes as it needs. Probes the filesystem, so a test calls it once. Skips where no link takes a block.
 	'''
-	need = link_text_taking_a_block(folder) - len('../../V0--2026-11-08_21-33-00_-0800/')
-	more = max(0, need - len(LONG_FOLDER) - 1 - len(LONG_FILE))
-	assert more <= 2 * 255 - len(LONG_FOLDER) - len(LONG_FILE), more
+	taking = link_text_taking_a_block(folder)
+	if taking is None:
+		pytest.skip('every link text the filesystem takes sits in the inode (f2fs with inline_data keeps up to about 3.4 KB there), so none takes a block')
+	more = max(0, taking - len('../../V0--2026-11-08_21-33-00_-0800/') - len(LONG_FOLDER) - 1 - len(LONG_FILE))
 	in_folder = min(more, 255 - len(LONG_FOLDER))
-	return f'{LONG_FOLDER}{"x" * in_folder}/{"y" * (more - in_folder)}{LONG_FILE}'
+	parts, more = [LONG_FOLDER + 'x' * in_folder], more - in_folder
+	while more >= 256:
+		parts.append('d' * 255)
+		more -= 256
+	if more:
+		# a folder of more - 1 bytes and its slash: at most a byte over, which a text that must only be this long can have
+		parts.append('d' * max(more - 1, 1))
+	return '/'.join(parts + [LONG_FILE])
 
 
-def books_job(tmp_path, tree=None):
+def books_job(tmp_path, long, tree=None):
 	'''
-	V0, V1 and V2 of a job whose V1 links keep, D/secret (a link short enough to sit in its inode), long_path() and b/x to
+	V0, V1 and V2 of a job whose V1 links keep, D/secret (a link short enough to sit in its inode), long (from long_path()) and b/x to
 	V0's copies, and copies b/y, which it modified.
 	'''
-	job = fresh_job(tmp_path, {'D/secret': 'secret' * 3000, 'b/x': 'x' * 20000, 'b/y': 'y', long_path(tmp_path): 'z' * 5000, 'keep': 'k'} if tree is None else tree)
+	job = fresh_job(tmp_path, {'D/secret': 'secret' * 3000, 'b/x': 'x' * 20000, 'b/y': 'y', long: 'z' * 5000, 'keep': 'k'} if tree is None else tree)
 	with open(os.path.join(job.monitor, 'b/y'), 'w') as f:
 		f.write('y' * 50000)
 	run_backup(job, OrderedDict([event_entry(job, 'b/y', 'modify')]))
@@ -1716,11 +1725,11 @@ def assert_books(job, info, caller):
 	assert tuple(caller) == real
 
 
-def reads_right(job):
+def reads_right(job, long):
 	for version in rv.list_versions(job.job_vault):
 		assert open(os.path.join(version.path, 'D/secret')).read() == 'secret' * 3000, version.name
 		assert open(os.path.join(version.path, 'b/x')).read() == 'x' * 20000, version.name
-		assert open(os.path.join(version.path, long_path(job.root))).read() == 'z' * 5000, version.name
+		assert open(os.path.join(version.path, long)).read() == 'z' * 5000, version.name
 		# modified in V1
 		assert open(os.path.join(version.path, 'b/y')).read() == ('y' if version.number == 0 else 'y' * 50000), version.name
 
@@ -1743,9 +1752,10 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 	# vault_size went by st_nlink, counted the removed version's change list, booked a link as a whole block, were
 	# measured again by du after an abort, each version counting the copies they then share, and were never written
 	# when a removal was cut short
-	job = books_job(tmp_path)
+	long = long_path(tmp_path)
+	job = books_job(tmp_path, long)
 	v0, v1, v2 = rv.list_versions(job.job_vault)
-	assert os.lstat(os.path.join(v1.path, long_path(job.root))).st_blocks and not os.lstat(os.path.join(v1.path, 'D/secret')).st_blocks
+	assert os.lstat(os.path.join(v1.path, long)).st_blocks and not os.lstat(os.path.join(v1.path, 'D/secret')).st_blocks
 	info = rv.get_vault_info(job.job_vault)
 	caller = [info.vault_size, info.vault_inodes]
 	assert_books(job, info.vault_info_dict, caller)
@@ -1771,9 +1781,9 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 		prune()
 		monkeypatch.undo()
 		assert list(info.vault_info_dict) == [0, 1, 2] and os.path.isdir(v0.path)
-		assert os.lstat(os.path.join(v1.path, long_path(job.root))).st_ino == os.lstat(os.path.join(v0.path, long_path(job.root))).st_ino
+		assert os.lstat(os.path.join(v1.path, long)).st_ino == os.lstat(os.path.join(v0.path, long)).st_ino
 		assert_books(job, info.vault_info_dict, caller)
-		reads_right(job)
+		reads_right(job, long)
 		prune()
 	elif case == 'kill':
 		real_run = rv.multiCMD.run_command
@@ -1790,7 +1800,7 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 		caller = [info.vault_size, info.vault_inodes]
 		assert list(info.vault_info_dict) == [0, 1, 2]
 		assert_books(job, info.vault_info_dict, caller)
-		reads_right(job)
+		reads_right(job, long)
 		prune()
 	else:
 		real_run = rv.multiCMD.run_command
@@ -1810,7 +1820,7 @@ def test_the_books_say_what_the_versions_take(tmp_path, monkeypatch, case):
 		assert not [name for name in os.listdir(job.job_vault) if name.startswith(v0.name)]
 	assert list(info.vault_info_dict) == [1, 2] and not os.path.exists(v0.path)
 	assert_books(job, info.vault_info_dict, caller)
-	reads_right(job)
+	reads_right(job, long)
 
 
 # --- fix round 5 ---

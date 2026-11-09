@@ -80,13 +80,15 @@ def link_text_limit(*folders: str) -> int:
 	return min(limits)
 
 
-def link_text_taking_a_block(folder: str) -> int:
+def link_text_taking_a_block(folder: str):
 	'''
-	The shortest symlink text, in bytes, whose link takes a block of folder's filesystem (st_blocks above 0): a short text sits in the inode, 59 bytes
-	or fewer on ext4 and well over 100 on XFS. A test that needs a link which takes space builds one at least this long.
+	The shortest symlink text, in bytes, whose link takes a block of folder's filesystem (st_blocks above 0), or None where even the longest text the
+	filesystem takes sits in the inode. A short text sits in the inode: 59 bytes or fewer on ext4, 336 on XFS with 512-byte inodes, about 3.4 KB on f2fs
+	with inline_data. A test that needs a link which takes space builds one at least this long.
 	'''
 	low, high = 1, link_text_limit(folder)
-	assert probe_link(folder, high).st_blocks, 'the longest link the filesystem takes sits in its inode too'
+	if not probe_link(folder, high).st_blocks:
+		return None
 	while low < high:
 		middle = (low + high) // 2
 		if probe_link(folder, middle).st_blocks:
