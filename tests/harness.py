@@ -598,4 +598,5 @@ def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, 
 
 
 def reverberator_script() -> str:
-	return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'reverberator.py'))
+	'''What a test runs as reverberator.py in a process of its own: its entry point, never syncing the filesystem under the basetemp (daemon_without_syncfs.py).'''
+	return os.path.abspath(os.path.join(os.path.dirname(__file__), 'daemon_without_syncfs.py'))

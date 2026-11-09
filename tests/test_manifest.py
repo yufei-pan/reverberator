@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
+from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS, REAL_SYNCFS_FOLDER
 from tests.harness import create_job, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry, reads_the_file_before
 from tests.test_names import contents, database, schema, schema_1_job
 
@@ -514,9 +514,10 @@ def test_a_comparison_storing_no_checked_file_record_makes_no_sync(job, monkeypa
 
 def test_the_real_sync_succeeds_on_the_test_filesystem(job):
 	os.makedirs(job.job_vault, exist_ok=True)
-	REAL_SYNC_VAULT_FILESYSTEMS(job.job_vault, 'job')
+	# through the stand-in: a real syncfs of the filesystem under the basetemp is never made
+	assert REAL_SYNC_VAULT_FILESYSTEMS(job.job_vault, 'job') == {next(iter(rv.vault_disks(job.job_vault)[1]))[0]: None}
 	with pytest.raises(OSError):
-		rv.syncfs_folder(os.path.join(job.job_vault, 'not there'))
+		REAL_SYNCFS_FOLDER(os.path.join(job.job_vault, 'not there'))
 
 
 def test_copies_a_backup_wrote_stay_unchecked_without_any_patch(job):

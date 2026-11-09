@@ -1920,19 +1920,45 @@ LIBC_SYNCFS = ctypes.CDLL(None, use_errno=True).syncfs
 LIBC_SYNCFS.argtypes = [ctypes.c_int]
 LIBC_SYNCFS.restype = ctypes.c_int
 
+def syncfs_fd(fd:int, path:str = None) -> None:
+	'''
+	syncfs the filesystem holding the open file fd: every dirty page of it is written before this returns, and a
+	writeback error the filesystem met since fd was opened is raised as OSError (naming path), even one another
+	process's sync reported first.
+	'''
+	if LIBC_SYNCFS(fd) != 0:
+		code = ctypes.get_errno()
+		raise OSError(code, os.strerror(code), path)
+
 def syncfs_folder(path:str) -> None:
 	'''
-	syncfs the filesystem holding the folder at path: every dirty page of it is written before this returns, and a
-	writeback error the filesystem met since and never reported (once: the next sync gets 0) is raised. Raises
-	OSError, FileNotFoundError or NotADirectoryError for a path that is no folder.
+	syncfs the filesystem holding the folder at path (syncfs_fd() on it, opened now): a writeback error the filesystem met
+	and never reported to a sync (once: the next sync gets 0) is raised. Raises OSError, FileNotFoundError or
+	NotADirectoryError for a path that is no folder.
 	'''
 	fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
 	try:
-		if LIBC_SYNCFS(fd) != 0:
-			code = ctypes.get_errno()
-			raise OSError(code, os.strerror(code), path)
+		syncfs_fd(fd, path)
 	finally:
 		os.close(fd)
+
+def sync_each_disk(disks:list, sync) -> dict:
+	'''
+	sync(disk, folders) for each disk of disks, the (disk, folder) pairs vault_disks() gives, with folders the disk's
+	folders in their order (branches that are folders of one filesystem share its one sync): side by side, each disk on a
+	thread of its own when there are several, as a pool's disks write out side by side. Returns {disk: what sync
+	returned}, in the disks' order, leaving out the disks for which it returned ... .
+	'''
+	folders = {}
+	for disk, folder in disks:
+		folders.setdefault(disk, []).append(folder)
+	run = lambda disk: (disk, sync(disk, folders[disk]))
+	if len(folders) > 1:
+		with ThreadPoolExecutor(max_workers=len(folders)) as pool:
+			synced = list(pool.map(run, folders))
+	else:
+		synced = [run(disk) for disk in folders]
+	return {disk: result for disk, result in synced if result is not ...}
 
 def sync_vault_filesystems(job_vault:str, job_name:str) -> dict:
 	'''
@@ -1947,30 +1973,22 @@ def sync_vault_filesystems(job_vault:str, job_name:str) -> dict:
 	a job vault gone off a pool (its disk may be gone too, and that says nothing of a write error).
 	'''
 	pooled, disks = vault_disks(job_vault)
-	# the first folder of each disk that holds the job vault: a branch without it is passed over for the next one of its disk
-	folders = {}
-	for disk, folder in disks:
-		folders.setdefault(disk, []).append(folder)
-	def sync(disk:str):
-		# (disk, None or the OSError), or (disk, ...) when no folder of it holds the job vault
+	def sync(disk:str, folders:list):
+		# None or the OSError, or ... when no folder of it holds the job vault: a branch without it is passed over for the
+		# next one of its disk
 		with VAULT_SYNC_LOCKS.setdefault(disk, threading.Lock()):
-			for folder in folders[disk]:
+			for folder in folders:
 				try:
 					syncfs_folder(folder)
-					return disk, None
+					return None
 				except (FileNotFoundError, NotADirectoryError):
 					if not pooled:
 						raise
 				except OSError as e:
 					record_failed_sync(disk, e, job_name)
-					return disk, e
-			return disk, ...
-	if len(folders) > 1:
-		with ThreadPoolExecutor(max_workers=len(folders)) as pool:
-			synced = list(pool.map(sync, folders))
-	else:
-		synced = [sync(disk) for disk in folders]
-	return {disk: result for disk, result in synced if result is not ...}
+					return e
+			return ...
+	return sync_each_disk(disks, sync)
 
 # the boot id the kernel makes anew at each boot, and the start of the name of a disk's marker in the state folder
 BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'

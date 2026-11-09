@@ -18,8 +18,20 @@ STILL_054 = {
 	'test_chain_links.py',
 }
 
-# the real helper, for the one test that runs it: isolated_runtime() replaces it for every test
+# the real helpers, for the one test that runs them: isolated_runtime() replaces them for every test
 REAL_SYNC_VAULT_FILESYSTEMS = rv.sync_vault_filesystems
+REAL_SYNCFS_FOLDER = rv.syncfs_folder
+REAL_SYNCFS_FD = rv.syncfs_fd
+
+
+def syncfs_stand_in(path:str) -> None:
+	'''syncfs_folder() without the syncfs: the folder is opened and closed, so a path that is no folder still raises as it does.'''
+	os.close(os.open(path, os.O_RDONLY | os.O_DIRECTORY))
+
+
+def syncfs_fd_stand_in(fd:int, path:str = None) -> None:
+	'''syncfs_fd() without the syncfs: an fd that is not open still raises.'''
+	os.fstat(fd)
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +68,9 @@ def isolated_runtime(tmp_path, monkeypatch):
 	# a real syncfs would flush the whole (ext4) filesystem under /tmp for every comparison that checks a copy; tests that count
 	# or fail syncs patch it themselves
 	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault, job_name: {})
+	# nor anything else: a restore syncs its target, and the filesystem under a basetemp can hold live trees. never a real syncfs
+	monkeypatch.setattr(rv, 'syncfs_folder', syncfs_stand_in)
+	monkeypatch.setattr(rv, 'syncfs_fd', syncfs_fd_stand_in)
 	# and never reads the host's fstab: a missing file, which a test writes with write_fstab() when it means to
 	monkeypatch.setattr(rv, 'FSTAB_PATH', str(tmp_path / 'fstab'))
 	yield
