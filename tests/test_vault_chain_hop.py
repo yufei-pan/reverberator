@@ -279,9 +279,10 @@ def test_a_change_list_cut_short_falls_back_to_the_text(job, cut):
 @pytest.mark.parametrize('header', ['whole', 'cut'])
 def test_a_version_with_two_change_lists_reads_the_one_with_rows(job, header):
 	v0, v1 = two_versions(job, {'a/x': 'x'}, {'deep/': None}, [('deep/x', 'move', 'a/x')])
-	# as pruning makes one when the name it works out from the recorded sizes is not there; it sorts first. One cut
+	# as pruning makes one when the name it works out from the recorded sizes is not there; it sorts first, with the smallest size and count a name can
+	# have (V1 itself records 4.00 KiB on ext4, as its folder takes a block, and 0.00 B on XFS, where a folder's entries sit in its inode). One cut
 	# in its header has no rows either
-	empty = f'{v1}--1.00_B-1_ino{rv.CONTENT_FILE_EXTENSION_NAME}'
+	empty = f'{v1}--0.00_B-0_ino{rv.CONTENT_FILE_EXTENSION_NAME}'
 	write_change_list(empty, job.monitor, [])
 	if header == 'cut':
 		with open(empty, 'rb+') as f:
