@@ -367,7 +367,9 @@ def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
 @pytest.mark.parametrize('spare', [1, 12, 22])
 def test_a_new_file_at_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	# on every filesystem, XFS included: a file new in the last batch is copied, not linked to an older version, so the path can be as long as a path
-	# can be whatever text the filesystem takes of a link. The tree of that version is built in staging, whose own name must not be longer than the version's
+	# can be whatever text the filesystem takes of a link. The tree of that version is built in staging, whose own name must not be longer than the version's,
+	# and the conversion builds it only for a version that holds a chain link (needs_plain_tree()): that link is k, which no batch changes, so 0.54 links it
+	# in the newest version (z, modified in the last batch, is copied)
 	job = create_job(str(tmp_path))
 	rel = long_rel(4095 - len(os.path.join(job.job_vault, V0_FOLDER, '')) - spare)
 	def seed(monitor):
@@ -385,6 +387,7 @@ def test_a_new_file_at_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	names = folders_of(job)
 	newest = os.path.join(job.job_vault, names[max(names)], rel)
 	assert 4072 <= len(newest) <= 4094 and os.path.isfile(newest) and not os.path.islink(newest)
+	assert os.path.islink(os.path.join(job.job_vault, names[max(names)], 'k'))
 	assert not any(os.path.lexists(os.path.join(job.job_vault, names[number], rel)) for number in names if number != max(names))
 	before = expected(job)
 	assert migrate(job) is True
