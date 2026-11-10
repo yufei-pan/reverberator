@@ -37,7 +37,8 @@ H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 
 	'walk_ahead_taken': 12, 'walk_ahead_taken_sub': 12, 'back_home_under_new': 12, 'c2_then_moved': 12, 'c2_then_into_old': 12,
 	'land_ahead_taken': 12,
 	# round 22's build: the shapes of the step back's rules
-	'nested_out_ancestor': 12}
+	'nested_out_ancestor': 12, 'moved_sub_out_before_walk': 12, 'back_into_new_then_out': 12, 'pairing_walk_under_new': 12,
+	'renamed_in_new_then_out': 12, 'renamed_in_new_then_out_sub': 12, 'out_of_new_then_out': 12, 'out_of_new_then_out_sub': 12}
 H_DEFAULT = 16
 SAMPLE = int(os.environ.get('REVERB_WATCH_SCHED_SAMPLE', '100'))
 BIG = 'p' * 200000
@@ -172,6 +173,32 @@ SHAPES = {
 	# the move-outs that hold a watch, as one would clear it at the parent's pairing; the step-back review's finding 1)
 	'nested_out_ancestor': [('mv', 'big/sub', '{outside}/sub'), ('mv', 'big', 'other/b2'), ('mv', 'next2/sub', 'other/b2/sub'),
 		('mv', '{outside}/sub/b', '{outside}/sub/z'), ('poke', 'other/b2/sub/z')],
+	# a subfolder of a folder moved into a new folder leaves the tree before the walk reaches it (rule 1: the watches the
+	# move-in moved join newDirWDs, where the subfolder's move-out finds its watch)
+	'moved_sub_out_before_walk': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big/sub', '{outside}/sub'), ('mv', 'next2/sub', 'n/big/sub'),
+		('write', '{outside}/sub/w', 'w')],
+	# a folder back from outside into a new folder, put in place there by a settle, then out again (rule 2: the settle's
+	# walk passes newDirWDs; 0.55.1 leaves the stale watch too)
+	'back_into_new_then_out': [('mv', 'big', '{outside}/big'), ('mkdir', 'n'), ('mv', '{outside}/big', 'n/big'), ('mkdir', 'big'), ('mv', 'n/big', '{outside}/b2'),
+		('mv', 'next2/sub', 'n/big'), ('write', '{outside}/b2/w', 'w')],
+	# a folder made in a new folder whose parent is renamed before its create is handled, then moved out of the tree (rule 3:
+	# a watch any walk adds below a folder of newDirWDs joins it)
+	'pairing_walk_under_new': [('mkdir', 'big/n'), ('mkdir', 'big/n/s'), ('mv', 'big', 'b2'), ('mv', 'b2/n/s', '{outside}/s'), ('mv', 'next2/sub', 'b2/n/s'),
+		('write', '{outside}/s/w', 'w')],
+	# renamed in a new folder, then out of the tree before the first move-in's walk (the same-read skip's fallback)
+	'renamed_in_new_then_out': [('mkdir', 'n'), ('mkdir', 'n/d'), ('mv', 'n/d', 'n/e'), ('mv', 'n/e', '{outside}/e'), ('mkdir', 'n/d'), ('write', '{outside}/e/w', 'w')],
+	'renamed_in_new_then_out_sub': [('mkdir', 'n'), ('mkdir', 'n/d/s'), ('mv', 'n/d', 'n/e'), ('mv', 'n/e', '{outside}/e'), ('mkdir', 'n/d/s'),
+		('write', '{outside}/e/s/w', 'w')],
+	# out of a new folder into the tree, then out of the tree before the settle: the walk found its watch where the events
+	# never put it, so its move-out matched none, and the settle's probe finds it at neither path (0.55.1 leaves it too)
+	'out_of_new_then_out': [('mkdir', 'n'), ('mkdir', 'n/d'), ('mv', 'n/d', 'other/x'), ('mv', 'other/x', '{outside}/x'), ('mkdir', 'n/d'),
+		('write', '{outside}/x/w', 'w')],
+	'out_of_new_then_out_sub': [('mkdir', 'n'), ('mkdir', 'n/d/s'), ('mv', 'n/d', 'other/x'), ('mv', 'other/x', '{outside}/x'), ('mkdir', 'n/d/s'),
+		('write', '{outside}/x/s/w', 'w')],
+	# the same, out of the tree as the move-in's walk adds its watch, before the walk lists it: what it holds was never
+	# found, and leaves with it
+	'renamed_in_new_out_early': [('mkdir', 'n'), ('mkdir', 'n/d/s'), ('mv', 'n/d', 'n/e'), ('mv', 'n/e', '{outside}/e')],
+	'out_of_new_out_early': [('mkdir', 'n'), ('mkdir', 'n/d/s'), ('mv', 'n/d', 'other/x'), ('mv', 'other/x', '{outside}/x')],
 	# a swap by one rename, then one of the two renamed: only the first path before finds the other's watch
 	'exchange_then_rename': [('exchange', 'big', 'other'), ('mv', 'big', 'b3'), ('poke', 'other/a'), ('write', 'b3/w', 'w')],
 	# two swaps through one folder: a watch is at neither of its own paths, only at one another watch held
