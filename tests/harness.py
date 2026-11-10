@@ -616,3 +616,55 @@ def scripted_watch(monkeypatch, monitor:str, reads:list, flag=None, queue=None, 
 def reverberator_script() -> str:
 	'''What a test runs as reverberator.py in a process of its own: its entry point, never syncing the filesystem under the basetemp (daemon_without_syncfs.py).'''
 	return os.path.abspath(os.path.join(os.path.dirname(__file__), 'daemon_without_syncfs.py'))
+
+
+def watch_map_errors(inotify_obj, wd_dic: dict, monitor: str, skip_list=None, add_watch=None) -> tuple:
+	'''
+	A watcher's watch map checked both ways against the tree, once the watcher has read every event: (stale, missing).
+	stale: each watch held that is not the one add_watch gives for its path, or whose path goes through a symlink below the
+	root (add_watch follows one there, and the watcher's walk never does), as (wd, rel, what add_watch gave, 'gone', or
+	'through a link'). missing: each folder of the tree the job watches (not skipped, not a symlink, on the root's
+	filesystem: no inner mount) with no watch held, as its rel. add_watch is the real INotify.add_watch, when a test
+	patched it; a watch the check adds goes again.
+	'''
+	flags = rv.inotify_simple.flags
+	# the watcher's own mask, so a held watch keeps its mask; ONLYDIR and DONT_FOLLOW only steer the lookup
+	mask = flags.MODIFY | flags.ATTRIB | flags.MOVED_FROM | flags.MOVED_TO | flags.CREATE | flags.DELETE | flags.DELETE_SELF | flags.MOVE_SELF | flags.UNMOUNT | flags.Q_OVERFLOW
+	add = add_watch or rv.inotify_simple.INotify.add_watch
+	root = monitor.rstrip('/') or '/'
+	root_real = os.path.realpath(root)
+	held = {wd: path.rstrip('/') or '/' for wd, path in list(wd_dic.items())}
+	stale, missing, added = [], [], []
+	def watch_of(path):
+		try:
+			got = add(inotify_obj, path, mask | flags.ONLYDIR | flags.DONT_FOLLOW)
+		except OSError:
+			return 'gone'
+		if got not in held and got not in added:
+			added.append(got)
+		return got
+	def through_link(path):
+		return os.path.realpath(path) != (root_real if path == root else root_real.rstrip('/') + path[len(root.rstrip('/')):])
+	for wd, path in held.items():
+		got = watch_of(path)
+		if got != wd:
+			stale.append((wd, os.path.relpath(path, root), got))
+		elif through_link(path):
+			stale.append((wd, os.path.relpath(path, root), 'through a link'))
+	root_dev = os.lstat(root).st_dev
+	for base, dirs, _ in os.walk(root):
+		for name in list(dirs):
+			path = os.path.join(base, name)
+			rel = os.path.relpath(path, root)
+			st = os.lstat(path)
+			if (skip_list is not None and skip_list.skips(rel + '/')) or os.path.islink(path) or st.st_dev != root_dev:
+				dirs.remove(name)
+				continue
+			if watch_of(path) not in held:
+				missing.append(rel)
+	for wd in added:
+		try:
+			inotify_obj.rm_watch(wd)
+		except OSError:
+			pass
+	return stale, missing

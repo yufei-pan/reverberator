@@ -6,7 +6,8 @@ between a new folder's watch and its listing, or between a walk and the read of 
 found the two that a second review found this way in two minutes.
 
 After the steps, everything settles, a marker goes into every folder, and the newest version must equal the tree: a folder that
-left every version, a change a discard threw away, or a folder with no working watch shows.
+left every version, a change a discard threw away, or a folder with no working watch shows. The watch map must be the tree's
+too, both ways: each watch held is the one add_watch gives for its path, and each folder has one.
 
 The first step runs at the first visit. The suite runs every vector up to H visits of a short shape, and a deterministic sample
 of SAMPLE out of them for a longer one. REVERB_WATCH_SCHED_H, REVERB_WATCH_SCHED_SAMPLE (0 for all) and REVERB_WATCH_SCHED_SHAPES (names, by commas) widen it.
@@ -20,17 +21,26 @@ import time
 import pytest
 
 import reverberator as rv
-from tests.harness import wait_until
+from tests.harness import wait_until, watch_map_errors
 from tests.test_moves_into_new_folders import live_view, session, version_view  # session is the fixture
 
 pytestmark = pytest.mark.inotify
 
 # the visits a shape's steps may land at: all of them for a short shape, where the window is a visit or two wide
-H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 12, 'in_then_poke_mv': 12, 'twice_in_new': 12, 'twice_in_new_sub': 12}
+H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 12, 'in_then_poke_mv': 12, 'twice_in_new': 12, 'twice_in_new_sub': 12,
+	# review 5's bounds for the shapes of five steps or more: 12 visits
+	'out_made_deep_into_new': 12, 'root_ahead': 12, 'c1_collision': 12, 'c2_unwatched_old': 12,
+	'sub_back_parent_into_new': 12, 'out_parent_deleted_back': 12, 'found_out': 12, 'back_then_sub_out': 12,
+	'sub_of_found_out': 12, 'q3_sub_out': 12, 'new_into_new_then_sub': 12, 'new_into_new_then_sub2': 12,
+	'made_at_pending_out_parent_deleted': 12, 'made_at_pending_out_moved': 12, 'cycle_guard': 12, 'cycle_guard_root': 12, 'q3_deep_out': 12,
+	'root_put_into_itself_touched': 12, 'back_home_via_new': 12, 'back_home_via_new_sub': 12, 'back_home_via_outside': 12,
+	'walk_ahead_taken': 12, 'walk_ahead_taken_sub': 12, 'back_home_under_new': 12, 'c2_then_moved': 12, 'c2_then_into_old': 12,
+	'land_ahead_taken': 12}
 H_DEFAULT = 16
 SAMPLE = int(os.environ.get('REVERB_WATCH_SCHED_SAMPLE', '100'))
 BIG = 'p' * 200000
-TREE = {'big/a': BIG, 'big/sub/b': BIG, 'big/sub/deep/x': 'x' * 100, 'next/z': 'z' * 100, 'f.txt': 'f' * 300, 'other/o': 'o', 'keep/k': 'k'}
+TREE = {'big/a': BIG, 'big/sub/b': BIG, 'big/sub/deep/x': 'x' * 100, 'next/z': 'z' * 100, 'next2/sub/z': 'z' * 100, 'f.txt': 'f' * 300, 'g.txt': 'g' * 300,
+	'other/o': 'o', 'keep/k': 'k'}
 SHAPES = {
 	# a folder made at the old path of the folder the walk of n found, and moved on before its own walk (R1)
 	'made_at_a_found_folders_old_path': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'next', 'big'), ('mkdir', 'big/new'), ('mv', 'big/new', 'big/sub'),
@@ -56,6 +66,105 @@ SHAPES = {
 	'twice_in_new': [('mkdir', 'n'), ('poke', 'big/a'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'n/c')],
 	# the same in a subfolder of the new folder
 	'twice_in_new_sub': [('mkdir', 'n'), ('mkdir', 'n/s'), ('poke', 'big/a'), ('mv', 'big', 'n/s/big'), ('mv', 'n/s/big', 'n/s/c')],
+	# a folder leaves the tree, a folder made at its old path expires its move-out, and its subfolder comes back into a new folder
+	# that a walk listed: the subfolder's watch stays where the walk found it (fuzz seed 647, through a skipped folder)
+	'out_made_sub_into_new': [('mkdir', 'n'), ('mv', 'big', '{outside}/big'), ('mkdir', 'big'), ('mv', '{outside}/big/sub', 'n/sub'), ('poke', 'n/sub/b')],
+	# the same one level deeper, and with no folder made at the old path
+	'out_made_deep_into_new': [('mkdir', 'n'), ('mv', 'big', '{outside}/big'), ('mkdir', 'big'), ('mv', '{outside}/big/sub/deep', 'n/deep'), ('write', 'n/deep/w', 'w')],
+	'out_sub_into_new': [('mkdir', 'n'), ('mv', 'big', '{outside}/big'), ('mv', '{outside}/big/sub', 'n/sub'), ('poke', 'n/sub/b')],
+	'out_deep_into_new': [('mkdir', 'n'), ('mv', 'big', '{outside}/big'), ('mv', '{outside}/big/sub/deep', 'n/deep'), ('write', 'n/deep/w', 'w')],
+	# a folder renamed twice into a folder whose move is being walked: the walk can list it at its last name before either rename
+	# is read, and a change that only its event shows comes at the new place ahead of the move (F2)
+	'twice_old_race': [('mv', 'other', 'o2'), ('poke', 'big/a'), ('mv', 'big', 'o2/x'), ('mv', 'o2/x', 'o2/big')],
+	'twice_old_race_sub': [('mv', 'other', 'o2'), ('poke', 'big/sub/b'), ('mv', 'big', 'o2/x'), ('mv', 'o2/x', 'o2/big')],
+	# the same at a walk's root: the place a create names holds, by its walk, the folder whose renames are still unread
+	'root_ahead': [('mv', 'other', 'o2'), ('poke', 'big/a'), ('mkdir', 'o2/x'), ('rmtree', 'o2/x'), ('mv', 'big', 'o2/x'), ('mv', 'o2/x', 'o2/big')],
+	# a walk of a renamed folder lists a folder made where its subfolder left, before that move is read (two watches, one path)
+	'c1_collision': [('mv', 'big', 'b2'), ('mv', 'b2/sub', 'b2/s2'), ('mkdir', 'b2/sub'), ('mkdir', 'b2/sub/deep'), ('write', 'b2/sub/deep/w', 'w'), ('poke', 'b2/s2/b')],
+	# the same where the folder that left had no watch yet: its move-out names the place of the new folder's watch
+	'c2_unwatched_old': [('mv', 'other', 'o2'), ('mkdir', 'o2/u'), ('mv', 'o2/u', 'o2/u2'), ('mkdir', 'o2/u'), ('write', 'o2/u/f', 'x'), ('write', 'o2/u2/g', 'y')],
+	# a subfolder taken back from a folder that left the tree, then changed so that only its event shows it
+	'out_back_sub': [('mv', 'big', '{outside}/big'), ('mv', '{outside}/big/sub', 'sub2'), ('poke', 'sub2/b')],
+	# two folders swapped by one rename (RENAME_EXCHANGE), then changed so that only the events show it
+	'exchange': [('exchange', 'big', 'other'), ('poke', 'other/a'), ('write', 'big/new', 'n')],
+	'exchange_twice': [('exchange', 'big', 'other'), ('exchange', 'other/sub', 'next2/sub'), ('poke', 'next2/sub/b'), ('write', 'other/sub/new', 'n')],
+	# a folder renamed over an empty folder (the empty one is replaced), then renamed on and changed
+	'over_empty': [('mkdir', 'e'), ('mv', 'big', 'e'), ('mv', 'e', 'f'), ('poke', 'f/a')],
+	# a change in the folder between the create at the place and the move there, which only its event shows: the root put's
+	# copy holds it (without the copy the move carries the old bytes over it; 0.55.1 discards the change in newDirWDs)
+	'over_empty_poke_between': [('mkdir', 'e'), ('poke', 'big/a'), ('mv', 'big', 'e')],
+	'gone_place_poke_between': [('mkdir', 'other/x'), ('rmtree', 'other/x'), ('poke', 'big/a'), ('mv', 'big', 'other/x')],
+	# a folder renamed between its walk's open and its watch (fuzz seed 4284): the watch goes only where the folder is once
+	# it exists, and a walk's root is opened from its parent's folder
+	'open_renamed_into_new': [('mkdir', 'other/m'), ('mkdir', 'n'), ('mv', 'other/m', 'n/m'), ('mkdir', 'n/m/s')],
+	'open_renamed_child_into_new': [('mkdir', 'other/m/k'), ('mkdir', 'n'), ('mv', 'other/m/k', 'n/k'), ('mkdir', 'n/k/s')],
+	'stale_root_path': [('mkdir', 'other/x'), ('mv', 'other', 'o2'), ('mkdir', 'other/x')],
+	# a create's walk finds there a folder whose move in is still queued, after the created folder's own move-out (fuzz seed
+	# 2509): that move-out is not the found folder's, or the found folder goes into itself (round 22's first design grew
+	# without bound there); 0.55.1 loses the poke in most orders, as the move-out took the found folder's watch with it
+	'root_put_into_itself': [('mkdir', 'n'), ('mv', 'n', 'big/n'), ('mv', 'big', 'n')],
+	'root_put_into_itself_poke': [('mkdir', 'n'), ('mv', 'n', 'big/n'), ('mv', 'big', 'n'), ('poke', 'n/a')],
+	'root_put_into_itself_touched': [('mkdir', 'n'), ('mkdir', 'big/x'), ('mv', 'n', 'big/n'), ('mv', 'big', 'n'), ('poke', 'n/a')],
+	'root_put_into_sub': [('mkdir', 'n'), ('mv', 'n', 'big/sub/n'), ('mv', 'big', 'n'), ('poke', 'n/sub/b')],
+	'root_put_wrong_mover': [('mkdir', 'n'), ('mv', 'n', 'other/n'), ('mv', 'big', 'n'), ('poke', 'n/a')],
+	# a folder leaves the tree and comes back to its place after its parent was renamed, before its move-out expires (fuzz seed 929)
+	'sub_back_parent_renamed': [('mv', 'big/sub', '{outside}/sub'), ('mv', 'big', 'b2'), ('mv', '{outside}/sub', 'b2/sub'), ('poke', 'b2/sub/b')],
+	'sub_back_parent_into_new': [('mv', 'big/sub', '{outside}/sub'), ('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', '{outside}/sub', 'n/big/sub'), ('poke', 'n/big/sub/b')],
+	# a folder moved out, its old parent deleted before the move-out expires, then the folder back in with its new parent, which
+	# has no MOVE_SELF of its own (fuzz seed 5837)
+	'out_parent_deleted_back': [('mv', 'big/sub', '{outside}/d/sub'), ('rmtree', 'big'), ('mkdir', 'n'), ('mv', '{outside}/d', 'n/d'), ('poke', 'n/d/sub/b')],
+	# a folder moved out of the tree from a new folder: its watch, at the old place, must go (F3; 0.55.1 keeps one in some orders)
+	'found_out': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big', '{outside}/big'), ('mkdir', 'big'), ('write', 'big/w', 'w')],
+	'back_then_sub_out': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big', 'big'), ('mv', 'big/sub', '{outside}/sub'), ('poke', 'big/a')],
+	'sub_of_found_out': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big/sub', '{outside}/sub'), ('mkdir', 'n/big/sub'), ('mv', 'next', 'n/big/sub/z')],
+	'q3_sub_out': [('mkdir', 'n'), ('mv', 'big', 'n/big'), ('mv', 'n/big/sub', '{outside}/sub'), ('rm', '{outside}/sub/b'), ('mkdir', 'big'), ('mkdir', 'big/sub'),
+		('write', 'big/sub/b', 'nb')],
+	# a folder made in the batch moved into another new folder, then a folder made in it there (cut down from fuzz seed 4284's
+	# round 6), and the same with a file moved in and out
+	'new_into_new_then_sub': [('mkdir', 'other/m'), ('mkdir', 'other/m/k'), ('mkdir', 'n'), ('mv', 'other/m', 'n/m'), ('mkdir', 'n/m/s'), ('write', 'n/m/s/w', 'w')],
+	'new_into_new_then_sub2': [('mkdir', 'other/m'), ('mv', 'f.txt', 'other/m/f'), ('mkdir', 'n'), ('mv', 'other/m', 'n/m'), ('mkdir', 'n/m/s'), ('mv', 'n/m/f', 'keep/f')],
+	# a folder made at the place of a folder whose move-out is pending, under a new path (its parent renamed), then moved out
+	# too: its move-out takes its own watch, not the first folder's, so its watch does not stay in the tree
+	'made_at_pending_out_parent_deleted': [('mv', 'big/sub', '{outside}/sub'), ('mv', 'big', 'b2'), ('mkdir', 'b2/sub'), ('mv', 'b2/sub', '{outside}/sub2'),
+		('rmtree', 'b2'), ('write', '{outside}/sub2/w', 'w')],
+	'made_at_pending_out_moved': [('mv', 'big/sub', '{outside}/sub'), ('mv', 'big', 'b2'), ('mkdir', 'b2/sub'), ('mv', 'b2/sub', '{outside}/sub2'),
+		('mkdir', 'b2/sub'), ('write', 'b2/sub/w', 'w')],
+	# a parent held below the folder moved into it: s's watch came through its open folder after its rename into n, which no
+	# event said (no MOVE_SELF), so a map of each watch's place still holds s in big when big moves into s
+	'cycle_guard': [('mkdir', 'big/s'), ('mkdir', 'n'), ('mv', 'big/s', 'n/s'), ('mv', 'big', 'n/s/big'), ('write', 'n/s/big/w', 'w')],
+	# the root put of a create read while the tree holds its parent under the put folder, and another folder at the put
+	# folder's old path holds the parent at the same path: the parent's path checks out, and the put would close a cycle
+	'cycle_guard_root': [('mkdir', 'big/sub/e'), ('mv', 'big', 'b0'), ('mkdir', 'big'), ('mv', 'b0/sub', 'big/sub'), ('mv', 'b0', 'big/sub/e')],
+	'q3_deep_out': [('mkdir', 'n'), ('mv', 'big/sub', 'n/sub'), ('mv', 'n/sub/deep', '{outside}/deep'), ('write', '{outside}/deep/y', 'y'), ('mkdir', 'big/sub'),
+		('mkdir', 'big/sub/deep'), ('write', 'big/sub/deep/y', 'ny')],
+	# a folder moved into a new folder and back to the very place it left, its parent renamed in between (fuzz seed 14124):
+	# its move-out from there is not the last move of it read when it expires, so its watches stay; 0.55.1 loses the write
+	# in most orders, and so did revision 1 before the move-out had to be the folder's last one read
+	'back_home_via_new': [('mkdir', 'big/n0'), ('mv', 'big/sub/deep', 'big/n0/deep'), ('mv', 'big', 'other/t'), ('mv', 'other/t/n0/deep', 'other/t/sub/deep'),
+		('write', 'other/t/sub/deep/w', 'w')],
+	'back_home_via_new_sub': [('mkdir', 'big/n0'), ('mv', 'big/sub', 'big/n0/sub'), ('mv', 'big', 'other/t'), ('mv', 'other/t/n0/sub', 'other/t/sub'),
+		('write', 'other/t/sub/deep/w', 'w')],
+	'back_home_via_outside': [('mv', 'big/sub/deep', '{outside}/deep'), ('mv', '{outside}/deep', 'next/deep'), ('mv', 'big', 'b2'), ('mv', 'next/deep', 'b2/sub/deep'),
+		('write', 'b2/sub/deep/w', 'w')],
+	# a walk of a new folder finds an old folder moved into it, and in that one a folder made where another left, before
+	# that one's move-out is read (fuzz seed 12812): the move-out names the found folder's watch, which had no MOVE_SELF
+	# after it, so its expiry leaves that watch alone
+	'walk_ahead_taken': [('mkdir', 'big/n'), ('mkdir', 'm'), ('mv', 'big/n', 'm/n'), ('mkdir', 'big/n'), ('mv', 'big', 'm/n/big'), ('write', 'm/n/big/n/w', 'w')],
+	'walk_ahead_taken_sub': [('mkdir', 'big/sub/n'), ('mkdir', 'm'), ('mv', 'big/sub/n', 'm/n'), ('mkdir', 'big/sub/n'), ('mv', 'big', 'm/n/big'),
+		('write', 'm/n/big/sub/n/w', 'w')],
+	# a folder back at its place from outside while its parent is in a folder made in the batch and a higher one moved into
+	# another (fuzz seed 12831, which 0.55.1 fails too): its move-in's walk runs at a stale path, and the walk of the other
+	# new folder, which meets the folder at its place, says it came back; 0.55.1 loses it in 179 of 1,000 sampled orders
+	'back_home_under_new': [('mv', 'big/sub/deep', '{outside}/deep'), ('mkdir', 'm'), ('mkdir', 'big/n'), ('mv', 'big/sub', 'big/n/sub'),
+		('mv', '{outside}/deep', 'big/n/sub/deep'), ('mv', 'big', 'm/big')],
+	# a move-out names the watch a walk gave a folder at its place before that folder's arrival was read, and its move-in
+	# lands that watch where the mover went: no MOVE_SELF of the watch comes before the next event in either folder of the
+	# move, so it goes back. c2_unwatched_old's root put, then the folder moved on or into the first one; and
+	# fuzz seed 19006's route, which 0.55.1 loses in 225 of 1,000 sampled orders
+	'c2_then_moved': [('mv', 'other', 'o2'), ('mkdir', 'o2/u'), ('mv', 'o2/u', 'o2/u2'), ('mkdir', 'o2/u'), ('mv', 'o2/u', 'o2/u3'), ('write', 'o2/u3/f', 'x'),
+		('write', 'o2/u2/g', 'y')],
+	'c2_then_into_old': [('mv', 'other', 'o2'), ('mkdir', 'o2/u'), ('mv', 'o2/u', 'o2/u2'), ('mkdir', 'o2/u'), ('mv', 'o2/u', 'o2/u2/u'), ('write', 'o2/u2/u/f', 'x')],
+	'land_ahead_taken': [('mkdir', 'big/n'), ('mv', 'big/n', 'other/n'), ('mkdir', 'big/n'), ('mkdir', 'm'), ('mv', 'big/n', 'm/n'), ('write', 'm/n/w', 'w')],
 }
 NAMES = [name for name in os.environ.get('REVERB_WATCH_SCHED_SHAPES', ','.join(SHAPES)).split(',') if name]
 
@@ -68,7 +177,10 @@ def vectors(name):
 	return every if not SAMPLE or len(every) <= SAMPLE else sorted(random.Random(name).sample(every, SAMPLE))
 
 
+# two orders of cycle_guard_root that the round 22 tree design pinned for its cycle guard: run whatever the sample
+GUARDED = {('cycle_guard_root', (0, 0, 0, 0, 0)), ('cycle_guard_root', (0, 2, 2, 3, 3))}
 CASES = [(name, vector) for name in NAMES for vector in vectors(name)]
+CASES += sorted(case for case in GUARDED if case[0] in NAMES and case not in CASES)
 
 
 def folders_of(root):
@@ -89,6 +201,14 @@ def test_a_schedule_ends_as_the_tree(folders_removed, session, job, tmp_path, mo
 	(outside / 'd' / 'x').write_text('x')
 	(outside / 'd' / 's' / 'y').write_text('y')
 	steps = [tuple(arg.replace('{outside}', str(outside)) for arg in step) for step in SHAPES[name]]
+	maps = []
+	real_init = rv.initializeFolderWatchers
+	def init(inotify_obj, monitor_path, wdDic, *args, **kwargs):
+		# the latest watch's map: an overflow starts a new watch
+		if not maps or maps[-1][1] is not wdDic:
+			maps.append((inotify_obj, wdDic))
+		return real_init(inotify_obj, monitor_path, wdDic, *args, **kwargs)
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', init)
 	one = session(TREE)
 	state = {'visits': 0, 'done': 0, 'armed': False, 'inside': False}
 	log = []
@@ -101,12 +221,18 @@ def test_a_schedule_ends_as_the_tree(folders_removed, session, job, tmp_path, mo
 			state['visits'] += 1
 			while state['done'] < len(steps) and vector[state['done']] <= at:
 				step = steps[state['done']]
-				state['done'] += 1
-				log.append(('step', at, where, step))
+				failed = None
 				try:
 					one.apply(step)
+				except BlockingIOError:
+					# a take while the watcher holds the queue, which the backuper cannot take then: at the next visit
+					break
 				except OSError as e:
-					log.append(('failed', os.strerror(e.errno)))
+					failed = os.strerror(e.errno)
+				state['done'] += 1
+				log.append(('step', at, where, step))
+				if failed:
+					log.append(('failed', failed))
 		finally:
 			state['inside'] = False
 	class Events(list):
@@ -146,8 +272,11 @@ def test_a_schedule_ends_as_the_tree(folders_removed, session, job, tmp_path, mo
 		open(os.path.join(job.monitor, folder, 'mark'), 'w').write('m')
 	one.back_up_next()
 	version, tree = version_view(job), live_view(job)
-	if version != tree:
+	# and the watches are the tree's: each one held is the folder's at its path, and each folder has one
+	stale, missing = watch_map_errors(*maps[-1], job.monitor, skip_list=one.skip_list, add_watch=real_add)
+	if version != tree or stale or missing:
 		detail = {rel: ('MISSING' if rel not in version else 'present', 'MISSING' if rel not in tree else 'present', version.get(rel, [None, None])[1] == tree.get(rel, [None, None])[1])
 			for rel in sorted(set(version) | set(tree)) if version.get(rel) != tree.get(rel)}
-		pytest.fail(f'{name} {vector}: {detail}\nto run it alone: REVERB_WATCH_SCHED_SHAPES={name} -k "{name}-{"_".join(map(str, vector))}"\nsteps and batches:\n'
+		pytest.fail(f'{name} {vector}: {detail} stale watches {stale} folders with no watch {missing}\n'
+			f'to run it alone: REVERB_WATCH_SCHED_SHAPES={name} -k "{name}-{"_".join(map(str, vector))}"\nsteps and batches:\n'
 			+ '\n'.join(map(str, log)), pytrace=False)

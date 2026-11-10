@@ -6,6 +6,7 @@ order of events that kept wrong bytes; the move into a new folder waits for its 
 Each batch runs as the backuper runs it: collapsed, replayed, compared with what it touched.
 '''
 import contextlib
+import ctypes
 import errno
 import itertools
 import os
@@ -39,15 +40,25 @@ class Session:
 		self.lock = threading.Lock()
 		self.flag = threading.Event()
 		self.thread = None
+		# the batches a take step took (apply()), backed up before the next one
+		self.held = []
 
 	def start(self):
 		watching = threading.Event()
-		self.thread = threading.Thread(target=rv.watchFolder, kwargs=dict(monitor_path=self.job.monitor, to_process=self.queue,
+		self.thread = threading.Thread(target=self.watch, kwargs=dict(monitor_path=self.job.monitor, to_process=self.queue,
 			to_process_lock=self.lock, to_process_flag=self.flag, irm=rv.inotify_resource_manager(), min_snapshot_delay_seconds=0.15,
 			max_shapshot_delay_seconds=60, skip_list=self.skip_list, watching=watching), daemon=True)
 		self.thread.start()
 		assert watching.wait(10), 'the watcher did not start'
 		self.take()
+
+	@staticmethod
+	def watch(**kwargs):
+		'''watchFolder() as watcher() runs it: after an overflow, a new watch of the tree, which queues its full comparison.'''
+		result = rv.watchFolder(**kwargs)
+		while result == rv.WATCH_RESULT_OVERFLOW and rv.GREEN_LIGHT.is_set():
+			result = rv.watchFolder(root_returned=True, **kwargs)
+		return result
 
 	def stop(self):
 		rv.GREEN_LIGHT.clear()
@@ -89,6 +100,9 @@ class Session:
 		return run_backup(self.job, entries, touched=scopes if scopes.subtrees or scopes.paths else None, matched_since=batch.read_wall_ns, **self.options)
 
 	def back_up_next(self):
+		held, self.held = self.held, []
+		for batch in held:
+			self.back_up(batch)
 		return self.back_up(self.take())
 
 	@contextlib.contextmanager
@@ -152,6 +166,23 @@ class Session:
 				f.seek(0)
 				f.write(b'N' * 100 + data[100:])
 			os.utime(at(args[0]), ns=(stat.st_atime_ns, stat.st_mtime_ns))
+		elif verb == 'exchange':
+			# one rename that swaps two folders (renameat2 RENAME_EXCHANGE)
+			libc = ctypes.CDLL(None, use_errno=True)
+			if libc.renameat2(-100, at(args[0]).encode(), -100, at(args[1]).encode(), 2) != 0:
+				raise OSError(ctypes.get_errno(), 'renameat2')
+		elif verb == 'symlink':
+			# as ln -s target link
+			os.symlink(at(args[0]), at(args[1]))
+		elif verb == 'take':
+			# a batch taken here, as the backuper takes one, and backed up before the next ( back_up_next() ). the backuper
+			# takes one only while the watcher does not hold the queue: when it does, the caller tries again later
+			if not self.lock.acquire(blocking=False):
+				raise BlockingIOError(errno.EAGAIN, 'the watcher holds the queue')
+			try:
+				self.held.append(self.queue.take())
+			finally:
+				self.lock.release()
 		elif verb == 'touch':
 			# a new mtime, as touch gives: the file is copied under either Only Sync Attributes setting
 			stat = os.lstat(at(args[0]))
