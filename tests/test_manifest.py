@@ -966,3 +966,52 @@ def test_a_read_only_open_of_schema_2_reads_no_layout(job, v054):
 	manifest.conn.close()
 	assert rv.read_recorded_monitor_paths(job.job_vault)[0] == [(0, job.monitor)]
 	assert contents(job) == before and schema(job) == '2'
+
+
+def test_a_restores_marker_is_alerted_on_once_by_the_daemons_check_and_becomes_its_own(job, monkeypatch, boot, capsys):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	error = OSError(errno.EIO, 'Input/output error')
+	# a restore's own sync met the error: the daemon never would, as it opens a handle for each sync
+	assert rv.mark_failed_sync('/mnt/d1', error, restore=True) is True
+	assert rv.read_vault_sync_marker(rv.vault_sync_marker_path('/mnt/d1')) == {'disk': '/mnt/d1', 'boot_id': 'boot-1', 'error': str(error), 'restore': True}
+	disk_sync(monkeypatch, {'/mnt/d1': None})
+	capsys.readouterr()
+	assert rv.check_vault_sync(job.job_vault, job.job_name) == ['/mnt/d1']
+	assert capsys.readouterr().out.count(f'VAULT WRITE ERROR: disk /mnt/d1 failed a sync ({error}); its copies stay unchecked until a reboot') == 1
+	assert rv.read_vault_sync_marker(rv.vault_sync_marker_path('/mnt/d1')) == {'disk': '/mnt/d1', 'boot_id': 'boot-1', 'error': str(error)}
+	# the next check alerts no more, and the disk stays unchecked
+	assert rv.check_vault_sync(job.job_vault, job.job_name) == ['/mnt/d1']
+	assert 'VAULT WRITE ERROR' not in capsys.readouterr().out
+
+
+def test_an_error_a_sync_meets_after_a_restores_marker_alerts_as_it_does_after_the_daemons_own(job, monkeypatch, boot, capsys):
+	seed_monitor(job, {'a.txt': 'a'})
+	run_backup(job)
+	rv.mark_failed_sync('/mnt/d1', OSError(errno.EIO, 'Input/output error'), restore=True)
+	# met before the daemon read the restore's marker: the one alert is for this error, and the marker is the daemon's now
+	disk_sync(monkeypatch, {'/mnt/d1': errno.ENOSPC})
+	capsys.readouterr()
+	assert rv.check_vault_sync(job.job_vault, job.job_name) == ['/mnt/d1']
+	out = capsys.readouterr().out
+	assert out.count('VAULT WRITE ERROR') == 1 and 'No space left on device' in out and 'Input/output error' not in out
+	assert 'restore' not in rv.read_vault_sync_marker(rv.vault_sync_marker_path('/mnt/d1'))
+	# and a later one is not alerted on again, as with any marker of the daemon's
+	disk_sync(monkeypatch, {'/mnt/d1': errno.EIO})
+	assert rv.check_vault_sync(job.job_vault, job.job_name) == ['/mnt/d1']
+	assert 'VAULT WRITE ERROR' not in capsys.readouterr().out
+
+
+def test_a_restore_that_meets_an_error_again_leaves_a_marker_that_stands(job, boot):
+	assert rv.mark_failed_sync('/mnt/d1', OSError(errno.EIO, 'Input/output error'), restore=True) is True
+	assert rv.mark_failed_sync('/mnt/d1', OSError(errno.ENOSPC, 'No space left on device'), restore=True) is False
+	assert rv.read_vault_sync_marker(rv.vault_sync_marker_path('/mnt/d1'))['error'] == str(OSError(errno.EIO, 'Input/output error'))
+
+
+def test_a_markers_temp_file_is_named_for_the_process(monkeypatch, boot):
+	# a restore and the daemon never write through one temp file
+	replaced = []
+	replace = os.replace
+	monkeypatch.setattr(os, 'replace', lambda source, dest: replaced.append(source) or replace(source, dest))
+	rv.mark_failed_sync('/mnt/d1', OSError(errno.EIO, 'Input/output error'))
+	assert replaced == [os.path.join(rv.state_dir_path(), f'.{os.path.basename(rv.vault_sync_marker_path("/mnt/d1"))}.{os.getpid()}.tmp')]

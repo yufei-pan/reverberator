@@ -2036,25 +2036,27 @@ def read_vault_sync_marker(path:str) -> 'dict | None':
 	except (OSError, ValueError):
 		return None
 
-def mark_failed_sync(disk:str, error:OSError, state_dir:str = None) -> bool:
+def mark_failed_sync(disk:str, error:OSError, state_dir:str = None, restore:bool = False) -> bool:
 	'''
 	Remember that a sync of disk failed, until the next reboot: write its marker in the state folder (state_dir_path(state_dir),
-	made when missing), one
-	line of JSON holding the disk, this boot's id and the error, through a temp file renamed into place. Returns True; or
-	False, writing nothing, when a marker of this boot already stands for the disk. Raises OSError when the marker cannot
-	be written. A disk's error is reported once (the kernel's next sync gets 0), so this is the only memory of it. The caller
+	made when missing), one line of JSON holding the disk, this boot's id and the error, through a temp file (named for this
+	process, as a restore and the daemon may write at once) renamed into place. Returns True; or False, writing nothing, when a
+	marker of this boot already stands for the disk. Raises OSError when the marker cannot be written. A disk's error is
+	reported once (the kernel's next sync gets 0), so this is the only memory of it. restore: a restore writes it
+	("restore": true), a marker the daemon has not alerted on yet: it stands for the disk against another restore, but not
+	against the daemon, which writes its own over it and so has the True that has it alert (record_failed_sync()). The caller
 	holds VAULT_SYNC_MARKERS_LOCK.
 	'''
 	boot_id = current_boot_id()
 	path = vault_sync_marker_path(disk, state_dir)
 	marker = read_vault_sync_marker(path)
-	if marker is not None and marker['boot_id'] == boot_id:
+	if marker is not None and marker['boot_id'] == boot_id and (restore or not marker.get('restore')):
 		return False
 	os.makedirs(os.path.dirname(path), exist_ok=True)
-	temp_path = os.path.join(os.path.dirname(path), '.' + os.path.basename(path) + '.tmp')
+	temp_path = os.path.join(os.path.dirname(path), f'.{os.path.basename(path)}.{os.getpid()}.tmp')
 	try:
 		with open(temp_path, 'w', encoding='utf-8') as f:
-			f.write(json.dumps({'disk': disk, 'boot_id': boot_id, 'error': str(error)}) + '\n')
+			f.write(json.dumps({'disk': disk, 'boot_id': boot_id, 'error': str(error), **({'restore': True} if restore else {})}) + '\n')
 		os.replace(temp_path, path)
 	except BaseException:
 		with contextlib.suppress(OSError):
@@ -2062,15 +2064,15 @@ def mark_failed_sync(disk:str, error:OSError, state_dir:str = None) -> bool:
 		raise
 	return True
 
-def failed_sync_disks() -> set:
+def failed_sync_markers() -> dict:
 	'''
-	The disks whose marker holds this boot's id (read from the file's content, never from its name). A marker that cannot
-	be read is ignored; one of another boot is removed, errors ignored. A missing state folder gives an empty set. Raises
-	OSError when the boot id cannot be read. The caller holds VAULT_SYNC_MARKERS_LOCK.
+	{disk: its marker's content} of the markers that hold this boot's id (read from the file's content, never from its
+	name). A marker that cannot be read is ignored; one of another boot is removed, errors ignored. A missing state folder
+	gives an empty dict. Raises OSError when the boot id cannot be read. The caller holds VAULT_SYNC_MARKERS_LOCK.
 	'''
 	boot_id = current_boot_id()
 	state = state_dir_path()
-	disks = set()
+	disks = {}
 	try:
 		names = os.listdir(state)
 	except OSError:
@@ -2083,22 +2085,34 @@ def failed_sync_disks() -> set:
 		if marker is None:
 			continue
 		if marker['boot_id'] == boot_id:
-			disks.add(marker['disk'])
+			disks[marker['disk']] = marker
 		else:
 			with contextlib.suppress(OSError):
 				os.remove(path)
 	return disks
+
+def failed_sync_disks() -> set:
+	'''The disks of failed_sync_markers(). The caller holds VAULT_SYNC_MARKERS_LOCK.'''
+	return set(failed_sync_markers())
 
 def check_vault_sync(job_vault:str, job_name:str) -> list:
 	'''
 	The sync of a comparison's vault (sync_vault_filesystems()), and what it means for the copies the comparison read back:
 	the sorted disks holding job_vault that failed a sync now, or that failed one since boot (a marker of this boot) or
 	since reverberator started (UNRECORDED_FAILED_DISKS). Each disk that failed now is recorded (record_failed_sync()) before
-	any other sync of it gets its 0, so a sync that got 0 finds the error here. Any exception is the caller's failed sync.
+	any other sync of it gets its 0, so a sync that got 0 finds the error here. A marker of one of those disks that a restore
+	wrote ("restore": true: its own sync met the error, which the daemon never would) is alerted on here, once, with the
+	VAULT WRITE ERROR line as for a new marker of the daemon's, and rewritten as the daemon's own (record_failed_sync()), so
+	no other sync of that disk alerts again. Any exception is the caller's failed sync.
 	'''
 	results = sync_vault_filesystems(job_vault, job_name)
 	with VAULT_SYNC_MARKERS_LOCK:
-		known = failed_sync_disks() | UNRECORDED_FAILED_DISKS
+		markers = failed_sync_markers()
+		known = set(markers) | UNRECORDED_FAILED_DISKS
+	for disk in sorted(set(markers) & set(results)):
+		if markers[disk].get('restore'):
+			# not under the disk's lock: it is not a sync's error, and a marker the daemon wrote meanwhile is not written over
+			record_failed_sync(disk, OSError(str(markers[disk].get('error', ''))), job_name)
 	return sorted({disk for disk, error in results.items() if error is not None} | (known & set(results)))
 
 def flush_vault_disks(job_vault:str, job_name:str) -> list:
@@ -2112,9 +2126,10 @@ def flush_vault_disks(job_vault:str, job_name:str) -> list:
 
 def record_failed_sync(disk:str, error:OSError, job_name:str) -> None:
 	'''
-	The failed sync of disk marked (mark_failed_sync()) and alerted once with the VAULT WRITE ERROR line; when its marker
-	cannot be written the alert says so, and the disk is remembered in UNRECORDED_FAILED_DISKS. The caller holds the disk's
-	lock (VAULT_SYNC_LOCKS).
+	The failed sync of disk marked (mark_failed_sync()) and alerted once with the VAULT WRITE ERROR line, for a marker that
+	is new or that a restore wrote; when its marker cannot be written the alert says so, and the disk is remembered in
+	UNRECORDED_FAILED_DISKS. The caller holds the disk's lock (VAULT_SYNC_LOCKS), unless the error is one that a restore
+	recorded (check_vault_sync()).
 	'''
 	with VAULT_SYNC_MARKERS_LOCK:
 		try:
@@ -2132,14 +2147,16 @@ def record_restore_write_error(disk:str, error:OSError, vault_folders:list, stat
 	the sync of a vault's disk the daemon opens next, which then gets 0: the cross-job rule of VAULT_SYNC_LOCKS, which
 	this restore, another process, cannot take part in by a lock but only by the marker. So when disk holds a job vault
 	of vault_folders (every job of the rule file the restore read), it is recorded as the daemon records its own
-	(mark_failed_sync()), in the state folder the command uses, and the daemon's comparisons then read the copies on it as
-	unchecked until a reboot. A disk holding no vault: nothing is recorded, and nothing is its daemon's to hear. Returns
+	(mark_failed_sync(), as a restore's marker: the daemon alerts on it once, when a comparison of a job whose vault is on
+	the disk reads it, check_vault_sync()), in the state folder the command uses, and the daemon's comparisons then read the
+	copies on it as unchecked until a reboot. A disk holding no vault: nothing is recorded, and nothing is its daemon's to
+	hear. Returns
 	None, or the OSError the marker could not be written with (a restore of a user other than root cannot write in
 	/run/reverberator). A vault whose disks cannot be listed is passed over.
 	'''
 	for vault_folder in vault_folders:
 		try:
-			if any(held == disk for held, _ in vault_disks(vault_folder)[1]):
+			if any(vault_disk == disk for vault_disk, _ in vault_disks(vault_folder)[1]):
 				break
 		except OSError:
 			continue
@@ -2147,7 +2164,7 @@ def record_restore_write_error(disk:str, error:OSError, vault_folders:list, stat
 		return None
 	with VAULT_SYNC_MARKERS_LOCK:
 		try:
-			mark_failed_sync(disk, error, state_dir)
+			mark_failed_sync(disk, error, state_dir, restore=True)
 		except OSError as e:
 			return e
 	return None
@@ -15147,6 +15164,8 @@ class RestoreReport:
 		self.left_private = False
 		# the "unsynced" and the "recopy" of the marker this run leaves now (restore_entry(), accept_restore())
 		self.record = (False, None)
+		# set when a recopy was kept because a disk of the vault's pool was missing (restore_entry())
+		self.held_for_vault = False
 		# a pool's branches, and the folders on them, the user could not open to sync them, each warned of once
 		self.unsynced_folders = set()
 		# set once the folders began to be given their owners, which a stop leaves half done
@@ -15167,12 +15186,6 @@ class RestoreReport:
 		'''Why the marker this run leaves says a run again copies everything again (RESTORE_RECOPY_REASONS: 'cut' while its copies are not known to be on disk), or None.'''
 		unsynced, recopy = self.record
 		return recopy or ('cut' if unsynced else None)
-
-	def tell_daemon(self, rel:str, disk:str, error:OSError) -> None:
-		'''Record a write error of disk, met by a sync of this restore, for the daemon (record_restore_write_error()); a warning when that cannot be done.'''
-		failure = record_restore_write_error(disk, error, self.vault_folders, self.state_dir)
-		if failure is not None:
-			self.warn(rel, f'could not record the write error of disk {disk} for the daemon ({failure}): it may not learn of it, and may commit a version over copies that are not on disk')
 
 	def note(self, word:str, rel:str, reason:str) -> None:
 		'''Write the line "word rel: reason" on stderr now (say()).'''
@@ -15281,10 +15294,12 @@ class RestoreReport:
 		if self.failed > len(self.failures):
 			lines.append(f'{self.failed - len(self.failures)} more failed: shown above as they happened')
 		if self.recopy and self.marker is not None:
-			if self.vault_incomplete:
+			if self.held_for_vault:
 				lines.append(f"What {self.target} holds is not known to be on disk, and a disk of the vault's pool is missing, whose entries this run did not meet: run the same restore again once all the vault's disks are there, which copies everything again. {unfinished_note(self.target)}")
 			else:
-				lines.append(f'What {self.target} holds is not known to be on disk: run the same restore again, which copies everything again. {recopy_way_out(self.target, self.made)} {unfinished_note(self.target)}')
+				# a failed sync, or a recopy not done, keeps its own line; a disk of the pool missing is another cause that stands too
+				missing = " A disk of the vault's pool is missing, whose entries this run did not meet: run it again once all the vault's disks are there." if self.vault_incomplete else ''
+				lines.append(f'What {self.target} holds is not known to be on disk: run the same restore again, which copies everything again. {recopy_way_out(self.target, self.made)}{missing} {unfinished_note(self.target)}')
 		elif self.failed > self.final and self.marker is not None:
 			lines.append(f'{self.failed - self.final} failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {unfinished_note(self.target)}')
 		elif self.left_private:
@@ -15780,8 +15795,9 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 	open_restore_disks() opened before the first copy, and never of a path opened now, so each reports every writeback
 	error its disk met since, even one another process's sync met first. A pool's disks are synced side by side
 	(sync_each_disk()). No sync is recorded as sync_vault_filesystems() records its own, but a write error it meets on a
-	disk holding a vault of the rule file is recorded for the daemon (RestoreReport.tell_daemon()): the kernel reports an
-	error once, so the daemon's next sync of that disk would get 0, and the restore's sync is the one that took it. On a pool
+	disk holding a vault of the rule file is recorded for the daemon (record_restore_write_error()), by the disk's own
+	sync as soon as it failed: the kernel reports an error once, so the daemon's next sync of that disk would get 0, and the
+	restore's sync is the one that took it. One that cannot be recorded is a warning. On a pool
 	the pool is listed again, as a disk may have joined it since the claim (a branch added, or a disk mounted where a
 	branch's folder was): it has no handle, and one opened now would miss an error another sync of it already saw, so one
 	that holds the restore's folder now (a copy may have landed there) fails the restore, saying so; one that does not
@@ -15796,24 +15812,26 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 		return False
 
 	def sync(disk:str, handles:list):
-		# None, or (why the disk is not known to hold what was restored, the OSError of its sync: None when it could not be
-		# opened before the first copy)
+		# None, or (why the disk is not known to hold what was restored, the OSError that kept a write error of its sync from
+		# being recorded for the daemon: None when it was, or the sync did not fail)
 		if isinstance(handles[0], OSError):
 			return f'the disk {disk} could not be opened to write the restore out to it ({handles[0]}): what was restored may not be on it', None
 		try:
 			syncfs_fd(handles[0], folder)
 		except OSError as e:
+			# recorded for the daemon at once, in this disk's own thread: not once every other disk was synced, nor after any output
+			unrecorded = record_restore_write_error(disk, e, report.vault_folders, report.state_dir)
 			if after_hand_over:
-				return f"the disk {disk} reported a write error as the restore's last changes were written out to it ({e}): the files restored are on disk, but their folders' owners, modes and times and the marker's removal may not be", e
-			return f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it', e
+				return f"the disk {disk} reported a write error as the restore's last changes were written out to it ({e}): the files restored are on disk, but their folders' owners, modes and times and the marker's removal may not be", unrecorded
+			return f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it', unrecorded
 		return None
 	synced = True
 	for disk, result in sync_each_disk(disks.handles, sync).items():
 		if result is not None:
-			message, error = result
+			message, unrecorded = result
 			report.fail(rel, message, rerun=False)
-			if error is not None:
-				report.tell_daemon(rel, disk, error)
+			if unrecorded is not None:
+				report.warn(rel, f'could not record the write error of disk {disk} for the daemon ({unrecorded}): it may not learn of it, and may commit a version over copies that are not on disk')
 			synced = False
 	if disks.listed is not None:
 		try:
@@ -16101,6 +16119,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			# a disk of the vault's pool is missing: the walk never met what it holds, so "every entry copied again" is not
 			# known, and what the killed run left of those entries would be handed over as done. the recopy stays, for a run
 			# again once the vault's disks are all there
+			report.held_for_vault = True
 			report.left_private = True
 			return
 		if not recopy or report.failed == report.final:

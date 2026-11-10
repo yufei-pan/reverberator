@@ -24,7 +24,7 @@ NOT_FOLLOWED = {
 	# a look unless made to make, which names_used() finds as real_folders_to(make)
 	'real_folders_to',
 	# the markers of failed syncs (check_vault_sync()): daemon state, in the state folder
-	'mark_failed_sync', 'failed_sync_disks',
+	'mark_failed_sync', 'failed_sync_disks', 'failed_sync_markers',
 }
 
 # every function outside TreeWriter using a helper of WRITE_HELPERS, and which
