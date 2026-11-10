@@ -658,21 +658,20 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** someone needs such links kept on an XFS vault.
 - **Approved:** 2026-11-09, "Accept: leave it out, warn (Recommended)".
 
-### A restore stopped before a reboot or a remount copies everything again
+### A killed restore copies everything again
 
 - **Kind:** known limitation.
-- **What the operator sees:** a folder restore that was stopped (Ctrl-C, SIGTERM, SIGHUP) or killed before its sync, and
-  whose target's disk was then remounted, or the machine rebooted, copies everything again when it is run again, rather
-  than keeping what it had copied; `--accept` is refused (exit 2) until that run has finished and synced. The same holds
-  on a kernel before 6.8, which gives no unique mount ids: there a rerun after any stop or kill copies everything again.
-  The README's restore paragraph says so.
-- **Why:** until a sync of the target succeeds, the marker records the boot and the mounts the copies were made in. After
-  a remount nothing tells a clean unmount, which wrote everything out, from a power cut, which may have left copied files
-  empty or cut short; keeping them could end in a restore that says it is done over files that lost their bytes. The
-  cost is the time of a full copy, never wrong data. Telling the two apart would mean reading every restored file back
-  against the vault.
-- **Revisit when:** big restores often get stopped and then remounted or rebooted before the rerun.
-- **Approved:** 2026-11-09, "Accept: recopy (Recommended)".
+- **What the operator sees:** a folder restore killed (SIGKILL), crashed or cut by a power loss before its sync copies
+  everything again when it is run again, rather than keeping what it had copied, and `--accept` is refused (exit 2) until
+  that run has finished and synced. A stopped one (Ctrl-C, SIGTERM, SIGHUP) first writes what it restored out to disk,
+  saying so, and waits for the disk, which nothing cuts short; the same restore run again keeps that. The README's restore
+  paragraph says so.
+- **Why:** no run can tell afterwards whether the copies reached the disk. A writeback error is reported to a sync through
+  a newly opened handle only if no other sync of that disk met it first, and the daemon's own vault flush is one. Keeping
+  the copies could end in a restore that says it is done over files that lost their bytes. The cost is time, never wrong
+  data.
+- **Revisit when:** big restores get killed often.
+- **Approved:** 2026-11-09, "Recopy after a kill (Recommended)", with the Ctrl-C wait "Wait for the disk (Recommended)".
 
 ### mergerfs answers EBADF to a lstat during an rm
 
