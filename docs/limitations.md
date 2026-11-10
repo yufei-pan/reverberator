@@ -216,6 +216,36 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Approved:** 2026-11-09, the user's choice "Known limitation (Recommended)", then "Widen the entry (Recommended)"
   for the second way.
 
+### A copy whose start was lost after a power loss
+
+- **Kind:** known limitation.
+- **What the operator sees:** a cut after a checkpoint of the disk (another job's commit, the kernel's periodic one, a
+  sync) and before the batch's flush ends can leave a copy all NUL in the tree. The next attempt copies again every file
+  the cut batch wrote, except one under an inner mount that is paused at that attempt (not mounted yet after the reboot,
+  say): that one stays marked unchecked, and the next full comparison with the mount back reads it by size, mtime and
+  last 64 KiB. So a copy whose row did not change (an attribute change with Only Sync Attributes off) and that ends in
+  64 KiB of NUL passes and stays all NUL in the newest version. Older versions keep the right copy.
+- **Why:** the read-back hashes the tail only, and a paused mount's file cannot be copied again at the retry.
+- **Revisit when:** such a loss is seen, or a job with an inner mount turns Only Sync Attributes off and holds files that
+  end in zeros. The fix at source: the roll-forward links the previous version's record back over a recorded file it
+  cannot copy again, so a paused mount's file keeps its last committed contents.
+- **Approved:** 2026-10-27, "Known limitation (Recommended)"; 2026-11-06, the text, "Approve the text (Recommended)".
+  0.55.3 narrows it to a file under an inner mount paused at the next attempt.
+
+### A write error in the middle of a copy after the reboot
+
+- **Kind:** known limitation.
+- **What the operator sees:** a copy a cut batch placed under an inner mount that is paused at the next attempt cannot
+  be copied again then; it stays marked unchecked, and after a reboot the full comparison with the mount back reads it
+  by its size, mtime and last 64 KiB. A page lost in the middle of the file to a write error passes, and the copy stays
+  wrong until the file changes again.
+- **Why:** reading every unchecked copy whole costs a full read of each; a paused mount's file cannot be copied again at
+  the retry.
+- **Revisit when:** a vault disk keeps working after write errors, so this is met; the fix at source is the same as for
+  the entry above.
+- **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)". 0.55.3 narrows it to
+  a file under an inner mount paused at the next attempt.
+
 ### A clock set back after a read was stamped
 
 - **Kind:** known limitation.
@@ -682,7 +712,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** deferred.
 - **What the operator sees:** nothing but cost: a plain `mv` loses the file's row, so the comparison reads it back
-  (since the release after 0.55.2 with no syncfs of its own). A rename of a folder of 2,000 files read 263.3 MB for a
+  (since 0.55.3 with no syncfs of its own). A rename of a folder of 2,000 files read 263.3 MB for a
   change that wrote 0.1 MB.
 - **Why:** keeping rows, and their unchecked mark, through a move is safe by reasoning only.
 - **Revisit when:** the lightness round after 0.55.1, with a power-loss run first.
@@ -691,7 +721,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** deferred.
 - **What the operator sees:** nothing but cost: about 3.5 ms of a batch's 13 ms of CPU on 162 mounts,
-  measured with eight reads; the release after 0.55.2 takes one off (a batch's unit reads no mount table).
+  measured with eight reads; 0.55.3 takes one off (a batch's unit reads no mount table).
 - **Why:** a lightness item; the reads sit in separate steps that need one table passed between them.
 - **Revisit when:** the lightness round after 0.55.1.
 
