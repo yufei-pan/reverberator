@@ -664,8 +664,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** a folder restore killed (SIGKILL), crashed or cut by a power loss before its sync copies
   everything again when it is run again, rather than keeping what it had copied, and `--accept` is refused (exit 2) until
   that run has finished and synced. A stopped one (Ctrl-C, SIGTERM, SIGHUP) first writes what it restored out to disk,
-  saying so, and waits for the disk, which nothing cuts short; the same restore run again keeps that. The README's restore
-  paragraph says so.
+  saying so, and waits for the disk, which nothing cuts short; the same restore run again keeps that, unless it was itself
+  copying everything again, or its write-out failed. The README's restore paragraph says so.
 - **Why:** no run can tell afterwards whether the copies reached the disk. A writeback error is reported to a sync through
   a newly opened handle only if no other sync of that disk met it first, and the daemon's own vault flush is one. Keeping
   the copies could end in a restore that says it is done over files that lost their bytes. The cost is time, never wrong
@@ -751,16 +751,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** older than 0.55.2 for unreadable files; the link left out joins it. A batch whose every entry drops out should
   commit nothing.
 - **Revisit when:** the round after 0.55.2.
-
-### Failures no rerun can fix still hold a folder restore's target
-
-- **Kind:** deferred.
-- **What the operator sees:** a folder restore that meets a broken chain in the vault, a link a referenced backup holds,
-  or a regular file whose target path is too long reports it as failed, keeps the target private (0700) with its
-  marker, and offers to run the same restore again, which can never succeed; `--accept` finishes it.
-- **Why:** older than 0.55.2, which made two such failures finish or say so: a link the target cannot hold, and a write
-  error at the restore's sync (lessons, 2026-11-09).
-- **Revisit when:** the round after 0.55.2: those kinds become failures no rerun can fix.
 
 ### The root's metadata is written every batch
 
