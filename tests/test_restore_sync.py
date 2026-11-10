@@ -1358,7 +1358,8 @@ def test_a_pool_disks_write_error_is_recorded_for_the_daemon_while_the_other_dis
 	def syncfs(fd, path=None):
 		if os.fstat(fd).st_ino == one:
 			raise write_error(1)
-		# the other disk is still syncing: the failed one is on record by now, not once every disk has finished
+		# the other disk is still syncing: the failed one is on record by now, not once every disk has finished. Up to 2 s for
+		# the failed disk's thread to write its marker, a few file operations: it passed at a host load of about 280
 		for _ in range(200):
 			if os.path.exists(marker):
 				break

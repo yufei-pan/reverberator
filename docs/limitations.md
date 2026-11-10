@@ -762,7 +762,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** when another program syncs a vault's filesystem (`sync -f`, a tool that calls syncfs) and
   meets a write error first, the daemon's flush before its commit, through a handle it opens then, hears nothing: no
   VAULT WRITE ERROR, and the batch commits a version whose copies may not be on disk. A reverberator restore that can
-  write the state folder (as root does) records such an error for the daemon; other programs do not.
+  write the state folder (as root does) records such an error for the daemon; other programs do not. The daemon logs a
+  restore's record only when a comparison of a job on that disk first reads a copy back, which may come late (mostly at
+  a restart or a full comparison); its commit flushes do not read it, though the restore itself says FAILED at once.
 - **Why:** the daemon opens a new handle for each sync, and Linux reports a write error to a handle opened after it only
   while no other sync has seen it.
 - **Revisit when:** planned for the next release after 0.55.2 (the user, 2026-11-09: "Next release after 0.55.2

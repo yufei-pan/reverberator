@@ -2005,9 +2005,10 @@ VAULT_SYNC_MARKER_PREFIX = 'vault-sync-failed-'
 # disk's slow sync holds up only the syncs of that disk. {disk, as vault_disks() names it: its lock}, kept for the
 # process, as there are few disks.
 VAULT_SYNC_LOCKS = {}
-# Held while the disks' markers and UNRECORDED_FAILED_DISKS are read or written, never during a sync, and only ever taken
-# after a disk's lock: a job reading the markers removes those of another boot, and must not take one that a failed sync
-# of another disk has just rewritten.
+# Held while the disks' markers and UNRECORDED_FAILED_DISKS are read or written, never during a sync, and never held while
+# a disk's lock is taken (a failed sync records under its disk's lock, so the order is the disk's lock, then this one): a
+# job reading the markers removes those of another boot, and must not take one that a failed sync of another disk has
+# just rewritten.
 VAULT_SYNC_MARKERS_LOCK = threading.Lock()
 # the disks whose failed sync could not be recorded in a marker: remembered until reverberator stops
 UNRECORDED_FAILED_DISKS = set()
@@ -2150,8 +2151,7 @@ def record_restore_write_error(disk:str, error:OSError, vault_folders:list, stat
 	(mark_failed_sync(), as a restore's marker: the daemon alerts on it once, when a comparison of a job whose vault is on
 	the disk reads it, check_vault_sync()), in the state folder the command uses, and the daemon's comparisons then read the
 	copies on it as unchecked until a reboot. A disk holding no vault: nothing is recorded, and nothing is its daemon's to
-	hear. Returns
-	None, or the OSError the marker could not be written with (a restore of a user other than root cannot write in
+	hear. Returns None, or the OSError the marker could not be written with (a restore of a user other than root cannot write in
 	/run/reverberator). A vault whose disks cannot be listed is passed over.
 	'''
 	for vault_folder in vault_folders:
@@ -15813,7 +15813,7 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 
 	def sync(disk:str, handles:list):
 		# None, or (why the disk is not known to hold what was restored, the OSError that kept a write error of its sync from
-		# being recorded for the daemon: None when it was, or the sync did not fail)
+		# being recorded for the daemon: None when it was recorded, when the disk holds no vault, or when the sync did not fail)
 		if isinstance(handles[0], OSError):
 			return f'the disk {disk} could not be opened to write the restore out to it ({handles[0]}): what was restored may not be on it', None
 		try:
