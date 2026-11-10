@@ -996,20 +996,28 @@ def test_a_failed_sync_whose_record_cannot_be_written_leaves_the_claims_record(j
 	assert sorted(os.path.basename(source) for source in made) == ['a.txt', 'b.txt'] and whole(target)
 
 
-FINAL_KINDS = ['dangling', 'referenced', 'too_long']
+# the failures no run again can fix: RESTORE_FINAL_KINDS, and a path the target's filesystem refuses as too long (ENAMETOOLONG)
+# at each step of restoring an entry: its copy by cp, its folder, the rename of its copy into place and, as a run again
+# picking up an earlier run's output looks at what is there, a look at it
+FINAL_KINDS = ['dangling', 'referenced', 'too_long', 'folder', 'rename', 'lstat']
+# the look at what is there is made only by a run picking up an earlier run's output
+FIRST_RUN_KINDS = [kind for kind in FINAL_KINDS if kind != 'lstat']
+# a stop in the hand-over comes between two folders: a folder that cannot be made leaves the target the only one
+STOPPED_KINDS = [kind for kind in FINAL_KINDS if kind != 'folder']
 
 
 def a_final_failure(kind, job, monkeypatch):
 	'''
-	proj/sub/b.txt of V0 made an entry no run again can restore, of kind (RESTORE_FINAL_KINDS, and a regular file whose
-	path the target's filesystem refuses as too long): the pattern its FAILED line's reason matches.
+	An entry of V0 that no run again can restore, of kind (one of FINAL_KINDS): (the entry's path as its FAILED line names
+	it, the pattern the line's reason matches, the files a run that copies everything makes).
 	'''
+	refused = OSError(errno.ENAMETOOLONG, os.strerror(errno.ENAMETOOLONG))
 	if kind == 'referenced':
 		held = os.path.join(rv.list_versions(job.job_vault)[0].path, 'proj/sub/b.txt')
 		os.remove(held)
 		# a referenced backup links the vault entry to the monitored file itself
 		os.symlink(f'{job.monitor}/proj/sub/b.txt', held)
-		return re.escape('not held in the vault (referenced backup)')
+		return 'proj/sub/b.txt', re.escape('not held in the vault (referenced backup)'), ['a.txt']
 	if kind == 'dangling':
 		resolved_entry = rv.resolved_entry
 
@@ -1017,49 +1025,78 @@ def a_final_failure(kind, job, monkeypatch):
 			found = resolved_entry(job_vault, walked, monitor_path)
 			return rv.ResolvedEntry('dangling', found.path, 'V0 is missing') if walked.path.endswith('b.txt') else found
 		monkeypatch.setattr(rv, 'resolved_entry', resolving)
-		return re.escape('dangling vault link: V0 is missing')
-	copy_command = rv.copy_command
-	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['sh', '-c', 'echo "cp: cannot create regular file \'$1\': File name too long" >&2; exit 1', 'sh', dest]
-		if source.endswith('b.txt') else copy_command(source, dest))
-	return "cp: cannot create regular file '.*': File name too long"
+		return 'proj/sub/b.txt', re.escape('dangling vault link: V0 is missing'), ['a.txt']
+	if kind == 'too_long':
+		copy_command = rv.copy_command
+		monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['sh', '-c', 'echo "cp: cannot create regular file \'$1\': File name too long" >&2; exit 1', 'sh', dest]
+			if source.endswith('b.txt') else copy_command(source, dest))
+		return 'proj/sub/b.txt', "cp: cannot create regular file '.*': File name too long", ['a.txt', 'b.txt']
+	if kind == 'folder':
+		make_restore_folder = rv.make_restore_folder
+
+		def making(dest):
+			if dest.endswith('/proj/sub'):
+				raise refused
+			return make_restore_folder(dest)
+		monkeypatch.setattr(rv, 'make_restore_folder', making)
+		return 'proj/sub', re.escape(f'{refused}: nothing in it was restored'), ['a.txt']
+	if kind == 'rename':
+		replace_entry = rv.replace_entry
+
+		def replacing(temp_path, dest_path):
+			if dest_path.endswith('/proj/sub/b.txt'):
+				raise refused
+			return replace_entry(temp_path, dest_path)
+		monkeypatch.setattr(rv, 'replace_entry', replacing)
+		return 'proj/sub/b.txt', re.escape(str(refused)), ['a.txt', 'b.txt']
+	lstat = os.lstat
+
+	def looking(path, *args, **kwargs):
+		# at the restored copy, not the vault's
+		if os.fspath(path).endswith('/out/proj/sub/b.txt'):
+			raise refused
+		return lstat(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'lstat', looking)
+	return 'proj/sub/b.txt', re.escape(str(refused)), ['a.txt']
 
 
-@pytest.mark.parametrize('kind', FINAL_KINDS)
+@pytest.mark.parametrize('kind', FIRST_RUN_KINDS)
 def test_a_failure_no_run_again_fixes_does_not_hold_a_restore(job, tmp_path, capsys, monkeypatch, kind):
 	backed_up(job)
-	reason = a_final_failure(kind, job, monkeypatch)
+	rel, reason, _ = a_final_failure(kind, job, monkeypatch)
 	out = destination(tmp_path)
 	target = os.path.join(out, 'proj')
 	events = record(monkeypatch)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
 	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
-	assert len(failed) == 1 and re.fullmatch('FAILED proj/sub/b.txt: ' + reason, failed[0])
+	assert len(failed) == 1 and re.fullmatch(f'FAILED {rel}: ' + reason, failed[0])
 	# finished, naming it: the rest restored, the folders handed over, the marker gone, and no run again offered
 	assert 'hand over' in events and 'handed over' in events
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and whole(target)
 	assert not os.path.lexists(os.path.join(target, 'sub', 'b.txt'))
+	assert not [name for _, _, names in os.walk(target) for name in names if name.endswith(rv.PARTIAL_COPY_SUFFIX)]
 	assert 'run the same restore again' not in stdout + err and '--accept' not in stdout + err
 
 
 @pytest.mark.parametrize('kind', FINAL_KINDS)
 def test_a_run_again_after_a_kill_finishes_over_a_failure_no_run_again_fixes(job, tmp_path, capsys, monkeypatch, kind):
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
-	reason = a_final_failure(kind, job, monkeypatch)
+	rel, reason, copied = a_final_failure(kind, job, monkeypatch)
 	made = copies(monkeypatch)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
 	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
-	assert len(failed) == 1 and re.fullmatch('FAILED proj/sub/b.txt: ' + reason, failed[0])
-	# everything copied again (b.txt too, unless it is a chain or a link that cannot be copied at all), the one entry named, the
-	# record cleared and the restore finished: nothing left to run again
-	assert sorted(os.path.basename(source) for source in made) == (['a.txt', 'b.txt'] if kind == 'too_long' else ['a.txt']) and whole(target)
+	assert len(failed) == 1 and re.fullmatch(f'FAILED {rel}: ' + reason, failed[0])
+	# everything copied again (all that can be copied: a chain, a link or a folder that cannot be made are not), the one
+	# entry named, the record cleared and the restore finished: nothing left to run again
+	assert sorted(os.path.basename(source) for source in made) == copied and whole(target)
 	assert 'keeping' not in stdout
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
 	assert 'run the same restore again' not in stdout + err
 
 
-@pytest.mark.parametrize('kind', FINAL_KINDS)
+@pytest.mark.parametrize('kind', STOPPED_KINDS)
 def test_a_run_again_after_a_kill_over_such_a_failure_that_stops_in_its_hand_over_is_finished_by_accept(job, tmp_path, capsys, monkeypatch, kind):
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
 	a_final_failure(kind, job, monkeypatch)

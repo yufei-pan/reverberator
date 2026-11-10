@@ -7707,6 +7707,8 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 			lines = [line.strip() for line in copy.task.stderr if line.strip()]
 			error = '; '.join(lines)
 			succeeded = copy.task.returncode == 0
+			# the OSError that put the finished copy in place and failed, when one did
+			raised = None
 			temp_name = os.path.basename(copy.temp_path)
 			if not succeeded and lines and all(copy_metadata_failure(line, temp_name) for line in lines) and os.path.lexists(copy.temp_path):
 				backuperTeeLogToTl(path=copy.source_path,warning=True,message=f'Copied {copy.source_path} to {copy.dest_path} without all of its metadata: {error}')
@@ -15132,8 +15134,15 @@ class RestoreReport:
 			# nowhere to write it: the summary has the first of the failures and warnings
 			pass
 
-	def fail(self, rel:str, reason:str, rerun:bool = True) -> None:
-		'''Record that rel was not restored, and say so now. rerun False: a run again cannot fix it.'''
+	def fail(self, rel:str, reason:str, rerun:bool = True, error:OSError = None) -> None:
+		'''
+		Record that rel was not restored, and say so now. rerun False: a run again cannot fix it. error, the OSError that
+		failed a step of restoring rel when one did, says so too when it is ENAMETOOLONG, the target's filesystem refusing a
+		path as too long (its folder, the rename of its copy into place, a look at it): the same path is refused again.
+		(cp's own refusal comes as a line, copy_path_too_long().)
+		'''
+		if error is not None and error.errno == errno.ENAMETOOLONG:
+			rerun = False
 		self.failed += 1
 		if not rerun:
 			self.final += 1
@@ -15249,7 +15258,7 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 	empty pending. A copy that succeeded takes its destination's place and counts as restored, as does one for which cp
 	only reported metadata it could not keep (a warning says so); one that failed leaves no partial file and is a
 	failure saying what cp said, or for a symlink the target's filesystem refuses as too long (link_too_long()) a
-	failure saying so that no run again fixes; a regular file whose path it refuses is one too, with what cp said. The report's target itself, a restored file or symlink in a folder anyone may write
+	failure saying so that no run again fixes; a regular file whose path it refuses (cp's line, or the rename into place failing with ENAMETOOLONG) is one too, with what it said. The report's target itself, a restored file or symlink in a folder anyone may write
 	in, never replaces what appeared there meanwhile (place_new_entry()); what is inside a folder target, which only
 	this restore can write in, takes its destination's place.
 	'''
@@ -15260,6 +15269,8 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 			lines = [line.strip() for line in copy.task.stderr if line.strip()]
 			error = '; '.join(lines)
 			succeeded = copy.task.returncode == 0
+			# the OSError that put the finished copy in place and failed, when one did
+			raised = None
 			temp_name = os.path.basename(copy.temp_path)
 			if not succeeded and lines and all(copy_metadata_failure(line, temp_name) for line in lines) and os.path.lexists(copy.temp_path):
 				report.warn(rel, f'copied without all of its metadata: {error}')
@@ -15276,7 +15287,7 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 				except FileExistsError:
 					succeeded, error = False, f'{copy.dest_path} appeared while restoring; left untouched'
 				except OSError as e:
-					succeeded, error = False, str(e)
+					succeeded, error, raised = False, str(e), e
 			if succeeded:
 				report.restored += 1
 				try:
@@ -15292,7 +15303,7 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 				report.fail(rel, "not restored: the target's filesystem cannot hold a link that long (its text or its path)", rerun=False)
 			else:
 				# a regular file's path the target's filesystem refuses as too long is refused again by a run again
-				report.fail(rel, error or f'cp exited with {copy.task.returncode}', rerun=not (copy.task.returncode != 0 and copy_path_too_long(copy.temp_path, lines)))
+				report.fail(rel, error or f'cp exited with {copy.task.returncode}', rerun=not (copy.task.returncode != 0 and copy_path_too_long(copy.temp_path, lines)), error=raised)
 				discard_copies([copy])
 			done += 1
 	finally:
@@ -15778,9 +15789,10 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	A dangling chain, a link to the live file of a referenced backup, an entry that cannot be read, a failed copy or an
 	OSError is a failure of that entry alone; so is a folder whose place holds a symlink, something else or another
 	user's folder, which is left as it is and never written through: nothing in it is restored. A dangling chain, a link
-	to the live file of a referenced backup, and a file or link whose path the target's filesystem refuses as too long are
-	failures no run again can fix (RESTORE_FINAL_KINDS, finish_restore_copies()): they hold nothing back, and the restore
-	goes on to its end without them, naming them. With resume, an entry
+	to the live file of a referenced backup, and an entry whose path the target's filesystem refuses as too long (at
+	any step: its folder made, its copy by cp, the rename of it into place, a look at it on resume: ENAMETOOLONG, see
+	RestoreReport.fail()) are failures no run again can fix (RESTORE_FINAL_KINDS): they hold nothing back, and the
+	restore goes on to its end without them, naming them. With resume, an entry
 	already there as restoring it leaves it (already_restored()) is kept, anything else in its place is replaced by a
 	copy, and partial files a killed run left are removed. With marked, the folder target was found holding this
 	restore's marker: it is read again once the target is locked, and a CommandError when it has gone meanwhile; the
@@ -15902,7 +15914,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			try:
 				restore_one(resolved, rel, target)
 			except OSError as e:
-				report.fail(rel, str(e))
+				report.fail(rel, str(e), error=e)
 		else:
 			# private until it is complete: nobody else can look in, nor put anything in for the copies to write through;
 			# and this run's alone
@@ -15924,7 +15936,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 					recopy = marker_recopy(marker)
 				lock = claim_restore_target(target, look_again if marked else None)
 			except OSError as e:
-				report.fail(rel, str(e))
+				report.fail(rel, str(e), error=e)
 				return
 			disks = open_restore_disks(target, lock, report, rel)
 			report.restored += 1
@@ -15949,12 +15961,13 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 						report.warn(entry_rel, 'not restored: it is the marker of a restore under way when this version was taken')
 						refused.add(entry_rel)
 					elif walked.kind == 'folder':
+						raised = None
 						try:
 							reason = make_restore_folder(dest)
 						except OSError as e:
-							reason = str(e)
+							reason, raised = str(e), e
 						if reason is not None:
-							report.fail(entry_rel, f'{reason}: nothing in it was restored')
+							report.fail(entry_rel, f'{reason}: nothing in it was restored', error=raised)
 							refused.add(entry_rel)
 						else:
 							if resume:
@@ -15985,7 +15998,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 							earlier.pop(entry_rel, None)
 							restore_one(entry, entry_rel, dest)
 				except OSError as e:
-					report.fail(entry_rel, str(e))
+					report.fail(entry_rel, str(e), error=e)
 				check_stop()
 				if len(pending) >= RESTORE_COPY_BATCH:
 					finish_batch()
