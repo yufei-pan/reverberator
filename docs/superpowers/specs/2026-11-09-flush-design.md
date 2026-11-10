@@ -13,6 +13,10 @@ Their pick, 2026-11-09, "Next release after 0.55.2 (Recommended)". The question 
 
 Still standing, for 0.55.2's restore: "Recopy after a kill (Recommended)": "… never wrong data."
 
+Their picks on this spec's two questions, 2026-11-09:
+- On the leftovers of a cut batch (section 4): "Copy again, marker goes (Recommended)". The option said: "A batch never commits past a failed sync of its own; a comparison's failed sync now fails the attempt too, then it retries. After a cut, the next attempt copies the cut batch's files again instead of reading 64 KiB of each back. Every copy a version commits is then written while its own handles were open. The cross-job markers, their locks and the restore's report to the daemon all go: less code. It closes the deferred entry and four limitations. Cost only after a cut or a write error." So the round builds option 1 (tasks 3 and 4), and the approved limitation "A comparison's failed sync does not fail the attempt" goes with the user's pick.
+- On a copy made where the vault refused a hard link (section 10, question 2): "Known limitation (Recommended)". The entry: what the operator sees (an older version's file can hold lost bytes with no alert, only where the vault refused a hard link and another program synced the disk at the wrong moment), why (no other copy of those bytes exists), and revisit if the vault ever shows refused hard links. The question told the user the main session had not checked whether their mergerfs pool ever refuses a hard link; the build checks it (section 9).
+
 ## Why
 
 - **The kernel's rule.** Linux keeps a filesystem's writeback errors in `sb->s_wb_err`.
@@ -264,6 +268,8 @@ A stand-in that flushes a scratch image by path finds the path from the fd (/pro
 
 ## 9. Left to the builder
 
+- Check whether a hard link on a mergerfs pool vault can be refused (EXDEV across branches under the pool's link and create policies, as the live pool sets them), and say what the record does then; the known limitation's text names the case.
+
 - Names, and the unit's form: a context manager, a registry, or both.
 - Whether to share `open_restore_disks()`'s core.
 - The exact point of each open, before its function's first write.
@@ -273,7 +279,7 @@ A stand-in that flushes a scratch image by path finds the path from the fd (/pro
   - whether their read-back goes, since it costs 64 KiB each before the copy;
   - the alert line's words.
 
-## 10. Questions for the user
+## 10. Questions for the user (answered 2026-11-09: option 1, and a known limitation; see The user's words)
 
 1. **The leftovers of a cut batch** (section 4). The options, recommended first:
    1. "Copy again, and the marker goes (Recommended)"
