@@ -206,7 +206,8 @@ def pytest_configure(config):
 	config.addinivalue_line('markers', 'on_054: this test is of a vault on 0.54: run_backup() and the vaults it writes are the 0.54 daemon\'s (tests/legacy054.py)')
 	# every process of the suite runs with the open file limit the daemon gives itself at start (soft raised to hard), so no
 	# test depends on whether an earlier one in its worker built the daemon's limits: a 1,500 folder deep tree's rmtree
-	# holds an fd per level, over the 1,024 a login shell starts with (2026-11-09, VM gate, EMFILE)
+	# holds an fd per level, over the 1,024 a login shell starts with (2026-11-09, VM gate, EMFILE). The commands (status,
+	# history, restore) raise no limit of their own: out of the suite they run with the one they are started with
 	soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 	if soft < hard:
 		resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
