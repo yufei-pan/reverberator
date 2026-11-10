@@ -57,8 +57,8 @@ def past_inline(tag: str) -> str:
 def seed_base(monitor: str) -> None:
 	files = {'a/x.txt': 'ax0', 'a/sub/m.txt': 'm0', 'a/sub/deep/k.txt': 'k0', 'b/y.txt': 'y0', 'b/w.txt': 'w0', 'c/z.txt': 'z0',
 		'c/keep.txt': 'keep0', 'd/g': 'g0', 'd/h': 'h0', 's1/one.txt': 's1', 's2/two.txt': 's2',
-		# past the inline size, as batch 3's swap of these two is the verification's to fix: their copies come after its comparison's sync, so
-		# only the commit's flush puts them on the disk, and a cut past the end shows a commit that did not
+		# past the inline size, as batch 3's swap of these two is the verification's to fix: the verification copies them after the replay, so
+		# only the commit's flush puts them on the disk (no comparison syncs), and a cut past the end shows a commit that did not
 		'f1.txt': past_inline('F1'), 'f2.txt': past_inline('F2'), 'q.txt': 'q0', 'r.txt': 'r0', 'rr/inside.txt': 'rr0', 'chain1.txt': 'c0', 'top.txt': 't0',
 		'g/h/i/j.txt': 'j0', 'g/h/i/gone.txt': 'gone0', 'g/h/other.txt': 'o0', 'g/top.txt': 'gt0',
 		'w/old.txt': 'o0', f'w/x{UNREADABLE}': 'b0', 'w/sub/s.txt': 's0', 'attrs.txt': 'attrs0', 'owned.txt': 'owned0',

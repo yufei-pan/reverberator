@@ -149,14 +149,6 @@ def test_the_real_sync_succeeds_on_the_test_filesystem(monkeypatch):
 				REAL_SYNC_VAULT_FILESYSTEMS(gone, 'job')
 
 
-def test_copies_a_backup_wrote_stay_unchecked_without_any_patch(job):
-	seed_monitor(job, {'a.txt': 'hello'})
-	v0 = run_backup(job)[0]
-	assert rv.read_copied_record(v0, 'a.txt').unchecked == 1
-	# read back from a committed version, a copy is checked, as the vault sync of the comparison stands behind it
-	assert rv.read_vault_record(v0, 'a.txt').unchecked == 0
-
-
 def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
 	# a crash mid copy can leave the size and mtime in place over space whose bytes never reached the disk
 	seed_monitor(job, {'a.txt': 'hello'})

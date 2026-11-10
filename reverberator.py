@@ -1939,8 +1939,7 @@ def sync_each_disk(disks:list, sync) -> dict:
 	'''
 	sync(disk, folders) for each disk of disks, (disk, folder) pairs, with folders the disk's folders in their order
 	(branches that are folders of one filesystem share its one sync): side by side, each disk on a thread of its own when
-	there are several, as a pool's disks write out side by side. Returns {disk: what sync returned}, in the disks' order,
-	leaving out the disks for which it returned ... .
+	there are several, as a pool's disks write out side by side. Returns {disk: what sync returned}, in the disks' order.
 	'''
 	folders = {}
 	for disk, folder in disks:
@@ -1951,7 +1950,7 @@ def sync_each_disk(disks:list, sync) -> dict:
 			synced = list(pool.map(run, folders))
 	else:
 		synced = [run(disk) for disk in folders]
-	return {disk: result for disk, result in synced if result is not ...}
+	return dict(synced)
 
 # the units of vault work open now (VaultUnit), each by the thread that opened it and its job vault: {(thread id,
 # vault_unit_key()): VaultUnit}. A unit is opened, synced and closed on one thread, and each job's backuper runs on a
@@ -2125,7 +2124,7 @@ def flush_vault_disks(job_vault:str, job_name:str) -> list:
 	old state, and a commit before it says its copies are there: the sorted disks whose sync failed, each alerted. Raises
 	OSError and RuntimeError as sync_vault_filesystems() does.
 	'''
-	return sorted(disk for disk, error in sync_vault_filesystems(job_vault, job_name).items() if error is not None)
+	return sorted(sync_vault_filesystems(job_vault, job_name))
 
 # the private folder prepare_change_list() writes a change list in before place_change_list() renames it into place: made
 # by mkdtemp() in the job vault, which no reader takes for a version or a change list, and removed by get_vault_info()
