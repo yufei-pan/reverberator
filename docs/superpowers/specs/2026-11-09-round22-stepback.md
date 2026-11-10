@@ -213,7 +213,7 @@ All live in `watchFolder()` for one watch's life; an overflow's restart starts t
 |---|---|---|
 | `wdDic` (wd → path) | as 0.55.1 | each path is where the events read so far put the folder, except while the watch is guarded. Only `move_watches()` at an unguarded pairing, the settle (on an empty queue) and removals change a held watch's path; a walk writes only the path of a watch it adds |
 | `cookieDic` (cookie → `COOKIE_VALUE(wd, path, isDir, wds)`) | as 0.55.1: a move-out waiting for its pair; `wds`, the watches mapped at or under its path when its `MOVED_FROM` was read | a cookie holds its `wds` in `outgoing` from its `MOVED_FROM` until it lets them go, once |
-| `newDirWDs` (set) | as 0.55.1: the watches of folders made since the last take, whose events are discarded (the batch's copy holds them) | every watch mapped at or under a folder of `newDirWDs` is in `newDirWDs` or in `found` (one exception, section 4): the MOVE_SELF rule's domain (3.3) |
+| `newDirWDs` (set) | as 0.55.1: the watches of folders made since the last take, whose events are discarded (the batch's copy holds them) | a watch whose folder can leave a new folder by a move read on the new folder's watch is in `newDirWDs` or `found` (or `new_before_take`, section 4): the MOVE_SELF rule's domain (3.3), which the rules below keep. It is not every watch under its folders (review 1's probe found some in neither set), and nothing looks only there for what a path holds |
 | `found` (wd → path) | a held watch a walk met at another path than its own, with the path the walk saw, and the take count the watcher knew at that read (3.4) | the watch is guarded until the next settle, which clears it |
 | `outgoing` (wd → count) | for each watch, how many cookies hold it | the count is the number of cookies still holding the watch; the entry goes at zero |
 | `leaving` (set) | the watches of a folder that left the tree or its place: an expired or evicted move-out's `wds`; a move into a skipped folder's; the watches under a folder moved out of a new folder whose own watch failed (it is in `unwatched`); and the watches at or under the path of a found or doubtful watch whose folder moved on (3.4) | each is probed at the next settle, and removed if its folder is not at its path |
@@ -253,9 +253,16 @@ until n2's own move-out lets it go, so that rename is a delete and a create.
 **What `newDirWDs` must keep true** (ruling 3, then the cost pass). A folder move-out read in a new folder keeps no
 cookie, because the new folder's copy holds what the folder was. The moved folder's own watch tells the move
 (`IN_MOVE_SELF`, fact H). The MOVE_SELF rule (3.3) acts on that event only for a watch in `newDirWDs` or `found`. So
-every watch that can be mapped under a new folder must be in one of the two sets. Otherwise its move goes unseen, and
-the watch stays mapped in the tree (stale) after its folder has left. The review's version, a look by path among the
-two sets at the `MOVED_FROM`, rested on the same line in the table.
+every watch whose folder can leave a new folder that way must be in one of the two sets. Otherwise its move goes
+unseen, and the watch stays mapped in the tree (stale) after its folder has left. The review's version, a look by path
+among the two sets at the `MOVED_FROM`, rested on the same line in the table.
+
+The line is about the rule's events, not about what a path holds. Review 1's probe of fix round 1 found watches mapped
+under a folder of `newDirWDs` in neither set, in 12 of 558 settles, all of `back_then_sub_out` (`mkdir n; mv big
+n/big; mv n/big big; mv big/sub /out/sub`): every folder that moved on had its watch in `newDirWDs`, and the watches
+of big/sub and big/sub/deep were in neither set. They were in `leaving` from big's first move-out, so the settle
+probed them anyway. So no look for the watches under a path searches these sets alone: the settle's pass over the
+paths that left, and the look for a moved folder with no watch of its own, pass over the map (3.4).
 
 Three rules keep it; the design pass had none of them, as its scan looked at every watch. Each rule is shown needed by
 a shape that fails without it: the rule taken out alone, the release-once rule kept in, and the watch map checked both
@@ -387,17 +394,17 @@ and `FIONREAD` is 0. Then, each step by probe (fact C: `add_watch` with the watc
    before it got there, and the MOVE_SELF rule marks only the moved folder's own watch. A watch still at its path stays.
    This pass is the build's fix for the hole it reported as finding A, for found watches; the cost pass runs it after
    step 2, for doubtful watches too.
-   - **Where it looks** (review 1). If every watch whose folder moved on is in `newDirWDs`, it looks only among
-     `newDirWDs` and the found watches of the settle's start. What a path of `newDirWDs` holds is there, by the rules
-     that keep `newDirWDs` (3.2), and the MOVE_SELF rule's folder moved out of a new folder is this case. Otherwise it
-     makes one pass over `wdDic`, a prefix test for each path.
+   - **Where it looks:** one pass over `wdDic`, a prefix test for each path against the paths that left (with or
+     without the trailing slash). No set holds every watch under a path (3.2), and an inner mount's watches are in
+     none of them (section 4).
    - **Why not a view by parent.** The map keeps no parent-to-children view, which would be state for each watch at
      rest, and the watch tree of round 22's first design.
-   - **The cost** is proportional to the folders made since the last take, where a pass over the map was proportional
-     to every watch. 300 times `mkdir -p new/d/s; mv new/d /out/` cost 3.3 to 3.4 s on the cost pass's code, against
-     0.04 s on 0.55.1 (section 7). Each pass walked up every path's parents.
-   - **The exception** is an inner mount followed in a new folder (section 4). Its watches are not in `newDirWDs`, so
-     they stay mapped in the tree when a folder holding it is moved out of the tree from the new folder, as on 0.55.1.
+   - **The cost** (review 1). The cost pass's code walked up each path's parents: 300 times `mkdir -p new/d/s; mv new/d
+     /out/` (`outofnew`) cost 3.3 to 3.4 s, against 0.04 s on 0.55.1 (section 7). The prefix test brings it to about
+     0.2 s, some 0.7 ms for each such move-out on a map of 20,000 watches, in proportion to the map. Fix round 1 narrowed
+     the pass to `newDirWDs` and the found watches when every folder that moved on was in `newDirWDs` (0.04 to 0.07 s),
+     on the line that what a path of `newDirWDs` holds is there. Review 1's probe of it found that line false (12 of
+     558 settles, 3.2) and the inner-mount route open again, so the fix round 2 ruling took the plain pass and its cost.
 3. **`leaving`:** each watch the probe finds not here is removed (`remove_watches()`); one it could not look for stays
    for the next settle; one still in `found` or `doubtful` waits for its walk's place, or a path it holds or held, to be
    probed (review 1: step 3 had probed a kept doubtful watch at its own path, found nothing and removed a live folder's
@@ -561,11 +568,15 @@ What the step back leaves, reasoned, not run, each with its bucket:
 - **A queue that never empties:** limitation 2 (section 6). The settle runs after the read that ends each burst, so a
   batch taken after a quiet period always follows it; only a batch taken while events keep coming (the maximum
   delay's) can come first. Fact F says the queue empties within milliseconds even at 108,000 events a second.
-- **An inner mount followed inside a folder made since the last take** is the exception to `newDirWDs`'s line: its walk
-  keeps the mount's events, so its watches are not in `newDirWDs`, and a move out of the tree, read on the new folder's
-  watch, of a folder holding the mount point leaves the mount's watches mapped in the tree. It needs a disk mounted below
-  a folder made in the same batch, and a folder inside the new one and above the mount point moved out of the tree in
-  that batch; 0.55.1 is the same. Proposed: not an issue.
+- **An inner mount followed inside a folder made since the last take: closed** since the cost pass (d99ef70; review
+  1 read it at 3e87c9c), and kept closed by the settle's full pass over the map. Its walk keeps the mount's events, so
+  its watches are not in `newDirWDs`. The route: a move out of the tree, read on the new folder's watch, of a folder
+  holding the mount point. It needs a disk mounted below a folder made in the same batch, and a folder inside the new
+  one and above the mount point moved out of the tree in that batch. The moved folder's watch is in `newDirWDs`, so the
+  MOVE_SELF rule makes it doubtful; the settle does not find it at its path, so that path left, and the pass over the
+  map sends the mount's watches under it to `leaving`, where each is probed at its own path and removed. Fix round 1's
+  narrowed pass, among `newDirWDs` and the found watches only, missed them, and the route was open again until fix
+  round 2. Shown by argument: a mount needs root, which this round's gates do not run.
 - **A folder the settle puts in place, which leaves the new folder before the settle's walk of it: closed** (review
   1). The settle's own run was a window.
   - Step 1 or 2 put the watch at its place, and only step 5's walk put it into `newDirWDs` (rule 2).
@@ -781,14 +792,15 @@ alternating, three runs each, at a lower host load than the table above, so the 
   the cost pass's ruling 5 asked for numbers, not code. Review 1 cut it (below).
 
 **Review 1** (fix round 1: the pass over the paths that left narrowed to `newDirWDs` and the found watches when it can
-be, and one realpath for each parent in a settle; 0.55.1 against 396580b, alternating). `outofnew` is review 1's
+be, and one realpath for each parent in a settle; 0.55.1 against 396580b, alternating; fix round 2 put the plain
+pass over the map back, below). `outofnew` is review 1's
 workload: 300 times `mkdir -p new_i/d/s; mv new_i/d /out/`, each in its own reads, a take every 30.
 
 | Workload | Runs | 0.55.1 | Branch |
 |---|---|---|---|
 | `outofnew` on the cost pass's code (3e87c9c), a pass over the map with a walk up each path's parents | 3 | 0.038 to 0.044 s | 3.26 to 3.42 s |
-| `outofnew`, the map pass as a prefix test alone (not built) | 3 | 0.037 to 0.047 s | 0.191 to 0.220 s |
-| `outofnew` | 3 / 6 | 0.039 to 0.043 / 0.032 to 0.049 s | 0.055 to 0.057 / 0.044 to 0.068 s |
+| `outofnew`, the map pass as a prefix test alone (fix round 1's tree) | 3 | 0.037 to 0.047 s | 0.191 to 0.220 s |
+| `outofnew`, the narrowed pass (396580b, gone in fix round 2) | 3 / 6 | 0.039 to 0.043 / 0.032 to 0.049 s | 0.055 to 0.057 / 0.044 to 0.068 s |
 | `outofnew` at 3,000 times, the narrowed pass | 3 | 0.385 to 0.426 s | 0.365 to 0.513 s |
 | move-outs (300 folders of 10 subfolders out and back) | 3 / 6 | 0.621 to 0.659 / 0.586 to 0.633 s | 0.633 to 0.646 / 0.580 to 0.644 s |
 | moves into new folders | 3 / 6 | 0.511 to 0.524 / 0.504 to 0.548 s | 0.546 to 0.567 / 0.536 to 0.563 s |
@@ -1050,8 +1062,8 @@ Each ruling that was the main session's, each call this spec made on its own, an
 13. **Settled:** the first walk keeps no `found` (not an issue); `raise_queue_limit_for_removals()` goes. Open: the
     settle's removal cap of half the instance's queue limit (this spec's number, 3.4); the two passes over every watch
     at a folder move stay.
-14. **Settled:** the fact-E races are not an issue. Open: an inner mount in a folder made since the last take
-    (section 4), proposed not an issue; 0.55.1 is the same.
+14. **Settled:** the fact-E races are not an issue. An inner mount in a folder made since the last take (section 4)
+    is closed by the settle's pass over the map (since the cost pass; fix round 2 keeps it), shown by argument only.
 15. **Tests changed for the prototype** (the design pass's call): the session restarts the watch after an overflow, as
     `watcher()` does; the session knows `exchange`; `tests/harness.py` gains `watch_map_errors()`; v16's 56-shape
     schedule file runs on 0.55.1's walk hooks, without its two `WatchTree` asserts. This spec adds the `symlink` and
@@ -1090,7 +1102,10 @@ Each ruling that was the main session's, each call this spec made on its own, an
     - Step 3 leaves a doubtful watch that step 2 kept.
     - The settle puts each watch it places into `newDirWDs` at the placement.
     - One realpath for each parent in a settle.
-    - The pass over the paths that left looks among `newDirWDs` and the found watches when every folder that moved on was
-      in `newDirWDs`, and otherwise makes one prefix pass over the map. This is the fix round's call, where the ruling
-      offered the review's prefix pass. It leans a second time on the rules that keep `newDirWDs`. An inner mount
-      followed in a new folder keeps its exception (section 4).
+    - The pass over the paths that left is one prefix pass over the map (fix round 2's ruling, the reviewer's option
+      a). Fix round 1 had narrowed it to `newDirWDs` and the found watches; review 1's probe found that premise false
+      and the inner-mount route open again (sections 3.2, 3.4 and 4). `outofnew` costs about 0.2 s on the branch
+      against 0.04 s on 0.55.1, some 0.7 ms for each move-out of a folder from a new folder (section 7): accepted by
+      the ruling.
+    - The look for a moved folder with no watch of its own (`leave_moved_out()`, a folder in `unwatched`) is one pass
+      over the map too, as it had leaned on the same premise (fix round 2's call; the case is rare).

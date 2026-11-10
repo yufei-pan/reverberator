@@ -2997,14 +2997,12 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	def leave_moved_out(path:str):
 		# the watches at or under path, a folder moved out of a folder made since the last take with no watch of its own, go
 		# once the queue is empty, but for those a walk finds in the tree by then. the move-out is in the events' view, so
-		# each the events hold is mapped at or under its path and is in newDirWDs or found (the rules that keep newDirWDs)
-		path_norm = path.rstrip('/')
-		prefix = path_norm + '/'
-		for wds in (newDirWDs, notes.found):
-			for wd in wds:
-				wd_path = wdDic.get(wd)
-				if wd_path is not None and (wd_path.rstrip('/') == path_norm or wd_path.startswith(prefix)):
-					notes.leaving.add(wd)
+		# each the events hold is mapped at or under its path; no set names them all, so it is one pass over the map
+		path_norm = path.rstrip('/') or '/'
+		prefix = path_norm + '/' if path_norm != '/' else '/'
+		for wd, wd_path in wdDic.items():
+			if wd_path == path_norm or wd_path.startswith(prefix):
+				notes.leaving.add(wd)
 	def stamp_found():
 		# the take count this read knew, for each watch a walk of it found: settle() copies its folder only after a take
 		if len(notes.found_takes) != len(notes.found):
@@ -3070,11 +3068,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			return
 		strays = set()
 		reals = {}
-		# the found watches before step 1 settles them, and whether every watch whose folder moved on is in newDirWDs: what
-		# a path of newDirWDs holds is then in newDirWDs or found (the rules that keep newDirWDs), and the pass over the
-		# paths that left looks there only, not at the whole map
-		found_at_start = tuple(notes.found)
-		all_new = True
 		def probe(path:str):
 			return probe_at(path, strays, reals)
 		# the folders whose watch is put in place here, each with whether the batch needs a copy of it
@@ -3104,7 +3097,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				placed.append((place.rstrip('/'), notes.found_takes.get(wd, seen_takes) != takes))
 			else:
 				moved_on.add(path.rstrip('/') or '/')
-				all_new = all_new and wd in newDirWDs
 		notes.found_takes = {wd: notes.found_takes.get(wd, seen_takes) for wd in kept}
 		notes.found.clear()
 		notes.found.update(kept)
@@ -3140,18 +3132,15 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				else:
 					# its folder left the tree, or a place no walk has reached yet
 					moved_on.add(path.rstrip('/') or '/')
-					all_new = all_new and wd in newDirWDs
 			notes.doubtful.clear()
 			notes.doubtful.update(kept)
 		if moved_on:
-			# the watches at or under those paths leave, but for those at their paths: among newDirWDs and found when each
-			# folder that moved on was in newDirWDs (the MOVE_SELF rule's, a folder moved out of a new folder), else one
-			# pass over the map, which keeps no parent to children view (no state per watch at rest). a path is at a top
-			# with or without its trailing slash
+			# one pass over the map: the watches at or under those paths leave, but for those at their paths. no set names
+			# them all (the map keeps no parent to children view, which would be state for each watch at rest). a path is at
+			# a top with or without its trailing slash
 			tops = tuple(top + '/' if top != '/' else '/' for top in moved_on)
-			for wd in (itertools.chain(newDirWDs, found_at_start) if all_new else wdDic):
-				path = wdDic.get(wd)
-				if path is not None and (path in moved_on or path.startswith(tops)):
+			for wd, path in wdDic.items():
+				if path in moved_on or path.startswith(tops):
 					notes.leaving.add(wd)
 		# 3. leaving: each one not at its path goes, at most half the queue's limit at a time, as each removal queues an
 		# IN_IGNORED: the other half is for the tree's events until the next read takes them
@@ -3355,7 +3344,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# this watch's folder was renamed, as the kernel tells its own watch after the rename's MOVED_FROM and
 						# MOVED_TO. a move the events follow put the watch where it went (a pair) or holds it (a move-out, until
 						# it pairs or expires); but a move read in a folder made since the last take keeps no cookie, and leaves
-						# the watch, in newDirWDs or found by the rules that keep newDirWDs, at its old path: unless a probe finds
+						# the watch (in newDirWDs or found, as the rules that keep newDirWDs aim to have it) at its old path: unless a probe finds
 						# it there, settle() looks for it ( its step 2; a found one that step 1 puts in place is settled there ).
 						# a read can end between the move-out and it, and a take come between them: the watch is then in
 						# new_before_take
