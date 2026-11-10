@@ -425,3 +425,62 @@ def test_a_probe_that_cannot_look_leaves_the_watch_flagged(session, job, tmp_pat
 	one.back_up_next()
 	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
 	assert not wrong(job) and not stale and not missing, (wrong(job), stale, missing)
+
+
+def test_the_kernel_tells_a_renamed_folder_its_move(tmp_path):
+	'''
+	What the watcher's MOVE_SELF rule rests on: a rename of a folder with a watch of its own is reported to that watch
+	(IN_MOVE_SELF) after the rename's MOVED_FROM and MOVED_TO, out of the watched tree too; a folder with no watch of its own,
+	or a watched subfolder of the moved one, gets none.
+	'''
+	flags = rv.inotify_simple.flags
+	mask = flags.MOVED_FROM | flags.MOVED_TO | flags.MOVE_SELF | flags.CREATE
+	tree, outside = tmp_path / 'tree', tmp_path / 'outside'
+	outside.mkdir()
+	def renamed(watched, to):
+		shutil.rmtree(tree, ignore_errors=True)
+		os.makedirs(tree / 'd' / 's')
+		with rv.inotify_simple.INotify() as inotify:
+			names = {inotify.add_watch(str(tree), mask): 'tree'}
+			for rel in watched:
+				names[inotify.add_watch(str(tree / rel), mask)] = rel
+			os.rename(tree / 'd', to)
+			shutil.rmtree(to)
+			kinds = {flags.MOVED_FROM: 'from', flags.MOVED_TO: 'to', flags.MOVE_SELF: 'self'}
+			return [(names[event.wd], next(name for flag, name in kinds.items() if event.mask & flag)) for event in inotify.read(timeout=1000) if event.mask & (flags.MOVED_FROM | flags.MOVED_TO | flags.MOVE_SELF)]
+	assert renamed(['d', 'd/s'], tree / 'e') == [('tree', 'from'), ('tree', 'to'), ('d', 'self')]
+	assert renamed(['d'], outside / 'e') == [('tree', 'from'), ('d', 'self')]
+	assert renamed([], tree / 'e') == [('tree', 'from'), ('tree', 'to')]
+	assert renamed(['d/s'], tree / 'e') == [('tree', 'from'), ('tree', 'to')]
+
+
+@pytest.mark.parametrize('run', range(3))
+@pytest.mark.parametrize('watched', [True, False], ids=['watched', 'never_watched'])
+def test_a_folder_renamed_twice_out_of_a_new_folder_leaves_no_watch(session, job, tmp_path, monkeypatch, watched, run):
+	'''
+	A folder made in a new folder, renamed in it and then out of the tree in one read, and another made at its first name: the
+	discarded move-out keeps no cookie, and the move-in's walk finds the folder gone, so only its IN_MOVE_SELF tells the watch
+	that left with it (a folder that never had one, its create read with its renames, tells nothing and needs nothing).
+	'''
+	maps = latest_map(monkeypatch)
+	one = session({'other/o': 'o'})
+	m = job.monitor
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	one.run([('mkdir', 'n')], 'apart')
+	if watched:
+		one.run([('mkdir', 'n/d/s')], 'apart')
+		one.settle()
+		assert any(held.rstrip('/') == f'{m}/n/d/s' for held in maps[-1][1].values())
+	with one.unread():
+		if not watched:
+			os.makedirs(f'{m}/n/d/s')
+		os.rename(f'{m}/n/d', f'{m}/n/e')
+		os.rename(f'{m}/n/e', outside / 'e')
+		os.makedirs(f'{m}/n/d/s')
+	one.back_up_next()
+	open(outside / 'e' / 's' / 'w', 'w').write('w')
+	one.apply(('write', 'n/d/s/f', 'f'))
+	one.back_up_next()
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	assert not wrong(job) and not stale and not missing, (wrong(job), stale, missing)
