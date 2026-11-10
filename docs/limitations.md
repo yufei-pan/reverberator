@@ -765,8 +765,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   such an error for the daemon; other programs do not.
 - **Why:** the daemon opens a new handle for each sync, and Linux reports a write error to a handle opened after it only
   while no other sync has seen it.
-- **Revisit when:** the next round that touches the commit flush: each batch opens its vault disks' handles before its
-  first copy and syncs through them, as a restore does (the pool cut and power-loss gates apply).
+- **Revisit when:** planned for the next release after 0.55.2 (the user, 2026-11-09: "Next release after 0.55.2
+  (Recommended)"): each batch opens its vault disks' handles before its first copy and syncs through them, as a
+  restore does, with the pool cut and power-loss gates.
 
 ### The root's metadata is written every batch
 
