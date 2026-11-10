@@ -744,12 +744,17 @@ def test_the_roll_forward_commits_over_the_link_a_cut_exchange_left_in_a_folders
 	# a folder deleted is recorded by swapping it with the previous version's forward link, which is then unlinked: a cut between leaves
 	# the tree holding at the folder's name a link whose text names its own place (TreeWriter.exchange_in()'s docstring; test_r_scan.py
 	# builds the same state). With the manifest lost, new_in_tree() listed it (ELOOP) and no attempt could commit; standing, it is a pin.
+	# The folder holds a subfolder too, so d/ and d/sub/ are both recorded: without new_in_tree()'s real_folders_to() half of its guard,
+	# kind_at(tree/d/sub) follows the link (ELOOP) even if the folder's own kind were checked
+	put_text(r_job.monitor, 'd/sub/k.txt', 'k0')
 	base(r_job)
 	shutil.rmtree(os.path.join(r_job.monitor, 'd'))
-	cut_before_the_commit(r_job, [(False, 'delete', 'd/inner.txt', None), (True, 'delete', 'd', None)], monkeypatch)
+	cut_before_the_commit(r_job, [(False, 'delete', 'd/inner.txt', None), (False, 'delete', 'd/sub/k.txt', None), (True, 'delete', 'd/sub', None), (True, 'delete', 'd', None)], monkeypatch)
 	tree = tree_of(r_job)
 	# the batch recorded the folder in the previous version, and the tree holds nothing at its name until the link goes there
-	assert not os.path.lexists(os.path.join(tree, 'd')) and os.path.isfile(os.path.join(committed_versions(r_job)[-1], 'd', 'inner.txt'))
+	previous = committed_versions(r_job)[-1]
+	assert not os.path.lexists(os.path.join(tree, 'd')) and os.path.isfile(os.path.join(previous, 'd', 'inner.txt'))
+	assert os.path.isdir(os.path.join(previous, 'd', 'sub')) and not os.path.islink(os.path.join(previous, 'd', 'sub'))
 	os.symlink(rv.forward_text('d', os.path.basename(tree)), os.path.join(tree, 'd'))
 	if manifest == 'lost':
 		lose_the_manifest(r_job)
@@ -761,10 +766,11 @@ def test_the_roll_forward_commits_over_the_link_a_cut_exchange_left_in_a_folders
 
 
 @pytest.mark.parametrize('manifest', ['standing', 'lost'])
-def test_the_roll_forward_copies_nothing_a_link_of_the_monitored_tree_leads_to(r_job, monkeypatch, manifest, tmp_path):
+def test_the_roll_forward_copies_nothing_a_link_of_the_monitored_tree_leads_to(r_job, monkeypatch, manifest, tmp_path, capsys):
 	# a folder moved out and an absolute link put in its place: the monitored d/inner.txt is a regular file through the link, and is
-	# no entry of the monitored tree. Nothing of what the link leads to is copied, whatever its size. (With the manifest standing, the
-	# replay of the delete of each row under the link is refused with a "Not removing ..." error line, on 5b93a71 too: no assertion on it)
+	# no entry of the monitored tree. Nothing of what the link leads to is copied, whatever its size. With the manifest standing, the
+	# replay of the delete of each row under the link finds the version holds nothing there but through the link: the rows go, and no
+	# error line is logged (before, one "Not removing ..." per row, though the version came out right)
 	base(r_job)
 	outside = tmp_path / 'outside'
 	outside.mkdir()
@@ -775,7 +781,9 @@ def test_the_roll_forward_copies_nothing_a_link_of_the_monitored_tree_leads_to(r
 	if manifest == 'lost':
 		lose_the_manifest(r_job)
 	reads, copies = recording_reads_and_copies(monkeypatch)
+	capsys.readouterr()
 	roll_forward(r_job)
+	assert [line for line in capsys.readouterr().out.splitlines() if line.startswith('[ERROR]')] == []
 	assert [source for source in copies if source.startswith(os.path.join(r_job.monitor, 'd') + os.sep)] == []
 	newest = committed_versions(r_job)[-1]
 	assert contents_of(newest) == contents_of(r_job.monitor)

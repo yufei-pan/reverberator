@@ -13455,13 +13455,12 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 			if in_place is not None:
 				# a file made where a folder above it was ( rm -rf L; echo > L ): nothing of it is in the version, its rows go
 				replaced_folder(in_place)
-				if isDir:
-					manifest.remove_tree(as_folder_entry(relative_path))
-				else:
-					manifest.discard(relative_path)
-				return
-			# nothing of it is in the version but through that link: only its rows go
-			not_through_link(relative_path,isDir,'removing')
+			# else a link is where a folder above it was: the version holds nothing of it but through that link, so only its rows go. Nothing
+			# is wrong, and there is no line, as a folder replaced by a link has one of these for each of its rows
+			if isDir:
+				manifest.remove_tree(as_folder_entry(relative_path))
+			else:
+				manifest.discard(relative_path)
 			return
 		written.wrote_in(relative_path)
 		if isDir:
