@@ -99,7 +99,9 @@ Fact (the main session checked it): every live vault is on its own f2fs disk, no
 - **Every path that records a read-back copy as checked.** `compare_entry()` reads a copy back with `read_vault_record()` (which leaves it checked) in two cases: for a row with no record, and for an unchecked row. `compare_scopes()` then records it, after the sync this round removes. What those rows can be:
   1. **An unchecked row of the latest version.** These are copies committed earlier, recorded unchecked by `read_copied_record()`. With section 4, a batch that placed a copy always runs its commit flush through its unit's handles, and no commit goes past a failed sync. So every copy this version commits was synced clean before its commit. A read-back from the page cache equals the disk. Copies 0.55.2 committed after a missed error were never protected by the comparison's sync either: its handle, opened at the sync, missed the same error.
   2. **A cut batch's recorded files,** which `prepare_roll_forward()` marks unchecked in the tree. Section 4 keeps them out of the read-back and copies them again.
-  3. **`read_rows_from_tree()`'s rows with no record** (an entry gone, or now of another kind). The read-back finds nothing (a create) or no file; no file is recorded as checked from them.
+  3. **`read_rows_from_tree()`'s rows with no record** (an entry gone, or now of another kind).
+     - An entry gone: the read-back finds nothing (a create).
+     - An entry now of another kind: the tree holds a file where the previous version held a link or a folder (a user's link replaced by a file, a folder replaced by a file). The read-back finds the cut batch's file, records it checked from the page cache and does not copy it again. So section 4, item 2 covers every name the batch recorded, whatever kind it was, and (over a rebuilt manifest) a folder that took a file's or a link's place: each file there is passed as trusted and copied again.
   4. **`manifest.rebuild()`'s rows with no record.**
      - Without a tree (`do_backup()`: "Manifest does not describe …", and the scans), those are the latest version's committed copies, which is case 1.
      - With `tree_path`, when a roll-forward's manifest was lost, the tree's files are read back. Among them are the cut batch's creates and its moves' targets, written before the unit opened.
@@ -123,14 +125,14 @@ Fact (the main session checked it): every live vault is on its own f2fs disk, no
    - The comparison no longer syncs (section 3).
    - The retry waits `JOB_RETRY_FIRST_SECONDS` (60 s), doubling to `JOB_RETRY_MAX_SECONDS` (3,600 s).
 2. **The roll-forward copies again what the cut batch recorded.**
-   - `prepare_roll_forward()` returns its recorded files: `give_back_folder_times()`'s list, with folders and links left out. `VaultInfo` carries them from the scan to the roll-forward.
-   - `roll_forward_entries()` passes them to `compare_scopes()` as trusted. They are then compared for presence and kind only, never read back.
-   - Each one whose monitored path is a regular file now is replayed as a modify, the way `roll_forward_entries()` already turns a stop's saved entries into modifies.
+   - `prepare_roll_forward()` returns every name the batch recorded: `give_back_folder_times()`'s list, real folders (ending with `/`), files and links, each of the kind it was in the previous version. `VaultInfo` carries them from the scan to the roll-forward.
+   - `roll_forward_entries()` passes the names whose monitored path is a regular file now (a folder's without its `/`) to `compare_scopes()` as trusted. They are then compared for presence and kind only, never read back. Every kind is passed, as the tree may hold a regular file where the previous version held a link or a folder, which the batch's copy put there.
+   - Each of them is replayed as a modify, the way `roll_forward_entries()` already turns a stop's saved entries into modifies.
    - What the cut batch created has no row while the manifest stands, so it is already copied again.
-   - **Why this list is complete.** Design R records every entry of the tree before changing it: `TreeWriter.copy()` calls `record(rel, True)` first, and `replay_ops()` records a file's attribute change as an entry when Only Sync Attributes is off. So the list holds every file the cut batch wrote over, including a copy made for an attribute change.
+   - **Why this list is complete.** Design R records every entry of the tree before changing it: `TreeWriter.copy()` calls `record(rel, True)` first, and `replay_ops()` records a file's attribute change as an entry when Only Sync Attributes is off. So the list holds every name the cut batch wrote over, including a copy made for an attribute change, and a file that took the place of a link or a folder (recorded as that link or folder).
    - The 64 KiB read-back of each of those files goes.
    - **Over a rebuilt manifest** (the user's pick, section 10, question 3). When `roll_forward_entries()` finds that the manifest does not describe the previous version and rebuilds it from the tree, it also finds the cut batch's new files and treats them as it treats the recorded files: passed as trusted, and replayed as a modify.
-     - **How it finds them.** After `manifest.rebuild(previous, tree_path=tree)`, it lists each real folder of the previous version (the recorded folders) beside its twin in the tree. Every tree entry that folder does not list is new, and so is everything under a folder among them.
+     - **How it finds them.** After `manifest.rebuild(previous, tree_path=tree)`, it lists each real folder of the previous version (the recorded folders) beside its twin in the tree. Every tree entry that folder does not list is new, and so is everything under a folder among them. A name both list is new too when the tree holds a folder there and the previous version's twin is neither a real folder nor a forward link (a folder that took a file's or a link's place); a file or link of the tree under such a name is the recorded name, found by `prepare_roll_forward()`.
      - **Which files those are:** the cut batch's creates and its moves' targets. A new entry in the tree always has a real parent in the previous version, because `TreeWriter.make_folders()` calls `ensure_real()` first.
      - **What stays as it was.** The rebuild still reads back the tree's other files, which earlier versions committed (section 3, case 1).
      - **Code:** about 20–30 lines in the rebuild branch, which only a lost manifest takes.
@@ -231,6 +233,7 @@ Tests run in Docker as uid 65534, with the code read-only, as 0.55.2's spec sect
    - it copies each again;
    - the newest version holds the right bytes.
    0.55.2 reads the leftover back and commits it.
+   Test 7 also runs for a file that took the place of an entry of another kind (a user's link replaced by a file, a folder replaced by a file, a file replaced by a folder holding a new file), with the manifest standing and with it lost: the same three expectations for the file.
 8. **Copy again after an attribute change.** Test 7 for a chmod with Only Sync Attributes off, of a file ending in 128 KiB of zeros, with the leftover all NUL at its size and mtime. The newest version holds the file's bytes. 0.55.2 keeps it all NUL: the limitation "A copy whose start was lost after a power loss".
 9. **No markers.**
    - Neither the daemon nor a restore writes a `vault-sync-failed-*` file.

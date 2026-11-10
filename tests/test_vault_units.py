@@ -645,6 +645,61 @@ def test_the_roll_forward_over_a_rebuilt_manifest_copies_again_what_the_cut_batc
 		assert read_bytes(os.path.join(newest, rel)) == read_bytes(os.path.join(r_job.monitor, rel)), rel
 
 
+# a file that took the place of an entry of another kind: what the cut batch recorded there is a link, a folder, or (for what is
+# new under a folder that took a file's place) nothing, and the comparison must not read the file back for any of them. Each
+# shape is cut, its file's middle overwritten, and rolled forward with the manifest standing and with it lost.
+# On 5b93a71: link_to_file fails in both manifest states, and folder_to_file and file_to_folder fail with the manifest lost
+# (the roll-forward kept only recorded regular files, and new_in_tree() skipped a name both folders list); folder_to_file and file_to_folder
+# with the manifest standing pass there, and pin that the comparison finds a create where a row of another kind stands.
+KIND_SHAPES = {
+	# a user's link replaced by a file: the file is the new tree's x
+	'link_to_file': dict(file='x', events=[(False, 'delete', 'x', None), (False, 'create', 'x', None)]),
+	# a folder (with a file in it) replaced by a file
+	'folder_to_file': dict(file='d', events=[(False, 'delete', 'd/inner.txt', None), (True, 'delete', 'd', None), (False, 'create', 'd', None)]),
+	# a file replaced by a folder holding a new file
+	'file_to_folder': dict(file='small.txt/a', events=[(False, 'delete', 'small.txt', None), (True, 'create', 'small.txt', None), (False, 'create', 'small.txt/a', None)]),
+}
+
+
+def change_kind(job, shape):
+	base_files = {'big.txt': big_text('b0'), 'small.txt': 's0', 'd/inner.txt': 'i0'}
+	for rel, text in base_files.items():
+		put_text(job.monitor, rel, text)
+	os.symlink('small.txt', os.path.join(job.monitor, 'x'))
+	run_backup(job, **KEPT)
+	if shape == 'link_to_file':
+		os.remove(os.path.join(job.monitor, 'x'))
+	elif shape == 'folder_to_file':
+		shutil.rmtree(os.path.join(job.monitor, 'd'))
+	else:
+		os.remove(os.path.join(job.monitor, 'small.txt'))
+	put_text(job.monitor, KIND_SHAPES[shape]['file'], big_text('n1'))
+	return KIND_SHAPES[shape]['events']
+
+
+@pytest.mark.parametrize('manifest', ['standing', 'lost'])
+@pytest.mark.parametrize('shape', sorted(KIND_SHAPES))
+def test_the_roll_forward_copies_again_a_file_that_took_the_place_of_another_kind(r_job, monkeypatch, shape, manifest):
+	events = change_kind(r_job, shape)
+	cut_before_the_commit(r_job, events, monkeypatch)
+	tree = tree_of(r_job)
+	rel = KIND_SHAPES[shape]['file']
+	assert os.path.isfile(os.path.join(tree, rel)) and not os.path.islink(os.path.join(tree, rel))
+	overwrite_middle(os.path.join(tree, rel))
+	if manifest == 'lost':
+		for name in (rv.MANIFEST_FILE_NAME, rv.MANIFEST_FILE_NAME + '-journal'):
+			if os.path.lexists(os.path.join(r_job.job_vault, name)):
+				os.remove(os.path.join(r_job.job_vault, name))
+	reads, copies = recording_reads_and_copies(monkeypatch)
+	roll_forward(r_job)
+	source = os.path.join(r_job.monitor, rel)
+	assert rel not in reads
+	assert source in copies
+	newest = committed_versions(r_job)[-1]
+	assert os.path.isfile(os.path.join(newest, rel)) and not os.path.islink(os.path.join(newest, rel))
+	assert read_bytes(os.path.join(newest, rel)) == read_bytes(source)
+
+
 # ---- 9. no markers
 
 def test_neither_the_daemon_nor_a_restore_writes_a_marker(r_job, errseq, monkeypatch, capsys, tmp_path):

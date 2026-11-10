@@ -1095,7 +1095,8 @@ def nameless_start(rule_path:str, rule):
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER, defaults=('', '', ''))
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
 # tree: on design R, the folder of a cut batch's tree, which the next attempt finishes (read_job_vault_r()); None with none.
-# recorded: what that batch recorded in the previous version before it changed the tree, which the roll-forward copies again (prepare_roll_forward())
+# recorded: what that batch recorded in the previous version before it changed the tree (real folders ending with /, files and links),
+# of which the roll-forward copies again each that is a regular file in the monitored tree now (prepare_roll_forward())
 VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER, defaults=[None, ()])
 ManifestRecord = namedtuple('ManifestRecord', MANIFEST_RECORD_HEADER)
 # a copy queued on an executor, which finish_copies() puts in place
@@ -6699,9 +6700,10 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> list:
 	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4), so the versions read exact
 	from here on, and a restore can run before the monitored path is back. Each real folder of the previous version gets its
 	times back (give_back_folder_times()). Returns what the batch recorded there before it changed the tree: its real folders,
-	ending with /, and its regular files, links left out. The tree may hold another copy of each of those files now, which a
-	write error some other sync saw, or a power cut, may have left wrong at its right size, mtime and tail: the roll-forward
-	copies them again (roll_forward_entries()). A link a cut exchange left
+	ending with /, its regular files and its links, each of the kind it was. The tree may hold a regular file at each of those names
+	now (a file may have replaced a link or a folder), which a write error some other sync saw, or a power cut, may have left
+	wrong at its right size, mtime and tail: the roll-forward copies again each that the monitored tree holds as a regular file
+	(roll_forward_entries()). A link a cut exchange left
 	in a folder's place in the tree is no concern of it: the comparison and the sweep of the whole tree take it. A record cut between
 	two renames gets its link back first (put_back_forward_links()), and a link hiding what a record put in on another disk goes before that
 	(remove_shadowed_links()); a lost manifest has no rows to tell it by. A name of the tree left of two kinds goes (remove_mixed_names()). Idempotent: a cut here repeats it. Raises OSError or sqlite3.Error.
@@ -6711,8 +6713,7 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> list:
 	if manifest.describes(previous):
 		put_back_forward_links(previous, info.tree, manifest)
 	remove_mixed_names(previous, info.tree)
-	recorded = give_back_folder_times(previous, manifest)
-	return [rel for rel in recorded if rel.endswith('/') or stat.S_ISREG(os.lstat(os.path.join(previous, rel)).st_mode)]
+	return give_back_folder_times(previous, manifest)
 
 def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 	'''
@@ -6752,9 +6753,10 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 	What the roll-forward of the tree info.tree replays (plan S4): what a full comparison finds between the monitored tree and that
 	tree, and two things more. Each file the cut batch wrote into the tree is copied again, never read back: a write error that
 	some other sync saw before this attempt's handles opened, or a power cut, may have left its copy wrong at its right size, mtime
-	and tail, and nothing can tell. Those are the regular files it recorded in the previous version (info.recorded,
-	prepare_roll_forward()), and, over a manifest that does not describe the previous version, as a lost one, whose rows are listed
-	from the tree, what it made there too (new_in_tree()). Each of them whose monitored path is a regular file now is trusted by the
+	and tail, and nothing can tell. Those are the names it recorded in the previous version (info.recorded, prepare_roll_forward():
+	a file may have replaced a link or a folder there, and its row, read from the tree, has no record to tell it by), and, over a
+	manifest that does not describe the previous version, as a lost one, whose rows are listed from the tree, what it made there too
+	(new_in_tree()). Each of them whose monitored path is a regular file now is trusted by the
 	comparison, as present and of its kind, and replayed as a modify; one that is not is compared as any other entry. And from the
 	entries a stop saved (given): each plain file "modify", "create" or "move" that the comparison did not find, under either form
 	of its key, while the monitored path is a regular file now, replayed as a modify. A file rewritten at its size, with its mtime
@@ -6768,7 +6770,7 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 	'''
 	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
 	# what the cut batch wrote over, and, over a rebuilt manifest, what it made
-	wrote = [rel for rel in info.recorded if not rel.endswith('/')]
+	wrote = [rel.rstrip('/') for rel in info.recorded]
 	manifest.begin()
 	try:
 		if not manifest.describes(previous):
@@ -6820,19 +6822,25 @@ def new_in_tree(previous:str, tree:str, folders:list) -> list:
 	(folders, rels with no trailing /, '' for its root) that the folder does not list beside its twin in the tree, and all
 	under such an entry. A real folder lists every entry the tree held when it was made real, and a new entry always has
 	one as its parent, as TreeWriter.make_folders() makes it real first: so these are the batch's creates and the targets of
-	its moves. A folder gone from the tree, or not a folder there, holds none. Raises OSError when a folder cannot be read.
+	its moves. So is a folder of the tree that took the place of a file or a link of the previous version, a name both list, whose
+	twin there is neither a real folder nor a forward link: it holds no real folder to list beside, and all under it is new. What a
+	file or a link of the tree took the place of is a name the batch recorded (prepare_roll_forward()), not found here. A folder gone
+	from the tree, or not a folder there, holds none. Raises OSError when a folder cannot be read.
 
 	Examples:
 		>>> with tempfile.TemporaryDirectory() as folder:
-		...     kept, tree = os.path.join(folder, 'V1--x'), os.path.join(folder, 'V2--x')
-		...     for path in (kept, tree, os.path.join(tree, 'new')): os.mkdir(path)
-		...     for path in (os.path.join(kept, 'old'), os.path.join(tree, 'old'), os.path.join(tree, 'made'), os.path.join(tree, 'new', 'f')): open(path, 'w').close()
+		...     kept, tree = os.path.join(folder, 'V1--2021-01-01_00-00-00_-0800'), os.path.join(folder, 'V2--2021-01-01_00-00-00_-0800')
+		...     for path in (kept, tree, os.path.join(tree, 'new'), os.path.join(tree, 'was_file'), os.path.join(tree, 'real'), os.path.join(kept, 'real'), os.path.join(tree, 'same')): os.mkdir(path)
+		...     for path in (os.path.join(kept, 'old'), os.path.join(kept, 'was_file'), os.path.join(tree, 'old'), os.path.join(tree, 'made'), os.path.join(tree, 'new', 'f'),
+		...             os.path.join(tree, 'was_file', 'g'), os.path.join(tree, 'real', 'h'), os.path.join(tree, 'same', 'k')): open(path, 'w').close()
 		...     os.symlink('old', os.path.join(tree, 'link'))
+		...     os.symlink('../V2--2021-01-01_00-00-00_-0800/same', os.path.join(kept, 'same'))
 		...     sorted(new_in_tree(kept, tree, ['']))
-		['made', 'new/f']
+		['made', 'new/f', 'was_file/g']
 	'''
 	made = []
 	errors = []
+	number = vault_version_number(os.path.basename(os.path.normpath(previous)))
 	for folder in folders:
 		try:
 			with os.scandir(os.path.join(tree, folder)) as entries:
@@ -6841,9 +6849,12 @@ def new_in_tree(previous:str, tree:str, folders:list) -> list:
 			continue
 		listed = set(os.listdir(os.path.join(previous, folder)))
 		for entry in held:
-			if entry.name in listed:
-				continue
 			rel = os.path.join(folder, entry.name)
+			if entry.name in listed:
+				twin = os.path.join(previous, rel)
+				# a name the batch recorded, or a folder that was a real folder or is unchanged: not new
+				if not entry.is_dir(follow_symlinks=False) or (os.path.isdir(twin) and not os.path.islink(twin)) or forwards_to_version(twin, rel, number + 1):
+					continue
 			if entry.is_dir(follow_symlinks=False):
 				made.extend(below for path, below, is_dir in iter_tree_entries(entry.path, rel + '/', errors=errors) if not is_dir and is_regular_file(path))
 			elif entry.is_file(follow_symlinks=False):
