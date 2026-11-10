@@ -6702,7 +6702,9 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> list:
 	ending with /, its regular files and its links, each of the kind it was. The tree may hold a regular file at each of those names
 	now (a file may have replaced a link or a folder), which a write error some other sync saw, or a power cut, may have left
 	wrong at its right size, mtime and tail: the roll-forward copies again each that the monitored tree holds as a regular file
-	(roll_forward_entries()). A link a cut exchange left
+	(roll_forward_entries()), and the rows of the regular files are marked unchecked, in a transaction of its own, for the one it
+	does not: a file under an inner mount that is paused at the roll-forward keeps its row, whose copy in the tree the next full
+	comparison that has the mount back reads (the row said version n's copy, and the tree may hold another now). A link a cut exchange left
 	in a folder's place in the tree is no concern of it: the comparison and the sweep of the whole tree take it. A record cut between
 	two renames gets its link back first (put_back_forward_links()), and a link hiding what a record put in on another disk goes before that
 	(remove_shadowed_links()); a lost manifest has no rows to tell it by. A name of the tree left of two kinds goes (remove_mixed_names()). Idempotent: a cut here repeats it. Raises OSError or sqlite3.Error.
@@ -6712,7 +6714,11 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> list:
 	if manifest.describes(previous):
 		put_back_forward_links(previous, info.tree, manifest)
 	remove_mixed_names(previous, info.tree)
-	return give_back_folder_times(previous, manifest)
+	recorded = give_back_folder_times(previous, manifest)
+	manifest.begin()
+	manifest.mark_unchecked(rel for rel in recorded if not rel.endswith('/'))
+	manifest.commit()
+	return recorded
 
 def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 	'''
@@ -6720,7 +6726,7 @@ def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 	link's text are read from the tree, and a row whose entry is gone or of another kind has no record, which the comparison
 	treats as a new entry. That batch may have changed any of them, and the monitored tree may have gone back since: a
 	comparison with the old row would say nothing differs. A file the batch wrote over is copied again
-	(roll_forward_entries()). The caller holds the transaction, as these rows stand only if the version commits: a repeated
+	(roll_forward_entries()), or, where that cannot be, left to its unchecked mark (prepare_roll_forward()). The caller holds the transaction, as these rows stand only if the version commits: a repeated
 	roll-forward needs version n's folder times again. One look at each row, on a path that a crash alone takes.
 	'''
 	changed = []
@@ -6797,12 +6803,10 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 	for path, values in given.items():
 		if values.event not in ('modify', 'create', 'move') or path.endswith('/') or path in found or path + '/' in found:
 			continue
-		try:
-			if stat.S_ISREG(os.lstat(path).st_mode):
-				found[path] = values._replace(event='modify', source_path=None)
-		except OSError:
-			# gone, or a parent of it is a file now: the comparison says what is there
-			pass
+		# a plain file of the monitored tree, through no link (what a link above it leads to is no entry of it); gone, or a parent
+		# of it a file now: the comparison says what is there
+		if real_folders_to(monitor_path, os.path.relpath(path, monitor_path)) and is_regular_file(path):
+			found[path] = values._replace(event='modify', source_path=None)
 	return found
 
 def is_regular_file(path:str) -> bool:
@@ -8739,6 +8743,10 @@ class VaultManifest:
 	def set_folder_mtimes(self, pairs):
 		'''Record the mtime of each folder row of (mtime_ns, folder rel ending with /) pairs that holds a record; the caller holds the transaction.'''
 		self.conn.executemany("UPDATE entries SET mtime_ns = ? WHERE path = ? AND kind = 'd'", ((mtime_ns, storable_name(rel)) for mtime_ns, rel in pairs))
+
+	def mark_unchecked(self, rels):
+		'''Mark the file records of rels unchecked, keeping the rest: each is a new copy of what it records, which delta generation reads back.'''
+		self.conn.executemany("UPDATE entries SET unchecked = 1 WHERE path = ? AND kind = 'f'", ((storable_name(rel),) for rel in rels))
 
 	def take_dirty_records(self, limit:int) -> list:
 		'''The rels of the dirty rows, each with its record, as (rel, record or None): the record is kept only for a row mark_vouched() marked.'''

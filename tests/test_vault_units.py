@@ -5,6 +5,7 @@ heard; a sync that fails commits nothing and fails the attempt, whose next attem
 comparison no longer syncs; and no failed-sync marker is written. The kernel's rule stands in at the syncfs binding
 (tests/errseq.py): one model per filesystem, sampled at each open.
 '''
+import datetime
 import errno
 import os
 import shutil
@@ -577,9 +578,9 @@ def recording_reads_and_copies(monkeypatch):
 	return reads, copies
 
 
-def roll_forward(job, **options):
-	'''The next attempt: the scan finds the cut batch's tree, and the batch rolls it forward.'''
-	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(),
+def roll_forward(job, given=None, **options):
+	'''The next attempt: the scan finds the cut batch's tree, and the batch rolls it forward. given: the entries a stop saved.'''
+	_, manifest, committed = rv.do_backup(OrderedDict() if given is None else given, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(),
 		only_sync_attributes=options.get('only_sync_attributes', False), keep_n_versions=0, backup_size_limit='0')
 	manifest.close()
 	assert committed is True
@@ -788,6 +789,84 @@ def test_the_roll_forward_copies_nothing_a_link_of_the_monitored_tree_leads_to(r
 	newest = committed_versions(r_job)[-1]
 	assert contents_of(newest) == contents_of(r_job.monitor)
 	assert contents_of(newest)['d'] == ('l', str(outside / 'd'))
+
+
+# ---- what the roll-forward does not copy again keeps its unchecked row, and a saved event is replayed through no link
+
+@pytest.mark.parametrize('mount', ['stays', 'paused_at_the_retry', 'goes_during_the_walk'])
+def test_a_cut_batchs_copy_under_an_inner_mount_paused_at_the_roll_forward_is_read_at_the_next_full_comparison(r_job, monkeypatch, tmp_path, mount):
+	# An attribute change with Only Sync Attributes off copies its file; the batch is cut after the copy, whose bytes did not reach the
+	# disk (NUL at its size and mtime, as after an f2fs checkpoint). At the retry the file's inner mount is not mounted yet: the
+	# roll-forward cannot copy it again, and its row, checked until now, must be unchecked, or no comparison reads the copy back and the
+	# newest version holds the file all NUL until it next changes. The mount going during the roll-forward's walk is the same: the
+	# forced modify is dropped (drop_unmounted_entries()). 'stays' is a pin (the roll-forward copies the file again).
+	# Without prepare_roll_forward()'s mark, the other two fail on 436b9c3 with the newest version all NUL.
+	data = b''.join(f'z{i:07d}\n'.encode() for i in range(40000))
+	path = os.path.join(r_job.monitor, 'disk', 'file.bin')
+	os.makedirs(os.path.dirname(path))
+	with open(path, 'wb') as f:
+		f.write(data)
+	put_text(r_job.monitor, 'a.txt', 'a0')
+	def mounted(*rels):
+		table = [('/', ('1',))] + [(os.path.join(r_job.monitor, rel.rstrip('/')), (rel,)) for rel in rels]
+		monkeypatch.setattr(rv, 'current_mount_table', lambda: table)
+	mounted('disk/')
+	run_backup(r_job, only_sync_attributes=False, **KEPT)
+	# as after any restart of the daemon: a full comparison reads the copies back and records them checked
+	run_backup(r_job, only_sync_attributes=False, **KEPT)
+	assert len(committed_versions(r_job)) == 1
+	os.chmod(path, 0o600)
+	cut_before_the_commit(r_job, [(False, 'attrib', 'disk/file.bin', None)], monkeypatch, only_sync_attributes=False)
+	copy = os.path.join(tree_of(r_job), 'disk', 'file.bin')
+	st = os.lstat(copy)
+	assert st.st_nlink == 1, 'the cut batch placed its own copy'
+	all_nul(copy)
+	aside = os.path.join(str(tmp_path), 'aside')
+	def unmount():
+		# the inner disk is not mounted: its folder is the empty one it leaves
+		os.rename(os.path.join(r_job.monitor, 'disk'), aside)
+		os.mkdir(os.path.join(r_job.monitor, 'disk'))
+		mounted()
+	if mount == 'paused_at_the_retry':
+		# not mounted yet when the daemon comes back
+		unmount()
+	elif mount == 'goes_during_the_walk':
+		real = rv.roll_forward_entries
+		def walked(*args, **kwargs):
+			found = real(*args, **kwargs)
+			# what drop_unmounted_entries() reads next: the disk was unmounted while the comparison ran
+			unmount()
+			return found
+		monkeypatch.setattr(rv, 'roll_forward_entries', walked)
+	roll_forward(r_job, only_sync_attributes=False)
+	if mount != 'stays':
+		os.rmdir(os.path.join(r_job.monitor, 'disk'))
+		os.rename(aside, os.path.join(r_job.monitor, 'disk'))
+	mounted('disk/')
+	# the next full comparison, with the disk there
+	run_backup(r_job, only_sync_attributes=False, **KEPT)
+	held = read_bytes(os.path.join(committed_versions(r_job)[-1], 'disk', 'file.bin'))
+	assert held == data, 'the newest version holds the file ' + ('all NUL' if not any(held) else 'wrong')
+
+
+def test_the_roll_forward_replays_no_saved_event_through_a_link_of_the_monitored_tree(r_job, monkeypatch, tmp_path):
+	# A stop saved an event for a new file in a/. Before the retry a was moved out and a link put in its place: the file is a regular
+	# file only as seen through the link, and replaying it as a modify copies what the link leads to into the version (on 436b9c3).
+	put_text(r_job.monitor, 'a/old.txt', 'o0')
+	base(r_job)
+	cut_before_the_commit(r_job, modify_big(r_job), monkeypatch)
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	shutil.move(os.path.join(r_job.monitor, 'a'), str(outside / 'a'))
+	put_text(str(outside), 'a/new.txt', big_text('n1'))
+	os.symlink(str(outside / 'a'), os.path.join(r_job.monitor, 'a'))
+	given = OrderedDict({os.path.join(r_job.monitor, 'a', 'new.txt'): rv.BackupEntryValues(datetime.datetime.now().isoformat(), 'create', None)})
+	reads, copies = recording_reads_and_copies(monkeypatch)
+	roll_forward(r_job, given)
+	assert [source for source in copies if source.startswith(os.path.join(r_job.monitor, 'a') + os.sep)] == []
+	newest = committed_versions(r_job)[-1]
+	assert contents_of(newest) == contents_of(r_job.monitor)
+	assert contents_of(newest)['a'] == ('l', str(outside / 'a'))
 
 
 # ---- 9. no markers

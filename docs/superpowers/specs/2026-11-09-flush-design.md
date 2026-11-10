@@ -98,7 +98,7 @@ Fact (the main session checked it): every live vault is on its own f2fs disk, no
 - **Not heard:** an error a sync saw before the unit opened. It cannot be on the unit's own writes, which come later. It matters only where the unit commits or reads back something written earlier.
 - **Every path that records a read-back copy as checked.** `compare_entry()` reads a copy back with `read_vault_record()` (which leaves it checked) in two cases: for a row with no record, and for an unchecked row. `compare_scopes()` then records it, after the sync this round removes. What those rows can be:
   1. **An unchecked row of the latest version.** These are copies committed earlier, recorded unchecked by `read_copied_record()`. With section 4, a batch that placed a copy always runs its commit flush through its unit's handles, and no commit goes past a failed sync. So every copy this version commits was synced clean before its commit. A read-back from the page cache equals the disk. Copies 0.55.2 committed after a missed error were never protected by the comparison's sync either: its handle, opened at the sync, missed the same error.
-  2. **A cut batch's recorded files,** which `prepare_roll_forward()` marks unchecked in the tree. Section 4 keeps them out of the read-back and copies them again.
+  2. **A cut batch's recorded files,** which `prepare_roll_forward()` marks unchecked in the tree, as 0.55.2 did. Section 4 keeps them out of the read-back and copies them again. The mark is for the one it cannot copy again: a file under an inner mount that is paused at the roll-forward (`compare_scopes()` keeps a paused row as it is, and `roll_forward_entries()` leaves a skipped or paused file out of the copies), or whose mount goes during the walk (`drop_unmounted_entries()` drops the forced modify). Its row stays unchecked, so the next full comparison that has the mount back reads the copy and copies it again if the disk holds something else.
   3. **`read_rows_from_tree()`'s rows with no record** (an entry gone, or now of another kind).
      - An entry gone: the read-back finds nothing (a create).
      - An entry now of another kind, at the same rel: a user's link replaced by a file (the row of the link, kind `l`, has no record, and the tree holds the cut batch's file at its rel). The read-back finds that file, records it checked from the page cache and does not copy it again.
@@ -130,6 +130,7 @@ Fact (the main session checked it): every live vault is on its own f2fs disk, no
    - `prepare_roll_forward()` returns every name the batch recorded: `give_back_folder_times()`'s list, real folders (ending with `/`), files and links, each of the kind it was in the previous version. `VaultInfo` carries them from the scan to the roll-forward.
    - `roll_forward_entries()` passes the names whose monitored path is a regular file now (a folder's without its `/`) to `compare_scopes()` as trusted. They are then compared for presence and kind only, never read back. Every kind is passed, as the tree may hold a regular file where the previous version held a link or a folder, which the batch's copy put there.
    - Each of them is replayed as a modify, the way `roll_forward_entries()` already turns a stop's saved entries into modifies.
+   - **The mark stays.** `prepare_roll_forward()` marks the rows of all the recorded files unchecked, in a transaction of its own (0.55.2's code, with `VaultManifest.mark_unchecked()`): a recorded file that is not copied again keeps an unchecked row, as 0.55.2 left it (section 3, case 2).
    - **Only through real folders of the monitored tree** (`real_folders_to()`): a name under a link of the monitored tree (a folder moved out and a link put in its place) is a regular file only as seen through the link, and replaying it would copy what the link leads to into the version.
    - What the cut batch created has no row while the manifest stands, so it is already copied again.
    - **Why this list is complete.** Design R records every entry of the tree before changing it: `TreeWriter.copy()` calls `record(rel, True)` first, and `replay_ops()` records a file's attribute change as an entry when Only Sync Attributes is off. So the list holds every name the cut batch wrote over, including a copy made for an attribute change, and a file that took the place of a link or a folder (recorded as that link or folder).
@@ -251,6 +252,7 @@ Tests run in Docker as uid 65534, with the code read-only, as 0.55.2's spec sect
       - it copies each again;
       - the newest version holds the right bytes.
     - **On main:** the rebuild reads both back and commits the overwritten create.
+11. **A recorded file the roll-forward cannot copy again** (section 3, case 2). An attribute change with Only Sync Attributes off, of a file under an inner mount, is cut after its copy is placed; the copy is overwritten with NUL at its size and mtime; the retry runs with that mount paused, and the next full comparison with the mount back follows. Expect the newest version to hold the file's bytes after that comparison. Without the mark of `prepare_roll_forward()` it holds the file all NUL. A saved event under a link of the monitored tree is not replayed as a modify through the link (`roll_forward_entries()`'s loop over the stop's saved entries).
 
 **Stand-ins that must move** to the binding, or the gates never run through the handles. This is lesson 2026-11-06: a stand-in goes as low in the stack as it can.
 - test_crash_power_loss.py's `flushing_for_real`;
@@ -333,7 +335,7 @@ The reviews and the VM gates are the main session's.
 - Whether to share `open_restore_disks()`'s core.
 - The exact point of each open, before its function's first write.
 - How a stand-in finds its image from an fd.
-- Whether `prepare_roll_forward()` still marks the recorded files unchecked. Once they are trusted, nothing reads the mark.
+- Whether `prepare_roll_forward()` still marks the recorded files unchecked: it does (section 4, item 2). A file the roll-forward does not copy again (under a paused inner mount) reads the mark at the next full comparison.
 - The alert line's words, within section 4, item 5.
 
 ## 10. Questions for the user (all answered 2026-11-09; see The user's words)
