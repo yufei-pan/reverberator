@@ -203,18 +203,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** a job monitors a network filesystem, or files are changed on a pool's disks directly.
 - **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
 
-### A copy whose start was lost after a power loss
+### A copy made where the vault refused a hard link
 
 - **Kind:** known limitation.
-- **What the operator sees:** a cut after a checkpoint of the disk (another job's commit, the kernel's periodic one, a
-  sync) and before the batch's flush ends can leave a copy all NUL in the tree. The roll-forward copies again every
-  file whose row differs. A copy whose row did not change, an attribute change with Only Sync Attributes off, is
-  compared by size, mtime and last 64 KiB, so one that ends in 64 KiB of NUL passes and stays all NUL in the newest
-  version. Older versions keep the right copy.
-- **Why:** the read-back hashes the tail only; a whole-file read would cost every check a full read.
-- **Revisit when:** such a loss is seen, or a job turns Only Sync Attributes off and holds files that end in zeros.
-- **Approved:** 2026-10-27, "Known limitation (Recommended)"; 2026-11-06, the text above, "Approve the text
-  (Recommended)".
+- **What the operator sees:** on a vault whose filesystem refuses a hard link, a record is a copy, and that copy holds
+  the only copy of an older version's file (a cut batch's record, or a 0.54 conversion's tree). That file can then read
+  wrong in two ways: it can hold lost bytes with no alert, when another program's sync of the disk saw the copy's write
+  error before the next attempt opened its handles; or it can be lost after a VAULT WRITE ERROR on that disk, when the
+  batch's own flush of the record copy fails and the retry does not make the record again and replaces the tree's file.
+- **Why:** no other copy of those bytes exists.
+- **Revisit when:** a vault ever shows refused hard links.
+- **Approved:** 2026-11-09, the user's choice "Known limitation (Recommended)", then "Widen the entry (Recommended)"
+  for the second way.
 
 ### A clock set back after a read was stamped
 
@@ -301,39 +301,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Approved:** 2026-10-27, the user's choice "Defer to round 11 (Recommended)"; then 2026-10-27, on that whole-file
   check: "why do we bother?", then "Drop it, known limitation (Recommended)"; 2026-10-28, on widening it to a rewrite
   made while running whose event a stop dropped: "Widen it (Recommended)".
-
-### A write error in the middle of a copy after the reboot
-
-- **Kind:** known limitation.
-- **What the operator sees:** after the reboot that ends a vault disk's failed-sync marker, the restart's full comparison
-  reads each unchecked copy back by its size, mtime and last 64 KiB. A page lost in the middle of a file to the write
-  error passes, and the copy stays wrong until the file changes again.
-- **Why:** reading every unchecked copy whole at a restart costs a full read of everything copied since the last check.
-- **Revisit when:** a vault disk keeps working after write errors, so this is met.
-- **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)".
-
-### A failed sync that cannot be recorded, after a restart
-
-- **Kind:** known limitation.
-- **What the operator sees:** when a vault disk's failed sync cannot be recorded (a broken or full state folder, an
-  unreadable boot id, or a disk path too long for a marker's name), the alert still goes out and the disk is remembered
-  in memory; if reverberator restarts before the next reboot, that
-  memory is gone, and copies on that disk read back from the page cache can be recorded checked, though after the reboot
-  they may be bad.
-- **Why:** it needs a disk write error while its marker cannot be written, and the alert has told the operator.
-- **Revisit when:** it is met.
-- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
-
-### Bind mounts and btrfs subvolumes get separate failed-sync markers
-
-- **Kind:** known limitation.
-- **What the operator sees:** markers are kept per mount point, so a vault reached through a bind mount of another
-  vault's disk, or btrfs subvolumes of one filesystem mounted at separate mount points, get separate markers, and a
-  write error one job's sync sees can be missed by the other job.
-- **Why:** the kernel keeps the error per filesystem; keying markers by mountinfo's device number would probably group
-  both layouts, an extra part for layouts not used on this host.
-- **Revisit when:** such a layout is used.
-- **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
 ### A rewritten rule row keeps the defaults it was given
 
@@ -550,17 +517,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** someone meets it on a real tree, or the format changes for another reason.
 - **Approved:** 2026-11-06, "Accept (Recommended)".
 
-### A comparison's failed sync does not fail the attempt
-
-- **Kind:** known limitation.
-- **What the operator sees:** when a comparison's sync of the vault disk fails, the attempt goes on. The disk is
-  marked and an alert goes out, the copies stay unchecked, and the next read-back copies them again. A batch's own
-  flush before its commit does fail the attempt.
-- **Why:** the kernel reports a write error once, so failing here would need the code to tell "failed now" from
-  "already marked", and a comparison with no copies should not fail.
-- **Revisit when:** an alert is ever missed.
-- **Approved:** 2026-11-06, "Accept (Recommended)".
-
 ### status can show one version fewer during a hand-over
 
 - **Kind:** known limitation.
@@ -722,18 +678,20 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** dropping them is safe by reasoning only, as `finish_r_commit()` finishes a lost swap and rename.
 - **Revisit when:** the lightness round after 0.55.1, with a power-loss run first.
 
-### A moved file is read back and syncs the vault
+### A moved file is read back
 
 - **Kind:** deferred.
-- **What the operator sees:** nothing but cost: a plain `mv` loses the file's row, so the comparison reads it back and
-  takes a syncfs. A rename of a folder of 2,000 files read 263.3 MB for a change that wrote 0.1 MB.
+- **What the operator sees:** nothing but cost: a plain `mv` loses the file's row, so the comparison reads it back
+  (since the release after 0.55.2 with no syncfs of its own). A rename of a folder of 2,000 files read 263.3 MB for a
+  change that wrote 0.1 MB.
 - **Why:** keeping rows, and their unchecked mark, through a move is safe by reasoning only.
 - **Revisit when:** the lightness round after 0.55.1, with a power-loss run first.
 
-### Eight mount table reads in a one-file batch
+### Seven mount table reads in a one-file batch
 
 - **Kind:** deferred.
-- **What the operator sees:** nothing but cost: about 3.5 ms of a batch's 13 ms of CPU on 162 mounts.
+- **What the operator sees:** nothing but cost: about 3.5 ms of a batch's 13 ms of CPU on 162 mounts,
+  measured with eight reads; the release after 0.55.2 takes one off (a batch's unit reads no mount table).
 - **Why:** a lightness item; the reads sit in separate steps that need one table passed between them.
 - **Revisit when:** the lightness round after 0.55.1.
 
@@ -755,21 +713,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** older than 0.55.2 for unreadable files; the link left out joins it. A batch whose every entry drops out should
   commit nothing.
 - **Revisit when:** the round after 0.55.2.
-
-### Another program's sync can take a vault disk's write error from the daemon
-
-- **Kind:** deferred.
-- **What the operator sees:** when another program syncs a vault's filesystem (`sync -f`, a tool that calls syncfs) and
-  meets a write error first, the daemon's flush before its commit, through a handle it opens then, hears nothing: no
-  VAULT WRITE ERROR, and the batch commits a version whose copies may not be on disk. A reverberator restore that can
-  write the state folder (as root does) records such an error for the daemon; other programs do not. The daemon logs a
-  restore's record only when a comparison of a job on that disk first reads a copy back, which may come late (mostly at
-  a restart or a full comparison); its commit flushes do not read it, though the restore itself says FAILED at once.
-- **Why:** the daemon opens a new handle for each sync, and Linux reports a write error to a handle opened after it only
-  while no other sync has seen it.
-- **Revisit when:** planned for the next release after 0.55.2 (the user, 2026-11-09: "Next release after 0.55.2
-  (Recommended)"): each batch opens its vault disks' handles before its first copy and syncs through them, as a
-  restore does, with the pool cut and power-loss gates.
 
 ### The root's metadata is written every batch
 
