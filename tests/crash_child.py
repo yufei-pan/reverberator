@@ -125,7 +125,7 @@ def reset_module_state() -> None:
 	rv.GREEN_LIGHT.set()
 	rv.RESTORE_STOP.clear()
 	for remembered in (rv.VERSION_MOVES, rv.VERSION_MOVES_WARNED, rv.PRUNE_ABORTED, rv.PRUNE_SALT_MISSING, rv.VAULTS_WITH_VERSIONS,
-			rv.UNRECORDED_FAILED_DISKS, rv.JOB_LOCK_UNCHECKED, rv.REAL_VAULT_FOLDERS, rv.ROOT_META_TROUBLE):
+			rv.JOB_LOCK_UNCHECKED, rv.REAL_VAULT_FOLDERS, rv.ROOT_META_TROUBLE, rv.VAULT_UNITS):
 		remembered.clear()
 	rv.is_version_folder_name.cache_clear()
 	rv.is_previous_version_name.cache_clear()
@@ -133,8 +133,6 @@ def reset_module_state() -> None:
 	rv.STATUS_BOARD = None
 	# no thread of the parent can hold one of these here, but one could have when the fork took the copy
 	rv.LOG_LOCK = threading.RLock()
-	rv.VAULT_SYNC_LOCKS.clear()
-	rv.VAULT_SYNC_MARKERS_LOCK = threading.Lock()
 	rv.REAL_VAULT_FOLDERS_LOCK = threading.Lock()
 	rv.VERSION_MOVES_LOCK = threading.Lock()
 	rv.BACKUP_SEMAPHORE = threading.Semaphore(2 * os.cpu_count())

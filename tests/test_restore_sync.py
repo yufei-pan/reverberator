@@ -17,7 +17,6 @@ import stat
 import time
 import pytest
 import reverberator as rv
-from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.harness import create_job, seed_monitor, run_backup, write_rule
 
 pytestmark = pytest.mark.unit
@@ -125,7 +124,7 @@ def test_both_syncs_go_through_the_fd_the_target_was_claimed_by(job, tmp_path, c
 	synced = []
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(fd))
 	# never by opening the target again
-	monkeypatch.setattr(rv, 'syncfs_folder', lambda path: pytest.fail(f'{path} opened again for its sync'))
+	monkeypatch.setattr(rv, 'LIBC_SYNCFS', lambda fd: pytest.fail(f'fd {fd} synced past syncfs_fd()'))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert (code, err) == (0, ''), stdout
 	assert len(fds) == 1 and synced == fds * 2
@@ -337,7 +336,7 @@ def test_a_pools_disks_are_opened_before_the_first_copy_and_every_sync_goes_thro
 	opened_branches(monkeypatch, branches, events)
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: events.append(('sync', fd)))
 	# never a path opened at the sync, the pool's own included, whose sync does not reach the disks
-	monkeypatch.setattr(rv, 'syncfs_folder', lambda path: pytest.fail(f'{path} opened for its sync'))
+	monkeypatch.setattr(rv, 'LIBC_SYNCFS', lambda fd: pytest.fail(f'fd {fd} synced past syncfs_fd()'))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj' + ('/a.txt' if kind == 'file' else ''), out, '--version', '0')
 	assert (code, err) == (0, ''), stdout
 	opened = [event for event in events if event[0] == 'opened']
@@ -408,7 +407,7 @@ def test_a_disk_that_joined_the_pool_after_the_claim_fails_the_restore_and_a_run
 	synced = []
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(os.fstat(fd).st_ino))
 	# an fd opened now would miss a writeback error another sync of that disk met first
-	monkeypatch.setattr(rv, 'syncfs_folder', lambda path: pytest.fail(f'{path} opened for its sync'))
+	monkeypatch.setattr(rv, 'LIBC_SYNCFS', lambda fd: pytest.fail(f'fd {fd} synced past syncfs_fd()'))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	(disk, branch), = joined
 	assert code == rv.EXIT_COMMAND_FAILED
@@ -537,7 +536,7 @@ def test_a_stop_on_a_pool_syncs_through_the_handles_opened_at_the_claim(job, tmp
 	opened_branches(monkeypatch, branches, events)
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: events.append(('sync', fd)))
 	# never a path opened at the sync, the pool's own included
-	monkeypatch.setattr(rv, 'syncfs_folder', lambda path: pytest.fail(f'{path} opened for its sync'))
+	monkeypatch.setattr(rv, 'LIBC_SYNCFS', lambda fd: pytest.fail(f'fd {fd} synced past syncfs_fd()'))
 	code, stdout, err = stopped_at_its_second_copy(job, tmp_path, capsys, monkeypatch, out)
 	assert (code, stdout) == (rv.EXIT_COMMAND_FAILED, '')
 	assert err == f'{stopping_line(target)}\nInterrupted: run the same restore again to pick it up, or again with --accept to keep what it restored as it is. {rv.unfinished_note(target)}\n'
@@ -1254,78 +1253,6 @@ def test_a_marker_without_made_never_says_to_remove_the_target(job, tmp_path, ca
 	assert code == rv.EXIT_USAGE and err.endswith(f'{way_out(target, False)}\n')
 
 
-@pytest.fixture
-def boot(tmp_path, monkeypatch):
-	path = tmp_path / 'boot_id'
-	path.write_text('boot-1\n')
-	monkeypatch.setattr(rv, 'BOOT_ID_PATH', str(path))
-	return path
-
-
-def restore_with_state(tmp_path, capsys, state, path, *extra):
-	'''restore() with its state folder the one given.'''
-	capsys.readouterr()
-	code = rv.run_command(['restore', path, *extra, '--rule', str(tmp_path / 'rule.tsv'), '--state_dir', state])
-	captured = capsys.readouterr()
-	return code, captured.out, captured.err
-
-
-def test_a_write_error_a_restore_meets_on_a_vault_disk_is_recorded_for_the_daemon(job, tmp_path, capsys, monkeypatch, boot):
-	backed_up(job)
-	out = destination(tmp_path)
-	target = os.path.join(out, 'proj')
-	state = str(tmp_path / 'elsewhere')
-	# the target and the job's vault are on one disk, and the restore's sync is the one that meets its write error
-	assert disk_of(target) == disk_of(job.job_vault)
-	record(monkeypatch, fail=lambda n: write_error(n) if n == 1 else None)
-	code, stdout, err = restore_with_state(tmp_path, capsys, state, f'{job.monitor}/proj', out, '--version', '0')
-	assert code == rv.EXIT_COMMAND_FAILED and 'WARNING' not in stdout
-	# its marker is where the command's state folder is, as the daemon writes its own, and nowhere else
-	marker = rv.vault_sync_marker_path(disk_of(job.job_vault), state)
-	assert os.path.isfile(marker) and rv.read_vault_sync_marker(marker) == {'disk': disk_of(job.job_vault), 'boot_id': 'boot-1', 'error': str(write_error(1)), 'restore': True}
-	assert not os.path.lexists(rv.vault_sync_marker_path(disk_of(job.job_vault)))
-	# the daemon, which reads that folder, reports it as it does a write error another job's sync met: copies on that disk
-	# stay unchecked, and it alerts on it once, when a comparison of a job on that disk reads it, and writes the marker as its own
-	monkeypatch.setenv('REVERB_STATE_DIR', state)
-	assert rv.failed_sync_disks() == {disk_of(job.job_vault)}
-	monkeypatch.setattr(rv, 'sync_vault_filesystems', REAL_SYNC_VAULT_FILESYSTEMS)
-	capsys.readouterr()
-	assert rv.check_vault_sync(job.job_vault, job.job_name) == [disk_of(job.job_vault)]
-	out = capsys.readouterr().out
-	assert out.count('VAULT WRITE ERROR') == 1 and f'disk {disk_of(job.job_vault)} failed a sync ({write_error(1)})' in out
-	assert rv.read_vault_sync_marker(marker) == {'disk': disk_of(job.job_vault), 'boot_id': 'boot-1', 'error': str(write_error(1))}
-	# and not again
-	assert rv.check_vault_sync(job.job_vault, job.job_name) == [disk_of(job.job_vault)]
-	assert 'VAULT WRITE ERROR' not in capsys.readouterr().out
-
-
-def test_a_write_error_a_restore_meets_on_a_disk_with_no_vault_is_recorded_for_no_one(job, tmp_path, capsys, monkeypatch, fake_pool, boot):
-	backed_up(job)
-	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
-	# the pool's disk holds the target and no vault
-	assert disk_of(branches['one']) != disk_of(job.job_vault)
-	record(monkeypatch, fail=lambda n: write_error(n) if n == 1 else None)
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	assert code == rv.EXIT_COMMAND_FAILED
-	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] and 'WARNING' not in stdout
-	assert rv.failed_sync_disks() == set() and not os.path.lexists(rv.vault_sync_marker_path(disk_of(branches['one'])))
-
-
-def test_a_write_error_that_cannot_be_recorded_for_the_daemon_is_a_warning(job, tmp_path, capsys, monkeypatch, boot):
-	backed_up(job)
-	out = destination(tmp_path)
-	disk = disk_of(job.job_vault)
-	# a folder at the marker's path: the state folder cannot take it, as a restore of a user other than root finds /run/reverberator
-	os.makedirs(rv.vault_sync_marker_path(disk))
-	record(monkeypatch, fail=lambda n: write_error(n) if n == 1 else None)
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	assert code == rv.EXIT_COMMAND_FAILED
-	warnings = [line for line in stdout.splitlines() if line.startswith('WARNING')]
-	assert len(warnings) == 1 and warnings[0].startswith(f'WARNING proj: could not record the write error of disk {disk} for the daemon (')
-	assert warnings[0].endswith('): it may not learn of it, and may commit a version over copies that are not on disk')
-	assert rv.failed_sync_disks() == set()
-
-
 def test_a_dangling_chain_on_a_vault_missing_a_disk_is_not_final(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -1342,32 +1269,6 @@ def test_a_dangling_chain_on_a_vault_missing_a_disk_is_not_final(job, tmp_path, 
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert (code, err) == (0, ''), stdout
 	assert whole(target) and os.path.isfile(os.path.join(target, 'sub', 'b.txt')) and not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
-
-
-def test_a_pool_disks_write_error_is_recorded_for_the_daemon_while_the_other_disks_still_sync(tmp_path, capsys, monkeypatch, fake_pool, boot):
-	# the job's vault is on disk one of the pool: that disk's sync fails at once, and disk two's is still going
-	job = create_job(str(tmp_path / 'disks' / 'one'))
-	backed_up(job)
-	shutil.copy(job.rule_path, tmp_path / 'rule.tsv')
-	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']})
-	assert disk_of(job.job_vault) == disk_of(branches['one']) != disk_of(branches['two'])
-	one = os.lstat(branches['one']).st_ino
-	marker = rv.vault_sync_marker_path(disk_of(job.job_vault), str(tmp_path / 'state'))
-	seen = []
-
-	def syncfs(fd, path=None):
-		if os.fstat(fd).st_ino == one:
-			raise write_error(1)
-		# the other disk is still syncing: the failed one is on record by now, not once every disk has finished. Up to 2 s for
-		# the failed disk's thread to write its marker, a few file operations: it passed at a host load of about 280
-		for _ in range(200):
-			if os.path.exists(marker):
-				break
-			time.sleep(0.01)
-		seen.append(os.path.exists(marker))
-	monkeypatch.setattr(rv, 'syncfs_fd', syncfs)
-	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	assert code == rv.EXIT_COMMAND_FAILED and seen == [True]
 
 
 def recopy_summary(target, made=True, missing=False):

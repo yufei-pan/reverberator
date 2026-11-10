@@ -339,6 +339,14 @@ def run_backup(job: JobPaths, entries=None, **kwargs) -> list:
 	return committed_versions(job)
 
 
+def vault_unit(job_vault: str) -> 'rv.VaultUnit':
+	'''
+	A unit of vault work on job_vault, as a step of the daemon opens it before its first write (rv.VaultUnit), for a test that runs
+	a step's code on its own with the real sync helper: every vault sync goes through a unit's handles, and one with none open is a bug.
+	'''
+	return rv.VaultUnit(job_vault, rv.PoolGuard([job_vault]))
+
+
 def latest_version(job: JobPaths) -> 'rv.VaultEntry':
 	info = rv.get_vault_info(job.job_vault)
 	return info.vault_info_dict[next(reversed(info.vault_info_dict))]

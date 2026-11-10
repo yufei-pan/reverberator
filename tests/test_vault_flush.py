@@ -5,14 +5,17 @@ current_version moves.
 '''
 import errno
 import os
+import shutil
 import subprocess
 import sys
+import threading
 from collections import OrderedDict
 import pytest
 import TSVZ
 import reverberator as rv
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
-from tests.harness import committed_versions, event_entry, seed_monitor
+from tests.errseq import open_folders
+from tests.harness import committed_versions, event_entry, seed_monitor, vault_unit
 from tests.test_vault_scan import (cut_off_at_the_swap, keep_modified, link_number, private_folders, restart_and_scan, run_backup,
 	three_versions, vault_names)
 
@@ -71,33 +74,26 @@ def test_an_error_on_one_branch_still_flushes_the_others(tmp_path, fake_pool, mo
 	assert calls == [(os.path.join(a, 'job'), True), (os.path.join(c, 'job'), True)]
 
 
-def recording_syncfs(monkeypatch, failing=()):
-	'''rv.syncfs_folder replaced by a recorder of paths, raising EIO for those in failing and FileNotFoundError for a folder not there.'''
-	calls = []
-	def syncfs(path):
-		if not os.path.isdir(path):
-			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
-		calls.append(path)
-		if path in failing:
-			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
-	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
-	return calls
+def disk_named(path):
+	'''The disk an alert names for path: the mount point holding it in the mount table the test has.'''
+	return rv.disk_name(rv.read_mount_table(), path)
 
 
-def test_the_vault_sync_on_a_pool_reaches_each_branch_holding_it(tmp_path, fake_pool, monkeypatch):
+def test_the_vault_sync_on_a_pool_syncs_each_filesystem_holding_it_once(tmp_path, fake_pool, errseq):
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
-	calls = recording_syncfs(monkeypatch)
-	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
-	assert sorted(calls) == [os.path.join(a, 'job'), os.path.join(c, 'job')]
-	assert results == {a: None, c: None}
+	# the fake pool's branches are folders of one filesystem: one handle, at the first branch's root, and one sync
+	with vault_unit(job_path):
+		assert REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job') == {}
+	assert errseq.synced() == [(a, 0)]
 
 
-def test_the_vault_sync_on_a_pool_gives_each_branch_its_result(tmp_path, fake_pool, monkeypatch):
+def test_the_vault_sync_on_a_pool_names_the_disk_of_a_failed_sync(tmp_path, fake_pool, errseq, capsys):
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
-	calls = recording_syncfs(monkeypatch, failing=[os.path.join(a, 'job')])
-	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
-	assert sorted(calls) == [os.path.join(a, 'job'), os.path.join(c, 'job')]
-	assert results[c] is None and results[a].errno == errno.EIO and set(results) == {a, c}
+	with vault_unit(job_path):
+		errseq.fail(job_path)
+		results = REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
+	assert list(results) == [a] and results[a].errno == errno.EIO
+	assert f'VAULT WRITE ERROR: disk {a} failed a sync (' in capsys.readouterr().out
 
 
 def pool_over_one_filesystem(tmp_path, fake_pool, monkeypatch, holding):
@@ -116,11 +112,11 @@ def pool_over_one_filesystem(tmp_path, fake_pool, monkeypatch, holding):
 	return os.path.join(pool, 'job'), disk, [os.path.join(branch, 'job') for branch in branches]
 
 
-def test_two_branch_folders_on_one_filesystem_are_one_disk(tmp_path, fake_pool, monkeypatch):
+def test_two_branch_folders_on_one_filesystem_are_one_disk(tmp_path, fake_pool, monkeypatch, errseq):
 	job_path, disk, (x, y) = pool_over_one_filesystem(tmp_path, fake_pool, monkeypatch, 'xy')
 	assert rv.vault_disks(job_path) == (True, [(disk, x), (disk, y)])
-	calls = recording_syncfs(monkeypatch)
-	assert REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job') == {disk: None} and len(calls) == 1
+	with vault_unit(job_path):
+		assert REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job') == {} and len(errseq.synced()) == 1
 	# the folders are still each flushed
 	flushed = recording_fsync(monkeypatch)
 	rv.fsync_vault_folder(job_path)
@@ -128,54 +124,96 @@ def test_two_branch_folders_on_one_filesystem_are_one_disk(tmp_path, fake_pool, 
 
 
 @pytest.mark.parametrize('holding', ['x', 'y', 'xy'])
-def test_an_error_met_through_either_branch_folder_is_its_filesystems_result(tmp_path, fake_pool, monkeypatch, holding):
+def test_an_error_met_through_either_branch_folder_is_its_filesystems_result(tmp_path, fake_pool, monkeypatch, errseq, holding):
 	job_path, disk, folders = pool_over_one_filesystem(tmp_path, fake_pool, monkeypatch, holding)
-	# the kernel reports a filesystem's error once, through whichever folder's sync meets it first
-	calls = []
-	def syncfs(path):
-		if not os.path.isdir(path):
-			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
-		calls.append(path)
-		if len(calls) == 1:
-			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
-	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
-	results = REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
-	assert list(results) == [disk] and results[disk].errno == errno.EIO and len(calls) == 1
+	# the kernel reports a filesystem's error once, to the one handle of it
+	with vault_unit(job_path):
+		errseq.fail(job_path)
+		results = REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
+	assert list(results) == [disk] and results[disk].errno == errno.EIO and len(errseq.synced()) == 1
 
 
-def test_the_vault_sync_off_any_pool_reaches_the_vault_itself(tmp_path, monkeypatch):
+def test_the_vault_sync_off_any_pool_reaches_the_vault_itself(tmp_path, errseq):
 	path = str(tmp_path / 'job')
 	os.makedirs(path)
-	calls = recording_syncfs(monkeypatch)
-	results = REAL_SYNC_VAULT_FILESYSTEMS(path, 'job')
-	assert calls == [path]
-	assert results == {rv.mount_holding(rv.read_mount_table(), os.path.realpath(path))[0]: None}
+	with vault_unit(path):
+		assert REAL_SYNC_VAULT_FILESYSTEMS(path, 'job') == {}
+	assert errseq.synced() == [(path, 0)]
 
 
-def test_the_vault_sync_off_any_pool_gives_an_error_other_than_a_missing_folder_as_the_disks_result(tmp_path, monkeypatch):
+def test_the_vault_sync_off_any_pool_gives_a_write_error_as_the_disks_result(tmp_path, errseq):
 	path = str(tmp_path / 'job')
 	os.makedirs(path)
-	recording_syncfs(monkeypatch, failing=[path])
-	results = REAL_SYNC_VAULT_FILESYSTEMS(path, 'job')
-	assert list(results.values())[0].errno == errno.EIO and list(results) == [rv.mount_holding(rv.read_mount_table(), os.path.realpath(path))[0]]
+	with vault_unit(path):
+		errseq.fail(path)
+		results = REAL_SYNC_VAULT_FILESYSTEMS(path, 'job')
+	assert list(results) == [disk_named(path)] and results[disk_named(path)].errno == errno.EIO
 
 
-def test_the_vault_sync_off_any_pool_raises_for_a_vault_that_is_gone(tmp_path, monkeypatch):
-	calls = recording_syncfs(monkeypatch)
-	with pytest.raises(FileNotFoundError):
-		REAL_SYNC_VAULT_FILESYSTEMS(str(tmp_path / 'gone'), 'job')
-	assert calls == []
+def test_the_vault_sync_off_any_pool_raises_for_a_vault_that_is_gone(tmp_path, errseq):
+	# its disk may be gone too, and that says nothing of a write error
+	gone = str(tmp_path / 'gone')
+	with vault_unit(gone):
+		with pytest.raises(FileNotFoundError):
+			REAL_SYNC_VAULT_FILESYSTEMS(gone, 'job')
+	path = str(tmp_path / 'job')
+	os.makedirs(path)
+	with vault_unit(path):
+		shutil.rmtree(path)
+		with pytest.raises(FileNotFoundError):
+			REAL_SYNC_VAULT_FILESYSTEMS(path, 'job')
+	assert errseq.synced() == []
 
 
-def test_the_vault_sync_raises_when_the_branch_list_cannot_be_read(tmp_path, fake_pool, monkeypatch):
+def test_the_vault_sync_raises_when_the_branch_list_cannot_be_read(tmp_path, fake_pool, monkeypatch, errseq):
 	job_path, _ = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
 	def unreadable(mount_point):
 		raise OSError(errno.ENODATA, os.strerror(errno.ENODATA))
-	monkeypatch.setattr(rv, 'read_pool_branches', unreadable)
-	calls = recording_syncfs(monkeypatch)
-	with pytest.raises(OSError):
-		REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
-	assert calls == []
+	with vault_unit(job_path):
+		monkeypatch.setattr(rv, 'read_pool_branches', unreadable)
+		with pytest.raises(OSError):
+			REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job')
+	assert errseq.synced() == []
+
+
+def test_a_vault_swapped_at_its_path_since_the_unit_opened_fails_the_sync(tmp_path, errseq, other_filesystem):
+	# off a pool, a disk mounted again at the vault's mount point holds what its fd never saw: the job vault moved to another filesystem here
+	path = str(tmp_path / 'job')
+	os.makedirs(path)
+	with vault_unit(path):
+		os.rename(path, str(tmp_path / 'old'))
+		os.symlink(other_filesystem, path)
+		with pytest.raises(OSError, match='is not on a filesystem this step opened'):
+			REAL_SYNC_VAULT_FILESYSTEMS(path, 'job')
+	assert errseq.synced() == []
+
+
+def test_a_sync_with_no_unit_open_is_a_bug(tmp_path, errseq):
+	path = str(tmp_path / 'job')
+	os.makedirs(path)
+	with pytest.raises(RuntimeError, match=f'no unit of vault work is open for {path}'):
+		REAL_SYNC_VAULT_FILESYSTEMS(path, 'job')
+	# nor on another thread than the one that opened it
+	with vault_unit(path):
+		failed = []
+		thread = threading.Thread(target=lambda: failed.append(pytest.raises(RuntimeError, REAL_SYNC_VAULT_FILESYSTEMS, path, 'job')))
+		thread.start()
+		thread.join()
+		assert failed
+	assert errseq.synced() == []
+
+
+def test_a_unit_inside_one_of_the_same_vault_uses_its_handles_and_closes_nothing(tmp_path, errseq):
+	path = str(tmp_path / 'job')
+	os.makedirs(path)
+	with vault_unit(os.path.join(str(tmp_path), '.', 'job')):
+		opened = [event for event in errseq.events if event[0] == 'open']
+		with vault_unit(path):
+			assert [event for event in errseq.events if event[0] == 'open'] == opened
+		errseq.fail(path)
+		# the outer unit's handle, opened before the error, still open and still hearing it
+		assert list(REAL_SYNC_VAULT_FILESYSTEMS(path, 'job').values())[0].errno == errno.EIO
+	assert [event[0] for event in errseq.events].count('close') == 1 and open_folders(path) == []
 
 
 def test_the_commit_flushes_the_job_vault_after_the_swap(job, monkeypatch):

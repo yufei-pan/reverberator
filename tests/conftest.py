@@ -54,8 +54,6 @@ def isolated_runtime(tmp_path, monkeypatch):
 	rv.PRUNE_SALT_MISSING.clear()
 	# and a test's vault seen with versions must not make a later scan of a new vault at that path fail
 	rv.VAULTS_WITH_VERSIONS.clear()
-	# and a test's disk whose failed sync could not be recorded must not keep a later test's copies unchecked
-	rv.UNRECORDED_FAILED_DISKS.clear()
 	rv.RESTORE_STOP.clear()
 	# and a test's lock that could not be checked must not hold back another's FAILED marker
 	rv.JOB_LOCK_UNCHECKED.clear()

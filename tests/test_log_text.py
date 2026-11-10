@@ -31,7 +31,7 @@ def test_a_real_marker_still_matches_the_firewatcher_patterns(capsys):
 	rv.job_log('j', 'FAILED: disk gone; retrying in 60s')
 	rv.job_log('j', 'UNREADABLE: /m/café: [Errno 5] Input/output error')
 	rv.job_log('j', 'STOPPED: bad pattern')
-	rv.job_log('j', 'VAULT WRITE ERROR: disk /mnt/vaults_data/a58 failed a sync ([Errno 5] Input/output error); its copies stay unchecked until a reboot')
+	rv.job_log('j', 'VAULT WRITE ERROR: disk /mnt/vaults_data/a58 failed a sync ([Errno 5] Input/output error): nothing is committed past it, and the next attempt copies again what this one changed')
 	rv.daemon_error_log('every job is stopped')
 	assert len(alerting_lines(capsys.readouterr().out)) == 5
 

@@ -19,9 +19,10 @@ from collections import OrderedDict
 import pytest
 
 import reverberator as rv
+from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.crash_batches import apply_batch1, apply_batch2, backup_events, change_batch3, put_text, seed_base, T0
 from tests.crash_child import in_child
-from tests.harness import create_job, link_text_limit
+from tests.harness import create_job, link_text_limit, vault_unit
 from tests.scratch_images import f2fs_mount, flush_scratch, LoopImage, needs_f2fs, SCRATCH, shut_down_scratch
 from tests.vault_oracle import check_vault, daemon_links, entry_view, read_view, recorded_design_r, sizes_by_newest_holder, snapshot_tree, version_number
 from tests.version_view_ground_truth import committed_folders, wrong_lists
@@ -128,11 +129,17 @@ def cli_differences(job_vault, wanted):
 
 
 def migrate(job, stop=None):
-	'''The conversion as a first start runs it: the scan, then the migration when the layout says it is not done. Its answer.'''
+	'''
+	The conversion as a first start runs it: the scan, then the migration when the layout says it is not done, in a unit of vault
+	work as convert_at_start() opens it. Its answer.
+	'''
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
 		rv.get_vault_info(job.job_vault, manifest=manifest)
-		return True if manifest.layout() == 'r' else rv.migrate_job_vault(job.job_vault, manifest, job.job_name, stop)
+		if manifest.layout() == 'r':
+			return True
+		with vault_unit(job.job_vault):
+			return rv.migrate_job_vault(job.job_vault, manifest, job.job_name, stop)
 	finally:
 		manifest.close()
 
@@ -157,13 +164,17 @@ def test_the_054_module_cannot_flush_the_disks(tmp_path, v054, monkeypatch):
 	assert module.sync_vault_filesystems.__code__ is not rv.sync_vault_filesystems.__code__
 	assert module.sync_vault_filesystems.__module__ == 'tests.legacy054'
 	assert module.sync_vault_filesystems(str(tmp_path)) == {}
-	with pytest.raises(AssertionError):
-		module.syncfs_folder(str(tmp_path))
+	fd = os.open(str(tmp_path), os.O_RDONLY | os.O_DIRECTORY)
+	try:
+		with pytest.raises(AssertionError):
+			module.LIBC_SYNCFS(fd)
+	finally:
+		os.close(fd)
 	flushed = []
 	monkeypatch.setattr(module, 'sync_vault_filesystems', lambda job_vault: flushed.append(job_vault) or {})
 	job = create_job(str(tmp_path))
 	v054.build(job, SMALL, keep_n_versions=2)
-	# the prune of a build syncs through the stub, and syncfs_folder() would have failed the build
+	# the prune of a build syncs through the stub, and the refused binding would have failed the build
 	assert set(flushed) <= {job.job_vault}
 
 
@@ -1003,8 +1014,13 @@ def test_a_conversion_on_f2fs_uses_exchange_and_keeps_times(v054, monkeypatch):
 
 
 def flushing_for_real(module):
-	'''A conversion's flushes reach the loop image, through the one helper: a stub would count a version done that a power loss loses.'''
-	module.sync_vault_filesystems = lambda job_vault, *job_name: (flush_scratch(job_vault), {})[1]
+	'''
+	A conversion's flushes reach the loop image, at the binding: the real helper above it syncs through the handles of the unit the
+	conversion opened, and an fd's path finds its image (flush_scratch()). A stub higher up would count a version done that a power
+	loss loses.
+	'''
+	module.sync_vault_filesystems = REAL_SYNC_VAULT_FILESYSTEMS
+	module.LIBC_SYNCFS = lambda fd: flush_scratch(os.readlink(f'/proc/self/fd/{fd}')) or 0
 
 
 @needs_f2fs

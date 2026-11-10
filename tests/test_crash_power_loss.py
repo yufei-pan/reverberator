@@ -1,8 +1,8 @@
 '''
 The power loss model of the crash runs (spec section 9), behind REVERB_SCRATCH: a fresh f2fs loop image with the live disks'
 features and mount options; a child runs batch 3 and at step c the filesystem stops with no checkpoint (f2fs_io shutdown 2);
-then umount, mount, the scan and a retry, and the oracle reads every version. A vault's comparisons flush the loop image for real
-here, as a checked row means its bytes are on the disk.
+then umount, mount, the scan and a retry, and the oracle reads every version. The vault's syncs flush the loop image for real
+here, as a committed copy means its bytes are on the disk.
 
 The shutdown and the flush go through tests/scratch_images.py, which refuses anything but a loop image this process attached
 under REVERB_SCRATCH: this host holds many live f2fs mounts, and a shutdown of one takes a production filesystem down.
@@ -21,6 +21,7 @@ from collections import Counter, deque
 import pytest
 
 import reverberator as rv
+from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests import scratch_images, version_view_ground_truth as view_truth
 from tests.crash_batches import after_retries, build_base, prepare, raw_events, restore
 from tests.crash_child import in_child, kill_run, retry, run_do_backup
@@ -34,8 +35,13 @@ IMAGE_MIB = 512
 
 
 def flushing_for_real(module):
-	'''The vault's comparisons flush the loop image, through the one helper: a stub would record copies checked that a power loss loses.'''
-	module.sync_vault_filesystems = lambda job_vault, *job_name: (flush_scratch(job_vault), {})[1]
+	'''
+	The vault's syncs flush the loop image, at the binding: the real helper above it syncs through the handles each unit opened
+	before its writes, as the daemon does, and an fd's path finds its image (flush_scratch()). A stub higher up would commit copies
+	that a power loss loses, and never run through the handles.
+	'''
+	module.sync_vault_filesystems = REAL_SYNC_VAULT_FILESYSTEMS
+	module.LIBC_SYNCFS = lambda fd: flush_scratch(os.readlink(f'/proc/self/fd/{fd}')) or 0
 
 
 def recorded_version(job_vault):

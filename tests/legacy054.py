@@ -26,11 +26,11 @@ MODULE_NAME = 'reverberator054'
 # what isolated_runtime() clears on rv between tests, as far as 0.54.1 has it
 # what the fake_pool fixture patches on rv: a fake pool must show to this module too, as to a daemon on that vault
 POOL_SEAM = ('MOUNTINFO_PATH', 'FS_SIGNATURE_MONITOR', 'read_pool_branches', 'statx_mount', 'F2FS_SYSFS_PATH', 'SYS_DEV_BLOCK_PATH', 'F2FS_UNTOLD', 'POOL_CHECK_SECONDS')
-REMEMBERED = ('VERSION_MOVES', 'VERSION_MOVES_WARNED', 'PRUNE_ABORTED', 'PRUNE_SALT_MISSING', 'VAULTS_WITH_VERSIONS', 'UNRECORDED_FAILED_DISKS', 'JOB_LOCK_UNCHECKED')
+REMEMBERED = ('VERSION_MOVES', 'VERSION_MOVES_WARNED', 'PRUNE_ABORTED', 'PRUNE_SALT_MISSING', 'VAULTS_WITH_VERSIONS', 'JOB_LOCK_UNCHECKED')
 
 
-def refused_syncfs(path):
-	raise AssertionError(f'a real syncfs of {path} from the 0.54 module of the tests')
+def refused_syncfs(fd):
+	raise AssertionError(f'a real syncfs of fd {fd} from the 0.54 module of the tests')
 
 
 def load_module(folder: str):
@@ -46,7 +46,8 @@ def load_module(folder: str):
 	sys.modules[MODULE_NAME] = module
 	spec.loader.exec_module(module)
 	module.sync_vault_filesystems = lambda job_vault: {}
-	module.syncfs_folder = refused_syncfs
+	# and the binding under it refused, so nothing that module runs makes a real syncfs
+	module.LIBC_SYNCFS = refused_syncfs
 	# a test's pytest.raises(rv.JobFailure) catches this module's failures too
 	for name in ('JobFailure', 'VaultScanError', 'PoolNotReady'):
 		setattr(module, name, getattr(rv, name))

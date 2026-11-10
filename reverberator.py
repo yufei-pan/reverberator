@@ -98,7 +98,7 @@ REVERB_RULE_HEADER = ['job_name', 'mon_path','vault_path', 'mon_fs_signature',
 		'vault_fs_signature', 'skip_list_file', 'full_comparison_interval', 'chain_length', 'copy_threads']
 SKIP_LIST_COLUMN_DESCRIPTIONS = ('A gitignore style list of paths not to back up, matched relative to the monitored path', 'Relative paths resolve against the rule file folder. Once a job has used patterns, set none to back up everything')
 VAULT_ENTRY_HEADER = ['version_number','path','timestamp','size','inode']
-VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes', 'tree']
+VAULT_INFO_HEADER = ['vault_info_dict', 'vault_size' , 'vault_inodes', 'tree', 'recorded']
 VAULT_TIMESTAMP_FORMAT = '%Y-%m-%d_%H-%M-%S_%z'
 MANIFEST_RECORD_HEADER = ['kind','size','mtime_ns','mode','uid','gid','hash','link','unchecked']
 
@@ -1094,8 +1094,9 @@ def nameless_start(rule_path:str, rule):
 # the last three columns are optional: 12 positional cells still make a rule
 ReverbRule = namedtuple('ReverbRule', REVERB_RULE_HEADER, defaults=('', '', ''))
 VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
-# tree: on design R, the folder of a cut batch's tree, which the next attempt finishes (read_job_vault_r()); None with none
-VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER, defaults=[None])
+# tree: on design R, the folder of a cut batch's tree, which the next attempt finishes (read_job_vault_r()); None with none.
+# recorded: what that batch recorded in the previous version before it changed the tree, which the roll-forward copies again (prepare_roll_forward())
+VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER, defaults=[None, ()])
 ManifestRecord = namedtuple('ManifestRecord', MANIFEST_RECORD_HEADER)
 # a copy queued on an executor, which finish_copies() puts in place
 PendingCopy = namedtuple('PendingCopy', ['task', 'source_path', 'temp_path', 'dest_path'])
@@ -1892,13 +1893,10 @@ def vault_disks(path:str, roots:bool = False) -> tuple:
 	'''
 	table = read_mount_table()
 	pool = mergerfs_mount(table, path)
-	def disk_of(folder:str) -> str:
-		held = mount_holding(table, os.path.realpath(folder))
-		return held[0] if held else folder
 	if pool is None:
-		return False, [(disk_of(path), path)]
+		return False, [(disk_name(table, path), path)]
 	rel = os.path.relpath(os.path.realpath(path), pool)
-	return True, [(disk_of(branch), branch if roots else os.path.join(branch, rel)) for branch in read_pool_branches(pool)]
+	return True, [(disk_name(table, branch), branch if roots else os.path.join(branch, rel)) for branch in read_pool_branches(pool)]
 
 def on_vault_branches(path:str, action, denied:list = None) -> None:
 	'''
@@ -1936,24 +1934,12 @@ def syncfs_fd(fd:int, path:str = None) -> None:
 		code = ctypes.get_errno()
 		raise OSError(code, os.strerror(code), path)
 
-def syncfs_folder(path:str) -> None:
-	'''
-	syncfs the filesystem holding the folder at path (syncfs_fd() on it, opened now): a writeback error the filesystem met
-	and never reported to a sync (once: the next sync gets 0) is raised. Raises OSError, FileNotFoundError or
-	NotADirectoryError for a path that is no folder.
-	'''
-	fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-	try:
-		syncfs_fd(fd, path)
-	finally:
-		os.close(fd)
-
 def sync_each_disk(disks:list, sync) -> dict:
 	'''
-	sync(disk, folders) for each disk of disks, the (disk, folder) pairs vault_disks() gives, with folders the disk's
-	folders in their order (branches that are folders of one filesystem share its one sync): side by side, each disk on a
-	thread of its own when there are several, as a pool's disks write out side by side. Returns {disk: what sync
-	returned}, in the disks' order, leaving out the disks for which it returned ... .
+	sync(disk, folders) for each disk of disks, (disk, folder) pairs, with folders the disk's folders in their order
+	(branches that are folders of one filesystem share its one sync): side by side, each disk on a thread of its own when
+	there are several, as a pool's disks write out side by side. Returns {disk: what sync returned}, in the disks' order,
+	leaving out the disks for which it returned ... .
 	'''
 	folders = {}
 	for disk, folder in disks:
@@ -1966,208 +1952,179 @@ def sync_each_disk(disks:list, sync) -> dict:
 		synced = [run(disk) for disk in folders]
 	return {disk: result for disk, result in synced if result is not ...}
 
+# the units of vault work open now (VaultUnit), each by the thread that opened it and its job vault: {(thread id,
+# vault_unit_key()): VaultUnit}. A unit is opened, synced and closed on one thread, and each job's backuper runs on a
+# thread of its own, so two jobs' units never meet here
+VAULT_UNITS = {}
+
+def vault_unit_key(job_vault:str) -> str:
+	'''The spelling a job vault's unit is known by: absolute and normal, as PoolGuard holds a path.'''
+	return os.path.normpath(os.path.abspath(job_vault))
+
+class VaultUnit:
+	'''
+	The handles every vault sync of one unit of vault work goes through (sync_vault_filesystems()): a batch (do_backup()), a
+	scan (get_vault_info()) or a conversion (convert_at_start()) opens them before its first write into the job vault, and
+	they are closed when it ends, however it ends (close(), or as a context manager). Linux keeps a filesystem's writeback
+	error in its superblock and reports it to a sync through each handle that was open when it happened, but to a handle
+	opened later only while no sync has seen it: so a sync through these hears every write error the filesystem met since
+	the unit began, whoever's sync met it first, another program's, a restore's or another job's.
+
+	Whether the job vault is on a mergerfs pool, and its branches, are what guard, the step's PoolGuard, found when the step
+	began: no mount table is read. Off a pool the handle is one fd of the job vault. On a pool it is an fd of each branch
+	the pool listed, at the branch's root, as a restore opens them (open_restore_disks()), so a copy that lands on a disk
+	where the job vault was not yet is heard too; branches that are folders of one filesystem share one fd, by
+	fstat().st_dev, as the kernel keeps the error once per filesystem. A handle that cannot be opened keeps its OSError,
+	which every sync that needs it raises. A unit made while one of the same job vault is open on this thread is that one:
+	it opens and closes nothing (get_vault_info() inside do_backup(), say).
+	'''
+	def __init__(self, job_vault:str, guard:'PoolGuard'):
+		self.key = (threading.get_ident(), vault_unit_key(job_vault))
+		self.own = self.key not in VAULT_UNITS
+		if not self.own:
+			return
+		self.job_vault = job_vault
+		# off a pool: the job vault's fd, and its filesystem once a sync asked (an fstat a unit that never syncs does without)
+		self.fd = None
+		self.dev = None
+		# on a pool: the mount point and the job vault's place below it, and {st_dev: (branch, fd)}, one per filesystem
+		self.pool = None
+		self.rel = None
+		self.handles = {}
+		# (path, OSError) of each handle that could not be opened
+		self.failed = []
+		state = guard.state_of(job_vault)
+		try:
+			if state is None:
+				try:
+					self.fd = os.open(job_vault, os.O_RDONLY | os.O_DIRECTORY)
+				except OSError as e:
+					self.failed.append((job_vault, e))
+			elif state.pool is None:
+				# the mount table could not be read when the step began, and the step's guard fails it
+				self.failed.append((job_vault, OSError(f'the disks holding {job_vault} are not known: {state.problem}')))
+			else:
+				self.pool = state.pool
+				self.rel = os.path.relpath(os.path.realpath(job_vault), state.pool)
+				for branch, _ in state.ids:
+					self.open_branch(branch)
+		except BaseException:
+			self.close_handles()
+			raise
+		VAULT_UNITS[self.key] = self
+
+	def open_branch(self, branch:str) -> None:
+		'''An fd of the branch's root, kept unless another branch's is of its filesystem.'''
+		fd = None
+		try:
+			fd = os.open(branch, os.O_RDONLY | os.O_DIRECTORY)
+			dev = os.fstat(fd).st_dev
+		except OSError as e:
+			if fd is not None:
+				os.close(fd)
+			self.failed.append((branch, e))
+			return
+		if dev in self.handles:
+			os.close(fd)
+		else:
+			self.handles[dev] = (branch, fd)
+
+	def holding(self) -> list:
+		'''
+		[(path, fd)]: the handle of each filesystem holding the job vault now, once each, picked by the st_dev of the job
+		vault on each branch that holds it (off a pool, of the job vault itself). Raises OSError when one cannot be told
+		(the branch list, or a branch's job vault, cannot be read; off a pool, the job vault is gone), when a handle it
+		needs could not be opened, or when one holding it is on a filesystem no handle of this unit is on: a disk that
+		joined the pool, or one mounted at a mount point since the unit began. That fd would miss an error another sync of
+		it saw, so what was written there is not known to be on disk.
+		'''
+		if self.pool is None:
+			if self.fd is None:
+				raise self.failed[0][1]
+			if self.dev is None:
+				self.dev = os.fstat(self.fd).st_dev
+			if os.stat(self.job_vault).st_dev != self.dev:
+				raise self.not_opened(self.job_vault)
+			return [(self.job_vault, self.fd)]
+		picked = {}
+		for branch in read_pool_branches(self.pool):
+			folder = os.path.join(branch, self.rel)
+			try:
+				dev = os.stat(folder).st_dev
+			except (FileNotFoundError, NotADirectoryError):
+				# nothing of the job vault can have landed there
+				continue
+			if dev not in self.handles:
+				# a branch that could not be opened may be this one
+				raise self.failed[0][1] if self.failed else self.not_opened(folder)
+			picked[dev] = self.handles[dev]
+		return list(picked.values())
+
+	@staticmethod
+	def not_opened(folder:str) -> OSError:
+		return OSError(f'{folder} is not on a filesystem this step opened: what was written there is not known to be on disk')
+
+	def close_handles(self) -> None:
+		if self.fd is not None:
+			os.close(self.fd)
+			self.fd = None
+		for _, fd in self.handles.values():
+			os.close(fd)
+		self.handles = {}
+
+	def close(self) -> None:
+		'''The end of the unit: its handles closed, unless it is a unit open before it on this thread. Runs once.'''
+		if self.own:
+			self.own = False
+			del VAULT_UNITS[self.key]
+			self.close_handles()
+
+	def __enter__(self) -> 'VaultUnit':
+		return self
+
+	def __exit__(self, *exc) -> None:
+		self.close()
+
+def disk_name(mount_table:list, folder:str) -> str:
+	'''The disk holding folder, as an alert names it: the mount point holding it (the kernel reports a write error once per mounted filesystem), or folder itself when the table has none.'''
+	held = mount_holding(mount_table, os.path.realpath(folder))
+	return held[0] if held else folder
+
 def sync_vault_filesystems(job_vault:str, job_name:str) -> dict:
 	'''
-	Write out everything dirty on the disks holding the job vault at job_vault, for a comparison to record the copies it
-	read back as checked (compare_scopes()), once syncfs_folder() was tried on every one of them (vault_disks()): on a
-	mergerfs pool, whose sync does not reach the disks, each branch holding the job vault; off a pool, the job vault's own
-	filesystem. Each disk is synced once, through the first folder that holds the job vault: branches that are folders of one
-	filesystem share its one sync and its one error. The disks are synced at once, each on a thread of its own, as a pool's
-	disks write out side by side. Each disk's sync, and the recording of the error it met (record_failed_sync()), hold that
-	disk's lock and no other (VAULT_SYNC_LOCKS). Returns {disk: None, or the OSError its sync raised}, in the disks' order.
-	On a pool a branch without the job vault is left out; a branch list that cannot be read raises its OSError, and so does
-	a job vault gone off a pool (its disk may be gone too, and that says nothing of a write error).
+	Write out everything dirty on the filesystems holding the job vault at job_vault, through the handles of the unit of
+	vault work open for it on this thread (VaultUnit): each filesystem holding it once (VaultUnit.holding()), side by side
+	(sync_each_disk()), never through a path opened now. A sync that fails names its disk, as the mount point holding its
+	handle (disk_name()), and is alerted with the VAULT WRITE ERROR line; the caller commits nothing past it and fails the
+	attempt, so a handle's error is heard once. Returns {disk: the OSError its sync raised}, of the disks that failed only.
+	Raises OSError as VaultUnit.holding() does, with no alert, as that is no write error; RuntimeError when no unit is open
+	for the job vault on this thread, a bug, as every sync must go through handles opened before the writes it vouches for.
 	'''
-	pooled, disks = vault_disks(job_vault)
-	def sync(disk:str, folders:list):
-		# None or the OSError, or ... when no folder of it holds the job vault: a branch without it is passed over for the
-		# next one of its disk
-		with VAULT_SYNC_LOCKS.setdefault(disk, threading.Lock()):
-			for folder in folders:
-				try:
-					syncfs_folder(folder)
-					return None
-				except (FileNotFoundError, NotADirectoryError):
-					if not pooled:
-						raise
-				except OSError as e:
-					record_failed_sync(disk, e, job_name)
-					return e
-			return ...
-	return sync_each_disk(disks, sync)
-
-# the boot id the kernel makes anew at each boot, and the start of the name of a disk's marker in the state folder
-BOOT_ID_PATH = '/proc/sys/kernel/random/boot_id'
-VAULT_SYNC_MARKER_PREFIX = 'vault-sync-failed-'
-# The kernel reports a disk's writeback error once, to the first sync that meets it, so every other job's sync of the disk
-# gets 0 and its comparison would record copies checked that never reached the disk. So a disk's sync holds that disk's
-# lock until the error it met is recorded (sync_vault_filesystems()): a later sync's 0 comes after the record, and one
-# disk's slow sync holds up only the syncs of that disk. {disk, as vault_disks() names it: its lock}, kept for the
-# process, as there are few disks.
-VAULT_SYNC_LOCKS = {}
-# Held while the disks' markers and UNRECORDED_FAILED_DISKS are read or written, never during a sync, and never held while
-# a disk's lock is taken (a failed sync records under its disk's lock, so the order is the disk's lock, then this one): a
-# job reading the markers removes those of another boot, and must not take one that a failed sync of another disk has
-# just rewritten.
-VAULT_SYNC_MARKERS_LOCK = threading.Lock()
-# the disks whose failed sync could not be recorded in a marker: remembered until reverberator stops
-UNRECORDED_FAILED_DISKS = set()
-
-def current_boot_id() -> str:
-	'''This boot's id. Raises OSError when it cannot be read.'''
-	with open(BOOT_ID_PATH, 'r') as f:
-		return f.read().strip()
-
-def vault_sync_marker_path(disk:str, state_dir:str = None) -> str:
-	'''
-	The marker file of a disk: one file in the state folder (state_dir_path(state_dir)), named by the disk's path percent-encoded (unique, readable). A
-	disk path too long for the name and the temp name of mark_failed_sync() to fit a file name gets no marker: writing it
-	raises OSError, and check_vault_sync() remembers the disk in memory with its alert.
-	>>> os.path.basename(vault_sync_marker_path('/mnt/vaults_data/a58'))
-	'vault-sync-failed-%2Fmnt%2Fvaults_data%2Fa58'
-	'''
-	return os.path.join(state_dir_path(state_dir), VAULT_SYNC_MARKER_PREFIX + urllib.parse.quote(os.fsencode(disk), safe=''))
-
-def read_vault_sync_marker(path:str) -> 'dict | None':
-	'''The marker file's content ({disk, boot_id, error}), None when it cannot be read or is no marker.'''
-	try:
-		with open(path, 'r', encoding='utf-8') as f:
-			content = json.load(f)
-		return content if isinstance(content, dict) and isinstance(content.get('disk'), str) and isinstance(content.get('boot_id'), str) else None
-	except (OSError, ValueError):
-		return None
-
-def mark_failed_sync(disk:str, error:OSError, state_dir:str = None, restore:bool = False) -> bool:
-	'''
-	Remember that a sync of disk failed, until the next reboot: write its marker in the state folder (state_dir_path(state_dir),
-	made when missing), one line of JSON holding the disk, this boot's id and the error, through a temp file (named for this
-	process, as a restore and the daemon may write at once) renamed into place. Returns True; or False, writing nothing, when a
-	marker of this boot already stands for the disk. Raises OSError when the marker cannot be written. A disk's error is
-	reported once (the kernel's next sync gets 0), so this is the only memory of it. restore: a restore writes it
-	("restore": true), a marker the daemon has not alerted on yet: it stands for the disk against another restore, but not
-	against the daemon, which writes its own over it and so has the True that has it alert (record_failed_sync()). The caller
-	holds VAULT_SYNC_MARKERS_LOCK.
-	'''
-	boot_id = current_boot_id()
-	path = vault_sync_marker_path(disk, state_dir)
-	marker = read_vault_sync_marker(path)
-	if marker is not None and marker['boot_id'] == boot_id and (restore or not marker.get('restore')):
-		return False
-	os.makedirs(os.path.dirname(path), exist_ok=True)
-	temp_path = os.path.join(os.path.dirname(path), f'.{os.path.basename(path)}.{os.getpid()}.tmp')
-	try:
-		with open(temp_path, 'w', encoding='utf-8') as f:
-			f.write(json.dumps({'disk': disk, 'boot_id': boot_id, 'error': str(error), **({'restore': True} if restore else {})}) + '\n')
-		os.replace(temp_path, path)
-	except BaseException:
-		with contextlib.suppress(OSError):
-			os.remove(temp_path)
-		raise
-	return True
-
-def failed_sync_markers() -> dict:
-	'''
-	{disk: its marker's content} of the markers that hold this boot's id (read from the file's content, never from its
-	name). A marker that cannot be read is ignored; one of another boot is removed, errors ignored. A missing state folder
-	gives an empty dict. Raises OSError when the boot id cannot be read. The caller holds VAULT_SYNC_MARKERS_LOCK.
-	'''
-	boot_id = current_boot_id()
-	state = state_dir_path()
-	disks = {}
-	try:
-		names = os.listdir(state)
-	except OSError:
-		return disks
-	for name in names:
-		if not name.startswith(VAULT_SYNC_MARKER_PREFIX):
-			continue
-		path = os.path.join(state, name)
-		marker = read_vault_sync_marker(path)
-		if marker is None:
-			continue
-		if marker['boot_id'] == boot_id:
-			disks[marker['disk']] = marker
-		else:
-			with contextlib.suppress(OSError):
-				os.remove(path)
-	return disks
-
-def failed_sync_disks() -> set:
-	'''The disks of failed_sync_markers(). The caller holds VAULT_SYNC_MARKERS_LOCK.'''
-	return set(failed_sync_markers())
-
-def check_vault_sync(job_vault:str, job_name:str) -> list:
-	'''
-	The sync of a comparison's vault (sync_vault_filesystems()), and what it means for the copies the comparison read back:
-	the sorted disks holding job_vault that failed a sync now, or that failed one since boot (a marker of this boot) or
-	since reverberator started (UNRECORDED_FAILED_DISKS). Each disk that failed now is recorded (record_failed_sync()) before
-	any other sync of it gets its 0, so a sync that got 0 finds the error here. A marker of one of those disks that a restore
-	wrote ("restore": true: its own sync met the error, which the daemon never would) is alerted on here, once, with the
-	VAULT WRITE ERROR line as for a new marker of the daemon's, and rewritten as the daemon's own (record_failed_sync()), so
-	no other sync of that disk alerts again. Any exception is the caller's failed sync.
-	'''
-	results = sync_vault_filesystems(job_vault, job_name)
-	with VAULT_SYNC_MARKERS_LOCK:
-		markers = failed_sync_markers()
-		known = set(markers) | UNRECORDED_FAILED_DISKS
-	for disk in sorted(set(markers) & set(results)):
-		if markers[disk].get('restore'):
-			# not under the disk's lock: it is not a sync's error, and a marker the daemon wrote meanwhile is not written over
-			record_failed_sync(disk, OSError(str(markers[disk].get('error', ''))), job_name)
-	return sorted({disk for disk, error in results.items() if error is not None} | (known & set(results)))
+	unit = VAULT_UNITS.get((threading.get_ident(), vault_unit_key(job_vault)))
+	if unit is None:
+		raise RuntimeError(f'no unit of vault work is open for {job_vault} on this thread, so its sync has no handle opened before its writes')
+	def sync(index:int, handles:list):
+		# None, or (the disk, the OSError) of its failed sync: handles is the one handle of a filesystem
+		path, fd = handles[0]
+		try:
+			syncfs_fd(fd, path)
+			return None
+		except OSError as e:
+			try:
+				disk = disk_name(read_mount_table(), path)
+			except OSError:
+				disk = path
+			job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({e}): nothing is committed past it, and the next attempt copies again what this one changed')
+			return disk, e
+	return dict(failed for failed in sync_each_disk(list(enumerate(unit.holding())), sync).values() if failed is not None)
 
 def flush_vault_disks(job_vault:str, job_name:str) -> list:
 	'''
-	Every disk holding the job vault written out (sync_vault_filesystems()), as a prune needs before it destroys the old
-	state, and a commit before it says its copies are there: the sorted disks whose sync failed now, each recorded as
-	sync_vault_filesystems() does it. A disk that failed a sync before and syncs now is not among them: what this sync wrote
-	is on it. Raises OSError as sync_vault_filesystems() does.
+	Every filesystem holding the job vault written out (sync_vault_filesystems()), as a prune needs before it destroys the
+	old state, and a commit before it says its copies are there: the sorted disks whose sync failed, each alerted. Raises
+	OSError and RuntimeError as sync_vault_filesystems() does.
 	'''
 	return sorted(disk for disk, error in sync_vault_filesystems(job_vault, job_name).items() if error is not None)
-
-def record_failed_sync(disk:str, error:OSError, job_name:str) -> None:
-	'''
-	The failed sync of disk marked (mark_failed_sync()) and alerted once with the VAULT WRITE ERROR line, for a marker that
-	is new or that a restore wrote; when its marker cannot be written the alert says so, and the disk is remembered in
-	UNRECORDED_FAILED_DISKS. The caller holds the disk's lock (VAULT_SYNC_LOCKS), unless the error is one that a restore
-	recorded (check_vault_sync()).
-	'''
-	with VAULT_SYNC_MARKERS_LOCK:
-		try:
-			if mark_failed_sync(disk, error):
-				job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({error}); its copies stay unchecked until a reboot')
-			# its marker stands now, so it is no longer remembered only in memory
-			UNRECORDED_FAILED_DISKS.discard(disk)
-		except OSError as marker_error:
-			UNRECORDED_FAILED_DISKS.add(disk)
-			job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({error}); its marker cannot be written ({marker_error}), so its copies stay unchecked only until reverberator stops, not until a reboot')
-
-def record_restore_write_error(disk:str, error:OSError, vault_folders:list, state_dir:str = None) -> 'OSError | None':
-	'''
-	A sync of a restore met a write error on disk. The kernel reports it once, and the restore's sync marked it seen for
-	the sync of a vault's disk the daemon opens next, which then gets 0: the cross-job rule of VAULT_SYNC_LOCKS, which
-	this restore, another process, cannot take part in by a lock but only by the marker. So when disk holds a job vault
-	of vault_folders (every job of the rule file the restore read), it is recorded as the daemon records its own
-	(mark_failed_sync(), as a restore's marker: the daemon alerts on it once, when a comparison of a job whose vault is on
-	the disk reads it, check_vault_sync()), in the state folder the command uses, and the daemon's comparisons then read the
-	copies on it as unchecked until a reboot. A disk holding no vault: nothing is recorded, and nothing is its daemon's to
-	hear. Returns None, or the OSError the marker could not be written with (a restore of a user other than root cannot write in
-	/run/reverberator). A vault whose disks cannot be listed is passed over.
-	'''
-	for vault_folder in vault_folders:
-		try:
-			if any(vault_disk == disk for vault_disk, _ in vault_disks(vault_folder)[1]):
-				break
-		except OSError:
-			continue
-	else:
-		return None
-	with VAULT_SYNC_MARKERS_LOCK:
-		try:
-			mark_failed_sync(disk, error, state_dir, restore=True)
-		except OSError as e:
-			return e
-	return None
 
 # the private folder prepare_change_list() writes a change list in before place_change_list() renames it into place: made
 # by mkdtemp() in the job vault, which no reader takes for a version or a change list, and removed by get_vault_info()
@@ -4099,8 +4056,12 @@ class PoolGuard:
 
 	def covers(self, path:str) -> bool:
 		'''Whether path, one of the paths, was on a pool when the step began (or the mount table could not be read).'''
+		return self.state_of(path) is not None
+
+	def state_of(self, path:str) -> 'PoolState | None':
+		'''The pool_state() of path, one of the paths, as the step began: None when it was on no pool.'''
 		path = os.path.normpath(path)
-		return any(held == path for held, _ in self.states)
+		return next((state for held, state in self.states if held == path), None)
 
 	def poll(self) -> None:
 		# threads poll too: of those that come at once, one checks and the others go on
@@ -5556,8 +5517,15 @@ def do_backup(backup_entries:dict,
 	# the entries whose metadata could not be copied, which may lack their extended attributes in the new version
 	unsynced = []
 	opened_manifest = manifest is None
-	if opened_manifest:
-		manifest = VaultManifest(job_vault)
+	# every vault sync of this backup goes through the handles opened here, before its first write into the job vault, and
+	# closed when it ends: a write error another program's sync met first is still heard (VaultUnit)
+	unit = VaultUnit(job_vault, pool_guard)
+	try:
+		if opened_manifest:
+			manifest = VaultManifest(job_vault)
+	except BaseException:
+		unit.close()
+		raise
 	# the job's backup and restore locks, held from before anything in the vault is changed to the end of this backup,
 	# so no restore reads it meanwhile. the comparison runs without them
 	locks = BackupLocks(job_name, job=job)
@@ -5748,7 +5716,7 @@ def do_backup(backup_entries:dict,
 				if tree is not None:
 					# what the comparison read of the tree stands only if the version commits
 					manifest.rollback()
-				return VaultInfo(vault_info_dict, vault_size, vault_inodes, tree), manifest, False
+				return VaultInfo(vault_info_dict, vault_size, vault_inodes, tree, vaultInfo.recorded), manifest, False
 			if backup_limit_size:
 				while vault_size + estimated_backup_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size} exceeds backup size limit {backup_limit_size}')
@@ -5833,10 +5801,11 @@ def do_backup(backup_entries:dict,
 		# a disk mounted while this backup walked is remembered too
 		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
 		# a commit says its copies are on the disk (spec section 2.6). they are flushed before the change list is written, as the
-		# list's fsync is a checkpoint, which keeps a new file's size and not its data. a comparison's clean sync after the last copy
-		# flushed them already (manifest.copies_unsynced). a roll-forward always flushes: it commits what the cut batch left in the tree,
-		# whose copies' rows went with that batch, and nothing tells which of them are on the disk yet.
-		# so does a batch of two renames: a disk's own order says nothing of the manifest's on another, whatever the batch changed
+		# list's fsync is a checkpoint, which keeps a new file's size and not its data: whenever the batch placed a copy
+		# (manifest.copies_unsynced), through the handles its unit opened before its first write, so a write error another
+		# program's sync met first is still heard. a roll-forward always flushes: it commits what the cut batch left in the tree,
+		# and nothing tells which of it is on the disk yet. so does a batch of two renames: a disk's own order says nothing of the
+		# manifest's on another, whatever the batch changed
 		if tree is not None or manifest.copies_unsynced or (writer is not None and writer.two_renames):
 			try:
 				flush_copies(job_vault,job_name,backup_folder)
@@ -5901,6 +5870,7 @@ def do_backup(backup_entries:dict,
 		raise
 	finally:
 		locks.release()
+		unit.close()
 
 def flush_copies(job_vault:str, job_name:str, version_path:str) -> None:
 	'''
@@ -6724,12 +6694,14 @@ def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest') -> 
 	if put_back:
 		forget_pool_cache(previous)
 
-def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> None:
+def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> list:
 	'''
 	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4), so the versions read exact
 	from here on, and a restore can run before the monitored path is back. Each real folder of the previous version gets its
-	times back (give_back_folder_times()), and the files recorded are marked unchecked, in a transaction of its own, as the tree
-	may hold another copy now where the row still says version n's: the comparison reads them there. A link a cut exchange left
+	times back (give_back_folder_times()). Returns what the batch recorded there before it changed the tree: its real folders,
+	ending with /, and its regular files, links left out. The tree may hold another copy of each of those files now, which a
+	write error some other sync saw, or a power cut, may have left wrong at its right size, mtime and tail: the roll-forward
+	copies them again (roll_forward_entries()). A link a cut exchange left
 	in a folder's place in the tree is no concern of it: the comparison and the sweep of the whole tree take it. A record cut between
 	two renames gets its link back first (put_back_forward_links()), and a link hiding what a record put in on another disk goes before that
 	(remove_shadowed_links()); a lost manifest has no rows to tell it by. A name of the tree left of two kinds goes (remove_mixed_names()). Idempotent: a cut here repeats it. Raises OSError or sqlite3.Error.
@@ -6740,17 +6712,15 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> None:
 		put_back_forward_links(previous, info.tree, manifest)
 	remove_mixed_names(previous, info.tree)
 	recorded = give_back_folder_times(previous, manifest)
-	manifest.begin()
-	manifest.mark_unchecked(rel for rel in recorded if not rel.endswith('/'))
-	manifest.commit()
+	return [rel for rel in recorded if rel.endswith('/') or stat.S_ISREG(os.lstat(os.path.join(previous, rel)).st_mode)]
 
 def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 	'''
 	The rows of version n as far as they say what is in the tree of a cut batch: each row's mode and owner, a folder's mtime and a
 	link's text are read from the tree, and a row whose entry is gone or of another kind has no record, which the comparison
 	treats as a new entry. That batch may have changed any of them, and the monitored tree may have gone back since: a
-	comparison with the old row would say nothing differs. A file's contents are left to its unchecked mark
-	(prepare_roll_forward()). The caller holds the transaction, as these rows stand only if the version commits: a repeated
+	comparison with the old row would say nothing differs. A file the batch wrote over is copied again
+	(roll_forward_entries()). The caller holds the transaction, as these rows stand only if the version commits: a repeated
 	roll-forward needs version n's folder times again. One look at each row, on a path that a crash alone takes.
 	'''
 	changed = []
@@ -6780,30 +6750,47 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 		changed_since_wall:int = None, pool_guard:'PoolGuard' = None) -> OrderedDict:
 	'''
 	What the roll-forward of the tree info.tree replays (plan S4): what a full comparison finds between the monitored tree and that
-	tree, and one thing more from the entries a stop saved (given): each plain file "modify", "create" or "move" that the comparison did
-	not find, under either form of its key, while the monitored path is a regular file now, replayed as a modify. A file rewritten at its
-	size, with its mtime set back, looks the same to the comparison however it was written (in place, removed and made again, or a file
-	renamed over it), and only the watcher saw it; a copy of an unchanged file is only a spare one. No other saved entry is used (no folder,
+	tree, and two things more. Each file the cut batch wrote into the tree is copied again, never read back: a write error that
+	some other sync saw before this attempt's handles opened, or a power cut, may have left its copy wrong at its right size, mtime
+	and tail, and nothing can tell. Those are the regular files it recorded in the previous version (info.recorded,
+	prepare_roll_forward()), and, over a manifest that does not describe the previous version, as a lost one, whose rows are listed
+	from the tree, what it made there too (new_in_tree()). Each of them whose monitored path is a regular file now is trusted by the
+	comparison, as present and of its kind, and replayed as a modify; one that is not is compared as any other entry. And from the
+	entries a stop saved (given): each plain file "modify", "create" or "move" that the comparison did not find, under either form
+	of its key, while the monitored path is a regular file now, replayed as a modify. A file rewritten at its size, with its mtime
+	set back, looks the same to the comparison however it was written (in place, removed and made again, or a file renamed over
+	it), and only the watcher saw it; a copy of an unchanged file is only a spare one. No other saved entry is used (no folder,
 	delete or attribute change): the comparison covers the whole tree, and an entry it did not find would fight what it
 	found, as a file that became a folder since would. delta_generate_backup_entries() is never called on it, as it commits naming the
-	version it compares, and it would name the tree. All of it is in a transaction the commit of the version ends, or a cut rolls back; a manifest
-	that does not describe the previous version, as a lost one, lists the tree first. A stop leaves the comparison partial, for the caller to
-	throw away. JobFailure rolls back and goes on up. skip, paused, job_name, reported and changed_since_wall are compare_scopes()'s;
-	pool_guard's pools must have stayed whole.
+	version it compares, and it would name the tree. All of it is in a transaction the commit of the version ends, or a cut rolls back. A
+	stop leaves the comparison partial, for the caller to throw away. JobFailure rolls back and goes on up. skip, paused, job_name,
+	reported and changed_since_wall are compare_scopes()'s; pool_guard's pools must have stayed whole.
 	'''
+	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
+	# what the cut batch wrote over, and, over a rebuilt manifest, what it made
+	wrote = [rel for rel in info.recorded if not rel.endswith('/')]
 	manifest.begin()
 	try:
-		if not manifest.describes(info.vault_info_dict[next(reversed(info.vault_info_dict))].path):
+		if not manifest.describes(previous):
 			backuperTeeLogToTl(path=monitor_path,message=f'Manifest does not describe the version before {info.tree}, listing the tree')
-			manifest.rebuild(info.vault_info_dict[next(reversed(info.vault_info_dict))].path,tree_path=info.tree)
+			manifest.rebuild(previous,tree_path=info.tree)
+			wrote += new_in_tree(previous, info.tree, [''] + [rel.rstrip('/') for rel in info.recorded if rel.endswith('/')])
 		read_rows_from_tree(manifest, info.tree)
+		walk_skip = skip_paused(skip, paused)
+		again = [os.path.join(monitor_path, rel) for rel in wrote if not skipped_rel(walk_skip, rel) and is_regular_file(os.path.join(monitor_path, rel))]
 		found = OrderedDict()
-		compare_scopes(found, manifest, info.tree, monitor_path, TouchedScopes([''], [], None, changed_since_wall), skip=skip, paused=paused, job_name=job_name, reported=reported, folder_times=True)
+		compare_scopes(found, manifest, info.tree, monitor_path, TouchedScopes([''], [], None, changed_since_wall), skip=skip, paused=paused, job_name=job_name, reported=reported,
+			trusted=frozenset(os.path.relpath(path, monitor_path) for path in again), folder_times=True)
 		if pool_guard is not None:
 			pool_guard.require()
 	except JobFailure:
 		manifest.rollback()
 		raise
+	for path in again:
+		if path in found or path + '/' in found:
+			continue
+		if is_regular_file(path):
+			found[path] = BackupEntryValues(datetime.datetime.now().isoformat(), 'modify', None)
 	for path, values in given.items():
 		if values.event not in ('modify', 'create', 'move') or path.endswith('/') or path in found or path + '/' in found:
 			continue
@@ -6814,6 +6801,56 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 			# gone, or a parent of it is a file now: the comparison says what is there
 			pass
 	return found
+
+def is_regular_file(path:str) -> bool:
+	'''Whether path is a regular file now, not following a link; False when it cannot be looked at.'''
+	try:
+		return stat.S_ISREG(os.lstat(path).st_mode)
+	except OSError:
+		return False
+
+def skipped_rel(skip, rel:str) -> bool:
+	'''Whether skip (a walk's skip predicate, or None) leaves out the entry rel, a file\'s, or a folder it is in.'''
+	parent = rel.rpartition('/')[0]
+	return skip is not None and (skip(rel) or (bool(parent) and skips_folder_or_parent(skip, parent + '/')))
+
+def new_in_tree(previous:str, tree:str, folders:list) -> list:
+	'''
+	The regular files of the tree of a cut batch that the batch made: each entry of a real folder of the previous version
+	(folders, rels with no trailing /, '' for its root) that the folder does not list beside its twin in the tree, and all
+	under such an entry. A real folder lists every entry the tree held when it was made real, and a new entry always has
+	one as its parent, as TreeWriter.make_folders() makes it real first: so these are the batch's creates and the targets of
+	its moves. A folder gone from the tree, or not a folder there, holds none. Raises OSError when a folder cannot be read.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     kept, tree = os.path.join(folder, 'V1--x'), os.path.join(folder, 'V2--x')
+		...     for path in (kept, tree, os.path.join(tree, 'new')): os.mkdir(path)
+		...     for path in (os.path.join(kept, 'old'), os.path.join(tree, 'old'), os.path.join(tree, 'made'), os.path.join(tree, 'new', 'f')): open(path, 'w').close()
+		...     os.symlink('old', os.path.join(tree, 'link'))
+		...     sorted(new_in_tree(kept, tree, ['']))
+		['made', 'new/f']
+	'''
+	made = []
+	errors = []
+	for folder in folders:
+		try:
+			with os.scandir(os.path.join(tree, folder)) as entries:
+				held = list(entries)
+		except (FileNotFoundError, NotADirectoryError):
+			continue
+		listed = set(os.listdir(os.path.join(previous, folder)))
+		for entry in held:
+			if entry.name in listed:
+				continue
+			rel = os.path.join(folder, entry.name)
+			if entry.is_dir(follow_symlinks=False):
+				made.extend(below for path, below, is_dir in iter_tree_entries(entry.path, rel + '/', errors=errors) if not is_dir and is_regular_file(path))
+			elif entry.is_file(follow_symlinks=False):
+				made.append(rel)
+	if errors:
+		raise OSError(errno.EIO, f'cannot read {", ".join(rel for rel, _ in errors)} in {tree}')
+	return made
 
 def measure_previous(previous:str, tree:str) -> tuple:
 	'''
@@ -7042,7 +7079,7 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	info = VaultInfo(vault_info_dict, sum(entry.size for entry in vault_info_dict.values()), sum(entry.inode for entry in vault_info_dict.values()), tree)
 	if tree is not None:
 		try:
-			prepare_roll_forward(info, manifest)
+			info = info._replace(recorded=prepare_roll_forward(info, manifest))
 		except (OSError, sqlite3.Error) as e:
 			raise VaultScanError(f'cannot make the tree {tree} ready for its roll-forward: {e}')
 	return info
@@ -7084,25 +7121,21 @@ def read_vault_whole(job_vault_path:str, guard:PoolGuard, judge_orphans:bool = T
 	return listing
 
 def remove_stale_change_lists(job_vault_path:str, listing:VaultListing, guard:PoolGuard) -> None:
-	'''Remove listing.stale, the lists whose folders are gone. Raises PoolNotReady, having removed none, with a disk missing once they are flushed.'''
+	'''
+	Remove listing.stale, the lists whose folders are gone. Raises PoolNotReady, having removed none, with a disk missing once
+	they are flushed, and JobFailure, having removed none, when the flush fails.
+	'''
 	stale = listing.stale
 	if stale and guard.covers(job_vault_path):
 		# on a pool the folder's removal may not be on every disk yet: one that comes back from a cut with a part of it
-		# would hold a version folder no list names, which no scan takes. every disk is flushed first, and a list stays
-		# while that fails
+		# would hold a version folder no list names, which no scan takes. every disk is flushed first, and a flush that fails
+		# fails the attempt with the lists kept, as nothing goes on past a failed sync
+		flush_or_fail(job_vault_path, os.path.basename(job_vault_path), f'{", ".join(os.path.basename(path) for path in stale)}, whose folders are gone, stay for now; the next scan removes them')
 		try:
-			failed_disks = flush_vault_disks(job_vault_path, os.path.basename(job_vault_path))
-		except OSError as e:
-			failed_disks = [f'({e})']
-		if failed_disks:
-			backuperTeeLogToTl(job_vault_path, f'Keeping {", ".join(os.path.basename(path) for path in stale)}, whose folders are gone, for now: the disks of the vault cannot all be flushed ({", ".join(failed_disks)})', error=True)
-			stale = []
-		else:
-			try:
-				guard.require()
-			except PoolNotReady as e:
-				backuperTeeLogToTl(job_vault_path, f'Cannot finish the vault scan, no list or folder in it is removed: {e.reason}', error=True)
-				raise
+			guard.require()
+		except PoolNotReady as e:
+			backuperTeeLogToTl(job_vault_path, f'Cannot finish the vault scan, no list or folder in it is removed: {e.reason}', error=True)
+			raise
 	for path in stale:
 		backuperTeeLogToTl(job_vault_path, f'Vault path {path.rpartition("--")[0]} for content {os.path.basename(path)} does not exist, deleting content file...', error=True)
 		try:
@@ -7136,50 +7169,53 @@ def get_vault_info(job_vault_path:str,manifest:'VaultManifest' = None) -> VaultI
 	# a disk of the vault pool that drops while the vault is read hides what it holds: what the read shows is acted on
 	# only with every disk there all along
 	guard = PoolGuard([job_vault_path])
-	if scan_gets_r_rules(job_vault_path, manifest):
-		try:
-			guard.require()
-		except PoolNotReady as e:
-			backuperTeeLogToTl(job_vault_path, f'Cannot scan the vault, nothing in it is removed: {e.reason}', error=True)
-			raise
-		own_manifest = manifest is None
-		if own_manifest:
-			manifest = VaultManifest(job_vault_path)
-		try:
-			return read_job_vault_r(job_vault_path, manifest, os.path.basename(job_vault_path))
-		finally:
+	# every vault sync of the scan goes through the handles opened here, before it writes (VaultUnit): those of the batch
+	# when a batch scans
+	with VaultUnit(job_vault_path, guard):
+		if scan_gets_r_rules(job_vault_path, manifest):
+			try:
+				guard.require()
+			except PoolNotReady as e:
+				backuperTeeLogToTl(job_vault_path, f'Cannot scan the vault, nothing in it is removed: {e.reason}', error=True)
+				raise
+			own_manifest = manifest is None
 			if own_manifest:
-				manifest.close()
-	listing = read_vault_whole(job_vault_path, guard)
-	if listing is None:
-		return VaultInfo({},0,0)
-	for name in listing.kept:
-		backuperTeeLogToTl(job_vault_path, f'Keeping {name}: it names no folder there, and its name does not say it is the change list of a version gone', error=True)
-	if listing.cut_off is not None:
-		# the guard above found every disk of the vault there all along
-		undo_cut_off_commit(job_vault_path, listing)
-	remove_stale_change_lists(job_vault_path, listing, guard)
-	remove_unfinished_change_lists(job_vault_path, listing)
-	if listing.orphans:
-		# a matched key naming an orphan, as a commit cut off leaves it, goes first: a commit later in the same second
-		# reuses the folder name, and the key would claim a time the vault never matched. one that cannot go stays, as
-		# only that reuse makes it count, and a scan that fails over it would stop the job
-		try:
-			forget_manifest_meta(job_vault_path, version=False, gone={os.path.basename(path) for path in listing.orphans})
-		except (OSError, sqlite3.Error) as e:
-			backuperTeeLogToTl(job_vault_path, f'Cannot forget the matched time of a version being removed: {e}', error=True)
-	kept = [(path, why) for path in listing.orphans if (why := remove_orphan(job_vault_path, path)) is not None]
-	if kept:
-		raise VaultScanError(f'cannot remove the incomplete versions {", ".join(f"{path} ({why})" for path, why in kept)}, and a backup would make a version of their number beside them')
-	move_current_version_forward(job_vault_path, listing)
-	vault_info_dict = OrderedDict()
-	vault_size = 0
-	vault_inodes = 0
-	for number, entry in sorted(listing.versions.items()):
-		vault_size += entry.size
-		vault_inodes += entry.inode
-		vault_info_dict[number] = entry
-	return VaultInfo(vault_info_dict, vault_size, vault_inodes)
+				manifest = VaultManifest(job_vault_path)
+			try:
+				return read_job_vault_r(job_vault_path, manifest, os.path.basename(job_vault_path))
+			finally:
+				if own_manifest:
+					manifest.close()
+		listing = read_vault_whole(job_vault_path, guard)
+		if listing is None:
+			return VaultInfo({},0,0)
+		for name in listing.kept:
+			backuperTeeLogToTl(job_vault_path, f'Keeping {name}: it names no folder there, and its name does not say it is the change list of a version gone', error=True)
+		if listing.cut_off is not None:
+			# the guard above found every disk of the vault there all along
+			undo_cut_off_commit(job_vault_path, listing)
+		remove_stale_change_lists(job_vault_path, listing, guard)
+		remove_unfinished_change_lists(job_vault_path, listing)
+		if listing.orphans:
+			# a matched key naming an orphan, as a commit cut off leaves it, goes first: a commit later in the same second
+			# reuses the folder name, and the key would claim a time the vault never matched. one that cannot go stays, as
+			# only that reuse makes it count, and a scan that fails over it would stop the job
+			try:
+				forget_manifest_meta(job_vault_path, version=False, gone={os.path.basename(path) for path in listing.orphans})
+			except (OSError, sqlite3.Error) as e:
+				backuperTeeLogToTl(job_vault_path, f'Cannot forget the matched time of a version being removed: {e}', error=True)
+		kept = [(path, why) for path in listing.orphans if (why := remove_orphan(job_vault_path, path)) is not None]
+		if kept:
+			raise VaultScanError(f'cannot remove the incomplete versions {", ".join(f"{path} ({why})" for path, why in kept)}, and a backup would make a version of their number beside them')
+		move_current_version_forward(job_vault_path, listing)
+		vault_info_dict = OrderedDict()
+		vault_size = 0
+		vault_inodes = 0
+		for number, entry in sorted(listing.versions.items()):
+			vault_size += entry.size
+			vault_inodes += entry.inode
+			vault_info_dict[number] = entry
+		return VaultInfo(vault_info_dict, vault_size, vault_inodes)
 
 
 def is_subpath(child, parent):
@@ -8335,8 +8371,8 @@ class VaultManifest:
 
 	def __init__(self, job_vault:str):
 		self.path = os.path.join(job_vault, MANIFEST_FILE_NAME)
-		# whether a copy placed in the version being written may not be on the disk yet: finish_copies() and a record made by a copy set it, a comparison's
-		# clean sync of the vault and the commit's flush (do_backup()) clear it. a batch commits only copies that are on the disk
+		# whether a copy placed in the version being written may not be on the disk yet: finish_copies() and a record made by a copy set it, and the
+		# commit's flush (do_backup()) clears it. a batch commits only copies that are on the disk
 		self.copies_unsynced = False
 		try:
 			self._open()
@@ -8688,10 +8724,6 @@ class VaultManifest:
 	def set_folder_mtimes(self, pairs):
 		'''Record the mtime of each folder row of (mtime_ns, folder rel ending with /) pairs that holds a record; the caller holds the transaction.'''
 		self.conn.executemany("UPDATE entries SET mtime_ns = ? WHERE path = ? AND kind = 'd'", ((mtime_ns, storable_name(rel)) for mtime_ns, rel in pairs))
-
-	def mark_unchecked(self, rels):
-		'''Mark the file records of rels unchecked, keeping the rest: each is a new copy of what it records, which delta generation reads back.'''
-		self.conn.executemany("UPDATE entries SET unchecked = 1 WHERE path = ? AND kind = 'f'", ((storable_name(rel),) for rel in rels))
 
 	def take_dirty_records(self, limit:int) -> list:
 		'''The rels of the dirty rows, each with its record, as (rel, record or None): the record is kept only for a row mark_vouched() marked.'''
@@ -10074,11 +10106,9 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	The vault is read, at version_path only, for unverified rows and unchecked copies, and what is read is recorded, as
 	delta_generate_backup_entries() describes. The trusted rels are rows this backup wrote from the monitored tree and
 	has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder from a file,
-	and never read back, so their copies stay unchecked. A file read back is recorded checked only after one sync of the
-	vault's filesystems made in this comparison, before its first such record (sync_vault_filesystems()); when that fails,
-	every file record it stores is unchecked, with one warning. A disk whose sync failed is marked until the next reboot
-	(mark_failed_sync(): the kernel reports a writeback error once), and while a disk holding the vault has its marker
-	every comparison's copies are unchecked, so the restart after the reboot reads them back.
+	and never read back, so their copies stay unchecked. A file read back is recorded checked with no sync of its own:
+	every copy a version commits was flushed through its batch's handles before its commit (do_backup()), and a cut
+	batch's files are trusted and copied again by its roll-forward (roll_forward_entries()).
 	Without attributes, attribute-only differences are left out. With scopes.changed_since or changed_since_wall, the
 	extended attributes of the entries changed since then, by their ctime (ctime_bound()), are compared too
 	(compare_entry()), never those of a trusted row. With folder_times, folders' mtimes are compared too
@@ -10131,35 +10161,12 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	recorded = 0
 	walk_errors = []
 	path_errors = []
-	# whether this comparison has synced the vault's filesystems yet, and whether that failed
-	synced = False
-	sync_failed = False
 	def settle(limit):
-		nonlocal recorded, synced, sync_failed
+		nonlocal recorded
 		while len(pending) > limit:
 			monitor_entry, rel, outcome = pending.popleft()
 			event, found = outcome.result() if isinstance(outcome, Future) else outcome
 			if found is not None:
-				if found.kind == 'f':
-					if not synced and not found.unchecked:
-						# the first copy to record as checked: all those read back here were made before this sync, so
-						# once it succeeds they are on the disks. a data-write error is reported once, to the first sync
-						# after it, so check_vault_sync() marks the disk until the reboot: every comparison that syncs
-						# it keeps its copies unchecked, not only the one whose sync saw the error
-						synced = True
-						try:
-							bad_disks = check_vault_sync(os.path.dirname(os.path.abspath(version_path)), job_name)
-							if not bad_disks:
-								# every copy placed so far is on the disks: only a copy placed after this sync still needs the commit's flush
-								manifest.copies_unsynced = False
-							if bad_disks:
-								sync_failed = True
-								backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed since boot on {", ".join(disk + (" (remembered only until reverberator stops: its marker could not be written)" if disk in UNRECORDED_FAILED_DISKS else "") for disk in bad_disks)}, so this comparison\'s copies read back stay unchecked')
-						except Exception as e:
-							sync_failed = True
-							backuperTeeLogToTl(path=monitor_path,warning=True,message=f'The sync of the vault failed ({e}), so this comparison\'s copies read back stay unchecked')
-					if sync_failed:
-						found = found._replace(unchecked=1)
 				manifest.set_records(((rel, found),))
 				recorded += 1
 			if event and (attributes or event != 'attrib'):
@@ -11335,8 +11342,8 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	for one: the whole rm -rf then removes only that link), then the whole by one more, which alone says whether it went.
 	On a mergerfs pool, where one request can change two disks and each comes back from a power loss at its own last
 	checkpoint, PRUNE_MARKER_FILE_NAME names the oldest version, fsynced, before the walk changes anything; after the walk
-	and the records every disk of the job vault is flushed (flush_vault_disks(); a disk whose sync fails keeps the oldest
-	version, with its marker and alert) and the pools required whole, then the marker names none, and the change lists go
+	and the records every disk of the job vault is flushed (flush_vault_disks(); a disk whose sync fails is alerted and keeps the
+	oldest version, its marker naming it) and the pools required whole, then the marker names none, and the change lists go
 	only after a second flush, once the folder is gone. A prune that finds the marker naming its oldest version, or
 	cannot read it, follows one cut off before its first flush: after the walk it links back each file of the oldest
 	version that the next one should hold but lacks (rows_dropping()'s rule, its place by VersionMoves.place(); at its own
@@ -11534,7 +11541,7 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	pooled = guard.covers(job_vault)
 	def flush_disks() -> 'str | None':
 		# every disk of the job vault's pool written out (flush_vault_disks()), then the pools required whole: None, or why
-		# the reference vault is kept (a disk whose sync failed now is marked, with its alert)
+		# the reference vault is kept (a disk whose sync failed now is alerted)
 		flush_started = time.monotonic()
 		try:
 			failed_disks = flush_vault_disks(job_vault, job_name)
@@ -12673,8 +12680,8 @@ class TreeWriter:
 		st = os.lstat(source)
 		linked = link_or_copy(source, dest)
 		if not linked and self.manifest is not None:
-			# a copy where hard links are refused is written like any copy: the commit's flush puts it on the disk (spec section 2.6),
-			# or a comparison's clean sync after it. record(), hl_record(), unfold() and hard_link_tree() all come through here
+			# a copy where hard links are refused is written like any copy: the commit's flush puts it on the disk (spec section 2.6).
+			# record(), hl_record(), unfold() and hard_link_tree() all come through here
 			self.manifest.copies_unsynced = True
 		if stat.S_ISLNK(st.st_mode):
 			self.sizes.record_dropped(0, 1)
@@ -13216,9 +13223,13 @@ def convert_at_start(job_vault:str, info:VaultInfo, job_name:str, monitor_path:s
 	'''
 	manifest = VaultManifest(job_vault)
 	wait = None
+	unit = None
 	try:
 		if manifest.layout() == 'r':
 			return info
+		# every vault sync of the conversion, and of its cut prune and its scan, goes through the handles opened here, before
+		# its first write (VaultUnit)
+		unit = VaultUnit(job_vault, PoolGuard([job_vault]))
 		if job is not None:
 			wait = job.begin_wait(None, 'converting the vault from 0.54')
 		if vault_layout(job_vault, manifest) == '0.54':
@@ -13232,6 +13243,8 @@ def convert_at_start(job_vault:str, info:VaultInfo, job_name:str, monitor_path:s
 	finally:
 		if wait is not None:
 			job.end_wait(wait)
+		if unit is not None:
+			unit.close()
 		manifest.close()
 
 # what TreeWriter.pre_record() does with a rel: makes the previous version's folder there real, or records the entry there
@@ -15136,13 +15149,9 @@ class RestoreReport:
 	restores, the marker of a folder target while it is there, and whether it left a folder target private as not
 	everything was restored.
 	'''
-	def __init__(self, vault_incomplete:bool = False, vault_folders:list = (), state_dir:str = None):
+	def __init__(self, vault_incomplete:bool = False):
 		# whether a disk of the vault's pool is missing (vault_pool_warning()), so the walk of the vault may not meet what it holds
 		self.vault_incomplete = vault_incomplete
-		# the job vaults of the rule file the restore read, and the state folder the command uses: a write error a sync of the
-		# restore meets on a disk holding one is recorded for the daemon (record_restore_write_error())
-		self.vault_folders = vault_folders
-		self.state_dir = state_dir
 		self.version = None
 		self.rel = ''
 		self.target = None
@@ -15794,10 +15803,8 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 	target), so what the restore reports done is on disk: syncfs_fd() of each of disks.handles, the handles
 	open_restore_disks() opened before the first copy, and never of a path opened now, so each reports every writeback
 	error its disk met since, even one another process's sync met first. A pool's disks are synced side by side
-	(sync_each_disk()). No sync is recorded as sync_vault_filesystems() records its own, but a write error it meets on a
-	disk holding a vault of the rule file is recorded for the daemon (record_restore_write_error()), by the disk's own
-	sync as soon as it failed: the kernel reports an error once, so the daemon's next sync of that disk would get 0, and the
-	restore's sync is the one that took it. One that cannot be recorded is a warning. On a pool
+	(sync_each_disk()). The daemon needs no word of an error a restore's sync took: each of its batches syncs through
+	handles opened before its own writes (VaultUnit), which hear it whoever saw it first. On a pool
 	the pool is listed again, as a disk may have joined it since the claim (a branch added, or a disk mounted where a
 	branch's folder was): it has no handle, and one opened now would miss an error another sync of it already saw, so one
 	that holds the restore's folder now (a copy may have landed there) fails the restore, saying so; one that does not
@@ -15812,26 +15819,20 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 		return False
 
 	def sync(disk:str, handles:list):
-		# None, or (why the disk is not known to hold what was restored, the OSError that kept a write error of its sync from
-		# being recorded for the daemon: None when it was recorded, when the disk holds no vault, or when the sync did not fail)
+		# None, or why the disk is not known to hold what was restored
 		if isinstance(handles[0], OSError):
-			return f'the disk {disk} could not be opened to write the restore out to it ({handles[0]}): what was restored may not be on it', None
+			return f'the disk {disk} could not be opened to write the restore out to it ({handles[0]}): what was restored may not be on it'
 		try:
 			syncfs_fd(handles[0], folder)
 		except OSError as e:
-			# recorded for the daemon at once, in this disk's own thread: not once every other disk was synced, nor after any output
-			unrecorded = record_restore_write_error(disk, e, report.vault_folders, report.state_dir)
 			if after_hand_over:
-				return f"the disk {disk} reported a write error as the restore's last changes were written out to it ({e}): the files restored are on disk, but their folders' owners, modes and times and the marker's removal may not be", unrecorded
-			return f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it', unrecorded
+				return f"the disk {disk} reported a write error as the restore's last changes were written out to it ({e}): the files restored are on disk, but their folders' owners, modes and times and the marker's removal may not be"
+			return f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it'
 		return None
 	synced = True
-	for disk, result in sync_each_disk(disks.handles, sync).items():
-		if result is not None:
-			message, unrecorded = result
+	for disk, message in sync_each_disk(disks.handles, sync).items():
+		if message is not None:
 			report.fail(rel, message, rerun=False)
-			if unrecorded is not None:
-				report.warn(rel, f'could not record the write error of disk {disk} for the daemon ({unrecorded}): it may not learn of it, and may commit a version over copies that are not on disk')
 			synced = False
 	if disks.listed is not None:
 		try:
@@ -16609,7 +16610,7 @@ def restore_command(args) -> int:
 					entry = None
 				if entry is None or restore_failure(entry, version) is None:
 					aside = move_target_aside(target)
-			report = RestoreReport(vault_incomplete=warned, vault_folders=[job_vault_path(each) for each in rules], state_dir=args.state_dir)
+			report = RestoreReport(vault_incomplete=warned)
 			try:
 				if args.accept:
 					accept_restore(job_vault, version, rule.mon_path, rel, target, report)

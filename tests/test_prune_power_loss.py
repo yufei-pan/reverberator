@@ -20,7 +20,7 @@ from collections import OrderedDict
 import pytest
 import reverberator as rv
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
-from tests.harness import create_job, daemon, event_entry, run_backup, seed_monitor
+from tests.harness import create_job, daemon, event_entry, run_backup, seed_monitor, vault_unit
 
 pytestmark = pytest.mark.unit
 
@@ -73,8 +73,10 @@ def three_versions(tmp_path):
 
 
 def prune(job):
+	'''The 0.54 prune of the oldest version, in a unit of vault work as the start's conversion runs it (finish_cut_prune()).'''
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
-	return info, rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=b's' * 16)
+	with vault_unit(job.job_vault):
+		return info, rv.decrement_stepper(info, job.job_name, job.monitor, prune_salt=b's' * 16)
 
 
 # --- the marker ---
@@ -342,12 +344,15 @@ def test_the_scan_flushes_a_pool_before_it_deletes_a_stale_list(tmp_path, monkey
 	stale = [name for name in os.listdir(job.job_vault) if name.startswith(os.path.basename(v0.path) + '--')]
 	assert len(stale) == 1
 	flushes = as_pool(monkeypatch, failing=['/mnt/disk_a'] if flush == 'failing' else ())
-	lines = logged(monkeypatch)
+	if flush == 'failing':
+		# nothing goes on past a failed sync: the scan fails the attempt, the list kept for the next one
+		with pytest.raises(rv.JobFailure, match='/mnt/disk_a failed a sync, so .*whose folders are gone, stay for now'):
+			rv.get_vault_info(job.job_vault)
+		assert flushes == [job.job_vault] and os.path.exists(os.path.join(job.job_vault, stale[0]))
+		return
 	info = rv.get_vault_info(job.job_vault).vault_info_dict
 	assert list(info) == [1, 2] and flushes == [job.job_vault]
-	assert os.path.exists(os.path.join(job.job_vault, stale[0])) == (flush == 'failing')
-	if flush == 'failing':
-		assert any(message.startswith('Keeping ') and 'cannot all be flushed (/mnt/disk_a)' in message for message, _ in lines)
+	assert not os.path.exists(os.path.join(job.job_vault, stale[0]))
 
 
 def test_the_scan_of_a_single_filesystem_flushes_nothing(tmp_path, monkeypatch):
@@ -360,28 +365,30 @@ def test_the_scan_of_a_single_filesystem_flushes_nothing(tmp_path, monkeypatch):
 	assert flushes == [] and not [name for name in os.listdir(job.job_vault) if name.startswith(os.path.basename(v0.path))]
 
 
-def test_the_disks_of_a_vault_sync_side_by_side(tmp_path, monkeypatch):
-	# each disk once, through its first folder holding the vault, on threads of their own
+def test_the_filesystems_of_a_vault_sync_side_by_side(tmp_path, fake_pool, errseq, monkeypatch, other_filesystem):
+	# each filesystem once, through its one handle, on threads of their own: two folders of one filesystem share it
 	import threading
-	folders = [str(tmp_path / name) for name in 'abcd']
-	for folder in folders[1:]:
-		os.makedirs(folder)
-	monkeypatch.setattr(rv, 'vault_disks', lambda path: (True, [('d1', folders[0]), ('d1', folders[1]), ('d2', folders[2]), ('d3', folders[3])]))
+	pool = str(tmp_path / 'pool')
+	os.makedirs(pool)
+	branches = [str(tmp_path / 'disks' / 'a'), str(tmp_path / 'disks' / 'b'), os.path.join(other_filesystem, 'c')]
+	fake_pool.add(pool, branches)
+	for branch in branches:
+		os.makedirs(os.path.join(branch, 'job'))
+	os.makedirs(os.path.join(pool, 'job'))
+	job_vault = os.path.join(pool, 'job')
 	barrier = threading.Barrier(2, timeout=5)
-	synced = []
-	def syncfs(path):
-		if not os.path.isdir(path):
-			raise FileNotFoundError(errno.ENOENT, 'ENOENT', path)
-		synced.append(path)
-		if path != folders[3]:
-			# d1 and d2 wait for each other: run one after the other, this would time out
-			barrier.wait()
-		else:
-			raise OSError(errno.EIO, 'EIO', path)
-	monkeypatch.setattr(rv, 'syncfs_folder', syncfs)
-	results = REAL_SYNC_VAULT_FILESYSTEMS(str(tmp_path), 'job')
-	assert list(results) == ['d1', 'd2', 'd3'] and results['d1'] is None and results['d2'] is None
-	assert results['d3'].errno == errno.EIO and sorted(synced) == sorted(folders[1:])
+	real = errseq.syncfs
+	def syncfs(fd):
+		# the two filesystems wait for each other: run one after the other, this would time out
+		barrier.wait()
+		return real(fd)
+	monkeypatch.setattr(rv, 'LIBC_SYNCFS', syncfs)
+	with vault_unit(job_vault):
+		errseq.fail(os.path.join(branches[2], 'job'))
+		results = REAL_SYNC_VAULT_FILESYSTEMS(job_vault, 'job')
+	# the other filesystem's sync failed, and is named by its disk; the first one's synced
+	assert list(results) == [os.path.realpath(branches[2])] and results[os.path.realpath(branches[2])].errno == errno.EIO
+	assert sorted(code for _, code in errseq.synced()) == [0, errno.EIO] and len(errseq.synced()) == 2
 
 
 # --- the rule, against the real replay: every chain link of V1 into V0 removed ---
@@ -794,7 +801,8 @@ def test_every_cut_state_on_a_pool_loses_nothing_after_the_rerun(monkeypatch):
 				scanned = rv.get_vault_info(job.job_vault).vault_info_dict
 				before[mix] = survey(job, pool, expect)
 				if 0 in scanned:
-					rv.decrement_stepper(scanned, job.job_name, job.monitor, prune_salt=b's' * 16)
+					with vault_unit(job.job_vault):
+						rv.decrement_stepper(scanned, job.job_name, job.monitor, prune_salt=b's' * 16)
 				assert list(rv.get_vault_info(job.job_vault).vault_info_dict) == [1, 2], mix
 				results[mix] = survey(job, pool, expect)
 		bad = {mix: result for mix, result in results.items() if any(result)}

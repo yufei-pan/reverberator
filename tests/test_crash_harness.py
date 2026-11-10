@@ -521,7 +521,7 @@ def test_a_kill_during_the_retry_is_safe(r_vault):
 
 
 def rows_checked(job):
-	'''Every file row checked, as a full comparison leaves a live vault's: only what the roll-forward marks is read back from the tree.'''
+	'''Every file row checked, as a full comparison leaves a live vault's: only what the roll-forward copies again is not taken from its row.'''
 	connection = sqlite3.connect(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME))
 	with connection:
 		connection.execute("UPDATE entries SET unchecked = 0 WHERE kind = 'f'")
@@ -675,8 +675,9 @@ def test_the_locks_are_free_between_the_scan_and_the_roll_forward(plain_r_vault,
 	prepared_scans = []
 	real_prepare = rv.prepare_roll_forward
 	def preparing(*args):
-		real_prepare(*args)
+		recorded = real_prepare(*args)
 		prepared_scans.append(args[0].tree)
+		return recorded
 	monkeypatch.setattr(rv, 'prepare_roll_forward', preparing)
 	real_wait = rv.wait_for_path
 	waiting = threading.Event()
@@ -1019,11 +1020,12 @@ def put_a_file_back(vault):
 	put_text(vault.job.monitor, 'a/x.txt', 'ax2', base['a/x.txt'].mtime_ns)
 
 
-def test_no_unchecked_marks_fails_the_oracle(plain_r_vault):
+def test_no_copy_again_of_what_the_cut_batch_wrote_fails_the_oracle(plain_r_vault):
 	vault = plain_r_vault
-	def no_marks(rv):
-		rv.VaultManifest.mark_unchecked = lambda self, rels: None
-	found = first_wrong(vault, no_marks, change=lambda: put_a_file_back(vault))
+	def no_copy_again(rv):
+		real = rv.prepare_roll_forward
+		rv.prepare_roll_forward = lambda info, manifest: (real(info, manifest), [])[1]
+	found = first_wrong(vault, no_copy_again, change=lambda: put_a_file_back(vault))
 	assert found is not None and any("'a/x.txt'" in line for line in found[1]), found
 
 

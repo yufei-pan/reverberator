@@ -96,20 +96,20 @@ class CutPoints(KillPoints):
 
 def real_flushes(points: CutPoints = None):
 	"""
-	A crash child's fault: a flush of the vault is the real helper (sync_vault_filesystems(): the disks of the pool, a thread and a lock for each, the record of
-	a failed sync), with the system call under it a syncfs of that folder's image (flush_scratch()), and one step of points for the whole flush. The step is
-	taken outside the helper's threads. What the helper takes as arguments is its own: nothing here repeats its signature.
+	A crash child's fault: a flush of the vault is the real helper (sync_vault_filesystems(): the handles the step's unit opened, one per filesystem of
+	the pool, a thread for each), with the system call under it, at the binding, a syncfs of the image its fd is open on (flush_scratch(), by the fd's
+	path), and one step of points for the whole flush. The step is taken outside the helper's threads. What the helper takes as arguments is its own:
+	nothing here repeats its signature.
 	"""
 	def fault(module):
-		def syncfs(folder):
-			if not os.path.isdir(folder):
-				raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), folder)
-			flush_scratch(folder)
+		def syncfs(fd):
+			flush_scratch(os.readlink(f'/proc/self/fd/{fd}'))
+			return 0
 		def sync(*args, **kwargs):
 			if points is not None:
 				points.step('flush')
 			return REAL_SYNC_VAULT_FILESYSTEMS(*args, **kwargs)
-		module.syncfs_folder = syncfs
+		module.LIBC_SYNCFS = syncfs
 		module.sync_vault_filesystems = sync
 	return fault
 
