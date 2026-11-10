@@ -92,7 +92,7 @@ def test_a_restore_that_returned_survives_a_power_loss(backed_up, image, monkeyp
 def test_without_its_sync_a_restore_loses_files_at_a_power_loss(backed_up, image, monkeypatch):
 	# the control: with no sync of the target, the same cut loses what the restore wrote, so the test above can see a missing sync
 	dest = destination(image)
-	monkeypatch.setattr(rv, 'sync_restore', lambda *args: True)
+	monkeypatch.setattr(rv, 'sync_restore', lambda *args, **kwargs: True)
 	assert restore(backed_up, dest, monkeypatch) == 0
 	shut_down_scratch(image.mount_point)
 	image.remount()
@@ -105,12 +105,12 @@ def test_a_cut_before_the_first_sync_leaves_the_marker_and_a_run_again_finishes(
 	sync_restore = rv.sync_restore
 	cut = []
 
-	def cutting(disks, folder, report, rel):
+	def cutting(disks, folder, report, rel, **kwargs):
 		# the power goes after the copies, before their sync
 		if not cut:
 			cut.append(folder)
 			shut_down_scratch(image.mount_point)
-		return sync_restore(disks, folder, report, rel)
+		return sync_restore(disks, folder, report, rel, **kwargs)
 	monkeypatch.setattr(rv, 'sync_restore', cutting)
 	assert restore(backed_up, dest, monkeypatch) == rv.EXIT_COMMAND_FAILED
 	assert cut == [target]
