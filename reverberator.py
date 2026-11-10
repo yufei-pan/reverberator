@@ -3320,10 +3320,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					elif event.mask & flags.MOVE_SELF:
 						# this watch's folder was renamed, as the kernel tells its own watch after the rename's MOVED_FROM and
 						# MOVED_TO. a move the events follow put the watch where it went (a pair) or holds it (a move-out, until
-						# it pairs or expires), and settle() checks one a walk found (its step 1); but a move read in a folder
-						# made since the last take keeps no cookie, and leaves the watch, in newDirWDs by the rules that keep it,
-						# at its old path: unless a probe finds it there, settle() looks for it ( its step 2 )
-						if event.wd in newDirWDs and event.wd not in notes.found and event.wd not in notes.outgoing and event.wd in wdDic:
+						# it pairs or expires); but a move read in a folder made since the last take keeps no cookie, and leaves
+						# the watch, in newDirWDs or found by the rules that keep newDirWDs, at its old path: unless a probe finds
+						# it there, settle() looks for it ( its step 2; a found one that step 1 puts in place is settled there )
+						if (event.wd in newDirWDs or event.wd in notes.found) and event.wd not in notes.outgoing and event.wd in wdDic:
 							strays = set()
 							if probe_at(wdDic[event.wd], strays) != event.wd:
 								notes.doubtful.setdefault(event.wd, wdDic[event.wd])
