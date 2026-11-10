@@ -648,9 +648,11 @@ def test_the_roll_forward_over_a_rebuilt_manifest_copies_again_what_the_cut_batc
 # a file that took the place of an entry of another kind: what the cut batch recorded there is a link, a folder, or (for what is
 # new under a folder that took a file's place) nothing, and the comparison must not read the file back for any of them. Each
 # shape is cut, its file's middle overwritten, and rolled forward with the manifest standing and with it lost.
-# On 5b93a71: link_to_file fails in both manifest states, and folder_to_file and file_to_folder fail with the manifest lost
-# (the roll-forward kept only recorded regular files, and new_in_tree() skipped a name both folders list); folder_to_file and file_to_folder
+# On 5b93a71: link_to_file fails in both manifest states, and folder_to_file, file_to_folder and dirlink_to_folder fail with the
+# manifest lost (the roll-forward kept only recorded regular files, and new_in_tree() skipped a name both folders list); those three
 # with the manifest standing pass there, and pin that the comparison finds a create where a row of another kind stands.
+# dirlink_to_folder is the one that needs new_in_tree() to tell a user's link to a folder from a real folder (kind_at(twin) == 'd',
+# not isdir()): a twin that is a link to a folder must still be new, and with isdir() its lost-manifest case reads y/f back.
 KIND_SHAPES = {
 	# a user's link replaced by a file: the file is the new tree's x
 	'link_to_file': dict(file='x', events=[(False, 'delete', 'x', None), (False, 'create', 'x', None)]),
@@ -658,6 +660,8 @@ KIND_SHAPES = {
 	'folder_to_file': dict(file='d', events=[(False, 'delete', 'd/inner.txt', None), (True, 'delete', 'd', None), (False, 'create', 'd', None)]),
 	# a file replaced by a folder holding a new file
 	'file_to_folder': dict(file='small.txt/a', events=[(False, 'delete', 'small.txt', None), (True, 'create', 'small.txt', None), (False, 'create', 'small.txt/a', None)]),
+	# a user's link to a folder (y -> d) replaced by a folder holding a new file
+	'dirlink_to_folder': dict(file='y/f', events=[(False, 'delete', 'y', None), (True, 'create', 'y', None), (False, 'create', 'y/f', None)]),
 }
 
 
@@ -666,15 +670,44 @@ def change_kind(job, shape):
 	for rel, text in base_files.items():
 		put_text(job.monitor, rel, text)
 	os.symlink('small.txt', os.path.join(job.monitor, 'x'))
+	os.symlink('d', os.path.join(job.monitor, 'y'))
 	run_backup(job, **KEPT)
-	if shape == 'link_to_file':
-		os.remove(os.path.join(job.monitor, 'x'))
-	elif shape == 'folder_to_file':
+	if shape == 'folder_to_file':
 		shutil.rmtree(os.path.join(job.monitor, 'd'))
-	else:
+	elif shape == 'file_to_folder':
 		os.remove(os.path.join(job.monitor, 'small.txt'))
+	else:
+		# a link of either kind goes
+		os.remove(os.path.join(job.monitor, 'x' if shape == 'link_to_file' else 'y'))
 	put_text(job.monitor, KIND_SHAPES[shape]['file'], big_text('n1'))
 	return KIND_SHAPES[shape]['events']
+
+
+def lose_the_manifest(job):
+	for name in (rv.MANIFEST_FILE_NAME, rv.MANIFEST_FILE_NAME + '-journal'):
+		if os.path.lexists(os.path.join(job.job_vault, name)):
+			os.remove(os.path.join(job.job_vault, name))
+
+
+def recording_rebuilds(monkeypatch):
+	'''The tree_path of each rebuild of the manifest from now on: a roll-forward over a lost manifest rebuilds it from the cut batch's tree.'''
+	rebuilt = []
+	real = rv.VaultManifest.rebuild
+	monkeypatch.setattr(rv.VaultManifest, 'rebuild', lambda self, version_path, tree_path=None: rebuilt.append(tree_path) or real(self, version_path, tree_path))
+	return rebuilt
+
+
+def contents_of(root):
+	'''What a tree holds, nothing followed: {rel: ('l', text) | ('d',) | ('f', bytes)}, the daemon's own files left out.'''
+	found = {}
+	for folder, folders, files in os.walk(root):
+		for name in folders + files:
+			path = os.path.join(folder, name)
+			rel = os.path.relpath(path, root)
+			if rel.startswith('.reverberator'):
+				continue
+			found[rel] = ('l', os.readlink(path)) if os.path.islink(path) else ('d',) if os.path.isdir(path) else ('f', read_bytes(path))
+	return found
 
 
 @pytest.mark.parametrize('manifest', ['standing', 'lost'])
@@ -687,17 +720,66 @@ def test_the_roll_forward_copies_again_a_file_that_took_the_place_of_another_kin
 	assert os.path.isfile(os.path.join(tree, rel)) and not os.path.islink(os.path.join(tree, rel))
 	overwrite_middle(os.path.join(tree, rel))
 	if manifest == 'lost':
-		for name in (rv.MANIFEST_FILE_NAME, rv.MANIFEST_FILE_NAME + '-journal'):
-			if os.path.lexists(os.path.join(r_job.job_vault, name)):
-				os.remove(os.path.join(r_job.job_vault, name))
+		lose_the_manifest(r_job)
+	rebuilt = recording_rebuilds(monkeypatch)
 	reads, copies = recording_reads_and_copies(monkeypatch)
 	roll_forward(r_job)
+	# a lost manifest is rebuilt from the tree (test 10's case), and a standing one is not
+	assert bool([tree_path for tree_path in rebuilt if tree_path]) == (manifest == 'lost')
 	source = os.path.join(r_job.monitor, rel)
 	assert rel not in reads
 	assert source in copies
 	newest = committed_versions(r_job)[-1]
 	assert os.path.isfile(os.path.join(newest, rel)) and not os.path.islink(os.path.join(newest, rel))
 	assert read_bytes(os.path.join(newest, rel)) == read_bytes(source)
+
+
+# ---- the roll-forward over a lost manifest reaches through no link
+# On c661652 both fail with the manifest lost and pass with it standing (pins): new_in_tree() listed what a link of the tree led to, as a
+# link stood where a recorded real folder was (a: ELOOP, for a link naming its own place), and the roll-forward took each recorded
+# name under a link of the monitored tree for a regular file of that tree and replayed it as a modify (b: d/inner.txt copied).
+
+@pytest.mark.parametrize('manifest', ['standing', 'lost'])
+def test_the_roll_forward_commits_over_the_link_a_cut_exchange_left_in_a_folders_place(r_job, monkeypatch, manifest):
+	# a folder deleted is recorded by swapping it with the previous version's forward link, which is then unlinked: a cut between leaves
+	# the tree holding at the folder's name a link whose text names its own place (TreeWriter.exchange_in()'s docstring; test_r_scan.py
+	# builds the same state). With the manifest lost, new_in_tree() listed it (ELOOP) and no attempt could commit; standing, it is a pin.
+	base(r_job)
+	shutil.rmtree(os.path.join(r_job.monitor, 'd'))
+	cut_before_the_commit(r_job, [(False, 'delete', 'd/inner.txt', None), (True, 'delete', 'd', None)], monkeypatch)
+	tree = tree_of(r_job)
+	# the batch recorded the folder in the previous version, and the tree holds nothing at its name until the link goes there
+	assert not os.path.lexists(os.path.join(tree, 'd')) and os.path.isfile(os.path.join(committed_versions(r_job)[-1], 'd', 'inner.txt'))
+	os.symlink(rv.forward_text('d', os.path.basename(tree)), os.path.join(tree, 'd'))
+	if manifest == 'lost':
+		lose_the_manifest(r_job)
+	rebuilt = recording_rebuilds(monkeypatch)
+	roll_forward(r_job)
+	assert bool([tree_path for tree_path in rebuilt if tree_path]) == (manifest == 'lost')
+	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
+	assert 'd' not in contents_of(committed_versions(r_job)[-1])
+
+
+@pytest.mark.parametrize('manifest', ['standing', 'lost'])
+def test_the_roll_forward_copies_nothing_a_link_of_the_monitored_tree_leads_to(r_job, monkeypatch, manifest, tmp_path):
+	# a folder moved out and an absolute link put in its place: the monitored d/inner.txt is a regular file through the link, and is
+	# no entry of the monitored tree. Nothing of what the link leads to is copied, whatever its size. (With the manifest standing, the
+	# replay of the delete of each row under the link is refused with a "Not removing ..." error line, on 5b93a71 too: no assertion on it)
+	base(r_job)
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	shutil.move(os.path.join(r_job.monitor, 'd'), str(outside / 'd'))
+	put_text(str(outside), 'd/extra.txt', big_text('x0'))
+	os.symlink(str(outside / 'd'), os.path.join(r_job.monitor, 'd'))
+	cut_before_the_commit(r_job, [(True, 'delete', 'd', None), (False, 'create', 'd', None)], monkeypatch)
+	if manifest == 'lost':
+		lose_the_manifest(r_job)
+	reads, copies = recording_reads_and_copies(monkeypatch)
+	roll_forward(r_job)
+	assert [source for source in copies if source.startswith(os.path.join(r_job.monitor, 'd') + os.sep)] == []
+	newest = committed_versions(r_job)[-1]
+	assert contents_of(newest) == contents_of(r_job.monitor)
+	assert contents_of(newest)['d'] == ('l', str(outside / 'd'))
 
 
 # ---- 9. no markers
