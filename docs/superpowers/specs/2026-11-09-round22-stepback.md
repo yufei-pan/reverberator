@@ -54,8 +54,8 @@ plus one sentence in a third (section 6).
 - **A folder move-out read in a new folder is marked by the moved folder's own `IN_MOVE_SELF`** (the MOVE_SELF rule,
   3.3). This replaces the same-read skip and its look by path. Under the skip, the look ran at nearly every rename:
   20,000 renames inside a new folder cost 14.9 to 15.6 s of watcher CPU, against 0.50 to 0.56 s on 0.55.1. They now
-  cost what 0.55.1's do (section 7). The rule covers found watches too. It opens one window that the skip did not have
-  (section 4).
+  cost what 0.55.1's do (section 7). The rule covers found watches too. It opened one window that the skip did not
+  have; the main session ruled it Fix now, and the old `newDirWDs` serves the rule until the next take (section 4).
 - **`settle()`'s walked and copied places are sets,** and each place looks up its parents (3.4, step 5). As a list,
   the cost grew with the square of the folders placed in one settle.
 - **Rules 2 and 3 of 3.2 each have a shape that needs them,** at 28 visits, beyond review 5's bounds (3.2).
@@ -222,8 +222,9 @@ zero (`guarded()`). A move whose source folder's watch or destination folder's w
 the `MOVED_TO`'s `wd`) is a delete and a create, never a rename in the vault, for a file as for a folder.
 
 **A watch that leaves `wdDic` leaves every set** (`found`, `leaving`, `doubtful`, `newDirWDs`, and its `outgoing`
-entry), wherever it goes: `DELETE_SELF`, `UNMOUNT`, `follow_inner_mounts()`'s and `remove_newly_skipped_watches()`'s
-removals, a walk's unreadable folder, the settle. Removing, letting go of, or flagging a wd that is no longer in
+entry; `new_before_take`, read only with `wdDic`, is the exception, section 4), wherever it goes: `DELETE_SELF`,
+`UNMOUNT`, `follow_inner_mounts()`'s and `remove_newly_skipped_watches()`'s removals, a walk's unreadable folder, the
+settle. Removing, letting go of, or flagging a wd that is no longer in
 `wdDic` does nothing (`remove_watches()` skips it, as 0.55.1's `remove_moved_away_watches()` did; today it raises
 `KeyError`). Watch numbers are not given again soon (round 22's fact 11), so a late let-go never touches another
 folder's watch.
@@ -345,7 +346,7 @@ in a new folder keeps no cookie, so nothing pairs it or expires it. The moved fo
 - **Tests.** `tests/test_watch_settle.py` pins fact H. It also runs a folder made in a new folder, renamed in it and
   then out of the tree in one read, with another made at its first name, both watched before and never watched. Without
   the rule, the watched case keeps a stale watch (3 of 3).
-- **Its one window** is in section 4.
+- **Its window at a take,** and the set kept for it until the next take (`new_before_take`), are in section 4.
 
 Any other subfolder's `IN_MOVE_SELF` is skipped, as on 0.55.1. File moves follow the same rows (guarded or not); a
 file's move-out holds no watch.
@@ -477,9 +478,9 @@ reaches a folder, nothing watches it: about 8 µs a folder, 0.15 s at 17,200 fol
   `DELETE_SELF` and `UNMOUNT` handling; a subfolder's `MOVE_SELF` skipped, but for the MOVE_SELF rule (3.3).
 - **Comes:** `found`, `outgoing` (a count), `leaving`, `doubtful` and `guarded()`; `move_watches()`, which also returns
   the watches it moved (for rule 1); `settle()` with its three-way probe; `queued_events()` (`FIONREAD`, with `import
-  termios`); the MOVE_SELF rule (3.3); `WATCH_RESULT_OVERFLOW` and the carried max-delay time;
-  `found` and rule 3 in `initializeFolderWatchers()`, and `found` in `follow_inner_mounts()`; the INFO lines of
-  section 5.
+  termios`); the MOVE_SELF rule (3.3) and `new_before_take` (section 4); `WATCH_RESULT_OVERFLOW` and the carried
+  max-delay time; `found` and rule 3 in `initializeFolderWatchers()`, and `found` in `follow_inner_mounts()`; the INFO
+  lines of section 5.
 
 ### 3.8 Why each harm is closed
 
@@ -546,30 +547,49 @@ What the step back leaves, reasoned, not run, each with its bucket:
   watch, of a folder holding the mount point leaves the mount's watches mapped in the tree. It needs a disk mounted below
   a folder made in the same batch, and a folder inside the new one and above the mount point moved out of the tree in
   that batch; 0.55.1 is the same. Proposed: not an issue.
-- **A move-out of a new folder whose `IN_MOVE_SELF` is read after a take** (a residual race of the cost pass's
-  MOVE_SELF rule, reasoned; no gate shows it, as the schedule harness reads a rename's events together). Its bucket is
-  open for the main session.
-  - **The window.** The rule needs the watch in `newDirWDs` (or `found`) when its `IN_MOVE_SELF` is read, and a take
-    clears `newDirWDs` right after the read that sees it. A read can end between the move-out's `MOVED_FROM`, read on
-    the new folder's watch (so no cookie), and its `IN_MOVE_SELF`: fact H counted 886 of 18,087 reads doing so under a
-    stream of renames. If a batch is also taken before the next read, that read clears `newDirWDs` first and then skips
-    the `IN_MOVE_SELF`.
-  - **The result.** The watch stays mapped at its old path in the tree while its folder is outside, until that folder
-    is deleted or the watch restarts. Its later events come at that path. A create there names a path that does not
-    exist. A rename inside it is a rename in the vault at that path: review 5's F1 route, which gives wrong bytes once
-    another folder holds that path with two files that end alike (size, mtime and the last 64 KiB).
-  - **What it needs, all together:**
-    - a read that ends inside the rename, which is common when renames are dense;
-    - a take seen at the very next read, as a maximum-delay take under a busy tree can be;
-    - a folder inside a folder made since the last take, moved out of the tree;
-    - another folder later put at its old path;
-    - a rename outside between two files that end alike.
-  - **Compared with the skip.** The same-read skip had no such window, as it looked at the `MOVED_FROM` in that read.
-  - **A narrowing, proposed and not built.** Keep the `newDirWDs` of before a take for the read after it, for the rule
-    alone: a swap at the take, and one more set lookup for each `IN_MOVE_SELF` in that read. I think, from my reading of
-    the kernel's rename notification (not checked here), that the kernel queues the `IN_MOVE_SELF` inside the same
-    rename call as its pair. If so, the read after holds it, unless the renaming thread was preempted between the two
-    events for a whole read of the watcher, which is the class of fact E.
+- **A move-out of a new folder whose `IN_MOVE_SELF` is read after a take: closed** (the main session's ruling: Fix
+  now), but for one case left, of fact E's class.
+  - **The window,** as the cost pass found it. The rule needs the watch in `newDirWDs` (or `found`) when its
+    `IN_MOVE_SELF` is read, and a take cleared `newDirWDs` right after the read that saw it. A read can end between the
+    move-out's `MOVED_FROM`, read on the new folder's watch (so no cookie), and its `IN_MOVE_SELF`: fact H counted 886 of
+    18,087 reads doing so under a stream of renames. If a batch was also taken before the `IN_MOVE_SELF` was read, that
+    read cleared `newDirWDs` first and then skipped the `IN_MOVE_SELF`.
+  - **What it did.** The watch stayed mapped at its old path in the tree while its folder was outside, until that folder
+    was deleted or the watch restarted. Its later events came at that path. A create there named a path that does not
+    exist. A rename inside it was a rename in the vault at that path: review 5's F1 route, which gives wrong bytes once
+    another folder holds that path with two files that end alike (size, mtime and the last 64 KiB). The same-read skip
+    had no such window, as it looked at the `MOVED_FROM` in that read.
+  - **The fix.** At a take, the watcher starts a new `newDirWDs` and keeps the old one (`new_before_take`) for the
+    MOVE_SELF rule alone, until the next take. The rule looks at `newDirWDs`, `found` and `new_before_take`.
+    `new_before_take` is read only together with `wdDic`, so a watch that leaves the map needs no removal from it (the
+    exception to "a watch that leaves `wdDic` leaves every set", 3.2): watch numbers are not given again soon (round 22's
+    fact 11).
+  - **Why until the next take, not for one read** (the ruling's first form). The kernel queues the `IN_MOVE_SELF` before
+    `rename()` returns (`tests/test_watch_settle.py`, fact H), but the renaming thread can be preempted between its
+    rename's `MOVED_FROM` or `MOVED_TO` and its `IN_MOVE_SELF` while other threads' events fill a whole read. A probe on
+    real inotify measured it: 20,000 to 200,000 renames by 1 to 64 threads (each renaming its own watched folders out of
+    the tree and back, with a write between), under a reader that reads as the watcher does and spends 0 to 200 µs after
+    each read.
+    - With one renaming thread, all 91 reads that ended between a rename's event and its `IN_MOVE_SELF` had it in the
+      next read.
+    - With 4 to 64 threads, 35 of 1,675 had it two or more reads later.
+
+    With the old set kept for one read only, two of the test's four cases below still fail.
+  - **The tests.** `tests/test_watch_settle.py` runs the window in process on real inotify.
+    - The read ends right after the move-out's `MOVED_FROM`, and a batch is taken before the next read.
+    - The `IN_MOVE_SELF` comes in that read, or in the read after it.
+    - Then a folder is made at the old path with two files alike in size, mtime and last 64 KiB, and a rename is made in
+      the folder outside.
+
+    Without the fix, all four cases (two each) keep the stale watch, and the version keeps the wrong bytes of `n/x/h`
+    (3 of 3 runs). With one read only, the cases where the `IN_MOVE_SELF` comes a read later fail the same way.
+  - **What is left.** An `IN_MOVE_SELF` read after two takes since its move-out. That needs the renaming thread stalled
+    inside one rename for a whole batch period: a take, the batch's backup, and the next take. This is fact E's class:
+    a rename's window widened by preemption.
+  - **Its cost.**
+    - The watch numbers of the folders made in one batch period are kept one batch period longer, as a set.
+    - An `IN_MOVE_SELF` of such a folder's watch that no move-out holds costs one probe, as it does for the current
+      period's. That is a rename within the tree of a folder made in the batch before.
 
 ## 5. What changes for the operator
 
@@ -1006,9 +1026,9 @@ Each ruling that was the main session's, each call this spec made on its own, an
 19. **The cost pass** (the main session's rulings on the build's report):
     - **The MOVE_SELF rule (3.3)** replaces the same-read skip and its fallback. It covers found watches, the build's
       call after `found_out`. The look by path stays only for a moved folder with no watch of its own.
-    - **Open: its residual race** (section 4). A move-out of a new folder whose `IN_MOVE_SELF` is read after a take
-      leaves a stale watch, and with it review 5's F1 route. Proposed, not built: keep the set from before the take for
-      the read after it.
+    - **Its window at a take** (section 4): ruled Fix now. The old `newDirWDs` serves the rule until the next take,
+      where the ruling said one read: this pass's call, as a probe found the `IN_MOVE_SELF` two or more reads late
+      under concurrent renames. What is left is a stall across two takes, which is fact E's class.
     - **Settled:** settle step 5's sets (ruling 2); version 0.55.4 on 0.55.3.
     - **Open, the reviewer's:** rules 2 and 3 show only at 28 visits.
     - **Open, the user's:** finding C, limitation 1's copy by its plain route (`mv X /out/X; mv Y X; mv /out/X/a
