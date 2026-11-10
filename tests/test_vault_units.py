@@ -20,7 +20,8 @@ import pytest
 import reverberator as rv
 from tests.crash_batches import backup_events, put_text
 from tests.errseq import open_folders
-from tests.harness import committed_versions, create_job, run_backup, write_rule
+from tests.harness import committed_versions, create_job, run_backup, vault_unit, write_rule
+from tests.scratch_images import needs_mount, ScratchTmpfs
 from tests.vault_oracle import check_vault, snapshot_tree, version_number
 
 pytestmark = pytest.mark.unit
@@ -437,6 +438,39 @@ def test_a_disk_that_joins_the_pool_holding_the_job_vault_fails_the_sync(r_job, 
 	assert len(synced) == 1 and synced[0][4] == 0
 	roots = {os.path.realpath(path) for path in fake_pool.pools[pool][:2]}
 	assert [path for kind, path, fd in (event for event in errseq.events[:marks[0]] if event[0] == 'open') if fd == synced[0][1] and os.path.realpath(path) in roots]
+
+
+# ---- 5, in the VM: a disk swapped at its mount point, off a pool and on one (root, to mount a tmpfs)
+
+def swapped_sync_fails(job, disk, folder, capsys):
+	'''A unit opened, a sync through it, the disk at folder swapped and the job vault made again there: the next sync raises, naming it.'''
+	with vault_unit(job.job_vault):
+		assert rv.sync_vault_filesystems(job.job_vault, job.job_name) == {}
+		capsys.readouterr()
+		disk.swap()
+		os.makedirs(folder)
+		with pytest.raises(OSError) as failed:
+			rv.sync_vault_filesystems(job.job_vault, job.job_name)
+	assert f'{folder} is not on a filesystem this step opened' in str(failed.value)
+	# no write error, so no alert
+	assert vault_write_errors(capsys.readouterr().out) == []
+
+
+@needs_mount
+def test_a_disk_swapped_at_the_vaults_mount_point_fails_the_sync(tmp_path, errseq, capsys):
+	with ScratchTmpfs(str(tmp_path / 'disk')) as disk:
+		job = create_job(disk.folder)
+		os.makedirs(job.job_vault)
+		swapped_sync_fails(job, disk, job.job_vault, capsys)
+
+
+@needs_mount
+def test_a_disk_swapped_at_a_branchs_mount_point_fails_the_sync(r_job, fake_pool, errseq, capsys):
+	branches = fake_pool.add(r_job.vault, ['a', 'b'])
+	with ScratchTmpfs(branches[0]) as disk:
+		for branch in branches:
+			os.makedirs(os.path.join(branch, r_job.job_name), exist_ok=True)
+		swapped_sync_fails(r_job, disk, os.path.join(branches[0], r_job.job_name), capsys)
 
 
 # ---- 6. a one-file batch off a pool

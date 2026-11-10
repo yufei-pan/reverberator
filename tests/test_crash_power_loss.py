@@ -356,3 +356,55 @@ def test_a_cut_after_the_change_list_is_written_keeps_every_copy_right():
 		folder = next(name for name in os.listdir(job.job_vault) if version_number(name) == newest)
 		with open(os.path.join(job.job_vault, folder, rel), 'rb') as f:
 			assert f.read() == wanted
+
+
+@needs_f2fs
+def test_a_power_cut_after_a_checkpoint_before_the_commit_flush_copies_an_attribute_changes_copy_again():
+	# tests 7 and 8 of the flush round under a real power loss. A chmod with Only Sync Attributes off copies a file whose row does
+	# not change; a folder's fsync is a checkpoint, which keeps the copy's size and mtime and not its data, and the power goes
+	# before the commit flush. A read-back by size, mtime and last 64 KiB passes a copy of all NUL when the file ends in 128 KiB of
+	# zeros, so the retry must copy what the cut batch wrote again. 0.55.2 read it back and kept it all NUL
+	options = {'only_sync_attributes': False}
+	rel = 'probe.bin'
+	wanted = random.Random(2).randbytes(256 << 10) + bytes(128 << 10)
+	def power_goes_before_the_flush(job_vault, mount):
+		def fault(module):
+			flushing_for_real(module)
+			def flush(*args, **kwargs):
+				# the checkpoint: the cut batch's tree, the newest version folder, holds the copy, and its fsync checkpoints the disk
+				tree = max((name for name in os.listdir(job_vault) if version_number(name) is not None), key=version_number)
+				assert os.path.isfile(os.path.join(job_vault, tree, rel)), tree
+				fd = os.open(os.path.join(job_vault, tree), os.O_RDONLY | os.O_DIRECTORY)
+				try:
+					os.fsync(fd)
+				finally:
+					os.close(fd)
+				shut_down_scratch(mount)
+				os.killpg(0, signal.SIGKILL)
+			module.flush_copies = flush
+		return fault
+	with LoopImage(os.path.join(SCRATCH, 'power-loss-before-flush'), 256) as image:
+		root = tempfile.mkdtemp(prefix='reverb-crash-', dir=image.mount_point)
+		job = create_job(root)
+		build_base(job, **options)
+		path = os.path.join(job.monitor, rel)
+		with open(path, 'wb') as f:
+			f.write(wanted)
+		raw = raw_events(job.monitor, [(False, 'create', rel, None)])
+		def batch(raw):
+			return lambda: run_do_backup(job, rv.change_events_to_backup_entries(deque(raw), job.monitor), options, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns())
+		first = in_child(job, None, batch(raw), flushing_for_real)
+		assert first.committed is True, first
+		os.chmod(path, 0o640)
+		raw = raw_events(job.monitor, [(False, 'attrib', rel, None)])
+		flush_scratch(root)
+		cut = in_child(job, None, batch(raw), power_goes_before_the_flush(job.job_vault, image.mount_point))
+		assert cut.killed, cut
+		image.remount()
+		again = retry(job, fault=flushing_for_real, options=options)
+		assert again.error is None and again.committed is True, again
+		newest = max(version_number(name) for name in os.listdir(job.job_vault) if version_number(name) is not None and os.path.isdir(os.path.join(job.job_vault, name)))
+		assert newest == 4
+		folder = next(name for name in os.listdir(job.job_vault) if version_number(name) == newest)
+		with open(os.path.join(job.job_vault, folder, rel), 'rb') as f:
+			assert f.read() == wanted
