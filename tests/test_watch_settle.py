@@ -7,6 +7,7 @@ change or left a watch on another folder's path on 0.55.1, or tests a part that 
 import errno
 import os
 import shutil
+import sys
 import threading
 import time
 
@@ -583,3 +584,101 @@ def test_a_move_out_of_a_new_folder_whose_move_self_comes_after_a_take_leaves_no
 	bad = wrong(job)
 	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
 	assert not bad and not stale and not missing, (relative(batch, m), bad, stale, missing)
+
+
+def watch_of_or_none(wd_dic, path):
+	return next((wd for wd, held in list(wd_dic.items()) if held.rstrip('/') == path), None)
+
+
+@pytest.mark.parametrize('run', range(3))
+@pytest.mark.parametrize('blinded', [True, False], ids=['blind', 'control'])
+def test_a_doubtful_watch_whose_place_cannot_be_probed_is_not_removed(session, job, tmp_path, monkeypatch, blinded, run):
+	'''
+	Review 1: big/sub and next2/sub swapped by one rename (both watches, at big/sub, doubtful with next2/sub before), then big
+	moved out of the tree in the same read, so its move-out holds big/sub's watches and makes them leaving at its expiry.
+	The probe of next2/sub, where big's old sub lives on, cannot look (EIO): settle() step 2 keeps that watch doubtful for
+	the next settle, and step 3 must leave it too, not probe it at big/sub, find nothing and remove it (next2/sub then had
+	no watch, and a later change in it no event).
+	'''
+	maps = latest_map(monkeypatch)
+	blind = blinded_probes(monkeypatch)
+	one = session({'big/a': 'a' * 100, 'big/sub/b': 'b' * 100, 'next2/sub/z': 'z' * 100, 'other/o': 'o'})
+	m = job.monitor
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	sub = watch_of(maps[-1][1], f'{m}/big/sub')
+	if blinded:
+		blind.add(f'{m}/next2/sub')
+	with one.unread():
+		one.apply(('exchange', 'big/sub', 'next2/sub'))
+		os.rename(f'{m}/big', outside / 'big')
+	# big's move-out expires at the quiet read, and that read's settle runs its leaving watches
+	wait_until(lambda: watch_of_or_none(maps[-1][1], f'{m}/big') is None, message='big still watched')
+	time.sleep(0.5)
+	held_during = sub in maps[-1][1]
+	blind.clear()
+	time.sleep(0.5)
+	one.apply(('write', 'next2/sub/new', 'n'))
+	one.back_up_next()
+	# a change in a later batch, which no comparison of the swap covers
+	one.apply(('write', 'next2/sub/later', 'l'))
+	one.apply(('write', 'other/marker', 'm'))
+	one.back_up_next()
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	assert held_during and not wrong(job) and not stale and not missing, (held_during, wrong(job), stale, missing)
+
+
+@pytest.mark.parametrize('run', range(3))
+@pytest.mark.parametrize('during', [True, False], ids=['moved_during_settle', 'moved_after_settle'])
+def test_a_placed_watch_whose_folder_leaves_before_the_settles_walk(session, job, tmp_path, monkeypatch, during, run):
+	'''
+	Review 1: settle() puts a found watch in place in a new folder (step 1); step 5's walk of that place would put it into
+	newDirWDs (rule 2). If the folder leaves the tree from the new folder between the placement and that walk, the walk
+	fails: the watch must be in newDirWDs from its placement, or its IN_MOVE_SELF is skipped, the watch stays at its old
+	place, and review 5's F1 follows. The control moves the folder once the settle's walk of it is done.
+	'''
+	maps = latest_map(monkeypatch)
+	one = session({'big/a': 'a' * 100, 'big/sub/b': 'b' * 100, 'other/o': 'o'})
+	m = job.monitor
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	state = {'moved': False, 'walked': False}
+	real_init = rv.initializeFolderWatchers
+	def init(inotify_obj, path, *args, **kwargs):
+		by_settle = sys._getframe(1).f_code.co_name == 'settle' and path.rstrip('/') == f'{m}/n/big'
+		if by_settle and during and not state['moved']:
+			# the folder put in place leaves the tree from the new folder before the settle's walk of it
+			state['moved'] = True
+			os.rename(f'{m}/n/big', outside / 'b2')
+		result = real_init(inotify_obj, path, *args, **kwargs)
+		if by_settle:
+			state['walked'] = True
+		return result
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', init)
+	# in one read: n made, big out of the tree and back into n (a create: its move-out's cookie is not the move-in's), and a
+	# folder made at big's old place, which expires big's move-out (its watches leaving, let go)
+	with one.unread():
+		os.mkdir(f'{m}/n')
+		os.rename(f'{m}/big', outside / 'big')
+		os.rename(outside / 'big', f'{m}/n/big')
+		os.mkdir(f'{m}/big')
+	wait_until(lambda: state['walked'], message='the settle did not walk n/big')
+	if not during:
+		os.rename(f'{m}/n/big', outside / 'b2')
+	one.back_up_next()
+	stale_after_move, _ = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	# review 5's F1 from here: a folder made at n/big with two files alike in size, mtime and last 64 KiB
+	os.mkdir(f'{m}/n/big')
+	same_but_head(f'{m}/n/big/a', b'G')
+	same_but_head(f'{m}/n/big/h', b'H')
+	one.back_up_next()
+	assert not wrong(job)
+	os.rename(outside / 'b2' / 'a', outside / 'b2' / 'h')
+	batch = one.take()
+	one.back_up(batch)
+	one.apply(('write', 'other/marker', 'm'))
+	one.back_up_next()
+	bad = wrong(job)
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	assert state['moved'] or not during
+	assert not stale_after_move and not bad and not stale and not missing, (relative(batch, m), stale_after_move, bad, stale, missing)

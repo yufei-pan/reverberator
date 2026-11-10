@@ -3011,9 +3011,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			for wd in notes.found:
 				notes.found_takes.setdefault(wd, seen_takes)
 	blind = object()
-	def probe_at(path:str, strays:set):
+	def probe_at(path:str, strays:set, reals:dict = None):
 		# the watch of the folder at path; None: not here (no folder, another one, one with no watch, or one through a
-		# symlink); blind: the probe could not look, which is never taken for an absence
+		# symlink); blind: the probe could not look, which is never taken for an absence. reals: through_link()'s
+		# real paths of the parents, shared by one settle's probes
 		try:
 			wd = inotify_obj.add_watch(path.rstrip('/') or '/', probe_flags)
 		except OSError as error:
@@ -3022,7 +3023,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			# a folder there with no watch: the probe's own goes again ( drop_strays() )
 			strays.add(wd)
 			return None
-		return None if through_link(path) else wd
+		return None if through_link(path, reals) else wd
 	def drop_strays(strays:set):
 		for wd in strays:
 			try:
@@ -3036,12 +3037,22 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				return False
 			path_norm = os.path.dirname(path_norm)
 		return True
-	def through_link(path:str) -> bool:
+	def through_link(path:str, reals:dict = None) -> bool:
 		# whether a folder below the root on the way to path is a symlink: add_watch follows it, as IN_DONT_FOLLOW covers the
 		# last name only, and the walk never does, so the watch it gives is not of the tree's folder at that path
 		path_norm = path.rstrip('/') or '/'
-		want = root_real if path_norm == root_norm else root_real.rstrip('/') + path_norm[len(root_norm.rstrip('/')):]
-		return os.path.realpath(path_norm) != want
+		if path_norm == root_norm:
+			return False
+		want = root_real.rstrip('/') + path_norm[len(root_norm.rstrip('/')):]
+		if reals is None:
+			return os.path.realpath(path_norm) != want
+		# the probe found a folder at the last name (IN_ONLYDIR with IN_DONT_FOLLOW), so only the folders above it can be
+		# links: one realpath for each parent, shared by one settle's probes
+		parent, _, name = path_norm.rpartition('/')
+		real = reals.get(parent)
+		if real is None:
+			real = reals[parent] = os.path.realpath(parent or '/')
+		return real.rstrip('/') + '/' + name != want
 	def settle():
 		'''
 		Once the kernel holds no event for this watch (FIONREAD), the map holds all the events said about every change
@@ -3058,8 +3069,14 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 		if not (notes.found or notes.leaving or notes.doubtful) or queued_events(inotify_obj):
 			return
 		strays = set()
+		reals = {}
+		# the found watches before step 1 settles them, and whether every watch whose folder moved on is in newDirWDs: what
+		# a path of newDirWDs holds is then in newDirWDs or found (the rules that keep newDirWDs), and the pass over the
+		# paths that left looks there only, not at the whole map
+		found_at_start = tuple(notes.found)
+		all_new = True
 		def probe(path:str):
-			return probe_at(path, strays)
+			return probe_at(path, strays, reals)
 		# the folders whose watch is put in place here, each with whether the batch needs a copy of it
 		placed = []
 		with to_process_lock:
@@ -3079,12 +3096,15 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				kept[wd] = place
 			elif got == wd:
 				wdDic[wd] = place
+				# into newDirWDs now, as step 5's walk would put it: its folder can leave from a new folder before that walk
+				newDirWDs.add(wd)
 				# the probe just saw where it is: a rename that left it doubtful is settled too
 				notes.doubtful.pop(wd, None)
 				# with no take since the read that noted it, the batch holds the create whose walk noted it
 				placed.append((place.rstrip('/'), notes.found_takes.get(wd, seen_takes) != takes))
 			else:
 				moved_on.add(path.rstrip('/') or '/')
+				all_new = all_new and wd in newDirWDs
 		notes.found_takes = {wd: notes.found_takes.get(wd, seen_takes) for wd in kept}
 		notes.found.clear()
 		notes.found.update(kept)
@@ -3111,6 +3131,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				if wd in where:
 					if where[wd].rstrip('/') != path.rstrip('/'):
 						wdDic[wd] = where[wd]
+						newDirWDs.add(wd)
 						# the batch recorded the swap as moves, which a change that keeps size, mtime and tail outlives
 						placed.append((where[wd].rstrip('/'), True))
 				elif (path.rstrip('/') or '/') in unseen or (before.rstrip('/') or '/') in unseen or wd in notes.found:
@@ -3119,12 +3140,18 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				else:
 					# its folder left the tree, or a place no walk has reached yet
 					moved_on.add(path.rstrip('/') or '/')
+					all_new = all_new and wd in newDirWDs
 			notes.doubtful.clear()
 			notes.doubtful.update(kept)
 		if moved_on:
-			# one pass over the map: the watches at or under those paths leave, but for those at their paths
-			for wd, path in wdDic.items():
-				if at_or_under(path.rstrip('/') or '/', moved_on):
+			# the watches at or under those paths leave, but for those at their paths: among newDirWDs and found when each
+			# folder that moved on was in newDirWDs (the MOVE_SELF rule's, a folder moved out of a new folder), else one
+			# pass over the map, which keeps no parent to children view (no state per watch at rest). a path is at a top
+			# with or without its trailing slash
+			tops = tuple(top + '/' if top != '/' else '/' for top in moved_on)
+			for wd in (itertools.chain(newDirWDs, found_at_start) if all_new else wdDic):
+				path = wdDic.get(wd)
+				if path is not None and (path in moved_on or path.startswith(tops)):
 					notes.leaving.add(wd)
 		# 3. leaving: each one not at its path goes, at most half the queue's limit at a time, as each removal queues an
 		# IN_IGNORED: the other half is for the tree's events until the next read takes them
@@ -3134,8 +3161,8 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			if path is None:
 				notes.leaving.discard(wd)
 				continue
-			if wd in notes.found:
-				# its walk's place could not be probed: it waits for that
+			if wd in notes.found or wd in notes.doubtful:
+				# its walk's place, or a path it holds or held, could not be probed (steps 1 and 2): it waits for that
 				continue
 			if len(gone) + len(strays) >= removal_cap:
 				break
