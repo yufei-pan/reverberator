@@ -1,8 +1,10 @@
 import os
 import resource
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import pytest
 import reverberator as rv
@@ -130,6 +132,28 @@ def fake_pool(tmp_path, monkeypatch):
 	monkeypatch.setattr(rv, 'F2FS_UNTOLD', set())
 	monkeypatch.setattr(rv, 'POOL_CHECK_SECONDS', 0)
 	return pool
+
+
+@pytest.fixture
+def errseq(monkeypatch):
+	'''
+	The kernel's writeback error rule at the syncfs binding (tests/errseq.py), with the real vault sync helper above it: every
+	vault sync of the test goes through the handles its unit opened, and fail() and seen_elsewhere() say what the kernel met.
+	'''
+	from tests.errseq import Errseq
+	model = Errseq(monkeypatch)
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', REAL_SYNC_VAULT_FILESYSTEMS)
+	return model
+
+
+@pytest.fixture
+def other_filesystem(tmp_path):
+	'''A folder on a filesystem other than tmp_path's: in /dev/shm, a tmpfs. Removed at the end.'''
+	if not os.path.isdir('/dev/shm') or os.stat('/dev/shm').st_dev == os.stat(str(tmp_path)).st_dev:
+		pytest.skip('needs /dev/shm on a filesystem other than the basetemp\'s')
+	folder = tempfile.mkdtemp(prefix='reverb-', dir='/dev/shm')
+	yield folder
+	shutil.rmtree(folder, ignore_errors=True)
 
 
 @pytest.fixture
