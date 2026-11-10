@@ -35,7 +35,9 @@ H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 
 	'made_at_pending_out_parent_deleted': 12, 'made_at_pending_out_moved': 12, 'cycle_guard': 12, 'cycle_guard_root': 12, 'q3_deep_out': 12,
 	'root_put_into_itself_touched': 12, 'back_home_via_new': 12, 'back_home_via_new_sub': 12, 'back_home_via_outside': 12,
 	'walk_ahead_taken': 12, 'walk_ahead_taken_sub': 12, 'back_home_under_new': 12, 'c2_then_moved': 12, 'c2_then_into_old': 12,
-	'land_ahead_taken': 12}
+	'land_ahead_taken': 12,
+	# round 22's build: the shapes of the step back's rules
+	'nested_out_ancestor': 12}
 H_DEFAULT = 16
 SAMPLE = int(os.environ.get('REVERB_WATCH_SCHED_SAMPLE', '100'))
 BIG = 'p' * 200000
@@ -165,6 +167,11 @@ SHAPES = {
 		('write', 'o2/u2/g', 'y')],
 	'c2_then_into_old': [('mv', 'other', 'o2'), ('mkdir', 'o2/u'), ('mv', 'o2/u', 'o2/u2'), ('mkdir', 'o2/u'), ('mv', 'o2/u', 'o2/u2/u'), ('write', 'o2/u2/u/f', 'x')],
 	'land_ahead_taken': [('mkdir', 'big/n'), ('mv', 'big/n', 'other/n'), ('mkdir', 'big/n'), ('mkdir', 'm'), ('mv', 'big/n', 'm/n'), ('write', 'm/n/w', 'w')],
+	# a folder moved out of the tree, then its old parent renamed and another folder moved onto its place there: its watch,
+	# held by its own move-out still, must not report a rename outside the tree as one inside the other folder (a count of
+	# the move-outs that hold a watch, as one would clear it at the parent's pairing; the step-back review's finding 1)
+	'nested_out_ancestor': [('mv', 'big/sub', '{outside}/sub'), ('mv', 'big', 'other/b2'), ('mv', 'next2/sub', 'other/b2/sub'),
+		('mv', '{outside}/sub/b', '{outside}/sub/z'), ('poke', 'other/b2/sub/z')],
 }
 NAMES = [name for name in os.environ.get('REVERB_WATCH_SCHED_SHAPES', ','.join(SHAPES)).split(',') if name]
 

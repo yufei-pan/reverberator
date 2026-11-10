@@ -2887,7 +2887,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 		if cookie_value.isDir:
 			forget_unwatched_under(unwatched,cookie_value.path)
 		# they go once the queue is empty, each one not where its path says by then ( settle() )
-		outgoing.difference_update(cookie_value.wds)
+		release_outgoing(cookie_value.wds)
 		leaving.update(cookie_value.wds)
 	def guarded(*wds) -> bool:
 		# a watch whose path may not be its folder's until the queue is empty (found, doubtful, or one that left the tree
@@ -2953,11 +2953,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				wdDic[wd] = before
 				copies.append(before.rstrip('/'))
 		doubtful.clear()
+		# each probe stands on its own: a folder that comes back during the probes comes back by an event, whose walk gives
+		# it a watch again (review: the all-or-nothing retry probed every leaving watch at every read of a busy tree)
 		gone = [wd for wd in leaving if wd in wdDic and probe(wdDic[wd]) != wd]
-		if not queued_events(inotify_obj):
-			# nothing moved while the probes ran
-			leaving.clear()
-			remove_watches(inotify_obj,wdDic,irm,gone)
+		leaving.clear()
+		remove_watches(inotify_obj,wdDic,irm,gone)
 		for wd in strays:
 			try:
 				inotify_obj.rm_watch(wd)
@@ -3001,7 +3001,18 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	leaving = set()
 	doubtful = {}
 	# the watches of each folder whose move-out is held for its move-in: they are guarded too ( guarded() )
-	outgoing = set()
+	outgoing = {}
+	def hold_outgoing(wds):
+		for wd in wds:
+			outgoing[wd] = outgoing.get(wd, 0) + 1
+	def release_outgoing(wds):
+		# a watch stays outgoing while any pending move-out holds it (a folder moved out, then its old parent renamed)
+		for wd in wds:
+			left = outgoing.get(wd, 0) - 1
+			if left <= 0:
+				outgoing.pop(wd, None)
+			else:
+				outgoing[wd] = left
 	# the takes this watcher knows of: one made before it started says nothing of the folders it creates
 	with to_process_lock:
 		seen_takes = to_process.takes
@@ -3051,7 +3062,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				lastProcessTime = time.monotonic()
 			with mount_table_lock:
 				mount_table, latest_mount_table[0] = latest_mount_table[0], None
-			if mount_table is not None and follow_inner_mounts(inotify_obj,monitor_path,mount_table,inner_mounts,wdDic,irm,watch_flags,to_process,to_process_lock,skip_list,job_name,unwatched):
+			if mount_table is not None and follow_inner_mounts(inotify_obj,monitor_path,mount_table,inner_mounts,wdDic,irm,watch_flags,to_process,to_process_lock,skip_list,job_name,unwatched,found=found):
 				# like an event, so the backuper waits for the tree to settle before comparing the folders
 				lastReadTime = time.monotonic()
 			now = time.monotonic()
@@ -3142,17 +3153,19 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						watcherTeeLogToTl(monitor_path,f'Discarding events for new recursive folder {wdDic[event.wd]} until its copy runs')
 					if isDir and event.mask & flags.MOVED_TO and event.cookie in cookieDic:
 						# a folder moved in from the tree: the recursive copy holds it, and its source stays in cookieDic so it
-						# still expires into its delete
+						# still expires into its delete. it lets its watches go here, once, so its expiry lets go of nothing
 						cookie_value = cookieDic[event.cookie]
 						if skipped:
 							# not watched there: they go once the queue is empty
-							outgoing.difference_update(cookie_value.wds)
+							release_outgoing(cookie_value.wds)
 							leaving.update(cookie_value.wds)
 							leaving.update(watches_under(wdDic,cookie_value.path))
+							cookieDic[event.cookie] = cookie_value._replace(wds=())
 						elif not guarded(cookie_value.wd, event.wd):
-							# its watches go with it, as the events say, unless the paths of either folder may be wrong
+							# its watches go with it, as the events say
 							move_watches(cookie_value.path, eventPath)
-							outgoing.difference_update(cookie_value.wds)
+							release_outgoing(cookie_value.wds)
+							cookieDic[event.cookie] = cookie_value._replace(wds=())
 						forget_unwatched_under(unwatched,cookie_value.path)
 					if isDir and not skipped and event.mask & (flags.CREATE | flags.MOVED_TO):
 						# the recursive copy holds this folder, but it still needs watches for later changes. a watch the walk
@@ -3202,7 +3215,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						watcherTeeLogToTl(monitor_path,f'Move from event detected for {eventPath}')
 					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir,watches_under(wdDic,eventPath) if isDir else ())
 					# they left with it: until a move-in pairs, a move they report is not renamed in the vault
-					outgoing.update(cookieDic[event.cookie].wds)
+					hold_outgoing(cookieDic[event.cookie].wds)
 					while len(cookieDic) > COOKIE_DICT_MAX_SIZE:
 						watcherTeeLogToTl(monitor_path,'Cookie dictionary is full, popping oldest item')
 						evicted_cookie,cookie_value = cookieDic.popitem(last=False)
@@ -3225,7 +3238,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							append_change_event(to_process, to_process_lock, ChangeEvent(monTime,cookie_value.isDir,'delete',cookie_value.path,None))
 							if cookie_value.isDir:
 								# they go once the queue is empty ( settle() )
-								outgoing.difference_update(cookie_value.wds)
+								release_outgoing(cookie_value.wds)
 								leaving.update(cookie_value.wds)
 								leaving.update(watches_under(wdDic,cookie_value.path))
 								forget_unwatched_under(unwatched,cookie_value.path)
@@ -3253,7 +3266,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 							if isDir:
 								# every watch at or under the old path goes with it, back in the tree
 								move_watches(cookie_value.path, eventPath)
-								outgoing.difference_update(cookie_value.wds)
+								release_outgoing(cookie_value.wds)
 								forget_unwatched_under(unwatched,cookie_value.path)
 								if skip_list is not None and skip_list.location_dependent:
 									remove_newly_skipped_watches(inotify_obj,eventPath,wdDic,irm,skip_list)
@@ -3313,8 +3326,8 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	what unwatched held there before goes first ( a folder made again, or a disk mounted again, is watched in full ).
 	With found (a dict), a watch held at another path than the one the walk finds its folder at stays where the events put
 	it, and found gets that path: the walk sees the tree ahead of the events still queued, which may bring it there yet.
-	The watcher settles it once the kernel holds no event ( watchFolder()'s settle() ). Without found, as at the first walk
-	and an inner mount's, the walk puts each watch it finds where it finds it.
+	The watcher settles it once the kernel holds no event ( watchFolder()'s settle() ). Without found, as at the first
+	walk, the walk puts each watch it finds where it finds it.
 	'''
 	if not os.path.exists(monitor_path):
 		return -1
@@ -3441,12 +3454,12 @@ def forget_unwatched_under(unwatched:set,folder_path:str) -> None:
 		prefix = folder_norm.rstrip('/') + '/'
 		unwatched.difference_update([folder for folder in unwatched if folder == folder_norm or folder.startswith(prefix)])
 
-def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None) -> int:
+def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None,found:dict = None) -> int:
 	'''
 	Bring the watches in line with a new mount table. Each inner mount mounted, unmounted or replaced since inner_mounts
 	(path -> fingerprint, updated here) is watched again from what is there now, and gets a 'scan' event so the backuper
-	compares that folder with the vault. Returns how many folders it queued. Folders left unwatched go into unwatched
-	( initializeFolderWatchers() ).
+	compares that folder with the vault. Returns how many folders it queued. Folders left unwatched go into unwatched,
+	and a watch the walk finds held at another path goes into found ( initializeFolderWatchers() ).
 	An unmounted disk's watches go with its IN_UNMOUNT events, or here if those come later (a lazy unmount sends none
 	while the disk is still in use); the mount point folder it uncovers is watched in their place.
 	'''
@@ -3463,7 +3476,7 @@ def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,moun
 		watcherTeeLogToTl(monitor_path,f'Inner mount {mount_point} {change}, watching what is there now and comparing it with the vault')
 		remove_watches_under(inotify_obj,wdDic,irm,mount_point)
 		# not into newDirWDs: the scan compares what is there already, and later events in it are recorded as they come
-		initializeFolderWatchers(inotify_obj,mount_point,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched)
+		initializeFolderWatchers(inotify_obj,mount_point,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=found)
 		if fingerprint is None:
 			del inner_mounts[mount_point]
 		else:

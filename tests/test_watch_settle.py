@@ -83,6 +83,36 @@ def test_a_rename_outside_the_tree_does_not_land_on_the_folder_now_at_the_old_pa
 	assert not bad and not wrong(job), (relative(batch, m), bad)
 
 
+@pytest.mark.parametrize('run', range(3))
+@pytest.mark.parametrize('tails', ['same', 'differ'])
+def test_a_nested_move_out_stays_guarded_through_its_parents_rename(session, job, tmp_path, run, tails):
+	'''
+	The step-back review's finding 1, F1 through an ancestor: keep/s/n2 leaves the tree, keep is renamed while that move-out
+	is pending (its pairing moves n2's watch to c/keep2/s/n2), and live lands there. A rename in n2 outside the tree came on
+	n2's watch as c/keep2/s/n2/g -> h, and the version renamed live's g onto h. A watch stays guarded while any pending
+	move-out holds it, so that rename is a delete and a create (wrong bytes 3 of 3 on 0.55.1 with alike tails).
+	'''
+	one = session({'keep/s/n2/g': 'n' * 5000, 'live/g': 'x', 'live/h': 'x', 'c/': None, 'other/o': 'o'})
+	outside = tmp_path / 'outside'
+	os.makedirs(outside)
+	m = job.monitor
+	same_but_head(f'{m}/live/g', b'G')
+	same_but_head(f'{m}/live/h', b'H', tails)
+	one.back_up_next()
+	assert not wrong(job)
+	# one batch, each step read on its own, no quiet read between them: the pair timeout has not passed
+	one.run([('mv', 'keep/s/n2', str(outside / 'n2')), ('mv', 'keep', 'c/keep2'), ('mv', 'live', 'c/keep2/s/n2')], 'apart')
+	os.rename(outside / 'n2' / 'g', outside / 'n2' / 'h')
+	batch = one.take()
+	one.back_up(batch)
+	one.apply(('write', 'other/marker', 'm'))
+	one.back_up_next()
+	bad = wrong(job)
+	one.stop()
+	run_backup(job, **one.options)
+	assert not bad and not wrong(job), (relative(batch, m), bad)
+
+
 def lose(monkeypatch, names):
 	'''The next read that holds an event named in names loses every such event, and ends with a Q_OVERFLOW.'''
 	real_read = rv.inotify_simple.INotify.read
