@@ -172,6 +172,17 @@ SHAPES = {
 	# the move-outs that hold a watch, as one would clear it at the parent's pairing; the step-back review's finding 1)
 	'nested_out_ancestor': [('mv', 'big/sub', '{outside}/sub'), ('mv', 'big', 'other/b2'), ('mv', 'next2/sub', 'other/b2/sub'),
 		('mv', '{outside}/sub/b', '{outside}/sub/z'), ('poke', 'other/b2/sub/z')],
+	# a swap by one rename, then one of the two renamed: only the first path before finds the other's watch
+	'exchange_then_rename': [('exchange', 'big', 'other'), ('mv', 'big', 'b3'), ('poke', 'other/a'), ('write', 'b3/w', 'w')],
+	# two swaps through one folder: a watch is at neither of its own paths, only at one another watch held
+	'exchange_chain': [('exchange', 'big', 'other'), ('exchange', 'big', 'next'), ('poke', 'other/a'), ('write', 'next/w', 'w')],
+	# a folder moved out of the tree, and a symlink to the outside made where its parent was: a probe through the link finds
+	# the folder's watch, which must not count
+	'out_then_link': [('mv', 'next2/sub', '{outside}/sub'), ('rmtree', 'next2'), ('symlink', '{outside}', 'next2'), ('write', '{outside}/sub/w', 'w')],
+	# back from outside under a new name, changed so that only its event shows it, with a take between or not: the settle's
+	# copy of a found folder is left to the create that noted it only when no take came between
+	'back_as_new_name': [('mv', 'big', '{outside}/big'), ('mv', '{outside}/big', 'big2'), ('poke', 'big2/a')],
+	'back_as_new_name_take': [('mv', 'big', '{outside}/big'), ('mv', '{outside}/big', 'big2'), ('take',), ('poke', 'big2/a')],
 }
 NAMES = [name for name in os.environ.get('REVERB_WATCH_SCHED_SHAPES', ','.join(SHAPES)).split(',') if name]
 

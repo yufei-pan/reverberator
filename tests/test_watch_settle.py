@@ -4,7 +4,11 @@ events hold, what needs the tree's view waits for an empty event queue (settle()
 settled is a delete and a create, and an event queue overflow restarts the watch. Each order here kept wrong bytes, lost a
 change or left a watch on another folder's path on 0.55.1, or tests a part that 0.55.1 lacks.
 '''
+import errno
 import os
+import shutil
+import threading
+import time
 
 import pytest
 
@@ -48,6 +52,34 @@ def latest_map(monkeypatch) -> list:
 		return real_init(inotify_obj, path, wdDic, *args, **kwargs)
 	monkeypatch.setattr(rv, 'initializeFolderWatchers', init)
 	return maps
+
+
+def captured_notes(monkeypatch) -> list:
+	'''The WatchNotes of each watch the test starts, newest last.'''
+	notes = []
+	class Captured(rv.WatchNotes):
+		__slots__ = ()
+		def __init__(self, *args):
+			super().__init__(*args)
+			notes.append(self)
+	monkeypatch.setattr(rv, 'WatchNotes', Captured)
+	return notes
+
+
+def blinded_probes(monkeypatch) -> set:
+	'''The paths whose probe (an add_watch with IN_ONLYDIR, as settle() makes them) fails with EIO while in the set.'''
+	blind = set()
+	real_add = rv.inotify_simple.INotify.add_watch
+	def add_watch(inotify, path, mask):
+		if mask & rv.inotify_simple.flags.ONLYDIR and path.rstrip('/') in blind:
+			raise OSError(errno.EIO, 'a probe that cannot look')
+		return real_add(inotify, path, mask)
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'add_watch', add_watch)
+	return blind
+
+
+def watch_of(wd_dic, path) -> int:
+	return next(wd for wd, held in list(wd_dic.items()) if held.rstrip('/') == path)
 
 
 @pytest.mark.parametrize('run', range(3))
@@ -188,5 +220,208 @@ def test_an_overflow_leaves_the_watches_on_the_tree(session, job, tmp_path, monk
 	else:
 		poke(f'{m}/b2/a')
 	back_up_batch(one, job, one.take())
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	assert not wrong(job) and not stale and not missing, (wrong(job), stale, missing)
+
+
+def test_a_big_move_out_is_unwatched_in_parts_that_fit_the_queue(session, job, tmp_path, monkeypatch):
+	'''
+	Each removed watch queues an IN_IGNORED, which counts against the queue limit the kernel read when the instance was made:
+	the watches of a folder of 300 folders moved out of the tree go at most half that limit at a time, with no overflow,
+	all of them within a few settles. The limit is 64 here as the watch reads it; the kernel's stays as it is.
+	'''
+	class SmallQueue(rv.inotify_resource_manager):
+		def __init__(self):
+			super().__init__()
+			self.max_queued_events = 64
+	monkeypatch.setattr(rv, 'inotify_resource_manager', SmallQueue)
+	removed = []
+	real_remove = rv.remove_watches
+	def remove(inotify_obj, wd_dic, irm, wds, *args, **kwargs):
+		wds = list(wds)
+		removed.append(len([wd for wd in wds if wd in wd_dic]))
+		return real_remove(inotify_obj, wd_dic, irm, wds, *args, **kwargs)
+	monkeypatch.setattr(rv, 'remove_watches', remove)
+	watches = []
+	real_watch = rv.watchFolder
+	def watch(**kwargs):
+		watches.append(1)
+		return real_watch(**kwargs)
+	monkeypatch.setattr(rv, 'watchFolder', watch)
+	maps = latest_map(monkeypatch)
+	one = session({**{f'big/d{i}/f': 'x' for i in range(300)}, 'other/o': 'o'})
+	m = job.monitor
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	gone = [wd for wd, path in list(maps[-1][1].items()) if path.startswith(f'{m}/big')]
+	assert len(gone) == 301
+	os.rename(f'{m}/big', outside / 'big')
+	one.back_up_next()
+	wait_until(lambda: not set(gone) & set(maps[-1][1]), message='the watches of the folder that left are still held')
+	assert sum(removed) == 301 and max(removed) <= 32, removed
+	assert len(watches) == 1, 'the watch started again'
+	one.apply(('write', 'other/marker', 'm'))
+	one.back_up_next()
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	assert not wrong(job) and not stale and not missing, (wrong(job), stale, missing)
+
+
+QUEUE_LIMIT = '/proc/sys/fs/inotify/max_queued_events'
+
+
+@pytest.mark.privileged
+@pytest.mark.skipif(os.geteuid() != 0 or 'PYTEST_XDIST_WORKER' in os.environ,
+	reason='sets the host-wide fs.inotify.max_queued_events: as root, alone (no xdist), in the test VM')
+def test_a_big_move_out_fits_a_real_queue_of_64(session, job, tmp_path, monkeypatch):
+	'''The same with the kernel's limit really 64 while the watch's instance is made: 301 removals at once overflowed it.'''
+	with open(QUEUE_LIMIT) as f:
+		before = f.read().strip()
+	overflows = []
+	real_read = rv.inotify_simple.INotify.read
+	def read(inotify, *args, **kwargs):
+		events = real_read(inotify, *args, **kwargs)
+		overflows.extend(e for e in events if e.mask & rv.inotify_simple.flags.Q_OVERFLOW)
+		return events
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+	maps = latest_map(monkeypatch)
+	try:
+		with open(QUEUE_LIMIT, 'w') as f:
+			f.write('64')
+		one = session({**{f'big/d{i}/f': 'x' for i in range(300)}, 'other/o': 'o'})
+	finally:
+		# the kernel read it when the watch's instance was made
+		with open(QUEUE_LIMIT, 'w') as f:
+			f.write(before)
+	m = job.monitor
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	gone = [wd for wd, path in list(maps[-1][1].items()) if path.startswith(f'{m}/big')]
+	os.rename(f'{m}/big', outside / 'big')
+	one.back_up_next()
+	wait_until(lambda: not set(gone) & set(maps[-1][1]), message='the watches of the folder that left are still held')
+	one.apply(('write', 'other/marker', 'm'))
+	one.back_up_next()
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	assert not overflows and len(maps) == 1
+	assert not wrong(job) and not stale and not missing, (wrong(job), stale, missing)
+
+
+def test_the_maximum_delay_counts_on_across_overflows(job, monkeypatch, poll_fast):
+	'''
+	While events never pause only the maximum delay takes a batch: a watch started again after an overflow counts it from the
+	old watch's last take, so overflows that keep coming (a sysctl that cannot be raised) never put the batch off for ever.
+	'''
+	monitor = job.monitor
+	os.makedirs(os.path.join(monitor, 'd'), exist_ok=True)
+	real_read = rv.inotify_simple.INotify.read
+	state = {'next': time.monotonic() + 0.3, 'overflows': 0}
+	def read(inotify, *args, **kwargs):
+		events = real_read(inotify, *args, **kwargs)
+		if time.monotonic() < state['next']:
+			return events
+		state['next'] = time.monotonic() + 0.3
+		state['overflows'] += 1
+		return list(events) + [rv.inotify_simple.Event(-1, rv.inotify_simple.flags.Q_OVERFLOW, 0, '')]
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+	queue, lock, flag = rv.ChangeEventQueue(monitor), threading.Lock(), threading.Event()
+	ready, stop = threading.Event(), threading.Event()
+	ready.set()
+	def write():
+		i = 0
+		while not stop.is_set():
+			with open(os.path.join(monitor, 'd', f'f{i % 20}'), 'w') as f:
+				f.write('x')
+			i += 1
+			time.sleep(0.02)
+	# a minimum delay never reached while the writes go on, and a maximum delay of 1 s
+	watching = threading.Thread(target=rv.watcher, args=(ready, monitor, queue, lock, flag, rv.inotify_resource_manager(), 30, 1), daemon=True)
+	writer = threading.Thread(target=write, daemon=True)
+	writer.start()
+	watching.start()
+	try:
+		assert flag.wait(6), f'no batch signalled in 6 s, with the maximum delay at 1 s and {state["overflows"]} overflows'
+		assert state['overflows'] >= 2
+	finally:
+		stop.set()
+		rv.GREEN_LIGHT.clear()
+		watching.join(10)
+		writer.join(5)
+		rv.GREEN_LIGHT.set()
+
+
+def test_removing_a_watch_already_gone_does_nothing():
+	class FakeINotify:
+		def __init__(self):
+			self.removed = []
+		def rm_watch(self, wd):
+			self.removed.append(wd)
+	class FakeIrm:
+		decreased = 0
+		def decreaseUserWatches(self, count=1):
+			self.decreased += count
+	inotify_obj, irm, wd_dic, forgotten = FakeINotify(), FakeIrm(), {1: '/m/a/', 2: '/m/b/'}, []
+	assert rv.remove_watches(inotify_obj, wd_dic, irm, [1, 3, 1], forgotten.append) == 1
+	assert inotify_obj.removed == [1] and irm.decreased == 1 and wd_dic == {2: '/m/b/'} and forgotten == [1]
+
+
+@pytest.mark.parametrize('kind', ['found', 'leaving', 'doubtful'])
+def test_a_folder_deleted_while_its_watch_is_flagged_leaves_every_set(session, job, tmp_path, monkeypatch, kind):
+	'''A watch that leaves the watch map leaves found, leaving, doubtful, outgoing and newDirWDs with it.'''
+	notes = captured_notes(monkeypatch)
+	maps = latest_map(monkeypatch)
+	blind = blinded_probes(monkeypatch)
+	one = session({'big/a': 'a', 'big/sub/b': 'b', 'other/o': 'o'})
+	m = job.monitor
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	wd = watch_of(maps[-1][1], f'{m}/big')
+	flagged = lambda: getattr(notes[-1], kind)
+	if kind == 'found':
+		# back from outside under a new name in one read: the move-in's walk notes big's watch at big2
+		blind.add(f'{m}/big2')
+		with one.unread():
+			os.rename(f'{m}/big', outside / 'big')
+			os.rename(outside / 'big', f'{m}/big2')
+		wait_until(lambda: wd in flagged(), message='not found')
+		shutil.rmtree(f'{m}/big2')
+	elif kind == 'leaving':
+		# out of the tree: its move-out expires at the quiet read
+		blind.add(f'{m}/big')
+		os.rename(f'{m}/big', outside / 'big')
+		wait_until(lambda: wd in flagged(), message='not leaving')
+		shutil.rmtree(outside / 'big')
+	else:
+		# swapped by one rename: both watches were taken from one path
+		blind.update({f'{m}/big', f'{m}/other'})
+		one.apply(('exchange', 'big', 'other'))
+		wait_until(lambda: wd in flagged(), message='not doubtful')
+		shutil.rmtree(f'{m}/other')
+	wait_until(lambda: wd not in maps[-1][1], message='the deleted folder is still watched')
+	left = notes[-1]
+	assert not [name for name in ('found', 'found_takes', 'leaving', 'doubtful', 'outgoing', 'new_dirs') if wd in getattr(left, name)]
+
+
+def test_a_probe_that_cannot_look_leaves_the_watch_flagged(session, job, tmp_path, monkeypatch):
+	'''A probe that fails (EIO, a dead mergerfs) is never taken for an absence: the watch stays leaving until one answers.'''
+	notes = captured_notes(monkeypatch)
+	maps = latest_map(monkeypatch)
+	blind = blinded_probes(monkeypatch)
+	one = session({'big/a': 'a', 'big/sub/b': 'b', 'other/o': 'o'})
+	m = job.monitor
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	wd = watch_of(maps[-1][1], f'{m}/big')
+	blind.add(f'{m}/big')
+	os.rename(f'{m}/big', outside / 'big')
+	one.back_up_next()
+	wait_until(lambda: wd in notes[-1].leaving, message='not leaving')
+	# the watcher reads every 0.05 s here, each read a settle that probes it again
+	time.sleep(0.3)
+	assert wd in maps[-1][1] and wd in notes[-1].leaving
+	blind.clear()
+	one.apply(('write', 'other/marker', 'm'))
+	wait_until(lambda: wd not in maps[-1][1], message='the watch of the folder that left is still held')
+	assert wd not in notes[-1].leaving
+	one.back_up_next()
 	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
 	assert not wrong(job) and not stale and not missing, (wrong(job), stale, missing)
