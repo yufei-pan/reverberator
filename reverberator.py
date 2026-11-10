@@ -2017,15 +2017,15 @@ def current_boot_id() -> str:
 	with open(BOOT_ID_PATH, 'r') as f:
 		return f.read().strip()
 
-def vault_sync_marker_path(disk:str) -> str:
+def vault_sync_marker_path(disk:str, state_dir:str = None) -> str:
 	'''
-	The marker file of a disk: one file in the state folder, named by the disk's path percent-encoded (unique, readable). A
+	The marker file of a disk: one file in the state folder (state_dir_path(state_dir)), named by the disk's path percent-encoded (unique, readable). A
 	disk path too long for the name and the temp name of mark_failed_sync() to fit a file name gets no marker: writing it
 	raises OSError, and check_vault_sync() remembers the disk in memory with its alert.
 	>>> os.path.basename(vault_sync_marker_path('/mnt/vaults_data/a58'))
 	'vault-sync-failed-%2Fmnt%2Fvaults_data%2Fa58'
 	'''
-	return os.path.join(state_dir_path(), VAULT_SYNC_MARKER_PREFIX + urllib.parse.quote(os.fsencode(disk), safe=''))
+	return os.path.join(state_dir_path(state_dir), VAULT_SYNC_MARKER_PREFIX + urllib.parse.quote(os.fsencode(disk), safe=''))
 
 def read_vault_sync_marker(path:str) -> 'dict | None':
 	'''The marker file's content ({disk, boot_id, error}), None when it cannot be read or is no marker.'''
@@ -2036,16 +2036,17 @@ def read_vault_sync_marker(path:str) -> 'dict | None':
 	except (OSError, ValueError):
 		return None
 
-def mark_failed_sync(disk:str, error:OSError) -> bool:
+def mark_failed_sync(disk:str, error:OSError, state_dir:str = None) -> bool:
 	'''
-	Remember that a sync of disk failed, until the next reboot: write its marker in the state folder (made when missing), one
+	Remember that a sync of disk failed, until the next reboot: write its marker in the state folder (state_dir_path(state_dir),
+	made when missing), one
 	line of JSON holding the disk, this boot's id and the error, through a temp file renamed into place. Returns True; or
 	False, writing nothing, when a marker of this boot already stands for the disk. Raises OSError when the marker cannot
 	be written. A disk's error is reported once (the kernel's next sync gets 0), so this is the only memory of it. The caller
 	holds VAULT_SYNC_MARKERS_LOCK.
 	'''
 	boot_id = current_boot_id()
-	path = vault_sync_marker_path(disk)
+	path = vault_sync_marker_path(disk, state_dir)
 	marker = read_vault_sync_marker(path)
 	if marker is not None and marker['boot_id'] == boot_id:
 		return False
@@ -2124,6 +2125,32 @@ def record_failed_sync(disk:str, error:OSError, job_name:str) -> None:
 		except OSError as marker_error:
 			UNRECORDED_FAILED_DISKS.add(disk)
 			job_log(job_name, f'VAULT WRITE ERROR: disk {disk} failed a sync ({error}); its marker cannot be written ({marker_error}), so its copies stay unchecked only until reverberator stops, not until a reboot')
+
+def record_restore_write_error(disk:str, error:OSError, vault_folders:list, state_dir:str = None) -> 'OSError | None':
+	'''
+	A sync of a restore met a write error on disk. The kernel reports it once, and the restore's sync marked it seen for
+	the sync of a vault's disk the daemon opens next, which then gets 0: the cross-job rule of VAULT_SYNC_LOCKS, which
+	this restore, another process, cannot take part in by a lock but only by the marker. So when disk holds a job vault
+	of vault_folders (every job of the rule file the restore read), it is recorded as the daemon records its own
+	(mark_failed_sync()), in the state folder the command uses, and the daemon's comparisons then read the copies on it as
+	unchecked until a reboot. A disk holding no vault: nothing is recorded, and nothing is its daemon's to hear. Returns
+	None, or the OSError the marker could not be written with (a restore of a user other than root cannot write in
+	/run/reverberator). A vault whose disks cannot be listed is passed over.
+	'''
+	for vault_folder in vault_folders:
+		try:
+			if any(held == disk for held, _ in vault_disks(vault_folder)[1]):
+				break
+		except OSError:
+			continue
+	else:
+		return None
+	with VAULT_SYNC_MARKERS_LOCK:
+		try:
+			mark_failed_sync(disk, error, state_dir)
+		except OSError as e:
+			return e
+	return None
 
 # the private folder prepare_change_list() writes a change list in before place_change_list() renames it into place: made
 # by mkdtemp() in the job vault, which no reader takes for a version or a change list, and removed by get_vault_info()
@@ -15092,9 +15119,13 @@ class RestoreReport:
 	restores, the marker of a folder target while it is there, and whether it left a folder target private as not
 	everything was restored.
 	'''
-	def __init__(self, vault_incomplete:bool = False):
+	def __init__(self, vault_incomplete:bool = False, vault_folders:list = (), state_dir:str = None):
 		# whether a disk of the vault's pool is missing (vault_pool_warning()), so the walk of the vault may not meet what it holds
 		self.vault_incomplete = vault_incomplete
+		# the job vaults of the rule file the restore read, and the state folder the command uses: a write error a sync of the
+		# restore meets on a disk holding one is recorded for the daemon (record_restore_write_error())
+		self.vault_folders = vault_folders
+		self.state_dir = state_dir
 		self.version = None
 		self.rel = ''
 		self.target = None
@@ -15114,11 +15145,8 @@ class RestoreReport:
 		# the entries (rels, in the order they came) kept or restored without all of their metadata, as far as a marker records
 		self.unset = {}
 		self.left_private = False
-		# why the marker this run leaves says a run again copies everything again (RESTORE_RECOPY_REASONS: 'cut' while it
-		# says its copies are not known to be on disk), or None
-		self.recopy = None
-		# set when a recopy of a vault whose pool is missing a disk was kept, as the walk could not meet what that disk holds
-		self.waits_for_vault = False
+		# the "unsynced" and the "recopy" of the marker this run leaves now (restore_entry(), accept_restore())
+		self.record = (False, None)
 		# a pool's branches, and the folders on them, the user could not open to sync them, each warned of once
 		self.unsynced_folders = set()
 		# set once the folders began to be given their owners, which a stop leaves half done
@@ -15133,6 +15161,18 @@ class RestoreReport:
 		self.progress_width = 0
 		# set once a write of the progress fails (a closed pipe, a hung-up terminal): it is not tried again
 		self.progress_failed = False
+
+	@property
+	def recopy(self) -> 'str | None':
+		'''Why the marker this run leaves says a run again copies everything again (RESTORE_RECOPY_REASONS: 'cut' while its copies are not known to be on disk), or None.'''
+		unsynced, recopy = self.record
+		return recopy or ('cut' if unsynced else None)
+
+	def tell_daemon(self, rel:str, disk:str, error:OSError) -> None:
+		'''Record a write error of disk, met by a sync of this restore, for the daemon (record_restore_write_error()); a warning when that cannot be done.'''
+		failure = record_restore_write_error(disk, error, self.vault_folders, self.state_dir)
+		if failure is not None:
+			self.warn(rel, f'could not record the write error of disk {disk} for the daemon ({failure}): it may not learn of it, and may commit a version over copies that are not on disk')
 
 	def note(self, word:str, rel:str, reason:str) -> None:
 		'''Write the line "word rel: reason" on stderr now (say()).'''
@@ -15241,8 +15281,8 @@ class RestoreReport:
 		if self.failed > len(self.failures):
 			lines.append(f'{self.failed - len(self.failures)} more failed: shown above as they happened')
 		if self.recopy and self.marker is not None:
-			if self.waits_for_vault:
-				lines.append(f"What {self.target} holds is not known to be on disk, and a disk of the vault's pool is missing, so not everything of it was copied again: run the same restore again once all the vault's disks are there, which copies everything again. {unfinished_note(self.target)}")
+			if self.vault_incomplete:
+				lines.append(f"What {self.target} holds is not known to be on disk, and a disk of the vault's pool is missing, whose entries this run did not meet: run the same restore again once all the vault's disks are there, which copies everything again. {unfinished_note(self.target)}")
 			else:
 				lines.append(f'What {self.target} holds is not known to be on disk: run the same restore again, which copies everything again. {recopy_way_out(self.target, self.made)} {unfinished_note(self.target)}')
 		elif self.failed > self.final and self.marker is not None:
@@ -15331,7 +15371,9 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 		discard_copies(rest)
 
 # the kinds of entry (restore_failure()) no run again can restore: a chain that leads nowhere, and a link to the live file
-# of a referenced backup. a run again reads the same vault, so they fail again and hold nothing back for it
+# of a referenced backup. a run again reads the same vault, so they fail again and hold nothing back for it. but while a
+# disk of the vault's pool is missing a chain may lead to what it holds: a dangling one is then a failure a run again may
+# fix (RestoreReport.vault_incomplete)
 RESTORE_FINAL_KINDS = ('dangling', 'referenced')
 
 def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
@@ -15403,7 +15445,7 @@ def read_restore_marker(target:str):
 	'''
 	What the marker of an unfinished folder restore at the top of target holds, {"job", "path", "version"}, "unset" when
 	it names any: the rels of the entries kept without all of their metadata, "unsynced" (True) when its copies are not
-	known to be on disk, whatever value the marker holds (earlier 0.55.2 builds wrote a boot and mounts there), and
+	known to be on disk, whatever value the marker holds, and
 	"recopy" when everything has to be copied again: 'sync failed' or 'cut' (write_restore_marker(); a marker of 0.55.1
 	has neither, and reads as before), and "made" (True) when a restore made the target folder, which a marker of 0.55.1
 	never says (so it is never told to be removed, recopy_way_out()); None when
@@ -15459,7 +15501,7 @@ def read_restore_marker(target:str):
 			raise unreadable('its list of entries without all of their metadata is not a list of paths')
 		found['unset'] = record['unset']
 	if 'unsynced' in record:
-		# its value says nothing more: an earlier 0.55.2 build's boot and mounts reads as true too
+		# its value says nothing more
 		found['unsynced'] = True
 	if 'recopy' in record:
 		found['recopy'] = record['recopy'] if record['recopy'] in RESTORE_RECOPY_REASONS else 'cut'
@@ -15471,7 +15513,7 @@ def read_restore_marker(target:str):
 # copies was killed or cut before any sync of them succeeded (restore_entry())
 RESTORE_RECOPY_REASONS = ('sync failed', 'cut')
 
-def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion, unset:list = (), unsynced:bool = False, recopy:str = None, made:bool = False, denied:list = None) -> str:
+def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion, unset:list = (), unsynced:bool = False, recopy:str = None, made:bool = False, new:bool = False, denied:list = None) -> str:
 	'''
 	Mark target, the folder a restore of rel of job_name from version writes into, as its own unfinished output, and
 	return the marker's path. It is written under a partial name, readable by this user alone, and renamed into place,
@@ -15481,8 +15523,8 @@ def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion,
 	recopy, one of RESTORE_RECOPY_REASONS, that a run again copies everything again and --accept is refused
 	(restore_entry() says when each is written and dropped). made, that a restore made target (this run, or the one whose
 	marker this carries on), is recorded ("made": true). The marker's name is made durable with it: target is fsynced after
-	the rename, and with made target's parent too, so a crash after the first copy finds the
-	marker; on a pool a branch the user cannot open is passed over for denied (fsync_vault_folder()).
+	the rename, and with new (the first marker of the run that made target) target's parent too, so a crash after the first
+	copy finds the marker; on a pool a branch the user cannot open is passed over for denied (fsync_vault_folder()).
 	'''
 	marker = os.path.join(target, RESTORE_MARKER_NAME)
 	temp = partial_copy_path(marker)
@@ -15516,7 +15558,7 @@ def write_restore_marker(target:str, job_name:str, rel:str, version:KeptVersion,
 			os.unlink(temp)
 		raise
 	fsync_vault_folder(target, denied)
-	if made:
+	if new:
 		fsync_vault_folder(os.path.dirname(target), denied)
 	return marker
 
@@ -15737,7 +15779,9 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 	target), so what the restore reports done is on disk: syncfs_fd() of each of disks.handles, the handles
 	open_restore_disks() opened before the first copy, and never of a path opened now, so each reports every writeback
 	error its disk met since, even one another process's sync met first. A pool's disks are synced side by side
-	(sync_each_disk()). Nothing is recorded, unlike sync_vault_filesystems(): a restore writes no vault marker. On a pool
+	(sync_each_disk()). No sync is recorded as sync_vault_filesystems() records its own, but a write error it meets on a
+	disk holding a vault of the rule file is recorded for the daemon (RestoreReport.tell_daemon()): the kernel reports an
+	error once, so the daemon's next sync of that disk would get 0, and the restore's sync is the one that took it. On a pool
 	the pool is listed again, as a disk may have joined it since the claim (a branch added, or a disk mounted where a
 	branch's folder was): it has no handle, and one opened now would miss an error another sync of it already saw, so one
 	that holds the restore's folder now (a copy may have landed there) fails the restore, saying so; one that does not
@@ -15752,21 +15796,24 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 		return False
 
 	def sync(disk:str, handles:list):
-		# None, or why the disk is not known to hold what was restored: it could not be opened before the first copy, or the
-		# sync of it failed
+		# None, or (why the disk is not known to hold what was restored, the OSError of its sync: None when it could not be
+		# opened before the first copy)
 		if isinstance(handles[0], OSError):
-			return f'the disk {disk} could not be opened to write the restore out to it ({handles[0]}): what was restored may not be on it'
+			return f'the disk {disk} could not be opened to write the restore out to it ({handles[0]}): what was restored may not be on it', None
 		try:
 			syncfs_fd(handles[0], folder)
 		except OSError as e:
 			if after_hand_over:
-				return f"the disk {disk} reported a write error as the restore's last changes were written out to it ({e}): the files restored are on disk, but their folders' owners, modes and times and the marker's removal may not be"
-			return f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it'
+				return f"the disk {disk} reported a write error as the restore's last changes were written out to it ({e}): the files restored are on disk, but their folders' owners, modes and times and the marker's removal may not be", e
+			return f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it', e
 		return None
 	synced = True
 	for disk, result in sync_each_disk(disks.handles, sync).items():
 		if result is not None:
-			report.fail(rel, result, rerun=False)
+			message, error = result
+			report.fail(rel, message, rerun=False)
+			if error is not None:
+				report.tell_daemon(rel, disk, error)
 			synced = False
 	if disks.listed is not None:
 		try:
@@ -15832,8 +15879,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	stderr and syncs through the same handles, which waits for the disk, as no signal cuts a sync short: once that
 	succeeds the marker is rewritten without it, so a run again keeps what is there; a failure records recopy 'sync
 	failed'. A sync that fails at any point writes "recopy": 'sync failed' in its place, or where that cannot be written
-	leaves the record the claim wrote, which a run again copies everything again over all the same. "unsynced", whatever its value
-	(earlier 0.55.2 builds wrote a boot and mounts), is left only by a run killed, crashed or cut before its sync, which
+	leaves the record the claim wrote, which a run again copies everything again over all the same. "unsynced", whatever
+	its value, is left only by a run killed, crashed or cut before its sync, which
 	may have lost bytes of what was copied, and no run can tell afterwards: it reads as recopy 'cut'. A run that finds a
 	recopy keeps nothing already there, copies everything again, and keeps the recopy in the marker until every entry
 	was copied again and a sync of them succeeded: a stop, which then needs no sync, any failure a run again may fix, or a
@@ -15860,9 +15907,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	# why this run copies everything again, keeping nothing already there (marker_recopy()), or None
 	recopy = None
 	# whether a restore made the target folder: this run does, unless it picks up a marker, which says
-	made = not resume
-	# the record of the marker on disk now: its "unsynced" and its "recopy"
-	record = (False, None)
+	report.made = not resume
 	# a file target's folder, opened before the copy, for its sync to report every writeback error since (or why it could not be)
 	folder_fd = None
 	# the handles every sync goes through (open_restore_disks()), once opened
@@ -15870,20 +15915,20 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	# set once a signal stopped the run
 	stopped = False
 
-	def mark(unsynced:bool = False, recopy:str = None):
-		# the marker as this run leaves it now: what it knows of, what it did not get to meet again, and what is on disk
-		nonlocal written, record
+	def mark(unsynced:bool = False, recopy:str = None, new:bool = False):
+		# the marker as this run leaves it now: what it knows of, what it did not get to meet again, and what is on disk.
+		# new: the first, by the run that made the target
+		nonlocal written
 		unset = list(report.unset) + [entry for entry in earlier if entry not in report.unset]
 		denied = []
 		try:
-			report.marker = write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, unsynced=unsynced, recopy=recopy, made=made, denied=denied)
+			report.marker = write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, unsynced=unsynced, recopy=recopy, made=report.made, new=new, denied=denied)
 		finally:
 			for folder, error in denied:
 				report.cannot_sync(rel, folder, error)
 		written = unset
-		record = (unsynced, recopy)
 		# copies not known to be on disk are copied again by a run again
-		report.recopy = recopy or ('cut' if unsynced else None)
+		report.record = (unsynced, recopy)
 
 	def write_error():
 		# a sync failed: what is there may not be on disk. unrecorded, the marker still holds the "unsynced" or the recopy of
@@ -15910,7 +15955,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 		if reason is None and cp_af_copy_path(resolved.path, dest, mcae, pending) is False:
 			reason = f'{resolved.path} is gone from the vault'
 		if reason is not None:
-			report.fail(entry_rel, reason, rerun=resolved.kind not in RESTORE_FINAL_KINDS)
+			# on a vault missing a disk (a 0.54 vault's chain to a file on it reads dangling) a run again may find it
+			report.fail(entry_rel, reason, rerun=resolved.kind not in RESTORE_FINAL_KINDS or (resolved.kind == 'dangling' and report.vault_incomplete))
 
 	def clear_partials(folder:str, held:str, entry_rel:str):
 		try:
@@ -15957,24 +16003,23 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 						raise target_exists(target)
 				def look_again():
 					# the run whose output this was may have finished while this one waited for the lock
-					nonlocal earlier, written, recopy, made
+					nonlocal earlier, written, recopy
 					marker = held_marker(target, os.path.basename(job_vault), rel, version)
 					earlier = dict.fromkeys(marker.get('unset', ()))
 					written = list(earlier)
 					recopy = marker_recopy(marker)
-					made = marker.get('made', False)
+					report.made = marker.get('made', False)
 				lock = claim_restore_target(target, look_again if marked else None)
 			except OSError as e:
 				report.fail(rel, str(e), error=e)
 				return
 			disks = open_restore_disks(target, lock, report, rel)
 			report.restored += 1
-			report.made = made
 			folders.append((resolved.path, target, rel))
 			try:
 				# not known to be on disk until this run's sync succeeds: killed before then, it leaves a run again that copies
 				# everything again. a recopy stays recorded as it is until it is done
-				mark(unsynced=not recopy, recopy=recopy)
+				mark(unsynced=not recopy, recopy=recopy, new=not resume)
 			except OSError as e:
 				report.fail(rel, f'cannot write its marker and make it durable: {e}')
 				report.left_private = True
@@ -16056,7 +16101,6 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			# a disk of the vault's pool is missing: the walk never met what it holds, so "every entry copied again" is not
 			# known, and what the killed run left of those entries would be handed over as done. the recopy stays, for a run
 			# again once the vault's disks are all there
-			report.waits_for_vault = True
 			report.left_private = True
 			return
 		if not recopy or report.failed == report.final:
@@ -16082,7 +16126,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			stop_copies(mcae, pending, target)
 		finally:
 			if report.marker is not None and not report.target_handing_over:
-				if stopped and record[0]:
+				if stopped and report.record[0]:
 					# stopped before its own sync, and no recopy: what it copied is written out through the handles opened before
 					# its first copy, so a run again keeps it. no signal cuts the wait for the disk short, a second Ctrl-C included
 					report.say(f'Stopping: writing what was restored into {target} out to disk first, which takes as long as the disk needs')
@@ -16094,7 +16138,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 				unset = list(report.unset) + [entry for entry in earlier if entry not in report.unset]
 				if unset != written:
 					with contextlib.suppress(OSError):
-						mark(*record)
+						mark(*report.record)
 			for sig, handler in handlers.items():
 				# None: a handler set from outside Python, which cannot be set back
 				signal.signal(sig, signal.SIG_DFL if handler is None else handler)
@@ -16147,14 +16191,12 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 	report.version, report.rel, report.target, report.accepted = version, rel, target, True
 	report.marker = os.path.join(target, RESTORE_MARKER_NAME)
 	unset = []
-	made = False
 	def look_again():
 		# the run whose output this was may have finished while this one waited for the lock
-		nonlocal made
 		marker = held_marker(target, os.path.basename(job_vault), rel, version, accept=True)
 		refuse_accept_unsynced(target, marker)
 		unset.extend(marker.get('unset', ()))
-		made = report.made = marker.get('made', False)
+		report.made = marker.get('made', False)
 	lock = claim_restore_target(target, look_again)
 	disks = None
 	try:
@@ -16209,8 +16251,8 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 			# what it holds may not be on disk: a run again copies everything again, and a later --accept is refused
 			denied = []
 			try:
-				write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, recopy='sync failed', made=made, denied=denied)
-				report.recopy = 'sync failed'
+				write_restore_marker(target, os.path.basename(job_vault), rel, version, unset, recopy='sync failed', made=report.made, denied=denied)
+				report.record = (False, 'sync failed')
 			except OSError as e:
 				report.fail(rel, f'the failed sync could not be recorded in its marker ({e}): move {target} out of the way and restore again', rerun=False)
 				# --accept only runs over a marker with no record (refuse_accept_unsynced()), so a run again would take the
@@ -16548,7 +16590,7 @@ def restore_command(args) -> int:
 					entry = None
 				if entry is None or restore_failure(entry, version) is None:
 					aside = move_target_aside(target)
-			report = RestoreReport(vault_incomplete=warned)
+			report = RestoreReport(vault_incomplete=warned, vault_folders=[job_vault_path(each) for each in rules], state_dir=args.state_dir)
 			try:
 				if args.accept:
 					accept_restore(job_vault, version, rule.mon_path, rel, target, report)

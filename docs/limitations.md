@@ -756,6 +756,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   commit nothing.
 - **Revisit when:** the round after 0.55.2.
 
+### Another program's sync can take a vault disk's write error from the daemon
+
+- **Kind:** deferred.
+- **What the operator sees:** when another program syncs a vault's filesystem (`sync -f`, a tool that calls syncfs) and
+  meets a write error first, the daemon's flush before its commit, through a handle it opens then, hears nothing: no
+  VAULT WRITE ERROR, and the batch commits a version whose copies may not be on disk. A reverberator restore records
+  such an error for the daemon; other programs do not.
+- **Why:** the daemon opens a new handle for each sync, and Linux reports a write error to a handle opened after it only
+  while no other sync has seen it.
+- **Revisit when:** the next round that touches the commit flush: each batch opens its vault disks' handles before its
+  first copy and syncs through them, as a restore does (the pool cut and power-loss gates apply).
+
 ### The root's metadata is written every batch
 
 - **Kind:** deferred.

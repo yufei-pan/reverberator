@@ -16,6 +16,7 @@ import shutil
 import stat
 import pytest
 import reverberator as rv
+from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.harness import seed_monitor, run_backup, write_rule
 
 pytestmark = pytest.mark.unit
@@ -861,6 +862,8 @@ def test_the_marker_is_on_disk_before_the_first_copy(job, tmp_path, capsys, monk
 	assert (code, err) == (0, ''), stdout
 	# the target, holding the marker, then the folder this restore made it in: both before any copy
 	assert events[:3] == [('fsync', target, True), ('fsync', out, True), 'copy']
+	# that folder once: only the first marker of the run that made the target needs it
+	assert [event for event in events if event[:2] == ('fsync', out)] == [('fsync', out, True)]
 
 
 def nul_out(path):
@@ -939,14 +942,13 @@ def killed_at_its_sync(job, tmp_path, capsys, monkeypatch):
 		killing.setattr(rv, 'sync_restore', lambda *args: (_ for _ in ()).throw(Killed()))
 		with pytest.raises(Killed):
 			restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	# one value, whatever the boot and the mounts; and that this restore made the target
+	# one value; and that this restore made the target
 	assert marker_of(target) == {'job': job.job_name, 'path': 'proj', 'version': rv.list_versions(job.job_vault)[0].name, 'unsynced': True, 'made': True}
 	return target
 
 
-# "unsynced" as this build writes it, and as earlier 0.55.2 builds did: a boot id and the target's mounts, or '' for none
-# to tell; and a value no build wrote
-@pytest.mark.parametrize('unsynced', [True, '3f2a9c1e-7b4d-4e8a-9c0f-5d6e7f8a9b0c mount 2147484088,2147484101', '', None], ids=['as_written', 'a_boot_and_mounts', 'none_to_tell', 'null'])
+# "unsynced" as the restore writes it, and whatever else a marker holds there: it reads as unsynced all the same
+@pytest.mark.parametrize('unsynced', [True, 'any text', None], ids=['as_written', 'a_string', 'null'])
 def test_a_run_again_after_a_kill_copies_everything_again_and_accept_is_refused(job, tmp_path, capsys, monkeypatch, unsynced):
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
 	marker = os.path.join(target, rv.RESTORE_MARKER_NAME)
@@ -1166,7 +1168,7 @@ def test_a_recopy_of_a_vault_missing_a_disk_keeps_its_recopy_and_the_target_priv
 	assert code == rv.EXIT_COMMAND_FAILED and handed == []
 	assert marker_of(target).get('recopy') == 'cut' and stat.S_IMODE(os.lstat(target).st_mode) == 0o700
 	assert not whole(target)
-	assert stdout.splitlines()[-1] == f"What {target} holds is not known to be on disk, and a disk of the vault's pool is missing, so not everything of it was copied again: run the same restore again once all the vault's disks are there, which copies everything again. {rv.unfinished_note(target)}"
+	assert stdout.splitlines()[-1] == f"What {target} holds is not known to be on disk, and a disk of the vault's pool is missing, whose entries this run did not meet: run the same restore again once all the vault's disks are there, which copies everything again. {rv.unfinished_note(target)}"
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
 	assert code == rv.EXIT_USAGE and 'no sync of what it holds is known to have succeeded' in err
 	# once the vault's disks are all there, the run again copies everything again and finishes
@@ -1248,3 +1250,86 @@ def test_a_marker_without_made_never_says_to_remove_the_target(job, tmp_path, ca
 	assert 'made' not in rv.read_restore_marker(target)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
 	assert code == rv.EXIT_USAGE and err.endswith(f'{way_out(target, False)}\n')
+
+
+@pytest.fixture
+def boot(tmp_path, monkeypatch):
+	path = tmp_path / 'boot_id'
+	path.write_text('boot-1\n')
+	monkeypatch.setattr(rv, 'BOOT_ID_PATH', str(path))
+	return path
+
+
+def restore_with_state(tmp_path, capsys, state, path, *extra):
+	'''restore() with its state folder the one given.'''
+	capsys.readouterr()
+	code = rv.run_command(['restore', path, *extra, '--rule', str(tmp_path / 'rule.tsv'), '--state_dir', state])
+	captured = capsys.readouterr()
+	return code, captured.out, captured.err
+
+
+def test_a_write_error_a_restore_meets_on_a_vault_disk_is_recorded_for_the_daemon(job, tmp_path, capsys, monkeypatch, boot):
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	state = str(tmp_path / 'elsewhere')
+	# the target and the job's vault are on one disk, and the restore's sync is the one that meets its write error
+	assert disk_of(target) == disk_of(job.job_vault)
+	record(monkeypatch, fail=lambda n: write_error(n) if n == 1 else None)
+	code, stdout, err = restore_with_state(tmp_path, capsys, state, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED and 'WARNING' not in stdout
+	# its marker is where the command's state folder is, as the daemon writes its own, and nowhere else
+	marker = rv.vault_sync_marker_path(disk_of(job.job_vault), state)
+	assert os.path.isfile(marker) and rv.read_vault_sync_marker(marker) == {'disk': disk_of(job.job_vault), 'boot_id': 'boot-1', 'error': str(write_error(1))}
+	assert not os.path.lexists(rv.vault_sync_marker_path(disk_of(job.job_vault)))
+	# the daemon, which reads that folder, reports it as it does a write error another job's sync met: copies on that disk
+	# stay unchecked
+	monkeypatch.setenv('REVERB_STATE_DIR', state)
+	assert rv.failed_sync_disks() == {disk_of(job.job_vault)}
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', REAL_SYNC_VAULT_FILESYSTEMS)
+	assert rv.check_vault_sync(job.job_vault, job.job_name) == [disk_of(job.job_vault)]
+
+
+def test_a_write_error_a_restore_meets_on_a_disk_with_no_vault_is_recorded_for_no_one(job, tmp_path, capsys, monkeypatch, fake_pool, boot):
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
+	# the pool's disk holds the target and no vault
+	assert disk_of(branches['one']) != disk_of(job.job_vault)
+	record(monkeypatch, fail=lambda n: write_error(n) if n == 1 else None)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] and 'WARNING' not in stdout
+	assert rv.failed_sync_disks() == set() and not os.path.lexists(rv.vault_sync_marker_path(disk_of(branches['one'])))
+
+
+def test_a_write_error_that_cannot_be_recorded_for_the_daemon_is_a_warning(job, tmp_path, capsys, monkeypatch, boot):
+	backed_up(job)
+	out = destination(tmp_path)
+	disk = disk_of(job.job_vault)
+	# a folder at the marker's path: the state folder cannot take it, as a restore of a user other than root finds /run/reverberator
+	os.makedirs(rv.vault_sync_marker_path(disk))
+	record(monkeypatch, fail=lambda n: write_error(n) if n == 1 else None)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	warnings = [line for line in stdout.splitlines() if line.startswith('WARNING')]
+	assert len(warnings) == 1 and warnings[0].startswith(f'WARNING proj: could not record the write error of disk {disk} for the daemon (')
+	assert warnings[0].endswith('): it may not learn of it, and may commit a version over copies that are not on disk')
+	assert rv.failed_sync_disks() == set()
+
+
+def test_a_dangling_chain_on_a_vault_missing_a_disk_is_not_final(job, tmp_path, capsys, monkeypatch):
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	with monkeypatch.context() as incomplete:
+		# a chain of a 0.54 vault to a file on the missing disk reads as leading nowhere
+		a_final_failure('dangling', job, incomplete)
+		incomplete.setattr(rv, 'vault_pool_warning', lambda job_vault: True)
+		code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	# a run again may find it once the disk is back: the target is held for it
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and stat.S_IMODE(os.lstat(target).st_mode) == 0o700
+	assert f'1 failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {rv.unfinished_note(target)}' in stdout
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert (code, err) == (0, ''), stdout
+	assert whole(target) and os.path.isfile(os.path.join(target, 'sub', 'b.txt')) and not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
