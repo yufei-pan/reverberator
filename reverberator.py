@@ -3178,6 +3178,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			forget_moved_away(cookie_value)
 		append_change_event(to_process, to_process_lock, pop_pending_move_from(cookie))
 	newDirWDs = set()
+	# newDirWDs as it was before the latest take, for the MOVE_SELF rule alone (read only with wdDic): a folder's move-out
+	# out of a new folder, read before a take, can have its IN_MOVE_SELF in a read after it, as a read can end between
+	# them and the renaming thread can be preempted before it queues the IN_MOVE_SELF (round 22's cost pass: with 4 to 64
+	# renaming threads, 35 of the 1,675 reads that ended between them had it two or more reads later)
+	new_before_take = set()
 	# the folders of newDirWDs whose discarded events were logged: one line per folder until a take clears both, as one
 	# busy new folder (a test run's traces) wrote hundreds of thousands of lines
 	discardLoggedWDs = set()
@@ -3238,8 +3243,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				# a batch was taken, signalled or not (the backuper's startup take, or one a predecessor's flag asked
 				# for), so its recursive folder copies run from now on: record events in those folders again. right after
 				# the read: an event read before the take happened before it, and the copy holds it; one read after it
-				# may come after the copy passed its entry, and is kept (a kept duplicate costs nothing)
-				newDirWDs.clear()
+				# may come after the copy passed its entry, and is kept (a kept duplicate costs nothing). a new set: the
+				# old one serves the MOVE_SELF rule until the next take
+				new_before_take, newDirWDs = newDirWDs, set()
+				notes.new_dirs = newDirWDs
 				discardLoggedWDs.clear()
 				lastProcessTime = time.monotonic()
 				if clock is not None:
@@ -3322,8 +3329,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						# MOVED_TO. a move the events follow put the watch where it went (a pair) or holds it (a move-out, until
 						# it pairs or expires); but a move read in a folder made since the last take keeps no cookie, and leaves
 						# the watch, in newDirWDs or found by the rules that keep newDirWDs, at its old path: unless a probe finds
-						# it there, settle() looks for it ( its step 2; a found one that step 1 puts in place is settled there )
-						if (event.wd in newDirWDs or event.wd in notes.found) and event.wd not in notes.outgoing and event.wd in wdDic:
+						# it there, settle() looks for it ( its step 2; a found one that step 1 puts in place is settled there ).
+						# a read can end between the move-out and it, and a take come between them: the watch is then in
+						# new_before_take
+						if (event.wd in newDirWDs or event.wd in notes.found or event.wd in new_before_take) and event.wd not in notes.outgoing and event.wd in wdDic:
 							strays = set()
 							if probe_at(wdDic[event.wd], strays) != event.wd:
 								notes.doubtful.setdefault(event.wd, wdDic[event.wd])

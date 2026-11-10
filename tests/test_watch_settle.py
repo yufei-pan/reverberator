@@ -484,3 +484,102 @@ def test_a_folder_renamed_twice_out_of_a_new_folder_leaves_no_watch(session, job
 	one.back_up_next()
 	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
 	assert not wrong(job) and not stale and not missing, (wrong(job), stale, missing)
+
+
+def test_the_kernel_queues_a_folders_move_self_within_its_rename(tmp_path):
+	'''
+	What the MOVE_SELF rule's take window rests on: once rename() returns, the queue holds the folder's IN_MOVE_SELF with
+	the rename's MOVED_FROM or MOVED_TO, yet a read can end between the two (a reader that took only part of the queue),
+	which leaves the IN_MOVE_SELF to a later read.
+	'''
+	flags = rv.inotify_simple.flags
+	mask = flags.MOVED_FROM | flags.MOVED_TO | flags.MOVE_SELF
+	tree, outside = tmp_path / 'tree', tmp_path / 'outside'
+	os.makedirs(tree / 'd')
+	outside.mkdir()
+	kinds = lambda events: [(e.wd, e.mask & ~flags.ISDIR) for e in events]
+	with rv.inotify_simple.INotify() as inotify:
+		top = inotify.add_watch(str(tree), mask)
+		moved = inotify.add_watch(str(tree / 'd'), mask)
+		# no wait: what each rename() queued before it returned
+		os.rename(tree / 'd', outside / 'd')
+		assert kinds(inotify.read(timeout=0)) == [(top, flags.MOVED_FROM), (moved, flags.MOVE_SELF)]
+		os.rename(outside / 'd', tree / 'd')
+		assert kinds(inotify.read(timeout=0)) == [(top, flags.MOVED_TO), (moved, flags.MOVE_SELF)]
+		os.rename(tree / 'd', outside / 'd')
+		# a read whose buffer holds the first event alone (16 bytes, and the name d padded to 16), then the next read
+		first = rv.inotify_simple.parse_events(os.read(inotify.fileno(), 32))
+		rest = inotify.read(timeout=0)
+	assert kinds(first) == [(top, flags.MOVED_FROM)] and kinds(rest) == [(moved, flags.MOVE_SELF)]
+
+
+def split_move_self(one, monkeypatch, name, lag):
+	'''
+	The read that holds the move-out of the folder name ends right after its MOVED_FROM, and a batch is taken before the next
+	read (held for back_up_next()). The folder's IN_MOVE_SELF comes in that next read, or, with lag 'read_after', in the
+	read after it, the next one holding a write of other/w alone. state['stage'] is 3 once the IN_MOVE_SELF was read. It
+	returns once the watcher reads through it (a read begun before it was set is over).
+	'''
+	real_read, flags = rv.inotify_simple.INotify.read, rv.inotify_simple.flags
+	state = {'rest': None, 'stage': 0}
+	reading = threading.Event()
+	def read(inotify, *args, **kwargs):
+		reading.set()
+		if state['stage'] == 0:
+			events = real_read(inotify, *args, **kwargs)
+			at = next((i for i, e in enumerate(events) if e.mask & flags.MOVED_FROM and e.name == name), None)
+			if at is None:
+				return events
+			state['rest'] = events[at + 1:]
+			assert any(e.mask & flags.MOVE_SELF for e in state['rest']), events
+			state['stage'] = 1
+			return events[:at + 1]
+		if state['stage'] == 1:
+			with one.lock:
+				one.held.append(one.queue.take())
+			if lag == 'read_after':
+				state['stage'] = 2
+				one.apply(('write', 'other/w', 'w'))
+				return real_read(inotify, *args, **kwargs)
+		if state['stage'] in (1, 2):
+			state['stage'] = 3
+			return state['rest']
+		return real_read(inotify, *args, **kwargs)
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+	assert reading.wait(10), 'the watcher did not read'
+	return state
+
+
+@pytest.mark.parametrize('run', range(2))
+@pytest.mark.parametrize('lag', ['next_read', 'read_after'])
+def test_a_move_out_of_a_new_folder_whose_move_self_comes_after_a_take_leaves_no_watch(session, job, tmp_path, monkeypatch, lag, run):
+	'''
+	The MOVE_SELF rule's take window: a folder made in a new folder leaves the tree from it (no cookie), the read ends between
+	its MOVED_FROM and its IN_MOVE_SELF, and a batch is taken before the IN_MOVE_SELF is read, which clears newDirWDs. The
+	watch must still leave: else it stays at n/x, and review 5's F1 follows (another folder made at n/x with two files alike
+	in size, mtime and last 64 KiB; a rename in the folder outside came as a rename at n/x, onto the other file's bytes).
+	'''
+	maps = latest_map(monkeypatch)
+	one = session({'other/o': 'o'})
+	outside = tmp_path / 'outside'
+	os.makedirs(outside)
+	m = job.monitor
+	one.run([('mkdir', 'n'), ('mkdir', 'n/x'), ('write', 'n/x/g', 'outside g')], 'apart')
+	one.settle()
+	state = split_move_self(one, monkeypatch, 'x', lag)
+	one.apply(('mv', 'n/x', str(outside / 'x')))
+	wait_until(lambda: state['stage'] == 3, message='the IN_MOVE_SELF was not read')
+	one.back_up_next()
+	os.mkdir(f'{m}/n/x')
+	same_but_head(f'{m}/n/x/g', b'G')
+	same_but_head(f'{m}/n/x/h', b'H')
+	one.back_up_next()
+	assert not wrong(job)
+	os.rename(outside / 'x' / 'g', outside / 'x' / 'h')
+	batch = one.take()
+	one.back_up(batch)
+	one.apply(('write', 'other/marker', 'm'))
+	one.back_up_next()
+	bad = wrong(job)
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	assert not bad and not stale and not missing, (relative(batch, m), bad, stale, missing)
