@@ -121,7 +121,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** a swap collapsed in one batch (`mv a t; mv b a; mv t b`) copies both files again instead of
   renaming them, and two folders whole: the replay renames each onto the other's old place, the comparison after the
-  batch finds both different and copies them, and nothing is logged at warning or error level. A file swapped with a
+  batch finds both different and copies them, and nothing is logged at warning or error level. An exchange of two entries
+  by one rename (`mv --exchange a b`, `RENAME_EXCHANGE`) in one batch is repaired the same way. A file swapped with a
   folder keeps one renamed and copies the other, logging `Not renaming … to …: … is a folder in the version, as an earlier
   move of the batch left it; doing delete & copy instead` (or `is not a folder`) at ERROR level, with no traceback
   (firewatcher does not alert on it). The result is right.
@@ -147,6 +148,45 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the warning shows up often in the live logs.
 - **Approved:** 2026-10-26, the user's choice "Known limitation (Recommended)"; widened 2026-10-29, "Widen the known
   limitation (Recommended)", then for the older collapse shapes "Widen the known limitation (Recommended)".
+
+### A move out of a folder that just left the tree is copied
+
+- **Kind:** known limitation.
+- **What the operator sees:** for the pair timeout after a folder is moved out of the tree (the larger of the job's
+  minimum snapshot delay and 30 s: 60 s by default, an hour on a job whose minimum delay is an hour), anything moved
+  from that folder back into the tree, as in `mv X /out/X; mv /out/X/sub sub`, is copied whole instead of renamed in
+  the vault, with one INFO line, `Copying <path>, moved from <path>: a watch of the move is not settled`. Until the
+  watcher next finds its event queue empty, normally at the end of that read, the same copy covers a rename in a folder
+  moved onto the place of one that had just left the tree and then moved on, in either folder of a swap by one rename
+  (`RENAME_EXCHANGE`), and in a folder the watcher found at a place its events had not brought it to yet (a rename
+  racing the walk of a folder just moved or made). 0.55.1 renamed these. The version is right; the copy costs the moved
+  entry's size once, and with a size limit it can prune older versions, as the copy of a move into a new folder can.
+- **Why:** such a folder's watch can report its moves at a path another folder now has; trusting it is how a version
+  kept a file's old bytes for good, and telling the two folders apart needs the watch tree of round 22's first design
+  (about 815 more lines and 94 bytes a watch).
+- **Revisit when:** the log shows big copies from this route often. Also when the no-copy move into a new folder gets
+  its own design.
+- **Approved:** 2026-11-09, the user's choice "Accept: copy (Recommended)"; then, with the window corrected to the pair
+  timeout and the routes named, "Approve as corrected (Recommended)".
+
+### A folder found ahead of its events can reach the vault a version late
+
+- **Kind:** known limitation.
+- **What the operator sees:** when a walk of the watcher finds a folder at a place its events have not brought it to
+  yet (a rename racing the walk of a folder just moved or made), or one rename swaps two folders (`RENAME_EXCHANGE`),
+  that folder's changes come at another path (its old one, or the other folder's) until the watcher finds its event
+  queue empty. Then it puts the folder's watch in place and watches what was made in it; a swapped folder, and a found
+  one after a batch taken in between, is also copied, with one INFO line, `Copying <path>: its changes came at another
+  path until the event queue ran empty`. A batch taken before that moment, while events keep coming (the maximum
+  delay's), can lack a change made in that folder meanwhile; the next version has it, and the copy that brings it
+  copies the folder whole once more (vault space). The queue empties often even in a busy tree: with writers at
+  108,000, 89,000 and 57,000 events a second it was empty after 42%, 59% and 69% of reads, the longest non-empty streak
+  under 10 ms.
+- **Why:** only an empty queue tells the watcher that what it sees in the tree is what its events say; deciding with
+  events unread is how 0.55.1 could remove a live folder's watch or keep a file's old bytes.
+- **Revisit when:** a live tree shows long stretches with no empty queue.
+- **Approved:** 2026-11-09, the user's choice "Accept: next version (Recommended)"; then, with the swap and the second
+  copy named, "Approve as corrected (Recommended)".
 
 ### One folder renamed back and forth thousands of times in one batch
 
@@ -323,14 +363,16 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** a file rewritten in place while the daemon is down, at the same size and with its mtime set
   back, changed only before its last 64 KiB, is missed at the restart and kept wrong until it changes again. So is such
   a rewrite made while the daemon ran, when a stop with the vault not there dropped its event: the start's full
-  comparison has the same blind spot.
+  comparison has the same blind spot. So is one made while the watcher watches the tree afresh after an event queue
+  overflow (about 8 µs a folder, some 0.15 s at 17,200 folders): the full comparison that follows has the same blind spot.
 - **Why:** a full comparison checks size, mtime and the tail hash; utime cannot set ctime back, but ctime is not checked.
   Reading the whole file when its ctime is after the matched time would catch it, but making that check affordable
   needed three more parts, for a rare case.
 - **Revisit when:** such rewrites are seen in practice.
 - **Approved:** 2026-10-27, the user's choice "Defer to round 11 (Recommended)"; then 2026-10-27, on that whole-file
   check: "why do we bother?", then "Drop it, known limitation (Recommended)"; 2026-10-28, on widening it to a rewrite
-  made while running whose event a stop dropped: "Widen it (Recommended)".
+  made while running whose event a stop dropped: "Widen it (Recommended)"; 2026-11-09, on the window of the watch's
+  restart after an overflow: "Accept: one sentence (Recommended)".
 
 ### A rewritten rule row keeps the defaults it was given
 
@@ -685,9 +727,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   arrival as a move; four reviews and the fix passes after them each found an order of events where the version then
   kept a file's old bytes for good where 0.55 is right (the last needs the stale watch of a folder that left the tree, at
   the moved folder's old path), so 0.55.1 copies, as 0.55 does. A copy costs space and time; a wrong version loses a backup.
-- **Revisit when:** the no-copy move gets its own design, after the two entries it went through are fixed ("A folder
-  renamed twice into a folder whose move is being walked can keep old bytes" and "A folder moved out of the tree from a
-  new folder keeps its watch"); sooner if size limits start pruning because of it.
+- **Revisit when:** the no-copy move gets its own design; sooner if size limits start pruning because of it.
 - **Approved:** 2026-11-07, "Drop the feature (Recommended)": 0.55.1 ships with every move into a new folder copied, as
   on 0.55, and the no-copy move gets its own design later.
 
@@ -753,43 +793,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** a lightness item.
 - **Revisit when:** the lightness round after 0.55.1.
 
-### A folder renamed twice into a folder whose move is being walked can keep old bytes
-
-- **Kind:** deferred.
-- **What the operator sees:** a change that keeps a file's size and mtime (`cp -p` of a same-size file), then its folder
-  moved into a folder whose own move the watcher is still walking, and renamed again in it after the walk listed the first
-  name (`mv other o2; mv big o2/x; mv o2/x o2/big`), can leave the version holding the file's old bytes for good, with no
-  line in the log; a restart's comparison does not see it. Seen in forced orders of events only, 225 of 1,365 on 0.55 and
-  0.55.1 alike, and never on the real daemon in 8 tries: the second rename has to land while the walk of a big folder has
-  not yet passed the first name. A move into a new folder does not reach it: that is copied.
-- **Why:** older than 0.55.1. The fix, a folder move whose watch a walk re-pointed before its move-out was read is copied
-  wherever it lands, changes what is recorded for a folder that never had a watch, so it needs its own design and gates.
-- **Revisit when:** the round right after 0.55.1, as the user decided on 2026-11-07.
-
-### A folder moved out of the tree from a new folder keeps its watch
-
-- **Kind:** deferred.
-- **What the operator sees:** after `mkdir n; mkdir n/x; mv n/x /elsewhere/x` in one batch, the watch of `/elsewhere/x`
-  stays mapped at `n/x` for as long as that folder exists, so changes there come as deletes, moves and writes under `n/x`
-  that cost extra work, and the check after the batch mostly puts the version right. It does not when another folder now at
-  `n/x` holds two files of one size, mtime and last 64 KiB (a `tar x` of two same-size files padded alike) and a rename in
-  `/elsewhere/x` goes from one of their names to the other: the version renames its file onto the other name, the check
-  finds nothing to tell them apart, and that version and every later one keep the wrong bytes for that file, with no line
-  in the log; a restart's comparison does not see it either (forced in-process, 3 of 3 on 0.55 and 0.55.1 alike; right
-  when the last bytes differ). In the same way, a folder moved
-  out of the tree whose old parent is renamed before its move-out expires (`mv keep/s/n2 /out/x; mv keep c/keep2`) keeps
-  its watch, re-pointed to `c/keep2/s/n2` where nothing lives, so a write in `/out/x` is recorded there and found gone.
-  Both are older than 0.55.1.
-- **Why:** the first folder's move-out comes on the watch of a new folder and is discarded, so no expiry removes its
-  watches; the second's expiry removes only the watches still mapped under its old path, as removing every watch it took
-  also removed a live folder's watch when 0.55.1 tried it. The fix belongs in the discard branch and the expiry, with a
-  check of the watch map at the end of the watcher's schedule tests. The no-copy move into a new folder tried during
-  0.55.1 kept wrong bytes through the first watch (a folder made at `n/x` and moved into a new folder looked like the
-  folder that left), one reason it went.
-- **Revisit when:** the round right after 0.55.1, with "A folder renamed twice into a folder whose move is being walked
-  can keep old bytes", as both can keep wrong bytes; the event queue overflow's unwatched folder goes with them, and both
-  before the no-copy move into a new folder.
-
 ### A size record too low after a rename falls back to a copy
 
 - **Kind:** deferred.
@@ -799,13 +802,3 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** older than 0.55.1. The fix is in the fallback; the cause is read, not verified:
   `manifest.move_tree()` runs before the rename, so the rows of what the version already holds at the target are gone.
 - **Revisit when:** the lightness round after 0.55.1. Then `tests/test_watcher_fuzz.py` stops leaving this fault out.
-
-### An event queue overflow can leave a new folder unwatched
-
-- **Kind:** deferred.
-- **What the operator sees:** an overflow of the kernel's event queue that loses a new folder's create: the full scan
-  copies the folder, but nothing walks it, so later writes in it raise no event until a restart.
-- **Why:** it needs the queue to overflow, and the fix is a walk of the tree at an overflow, which belongs with the next
-  change to the watcher.
-- **Revisit when:** the next round that changes the watcher.
-
