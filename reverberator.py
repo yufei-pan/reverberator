@@ -7646,12 +7646,27 @@ def copy_failure_side(source_path:str, temp_path:str, lines:list) -> str:
 		return 'vanished'
 	return 'vault' if source_readable(source_path) else 'source'
 
+def copy_path_too_long(temp_path:str, lines:list) -> bool:
+	'''
+	Whether the lines cp wrote for a failed copy into temp_path say the filesystem written into refuses its path (or
+	text) as too long: one names this copy's own partial file and ends, after the last quoted path, with ENAMETOOLONG's
+	message (cp runs with the C locale).
+
+	Examples:
+		>>> temp = '/v/.0f.reverberator-partial'
+		>>> line = f"cp: cannot create regular file '{temp}': File name too long"
+		>>> copy_path_too_long(temp, [line]), copy_path_too_long(temp, ["cp: cannot stat '/x': File name too long"])
+		(True, False)
+	'''
+	temp_name = os.path.basename(temp_path)
+	return any(temp_name in line and cp_error(line).endswith(os.strerror(errno.ENAMETOOLONG)) for line in lines)
+
 def link_too_long(source_path:str, temp_path:str, lines:list) -> bool:
 	'''
 	Whether a failed copy of source_path into temp_path is a symlink the filesystem written into refuses as too long, its
-	text or its path (on XFS a link text of 1,024 bytes and up), from the lines cp wrote: one names this copy's own partial
-	file and ends, after the last quoted path, with ENAMETOOLONG's message (cp runs with the C locale), and lstat shows
-	source_path a symlink. No run again can copy such a link there. A regular file with a path too long is not one.
+	text or its path (on XFS a link text of 1,024 bytes and up), from the lines cp wrote (copy_path_too_long()) and lstat,
+	which shows source_path a symlink. No run again can copy such a link there. A regular file with a path too long is not
+	one: for a backup that is the vault's failure, a restore's own (finish_restore_copies()) is one no run again fixes too.
 
 	Examples:
 		>>> temp = '/v/.0f.reverberator-partial'
@@ -7659,8 +7674,7 @@ def link_too_long(source_path:str, temp_path:str, lines:list) -> bool:
 		>>> link_too_long('/', temp, [line]), link_too_long('/', temp, ["cp: cannot stat '/x': File name too long"])
 		(False, False)
 	'''
-	temp_name = os.path.basename(temp_path)
-	if not any(temp_name in line and cp_error(line).endswith(os.strerror(errno.ENAMETOOLONG)) for line in lines):
+	if not copy_path_too_long(temp_path, lines):
 		return False
 	try:
 		return stat.S_ISLNK(os.lstat(source_path).st_mode)
@@ -15181,8 +15195,14 @@ class RestoreReport:
 
 	def summary(self) -> str:
 		'''What was restored, from which version to where, then each entry restored without all of its metadata and each one not restored.'''
-		if self.accepted:
+		if self.accepted and not self.handing_over:
+			# its sync before the hand-over failed: nothing was handed over, and the marker stays
+			head = f'Did not keep {self.target} as it is, restored from V{self.version.number}: gave no folder its own metadata, copied nothing'
+		elif self.accepted:
 			head = f'Kept {self.target} as it is, restored from V{self.version.number}: gave {self.handed_over} folders their own metadata, copied nothing'
+			if self.failed:
+				# the sync after the hand-over failed
+				head += ', but not all of it is known to be on disk'
 		else:
 			head = f'Restored {self.restored} entries ({show_size(self.bytes)})'
 			if self.version is not None:
@@ -15229,7 +15249,7 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 	empty pending. A copy that succeeded takes its destination's place and counts as restored, as does one for which cp
 	only reported metadata it could not keep (a warning says so); one that failed leaves no partial file and is a
 	failure saying what cp said, or for a symlink the target's filesystem refuses as too long (link_too_long()) a
-	failure saying so that no run again fixes. The report's target itself, a restored file or symlink in a folder anyone may write
+	failure saying so that no run again fixes; a regular file whose path it refuses is one too, with what cp said. The report's target itself, a restored file or symlink in a folder anyone may write
 	in, never replaces what appeared there meanwhile (place_new_entry()); what is inside a folder target, which only
 	this restore can write in, takes its destination's place.
 	'''
@@ -15271,7 +15291,8 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 				# no run again can put it there: the restore goes on to its end without it
 				report.fail(rel, "not restored: the target's filesystem cannot hold a link that long (its text or its path)", rerun=False)
 			else:
-				report.fail(rel, error or f'cp exited with {copy.task.returncode}')
+				# a regular file's path the target's filesystem refuses as too long is refused again by a run again
+				report.fail(rel, error or f'cp exited with {copy.task.returncode}', rerun=not (copy.task.returncode != 0 and copy_path_too_long(copy.temp_path, lines)))
 				discard_copies([copy])
 			done += 1
 	finally:
@@ -15279,6 +15300,10 @@ def finish_restore_copies(pending:list, report:RestoreReport) -> None:
 		rest = pending[done:]
 		pending.clear()
 		discard_copies(rest)
+
+# the kinds of entry (restore_failure()) no run again can restore: a chain that leads nowhere, and a link to the live file
+# of a referenced backup. a run again reads the same vault, so they fail again and hold nothing back for it
+RESTORE_FINAL_KINDS = ('dangling', 'referenced')
 
 def restore_failure(resolved:ResolvedEntry, version:KeptVersion):
 	'''Why the entry version holds, as resolved_entry() gives it, cannot be copied out: None for a file, a user's symlink or a folder.'''
@@ -15615,26 +15640,33 @@ def claim_restore_target(target:str, check = None) -> int:
 		raise
 	return fd
 
-def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str):
+# what a restore's syncs go through: handles, [(disk, fd or OSError)] (or the OSError of listing the disks), and listed, the
+# disks the pool listed at the claim (None off a pool), as open_restore_disks() makes them
+RestoreDisks = namedtuple('RestoreDisks', ['handles', 'listed'])
+
+def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> RestoreDisks:
 	'''
 	The handles every sync of a restore goes through (sync_restore()), opened once, before its first copy: a sync through
 	an fd opened after a writeback error hears of it only while no other sync of that disk has (any syncfs marks it seen,
 	the daemon's own vault flush included), while one through an fd opened before it always does. folder is the restore's
 	folder (the folder target, or the folder holding a file target) and fd that folder as this run opened it.
-	[(disk, fd or OSError)], one per disk: off a mergerfs pool [(the disk holding folder, fd)]. On a pool, whose own sync
-	does not reach the disks, each disk the pool lists with an fd of the first of its branches (vault_disks(roots=True))
-	that opens: the branch itself, not folder on it, so a copy that lands on a disk where folder was not yet is covered as
-	well, as a syncfs of any fd of a filesystem syncs all of it. A branch not there is passed over; a disk none of whose
-	branches the restoring user can open is a warning naming each, once per restore (report.cannot_sync()), and is left
-	out; one whose branch failed to open otherwise keeps that OSError, for its syncs to fail with. The OSError when the
-	disks cannot be listed, for the syncs to fail with too. close_restore_disks() closes what this opened.
+	.handles is [(disk, fd or OSError)], one per disk: off a mergerfs pool [(the disk holding folder, fd)]. On a pool,
+	whose own sync does not reach the disks, each disk the pool lists with an fd of the first of its branches
+	(vault_disks(roots=True)) that opens: the branch itself, not folder on it, so a copy that lands on a disk where folder
+	was not yet is covered as well, as a syncfs of any fd of a filesystem syncs all of it. A branch not there is passed
+	over; a disk none of whose branches the restoring user can open is a warning naming each, once per restore
+	(report.cannot_sync()), and is left out; one whose branch failed to open otherwise keeps that OSError, for its syncs to
+	fail with. It is the OSError when the disks cannot be listed, for the syncs to fail with too. .listed is every disk the
+	pool listed, those left out and failed included, which sync_restore() compares the pool with later: a disk that joined
+	it since has no handle, and one opened now would miss an error another sync of it has seen. close_restore_disks()
+	closes what this opened.
 	'''
 	try:
 		pooled, disks = vault_disks(folder, roots=True)
 	except OSError as e:
-		return e
+		return RestoreDisks(e, None)
 	if not pooled:
-		return [(disks[0][0], fd)]
+		return RestoreDisks([(disks[0][0], fd)], None)
 	branches = {}
 	for disk, branch in disks:
 		branches.setdefault(disk, []).append(branch)
@@ -15656,53 +15688,74 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str):
 				handles.append((disk, failure))
 			for branch, error in denied if failure is None else ():
 				report.cannot_sync(rel, branch, error)
-	return handles
+	return RestoreDisks(handles, frozenset(branches))
 
 def close_restore_disks(disks, fd:int) -> None:
 	'''Close the fds open_restore_disks() opened for disks (None when it never ran): every one but fd, the folder it was given.'''
-	for _, handle in disks if isinstance(disks, list) else ():
+	for _, handle in disks.handles if isinstance(disks, RestoreDisks) and isinstance(disks.handles, list) else ():
 		if isinstance(handle, int) and handle != fd:
 			os.close(handle)
 
-def sync_restore(disks, folder:str, report:RestoreReport, rel:str) -> bool:
+def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_over:bool = False) -> bool:
 	'''
 	Write out everything dirty on the disks holding the restore's folder (the folder target, or the folder holding a file
-	target), so what the restore reports done is on disk: syncfs_fd() of each of disks, the handles open_restore_disks()
-	opened before the first copy, and never of a path opened now, so each reports every writeback error its disk met
-	since, even one another process's sync met first. A pool's disks are synced side by side (sync_each_disk()). Nothing
-	is recorded, unlike sync_vault_filesystems(): a restore writes no vault marker. A disk whose sync failed, or whose
-	branch could not be opened, or disks that could not be listed, is a failure of rel that no run again fixes as it is;
-	False then, once every disk was tried.
+	target), so what the restore reports done is on disk: syncfs_fd() of each of disks.handles, the handles
+	open_restore_disks() opened before the first copy, and never of a path opened now, so each reports every writeback
+	error its disk met since, even one another process's sync met first. A pool's disks are synced side by side
+	(sync_each_disk()). Nothing is recorded, unlike sync_vault_filesystems(): a restore writes no vault marker. On a pool
+	the pool is listed again, as a disk may have joined it since the claim (a branch added, or a disk mounted where a
+	branch's folder was): it has no handle, and one opened now would miss an error another sync of it already saw, so one
+	that holds the restore's folder now (a copy may have landed there) fails the restore, saying so; one that does not
+	is passed over, as nothing can have landed there. A disk whose sync failed, or whose branch could not be opened, or
+	that joined, or disks that could not be listed, is a failure of rel that no run again fixes as it is, as a run again
+	opens that disk at its own claim; False then, once every disk was tried. after_hand_over is the sync once the files
+	were synced and the folders handed over, so what it failed to write is their folders' owners, modes and times and the
+	marker's removal, which its failure says.
 	'''
-	if isinstance(disks, OSError):
-		report.fail(rel, f'the disks holding {folder} could not be listed to write the restore out to them: {disks}', rerun=False)
+	unlisted = lambda error: f'the disks holding {folder} could not be listed to write the restore out to them: {error}'
+	if isinstance(disks.handles, OSError):
+		report.fail(rel, unlisted(disks.handles), rerun=False)
 		return False
 
 	def sync(disk:str, handles:list):
-		# None, or the OSError of the sync or of the open before the first copy
+		# None, or why the disk is not known to hold what was restored: it could not be opened before the first copy, or the
+		# sync of it failed
 		if isinstance(handles[0], OSError):
-			return handles[0]
+			return f'the disk {disk} could not be opened to write the restore out to it ({handles[0]}): what was restored may not be on it'
 		try:
 			syncfs_fd(handles[0], folder)
 		except OSError as e:
-			return e
+			if after_hand_over:
+				return f"the disk {disk} reported a write error as the restore's last changes were written out to it ({e}): the files restored are on disk, but their folders' owners, modes and times and the marker's removal may not be"
+			return f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it'
 		return None
 	synced = True
-	for disk, result in sync_each_disk(disks, sync).items():
+	for disk, result in sync_each_disk(disks.handles, sync).items():
 		if result is not None:
-			report.fail(rel, f'the disk {disk} reported a write error as the restore was written out to it ({result}): what was restored may not be on it', rerun=False)
+			report.fail(rel, result, rerun=False)
+			synced = False
+	if disks.listed is not None:
+		try:
+			pooled, now = vault_disks(folder)
+		except OSError as e:
+			report.fail(rel, unlisted(e), rerun=False)
+			return False
+		joined = set()
+		for disk, held in now if pooled else ():
+			if disk in disks.listed or disk in joined:
+				continue
+			try:
+				os.lstat(held)
+			except (FileNotFoundError, NotADirectoryError):
+				# nothing can have landed there
+				continue
+			except OSError:
+				# whether it holds the folder cannot be told: counted as holding it
+				pass
+			joined.add(disk)
+			report.fail(rel, f'the disk {disk} joined the pool while the restore ran: what was restored onto it is not known to be on disk', rerun=False)
 			synced = False
 	return synced
-
-def drop_marker(target:str, report:RestoreReport) -> None:
-	'''
-	Remove the marker of the restore at target, whose record of a failed sync could not be written by --accept, which
-	only runs over a marker with no record (refuse_accept_unsynced()): a run again then refuses the target, as its name
-	is taken, rather than keep what is there. One that cannot be removed either stays.
-	'''
-	with contextlib.suppress(OSError):
-		os.unlink(os.path.join(target, RESTORE_MARKER_NAME))
-		report.marker = None
 
 def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str, target:str, threads:int, report:RestoreReport, resume:bool = False, aside:str = None, marked:bool = False) -> None:
 	'''
@@ -15724,7 +15777,10 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	A file of the walk that is a prune's temporary (is_prune_temp()) is passed over: not restored, counted or warned of.
 	A dangling chain, a link to the live file of a referenced backup, an entry that cannot be read, a failed copy or an
 	OSError is a failure of that entry alone; so is a folder whose place holds a symlink, something else or another
-	user's folder, which is left as it is and never written through: nothing in it is restored. With resume, an entry
+	user's folder, which is left as it is and never written through: nothing in it is restored. A dangling chain, a link
+	to the live file of a referenced backup, and a file or link whose path the target's filesystem refuses as too long are
+	failures no run again can fix (RESTORE_FINAL_KINDS, finish_restore_copies()): they hold nothing back, and the restore
+	goes on to its end without them, naming them. With resume, an entry
 	already there as restoring it leaves it (already_restored()) is kept, anything else in its place is replaced by a
 	copy, and partial files a killed run left are removed. With marked, the folder target was found holding this
 	restore's marker: it is read again once the target is locked, and a CommandError when it has gone meanwhile; the
@@ -15814,7 +15870,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 		if reason is None and cp_af_copy_path(resolved.path, dest, mcae, pending) is False:
 			reason = f'{resolved.path} is gone from the vault'
 		if reason is not None:
-			report.fail(entry_rel, reason)
+			report.fail(entry_rel, reason, rerun=resolved.kind not in RESTORE_FINAL_KINDS)
 
 	def clear_partials(folder:str, held:str, entry_rel:str):
 		try:
@@ -15824,9 +15880,11 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 
 	try:
 		if threading.current_thread() is threading.main_thread():
-			# only the main thread can set them, and only it gets them
+			# only the main thread can set them, and only it gets them. one ignored at the start stays ignored, as nohup
+			# leaves SIGHUP for a restore that goes on after its terminal is gone
 			for sig in RESTORE_STOP_SIGNALS:
-				handlers[sig] = signal.signal(sig, lambda signum, frame: RESTORE_STOP.set())
+				if signal.getsignal(sig) != signal.SIG_IGN:
+					handlers[sig] = signal.signal(sig, lambda signum, frame: RESTORE_STOP.set())
 		backward = read_vault_layout_for_command(job_vault) != 'r'
 		# the rels of the folders not restored, whose contents are not either
 		refused = set()
@@ -15963,8 +16021,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			report.left_private = True
 			return
 		hand_over_folders(folders, report, check_stop)
-		# and the folders' metadata and the marker's removal, before the restore says it is done
-		sync_restore(disks, target, report, rel)
+		# and the folders' metadata and the marker's removal, before the restore says it is done: the files are on disk by now
+		sync_restore(disks, target, report, rel, after_hand_over=True)
 	except KeyboardInterrupt:
 		stopped = True
 		raise
@@ -16102,12 +16160,17 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 				report.recopy = 'sync failed'
 			except OSError as e:
 				report.fail(rel, f'the failed sync could not be recorded in its marker ({e}): move {target} out of the way and restore again', rerun=False)
-				drop_marker(target, report)
+				# --accept only runs over a marker with no record (refuse_accept_unsynced()), so a run again would take the
+				# marker for one with none and keep what is there: it goes, and a run again refuses the target as its name
+				# is taken. one that cannot be removed either stays
+				with contextlib.suppress(OSError):
+					os.unlink(os.path.join(target, RESTORE_MARKER_NAME))
+					report.marker = None
 			for folder, error in denied:
 				report.cannot_sync(rel, folder, error)
 			return
 		hand_over_folders(folders, report)
-		sync_restore(disks, target, report, rel)
+		sync_restore(disks, target, report, rel, after_hand_over=True)
 	finally:
 		close_restore_disks(disks, lock)
 		os.close(lock)

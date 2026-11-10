@@ -646,22 +646,19 @@ def test_in_place_root_is_private_while_restoring(job, tmp_path, capsys, monkeyp
 	assert metadata(job.monitor) == kept_root_metadata(held)
 	assert stat.S_IMODE(os.lstat(job.monitor).st_mode) == 0o751 and (not ROOT or os.lstat(job.monitor).st_uid == OTHER)
 	assert tree(job.monitor) == {'a.txt': 'a', 'd/': None, 'd/b.txt': 'b', 'd/c.txt': 'c'}
-	# when anything fails it stays private, and says so
+	# when anything a run again may fix fails it stays private, and says so
 	monkeypatch.setattr(rv, 'cp_af_copy_path', cp_af_copy_path)
 	shutil.rmtree(job.monitor)
 	os.mkdir(job.monitor, 0o755)
-	# held as a link to the live file: not in the vault
-	os.remove(os.path.join(held, 'd/c.txt'))
-	os.symlink(f'{job.monitor}/d/c.txt', os.path.join(held, 'd/c.txt'))
+	copy_command = rv.copy_command
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['false'] if source.endswith('c.txt') else copy_command(source, dest))
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
 	assert code == rv.EXIT_COMMAND_FAILED
 	assert stdout.endswith(f'{until_then(job.monitor)}\n')
 	assert stat.S_IMODE(os.lstat(job.monitor).st_mode) == 0o700 and os.lstat(job.monitor).st_uid == os.geteuid()
 	assert os.path.isfile(marker)
 	# no longer empty, but holding this restore's own unfinished output: picked up
-	os.remove(os.path.join(held, 'd/c.txt'))
-	with open(os.path.join(held, 'd/c.txt'), 'w', encoding='utf-8') as f:
-		f.write('c')
+	monkeypatch.setattr(rv, 'copy_command', copy_command)
 	code, stdout, err = restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
 	assert code == 0 and err.startswith('Restoring the whole job into ')
 	assert stdout == f'Restored 3 entries ({rv.show_size(1)}) from V0 to {job.monitor}, keeping 2 already there\n'

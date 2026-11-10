@@ -473,6 +473,14 @@ class FakePool:
 		self.write()
 		return real
 
+	def join(self, pool_mount:str, mount_point:str, name:str) -> str:
+		'''A new disk mounted at mount_point joins the pool at pool_mount as a branch, its folder name; the branch's real path.'''
+		branch = os.path.join(self.add_mount(mount_point), name)
+		os.makedirs(branch, exist_ok=True)
+		self.pools[os.path.realpath(pool_mount)].append(branch)
+		self.write()
+		return branch
+
 	def drop(self, branch:str):
 		'''The branch's (or a pool's) line goes; its folder stays, as a disk's mount point does.'''
 		real = self.branch_path(branch)

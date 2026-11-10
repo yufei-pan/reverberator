@@ -311,8 +311,9 @@ def test_restore_reports_referenced_links(job, tmp_path, capsys):
 	code, stdout, _ = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
 	assert 'FAILED proj/r.txt: not held in the vault (referenced backup)' in stdout.split('\n')
-	# never the live file in its place
-	assert marked_tree(os.path.join(out, 'proj')) == {'a.txt': 'a'}
+	# never the live file in its place; no run again could restore it, so the restore finished: no marker, nothing held back
+	assert tree(os.path.join(out, 'proj')) == {'a.txt': 'a'}
+	assert 'run the same restore again' not in stdout
 	out = destination(tmp_path, 'file')
 	code, stdout, _ = restore(tmp_path, capsys, f'{job.monitor}/proj/r.txt', out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
@@ -534,6 +535,31 @@ def test_restore_stops_cleanly_on_a_signal(job, tmp_path, capsys, monkeypatch):
 	assert {sig: signal.getsignal(sig) for sig in handlers} == handlers
 	# what it left stays private
 	assert stat.S_IMODE(os.lstat(os.path.join(out, 'monitor')).st_mode) == 0o700
+
+
+def test_a_signal_ignored_at_the_start_stays_ignored_for_the_restore(job, tmp_path, capsys, monkeypatch):
+	# nohup leaves SIGHUP ignored: a restore it starts goes on after the terminal hangs up, and puts every handler back
+	seed_monitor(job, {'proj/a.txt': 'a', 'proj/b.txt': 'b'})
+	run_backup(job)
+	write_rule(job)
+	during = {}
+	copy_command = rv.copy_command
+
+	def hanging_up(source, dest):
+		during.update({sig: signal.getsignal(sig) for sig in rv.RESTORE_STOP_SIGNALS})
+		os.kill(os.getpid(), signal.SIGHUP)
+		return copy_command(source, dest)
+	monkeypatch.setattr(rv, 'copy_command', hanging_up)
+	before = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+	try:
+		code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', destination(tmp_path), '--version', '0')
+		after = signal.getsignal(signal.SIGHUP)
+	finally:
+		signal.signal(signal.SIGHUP, before)
+	assert (code, err) == (0, ''), stdout
+	assert during[signal.SIGHUP] == signal.SIG_IGN and after == signal.SIG_IGN
+	# the others it still stops on
+	assert callable(during[signal.SIGINT]) and callable(during[signal.SIGTERM])
 
 
 def test_restore_failure_reasons():
