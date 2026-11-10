@@ -579,7 +579,9 @@ folder still costs the settle's probe and second walk of the moved folder, where
 - **Memory:** no state per watch at rest. The four structures hold only the watches of a race or of a pending
   move-out, until the next settle, pairing or expiry. `outgoing` holds one entry per watch of a pending move-out for up
   to the pair timeout, where 0.55.1 holds the cookie's tuple alone: for a move-out of 100,000 folders, a dict of
-  100,000 entries, a few MB (reasoned; the build measures it, section 8).
+  100,000 entries, a few MB (reasoned). Measured by the build (`outpeak`: tracemalloc's peak from the move-out of a
+  folder of 100,000 subfolders until its expiry has removed their watches, three runs each): 11.77 MiB on the branch,
+  0.89 MiB on 0.55.1, the same in each run.
 - **Per event:** nothing for a file event (5 to 6.5 µs an event on both codes in the file writes above). One `settle()`
   call per read, which returns at once when nothing is noted; with something noted, one `FIONREAD` ioctl. A move-in
   whose move-out was read looks its two folders' watches up in four structures, almost always empty. A folder move-out
