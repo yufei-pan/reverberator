@@ -3,22 +3,23 @@
 Version 0.55.3. This is the design pass the user chose on 2026-11-09, "Step back on the design (Recommended)": a design
 smaller than round 22's watch tree (v16, `2026-11-08-round22-watcher-design.md`), where a wrong watch map costs an extra
 copy or a rescan of one folder, never wrong bytes or a lost change. A design review the same day found it sound with
-changes; the main session ruled on its findings, and the user approved its three limitations. This revision is the spec
-a builder builds from. v16 stays the fallback until the build passes its gates.
+changes, a spec check followed, the main session ruled on both, and the user approved its limitations. This revision is
+the spec a builder builds from. v16 stays the fallback until the build passes its gates.
 
 **The design.** Keep 0.55.1's watcher and change four things in it:
 1. **A walk never moves a watch the events hold.** One it finds at another path stays where the events put it, and the
    watcher notes where the walk saw it.
 2. **What needs the tree's view waits until the kernel holds no unread event** (`FIONREAD` on the inotify descriptor is
-   0 after a read is handled). Then a probe sees what the events would say: a noted watch is put where the walk saw it
-   (and that folder is copied, as its events since came at the old path), the watches of a folder that left the tree
-   are removed, and a folder move that took two watches from one path is settled.
+   0 after a read is handled). Then a probe sees what the events would say: a noted watch is put where the walk saw it,
+   the watches of a folder that left the tree are removed, and a folder move that took two watches from one path is
+   settled; a folder whose events came at another path is copied where the batch does not copy it already.
 3. **A move reported by a watch whose path is not settled** (noted by a walk, of a folder that left or is leaving, or
    taken in an ambiguous move) **is recorded as a delete and a create, never as a rename in the vault.**
 4. **An overflow restarts the watch**, as v16 does.
 
-It closes the three deferred entries and passes the routes v16 fixes, keeps no state per watch and costs nothing per
-file event. The price is a copy where 0.55.1 kept a rename in a few rare orders, and three known limitations (section 6).
+It closes the three deferred entries and passes the routes v16 fixes, keeps no state per watch at rest and costs
+nothing per file event. The price is a copy where 0.55.1 kept a rename in a few rare orders, and two known limitations
+plus one sentence in a third (section 6).
 
 **What the review changed** (each a main session ruling; sections 7 and 8 hold the numbers):
 - **`outgoing` is a count per watch, and each move-out lets its watches go once** (3.2). As a set, an ancestor's
@@ -27,9 +28,24 @@ file event. The price is a copy where 0.55.1 kept a rename in a few rare orders,
 - **`settle()` acts per probe, with no retry** (3.4). The retry probed every `leaving` watch again at each read of a
   busy tree: 6.21 s of watcher CPU after a big move-out, where 0.55.1 spends 0.335 s.
 - **The discard branch's folder move-out looks only at `newDirWDs` and `found`**, not at every watch (3.2): 2.94 to
-  3.05 s against 0.046 to 0.053 s for 2,000 folder renames inside a new folder. Two rules keep what that rests on.
+  3.05 s against 0.046 to 0.053 s for 2,000 folder renames inside a new folder.
 - **`follow_inner_mounts()` passes `found`** (3.5).
-- Fact D on mergerfs and fact F on busy trees (3.1); the residual races for every kind of probe (section 4).
+
+**What the spec check changed** (the main session's rulings on it, and the user's corrected picks):
+- **The discard branch skips its scan when the same read holds the move-in** onto a watched folder that is not skipped
+  (3.3); the move-in runs the scan only if its walk does not meet the moved folder's watch.
+- **A walk puts each watch it adds below a new folder into `newDirWDs`** (rule 3 of 3.2): a normal pairing's walk can
+  reach new folders nested in the moved one.
+- **`doubtful` keeps the first path before, and the settle probes every path the doubtful watches hold or held** (3.4).
+- **A probe counts only for a path with no symlink in it** (fact C), and **a probe that cannot look leaves the watch
+  flagged** for the next settle (3.4).
+- **A found folder is copied by the settle only when a batch was taken since the walk noted it** (3.4).
+- **`raise_queue_limit_for_removals()` goes**, and the settle removes at most half the instance's queue limit at a time
+  (3.4). **The max-delay clock carries across an overflow's restart** (3.6). **One full comparison follows an overflow.**
+- **A watch that leaves `wdDic` leaves every set** (3.2). The answers to a builder's questions are in 3.2 to 3.6, 8.2,
+  10 and 11.
+- **Limitations 1 and 2 as corrected; the overflow's window as one sentence** in "A rewrite made while down that keeps
+  size and mtime" (section 6). The fact-E races and the first walk's race are not an issue (section 4).
 
 ## The user's words
 
@@ -53,6 +69,16 @@ file event. The price is a copy where 0.55.1 kept a rename in a few rare orders,
     folder's change can land one version late.
   - "Accept: one sentence (Recommended)": the overflow restart's blind window, about 0.15 s at 17,200 folders, for
     changes that keep size, mtime and the last 64 KiB, as one sentence in the existing overflow entry.
+- 2026-11-09, after the main session said its first question had the window wrong:
+  - Limitation 1, "Approve as corrected (Recommended)": the window is the job's minimum snapshot delay or 30 s,
+    whichever is longer (60 s by default); anything moved from a folder that left the tree back into the tree is copied
+    whole in that window; the same copy covers a folder moved onto the place of one that just left, then moved again,
+    and renames through a two-folder swap until the queue next runs empty. "Revisit if the log shows big copies from
+    this route often, as you said."
+  - Limitation 2, "Approve as corrected (Recommended)": it also names that a folder swapped with another in one rename
+    has its changes seen at the other folder's path until the next empty queue, then copied by the settle, and that
+    after a batch taken in between, that copy copies the folder whole once more (vault space). "Revisit if a live tree
+    shows long stretches with no empty queue, as you said."
 
 Not the user's words: the rounds' ruling that when the watcher cannot be sure it errs toward a copy, never toward wrong
 bytes (round 21).
@@ -123,10 +149,19 @@ working watch. The step back makes each of the three safe at its source.
   lets them lag until the events, or the settle, move them.
 - **C. `add_watch` is a probe.** inotify keeps one mark per inode per instance, so `add_watch` of a watched folder
   returns its watch by whatever path (round 22's fact 6), with or without `IN_MASK_ADD`, which changes only how masks
-  combine; `IN_ONLYDIR` and `IN_DONT_FOLLOW` steer only the lookup. So `add_watch(path) == wd` says the folder of `wd`
-  is at `path`. A wd not in the map is a folder with no watch (the probe's own, removed again); a failed `add_watch`
-  is "not there" (`ENOENT`, `ENOTDIR`; `EACCES` cannot hit the daemon, which runs as root; `ENOSPC` only for a folder
-  with no watch).
+  combine. `IN_ONLYDIR` and `IN_DONT_FOLLOW` steer only the lookup, and `IN_DONT_FOLLOW` covers only the last
+  component: a symlink earlier in the path is followed (the spec check). So a probe of a path answers one of three:
+  - **here:** it returns the watch, and the path has no symlink in it below the tree's root;
+  - **not here:** `ENOENT` or `ENOTDIR`; another watch; a watch not in the map (a folder with no watch: the probe's own,
+    removed again); or a symlink in the path below the root (the tree's walk never follows one, so the folder is not at
+    that path in the tree);
+  - **could not look:** any other error (`EIO`, `ENOTCONN` from a dead mergerfs, `ENOMEM`, `ENOSPC` at the user's watch
+    limit). It is never counted as an absence (the rules' absence rule): the watch keeps its flag for the next settle.
+
+  The symlink check is the builder's choice of two: compare `os.path.realpath(path)` with the root's real path (taken
+  once per watch, so a monitored path that itself goes through a link still works) joined with the part of `path`
+  below the root; or `lstat` each component below the root. It runs only when the probe returned the watch, as every
+  other answer is "not here" already, so a big `leaving` set of folders gone pays nothing for it.
 - **D. C holds on mergerfs.** In the test VM, on a scratch mergerfs 2.42.0 pool over two tmpfs branches, with the live
   pools' options, then with `cache.entry=1`, then with every cache off: `add_watch` by a renamed folder's new path
   returned its old watch on every line, after a rename in place, a move out of the tree and back under a new name, a
@@ -140,6 +175,8 @@ working watch. The step back makes each of the three safe at its source.
 - **F. Busy trees empty their queue often.** In a container, with writers at 57,000, 89,000 and 108,000 events a
   second and 6 µs of handling an event, the queue was empty after 69%, 59% and 42% of reads, the longest non-empty
   streak under 10 ms (the review's `fionread_burst.py`).
+- **G. One full comparison at a time.** `ChangeEventQueue.append()` drops every event while a `full_scan` is queued, a
+  second `full_scan` included.
 
 ### 3.2 The structures, and what each keeps true
 
@@ -150,14 +187,21 @@ All live in `watchFolder()` for one watch's life; an overflow's restart starts t
 | `wdDic` (wd → path) | as 0.55.1 | each path is where the events read so far put the folder, except while the watch is guarded. Only `move_watches()` at an unguarded pairing, the settle (on an empty queue) and removals change a held watch's path; a walk writes only the path of a watch it adds |
 | `cookieDic` (cookie → `COOKIE_VALUE(wd, path, isDir, wds)`) | as 0.55.1: a move-out waiting for its pair; `wds`, the watches mapped at or under its path when its `MOVED_FROM` was read | a cookie holds its `wds` in `outgoing` from its `MOVED_FROM` until it lets them go, once |
 | `newDirWDs` (set) | as 0.55.1: the watches of folders made since the last take, whose events are discarded (the batch's copy holds them) | every watch mapped at or under a folder of `newDirWDs` is in `newDirWDs` or in `found` (one exception, section 4) |
-| `found` (wd → path) | a held watch a walk met at another path than its own, with the path the walk saw | the watch is guarded until the next settle, which clears `found` |
+| `found` (wd → path) | a held watch a walk met at another path than its own, with the path the walk saw, and the take count the watcher knew at that read (3.4) | the watch is guarded until the next settle, which clears it |
 | `outgoing` (wd → count) | for each watch, how many cookies hold it | the count is the number of cookies still holding the watch; the entry goes at zero |
-| `leaving` (set) | the watches of a folder that left the tree or its place: an expired or evicted move-out's `wds`, the watches under a folder's move-out read in a new folder, a move into a skipped folder's | each is probed at the next settle, and removed if its folder is not at its path |
-| `doubtful` (wd → path before) | each watch a folder move took from a path that held more than one watch (`RENAME_EXCHANGE`, or a folder moved onto the place of one whose move-out is pending) | settled at the next settle |
+| `leaving` (set) | the watches of a folder that left the tree or its place: an expired or evicted move-out's `wds`, the watches under a folder's move-out read in a new folder, a move into a skipped folder's, and a doubtful watch no probe found (3.4) | each is probed at the next settle, and removed if its folder is not at its path |
+| `doubtful` (wd → path before) | every watch a folder move took when the old path held more than one watch (`RENAME_EXCHANGE`, or a folder moved onto the place of one whose move-out is pending), descendants included, with its path before the first such move (a later one keeps it) | settled at the next settle |
 
 **Guarded.** A watch is guarded while it is in `found`, `leaving` or `doubtful`, or its `outgoing` count is above
 zero (`guarded()`). A move whose source folder's watch or destination folder's watch is guarded (the cookie's `wd` and
-the `MOVED_TO`'s `wd`) is a delete and a create, never a rename in the vault.
+the `MOVED_TO`'s `wd`) is a delete and a create, never a rename in the vault, for a file as for a folder.
+
+**A watch that leaves `wdDic` leaves every set** (`found`, `leaving`, `doubtful`, `newDirWDs`, and its `outgoing`
+entry), wherever it goes: `DELETE_SELF`, `UNMOUNT`, `follow_inner_mounts()`'s and `remove_newly_skipped_watches()`'s
+removals, a walk's unreadable folder, the settle. Removing, letting go of, or flagging a wd that is no longer in
+`wdDic` does nothing (`remove_watches()` skips it, as 0.55.1's `remove_moved_away_watches()` did; today it raises
+`KeyError`). Watch numbers are not given again soon (round 22's fact 11), so a late let-go never touches another
+folder's watch.
 
 **The count** (review finding 1). In `mv keep/s/n2 /out/n2; mv keep c/keep2; mv live c/keep2/s/n2; mv /out/n2/g
 /out/n2/h`, n2's watch is held by its own move-out and by keep's. As a set, keep's pairing cleared it while n2's
@@ -179,85 +223,135 @@ until n2's own move-out lets it go, so that rename is a delete and a create.
 - the discard branch's guarded pairing moves and lets go of nothing; its expiry does both, once.
 
 **What `newDirWDs` must keep true** (ruling 3). The discard branch's folder `MOVED_FROM` makes `leaving` the watches
-mapped at or under its path, as the design pass had it, but looks for them only among `newDirWDs` and `found`. That
-rests on `newDirWDs`'s line in the table, which two rules keep; the design pass had neither, as its scan looked at
-every watch:
+mapped at or under its path, as the design pass had it, but looks for them only among `newDirWDs` and `found`, each
+matched by its `wdDic` path: the move-out's path is in the events' view, and a found watch that is not guarded
+otherwise has had its own events read before any move-out of a folder holding it (one queue, fact A). That rests on
+`newDirWDs`'s line in the table, which three rules keep; the design pass had none of them, as its scan looked at every
+watch:
 1. **The discard branch's unguarded pairing puts every watch `move_watches()` moved into `newDirWDs`**, as 0.55.1's
    removal and the walk's re-adding did. Without it, a subfolder of the moved folder that leaves before the walk
    reaches it (`mkdir n; mv big n/big; mv n/big/sub /out/sub`) keeps a watch mapped in the new folder that no scan of
    `newDirWDs` finds, whose events are not discarded either.
-2. **The settle's walk of a folder it copies passes `newDirWDs`**, as every create's walk does: the settle's copy is a
-   `create`, which holds what the folder's events would say until the take. Without it, a watch from outside the new
-   folder that the settle put in it, and what its walk adds, are in neither set once the settle has cleared `found`:
-   in `mv big /out/big; mkdir n; mv /out/big n/big`, big's watch, still held by its pending move-out, is `found` at
-   `n/big` and put there; once that move-out expires (`mkdir big`) nothing guards it, and a later `mv n/big /out/b2`
-   leaves it stale. (A folder made inside the new folder needs no rule: its create's walk put it in `newDirWDs`.)
+2. **The settle's walk of a folder it puts in place passes `newDirWDs`**, as every create's walk does: the batch holds
+   a create that copies the folder (the settle's, or the one that noted it, 3.4), and that copy holds what the folder's
+   events would say until the take. Without it, a watch from outside the new folder that the settle put in it, and what
+   its walk adds, are in neither set once the settle has cleared `found`: in `mv big /out/big; mkdir n; mv /out/big
+   n/big`, big's watch, still held by its pending move-out, is `found` at `n/big` and put there; once that move-out
+   expires (`mkdir big`) nothing guards it, and a later `mv n/big /out/b2` leaves it stale. (A folder made inside the
+   new folder needs no rule: its create's walk put it in `newDirWDs`.)
+3. **Any walk puts a watch it adds into `newDirWDs` when the folder it is in has its watch there** (the spec check's
+   4a). The walk knows that folder's watch from its own record of what it watched (`watched`); a walk's root joins only
+   when its caller passes `newDirWds`, as today, so an inner mount's walk, whose root's parent is not looked at, keeps
+   its events (section 4). Without it, in `mkdir A/n` (handled), then `mkdir A/n/s; mv A B` before the next read, the
+   discard branch's walk of `A/n/s` fails as A is gone, the pairing's walk of B adds s's watch at `B/n/s` outside
+   `newDirWDs`, and `mv B/n/s /out/s` leaves it stale.
 
-Every other walk under a new folder passes `newDirWDs` already: a create's, the discard branch's, a move-in with no
-pair, and a guarded move-in, which becomes a create. A normal pairing cannot land under a new folder, as its
-`MOVED_TO` came on a watch not in `newDirWDs`; a watch mapped in a new folder and not in `newDirWDs` is in `found`,
-hence guarded, so a move into it is a create too.
+With these, each way a watch gets mapped under a new folder keeps the line: a walk that passes `newDirWDs` (a create's,
+the discard branch's, a move-in with no pair, a guarded move-in, which becomes a create, the settle's), a walk below a
+new folder (rule 3), the discard pairing (rule 1). A normal pairing's `MOVED_TO` came on a watch not in `newDirWDs`,
+and a watch mapped in a new folder and not in `newDirWDs` is in `found`, hence guarded, so a move into it is a create.
 
 ### 3.3 Event by event, against 0.55.1
 
 | Where | 0.55.1 | Step back |
 |---|---|---|
 | A walk meets a watch held at another path | puts it there (`wdDic[wd] = folder`), and in `newDirWDs` for a create's walk | leaves it where the events put it, notes the path the walk saw in `found`, and does not add it to `newDirWDs` (3.5) |
+| A walk adds a watch below a folder of `newDirWDs` | in `newDirWDs` only for a create's walk | in `newDirWDs` for any walk (rule 3) |
 | Folder `MOVED_FROM` | cookie with the watches under the path | the same; each of them gains one in `outgoing` |
-| Folder `MOVED_FROM` in a new folder (discard branch) | nothing: the watches stay for good | the watches at or under the path, among `newDirWDs` and `found`, are `leaving` |
+| Folder `MOVED_FROM` in a new folder (discard branch) | nothing: the watches stay for good | if the same read holds this cookie's `MOVED_TO` on a watch in `wdDic`, at a path the skip list keeps: nothing yet (its move-in decides, below). Otherwise the watches at or under the path, among `newDirWDs` and `found`, are `leaving` |
+| A move-in whose move-out the discard branch left to it (either branch: it is a create, as the discard branch keeps no cookie) | walk | the walk, with `newDirWDs` and `found`; if the watch at the walk's root is not one that was mapped at the move-out's path (the folder moved on before the walk, or another folder is there), the move-in runs the discard branch's scan for the move-out's path then |
 | `MOVED_TO`, cookie known, neither folder's watch guarded | `move` recorded, every path under the old one rewritten, walk | the same (`move_watches()`, 0.55.1's loop; walk with `found`); the cookie lets go |
-| `MOVED_TO`, cookie known, a folder's watch guarded | as above | one INFO line; the move-out expires into its delete, and the move-in is a create (walk with `newDirWDs` and `found`), as one with an unknown cookie |
-| The rewrite takes more than one watch from exactly the old path | moves them all | moves them all, and each watch it moved is `doubtful`, with its path before |
+| `MOVED_TO`, cookie known, a folder's watch guarded | as above | rule 3's INFO line, for a file as for a folder; the move-out expires into its delete, and the move-in is a create (walk with `newDirWDs` and `found`), as one with an unknown cookie |
+| The rewrite takes more than one watch from exactly the old path | moves them all | moves them all, and every watch it moved is `doubtful` (descendants too), keeping the path before the first such move |
 | A move-out expires or is evicted | delete recorded; `remove_moved_away_watches()` probes the watches still under the old path and removes them now | delete recorded; it lets go, and its `wds` are `leaving` |
 | Folder `MOVED_TO` into a new folder, cookie known (discard branch) | walk, then `remove_watches_under()` of the old path | unguarded: `move_watches()`, every watch it moved into `newDirWDs`, the cookie lets go and stays with no watches; guarded: nothing moves. Then the walk, with `newDirWDs` and `found` |
 | Folder `MOVED_TO` into a skipped folder, cookie known | delete; `remove_watches_under()` now | delete; the cookie lets go; its `wds` and the watches under its path are `leaving` |
-| End of a read, and every read with no event | nothing | `settle()` |
+| End of a read, and every read with no event | nothing | `settle()` (3.4) |
 | `Q_OVERFLOW` | full comparison requested; the watch goes on | the same, then the watch ends and `watcher()` starts a new one (3.6) |
+
+**The same-read skip** (the user's goal "as light and as fast as possible", ruled as the spec check's Q1 (a)). Most
+folder move-outs in a new folder are renames within the tree (`npm install`, a build's temp folders), whose move-in
+comes next in the same read; its walk meets the moved folder and notes its watches as `found`, so the scan finds
+nothing the settle would not fix. The discard branch finds the move-in through an index of the read's `MOVED_TO`
+cookies, built once per read on the first move-out that needs it, and records the move-out's path for the move-in
+(cookie → path, cleared at the end of the read). Only move-outs of the tree and pairs split across reads pay the scan.
+The fallback at the move-in is this spec's: without it, `mkdir n; mkdir n/d; mv n/d n/e; mv n/e /out/e`, with the
+second rename before the first move-in's walk, leaves n/d's watch mapped at `n/d` and no scan ever looks there. A
+recorded path whose move-in was not walked by the end of the read gets its scan then.
 
 A subfolder's `MOVE_SELF` is skipped, as on 0.55.1. File moves follow the same rows (guarded or not); a file's
 move-out holds no watch.
 
 ### 3.4 `settle()`
 
-It runs at the end of every read, and at every read with no event, after the quiet read's expiries. It returns at once
-unless `found`, `leaving` or `doubtful` holds something and `FIONREAD` is 0. Then, each step by probe (`add_watch` of
-the path with the watcher's mask, `IN_ONLYDIR` and `IN_DONT_FOLLOW`):
-1. **`found`:** each watch still at another path than the walk saw, which the probe finds there, is put there, and its
-   folder is to be copied. A watch is left there with no event of the move only when the move was not taken as one (a
-   move-in with no pair, one in a folder made in the batch, or one rule 3 turned into a copy), so the batch copies that
-   folder already, and the collapse drops the settle's copy as covered. `found` is cleared.
-2. **`doubtful`:** each watch not at its path but at its path before goes back there, and its folder is to be copied.
-   `doubtful` is cleared.
-3. **`leaving`:** each watch the probe does not find at its path is removed (`remove_watches()`), and `leaving` is
-   cleared, whatever the queue holds by then (ruling 2).
+**Where it runs:** at the end of every read's events, and at every read with no event after the quiet read's expiries,
+in both cases before the read's `read_wall_ns` and `pending_move_outs` stamp, and, with no event, before the quiet
+signal and the branch's `continue`: the stamp claims every change before the read began has its event queued, so the
+settle's creates must be queued under it. It returns at once unless `found`, `leaving` or `doubtful` holds something
+and `FIONREAD` is 0. Then, each step by probe (fact C: `add_watch` with the watcher's mask, `IN_ONLYDIR` and
+`IN_DONT_FOLLOW`):
+1. **`found`:** each watch still at another path than the walk saw, which the probe finds here, is put there. One the
+   probe finds not here is left as its events have it (they said where it is, or a later walk notes it again); one it
+   could not look for stays in `found`. The rest of `found` is cleared.
+2. **`doubtful`:** every path a doubtful watch holds now or held before (its first path before) is probed once, and
+   each doubtful watch a probe finds here goes to that path, its folder to be copied if it moved. A doubtful watch no
+   probe found goes to `leaving`, for step 3 to probe at its own path: its folder left the tree, or moved by a rename
+   whose walk noted it in `found`, which step 1 put in place. One a probe could not look for stays in `doubtful`. The
+   spec check's two orders show why: in `mv --exchange site.new site; mv site.new site.old`, the second move takes both
+   watches again, and only the first path before (`site`) finds the watch of the folder now at `site`; in `exchange A
+   B; exchange A C`, one watch is at neither of its own paths, only at a path another doubtful watch held.
+3. **`leaving`:** each watch the probe finds not here is removed (`remove_watches()`); one it could not look for stays
+   for the next settle; the rest leave `leaving`. At most half the queue limit the instance was made with is removed in
+   one settle; the rest stays for the next one (ruling on `raise_queue_limit_for_removals()`, below).
 4. The probes' own watches (a folder at a probed path that had none) are removed.
-5. Each folder to be copied, outermost first and once (one under another is covered), is walked with `newDirWDs` and
-   `found` (rule 2 of 3.2), then gets a `create` event, with one INFO line. It is walked first, so a change made after
-   the copy passed it raises its event.
+5. Each folder put in place is walked, outermost first and once (one under another is in its walk), with `newDirWDs`
+   and `found` (rule 2 of 3.2), so what was made in it while its events came at another path gets watched. It also gets
+   a `create` event, with one INFO line, `Copying <path>: its changes came at another path until the event queue ran
+   empty`, when the batch does not copy it already:
+   - a doubtful folder, always: the batch recorded the swap as moves, and its repair copies come from a comparison of
+     size, mtime and the last 64 KiB, which does not see a change that keeps them;
+   - a found folder, only when a batch was taken since the walk noted it (the spec check's Q2 (a)): with no take
+     since, the batch still holds the create whose walk noted it (a move-in with no pair, a guarded move-in, or the
+     create of the new folder it is in), so the settle's create would be a second copy that the collapse drops as
+     covered. The watcher stores with each `found` entry the take count it knew at that read, and the settle compares
+     it with the queue's own count under the queue's lock, as the discard branch's "a take since this read" check
+     does: a take between the read and the settle then counts as a take, so a copy is never skipped wrongly (one taken
+     just before the note costs a covered copy).
 
-`found` comes before `leaving`, so a folder that came back keeps its watch; the walks come last, so what was made in a
-found folder while its events came at the old path gets watched, and its copy holds it. Each correction is per watch,
-by probe, so two watches at one path never confuse it, and none moves a watch ahead of the events: on an empty queue
-nothing is ahead.
+   Each walk comes before its create, so a change made after the copy passed it raises its event.
 
-**Why no retry** (the review's argument, ruling 2). A probe that does not find a leaving watch at its path, on a queue
-that was empty when the settle began, means its folder is not there. A folder that comes back into the tree while the
-probes run comes back by a rename whose events are read next: from outside its cookie was never seen, so the move-in
-is a create, whose walk gives it a new watch and whose copy holds what it holds, a change made before that walk
-included; within the tree its move-out and move-in come too, with the same walk. So no removal needs undoing, and none
-needs the queue to stay empty while the probes run. The design pass's re-check (`if not queued_events()` before the
-removals) made every probe of a big `leaving` set run again at each read of a busy tree, removing nothing.
+`found` comes before `doubtful` and `leaving`, so a folder that came back keeps its watch; the walks come last. Each
+correction is per watch, by probe, so two watches at one path never confuse it, and none moves a watch ahead of the
+events: on an empty queue nothing is ahead. New `found` entries from step 5's walks wait for the next settle: the
+watcher reads again within its poll wait (3 s by default), with those watches guarded meanwhile, and a loop of settles
+in one read would need another bound.
+
+**Why no retry** (the review's argument, ruling 2). A probe that finds a leaving watch not here, on a queue that was
+empty when the settle began, means its folder is not there. A folder that comes back into the tree while the probes
+run comes back by a rename whose events are read next: from outside its cookie was never seen, so the move-in is a
+create, whose walk gives it a new watch and whose copy holds what it holds, a change made before that walk included;
+within the tree its move-out and move-in come too, with the same walk. So no removal needs undoing, and none needs the
+queue to stay empty while the probes run. The design pass's re-check (`if not queued_events()` before the removals)
+made every probe of a big `leaving` set run again at each read of a busy tree, removing nothing.
+
+**Removals and the queue.** Each removed watch queues an `IN_IGNORED`, which counts against the queue limit, and the
+kernel reads that limit only when an instance is made (round 22's fact 15), so `raise_queue_limit_for_removals()`'s
+sysctl write never enlarged the queue of the instance removing the watches. It goes. The settle caps its removals at
+half the limit the instance was made with (`irm.max_queued_events` read just before `inotify_simple.INotify()`; the
+kernel's default 16,384 if it could not be read), so their `IN_IGNORED` events fit with the other half free for the
+tree's own events until the next read takes them; a `leaving` set of 10,001 under the default limit takes two settles.
+The other removals (an inner mount's, a skip list's after a move, a walk's unreadable folder) are as 0.55.1 left them
+in effect, as the raise never reached them either; an overflow there now restarts the watch.
 
 ### 3.5 The walks
 
-`initializeFolderWatchers()` gains `found` (a dict). With it, a held watch met at another path than its own stays
-where the events put it, `found` gets the path the walk saw, and the walk returns the watch without adding it to
-`newDirWds`: it is guarded until the settle. The walk still lists the folder by path (`iter_tree_entries()`), so what
+`initializeFolderWatchers()` gains `found` (a dict) and rule 3. With `found`, a held watch met at another path than its
+own stays where the events put it, `found` gets the path the walk saw, and the walk returns the watch without adding it
+to `newDirWds`: it is guarded until the settle. The walk still lists the folder by path (`iter_tree_entries()`), so what
 is under it is met too. Callers:
-- the first walk of a watch: without `found`, as 0.55.1 (the review left its race with a rename out of this round: the
-  start's full comparison follows it);
+- the first walk of a watch: without `found`, as 0.55.1 (its race with a rename is not an issue, section 4);
 - a create's walk and a move-in's with no pair: `newDirWDs` and `found`;
-- the normal pairing's walk: `found`;
+- the normal pairing's walk: `found` (rule 3 still puts what it adds below a new folder into `newDirWDs`);
 - the discard branch's walks: `newDirWDs` and `found`;
 - the settle's walk: `newDirWDs` and `found`;
 - `follow_inner_mounts()`'s walk of a mount point: `found` (review finding 4), passed down from `watchFolder()`; not
@@ -273,28 +367,34 @@ signature reset:
 - closing the old instance frees its watches at once, with no flood of `IGNORED`;
 - the new instance takes the raised limit, which the kernel reads only when an instance is made (round 22's fact 15);
 - its first walk watches the tree as it is, a folder whose create was lost included;
-- once that walk is done it queues a full comparison again; the one queued at the overflow makes the batch in progress
-  a full comparison too, and the queue keeps one full comparison.
+- **one full comparison follows:** the one queued at the overflow makes the batch in progress a full comparison, and
+  the restart's own request after its walk is dropped while that one is queued (fact G). Only if a batch is taken
+  during the walk does the restart's request make the next batch a full comparison too, which then covers the walk.
+- **the max-delay clock carries across the restart:** the new watch counts from the old watch's last take, not from its
+  own start (0.55.1 never restarted at an overflow, and while events never pause only the maximum delay takes a batch,
+  so repeated overflows, as when the sysctl cannot be raised, must not keep putting it off). How the time reaches the
+  new watch is the builder's choice (for example, `watcher()` keeps it and hands it to each `watchFolder()`).
 
 What the old watch held goes: its pending move-outs (the comparison finds what is gone), `newDirWDs` (the new watch
-keeps those folders' events: more events, no loss) and the four sets. Each restart starts the max-delay clock again.
-From the old instance's close until the new walk reaches a folder, nothing watches it: about 8 µs a folder, 0.15 s at
-17,200 folders (limitation 3).
+keeps those folders' events: more events, no loss) and the four sets. From the old instance's close until the new walk
+reaches a folder, nothing watches it: about 8 µs a folder, 0.15 s at 17,200 folders (the sentence of section 6).
 
 ### 3.7 What goes, what stays, what comes
 
-- **Goes:** `remove_moved_away_watches()` (its probe moves to the settle); the rewrite loop written inline in the
-  `MOVED_TO` branch (it becomes `move_watches()`); the discard branch's `remove_watches_under()` at a folder move-in
-  with a known cookie; the skipped move-in's `remove_watches_under()`; the walk's `wdDic[wd] = folder` for a held watch
-  when `found` is given; `Q_OVERFLOW`'s `continue`.
+- **Goes:** `remove_moved_away_watches()` (its probe moves to the settle); `raise_queue_limit_for_removals()` and its
+  sysctl write (3.4); the rewrite loop written inline in the `MOVED_TO` branch (it becomes `move_watches()`); the
+  discard branch's `remove_watches_under()` at a folder move-in with a known cookie; the skipped move-in's
+  `remove_watches_under()`; the walk's `wdDic[wd] = folder` for a held watch when `found` is given; `Q_OVERFLOW`'s
+  `continue`.
 - **Stays:** the walk by path; `cookieDic` and its `wds` (one pass over every watch at each folder move-out, one at each
   pairing; v16 removed them); `newDirWDs` and its discard, cleared at each take; the expiry triggers; `remove_watches()`
-  with `raise_queue_limit_for_removals()`; `remove_newly_skipped_watches()`; `follow_inner_mounts()`'s
-  `remove_watches_under()`; the `DELETE_SELF` and `UNMOUNT` handling; a subfolder's `MOVE_SELF` skipped.
+  (skipping gone wds); `remove_newly_skipped_watches()`; `follow_inner_mounts()`'s `remove_watches_under()`; the
+  `DELETE_SELF` and `UNMOUNT` handling; a subfolder's `MOVE_SELF` skipped.
 - **Comes:** `found`, `outgoing` (a count), `leaving`, `doubtful` and `guarded()`; `move_watches()`, which also returns
-  the watches it moved (for rule 1); `settle()`; `queued_events()` (`FIONREAD`, with `import termios`);
-  `WATCH_RESULT_OVERFLOW`; the `found` parameter of `initializeFolderWatchers()` and of `follow_inner_mounts()`; the
-  INFO lines of section 5.
+  the watches it moved (for rule 1); `settle()` with its three-way probe; `queued_events()` (`FIONREAD`, with `import
+  termios`); the same-read skip's index and recorded paths; `WATCH_RESULT_OVERFLOW` and the carried max-delay time;
+  `found` and rule 3 in `initializeFolderWatchers()`, and `found` in `follow_inner_mounts()`; the INFO lines of
+  section 5.
 
 ### 3.8 Why each harm is closed
 
@@ -305,11 +405,12 @@ From the old instance's close until the new walk reaches a folder, nothing watch
   arrival in the one queue, fact A), and the arrival's walk finds it held elsewhere if a move-out took it meanwhile
   (`found`). The check after the batch then compares, and a copy is made from the tree.
 - *A change at a path ahead of the events.* No watch moves ahead: walks note, the settle runs on an empty queue. A
-  watch of a folder that reached its place where no event saw it lags at the old path until the settle, and the settle
-  copies the folder.
-- *A folder with no working watch.* A watch is removed only by a probe on an empty queue, after the found watches were
-  put where they are (so a folder that came back keeps its watch). Folders made inside a lagging folder are walked at
-  the settle. An overflow walks the whole tree again.
+  watch of a folder that reached its place where no event saw it lags at the old path until the settle, and the folder
+  is copied, by the batch's create or the settle's.
+- *A folder with no working watch.* A watch is removed only by a probe on an empty queue that found it not here (never
+  one that could not look, nor through a symlink), after the found watches were put where they are (so a folder that
+  came back keeps its watch). Folders made inside a lagging folder are walked at the settle. An overflow walks the whole
+  tree again.
 
 ## 4. The three deferred entries, v16's routes and item 23
 
@@ -318,134 +419,133 @@ From the old instance's close until the new walk reaches a folder, nothing watch
   No copy: the found watch is where the events put it by the settle. Gates: `twice_old_race`, `twice_old_race_sub`,
   `root_ahead`.
 - **"A folder moved out of the tree from a new folder keeps its watch" (F3):** closed, with the count. A move-out
-  discarded in a new folder makes its watches `leaving` (found among `newDirWDs` and `found`, 3.2); an expiry makes
-  them `leaving` by watch, not by path, so an ancestor's rename in between does not hide them; and while a move-out
-  holds a watch it is guarded, so a rename it reports is a delete and a create. F1 is 6 of 6 right with the count:
-  review 5's order through a new folder already on the design pass (0.55.1: 3 of 6 wrong), and its ancestor route (the
-  review's `test_nested_outgoing.py`) on the review's patched copy (0.55.1 and the design pass: 3 of 6 wrong, the three
-  with alike tails).
+  discarded in a new folder makes its watches `leaving` (found among `newDirWDs` and `found`, 3.2, or by its move-in's
+  fallback, 3.3); an expiry makes them `leaving` by watch, not by path, so an ancestor's rename in between does not hide
+  them; and while a move-out holds a watch it is guarded, so a rename it reports is a delete and a create. F1 is 6 of 6
+  right with the count: review 5's order through a new folder already on the design pass (0.55.1: 3 of 6 wrong), and
+  its ancestor route (the review's `test_nested_outgoing.py`) on the review's patched copy (0.55.1 and the design pass:
+  3 of 6 wrong, the three with alike tails).
 - **"An event queue overflow can leave a new folder unwatched":** closed, by the restart. The overflow probe: 9 of 9
-  right with the watch map checked both ways (0.55.1: 9 of 9 wrong); the entry becomes limitation 3.
+  right with the watch map checked both ways (0.55.1: 9 of 9 wrong). The entry goes; the restart's window is one
+  sentence in another entry (section 6).
 - **v16's routes** (`exchange`, `exchange_twice`, `over_empty`, the `root_put_*` shapes, `back_home_*`,
   `land_ahead_taken`, `back_home_under_new`) and the seeds that found them: all in the gates of section 8.
 - **v16's item 23** (an expiry before the folder's `MOVE_SELF`, with a create elsewhere at the same path) does not
   arise: the step back takes no meaning from a subfolder's `MOVE_SELF` and removes no watch by its place in the event
   order, only by a probe on an empty queue.
 
-What the step back leaves, reasoned, not run:
-- **A rename caught in its window (fact E), at any probe.** A probe between a rename's move of the name and the queueing
-  of its events sees the new tree with an empty queue. A `found` or `doubtful` watch put there is ahead of the events:
-  a change made in its folder before they are queued is recorded at the place the move then lands on, and the collapse
-  drops it as what the move replaced. A `leaving` watch removed there loses a change made before its folder's move-in
-  walk adds a new watch. Each needs a rename of that very folder during the settle's probe of it, and a change in the
-  same microseconds that keeps size, mtime and the last 64 KiB. v16 rests on the same kernel ordering; 0.55.1's expiry
-  probes with a whole read unhandled.
-- **A queue that never empties** (limitation 2). Until the settle, a found folder's changes come at its old path, and a
-  move through a guarded watch is a copy. The settle runs after the read that ends each burst, so a batch taken after
-  a quiet period always follows it; only a batch taken while events keep coming (the maximum delay's) can come first,
-  and that version can lack a change in the found folder, which the settle's copy brings into the next one. Fact F says
-  the queue empties within milliseconds even at 108,000 events a second.
+What the step back leaves, reasoned, not run, each with its bucket:
+- **A rename caught in its window (fact E), at any probe: not an issue** (the main session's ruling on the spec check's
+  1e). A probe between a rename's move of the name and the queueing of its events sees the new tree with an empty
+  queue: a `found` or `doubtful` watch put there is ahead of the events, so a change made in its folder before they are
+  queued is recorded where the move then lands and dropped as what the move replaced; a `leaving` watch removed there
+  loses a change made before its folder's move-in walk adds a new watch. It needs a rename of the very folder probed,
+  inside that window, and a change in the same microseconds that keeps size, mtime and the last 64 KiB. v16 rests on
+  the same kernel ordering.
+- **The first walk's race with a rename: not an issue** (the same ruling). The first walk puts a watch where it finds
+  it, as on 0.55.1 (3.5), so a change made during it can be dropped as what a queued rename replaced; it is the blind
+  spot of "A rewrite made while down that keeps size and mtime", as the start's full comparison follows the first walk.
+- **A queue that never empties:** limitation 2 (section 6). The settle runs after the read that ends each burst, so a
+  batch taken after a quiet period always follows it; only a batch taken while events keep coming (the maximum
+  delay's) can come first. Fact F says the queue empties within milliseconds even at 108,000 events a second.
 - **An inner mount followed inside a folder made since the last take** is the exception to `newDirWDs`'s line: its walk
   keeps the mount's events, so its watches are not in `newDirWDs`, and a move out of the tree, read on the new folder's
   watch, of a folder holding the mount point leaves the mount's watches mapped in the tree. It needs a disk mounted below
   a folder made in the same batch, and a folder inside the new one and above the mount point moved out of the tree in
   that batch; 0.55.1 is the same. Proposed: not an issue.
-- **The first walk** puts a watch where it finds it, as on 0.55.1 (3.5).
 
 ## 5. What changes for the operator
 
 - The three deferred entries go (section 4).
-- **A move out of a folder that has just left the tree is copied**, where 0.55.1 renamed it in the vault: `mv X /out/X;
-  mv /out/X/sub sub` within the pair timeout (60 s by default) copies `sub` whole. So is a rename reported by a folder
-  a walk found ahead of its events, or by either folder of a `RENAME_EXCHANGE`, until the next empty queue. The version
-  is right; the copy costs the moved entry's size once (limitation 1). One INFO line each: `Copying <path>, moved from
-  <path>: a watch of the move is not settled`.
-- **The settle's copy** logs one INFO line: `Copying <path>: its watch got there with no event of the move, so its
-  events since came at its old path`. It comes once per found watch put in place, which includes every folder renamed
-  inside a folder made in the same batch (the discard branch keeps no cookie, so the move-in's walk finds the watch at
-  the old path); those copies cost no bytes, as the new folder's copy covers them. 0.55.1 logged nothing there.
-- **A change in a found folder can reach the vault one version late** under events that never pause (limitation 2).
-- **An overflow restarts the watch:** one more INFO line, `Watching the tree again after the overflow`, and a second
-  full comparison after the walk (limitation 3).
+- **A move out of a folder that has just left the tree is copied**, where 0.55.1 renamed it in the vault, for the pair
+  timeout after the folder left (the larger of the job's minimum snapshot delay and 30 s; 60 s by default): `mv X
+  /out/X; mv /out/X/sub sub` copies `sub` whole. So is a rename in a folder a walk found ahead of its events, in either
+  folder of a `RENAME_EXCHANGE`, or in a folder moved onto the place of one that had just left and then moved on, until
+  the next empty queue (limitation 1). One INFO line each (rule 3's): `Copying <path>, moved from <path>: a watch of the
+  move is not settled`.
+- **The settle's copy** logs one INFO line, `Copying <path>: its changes came at another path until the event queue ran
+  empty`: after a swap by one rename, and for a found folder when a batch was taken since the walk noted it
+  (limitation 2). A folder renamed inside a folder made in the same batch is still walked a second time by the settle
+  (two more INFO lines, the walk's own), with no copy and no copy line.
+- **A change in a found or swapped folder can reach the vault one version late** under events that never pause, and its
+  copy then copies the folder whole once more (limitation 2).
+- **An overflow restarts the watch:** one more INFO line, `Watching the tree again after the overflow`; one full
+  comparison follows, as on 0.55.1, and a batch taken during the restart's walk is followed by another; the maximum
+  delay counts on from before the overflow. A change during the walk that keeps size, mtime and the last 64 KiB is
+  missed (section 6).
 - The watches of a folder moved out of the tree go at the first empty queue after its move-out expires, where 0.55.1
   removed them at the expiry itself.
 
 ## 6. docs/limitations.md and the README
 
 **docs/limitations.md** (round 22's build):
-- **Goes:** "A folder renamed twice into a folder whose move is being walked can keep old bytes" and "A folder moved out
-  of the tree from a new folder keeps its watch".
-- **Replaced in place:** "An event queue overflow can leave a new folder unwatched" becomes "An event queue overflow
-  restarts the watch" (limitation 3 below); the user's pick puts its window as one sentence in the overflow entry.
-- **Changed:** "A folder or file moved into a new folder is copied whole": its revisit no longer waits for the two
-  entries that go: "Revisit when: the no-copy move gets its own design; sooner if size limits start pruning because of
-  it."
+- **Goes, as closed:** "A folder renamed twice into a folder whose move is being walked can keep old bytes", "A folder
+  moved out of the tree from a new folder keeps its watch" and "An event queue overflow can leave a new folder
+  unwatched".
+- **Changed:**
+  - "A folder or file moved into a new folder is copied whole": its revisit no longer waits for the two entries that
+    go: "Revisit when: the no-copy move gets its own design; sooner if size limits start pruning because of it."
+  - "A rewrite made while down that keeps size and mtime" gains one sentence at the end of "What the operator sees":
+    "So is one made while the watcher watches the tree afresh after an event queue overflow (about 8 µs a folder, some
+    0.15 s at 17,200 folders): the full comparison that follows has the same blind spot." Its "Approved" gains:
+    "2026-11-09, on the window of the watch's restart after an overflow: "Accept: one sentence (Recommended)"."
+  - "Swaps in one batch are repaired by copies" gains, after its first sentence: "An exchange of two entries by one
+    rename (`mv --exchange a b`, `RENAME_EXCHANGE`) in one batch is repaired the same way."
 - **New:** limitations 1 and 2 below, after "A move that another change of the batch outran is copied".
-
-The three entries, as they go into the file:
 
 ```markdown
 ### A move out of a folder that just left the tree is copied
 
 - **Kind:** known limitation.
-- **What the operator sees:** a file or folder moved back into the tree out of a folder that was moved out of it less
-  than the pair timeout before (60 s by default), as in `mv X /out/X; mv /out/X/sub sub`, is copied whole instead of
-  renamed in the vault, with one INFO line, `Copying <path>, moved from <path>: a watch of the move is not settled`. So
-  is a rename in a folder the watcher found at a place its events had not brought it to yet (a rename racing the walk
-  of a folder just moved or made), or in either folder of a swap by one rename (`RENAME_EXCHANGE`), until the watcher
-  next finds its event queue empty, normally at the end of that read. 0.55.1 renamed these. The version is right; the
-  copy costs the moved entry's size once, and with a size limit it can prune older versions, as the copy of a move into
-  a new folder can.
+- **What the operator sees:** for the pair timeout after a folder is moved out of the tree (the larger of the job's
+  minimum snapshot delay and 30 s: 60 s by default, an hour on a job whose minimum delay is an hour), anything moved
+  from that folder back into the tree, as in `mv X /out/X; mv /out/X/sub sub`, is copied whole instead of renamed in
+  the vault, with one INFO line, `Copying <path>, moved from <path>: a watch of the move is not settled`. Until the
+  watcher next finds its event queue empty, normally at the end of that read, the same copy covers a rename in a folder
+  moved onto the place of one that had just left the tree and then moved on, in either folder of a swap by one rename
+  (`RENAME_EXCHANGE`), and in a folder the watcher found at a place its events had not brought it to yet (a rename
+  racing the walk of a folder just moved or made). 0.55.1 renamed these. The version is right; the copy costs the moved
+  entry's size once, and with a size limit it can prune older versions, as the copy of a move into a new folder can.
 - **Why:** such a folder's watch can report its moves at a path another folder now has; trusting it is how a version
   kept a file's old bytes for good, and telling the two folders apart needs the watch tree of round 22's first design
   (about 815 more lines and 94 bytes a watch).
-- **Revisit when:** the INFO line shows up often in the live logs, or the no-copy move into a new folder gets its own
-  design.
-- **Approved:** 2026-11-09, the user's choice "Accept: copy (Recommended)".
+- **Revisit when:** the log shows big copies from this route often. Also when the no-copy move into a new folder gets
+  its own design.
+- **Approved:** 2026-11-09, the user's choice "Accept: copy (Recommended)"; then, with the window corrected to the pair
+  timeout and the routes named, "Approve as corrected (Recommended)".
 
 ### A folder found ahead of its events can reach the vault a version late
 
 - **Kind:** known limitation.
 - **What the operator sees:** when a walk of the watcher finds a folder at a place its events have not brought it to
-  yet (it was renamed while the walk of a folder just moved or made ran), the folder's changes keep coming at its old
-  path until the watcher finds its event queue empty; then it puts the folder's watch in place, watches what was made
-  in it and copies it, with one INFO line, `Copying <path>: its watch got there with no event of the move, so its events
-  since came at its old path`. A batch taken before that moment, while events keep coming (the maximum delay's), can
-  lack a change made in that folder meanwhile; the next version has it. The queue empties often even in a busy tree:
-  with writers at 108,000, 89,000 and 57,000 events a second it was empty after 42%, 59% and 69% of reads, the longest
-  non-empty streak under 10 ms.
+  yet (a rename racing the walk of a folder just moved or made), or one rename swaps two folders (`RENAME_EXCHANGE`),
+  that folder's changes come at another path (its old one, or the other folder's) until the watcher finds its event
+  queue empty. Then it puts the folder's watch in place and watches what was made in it; a swapped folder, and a found
+  one after a batch taken in between, is also copied, with one INFO line, `Copying <path>: its changes came at another
+  path until the event queue ran empty`. A batch taken before that moment, while events keep coming (the maximum
+  delay's), can lack a change made in that folder meanwhile; the next version has it, and the copy that brings it
+  copies the folder whole once more (vault space). The queue empties often even in a busy tree: with writers at
+  108,000, 89,000 and 57,000 events a second it was empty after 42%, 59% and 69% of reads, the longest non-empty streak
+  under 10 ms.
 - **Why:** only an empty queue tells the watcher that what it sees in the tree is what its events say; deciding with
   events unread is how 0.55.1 could remove a live folder's watch or keep a file's old bytes.
-- **Revisit when:** a version is found to lack a change that the next version holds, on a job whose events never pause.
-- **Approved:** 2026-11-09, the user's choice "Accept: next version (Recommended)".
-
-### An event queue overflow restarts the watch
-
-- **Kind:** known limitation.
-- **What the operator sees:** when the kernel's event queue overflows, the watcher logs `Queue overflow, event maybe
-  lost` (ERROR), doubles the queue limit, logs `Watching the tree again after the overflow` and watches the tree afresh
-  with a new inotify instance: the batch in progress becomes a full comparison, and another follows the new watch's
-  walk, so a folder whose create was lost is watched and backed up. A change made during that walk (about 8 µs a
-  folder, some 0.15 s for 17,000 folders) that keeps a file's size, mtime and last 64 KiB is seen by neither comparison,
-  and the vault keeps that file's old bytes until it next changes.
-- **Why:** after lost events the watch map cannot be trusted, and only a new instance takes the raised queue limit (the
-  kernel reads it when an instance is made); keeping the old instance's watches through the walk would hold two watches
-  a folder for the walk's length, for an event the live logs have not shown.
-- **Revisit when:** an overflow shows in the live logs.
-- **Approved:** 2026-11-09, the user's choice "Accept: one sentence (Recommended)": the walk's window as one sentence in
-  the overflow entry, rewritten here as the restart closes "An event queue overflow can leave a new folder unwatched".
+- **Revisit when:** a live tree shows long stretches with no empty queue.
+- **Approved:** 2026-11-09, the user's choice "Accept: next version (Recommended)"; then, with the swap and the second
+  copy named, "Approve as corrected (Recommended)".
 ```
 
-**README**, one line each in its list of limitations, after the line on a move another change of the batch outran:
-- "A file or folder moved back into the tree out of a folder that left it within the pair timeout (mv X /out/X; mv
-  /out/X/sub sub), or renamed in a folder the watcher found ahead of its events or swapped by one rename
-  (RENAME_EXCHANGE), is copied whole once instead of renamed, with one INFO line (Copying …: a watch of the move is not
-  settled). The result is right."
-- "Under events that never pause, a change in a folder the watcher found ahead of its events can reach the vault one
-  version late."
-- "An event queue overflow makes the watcher watch the tree afresh and compare it in full twice; a change made during
-  that walk (about 0.15 s for 17,000 folders) that keeps a file's size, mtime and last 64 KiB is missed until the file
-  next changes."
+**README:**
+- one line each in its list of limitations, after the line on a move another change of the batch outran:
+  - "For the pair timeout after a folder leaves the tree (the larger of the minimum snapshot delay and 30 s), anything
+    moved from it back into the tree (mv X /out/X; mv /out/X/sub sub) is copied whole instead of renamed, with one INFO
+    line (Copying …: a watch of the move is not settled); so is a rename in a folder the watcher found ahead of its
+    events or swapped by one rename (mv --exchange), until its event queue next runs empty. The result is right."
+  - "Under events that never pause, a change in a folder the watcher found ahead of its events, or swapped by one
+    rename, can reach the vault one version late, and that folder is then copied whole once more."
+- line 36 ("A file rewritten in place while reverberator is down…") gains one clause: "…, or during the watcher's
+  restart after an event queue overflow (about 0.15 s at 17,200 folders)".
+- line 46 ("A swap in one batch (mv a t; mv b a; mv t b)…") names the exchange: "(mv a t; mv b a; mv t b, or mv
+  --exchange a b)".
 
 docs/lessons.md: nothing; no API changes (the log lines are not an API, and no flag, config key or format changes).
 
@@ -467,24 +567,29 @@ CPU only. The host ran at a load of 200 to 270 on 32 cores, so the CPU numbers c
 | 10,000 folders made one by one, as `tar x` | 0.078 to 0.094 s | 0.081 to 0.083 s |
 | One overflow | none (no walk) | 0.153 to 0.165 s: the restart walks the tree, about 8 µs a folder |
 | `outbusy2` (the review's): a folder of 10,001 subfolders moved out of the tree while a writer keeps it busy (about 200 writes a second for 36 s), so its move-out expires at the pair timeout during the writes; one run each | 0.335 s | design pass 6.21 s; per probe (the review's patched copy) 0.284 s |
-| `renamesinnew` (the review's): 2,000 `mkdir n/d; mv n/d n/e` inside a folder made in the batch | 0.046 to 0.053 s | design pass 2.94 to 3.05 s; with ruling 3 not run |
+| `renamesinnew` (the review's): 2,000 `mkdir n/d; mv n/d n/e` inside a folder made in the batch | 0.046 to 0.053 s | design pass 2.94 to 3.05 s; with ruling 3 and the same-read skip, not run |
 
-**Ruling 3's scan, timed alone** (this revision; a Python loop of the two scans with no inotify, in a container as uid
+**Ruling 3's scan, timed alone** (this spec; a Python loop of the two scans with no inotify, in a container as uid
 65534 at a load of about 22): for 2,000 such move-outs in a tree of 20,251 watches, scanning every watch took 1.53 s and
 scanning `newDirWDs` and `found` 0.086 s, `newDirWDs` growing to 2,001. That scan grows with the folders made since the
-last take, so its total grows with their square: 20,000 renames inside one new folder would cost about 100 times as
-much, some 8.6 s (reasoned from the square, not run), where 0.55.1's discard branch does nothing at a move-out. The
-build measures `renamesinnew` at 2,000 and at 20,000 (section 8).
+last take, so a run of move-outs that all pay it grows with their square (20,000 would cost some 8.6 s, reasoned, not
+run). The same-read skip leaves it to move-outs of the tree and pairs split across reads. Each rename inside a new
+folder still costs the settle's probe and second walk of the moved folder, where 0.55.1 walks it once.
 
-- **Memory:** no state per watch. The four structures hold only the watches of a race or of a pending move-out, until
-  the next settle, pairing or expiry.
+- **Memory:** no state per watch at rest. The four structures hold only the watches of a race or of a pending
+  move-out, until the next settle, pairing or expiry. `outgoing` holds one entry per watch of a pending move-out for up
+  to the pair timeout, where 0.55.1 holds the cookie's tuple alone: for a move-out of 100,000 folders, a dict of
+  100,000 entries, a few MB (reasoned; the build measures it, section 8).
 - **Per event:** nothing for a file event (5 to 6.5 µs an event on both codes in the file writes above). One `settle()`
   call per read, which returns at once when nothing is noted; with something noted, one `FIONREAD` ioctl. A move-in
-  whose move-out was read looks its two folders' watches up in four structures, almost always empty.
-- **Per folder walked:** for a watch the walk finds held (not a new one), one comparison of its path, as before.
+  whose move-out was read looks its two folders' watches up in four structures, almost always empty. A folder move-out
+  in a new folder looks its cookie up in the read's index.
+- **Per folder walked:** for a watch the walk finds held (not a new one), one comparison of its path, as before; for a
+  watch it adds below the root, one lookup of its parent in the walk's own record and one in `newDirWDs`.
 - **Per folder move:** 0.55.1's two passes over every watch stay (v16 removed them; section 9).
-- **Extra reads:** the settle's probes (an `add_watch` per noted watch, a lookup in the dentry cache) and its walk of
-  each found folder; the copies of rule 3 read the moved entry whole.
+- **Extra reads:** the settle's probes (an `add_watch` per noted watch, a lookup in the dentry cache, and the symlink
+  check for a probe that found its watch) and its walk of each folder it puts in place; the copies of rule 3 read the
+  moved entry whole.
 - **Extra copies, counted on the design pass** (`tools/copycount.py` in the scratch folder): the 99 schedule shapes at
   small bounds (every order to 6 visits for 3 and 4 steps, to 5 for 5 steps, 50 sampled for 6 and 7; 5,334 orders),
   each order's batches logged on both codes and each create carried through the batch's later moves and deletes as the
@@ -520,147 +625,206 @@ copied that commit's files.
 inner-mount walk was in the review's runs but is not in the patch it saved): the ancestor route's probe 6 of 6, review
 5's F1 probe 6 of 6, the overflow probe 9 of 9; 2,882 orders of 27 move-out and found-watch shapes at 3:8, 4:8 and
 5:6 visits and 100 sampled for 6 and 7, the watch map checked both ways, none wrong; `outbusy2` 0.284 s. The 99 shapes
-at review 5's bounds and the fuzz were not run on it. Ruling 3 has not run anywhere.
+at review 5's bounds and the fuzz were not run on it. Ruling 3 and the spec check's rules have not run anywhere.
 
 ### 8.2 The gates on the built branch
 
-Every gate below runs on the branch before release; each has a bar. Test code never runs as root on the host: the
-container gates as uid 65534 (the scratch `dk.sh`: `docker run --rm --init --memory=<cap>` with no `--memory-swap`,
-`--pids-limit`, `--user 65534:65534`, the code and the test venv read-only), the root suite in the test VM. Read
-`/proc/pressure/memory` before a fan-out, cap each container, and remove each run's temp tree at its end.
+Every gate below runs on the branch before release; each has a bar. **The base** for the watcher gates (shapes, probes,
+fuzz, benchmarks) is 0.55.1 (6726e75); for the suite gates it is 0.55.1 until main is merged in, then main as merged,
+run beside the branch in the same container or VM. 0.55.2 changes nothing in the watcher, so its merge changes no
+watcher bar. Test code never runs as root on the host: the container gates as uid 65534 (the scratch `dk.sh`: `docker
+run --rm --init --memory=<cap>` with no `--memory-swap`, `--pids-limit`, `--user 65534:65534`, the code and the test
+venv read-only), the root suite in the test VM. Read `/proc/pressure/memory` before a fan-out, cap each container, and
+remove each run's temp tree at its end.
 
 | Gate | Bar |
 |---|---|
-| The 99 shapes plus the new `nested_out_ancestor` and ruling 3's two shapes (section 10, task 1) at review 5's bounds (3 and 4 steps every vector to 16 visits, 5 to 12, 6 and 7 steps 1,000 sampled), the watch map checked both ways (`all99.sh`, `SCHED_WATCHES=1`) | none wrong |
+| The 99 shapes plus the new ones of task 1 at review 5's bounds (3 and 4 steps every vector to 16 visits, 5 to 12, 6 and 7 steps 1,000 sampled), the watch map checked both ways (`all99.sh`, `SCHED_WATCHES=1`) | none wrong |
 | The seed 4284 agent's 10 shapes at review 5's bounds | none wrong |
 | `tests/test_watcher_schedules.py` at every order (`REVERB_WATCH_SCHED_SAMPLE=0`) | none failed |
-| The in-process probes in the suite: review 5's F1 order and its ancestor route, each with its control; the overflow cases | 6 of 6, 6 of 6, 9 of 9 |
-| The fuzz, seeds 0 to 29,999, lists checked, 15 containers of 2,000 seeds, each process's address space capped at 12 GB (`fz.sh`) | no failure; teardown errors only of the size-record class ("A size record too low after a rename falls back to a copy") |
+| The in-process tests of task 1: review 5's F1 order and its ancestor route, each with its control; the overflow cases; the chunked removal; the clock across an overflow; gone wds; a probe that could not look | 6 of 6, 6 of 6, 9 of 9, the rest all pass |
+| The fuzz, seeds 0 to 29,999, lists checked, 15 containers of 2,000 seeds (`fz.sh`), each under its `--memory` cap with no `--memory-swap`, and inside it each process's address space capped at 12 GB: a normal worker's is 4.8 to 7 GB, so a runaway seed (as 2509 was on v8) fails alone with a `MemoryError` instead of the cap killing the whole container's 2,000 seeds | no failure; teardown errors only of the size-record class ("A size record too low after a rename falls back to a copy") |
 | Fuzz seeds 2195, 2509, 4284, 12812, 12831, 14124, 16462 and 19006 alone, 3 tries each | all pass |
 | The copy count of section 7 | none wrong; the extra copies over 0.55.1's right orders are limitation 1's and the settle's, each named |
-| The suite in containers as uid 65534 | fails only what the base (main with 0.55.2) fails in the same container |
-| The suite as root in the test VM (`gate.sh`, tag v0.54.1 in its `.git`): `--deselect tests/test_pool_cut.py`, then `tests/test_pool_cut.py` alone (`--alone`); this holds the suite's mergerfs and power-loss tests, which the user brought back for this round | all pass, but the queue-fill skip |
-| `probes/bench_watcher.py` (`bench.sh`): every workload of section 7, `renamesinnew` also at 20,000 renames, the base and the branch alternating, three runs each | each within the base's noise (the ranges overlap), the overflow excepted; `outbusy2` and `renamesinnew` at the base's numbers. A miss goes to the main session with the numbers, not into more code |
+| The suite in containers as uid 65534 | fails only what the base fails in the same container |
+| The suite as root in the test VM (`gate.sh`, tag v0.54.1 in its `.git`): `--deselect tests/test_pool_cut.py`, then `tests/test_pool_cut.py` alone (`--alone`); this holds the suite's mergerfs and power-loss tests, which the user brought back for this round, and the chunked-removal test with the sysctl really set low | all pass, but the queue-fill skip |
+| `probes/bench_watcher.py` (`bench.sh`): every workload of section 7, `renamesinnew` at 2,000 and 20,000 renames, the base and the branch alternating, three runs each; and tracemalloc's peak during a pending move-out of 100,000 folders | each within the base's noise (the ranges overlap), the overflow excepted; `outbusy2` and `renamesinnew` at the base's numbers. The peak is measured and written into section 7, with no bar. A miss goes to the main session with the numbers, not into more code |
+
+**When the schedule harness checks the watch map:** after the shape's last batch, as the prototype's harness does. That
+batch follows a quiet read, whose expiries and settle have run, so no watch is still flagged for a reason the next
+settle would fix; a watch still flagged then and wrong counts as stale. `watch_map_errors()` also counts as stale a
+held watch whose path has a symlink below the root (fact C), which `add_watch` by path alone would pass.
 
 ## 9. Against v16
 
 | | Step back | v16 |
 |---|---|---|
-| reverberator.py | the design pass's +153/-74, plus about 30 lines for the review's changes (estimated) | +815/-170 |
-| Rules | four, with the structures of 3.2 | about twenty (its 2.1) |
-| Memory | none per watch | 94 B a watch, 1.6 MB at the live 17,200 |
+| reverberator.py | the design pass's +153/-74, plus the review's and the spec check's changes (estimated at 60 to 90 lines) | +815/-170 |
+| Rules | four, with the structures of 3.2 and their rules | about twenty (its 2.1) |
+| Memory | none per watch at rest; a count per watch of a pending move-out | 94 B a watch, 1.6 MB at the live 17,200 |
 | First walk | as 0.55.1 | about 1.4 µs a folder more (idle), 24 to 85 ms at 17,200 |
 | A folder made | as 0.55.1 | 3.7 to 5.5 µs more |
 | A folder renamed | as 0.55.1: two passes over every watch | O(its subtree): 0.13 µs a watch a rename saved |
 | Copies 0.55.1 does not make | limitation 1's; counted, 25 more copies in the 5,150 orders 0.55.1 gets right | the root put's copy (14 of 5,624 orders) |
 | Walk | 0.55.1's, by path | through open folders, iterative, `/proc` needed |
-| Known wrong order left | none run; the reasoned ones of section 4 | item 23, reasoned |
+| Known wrong order left | none run; section 4's, each bucketed | item 23, reasoned |
 
 v16 is faster where one folder of a large tree is renamed often; the step back is lighter in memory and in walks, and a
-fifth of the code. The passes over every watch at a folder move could go on their own later, by an index of paths
+fraction of the code. The passes over every watch at a folder move could go on their own later, by an index of paths
 (the lightness round), without the rest of the watch tree.
 
 ## 10. The build's tasks, in order
 
-The design pass's reverberator.py diff against 6726e75 is in the worktree, untracked:
-`.superpowers/sdd/2026-11-08-round22/stepback.diff` (the scratch clone's commit 50e391d plus an uncommitted docstring).
-The main session hands the builder the rest: the scratch clone's test changes (its commits 100ef5c and 5e62c74), the
-probes (the design pass's `test_r5_f3_wrong.py`, `test_overflow.py`, `watchmap.py`, `test_sched.py` with the 99 shapes'
-list; the review's `test_nested_outgoing.py`, and `bench_watcher.py` with `outbusy2` and `renamesinnew`) and the
-scratch helpers (`dk.sh`, `suite_dk.sh`, `all99.sh`, `sched.sh`, `fz.sh`, `bench.sh`, `probe.sh`). Each task ends with
-its command passing; `<tree>` is the worktree, run in a container as uid 65534 (`dk.sh <cap> <tree> python3 -m pytest
--q -n auto -p no:cacheprovider -o tmp_path_retention_policy=failed --basetemp=<bt> <files>`).
+**Base:** build on round22 now (0.55.1 and this spec); merge main in once 0.55.2 is on main, and run the suite gates
+again after the merge. **Inputs:** the design pass's reverberator.py diff against 6726e75 is in the worktree,
+untracked: `.superpowers/sdd/2026-11-08-round22/stepback.diff` (the scratch clone's commit 50e391d plus an uncommitted
+docstring). The main session hands over the rest in the build brief: the scratch clone (its test commits 100ef5c and
+5e62c74, and v16's 56-shape schedule file in them); the probes (the design pass's `test_r5_f3_wrong.py`,
+`test_overflow.py`, `watchmap.py`, `test_sched.py` with the 99 shapes' list and the seed 4284 agent's 10 shapes; the
+review's `test_nested_outgoing.py`, and `bench_watcher.py` with `outbusy2` and `renamesinnew`); the scratch helpers
+(`dk.sh`, `suite_dk.sh`, `all99.sh`, `sched.sh`, `fz.sh`, `bench.sh`, `probe.sh`); and the test VM with its `gate.sh`.
+Each task ends with its command passing; `<tree>` is the worktree, run in a container as uid 65534 (`dk.sh <cap> <tree>
+python3 -m pytest -q -n auto -p no:cacheprovider -o tmp_path_retention_policy=failed --basetemp=<bt> <files>`).
 
-1. **The base, and the tests first.**
-   - Merge main into round22 once 0.55.2 is there; `__version__ = "0.55.3"`.
-   - Bring in the clone's test changes against 6726e75: `watch_map_errors()` in `tests/harness.py`; `Session.watch()`
-     in `tests/test_moves_into_new_folders.py`, which runs `watchFolder()` again with `root_returned=True` after
-     `WATCH_RESULT_OVERFLOW`, as `watcher()` does, and the `exchange` verb (`renameat2()` with `RENAME_EXCHANGE`);
-     `tests/test_watcher_schedules.py` with v16's 56 shapes on 0.55.1's walk hooks (`iter_tree_entries()`), without
-     v16's two `WatchTree` asserts, and the watch map checked at the end of every shape. They name
-     `rv.WATCH_RESULT_OVERFLOW`, which task 2 adds: for the red run on the base, add that one constant alone.
-   - Add the shapes, to the schedule file and to the 99's list (`probes/test_sched.py`): `nested_out_ancestor`, the
-     review's route in the file's tree (`mv big/sub {outside}/sub; mv big other/b2; mv next2/sub other/b2/sub; mv
-     {outside}/sub/b {outside}/sub/z`, then a `poke` in `other/b2/sub`); for ruling 3's rule 1,
-     `moved_sub_out_before_walk` (`mkdir n; mv big n/big; mv n/big/sub {outside}/sub; mv next2/sub n/big/sub`, then a
-     write in `{outside}/sub`); for rule 2, `back_into_new_then_out` (`mv big {outside}/big; mkdir n; mv {outside}/big
-     n/big; mkdir big; mv n/big {outside}/b2; mv next2/sub n/big`, then a write in `{outside}/b2`; 0.55.1 leaves the
-     stale watch here too). The builder fits the steps to the harness if they need it.
-   - A new test file (its name the builder's) with the in-process probes: review 5's F1 order and its control
-     (`test_r5_f3_wrong.py`), its ancestor route and control (`test_nested_outgoing.py`), the overflow cases with
-     `watch_map_errors()` (`test_overflow.py`, whose `watchmap.py` is the same check).
+1. **The version, and the tests first.**
+   - `__version__ = "0.55.3"`.
+   - Bring in the clone's test changes against 6726e75: `watch_map_errors()` in `tests/harness.py`, which also counts a
+     held watch whose path has a symlink below the root as stale; `Session.watch()` in
+     `tests/test_moves_into_new_folders.py`, which runs `watchFolder()` again with `root_returned=True` after
+     `WATCH_RESULT_OVERFLOW`, as `watcher()` does, the `exchange` verb (`renameat2()` with `RENAME_EXCHANGE`), and new
+     verbs `symlink` and `take`; `tests/test_watcher_schedules.py` with v16's 56 shapes on 0.55.1's walk hooks
+     (`iter_tree_entries()`), without v16's two `WatchTree` asserts, and the watch map checked at the end of every
+     shape. They name `rv.WATCH_RESULT_OVERFLOW`, which task 2 adds: for the red run on the base, add that one constant.
+   - Add these shapes, to the schedule file and to the 99's list (`probes/test_sched.py`), in the file's tree; the
+     builder fits the steps to the harness if they need it:
+
+     | Shape | Steps | What it holds |
+     |---|---|---|
+     | `nested_out_ancestor` | `mv big/sub {outside}/sub; mv big other/b2; mv next2/sub other/b2/sub; mv {outside}/sub/b {outside}/sub/z`, a `poke` in `other/b2/sub` | the count (the review's route) |
+     | `moved_sub_out_before_walk` | `mkdir n; mv big n/big; mv n/big/sub {outside}/sub; mv next2/sub n/big/sub`, a write in `{outside}/sub` | rule 1 |
+     | `back_into_new_then_out` | `mv big {outside}/big; mkdir n; mv {outside}/big n/big; mkdir big; mv n/big {outside}/b2; mv next2/sub n/big`, a write in `{outside}/b2` | rule 2 (0.55.1 leaves the stale watch too) |
+     | `pairing_walk_under_new` | `mkdir big/n`, then `mkdir big/n/s; mv big b2` before that read is handled, `mv b2/n/s {outside}/s; mv next2/sub b2/n/s`, a write in `{outside}/s` | rule 3 (the spec check's 4a) |
+     | `renamed_in_new_then_out` | `mkdir n; mkdir n/d; mv n/d n/e; mv n/e {outside}/e; mkdir n/d`, a write in `{outside}/e` | the same-read skip's fallback |
+     | `exchange_then_rename` | `exchange big other; mv big b3`, a `poke` in `other/a`, a write in `b3` | `doubtful`'s first path before (4b) |
+     | `exchange_chain` | `exchange big other; exchange big next`, a `poke` in `other/a`, a write in `next` | the probe of every doubtful path (4b) |
+     | `out_then_link` | `mv next2/sub {outside}/sub; rmtree next2; symlink next2 → {outside}`, a write in `{outside}/sub` | the symlink check (4c) |
+     | `back_as_new_name` and `back_as_new_name_take` | `mv big {outside}/big; mv {outside}/big big2`, a `poke` in `big2/a`; the second with a `take` between the move-in and the poke | the settle's covered copy (Q2 (a)): no lost change with a take between the note and the settle or without |
+   - A new test file (its name the builder's) with the in-process tests:
+     - review 5's F1 order and its control (`test_r5_f3_wrong.py`), its ancestor route and control
+       (`test_nested_outgoing.py`), the overflow cases with `watch_map_errors()` (`test_overflow.py`, whose
+       `watchmap.py` is the same check);
+     - **the chunked removal:** the queue limit the watch reads at its start patched to 64, a folder of 300 subfolders
+       moved out of the tree, then quiet: no overflow restart, and every one of its watches gone within a few settles,
+       the map checked both ways; in the test VM as root, the same with `fs.inotify.max_queued_events` really set to 64
+       for the test and restored after;
+     - **the clock across an overflow:** events queued, the maximum delay short, an overflow in between: the batch is
+       still signalled when the maximum delay since the last take has passed;
+     - **gone wds:** `remove_watches()` with a wd already gone does nothing; a `DELETE_SELF` of a watch in `found`,
+       `leaving` or `doubtful` takes it out of every set;
+     - **could not look:** a fake `add_watch` that raises `EIO` for a leaving watch's path: the watch stays, still
+       `leaving`, and goes at the first settle whose probe answers.
    - Run them on the base and record what fails. Expected red: the F1 order 3 of 6, the ancestor route 3 of 6, the
-     overflow cases 9 of 9, and in the schedule file some orders of the shapes 8.1 names for 0.55.1. Command: the suite
-     command with `tests/test_watcher_schedules.py`, the new file, `tests/test_moves_into_new_folders.py`.
+     overflow cases 9 of 9, some orders of the shapes 8.1 names for 0.55.1, of `back_into_new_then_out`,
+     `pairing_walk_under_new`, `renamed_in_new_then_out` and `out_then_link`, and the tests of parts 0.55.1 lacks.
+     Command: the suite command with `tests/test_watcher_schedules.py`, the new file,
+     `tests/test_moves_into_new_folders.py`.
 2. **The design pass's code.** Port `stepback.diff`: `found` in the walk, `guarded()`, the four structures,
    `move_watches()`, the event rows of 3.3, `settle()` and `queued_events()`, the overflow restart and `watcher()`'s
-   `root_lost`, and `remove_moved_away_watches()` gone. Proof: the task 1 tests pass but the ancestor route's probe
-   (still 3 of 6 wrong, which shows the count is needed), and the suite in a container fails only what the base fails.
+   `root_lost`, and `remove_moved_away_watches()` gone. Proof: the task 1 tests from the design pass's gates pass
+   (F1, overflow, the 56 shapes), the ancestor route's probe still fails 3 of 6 (the count is needed), and the suite in
+   a container fails only what the base fails.
 3. **The review's changes, rulings 1, 2 and 4.**
    - `outgoing` as a count (3.2): hold at a `MOVED_FROM`; let go once, at the pops 3.2 lists, and at the discard
      branch's unguarded pairing with the cookie stored again with no `wds`.
    - `settle()` per probe: the re-check before the removals goes (3.4), with the argument for no retry in a comment.
    - `follow_inner_mounts()` takes `found` and passes it to its walk; `watchFolder()` passes its own; the walk's
      docstring then names the first walk alone as the one without `found`.
-   Proof: the ancestor route 6 of 6, F1 6 of 6, overflow 9 of 9; `bench.sh` with `outbusy2` at the base's number.
-4. **Ruling 3 and its two rules** (3.2): the discard branch's folder `MOVED_FROM` looks among `newDirWDs` and `found`;
-   the discard branch's unguarded pairing puts the watches `move_watches()` moved into `newDirWDs`; the settle's walk
-   passes `newDirWDs`. Proof: `moved_sub_out_before_walk` and `back_into_new_then_out` pass with the rules, and each
-   fails in some order without its rule (run each shape at review 5's bounds on the branch with that rule taken out,
-   to show it is needed, then put it back; task 3's release-once rule stays in, as the design pass's expiry would make
-   rule 1's stale watches `leaving` at the quiet read and hide the need); every shape of the schedule file passes;
-   `bench.sh` with `renamesinnew` at 2,000 and 20,000. If `renamesinnew` misses the base's numbers, stop and report
-   them to the main session (section 12, item 3).
-5. **The docs** (section 6), word for word: docs/limitations.md and the three README lines. The user approved the
-   entries; the main session writes them, or tells the builder to.
-6. **The gates of 8.2**, on the branch.
+
+   Proof: the ancestor route 6 of 6, F1 6 of 6, overflow 9 of 9; `nested_out_ancestor` passes; `bench.sh` with
+   `outbusy2` at the base's number.
+4. **The settle and its housekeeping (the spec check's rulings).** The three-way probe with the symlink check (fact C);
+   `doubtful`'s first path before and the probe of every doubtful path (3.4 step 2); a doubtful watch no probe finds into
+   `leaving`; a found folder copied only after a take since its note (3.4 step 5); the removals capped at half the
+   instance's queue limit and `raise_queue_limit_for_removals()` gone; a watch leaving `wdDic` leaving every set, and
+   `remove_watches()` skipping gone wds (3.2); the max-delay clock carried across the restart (3.6). Proof:
+   `exchange_then_rename`, `exchange_chain`, `out_then_link`, `back_as_new_name` and `back_as_new_name_take` pass; the
+   in-process tests of the chunked removal, the clock, gone wds and could-not-look pass; the 56 shapes still pass.
+5. **Ruling 3, its three rules and the same-read skip** (3.2, 3.3). Proof: `moved_sub_out_before_walk`,
+   `back_into_new_then_out`, `pairing_walk_under_new` and `renamed_in_new_then_out` pass, and each fails in some order
+   without its rule or the fallback (run each at review 5's bounds with that one part taken out, to show it is needed,
+   then put it back; task 3's release-once rule stays in, as the design pass's expiry would make rule 1's stale watches
+   `leaving` at the quiet read and hide the need); every shape of the schedule file passes; `bench.sh` with
+   `renamesinnew` at 2,000 and 20,000. If `renamesinnew` misses the base's numbers, stop this task, report the numbers
+   to the main session, and go on with tasks 6 and 7: the docs do not depend on it, and the correctness gates run on the
+   branch as it is (again, if the answer changes ruling 3's code).
+6. **The docs** (section 6), word for word: docs/limitations.md and the README lines. The user approved the entries;
+   the main session writes them, or tells the builder to.
+7. **The gates of 8.2**, on the branch.
 
 ## 11. Left to the builder
 
-- Names, comments and DEBUG lines; how `move_watches()` hands back what it moved; how the probes fold into the suite;
-  the order of the commits (the task 1 tests may land with the code they need, so that no commit of the branch is red).
-- Log levels, but for the lines of sections 3.6 and 5, which the limitations quote and their revisits read. The
-  settle's copy line comes once per folder renamed inside a folder made in the batch, so it stays one line, like the
-  walk's own.
-- If a shape of task 1 does not fail without its rule, say so and keep it as a regression shape; the rule then rests
-  on its argument in 3.2, and the main session decides whether it stays.
+- Names, comments and DEBUG lines; how `move_watches()` hands back what it moved; how `found` keeps the take count with
+  each entry; how the carried max-delay time reaches the new watch; the symlink check's form (fact C); how the probes
+  fold into the suite; the order of the commits (the task 1 tests may land with the code they need, so that no commit
+  of the branch is red).
+- Log levels, but for the lines of sections 3.6 and 5, which the limitations quote and their revisits read. Count them
+  right: a walk logs two INFO lines of its own ("Adding watch for", "Watching N sub folders"), so a folder renamed
+  inside a folder made in the batch goes from 0.55.1's one walk and two lines to two walks and four lines, with no copy
+  line (Q2 (a)).
+- If a shape of task 1 does not fail without its part, say so and keep it as a regression shape; the part then rests on
+  its argument in 3.2 to 3.4, and the main session decides whether it stays.
 
 ## 12. Calls to confirm
 
 Each ruling that was the main session's, each call this spec made on its own, and each change of behaviour against
-0.55.1:
-1. **`outgoing` as a count** (ruling 1, review finding 1). This spec adds that each move-out lets its watches go once:
-   the discard branch's unguarded pairing stores its cookie again with no `wds`, so its expiry neither lets go a second
-   time nor makes those watches `leaving` (the review's patch let go at both). Reasoned, not run.
-2. **`settle()` per probe, no retry** (ruling 2, finding 2), with the review's argument (3.4).
-3. **The discard branch's scan over `newDirWDs` and `found`** (ruling 3, finding 3, for the user's "as light and as fast
-   as possible"). This spec adds the two rules it needs (3.2): the discard pairing's moved watches go into `newDirWDs`,
-   and the settle's walk passes `newDirWDs`. Not run. Timed alone, the scan costs 0.086 s against 1.53 s for 2,000
-   renames, but grows with the square of the folders made since the last take, where 0.55.1 pays nothing. If
-   `renamesinnew` misses the base, the choice is the main session's: accept it; skip the scan when the same read holds
-   the move-in of the same cookie into a watched folder (that move-in's walk finds the watch); or the index of paths
-   of the lightness round.
-4. **`found` through the inner-mount walk** (ruling 4, finding 4). It is not in the review's saved patch.
+0.55.1. **Settled** marks those the 2026-11-09 rulings or picks decided.
+1. **`outgoing` as a count** (ruling 1). Open: this spec's release-once rule (the discard branch's unguarded pairing
+   stores its cookie again with no `wds`, so its expiry neither lets go again nor makes those watches `leaving`; the
+   review's patch let go at both). Reasoned, not run.
+2. **`settle()` per probe, no retry** (ruling 2), with the review's argument (3.4).
+3. **Ruling 3's scan over `newDirWDs` and `found`.** Settled: its cost question, by the same-read skip (Q1 (a)), with
+   `renamesinnew` at 2,000 and 20,000 as the gate; rule 3 (4a). Open: rules 1 and 2 (this spec's), and the skip's
+   fallback at the move-in (this spec's: the walk that does not meet the moved folder's watch runs the scan).
+4. **`found` through the inner-mount walk** (ruling 4). It is not in the review's saved patch.
 5. **The note's edits** (the main session's): limitation 2 cut to the measured statement; the residual races cover
-   `found`, `doubtful` and `leaving` probes alike; the mergerfs probe as fact D.
-6. **The gates:** the ancestor route's shape and probe, and `outbusy2` and `renamesinnew` with the base's numbers as
-   the bar, are the main session's; this spec adds ruling 3's two shapes, `renamesinnew` at 20,000, the fuzz at seeds
-   0 to 29,999 (v16's gate; the design pass ran 0 to 5,999) and the copy count again.
-7. **The overflow entry:** "one sentence in the existing overflow entry" read as the deferred entry rewritten in place,
-   with a new heading and kind, the window as its one sentence.
-8. **Three README lines**, one for each new limitation (section 6).
-9. **Version and base:** 0.55.3, from round22 with main merged in once 0.55.2 is there.
-10. **More INFO lines than 0.55.1:** rule 3's copy line, the settle's copy line (once per folder renamed inside a
-    folder made in the batch, among others; those copies cost no bytes) and the overflow's restart line.
-11. **New copies** (limitation 1) and **a change one version late** (limitation 2): approved by the user.
+   every kind of probe; the mergerfs probe as fact D.
+6. **The gates:** the ancestor route's shape and probe, `outbusy2` and `renamesinnew` with the base's numbers, and the
+   memory peak are the main session's. Open, this spec's: the fuzz at seeds 0 to 29,999 (the design pass ran 0 to 5,999)
+   and the copy count again; keeping the fuzz's 12 GB address-space cap inside the `--memory` cap, for its reason in 8.2
+   (the ruling said to drop it unless the spec gave one).
+7. **The overflow's window:** settled, one sentence in "A rewrite made while down that keeps size and mtime" and one
+   clause in its README line; the deferred overflow entry goes. Settled: one full comparison follows an overflow.
+8. **README lines:** this spec's: the two lines of limitations 1 and 2, and "or mv --exchange a b" in the swap line.
+9. **Version and base:** settled: 0.55.3, built on round22 now, main merged in once 0.55.2 is on main, the watcher gates
+   against 0.55.1.
+10. **More INFO lines than 0.55.1:** rule 3's copy line, the settle's copy line (fewer, by Q2 (a)), the overflow's
+    restart line, and the settle's second walk of a folder renamed inside a new folder (its two lines).
+11. **Limitations 1 and 2:** settled, "Approve as corrected (Recommended)". Open: limitation 1 keeps the found route
+    ("a rename through a folder whose events the watcher hasn't reached", from the first pick), which the corrected
+    question, as relayed to this spec, does not name again.
 12. **The watches of a folder that left are removed at the first empty queue after its move-out expires**, not at the
     expiry; a probe with a read unhandled was R5's failure.
-13. **Kept from 0.55.1 on purpose:** the first walk without `found` (the review left it out of this round);
-    `raise_queue_limit_for_removals()`; the two passes over every watch at a folder move.
-14. **An inner mount in a folder made since the last take** (section 4): proposed not an issue; 0.55.1 is the same.
+13. **Settled:** the first walk keeps no `found` (not an issue); `raise_queue_limit_for_removals()` goes. Open: the
+    settle's removal cap of half the instance's queue limit (this spec's number, 3.4); the two passes over every watch
+    at a folder move stay.
+14. **Settled:** the fact-E races are not an issue. Open: an inner mount in a folder made since the last take
+    (section 4), proposed not an issue; 0.55.1 is the same.
 15. **Tests changed for the prototype** (the design pass's call): the session restarts the watch after an overflow, as
     `watcher()` does; the session knows `exchange`; `tests/harness.py` gains `watch_map_errors()`; v16's 56-shape
-    schedule file runs on 0.55.1's walk hooks, without its two `WatchTree` asserts.
-16. **Not run on any code yet:** ruling 3 and its two rules, the release-once rule, and the 99 shapes at review 5's
-    bounds and the fuzz with the review's changes; `found` through the inner-mount walk ran only in the review's runs.
-    The real daemon ran only through the VM suite's tests that start it, on the design pass.
+    schedule file runs on 0.55.1's walk hooks, without its two `WatchTree` asserts. This spec adds the `symlink` and
+    `take` verbs and the symlink check in `watch_map_errors()`.
+16. **Settled by the rulings, with this spec's choices in them:** `doubtful` keeps the first path before and every
+    doubtful path is probed (4b), and a doubtful watch no probe finds goes to `leaving` (this spec's); a probe counts
+    only with no symlink in the path, checked only when it found its watch (4c; the check's form left to the builder);
+    a probe that could not look leaves the watch flagged (`ENOSPC` among those errors, though the kernel answers it
+    only for a folder with no watch); a found folder is copied only after a take since its note, compared with the
+    queue's own count under its lock (Q2 (a), the comparison this spec's); doubtful folders are always copied (this
+    spec's: their repair is a comparison that a size-, mtime- and tail-keeping change escapes); the max-delay clock
+    carries across a restart; a watch leaving `wdDic` leaves every set.
+17. **Answers to a builder's questions that this spec decided:** the settle's place in the read loop (3.4); new
+    `found` entries from step 5's walks wait for the next settle; ruling 3 matches a found watch by its `wdDic` path;
+    the guarded pairing's line is rule 3's, for files too; the map is checked after the shape's last batch.
+18. **Not run on any code yet:** ruling 3 with its rules and the same-read skip, the release-once rule, the spec check's
+    settle rules, and the 99 shapes at review 5's bounds and the fuzz with the review's changes; `found` through the
+    inner-mount walk ran only in the review's runs. The real daemon ran only through the VM suite's tests that start
+    it, on the design pass.
