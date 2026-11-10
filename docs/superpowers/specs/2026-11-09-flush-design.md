@@ -1,6 +1,6 @@
 # The daemon's vault syncs go through handles opened before its writes
 
-For the release after 0.55.2. Branch flush, on r0552 (0.55.2, not merged yet). The builder rebases onto 0.55.2's final commit before building; every "fails on 0.55.2" below means on that commit. The round closes the deferred entry in docs/limitations.md, "Another program's sync can take a vault disk's write error from the daemon", and builds section 4 as the user picked.
+For the release after 0.55.2. Branch flush, on main: 0.55.2 is merged and live, with main at abcf1fa. The base for the build is main; every "fails on 0.55.2" below means on main. The round closes the deferred entry in docs/limitations.md, "Another program's sync can take a vault disk's write error from the daemon", and builds section 4 as the user picked.
 
 ## The user's words
 
@@ -17,6 +17,7 @@ Their picks on this spec's two questions, 2026-11-09:
 - On the leftovers of a cut batch (section 4): "Copy again, marker goes (Recommended)". The option said: "A batch never commits past a failed sync of its own; a comparison's failed sync now fails the attempt too, then it retries. After a cut, the next attempt copies the cut batch's files again instead of reading 64 KiB of each back. Every copy a version commits is then written while its own handles were open. The cross-job markers, their locks and the restore's report to the daemon all go: less code. It closes the deferred entry and four limitations. Cost only after a cut or a write error." So the round builds option 1 (section 4, task 3), and the approved limitation "A comparison's failed sync does not fail the attempt" goes with the user's pick.
 - On a copy made where the vault refused a hard link (section 10, question 2): "Known limitation (Recommended)". The entry: what the operator sees (an older version's file can hold lost bytes with no alert, only where the vault refused a hard link and another program synced the disk at the wrong moment), why (no other copy of those bytes exists), and revisit if the vault ever shows refused hard links. The question told the user the main session had not checked whether their mergerfs pool ever refuses a hard link; no live vault is on a pool (the fact below), so the build checks nothing.
 - Then, on the same question, a second route the spec check found: "Widen the entry (Recommended)". The entry also says that an older version's file can be lost after a VAULT WRITE ERROR on that disk, on a vault that refuses hard links. The batch's own flush of the record copy fails, and the retry doesn't make the record again and replaces the tree's file. Revisit if a vault ever shows refused hard links. No new code.
+- On a roll-forward whose manifest was lost (section 10, question 3), 2026-11-09: "Copy those again too (Recommended)". A retry over a rebuilt manifest also copies the cut batch's new files again (its creates and its moves' targets), so "after a cut, its files are copied again" holds with no exception.
 
 Fact (the main session checked it): every live vault is on its own f2fs disk, none on a mergerfs pool, so a refused hard link does not arise for them.
 
@@ -101,9 +102,10 @@ Fact (the main session checked it): every live vault is on its own f2fs disk, no
   3. **`read_rows_from_tree()`'s rows with no record** (an entry gone, or now of another kind). The read-back finds nothing (a create) or no file; no file is recorded as checked from them.
   4. **`manifest.rebuild()`'s rows with no record.**
      - Without a tree (`do_backup()`: "Manifest does not describe …", and the scans), those are the latest version's committed copies, which is case 1.
-     - With `tree_path`, when a roll-forward's manifest was lost, the tree's files are read back. Among them are the cut batch's creates, written before the unit opened.
-     - Their records stand only if the roll-forward commits, and it always runs its commit flush first, through the same handle. That flush hears exactly what the comparison's sync would have heard.
-     - What neither hears is an error seen before the unit opened. 0.55.2's marker covered that when one of our syncs saw it. Section 10, question 3 asks about it.
+     - With `tree_path`, when a roll-forward's manifest was lost, the tree's files are read back. Among them are the cut batch's creates and its moves' targets, written before the unit opened.
+     - Neither the comparison's sync nor the commit flush would hear an error seen before the unit opened. 0.55.2's marker covered that when one of our syncs saw it.
+     - So the user's pick (section 10, question 3) applies: section 4, item 2 keeps those files out of the read-back and copies them again too.
+     - What the rebuild still reads back are files of earlier versions, which are case 1.
   5. **The verification after the replay** (`compare_scopes(fixes, …)`). The batch's own rows are trusted and never read back; the rest are cases 1 to 4.
   6. **`compare_scanned_folders()`** compares the latest version only. It hands a cut tree to the roll-forward (its `vaultInfo.tree is not None` return).
 - **Verdict:** no path needs the comparison's sync. `check_vault_sync()` goes, along with:
@@ -111,7 +113,7 @@ Fact (the main session checked it): every live vault is on its own f2fs disk, no
   - the marker reading inside the comparison;
   - the warning lines that came with them.
 - **What the drop saves:** one syncfs for each comparison that reads a copy back. That covers the start's full comparison, and a moved file (`A moved file is read back and syncs the vault`), whose read-back stays. Each such syncfs was an f2fs checkpoint when the disk was dirty, plus its mount table read, open, close and marker reads. A batch that placed a copy now always runs its commit flush, but its comparison no longer syncs, so no batch syncs more often than in 0.55.2.
-- **The markers and `VAULT_SYNC_LOCKS`.** They existed to carry an error that one sync saw to the syncs that would then get 0. With section 4, no committed copy and no read-back depends on another sync's report, apart from case 4 with a lost manifest. So they go.
+- **The markers and `VAULT_SYNC_LOCKS`.** They existed to carry an error that one sync saw to the syncs that would then get 0. With section 4, no committed copy and no read-back depends on another sync's report, a lost manifest's included. So they go.
 
 ## 4. The rest of the build (the user's pick, "Copy again, marker goes")
 
@@ -124,11 +126,17 @@ Fact (the main session checked it): every live vault is on its own f2fs disk, no
    - `prepare_roll_forward()` returns its recorded files: `give_back_folder_times()`'s list, with folders and links left out. `VaultInfo` carries them from the scan to the roll-forward.
    - `roll_forward_entries()` passes them to `compare_scopes()` as trusted. They are then compared for presence and kind only, never read back.
    - Each one whose monitored path is a regular file now is replayed as a modify, the way `roll_forward_entries()` already turns a stop's saved entries into modifies.
-   - What the cut batch created has no row, so it is already copied again.
+   - What the cut batch created has no row while the manifest stands, so it is already copied again.
    - **Why this list is complete.** Design R records every entry of the tree before changing it: `TreeWriter.copy()` calls `record(rel, True)` first, and `replay_ops()` records a file's attribute change as an entry when Only Sync Attributes is off. So the list holds every file the cut batch wrote over, including a copy made for an attribute change.
    - The 64 KiB read-back of each of those files goes.
+   - **Over a rebuilt manifest** (the user's pick, section 10, question 3). When `roll_forward_entries()` finds that the manifest does not describe the previous version and rebuilds it from the tree, it also finds the cut batch's new files and treats them as it treats the recorded files: passed as trusted, and replayed as a modify.
+     - **How it finds them.** After `manifest.rebuild(previous, tree_path=tree)`, it lists each real folder of the previous version (the recorded folders) beside its twin in the tree. Every tree entry that folder does not list is new, and so is everything under a folder among them.
+     - **Which files those are:** the cut batch's creates and its moves' targets. A new entry in the tree always has a real parent in the previous version, because `TreeWriter.make_folders()` calls `ensure_real()` first.
+     - **What stays as it was.** The rebuild still reads back the tree's other files, which earlier versions committed (section 3, case 1).
+     - **Code:** about 20–30 lines in the rebuild branch, which only a lost manifest takes.
+     - **Cost per rebuild:** one listing of each folder the cut batch touched and its twin, and a full copy of each new file, where today 64 KiB of each is read back. Nothing on any other path.
 3. **The commit flush runs whenever the batch placed a copy** (`copies_unsynced`, set by `finish_copies()` and `TreeWriter.keep_entry()`), or the batch is a roll-forward, or on two renames, as today minus the comparison's half.
-4. **Parts that go,** as of 0.55.2's final commit:
+4. **Parts that go,** as of main:
    - the markers: `mark_failed_sync()` (with its `restore=`), `failed_sync_markers()`, `failed_sync_disks()`, `read_vault_sync_marker()`, `vault_sync_marker_path()`, `VAULT_SYNC_MARKER_PREFIX`, `current_boot_id()` and `BOOT_ID_PATH` (only the markers use the boot id);
    - `VAULT_SYNC_LOCKS`, `VAULT_SYNC_MARKERS_LOCK` and `UNRECORDED_FAILED_DISKS`;
    - `check_vault_sync()`, `compare_scopes()`'s sync and `sync_failed` branch, and `record_failed_sync()`'s marker part (the alert stays);
@@ -159,7 +167,7 @@ Fact (the main session checked it): every live vault is on its own f2fs disk, no
 | **Batch that placed a copy** (the commit flush) | 1 mount table read, open, syncfs, close | open, fstat, lstat, syncfs, close: one mount table read fewer, two syscalls more |
 | **Batch with no copy** (a delete, a rename, an attribute change under Only Sync Attributes) | none | open and close |
 | **A comparison that reads a copy back** (the start's full comparison, a moved file) | 1 syncfs, which is an f2fs checkpoint on a dirty disk, plus a mount table read, open, close, the boot id (open, read, close) and the state folder (open, getdents, close) | none |
-| **After a cut** | 64 KiB read back of each file the cut batch changed | each of those files copied again |
+| **After a cut** | 64 KiB read back of each file the cut batch changed (over a rebuilt manifest, of each of its new files too) | each of those files copied again |
 | **After a write error** | the attempt goes on past a comparison's failed sync | the attempt fails and retries after 60 s |
 | **fds held** | 1, during each sync | 1 per filesystem, for the unit |
 | **f2fs checkpoints** | one per syncfs of a dirty disk | the commit flushes as before; each comparison's syncfs is gone |
@@ -185,7 +193,7 @@ Tests run in Docker as uid 65534, with the code read-only, as 0.55.2's spec sect
 - **`LIBC_SYNCFS(fd)`:** when the fd's filesystem's counter differs from its cursor, it returns EIO, marks the error seen and moves the cursor to the counter. Otherwise it returns 0. An fd the wrapper never saw opened samples at its first sync.
 - **One model per superblock,** so a pool test with branches on several filesystems gets one model each.
 
-**The tests.** Task 1 writes them for the final behaviour, so none is rewritten later. Each fails on 0.55.2's final commit.
+**The tests.** Task 1 writes them for the final behaviour, so none is rewritten later. Each fails on main.
 1. **Commit flush.** Between a batch's copies and its commit flush, `fail()` and then `seen_elsewhere()`. Expect:
    - the flush raises;
    - VAULT WRITE ERROR names the disk;
@@ -228,6 +236,14 @@ Tests run in Docker as uid 65534, with the code read-only, as 0.55.2's spec sect
    - Neither the daemon nor a restore writes a `vault-sync-failed-*` file.
    - A restore whose sync fails warns nothing about the daemon.
    - The alert is one line.
+10. **Copy again over a rebuilt manifest** (section 4, item 2; the user's pick on section 10, question 3).
+    - **Setup.** A batch creates a file and moves another, and is killed after the create's copy is placed and the move is replayed. The create's leftover has its middle overwritten, keeping its size, mtime and last 64 KiB. The manifest file is removed before the retry.
+    - **Expect:**
+      - the roll-forward rebuilds the manifest from the tree;
+      - it reads back neither the create nor the move's target (a recorder on `read_vault_record()` for those rels);
+      - it copies each again;
+      - the newest version holds the right bytes.
+    - **On main:** the rebuild reads both back and commits the overwritten create.
 
 **Stand-ins that must move** to the binding, or the gates never run through the handles. This is lesson 2026-11-06: a stand-in goes as low in the stack as it can.
 - test_crash_power_loss.py's `flushing_for_real`;
@@ -257,7 +273,7 @@ A stand-in that flushes a scratch image by path finds the path from the fd (/pro
     - an fsync of the file through a new fd returns EIO, which checks section 1's per-file fsyncs.
   - **The batch.** Put a job's vault there. A hook before the commit flush finds the placed copy's extent by FIEMAP, loads the error table, runs `sync -f` and loads the plain table back. Then the commit flush raises: VAULT WRITE ERROR, and nothing commits.
   - **Why ext4 and not f2fs.** f2fs writes out of place, so no fixed range is a file's next write. The rule belongs to the VFS, and f2fs records data write errors the same way (`f2fs_write_end_io()` calls `mapping_set_error()`; read, not run). ext4's default `data_err=ignore` keeps a data write error from aborting its journal.
-- **Docker:** in the same container, nothing fails that does not also fail on 0.55.2's final commit.
+- **Docker:** in the same container, nothing fails that does not also fail on main.
 
 ## 7. Docs and version
 
@@ -282,21 +298,21 @@ A stand-in that flushes a scratch image by path finds the path from the fd (/pro
     - **Revisit when:** a vault ever shows refused hard links.
     - **Approved:** 2026-11-09, "Known limitation (Recommended)"; then "Widen the entry (Recommended)".
     - No new code.
-  - writes section 10, question 3's entry once the user decides it.
 - **Version:** the main session sets `__version__` at merge, to the next free version. That is 0.55.3 if this ships before the watcher round, which also claims 0.55.3. The builder leaves "0.55.2".
 
 ## 8. Build tasks, in order
 
-The builder first rebases onto 0.55.2's final commit.
-1. **Write the stand-in and tests 1 to 9.**
-   - Prove: on a worktree of 0.55.2's final commit with the test files copied in, `pytest -n auto <the new files>` fails every test. List them in the handback.
+The base is main (0.55.2).
+1. **Write the stand-in and tests 1 to 10.**
+   - Prove: on a worktree of main with the test files copied in, `pytest -n auto <the new files>` fails every test. List them in the handback.
 2. **Build the units and handles (section 2).** `syncfs_folder()` goes, and the stand-ins move.
    - Prove: tests 5 and 6 pass.
    - Prove: `git grep -n syncfs_folder` finds nothing.
-3. **Build section 4 and section 3's drop of the comparison's sync.**
-   - Prove: tests 1 to 9 pass.
+3. **Build section 4 and section 3's drop of the comparison's sync.** This task owns `roll_forward_entries()`: its recorded files, and its rebuild case.
+   - Prove: tests 1 to 10 pass.
+   - Prove, for the rebuild case alone: `pytest -n auto <test 10's file> -k rebuilt` fails on a worktree of main with the file copied in, where the rebuild reads the cut batch's creates back. It passes on the branch, where they are trusted and copied again.
    - Prove: `git grep -n -E 'check_vault_sync|mark_failed_sync|failed_sync_markers|VAULT_SYNC_LOCKS|UNRECORDED_FAILED_DISKS|record_restore_write_error|vault-sync-failed'` finds nothing outside docs/lessons*.
-   - Prove: the whole suite in Docker fails nothing that does not also fail on 0.55.2's final commit in the same container.
+   - Prove: the whole suite in Docker fails nothing that does not also fail on main in the same container.
 4. **Write the VM tests:** the real-error test, the power-loss shape of section 6, and test 5's swap cases.
    - Prove: in Docker each skips, printing its reason.
 5. **Write the docs of section 7.**
@@ -313,7 +329,7 @@ The reviews and the VM gates are the main session's.
 - Whether `prepare_roll_forward()` still marks the recorded files unchecked. Once they are trusted, nothing reads the mark.
 - The alert line's words, within section 4, item 5.
 
-## 10. Questions for the user (1 and 2 answered 2026-11-09, see The user's words; 3 open)
+## 10. Questions for the user (all answered 2026-11-09; see The user's words)
 
 1. **The leftovers of a cut batch** (section 4). The options, recommended first:
    1. "Copy again, and the marker goes (Recommended)"
@@ -330,7 +346,10 @@ The reviews and the VM gates are the main session's.
    - **Decided (the user, 2026-11-09):** "Known limitation (Recommended)", then "Widen the entry (Recommended)".
      - The spec check found a second route. On a vault that refuses hard links, the batch's own flush of the record copy fails (VAULT WRITE ERROR names only the disk). The retry does not make the record again, and it replaces the tree's file. So that older version's file is lost.
      - The entry names both routes; section 7 has its text. No new code.
-3. **New, open: known limitation? A roll-forward whose manifest was lost** (section 3, case 4).
+3. **Known limitation? A roll-forward whose manifest was lost** (section 3, case 4).
+   - **Decided (the user, 2026-11-09):** "Copy those again too (Recommended)". A retry over a rebuilt manifest also copies the cut batch's new files again (its creates and its moves' targets), so "after a cut, its files are copied again" holds with no exception.
+   - The design is in section 4, item 2. Test 10 pins it, and task 3 builds it. No known limitation is written.
+   - The question as asked:
    - **What happens.** A batch is cut: a stop, a kill or a failed attempt after its hand-over. Before the retry, its manifest is lost. The roll-forward then rebuilds the rows from the tree (`manifest.rebuild(previous, tree_path=tree)`). The cut batch's creates get rows there, so they are read back and committed, not copied again as they are when the manifest stands.
    - **How the manifest gets lost without a reboot.** Nothing in the daemon loses it; something outside must remove or damage the sqlite file:
      - an operator removing it (the daemon's own line for a manifest that cannot be opened says to remove the file if the error stays, "unless a backup was cut off, whose folder times it holds");
@@ -350,9 +369,9 @@ The reviews and the VM gates are the main session's.
      - There is no alert only when another program's sync saw the error. A restore's sync reports it to its own run.
    - **What 0.55.2 did.** When one of our syncs saw the error, its marker kept those copies unchecked until a reboot, and the restart then read them from the disk. So option 1 regresses the alerted case without a reboot.
    - **How likely.** It needs three faults at once: a cut, a manifest removed or damaged from outside before the retry, and a write error (or, after a power cut, a file ending in zeros). The approved "A manifest lost in the same cut as a split on a pool" needs two.
-   - Options:
-     1. **"Known limitation (Recommended)":** revisit if a manifest is ever lost on a live vault.
-     2. **"Copy those again too":** a roll-forward over a rebuilt manifest treats the cut batch's creates as it treats its recorded files.
+   - Options (the spec first recommended option 1; the user picked option 2):
+     1. **"Known limitation":** revisit if a manifest is ever lost on a live vault.
+     2. **"Copy those again too" (picked):** a roll-forward over a rebuilt manifest treats the cut batch's creates as it treats its recorded files.
         - **Code:** one branch in `roll_forward_entries()`'s rebuild case, about 20–30 lines, and one test. After the rebuild, it lists each real folder of the previous version beside its twin in the tree. Every tree entry that folder does not list, with everything under a folder among them, is passed as trusted and replayed as a modify, like the recorded files. Those entries are the cut batch's creates and its moves' targets: a create in the tree always has a real parent in the previous version, as `make_folders()` makes it real first.
         - **Cost per rebuild:** one listing of each folder the cut batch touched and its twin, and a full copy of each of its creates and moves' targets, where today 64 KiB of each is read back.
         - **Cost elsewhere:** nothing on any other path.
@@ -370,6 +389,8 @@ The reviews and the VM gates are the main session's.
 - **`remove_stale_change_lists()`'s failed flush now fails the attempt.**
 - **Alerts.** VAULT WRITE ERROR is logged once per unit that hears the error. A failing disk alerts at every retry of every job on it (60 s, doubling up to 1 h), where 0.55.2 alerted once per disk per boot.
 - **Five limitations close** (section 4, item 6), one more than the user's option named: "A copy whose start was lost after a power loss" closes through the same recopy.
+- **Over a rebuilt manifest, the cut batch's new files are found by listing the previous version's real folders beside their twins in the tree** (section 4, item 2). The rule rests on `make_folders()` making a new entry's parent real first, a reading of the code that test 10 checks.
+  - Moves' targets are copied again too, though their bytes came from an earlier version.
 - **API changes, with a lessons entry:**
   - the state folder's `vault-sync-failed-*` files go;
   - the alert line changes;
