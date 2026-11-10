@@ -256,8 +256,9 @@ def test_interrupted_restore_picks_up(job, tmp_path, capsys, monkeypatch):
 	# marked as this restore's own, written whole and private, and the output kept private; stopped before its sync, it
 	# synced its copies on its way out, so the marker no longer says they are not known to be on disk
 	with open(marker, encoding='utf-8') as f:
-		assert json.load(f) == {'job': job.job_name, 'path': 'proj', 'version': versions(job)[0].name}
-	assert rv.read_restore_marker(target) == {'job': job.job_name, 'path': 'proj', 'version': versions(job)[0].name}
+		# the restore made the target: its marker says so, for the way out of a recopy that keeps failing
+		assert json.load(f) == {'job': job.job_name, 'path': 'proj', 'version': versions(job)[0].name, 'made': True}
+	assert rv.read_restore_marker(target) == {'job': job.job_name, 'path': 'proj', 'version': versions(job)[0].name, 'made': True}
 	assert stat.S_IMODE(os.lstat(marker).st_mode) == 0o600
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o700
 	before = inodes(target)

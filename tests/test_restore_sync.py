@@ -12,6 +12,7 @@ import errno
 import json
 import os
 import re
+import shutil
 import stat
 import pytest
 import reverberator as rv
@@ -547,6 +548,31 @@ def test_a_stop_on_a_pool_syncs_through_the_handles_opened_at_the_claim(job, tmp
 	assert 'unsynced' not in marker_of(target) and 'recopy' not in marker_of(target)
 
 
+def test_a_failed_second_listing_of_the_pool_says_the_look_for_a_joined_disk_failed(job, tmp_path, capsys, monkeypatch, fake_pool):
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
+	target = os.path.join(out, 'proj')
+	error = OSError(errno.EIO, os.strerror(errno.EIO), 'the branch list')
+	synced, armed = [], []
+	# the pool is listed again right after the handles were synced
+	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(os.fstat(fd).st_ino) or armed.append(True))
+	vault_disks = rv.vault_disks
+
+	def listing(path, roots=False):
+		if armed and not roots:
+			armed.clear()
+			raise error
+		return vault_disks(path, roots)
+	monkeypatch.setattr(rv, 'vault_disks', listing)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
+	# the handles were synced: it is not said that the disks could not be listed to write the restore out to them
+	assert failed == [f'FAILED proj: the disks holding {target} could not be listed again to check for a disk that joined the pool while the restore ran: {error}']
+	assert synced == [os.lstat(branches['one']).st_ino]
+	assert marker_of(target).get('recopy') == 'sync failed'
+
+
 def deny(monkeypatch, paths):
 	'''An open of a folder of paths (a callable, or a set) as a folder fails with EACCES, as for a user its mode shuts out.'''
 	real_open = os.open
@@ -609,16 +635,18 @@ def test_disks_that_cannot_be_listed_are_not_called_a_write_error(job, tmp_path,
 	target = os.path.join(out, 'proj')
 	vault_disks = rv.vault_disks
 
+	error = OSError(errno.EIO, os.strerror(errno.EIO), 'the branch list')
+
 	def listing(path, roots=False):
 		# for the handles the syncs go through, opened at the claim; the marker's fsync lists them too, and can
 		if roots:
-			raise OSError(errno.EIO, os.strerror(errno.EIO), 'the branch list')
+			raise error
 		return vault_disks(path)
 	monkeypatch.setattr(rv, 'vault_disks', listing)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
 	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
-	assert len(failed) == 1 and 'could not be listed' in failed[0]
+	assert failed == [f'FAILED proj: the disks holding {target} could not be listed to write the restore out to them: {error}']
 	assert 'write error' not in stdout
 	assert f'What {target} holds is not known to be on disk: run the same restore again, which copies everything again' in stdout
 
@@ -911,8 +939,8 @@ def killed_at_its_sync(job, tmp_path, capsys, monkeypatch):
 		killing.setattr(rv, 'sync_restore', lambda *args: (_ for _ in ()).throw(Killed()))
 		with pytest.raises(Killed):
 			restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
-	# one value, whatever the boot and the mounts
-	assert marker_of(target) == {'job': job.job_name, 'path': 'proj', 'version': rv.list_versions(job.job_vault)[0].name, 'unsynced': True}
+	# one value, whatever the boot and the mounts; and that this restore made the target
+	assert marker_of(target) == {'job': job.job_name, 'path': 'proj', 'version': rv.list_versions(job.job_vault)[0].name, 'unsynced': True, 'made': True}
 	return target
 
 
@@ -1114,3 +1142,109 @@ def test_a_run_again_after_a_kill_over_such_a_failure_that_stops_in_its_hand_ove
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
 	assert (code, err) == (0, ''), stdout
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and whole(target)
+
+
+def test_a_recopy_of_a_vault_missing_a_disk_keeps_its_recopy_and_the_target_private(job, tmp_path, capsys, monkeypatch):
+	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
+	# a leftover of the killed run, whose bytes were lost
+	nul_out(os.path.join(target, 'a.txt'))
+	iter_version_entries = rv.iter_version_entries
+
+	def without_a_txt(*args, **kwargs):
+		# a disk of the vault's pool is missing: its entries are not in the walk
+		for entry_rel, walked in iter_version_entries(*args, **kwargs):
+			if entry_rel != 'proj/a.txt':
+				yield entry_rel, walked
+	handed = []
+	hand_over_folders = rv.hand_over_folders
+	with monkeypatch.context() as incomplete:
+		incomplete.setattr(rv, 'vault_pool_warning', lambda job_vault: True)
+		incomplete.setattr(rv, 'iter_version_entries', without_a_txt)
+		incomplete.setattr(rv, 'hand_over_folders', lambda *args, **kwargs: handed.append(args) or hand_over_folders(*args, **kwargs))
+		code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0')
+	# not everything was copied again: the recopy stays, nothing is handed over, and the NUL file is not taken as done
+	assert code == rv.EXIT_COMMAND_FAILED and handed == []
+	assert marker_of(target).get('recopy') == 'cut' and stat.S_IMODE(os.lstat(target).st_mode) == 0o700
+	assert not whole(target)
+	assert stdout.splitlines()[-1] == f"What {target} holds is not known to be on disk, and a disk of the vault's pool is missing, so not everything of it was copied again: run the same restore again once all the vault's disks are there, which copies everything again. {rv.unfinished_note(target)}"
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
+	assert code == rv.EXIT_USAGE and 'no sync of what it holds is known to have succeeded' in err
+	# once the vault's disks are all there, the run again copies everything again and finishes
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0')
+	assert (code, err) == (0, ''), stdout
+	assert whole(target) and not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
+
+
+def test_a_first_restore_of_a_vault_missing_a_disk_is_not_held_for_it(job, tmp_path, capsys, monkeypatch):
+	# nothing was left by an earlier run: what the walk does not meet is not there, and the exit code says why
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	monkeypatch.setattr(rv, 'vault_pool_warning', lambda job_vault: True)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED and 'FAILED' not in stdout
+	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and whole(target)
+
+
+def way_out(target, made):
+	fresh = f'remove {target} and restore it fresh' if made else 'restore into a new folder instead'
+	return f'If that keeps failing, fix the cause and run it again, or {fresh}.'
+
+
+@pytest.mark.parametrize('reason', ['cut', 'sync failed'])
+def test_a_recopy_that_keeps_failing_names_the_way_out_for_a_target_a_restore_made(job, tmp_path, capsys, monkeypatch, reason):
+	if reason == 'cut':
+		target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
+	else:
+		target = a_failed_sync_then_a_nul_file(job, tmp_path, capsys, monkeypatch)
+	assert marker_of(target)['made'] is True
+	# --accept is refused, and says what to do about a run again that cannot finish
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
+	assert (code, stdout) == (rv.EXIT_USAGE, '')
+	assert err.endswith(f'run the same restore again without --accept, which copies everything again. {way_out(target, True)}\n')
+	# the run again fails a copy, and its summary says so too; the marker still says the restore made the target
+	copy_command = rv.copy_command
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['false'] if source.endswith('b.txt') else copy_command(source, dest))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert stdout.splitlines()[-1] == f'What {target} holds is not known to be on disk: run the same restore again, which copies everything again. {way_out(target, True)} {rv.unfinished_note(target)}'
+	assert marker_of(target)['made'] is True and marker_of(target).get('recopy') == reason
+
+
+def a_whole_job_root_killed_at_its_sync(job, tmp_path, capsys, monkeypatch):
+	'''A restore in place of the whole job into its empty monitored path, which no restore made, killed before its sync: the root.'''
+	backed_up(job)
+	# a replaced disk: its root empty
+	shutil.rmtree(job.monitor)
+	os.mkdir(job.monitor, 0o755)
+	with monkeypatch.context() as killing:
+		killing.setattr(rv, 'sync_restore', lambda *args, **kwargs: (_ for _ in ()).throw(Killed()))
+		with pytest.raises(Killed):
+			restore(tmp_path, capsys, job.monitor, '--in-place', '--version', '0', '--yes')
+	assert 'made' not in marker_of(job.monitor)
+	return job.monitor
+
+
+def test_a_recopy_that_keeps_failing_never_says_to_remove_a_target_no_restore_made(job, tmp_path, capsys, monkeypatch):
+	root = a_whole_job_root_killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
+	code, stdout, err = restore(tmp_path, capsys, root, '--in-place', '--version', '0', '--accept')
+	assert (code, stdout) == (rv.EXIT_USAGE, '')
+	assert err.endswith(f'run the same restore again without --accept, which copies everything again. {way_out(root, False)}\n') and 'remove' not in err
+	copy_command = rv.copy_command
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: ['false'] if source.endswith('b.txt') else copy_command(source, dest))
+	code, stdout, err = restore(tmp_path, capsys, root, '--in-place', '--version', '0', '--yes')
+	assert code == rv.EXIT_COMMAND_FAILED
+	assert stdout.splitlines()[-1] == f'What {root} holds is not known to be on disk: run the same restore again, which copies everything again. {way_out(root, False)} {rv.unfinished_note(root)}'
+	assert 'remove' not in stdout and 'made' not in marker_of(root)
+
+
+def test_a_marker_without_made_never_says_to_remove_the_target(job, tmp_path, capsys, monkeypatch):
+	# a marker of 0.55.1 (or one made by hand) says nothing of who made the target
+	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
+	marker = os.path.join(target, rv.RESTORE_MARKER_NAME)
+	written = {key: value for key, value in marker_of(target).items() if key != 'made'}
+	with open(marker, 'w', encoding='utf-8') as f:
+		json.dump(written, f)
+	assert 'made' not in rv.read_restore_marker(target)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
+	assert code == rv.EXIT_USAGE and err.endswith(f'{way_out(target, False)}\n')

@@ -665,13 +665,17 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   everything again when it is run again, rather than keeping what it had copied, and `--accept` is refused (exit 2) until
   that run has finished and synced. A stopped one (Ctrl-C, SIGTERM, SIGHUP) first writes what it restored out to disk,
   saying so, and waits for the disk, which nothing cuts short; the same restore run again keeps that, unless it was itself
-  copying everything again, or its write-out failed. The README's restore paragraph says so.
+  copying everything again, or its write-out failed. A run again that keeps failing for a cause it may fix can never
+  finish while the cause stays: the summary and `--accept`'s refusal say to fix the cause and run again, or to remove the
+  target and restore it fresh (only for a target a restore made; otherwise to restore into a new folder instead). The
+  README's restore paragraph says so.
 - **Why:** no run can tell afterwards whether the copies reached the disk. A writeback error is reported to a sync through
   a newly opened handle only if no other sync of that disk met it first, and the daemon's own vault flush is one. Keeping
   the copies could end in a restore that says it is done over files that lost their bytes. The cost is time, never wrong
   data.
 - **Revisit when:** big restores get killed often.
-- **Approved:** 2026-11-09, "Recopy after a kill (Recommended)", with the Ctrl-C wait "Wait for the disk (Recommended)".
+- **Approved:** 2026-11-09, "Recopy after a kill (Recommended)", with the Ctrl-C wait "Wait for the disk (Recommended)";
+  2026-11-09, "Say the way out (Recommended)" for a rerun that keeps failing.
 
 ### mergerfs answers EBADF to a lstat during an rm
 
