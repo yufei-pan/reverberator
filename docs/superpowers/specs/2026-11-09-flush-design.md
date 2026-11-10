@@ -15,7 +15,8 @@ Still standing, for 0.55.2's restore: "Recopy after a kill (Recommended)": "… 
 
 Their picks on this spec's two questions, 2026-11-09:
 - On the leftovers of a cut batch (section 4): "Copy again, marker goes (Recommended)". The option said: "A batch never commits past a failed sync of its own; a comparison's failed sync now fails the attempt too, then it retries. After a cut, the next attempt copies the cut batch's files again instead of reading 64 KiB of each back. Every copy a version commits is then written while its own handles were open. The cross-job markers, their locks and the restore's report to the daemon all go: less code. It closes the deferred entry and four limitations. Cost only after a cut or a write error." So the round builds option 1 (section 4, task 3), and the approved limitation "A comparison's failed sync does not fail the attempt" goes with the user's pick.
-- On a copy made where the vault refused a hard link (section 10, question 2): "Known limitation (Recommended)". The entry: what the operator sees (an older version's file can hold lost bytes with no alert, only where the vault refused a hard link and another program synced the disk at the wrong moment), why (no other copy of those bytes exists), and revisit if the vault ever shows refused hard links. The question told the user the main session had not checked whether their mergerfs pool ever refuses a hard link; the build checks it (section 9).
+- On a copy made where the vault refused a hard link (section 10, question 2): "Known limitation (Recommended)". The entry: what the operator sees (an older version's file can hold lost bytes with no alert, only where the vault refused a hard link and another program synced the disk at the wrong moment), why (no other copy of those bytes exists), and revisit if the vault ever shows refused hard links. The question told the user the main session had not checked whether their mergerfs pool ever refuses a hard link; no live vault is on a pool (the fact below), so the build checks nothing.
+- Then, on the same question, a second route the spec check found: "Widen the entry (Recommended)". The entry also says that an older version's file can be lost after a VAULT WRITE ERROR on that disk, on a vault that refuses hard links. The batch's own flush of the record copy fails, and the retry doesn't make the record again and replaces the tree's file. Revisit if a vault ever shows refused hard links. No new code.
 
 Fact (the main session checked it): every live vault is on its own f2fs disk, none on a mergerfs pool, so a refused hard link does not arise for them.
 
@@ -272,7 +273,16 @@ A stand-in that flushes a scratch image by path finds the path from the fd (/pro
   - removes the deferred entry and the five entries in section 4, item 6;
   - narrows "A moved file is read back and syncs the vault";
   - takes one read off "Eight mount table reads";
-  - writes the known limitations once they are approved (section 10).
+  - writes the known limitation the user approved for section 10, question 2, "A copy made where the vault refused a hard link":
+    - **Kind:** known limitation.
+    - **What the operator sees:** on a vault whose filesystem refuses a hard link, a record is a copy, and that copy holds the only copy of an older version's file (a cut batch's record, or a 0.54 conversion's tree). That file can then read wrong in two ways:
+      - it can hold lost bytes with no alert, when another program's sync of the disk saw the copy's write error before the next attempt opened its handles;
+      - it can be lost after a VAULT WRITE ERROR on that disk: the batch's own flush of the record copy fails, and the retry doesn't make the record again and replaces the tree's file.
+    - **Why:** no other copy of those bytes exists.
+    - **Revisit when:** a vault ever shows refused hard links.
+    - **Approved:** 2026-11-09, "Known limitation (Recommended)"; then "Widen the entry (Recommended)".
+    - No new code.
+  - writes section 10, question 3's entry once the user decides it.
 - **Version:** the main session sets `__version__` at merge, to the next free version. That is 0.55.3 if this ships before the watcher round, which also claims 0.55.3. The builder leaves "0.55.2".
 
 ## 8. Build tasks, in order
@@ -296,8 +306,6 @@ The reviews and the VM gates are the main session's.
 
 ## 9. Left to the builder
 
-- Check whether a hard link on a mergerfs pool vault can be refused (EXDEV across branches under the pool's link and create policies, as the live pool sets them), and say what the record does then; the known limitation's text names the case.
-
 - Names, and the unit's form: a context manager, a registry, or both.
 - Whether to share `open_restore_disks()`'s core.
 - The exact point of each open, before its function's first write.
@@ -305,7 +313,7 @@ The reviews and the VM gates are the main session's.
 - Whether `prepare_roll_forward()` still marks the recorded files unchecked. Once they are trusted, nothing reads the mark.
 - The alert line's words, within section 4, item 5.
 
-## 10. Questions for the user (answered 2026-11-09: option 1, and a known limitation; see The user's words)
+## 10. Questions for the user (1 and 2 answered 2026-11-09, see The user's words; 3 open)
 
 1. **The leftovers of a cut batch** (section 4). The options, recommended first:
    1. "Copy again, and the marker goes (Recommended)"
@@ -319,14 +327,36 @@ The reviews and the VM gates are the main session's.
    - Options:
      1. "Known limitation (Recommended)": revisit when such a vault is used.
      2. "Find a fix first": no design is known. Hearing it would mean keeping a handle across a cut, and nothing survives a kill.
+   - **Decided (the user, 2026-11-09):** "Known limitation (Recommended)", then "Widen the entry (Recommended)".
+     - The spec check found a second route. On a vault that refuses hard links, the batch's own flush of the record copy fails (VAULT WRITE ERROR names only the disk). The retry does not make the record again, and it replaces the tree's file. So that older version's file is lost.
+     - The entry names both routes; section 7 has its text. No new code.
 3. **New, open: known limitation? A roll-forward whose manifest was lost** (section 3, case 4).
-   - **What happens.** A batch is cut, and its manifest is lost too (the sqlite file deleted or corrupt). Its creates then get rows from the rebuild of the tree, are read back, and are committed.
-   - **Where it goes wrong.** If a write error on one of them was seen before the retry's handles opened, nothing hears it, and the newest version holds that file wrong, with no alert, until the file changes. The error may have been seen by the cut batch's own failed flush, or by another program.
-   - **What 0.55.2 did.** Its marker kept those copies unchecked when one of our syncs had seen the error.
-   - **How likely.** It needs three faults at once: a cut, a lost manifest and a write error. The approved "A manifest lost in the same cut as a split on a pool" needs two.
+   - **What happens.** A batch is cut: a stop, a kill or a failed attempt after its hand-over. Before the retry, its manifest is lost. The roll-forward then rebuilds the rows from the tree (`manifest.rebuild(previous, tree_path=tree)`). The cut batch's creates get rows there, so they are read back and committed, not copied again as they are when the manifest stands.
+   - **How the manifest gets lost without a reboot.** Nothing in the daemon loses it; something outside must remove or damage the sqlite file:
+     - an operator removing it (the daemon's own line for a manifest that cannot be opened says to remove the file if the error stays, "unless a backup was cut off, whose folder times it holds");
+     - another program;
+     - a disk fault that leaves it unreadable.
+   - **The code that then rebuilds.**
+     - `VaultManifest()` discards a file that is not a database ("Discarding unreadable manifest"). `_open()` drops the tables of an unknown schema. A missing file opens empty.
+     - `roll_forward_entries()` then finds that the manifest no longer describes the previous version, and lists the tree.
+     - A write error does not do it on its own: without a reboot, sqlite reads its pages back from the page cache as written.
+   - **Without a reboot between the cut and the retry,** the read-back comes from the page cache, which shows each page as written, so any failed write passes. A write error on one of the creates, seen before the retry's handles opened, is heard by no one. The newest version then holds that file wrong until it changes.
+   - **After a reboot** (or a power cut), the read-back reads the disk. A loss in the file's last 64 KiB differs, and the file is copied again. Still passing:
+     - a loss before the last 64 KiB;
+     - a file ending in 64 KiB of zeros whose data was lost (after a power cut this needs no write error at all).
+     These are the shapes of "A write error in the middle of a copy after the reboot" and "A copy whose start was lost after a power loss", left for those files only.
+   - **Alerts.**
+     - When the cut batch's own failed flush heard the error (the error that cut it), VAULT WRITE ERROR and FAILED fired. The operator was alerted, but the newest version still holds the wrong file.
+     - There is no alert only when another program's sync saw the error. A restore's sync reports it to its own run.
+   - **What 0.55.2 did.** When one of our syncs saw the error, its marker kept those copies unchecked until a reboot, and the restart then read them from the disk. So option 1 regresses the alerted case without a reboot.
+   - **How likely.** It needs three faults at once: a cut, a manifest removed or damaged from outside before the retry, and a write error (or, after a power cut, a file ending in zeros). The approved "A manifest lost in the same cut as a split on a pool" needs two.
    - Options:
      1. **"Known limitation (Recommended)":** revisit if a manifest is ever lost on a live vault.
-     2. **"Copy those again too":** a roll-forward over a rebuilt manifest also copies again each tree file under a real folder of the previous version that the folder does not list (the cut batch's creates, and its moves' targets). It is a walk of the cut batch's real folders, on a path only a lost manifest takes.
+     2. **"Copy those again too":** a roll-forward over a rebuilt manifest treats the cut batch's creates as it treats its recorded files.
+        - **Code:** one branch in `roll_forward_entries()`'s rebuild case, about 20–30 lines, and one test. After the rebuild, it lists each real folder of the previous version beside its twin in the tree. Every tree entry that folder does not list, with everything under a folder among them, is passed as trusted and replayed as a modify, like the recorded files. Those entries are the cut batch's creates and its moves' targets: a create in the tree always has a real parent in the previous version, as `make_folders()` makes it real first.
+        - **Cost per rebuild:** one listing of each folder the cut batch touched and its twin, and a full copy of each of its creates and moves' targets, where today 64 KiB of each is read back.
+        - **Cost elsewhere:** nothing on any other path.
+        - It also closes the zeros and mid-file shapes for those files after a power cut.
 
 ## 11. Calls to confirm (the spec's own calls)
 
