@@ -2,14 +2,16 @@
 0.55.2: a restore's sync against a real power loss, behind REVERB_SCRATCH: the restore writes onto a fresh f2fs loop image with
 the live disks' features and mount options, the filesystem stops with no checkpoint (f2fs_io shutdown 2), and is mounted again.
 A restore that returned holds every file whole and no marker; one cut after its copies and before its sync leaves its marker,
-whose copies are of a mount that is gone (the image is mounted again in the same boot), and the same restore run again copies
-everything again and finishes it. The control shows the cut loses what no sync wrote out.
+which says its copies are not known to be on disk, and the same restore run again copies everything again and finishes it. One
+stopped by a signal after its copies writes them out on its way out: the cut after loses none of them, and the same restore run
+again keeps them. The control shows the cut loses what no sync wrote out.
 
 The real syncfs(2) binding runs here only around the restore, whose syncs reach the loop image alone (its target is on it). The
 shutdown and the flush go through tests/scratch_images.py, which refuses anything but a loop image this process attached under
 REVERB_SCRATCH.
 '''
 import os
+import signal
 
 import pytest
 
@@ -103,27 +105,62 @@ def test_a_cut_before_the_first_sync_leaves_the_marker_and_a_run_again_finishes(
 	sync_restore = rv.sync_restore
 	cut = []
 
-	def cutting(fd, folder, report, rel):
+	def cutting(disks, folder, report, rel):
 		# the power goes after the copies, before their sync
 		if not cut:
 			cut.append(folder)
 			shut_down_scratch(image.mount_point)
-		return sync_restore(fd, folder, report, rel)
+		return sync_restore(disks, folder, report, rel)
 	monkeypatch.setattr(rv, 'sync_restore', cutting)
 	assert restore(backed_up, dest, monkeypatch) == rv.EXIT_COMMAND_FAILED
 	assert cut == [target]
 	monkeypatch.setattr(rv, 'sync_restore', sync_restore)
 	image.remount()
-	# the marker was on the disk before the first copy, saying its copies are not known to be on disk; made in a mount the
-	# cut ended, so a run again copies everything again
+	# the marker was on the disk before the first copy, saying its copies are not known to be on disk, so a run again copies
+	# everything again
 	marker = rv.read_restore_marker(target)
-	assert 'unsynced' in marker and rv.marker_recopy(marker, rv.restore_mount_identity(target)) == 'cut'
+	assert 'unsynced' in marker and rv.marker_recopy(marker) == 'cut'
 	copied = []
 	copy_command = rv.copy_command
 	monkeypatch.setattr(rv, 'copy_command', lambda source, dest_path: copied.append(source) or copy_command(source, dest_path))
 	assert restore(backed_up, dest, monkeypatch) == 0
 	# everything copied again, whatever the cut left of it
 	assert len(copied) == len(FILES)
+	shut_down_scratch(image.mount_point)
+	image.remount()
+	assert lost(dest) == []
+	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
+
+
+def test_a_restore_stopped_after_its_copies_writes_them_out_and_a_run_again_keeps_them(backed_up, image, monkeypatch):
+	dest = destination(image)
+	target = os.path.join(dest, 'proj')
+	copy_command = rv.copy_command
+	started = []
+
+	def stopping(source, dest_path):
+		# a Ctrl-C as the third copy starts, once the first two are in place
+		started.append(source)
+		if len(started) == 3:
+			os.kill(os.getpid(), signal.SIGINT)
+		return copy_command(source, dest_path)
+	with monkeypatch.context() as stopped:
+		stopped.setattr(rv, 'RESTORE_COPY_BATCH', 2)
+		stopped.setattr(rv, 'copy_command', stopping)
+		assert restore(backed_up, dest, monkeypatch) == rv.EXIT_COMMAND_FAILED
+	kept = sorted(rel for rel in FILES if os.path.lexists(os.path.join(dest, rel)))
+	assert len(kept) == 2
+	# the power goes right after the stop: what it restored was written out on its way out, and its marker says so
+	shut_down_scratch(image.mount_point)
+	image.remount()
+	assert sorted(set(FILES) - set(lost(dest))) == kept
+	marker = rv.read_restore_marker(target)
+	assert marker is not None and rv.marker_recopy(marker) is None
+	copied = []
+	monkeypatch.setattr(rv, 'copy_command', lambda source, dest_path: copied.append(source) or copy_command(source, dest_path))
+	assert restore(backed_up, dest, monkeypatch) == 0
+	# the run again keeps them and copies the rest
+	assert len(copied) == len(FILES) - len(kept)
 	shut_down_scratch(image.mount_point)
 	image.remount()
 	assert lost(dest) == []
