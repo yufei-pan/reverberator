@@ -38,7 +38,9 @@ H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 
 	'land_ahead_taken': 12,
 	# round 22's build: the shapes of the step back's rules
 	'nested_out_ancestor': 12, 'moved_sub_out_before_walk': 12, 'back_into_new_then_out': 12, 'pairing_walk_under_new': 12,
-	'renamed_in_new_then_out': 12, 'renamed_in_new_then_out_sub': 12, 'out_of_new_then_out': 12, 'out_of_new_then_out_sub': 12}
+	'renamed_in_new_then_out': 12, 'renamed_in_new_then_out_sub': 12, 'out_of_new_then_out': 12, 'out_of_new_then_out_sub': 12,
+	# the cost pass: the orders that need rules 2 and 3 come after visit 16
+	'new_sub_walked_by_pair_then_out': 28, 'into_renamed_new_then_out': 28}
 H_DEFAULT = 16
 SAMPLE = int(os.environ.get('REVERB_WATCH_SCHED_SAMPLE', '100'))
 BIG = 'p' * 200000
@@ -199,6 +201,16 @@ SHAPES = {
 	# found, and leaves with it
 	'renamed_in_new_out_early': [('mkdir', 'n'), ('mkdir', 'n/d/s'), ('mv', 'n/d', 'n/e'), ('mv', 'n/e', '{outside}/e')],
 	'out_of_new_out_early': [('mkdir', 'n'), ('mkdir', 'n/d/s'), ('mv', 'n/d', 'other/x'), ('mv', 'other/x', '{outside}/x')],
+	# a folder made in a new folder, whose create is read after the new folder's parent was renamed, so the pair's walk watches
+	# it, then moved out of the tree: rule 3 (a watch a walk adds below a folder of newDirWDs joins it) is what lets its
+	# IN_MOVE_SELF be looked at
+	'new_sub_walked_by_pair_then_out': [('mkdir', 'next/n'), ('mkdir', 'next/n/s'), ('mv', 'next', 'nx'), ('mv', 'nx/n/s', '{outside}/s')],
+	# a folder of the tree moved into a folder whose rename in a new folder is not settled yet (a pair the watcher does not
+	# trust), so a settle puts it in place, then moved out of the tree: rule 2 (the settle's walk passes newDirWDs)
+	'into_renamed_new_then_out': [('mkdir', 'n/m'), ('mv', 'n/m', 'n/m2'), ('mv', 'next', 'n/m2/nx'), ('mv', 'n/m2/nx', '{outside}/nx')],
+	# a rename inside a folder that left the tree, reported at its old path, which another folder has taken: a delete and a
+	# create there (limitation 1's copy), never a rename in that folder
+	'renamed_outside_onto_taken_place': [('mv', 'next2/sub', '{outside}/sub'), ('mv', 'next', 'next2/sub'), ('mv', '{outside}/sub/z', '{outside}/sub/y')],
 	# a swap by one rename, then one of the two renamed: only the first path before finds the other's watch
 	'exchange_then_rename': [('exchange', 'big', 'other'), ('mv', 'big', 'b3'), ('poke', 'other/a'), ('write', 'b3/w', 'w')],
 	# two swaps through one folder: a watch is at neither of its own paths, only at one another watch held
