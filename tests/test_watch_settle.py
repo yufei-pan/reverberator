@@ -4,6 +4,7 @@ events hold, what needs the tree's view waits for an empty event queue (settle()
 settled is a delete and a create, and an event queue overflow restarts the watch. Each order here kept wrong bytes, lost a
 change or left a watch on another folder's path on 0.55.1, or tests a part that 0.55.1 lacks.
 '''
+import contextlib
 import errno
 import os
 import shutil
@@ -774,3 +775,65 @@ def test_a_move_self_between_an_ancestors_move_out_and_its_pair(session, job, tm
 	one.back_up_next()
 	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
 	assert state['done'] and not wrong(job) and not stale and not missing, (state['seen'], wrong(job), stale, missing)
+
+
+@contextlib.contextmanager
+def never_quiet(monitor):
+	'''A busy tree: a file written every 20 ms, so no read finds the tree quiet (0.15 s) and no move-out expires for that.'''
+	stop = threading.Event()
+	def write():
+		while not stop.is_set():
+			with open(f'{monitor}/busy', 'a') as f:
+				f.write('x')
+			time.sleep(0.02)
+	thread = threading.Thread(target=write, daemon=True)
+	thread.start()
+	try:
+		yield
+	finally:
+		stop.set()
+		thread.join()
+
+
+@pytest.mark.parametrize('after', ['rm', 'mv', 'write', 'mv_onto'])
+def test_a_folder_moved_out_of_a_place_another_folders_move_out_is_pending_at(session, job, tmp_path, after):
+	'''
+	Re-review 3: big/sub leaves the tree, then big, and a new big/sub is made in a new big and leaves the tree too, all
+	before a quiet read, so the first move-out is still pending at big/sub when the new one's IN_MOVE_SELF is read. Fix
+	round 4's rule skipped any watch whose path held a pending move-out, taking it for the watch's own: the new big/sub's
+	watch stayed at big/sub, and once another folder was made there, a change in the folder outside came at big/sub. With
+	'mv_onto' the folder at big/sub holds two files alike in size, mtime and last 64 KiB, and the rename outside made the
+	version rename one onto the other: wrong bytes at big/sub/g (0.55.1 too). Now every IN_MOVE_SELF is probed.
+	'''
+	one = session({'big/a': 'a' * 1000, 'big/sub/b': 'b' * 5000, 'other/o': 'o'})
+	m = job.monitor
+	out = tmp_path / 'outside'
+	os.makedirs(out)
+	with never_quiet(m):
+		for step in [('mv', 'big/sub', f'{out}/s1'), ('mv', 'big', f'{out}/b1'), ('mkdir', 'big'), ('mkdir', 'big/sub'),
+				('write', 'big/sub/f', 'first'), ('mv', 'big/sub', f'{out}/s2')]:
+			# each step read and handled before the next
+			one.apply(step)
+			one.settle()
+	one.back_up(one.take())
+	assert not wrong(job), 'after the moves'
+	one.apply(('mkdir', 'big/sub'))
+	one.apply(('write', 'big/sub/f', 'A' + 'keep' * 30000))
+	if after == 'mv_onto':
+		# two files of one size, mtime and last 64 KiB in the folder now at big/sub (the first byte differs)
+		one.apply(('write', 'big/sub/g', 'B' + 'keep' * 30000))
+		stat = os.lstat(f'{m}/big/sub/f')
+		os.utime(f'{m}/big/sub/g', ns=(stat.st_atime_ns, stat.st_mtime_ns))
+	one.back_up(one.take())
+	assert not wrong(job), 'after the folder is made again'
+	if after == 'rm':
+		os.remove(out / 's2' / 'f')
+	elif after in ('mv', 'mv_onto'):
+		os.rename(out / 's2' / 'f', out / 's2' / 'g')
+	else:
+		(out / 's2' / 'h').write_text('outside')
+	batch = one.take()
+	events = [event for event in relative(batch, m) if event[1] != 'busy']
+	one.back_up(batch)
+	# nothing outside the tree comes as a change in it
+	assert not wrong(job) and not events, (wrong(job), events)

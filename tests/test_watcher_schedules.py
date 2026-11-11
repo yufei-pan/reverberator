@@ -42,7 +42,9 @@ H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 
 	# the cost pass: the orders that need rules 2 and 3 come after visit 16
 	'new_sub_walked_by_pair_then_out': 28, 'into_renamed_new_then_out': 28,
 	# re-review 2: two steps spread over the pairing walk of o2, the four before them all at the first visit (AT_ONCE)
-	'lag_child_out': 40, 'lag_child_out_back': 40}
+	'lag_child_out': 40, 'lag_child_out_back': 40,
+	# re-review 3: the shapes of another folder's move-out pending at a watch's path
+	'other_pending_remade': 16, 'other_pending_swapped_in': 12, 'other_pending_out_and_back': 12}
 H_DEFAULT = 16
 # shapes whose first steps all run at the first visit, so that only the later ones spread over the visits
 AT_ONCE = {'lag_child_out': 4, 'lag_child_out_back': 4}
@@ -239,6 +241,19 @@ SHAPES = {
 	# rename's pairing walk (not as new); the folder's create, read later, makes it new, and the subfolder's move-out out
 	# of the tree is then read on it and discarded: only its IN_MOVE_SELF tells the move (105 of 816 orders stale on 3ff5027)
 	'pair_then_new_sub_out': [('mv', 'other', 'o2'), ('mkdir', 'o2/n'), ('mkdir', 'o2/n/w'), ('mv', 'o2/n/w', '{outside}/w')],
+	# re-review 3: a folder moved out of the tree from a place where another folder's move-out is pending. Here big/sub
+	# leaves, then big; a new big/sub is made in the new big (its events discarded) and leaves too, so its move-out keeps no
+	# cookie and its IN_MOVE_SELF meets the first move-out pending at big/sub (fix round 4's rule skipped it: 105 of 816
+	# orders stale on its commit)
+	'other_pending_remade': [('mv', 'big/sub', '{outside}/s1'), ('mv', 'big', '{outside}/b1'), ('mkdir', 'big/sub'),
+		('mv', 'big/sub', '{outside}/s2')],
+	# the same with a folder renamed in to take big's place (735 of 1,365 orders stale on fix round 4's commit)
+	'other_pending_swapped_in': [('mkdir', 'u/sub'), ('mv', 'big/sub', '{outside}/s1'), ('mv', 'big', 'bold'), ('mv', 'u', 'big'),
+		('mv', 'big/sub', '{outside}/s2')],
+	# a control (passes on both): big comes back by a pair, so it is not new, and the new big/sub's move-out, read on its
+	# watch, keeps a cookie
+	'other_pending_out_and_back': [('mv', 'big/sub', '{outside}/s1'), ('mv', 'big', '{outside}/big'), ('mv', '{outside}/big', 'big'),
+		('mkdir', 'big/sub'), ('mv', 'big/sub', '{outside}/s2')],
 }
 NAMES = [name for name in os.environ.get('REVERB_WATCH_SCHED_SHAPES', ','.join(SHAPES)).split(',') if name]
 

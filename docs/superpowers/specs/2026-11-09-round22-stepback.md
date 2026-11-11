@@ -61,13 +61,16 @@ plus one sentence in a third (section 6).
 - **Rules 2 and 3 of 3.2 each have a shape that needs them,** at 28 visits, beyond review 5's bounds (3.2).
 - **Version 0.55.4,** on main's 0.55.3.
 
-**What the final review changed** (fix round 4, the main session's rulings; 3.2, 3.3, 4 and 7 hold the details):
-- **The MOVE_SELF rule probes every subfolder's `IN_MOVE_SELF`,** but one whose own path holds a pending move-out
-  (route B, 3.3). The cost pass's rule acted only for a watch in `newDirWDs` or `found`, inferring that the events
-  followed every other move, and four reviews in a row found a watch where that was false. `new_before_take`, re-review
-  2's cookie change and `WatchNotes.new_dirs` went with the inference.
-- **Its cost:** one probe for each folder rename the pairing settled, with one `realpath` for each parent in a read
-  (`renamesold`, section 7).
+**What the final review changed** (fix rounds 4 and 5, the main session's rulings; 3.2, 3.3, 4 and 7 hold the
+details):
+- **The MOVE_SELF rule probes every subfolder's `IN_MOVE_SELF`** of a mapped watch, with no condition (3.3).
+  - The cost pass's rule acted only for a watch in `newDirWDs` or `found`, inferring that the events followed every
+    other move. Four reviews in a row found a watch where that was false.
+  - Fix round 4 kept one skip, for a watch whose path holds a pending move-out, taken for its own. Re-review 3 found it
+    can be another folder's, the fifth such inference to fail.
+  - `new_before_take`, re-review 2's cookie change and `WatchNotes.new_dirs` went with the inferences.
+- **Its cost:** one probe for each folder rename (an `add_watch` and a `realpath` of the parent: `renamesold`), and the
+  settle's pass over the map for each settle in which a folder moved out of the tree (`stayout`; section 7).
 - **The settle's pass over the paths that left takes only the outermost ones** (finding 4, 3.4).
 - **Parts that went:** `through_link()`'s form with no shared real paths, and a test pinning the absence of a call that
   no longer exists.
@@ -230,7 +233,7 @@ All live in `watchFolder()` for one watch's life; an overflow's restart starts t
 | `found` (wd → path) | a held watch a walk met at another path than its own, with the path the walk saw, and the take count the watcher knew at that read (3.4) | the watch is guarded until the next settle, which clears it |
 | `outgoing` (wd → count) | for each watch, how many cookies hold it | the count is the number of cookies still holding the watch; the entry goes at zero |
 | `leaving` (set) | the watches of a folder that left the tree or its place: an expired or evicted move-out's `wds`; a move into a skipped folder's; the watches under a folder moved out of a new folder whose own watch failed (it is in `unwatched`); and the watches at or under the path of a found or doubtful watch whose folder moved on (3.4) | each is probed at the next settle, and removed if its folder is not at its path |
-| `doubtful` (wd → path before) | every watch a folder move took when the old path held more than one watch (`RENAME_EXCHANGE`, or a folder moved onto the place of one whose move-out is pending), descendants included, with its path before the first such move (a later one keeps it); and a watch whose `IN_MOVE_SELF` says it moved, but for one whose own path holds a pending move-out, unless a probe finds it at its path, with that path (3.3) | settled at the next settle |
+| `doubtful` (wd → path before) | every watch a folder move took when the old path held more than one watch (`RENAME_EXCHANGE`, or a folder moved onto the place of one whose move-out is pending), descendants included, with its path before the first such move (a later one keeps it); and a watch whose `IN_MOVE_SELF` says it moved, unless a probe finds it at its path, with that path (3.3) | settled at the next settle |
 
 **Guarded.** A watch is guarded while it is in `found`, `leaving` or `doubtful`, or its `outgoing` count is above
 zero (`guarded()`). A move whose source folder's watch or destination folder's watch is guarded (the cookie's `wd` and
@@ -274,9 +277,9 @@ in one of them, and three rules (below) put it there. Four reviews in a row foun
 - the final review's three routes: a late create, an ancestor's move-out that pairs, and the settle's placement (all
   in section 4).
 
-The rule now probes every subfolder's `IN_MOVE_SELF` but one whose own path holds a pending move-out (3.3), so no
-membership is inferred, and `new_before_take` went. This removes the state the failures needed, where a fifth rule
-would only have added more.
+The rule now probes every subfolder's `IN_MOVE_SELF` (3.3), so no membership is inferred, and `new_before_take` went.
+This removes the state the failures needed, where a fifth rule would only have added more. Fix round 4's form kept a
+skip for a watch whose path held a pending move-out, and that was the fifth inference to fail (re-review 3, section 4).
 
 **Three rules put watches into `newDirWDs`.** They stay, now for the discard alone: each puts a watch there whose folder
 the batch's copy holds.
@@ -305,7 +308,7 @@ discarded: more work, still right.
 | A walk adds a watch below a folder of `newDirWDs` | in `newDirWDs` only for a create's walk | in `newDirWDs` for any walk (rule 3) |
 | Folder `MOVED_FROM` | cookie with the watches under the path | the same; each of them gains one in `outgoing` |
 | Folder `MOVED_FROM` in a new folder (discard branch) | nothing: the watches stay for good | no cookie, as on 0.55.1. The moved folder's `IN_MOVE_SELF` marks its watch (the next row). For a moved folder whose own watch failed (it is in `unwatched`), the watches at or under the path, by one pass over the map, are `leaving` |
-| A subfolder's `IN_MOVE_SELF` | skipped | a probe of the watch's path, but when that path holds a pending move-out (its own, which deals with it). Unless the watch is there, it is `doubtful` with that path (the MOVE_SELF rule, below) |
+| A subfolder's `IN_MOVE_SELF` | skipped | a probe of the watch's path. Unless the watch is there, it is `doubtful` with that path (the MOVE_SELF rule, below) |
 | `MOVED_TO`, cookie known, neither folder's watch guarded | `move` recorded, every path under the old one rewritten, walk | the same (`move_watches()`, 0.55.1's loop; walk with `found`); the cookie lets go |
 | `MOVED_TO`, cookie known, a folder's watch guarded | as above | rule 3's INFO line, for a file as for a folder; the move-out expires into its delete, and the move-in is a create (walk with `newDirWDs` and `found`), as one with an unknown cookie |
 | The rewrite takes more than one watch from exactly the old path | moves them all | moves them all, and every watch it moved is `doubtful` (descendants too), keeping the path before the first such move |
@@ -315,20 +318,32 @@ discarded: more work, still right.
 | End of a read, and every read with no event | nothing | `settle()` (3.4) |
 | `Q_OVERFLOW` | full comparison requested; the watch goes on | the same, then the watch ends and `watcher()` starts a new one (3.6) |
 
-**The MOVE_SELF rule** (the cost pass's ruling 1, in place of the spec check's same-read skip; fix round 4's form). A
+**The MOVE_SELF rule** (the cost pass's ruling 1, in place of the spec check's same-read skip; fix round 5's form). A
 folder move-out read in a new folder keeps no cookie, so nothing pairs it or expires it. The moved folder's own watch
 tells the move (`IN_MOVE_SELF`, fact H).
-- **The rule.** On a subfolder's `IN_MOVE_SELF` of a mapped watch, the watcher probes the watch's path (fact C) unless
-  that path holds a pending move-out. Unless the watch is there, it is `doubtful`, with that path.
-- **The skip.** A pending move-out at the watch's own path is the folder's own: the kernel queues the rename's
-  `MOVED_FROM` and `MOVED_TO` before its `IN_MOVE_SELF` (fact H). If the `MOVED_TO` came, the pair has already put the
-  watch where it went, and no move-out is pending there. If not, the folder left the tree or went where the events
-  keep no pair, and the move-out's expiry makes its watches `leaving`.
+- **The rule.** On a subfolder's `IN_MOVE_SELF` of a mapped watch, the watcher probes the watch's path (fact C), every
+  time. Unless the watch is there, it is `doubtful`, with that path. The probe takes a fresh `realpath` of the parent;
+  only one settle's probes share them.
 - **The settle.** Step 2 (3.4) probes the watch again. If its folder is at neither its path nor its path before, it
   leaves with every watch its path holds, but for those at their paths.
-- **Why every other one is probed** (fix round 4). The cost pass's rule probed only a watch in `newDirWDs` or `found`
-  that no pending move-out held (`outgoing`), so it inferred from those sets that every other move was in the events'
-  view. Four reviews in a row found a watch where it was not:
+- **A watch whose own move-out is pending** (a folder moved out of the tree, its cookie not expired yet). The kernel
+  queues the rename's `MOVED_FROM` and `MOVED_TO` before its `IN_MOVE_SELF` (fact H), so a move-out still pending then
+  had no pair in the tree. The probe finds the watch gone, and it is `doubtful`. The next settle's step 2 finds it at
+  neither path and puts the path in `moved_on`. The map pass makes it and those under it `leaving`, and step 3 removes
+  them. The cookie's expiry, later, lets go of watches no longer mapped (`release()` and `leave()` pass over them) and
+  queues the delete, as before.
+- **Why the skip went** (fix round 5). Fix round 4's form skipped a watch whose path held a pending move-out, taking
+  that move-out for the watch's own. It can be another folder's (re-review 3):
+  - `mv big/sub /out/s1; mv big /out/b1; mkdir big/sub; mv big/sub /out/s2`: the new big/sub's move-out is read in a
+    new folder (no cookie), and its `IN_MOVE_SELF` meets s1's move-out pending at big/sub;
+  - shapes `other_pending_remade` (105 of 816 orders stale on fix round 4's commit) and `other_pending_swapped_in`
+    (735 of 1,365);
+  - in process, a rename outside onto a twin gave wrong bytes at big/sub/g (0.55.1 too).
+
+  It was the fifth inference of its kind to fail. A rule that infers nothing is the simple one.
+- **Why no set decides** (fix round 4). The cost pass's rule probed only a watch in `newDirWDs` or `found` that no
+  pending move-out held (`outgoing`), so it inferred from those sets that every other move was in the events' view.
+  Four reviews in a row found a watch where it was not:
   - review 1's take window, closed then by `new_before_take`;
   - re-review 2's `lag_child_out`, closed then by a cookie that also took the found place's watches;
   - the final review's late create, its ancestor's move-out that pairs, and the settle's placement window (section 4).
@@ -336,8 +351,9 @@ tells the move (`IN_MOVE_SELF`, fact H).
   The probe needs no such inference. `new_before_take` and re-review 2's cookie change went with the set condition.
   Their shapes and tests pass without them: `lag_child_out` and `lag_child_out_back` (1,640 orders), and the take
   window's test.
-- **Its cost** is one probe for each folder rename in the tree that paired: an `add_watch` and one `realpath` of the
-  parent. `renamesold` measures it (section 7).
+- **Its cost** is one probe for each folder rename (an `add_watch` and one `realpath` of the parent: `renamesold`).
+  Each settle in which a folder moved out of the tree then also makes the settle's pass over the map (`stayout`: about
+  0.6 to 0.9 ms each on a map of 20,000 watches, the pass `outofnew` already pays, item 20). Section 7 has both.
 - **The watches it leaves alone.**
   - A watch with no `IN_MOVE_SELF`: a folder under a moved one, which a pair moves with it, and the settle's pass over
     the paths that left covers.
@@ -345,17 +361,18 @@ tells the move (`IN_MOVE_SELF`, fact H).
     both when it puts the watch in place.
 - **The look by path** (one pass over the map, at the `MOVED_FROM`) stays for one case: a moved folder whose own watch
   failed (it is in `unwatched`). Its subfolders may hold watches that get no `IN_MOVE_SELF` of their own (fact H).
-- **Why the skip went** (the cost pass). In `renamesinnew`, each folder's create and rename come in one read, so the
-  move-in's walk adds a new watch at the moved folder's place, which the fallback could not tell from another folder
-  there. The look over `newDirWDs` ran at nearly every rename, and its cost grew with the square of the renames
-  (section 7).
+- **Why the same-read skip went** (the cost pass). In `renamesinnew`, each folder's create and rename come in one
+  read, so the move-in's walk adds a new watch at the moved folder's place, which the fallback could not tell from
+  another folder there. The look over `newDirWDs` ran at nearly every rename, and its cost grew with the square of the
+  renames (section 7).
 - **Absence and overflow.** The rule acts on the event when it comes, and never on its absence. An overflow restarts
   the watch, and a lost `IN_MOVE_SELF` goes with it.
 - **Tests.** `tests/test_watch_settle.py` pins fact H. It also runs:
   - a folder made in a new folder, renamed in it and then out of the tree in one read, with another made at its first
     name, both watched before and never watched (without the rule, the watched case keeps a stale watch, 3 of 3);
   - the take window (section 4);
-  - the final review's first walk and ancestor routes (section 4).
+  - the final review's first walk and ancestor routes (section 4);
+  - re-review 3's rename outside onto a twin, with another folder's move-out pending at the path (section 4).
 
 File moves follow the same rows (guarded or not); a file's move-out holds no watch.
 
@@ -627,23 +644,24 @@ What the step back leaves, reasoned, not run, each with its bucket:
     good: review 5's F1 route once another folder holds that path. 0.55.1 has the route too (re-review 2: 28 of 103
     orders).
   - **The fix.** Fix round 3 had the cookie also hold the watches under the folder's place below the found place.
-    Fix round 4's rule closes the route without it: dd's `IN_MOVE_SELF` comes at `o2/big/dd`, where no move-out is
-    pending, so the probe finds dd gone and the settle removes its watch (3.3). The cookie change went.
+    The MOVE_SELF rule's probe closes the route without it (fix rounds 4 and 5): dd's probe at `o2/big/dd` finds dd
+    gone, and the settle removes its watch (3.3). The cookie change went.
   - **Shapes:** `lag_child_out` (then a write in `/out/dd`) and `lag_child_out_back` (a folder made again at
     `o2/big/dd`). Their first four steps run at the first visit and the last two at every pair of visits up to 40
     (the schedule file's `AT_ONCE`): 820 orders each. On 898961f, 57 of the 1,640 fail (28 and 29). Each failure keeps
     dd's watch at `o2/big/dd`, with the folder gone or a new folder's watch beside it. None shows wrong bytes in
     these shapes. They pass on 3ff5027 (the cookie change) and on fix round 4's rule without it, all 1,640.
 - **The final review's findings 1 to 3: an `IN_MOVE_SELF` the old rule skipped: closed** (the main session's ruling:
-  route B, 3.3). Each is a watch outside the sets the old rule looked at, so its folder's move went unseen and the
-  watch stayed mapped in the tree.
+  route B in fix round 4, whose skip went in fix round 5; 3.3). Each is a watch outside the sets the old rule looked
+  at, so its folder's move went unseen and the watch stayed mapped in the tree.
   - **Finding 1, a late create.** `mv other o2; mkdir o2/n; mkdir o2/n/w; mv o2/n/w /out/w`.
     - o2's pairing walk watches n and w, not as new. n's create, read later, makes n new, but its walk no longer meets
       w, which has left.
     - w's move-out is read on n's watch and discarded (no cookie). w's watch is in no set, so its `IN_MOVE_SELF` was
       skipped.
     - Shape: `pair_then_new_sub_out`, 105 of 816 orders stale at `o2/n/w` on 3ff5027.
-    - The same route runs through the first walk and through the overflow restart's walk (3 of 3 each).
+    - The same route runs through the first walk (the test below, 3 of 3). It runs through the overflow restart's walk
+      too, which is a first walk: that is reasoned, as no run here forces an overflow at that point.
     - The test `test_a_folder_made_during_the_first_walk_whose_subfolder_leaves` fails 3 of 3 on 3ff5027.
     - 0.55.1 has the route too.
   - **Finding 2, an ancestor's move-out that pairs.** w (in a new folder) leaves the tree, while x above it is renamed
@@ -653,8 +671,7 @@ What the step back leaves, reasoned, not run, each with its bucket:
     - x's pair then took the watch to `y/n/w`.
     - The test `test_a_move_self_between_an_ancestors_move_out_and_its_pair` forces that order on the read: 3 of 3
       stale on 3ff5027.
-    - Now the watch's own path holds no pending move-out (x's path does), so the probe marks it `doubtful`. The pair
-      takes it along, and step 2 finds it at neither path.
+    - Now the probe marks it `doubtful`. The pair takes it along, and step 2 finds it at neither path.
   - **Finding 3, the settle's placement** (reasoned). Between a placement and step 5's walk, a subfolder of the
     placed folder could leave the same way as in finding 1. The probe covers it too.
   - With the rule's new form, all three pass: the shape's 816 orders, and both tests 3 of 3, with their controls.
@@ -662,6 +679,25 @@ What the step back leaves, reasoned, not run, each with its bucket:
   path and paths under it, and the prefix pass compared each watch with every one of them. On a map of 30,001 watches,
   10,001 nested paths cost 0.50 s, against 0.9 ms with the outermost path only. The settle now keeps only the outermost
   paths (3.4).
+- **A move-out pending at the path of a folder that left without a cookie: closed** (re-review 3's finding 1; the main
+  session's ruling: Fix now, fix round 5).
+  - **The route.** `mv big/sub /out/s1; mv big /out/b1; mkdir big/sub; mv big/sub /out/s2`, all before a quiet read.
+    - The new big/sub is made in a new big, so its move-out is read in the discard branch, with no cookie.
+    - Its `IN_MOVE_SELF` met s1's move-out, still pending at big/sub. Fix round 4's rule took that move-out for the
+      watch's own and skipped the probe.
+    - The watch stayed at big/sub. Once another folder was made there, a change in `/out/s2` came at big/sub.
+  - **Wrong bytes.** With two files alike in size, mtime and last 64 KiB in the folder now at big/sub, a rename
+    outside made the version rename one onto the other: wrong bytes at big/sub/g. 0.55.1 has this too; 3ff5027 did
+    not.
+  - **The fix.** Every `IN_MOVE_SELF` of a mapped watch is probed (3.3).
+  - **Shapes**, at every order:
+    - `other_pending_remade` (to 16 visits) and `other_pending_swapped_in` (to 12): 105 of 816 and 735 of 1,365 orders
+      stale on fix round 4's commit;
+    - `other_pending_out_and_back`, a control that passes on both.
+  - **The test** `test_a_folder_moved_out_of_a_place_another_folders_move_out_is_pending_at` (rm, mv, write, mv_onto).
+    On fix round 4's commit all four fail: `mv_onto` with wrong bytes at big/sub/g, the other three with a change in
+    `/out/s2` reported at big/sub.
+  - **With the fix,** the three shapes pass all 3,546 orders, and the test passes in all four forms.
 
 ## 5. What changes for the operator
 
@@ -684,6 +720,15 @@ What the step back leaves, reasoned, not run, each with its bucket:
   missed (section 6).
 - The watches of a folder moved out of the tree go at the first empty queue after its move-out expires, where 0.55.1
   removed them at the expiry itself.
+- **A move reported by a folder renamed again before its first rename's `IN_MOVE_SELF` is read is copied** (re-review
+  3's finding 2; **awaiting the user's answer** on whether limitation 1 widens to it, so docs/limitations.md and the
+  README do not say it yet).
+  - **The route.** A folder is renamed, then it or a folder above it is renamed again, before the watcher reads the
+    first rename's `IN_MOVE_SELF`.
+  - **What happens.** The probe finds the tree ahead of the events: the watch is not at the path the first rename's
+    pair gave it. So the watch is `doubtful` until the next empty queue, and a move it reports meanwhile is a delete
+    and a create, which copies, where 3ff5027 renamed in the vault.
+  - The version is right. Only the cost of a copy over a rename differs, as in limitation 1.
 
 ## 6. docs/limitations.md and the README
 
@@ -916,6 +961,31 @@ The gate set, 0.55.1 against the fix round's commit, alternating, three runs eac
   - Route A (the reviewer's candidates) would have saved only the probe, so the fix round kept route B.
 - **The moves into new folders** stay at the cost pass's +5 to 7%. `outofnew` stays at its accepted cost (item 20),
   and the overflow at its restart walk. The rest overlap 0.55.1.
+
+- **Memory:** no state per watch at rest. The four structures hold only the watches of a race or of a pending
+  move-out, until the next settle, pairing or expiry. `outgoing` holds one entry per watch of a pending move-out for up
+  to the pair timeout, where 0.55.1 holds the cookie's tuple alone: for a move-out of 100,000 folders, a dict of
+  100,000 entries, a few MB (reasoned). Measured by the build (`outpeak`: tracemalloc's peak from the move-out of a
+  folder of 100,000 subfolders until its expiry has removed their watches, three runs each): 11.77 MiB on the branch,
+  0.89 MiB on 0.55.1, the same in each run.
+- **Per event:** nothing for a file event (5 to 6.5 µs an event on both codes in the file writes above). One `settle()`
+  call per read, which returns at once when nothing is noted; with something noted, one `FIONREAD` ioctl. A move-in
+  whose move-out was read looks its two folders' watches up in four structures, almost always empty. A subfolder's
+  `IN_MOVE_SELF` costs one probe (fix round 5).
+- **Per folder walked:** for a watch the walk finds held (not a new one), one comparison of its path, as before; for a
+  watch it adds below the root, one lookup of its parent in the walk's own record and one in `newDirWDs`.
+- **Per folder move:** 0.55.1's two passes over every watch stay (v16 removed them; section 9).
+- **Extra reads:** the settle's probes (an `add_watch` per noted watch, a lookup in the dentry cache, and the symlink
+  check for a probe that found its watch) and its walk of each folder it puts in place; the copies of rule 3 read the
+  moved entry whole.
+- **Extra copies, counted on the design pass** (`tools/copycount.py` in the scratch folder): the 99 schedule shapes at
+  small bounds (every order to 6 visits for 3 and 4 steps, to 5 for 5 steps, 50 sampled for 6 and 7; 5,334 orders),
+  each order's batches logged on both codes and each create carried through the batch's later moves and deletes as the
+  collapse carries it, a create under another one counted as covered. 0.55.1 ended wrong in 184 orders
+  (`exchange_twice` 56, `root_put_*` 89, `exchange` 21, `over_empty` 18), the step back in none. Over the 5,150 orders
+  0.55.1 gets right the step back made 6,526 copies to 0.55.1's 6,501: 21 are `out_back_sub` (`mv big /out/big; mv
+  /out/big/sub sub2`, limitation 1), and 4 are an empty folder of `root_put_into_itself` (`mkdir n; mv n big/n; mv big
+  n`) copied by the settle. Where 0.55.1 is wrong, the step back's extra copies are the repair.
 
 ## 8. Gates
 
@@ -1225,3 +1295,16 @@ Each ruling that was the main session's, each call this spec made on its own, an
     - **New tests:** the shape `pair_then_new_sub_out`, plus `test_a_folder_made_during_the_first_walk_whose_subfolder_leaves`
       and `test_a_move_self_between_an_ancestors_move_out_and_its_pair` in tests/test_watch_settle.py. Each fails on
       3ff5027 (105 of 816; 3 of 3; 3 of 3) and passes with route B.
+23. **Re-review 3** (fix round 5; the main session's rulings):
+    - **Every `IN_MOVE_SELF` of a mapped watch is probed**, with no condition (3.3, section 4). Fix round 4's skip of a
+      watch whose path held a pending move-out went: that move-out can be another folder's.
+    - **`read_reals` goes:** each MOVE_SELF probe takes its own `realpath` of the parent. It saved about 6 µs for each
+      paired folder rename, which the probe-off runs could not see, and it was the only state that a link swapped in
+      mid-read could outlive for the rest of that read. The settle's cache for one settle stays.
+    - **Kept:** the outermost-paths loop and rules 1 to 3 of 3.2.
+    - **New tests:** the shapes `other_pending_remade`, `other_pending_swapped_in` and `other_pending_out_and_back` (a
+      control), and `test_a_folder_moved_out_of_a_place_another_folders_move_out_is_pending_at`.
+    - **Awaiting the user:** whether limitation 1 widens to re-review 3's finding 2 (section 5). docs/limitations.md and
+      the README are unchanged until then.
+    - **Section 4's overflow claim corrected:** the final review's finding 1 through the overflow restart's walk is
+      reasoned, not run.

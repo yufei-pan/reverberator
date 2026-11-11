@@ -3001,7 +3001,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	def probe_at(path:str, strays:set, reals:dict):
 		# the watch of the folder at path; None: not here (no folder, another one, one with no watch, or one through a
 		# symlink); blind: the probe could not look, which is never taken for an absence. reals: through_link()'s
-		# real paths of the parents, shared by one settle's probes, or one read's
+		# real paths of the parents, shared by one settle's probes (a MOVE_SELF probe passes its own)
 		try:
 			wd = inotify_obj.add_watch(path.rstrip('/') or '/', probe_flags)
 		except OSError as error:
@@ -3289,10 +3289,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 				decodedEvents = [[event.wd, flags.from_mask(event.mask),event.cookie, event.name] for event in events]
 				watcherTeeLogToTl(monitor_path,'\n'+multiCMD.pretty_format_table(decodedEvents,header=['wd', 'mask','cookie','name']))
 			monTime = time.monotonic()
-			# the real paths of the parents the MOVE_SELF rule's probes meet, shared by one read's probes as by one settle's:
-			# one realpath for each parent, not each probe (2,000 probes of renamed folders: 1.1 to 1.5 us each, against 7.5
-			# to 8.6 us with a realpath each)
-			read_reals = {}
 			for event in events:
 				if event.mask & flags.Q_OVERFLOW:
 					watcherTeeLogToTl(monitor_path,'Queue overflow, event maybe lost',error=True)
@@ -3332,20 +3328,19 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						continue
 					elif event.mask & flags.MOVE_SELF:
 						# this watch's folder was renamed, as the kernel tells its own watch after the rename's MOVED_FROM and
-						# MOVED_TO. a move-out pending at the watch's own path is its own, and deals with it: its pair puts the
-						# watch where it went, its expiry makes it leaving. any other may have left the watch at a path its
-						# folder is not at (a move read in a folder made since the last take keeps no cookie; one read at a
-						# path the events lag behind holds another folder's watches; an ancestor's move-out that pairs takes
-						# it along), so a probe looks: unless the watch is there, settle() looks for it ( its step 2; a found
-						# one that step 1 puts in place is settled there )
+						# MOVED_TO. the events may have left the watch at a path its folder is not at (a move read in a folder
+						# made since the last take keeps no cookie; one read at a path the events lag behind holds another
+						# folder's watches; an ancestor's move-out that pairs takes it along; a move-out pending at its path
+						# may be another folder's), and no condition tells those apart from a move they followed, so a probe
+						# looks, every time: unless the watch is there, settle() looks for it ( its step 2; a found one that
+						# step 1 puts in place is settled there ). one whose own move-out is pending is not there, and leaves
+						# by the settle; its expiry then passes over its gone watches
 						path = wdDic.get(event.wd)
-						if path is not None and path.rstrip('/') not in pendingMoveFromPaths:
+						if path is not None:
 							strays = set()
-							if probe_at(path, strays, read_reals) != event.wd:
+							if probe_at(path, strays, {}) != event.wd:
 								notes.doubtful.setdefault(event.wd, path)
 							drop_strays(strays)
-						elif DEBUG:
-							watcherTeeLogToTl(monitor_path,'Sub dir move self event detected, skipping')
 						continue
 				if not event.name:
 					if event.mask & flags.IGNORED:
