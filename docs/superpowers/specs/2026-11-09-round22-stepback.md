@@ -353,7 +353,7 @@ tells the move (`IN_MOVE_SELF`, fact H).
   window's test.
 - **Its cost** is one probe for each folder rename (an `add_watch` and one `realpath` of the parent: `renamesold`).
   Each settle in which a folder moved out of the tree then also makes the settle's pass over the map (`stayout`: about
-  0.6 to 0.9 ms each on a map of 20,000 watches, the pass `outofnew` already pays, item 20). Section 7 has both.
+  0.3 to 0.7 ms each on a map of 20,000 watches, the pass `outofnew` already pays, item 20). Section 7 has both.
 - **The watches it leaves alone.**
   - A watch with no `IN_MOVE_SELF`: a folder under a moved one, which a pair moves with it, and the settle's pass over
     the paths that left covers.
@@ -721,8 +721,7 @@ What the step back leaves, reasoned, not run, each with its bucket:
 - The watches of a folder moved out of the tree go at the first empty queue after its move-out expires, where 0.55.1
   removed them at the expiry itself.
 - **A move reported by a folder renamed again before its first rename's `IN_MOVE_SELF` is read is copied** (re-review
-  3's finding 2; **awaiting the user's answer** on whether limitation 1 widens to it, so docs/limitations.md and the
-  README do not say it yet).
+  3's finding 2; limitation 1 widened to it, approved 2026-11-11, "Widen the entry (Recommended)").
   - **The route.** A folder is renamed, then it or a folder above it is renamed again, before the watcher reads the
     first rename's `IN_MOVE_SELF`.
   - **What happens.** The probe finds the tree ahead of the events: the watch is not at the path the first rename's
@@ -961,6 +960,30 @@ The gate set, 0.55.1 against the fix round's commit, alternating, three runs eac
   - Route A (the reviewer's candidates) would have saved only the probe, so the fix round kept route B.
 - **The moves into new folders** stay at the cost pass's +5 to 7%. `outofnew` stays at its accepted cost (item 20),
   and the overflow at its restart walk. The rest overlap 0.55.1.
+
+**Fix round 5** (every `IN_MOVE_SELF` probed, each with its own `realpath`; 0.55.1 against a7702c8, alternating, three
+runs each, with no gate running beside them). `stayout` is re-review 3's workload (`moveoutsstay`): 300 folders of 10
+subfolders moved out of the tree for good, 2 ms apart, so each move-out is read alone and the queue then empties.
+
+| Workload | 0.55.1 | Branch |
+|---|---|---|
+| `renamesold`, 2,000 | 3.318 to 3.518 s | 3.466 to 3.498 s |
+| `renamesold`, 20,000 | 34.08 to 71.53 s | 34.91 to 50.01 s |
+| `renamesinnew`, 2,000 | 0.038 to 0.046 s | 0.032 to 0.040 s |
+| `renamesinnew`, 20,000 | 0.330 to 0.413 s | 0.407 to 0.437 s |
+| move-outs | 0.361 to 0.426 s | 0.372 to 0.395 s |
+| moves into new folders | 0.288 to 0.323 s | 0.312 to 0.327 s |
+| `outofnew` | 0.048 to 0.059 s | 0.308 to 0.341 s |
+| `stayout` | 0.396 to 0.427 s | 0.512 to 0.586 s |
+
+- **`renamesold` overlaps 0.55.1 without the shared `realpath`.** The host was busier than in fix round 4's quiet
+  set, so the 20,000 runs are wide on both codes.
+- **`stayout` costs about 0.3 to 0.7 ms for each folder moved out of the tree** (0.28 to 0.63 ms here, 0.64 to 0.72
+  ms on the reviewer's runs). Its own move-out is pending when its
+  `IN_MOVE_SELF` is read, so the probe finds it gone, and the next settle makes the pass over the map that `outofnew`
+  already pays (item 20). On the reviewer's runs, 4af5002 (which skipped that probe) gave 0.560 to 0.645 s against
+  0.752 to 0.861 s for the probe of every one.
+- **The rest overlap 0.55.1,** but `outofnew`, at its accepted cost.
 
 - **Memory:** no state per watch at rest. The four structures hold only the watches of a race or of a pending
   move-out, until the next settle, pairing or expiry. `outgoing` holds one entry per watch of a pending move-out for up
@@ -1304,7 +1327,7 @@ Each ruling that was the main session's, each call this spec made on its own, an
     - **Kept:** the outermost-paths loop and rules 1 to 3 of 3.2.
     - **New tests:** the shapes `other_pending_remade`, `other_pending_swapped_in` and `other_pending_out_and_back` (a
       control), and `test_a_folder_moved_out_of_a_place_another_folders_move_out_is_pending_at`.
-    - **Awaiting the user:** whether limitation 1 widens to re-review 3's finding 2 (section 5). docs/limitations.md and
-      the README are unchanged until then.
+    - **Limitation 1 widened** to re-review 3's finding 2 (section 5): approved 2026-11-11, "Widen the entry
+      (Recommended)"; docs/limitations.md and the README say it.
     - **Section 4's overflow claim corrected:** the final review's finding 1 through the overflow restart's walk is
       reasoned, not run.
