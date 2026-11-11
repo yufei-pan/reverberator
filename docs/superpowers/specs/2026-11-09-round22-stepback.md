@@ -877,55 +877,45 @@ for `outofnew` and `renamesinnew`; the host's load rose from about 8 to 110 whil
 - **The rest** overlap 0.55.1, but for the moves into new folders, still about +5% (the cost pass's figure), and the
   overflow's restart walk.
 
-**Fix round 4** (route B: every subfolder's `IN_MOVE_SELF` probed but one whose own path holds a pending move-out;
-0.55.1 against the branch, alternating, three runs each). `renamesold` is the fix round's workload: `<count>` renames
-of folders watched since the watch began (not new), each within its parent and back on the next pass. Each one pairs,
-and the rule now probes it where the old rule skipped it.
+**Fix round 4** (route B: every subfolder's `IN_MOVE_SELF` probed but one whose own path holds a pending move-out).
+`renamesold` is the fix round's workload: `<count>` renames of folders watched since the watch began (not new), each
+within its parent and back on the next pass. Each one pairs, and the rule now probes it where the old rule skipped it.
 
-| Workload | 0.55.1 | Route B, a realpath each probe | Route B, a realpath per parent per read |
-|---|---|---|---|
-| `renamesold`, 2,000 (a quiet host) | 3.405 to 3.473 s | 3.490 to 3.535 s | |
-| `renamesold`, 2,000 (a busier host) | 4.251 to 4.799 s | 4.407 to 4.756 s | 4.250 to 5.113 s |
-| `renamesold`, 20,000 (quiet, then busier) | 34.97 to 44.32 / 49.80 to 57.89 s | 35.38 to 50.24 / 46.57 to 64.28 s | 41.24 to 112.67 s |
-| the probe alone: 2,000 probes of watched folders (`probe_micro.py`) | | 7.5 to 8.6 µs a probe | 1.1 to 1.5 µs a probe |
-| `renamesinnew`, 2,000 | 0.032 to 0.045 s | 0.034 to 0.046 s | |
-| `renamesinnew`, 20,000 | 0.325 to 0.456 s | 0.332 to 0.469 s | |
-| move-outs | 0.317 to 0.352 s | 0.335 to 0.341 s | |
-| moves into new folders | 0.263 to 0.269 s | 0.265 to 0.283 s | |
-| `outofnew` | 0.030 to 0.055 s | 0.193 to 0.335 s | |
+First, route B with a realpath for each probe, against 0.55.1, three runs each:
+- `renamesold` at 2,000 on a quiet host: 3.490 to 3.535 s against 3.405 to 3.473 s. That is a miss, of +2.5%.
+- The ruling's step for a miss is to share the parents' real paths across one read's probes, as one settle's probes
+  share them. Alone, that brings a probe of a watched folder from 7.5 to 8.6 µs down to 1.1 to 1.5 µs
+  (`probe_micro.py`: 2,000 probes), and the code takes it.
 
-- **`renamesold` with a realpath each probe** missed 0.55.1's range at 2,000 on the quiet host: +2.5%, about 40 µs
-  for each rename. The ruling's step for a miss is to share the parents' real paths across one read's probes, as one
-  settle's probes share them. That brings the probe from 7.5 to 8.6 µs down to 1.1 to 1.5 µs, and the code takes it.
-- **The busier host's runs overlap,** but are too noisy to show a 2% difference: 0.55.1's own 20,000 ran from 35 to
-  58 s. Each rename costs 0.55.1 about 1.7 ms, its two passes over every watch at a folder move (section 9), so the
-  probe is a small part of it either way.
+The gate set, 0.55.1 against the fix round's commit, alternating, three runs each on a quiet host:
 
-- **Memory:** no state per watch at rest. The four structures hold only the watches of a race or of a pending
-  move-out, until the next settle, pairing or expiry. `outgoing` holds one entry per watch of a pending move-out for up
-  to the pair timeout, where 0.55.1 holds the cookie's tuple alone: for a move-out of 100,000 folders, a dict of
-  100,000 entries, a few MB (reasoned). Measured by the build (`outpeak`: tracemalloc's peak from the move-out of a
-  folder of 100,000 subfolders until its expiry has removed their watches, three runs each): 11.77 MiB on the branch,
-  0.89 MiB on 0.55.1, the same in each run.
-- **Per event:** nothing for a file event (5 to 6.5 µs an event on both codes in the file writes above). One `settle()`
-  call per read, which returns at once when nothing is noted; with something noted, one `FIONREAD` ioctl. A move-in
-  whose move-out was read looks its two folders' watches up in four structures, almost always empty. A subfolder's
-  `IN_MOVE_SELF` looks its watch up in three sets, and probes it when it is in `newDirWDs` or `found` and no move-out
-  holds it.
-- **Per folder walked:** for a watch the walk finds held (not a new one), one comparison of its path, as before; for a
-  watch it adds below the root, one lookup of its parent in the walk's own record and one in `newDirWDs`.
-- **Per folder move:** 0.55.1's two passes over every watch stay (v16 removed them; section 9).
-- **Extra reads:** the settle's probes (an `add_watch` per noted watch, a lookup in the dentry cache, and the symlink
-  check for a probe that found its watch) and its walk of each folder it puts in place; the copies of rule 3 read the
-  moved entry whole.
-- **Extra copies, counted on the design pass** (`tools/copycount.py` in the scratch folder): the 99 schedule shapes at
-  small bounds (every order to 6 visits for 3 and 4 steps, to 5 for 5 steps, 50 sampled for 6 and 7; 5,334 orders),
-  each order's batches logged on both codes and each create carried through the batch's later moves and deletes as the
-  collapse carries it, a create under another one counted as covered. 0.55.1 ended wrong in 184 orders
-  (`exchange_twice` 56, `root_put_*` 89, `exchange` 21, `over_empty` 18), the step back in none. Over the 5,150 orders
-  0.55.1 gets right the step back made 6,526 copies to 0.55.1's 6,501: 21 are `out_back_sub` (`mv big /out/big; mv
-  /out/big/sub sub2`, limitation 1), and 4 are an empty folder of `root_put_into_itself` (`mkdir n; mv n big/n; mv big
-  n`) copied by the settle. Where 0.55.1 is wrong, the step back's extra copies are the repair.
+| Workload | 0.55.1 | Branch |
+|---|---|---|
+| `renamesold`, 2,000 | 3.594 to 3.773 s | 3.559 to 3.834 s |
+| `renamesold`, 20,000 | 34.796 to 35.061 s | 35.588 to 36.158 s |
+| `renamesold`, 20,000, again, four runs, with the probe turned off as a third code | 34.494 to 40.766 s | 34.999 to 35.554 s; probe off 35.375 to 36.744 s |
+| `renamesinnew`, 2,000 | 0.032 to 0.036 s | 0.032 to 0.034 s |
+| `renamesinnew`, 20,000 | 0.319 to 0.555 s | 0.330 to 0.333 s |
+| move-outs | 0.335 to 0.350 s | 0.340 to 0.358 s |
+| moves into new folders | 0.261 to 0.266 s | 0.280 to 0.285 s |
+| `outofnew` | 0.027 to 0.038 s | 0.190 to 0.204 s |
+| the watcher's memory after watching 101,051 folders | 17.61 MiB | 17.61 MiB |
+| the first walk of 101,051 folders | 0.412 to 0.418 s | 0.406 to 0.414 s |
+| 20,000 file writes in 50 folders | 0.208 to 0.278 s | 0.255 to 0.319 s |
+| 200 renames of folders of 50 subfolders, and back | 0.806 to 1.365 s | 0.817 to 0.989 s |
+| 2,000 renames in a folder of 10,000 subfolders | 5.344 to 5.843 s | 5.342 to 5.723 s |
+| 10,000 folders made one by one | 0.050 to 0.068 s | 0.047 to 0.050 s |
+| one overflow | 0.000 s | 0.088 to 0.105 s |
+| `outbusy2` | 0.266 to 0.308 s | 0.251 to 0.307 s |
+| `outpeak`, watcher CPU | 0.129 to 0.132 s | 0.135 to 0.139 s |
+
+- **`renamesold` at 20,000 missed in the gate set by 2.3%,** but the probe is not what costs it:
+  - A cProfile of the watcher thread over 2,000 renames puts 0.045 s of 27 s in the probes (0.17%). Nearly all the
+    rest is the two passes over every watch at each folder move, which 0.55.1 makes too (section 9).
+  - In the four-run set, the same code with the probe turned off is no faster, and both overlap 0.55.1.
+  - Route A (the reviewer's candidates) would have saved only the probe, so the fix round kept route B.
+- **The moves into new folders** stay at the cost pass's +5 to 7%. `outofnew` stays at its accepted cost (item 20),
+  and the overflow at its restart walk. The rest overlap 0.55.1.
 
 ## 8. Gates
 
@@ -1219,6 +1209,10 @@ Each ruling that was the main session's, each call this spec made on its own, an
       1.5 µs a probe, against 7.5 to 8.6 µs with a realpath each. A parent replaced by a symlink within one read could
       pass a probe through it until the next read; the events of that replacement follow in the queue (the fix round's
       call, as for one settle's probes).
+    - **Route B kept, not route A** (the fix round's call, against the ruling's letter). After the realpath sharing,
+      `renamesold` at 20,000 still missed 0.55.1's range once, by 2.3%. But the probe costs 0.17% of the watcher's time
+      there, and the same code with the probe off is no faster. A second set overlaps 0.55.1 (section 7). Route A would
+      save only the probe.
     - **The settle keeps only the outermost paths that left** (finding 4).
     - **Parts that went:** `through_link()`'s form with no shared real paths;
       `tests/test_jobs.py::test_removing_many_watches_writes_no_queue_limit`. `move_watches()` still returns its list,
