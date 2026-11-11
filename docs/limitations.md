@@ -154,12 +154,13 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** known limitation.
 - **What the operator sees:** for the pair timeout after a folder is moved out of the tree (the larger of the job's
   minimum snapshot delay and 30 s: 60 s by default, an hour on a job whose minimum delay is an hour), anything moved
-  from that folder back into the tree, as in `mv X /out/X; mv /out/X/sub sub`, is copied whole instead of renamed in
-  the vault, with one INFO line, `Copying <path>, moved from <path>: a watch of the move is not settled`. Until the
-  watcher next finds its event queue empty, normally at the end of that read, the same copy covers a rename in a folder
-  moved onto the place of one that had just left the tree and then moved on, in either folder of a swap by one rename
-  (`RENAME_EXCHANGE`), and in a folder the watcher found at a place its events had not brought it to yet (a rename
-  racing the walk of a folder just moved or made). For the pair timeout too, a rename inside a folder that left the
+  from that folder back into the tree, as in `mv X /out/X; mv /out/X/sub sub`, is copied whole instead of renamed in the
+  vault, with one INFO line, `Copying <path>, moved from <path>: a watch of the move is not settled`. Until the watcher
+  next finds its event queue empty, normally at the end of that read, the same copy covers a rename in a folder moved
+  onto the place of one that had just left the tree and then moved on, in either folder of a swap by one rename
+  (`RENAME_EXCHANGE`), in a folder the watcher found at a place its events had not brought it to yet (a rename racing
+  the walk of a folder just moved or made), and in a folder that was renamed and then renamed again, itself or a folder
+  above it, before the watcher read the first rename. For the pair timeout too, a rename inside a folder that left the
   tree, made after another folder was moved to its old place (`mv X /out/X; mv Y X; mv /out/X/a /out/X/b`, or the same
   with X's parent renamed in between), is reported at X's old path: the entry named b in the folder now at X, if it has
   one, is copied whole once, with the same line. 0.55.1 renamed these. The version is right; the copy costs the moved
@@ -171,7 +172,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   its own design.
 - **Approved:** 2026-11-09, the user's choice "Accept: copy (Recommended)"; then, with the window corrected to the pair
   timeout and the routes named, "Approve as corrected (Recommended)"; 2026-11-10, the rename inside a folder that left
-  the tree after another took its place, "Add the sentence (Recommended)".
+  the tree after another took its place, "Add the sentence (Recommended)"; 2026-11-11, a folder renamed again (itself
+  or a folder above it) before the watcher read the first rename, "Widen the entry (Recommended)".
 
 ### A folder found ahead of its events can reach the vault a version late
 
