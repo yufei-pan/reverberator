@@ -159,7 +159,10 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   watcher next finds its event queue empty, normally at the end of that read, the same copy covers a rename in a folder
   moved onto the place of one that had just left the tree and then moved on, in either folder of a swap by one rename
   (`RENAME_EXCHANGE`), and in a folder the watcher found at a place its events had not brought it to yet (a rename
-  racing the walk of a folder just moved or made). 0.55.1 renamed these. The version is right; the copy costs the moved
+  racing the walk of a folder just moved or made). For the pair timeout too, a rename inside a folder that left the
+  tree, made after another folder was moved to its old place (`mv X /out/X; mv Y X; mv /out/X/a /out/X/b`, or the same
+  with X's parent renamed in between), is reported at X's old path: the entry named b in the folder now at X, if it has
+  one, is copied whole once, with the same line. 0.55.1 renamed these. The version is right; the copy costs the moved
   entry's size once, and with a size limit it can prune older versions, as the copy of a move into a new folder can.
 - **Why:** such a folder's watch can report its moves at a path another folder now has; trusting it is how a version
   kept a file's old bytes for good, and telling the two folders apart needs the watch tree of round 22's first design
@@ -167,7 +170,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the log shows big copies from this route often. Also when the no-copy move into a new folder gets
   its own design.
 - **Approved:** 2026-11-09, the user's choice "Accept: copy (Recommended)"; then, with the window corrected to the pair
-  timeout and the routes named, "Approve as corrected (Recommended)".
+  timeout and the routes named, "Approve as corrected (Recommended)"; 2026-11-10, the rename inside a folder that left
+  the tree after another took its place, "Add the sentence (Recommended)".
 
 ### A folder found ahead of its events can reach the vault a version late
 
@@ -285,6 +289,19 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   the entry above.
 - **Approved:** 2026-10-27, the user's choice "Known limitation (Recommended)". 0.55.3 narrows it to
   a file under an inner mount paused at the next attempt.
+
+### A write error on a paused mount's copy, with no reboot
+
+- **Kind:** deferred.
+- **What the operator sees:** a batch whose own flush failed raises VAULT WRITE ERROR, and its next attempt copies again
+  what it wrote, except a file under an inner mount that is paused at that attempt. When the mount comes back without a
+  reboot, the full comparison reads that copy back by size, mtime and last 64 KiB, and the read can come from the page
+  cache, which still holds what was meant to be written: a copy wrong on the disk passes, and the newest version keeps
+  it until the file changes again. The alert has fired by then.
+- **Why:** 0.55.2's failed-sync marker kept such a copy unchecked until a reboot; 0.55.3 dropped the markers, as each
+  unit now hears its own write errors.
+- **Revisit when:** the round after round 22, with the fix at source of the two entries above: the roll-forward links
+  the previous version's record back over a recorded file it cannot copy again, which closes all three.
 
 ### A clock set back after a read was stamped
 
@@ -730,6 +747,28 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the no-copy move gets its own design; sooner if size limits start pruning because of it.
 - **Approved:** 2026-11-07, "Drop the feature (Recommended)": 0.55.1 ships with every move into a new folder copied, as
   on 0.55, and the no-copy move gets its own design later.
+
+### A pool vault on a mount of its own fails every backup
+
+- **Kind:** deferred.
+- **What the operator sees:** on a mergerfs pool, a job whose vault folder on a branch disk is on another filesystem
+  than that disk's root (a mount nested under the branch, a btrfs subvolume) fails every attempt with `<folder> is not
+  on a filesystem this step opened: what was written there is not known to be on disk`, and makes no version. No live
+  job has such a vault.
+- **Why:** each unit opens one handle at each branch's root before its first write, and refuses to vouch for a write on
+  a filesystem none of its handles is on, as that handle would miss an error another sync saw.
+- **Revisit when:** the round after round 22: open each branch's handle at the job vault's folder on it (or its nearest
+  existing parent), so the handle is on the filesystem that holds the vault.
+
+### A start with changes pending makes two versions
+
+- **Kind:** deferred.
+- **What the operator sees:** a restart with a batch pending commits that batch as one version, then the start's full
+  comparison commits what changed while the daemon was down as another, a second later (seen on a live job's restart,
+  2026-11-10). Under a Keep count, each such restart pushes one more old version out.
+- **Why:** the start resumes the pending batch and commits it before the comparison runs.
+- **Revisit when:** the round after round 22: one version per start, the resumed batch and the comparison's changes
+  together.
 
 ### A batch with nothing to do still makes two commits
 
