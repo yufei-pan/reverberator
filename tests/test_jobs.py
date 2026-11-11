@@ -736,28 +736,6 @@ def test_ignored_and_unknown_watch_events_log_quietly(monkeypatch, poll_fast):
 	assert unknown and '{' not in unknown[0]
 
 
-def test_removing_many_watches_writes_no_queue_limit():
-	# each removal queues an IN_IGNORED against the limit the kernel read when the instance was made: raising the sysctl
-	# makes no room in it, so the watcher removes a big set in parts instead (settle())
-	class FakeIrm:
-		max_queued_events = 10
-		def __init__(self):
-			self.raised = []
-		def increaseInotifyMaxQueueEvents(self, max_events):
-			self.raised.append(max_events)
-			return True
-		def decreaseUserWatches(self, count=1):
-			pass
-	class FakeINotify:
-		def rm_watch(self, wd):
-			pass
-	wd_dic = {i: f'/m/d/{i}/' for i in range(30)}
-	wd_dic[100] = '/m/d'
-	irm = FakeIrm()
-	assert rv.remove_watches_under(FakeINotify(), wd_dic, irm, '/m/d') == 31
-	assert not irm.raised and wd_dic == {}
-
-
 def _fake_inotify_with(events_first, monkeypatch):
 	flags = rv.inotify_simple.flags
 	class FakeINotify:

@@ -367,7 +367,7 @@ def test_removing_a_watch_already_gone_does_nothing():
 
 @pytest.mark.parametrize('kind', ['found', 'leaving', 'doubtful'])
 def test_a_folder_deleted_while_its_watch_is_flagged_leaves_every_set(session, job, tmp_path, monkeypatch, kind):
-	'''A watch that leaves the watch map leaves found, leaving, doubtful, outgoing and newDirWDs with it.'''
+	'''A watch that leaves the watch map leaves found, leaving, doubtful and outgoing with it.'''
 	notes = captured_notes(monkeypatch)
 	maps = latest_map(monkeypatch)
 	blind = blinded_probes(monkeypatch)
@@ -399,7 +399,7 @@ def test_a_folder_deleted_while_its_watch_is_flagged_leaves_every_set(session, j
 		shutil.rmtree(f'{m}/other')
 	wait_until(lambda: wd not in maps[-1][1], message='the deleted folder is still watched')
 	left = notes[-1]
-	assert not [name for name in ('found', 'found_takes', 'leaving', 'doubtful', 'outgoing', 'new_dirs') if wd in getattr(left, name)]
+	assert not [name for name in ('found', 'found_takes', 'leaving', 'doubtful', 'outgoing') if wd in getattr(left, name)]
 
 
 def test_a_probe_that_cannot_look_leaves_the_watch_flagged(session, job, tmp_path, monkeypatch):
@@ -682,3 +682,95 @@ def test_a_placed_watch_whose_folder_leaves_before_the_settles_walk(session, job
 	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
 	assert state['moved'] or not during
 	assert not stale_after_move and not bad and not stale and not missing, (relative(batch, m), stale_after_move, bad, stale, missing)
+
+
+@pytest.mark.parametrize('run', range(3))
+@pytest.mark.parametrize('when', ['before_the_create_is_read', 'after'])
+def test_a_folder_made_during_the_first_walk_whose_subfolder_leaves(session, job, tmp_path, monkeypatch, when, run):
+	'''
+	The final review's finding 1, through the first walk: a folder made while the first walk runs, in a folder the walk has
+	watched and not listed yet, so its create is queued and the walk watches it and its subfolder, neither as new. The
+	subfolder leaves the tree before the create is read: the create's walk then makes the folder new, the subfolder's
+	move-out is read on it and discarded (no cookie), and only the subfolder's IN_MOVE_SELF tells the move. With the
+	MOVE_SELF rule's old set condition the watch, in no set, was skipped and stayed at a/n/w (3 of 3). The control moves
+	the subfolder out once its parent's create is read.
+	'''
+	maps = latest_map(monkeypatch)
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	m = job.monitor
+	flags = rv.inotify_simple.flags
+	real_add, real_read = rv.inotify_simple.INotify.add_watch, rv.inotify_simple.INotify.read
+	state = {'made': False, 'moved': False}
+	def add_watch(inotify, path, mask):
+		wd = real_add(inotify, path, mask)
+		if not state['made'] and path.rstrip('/') == f'{m}/a' and not mask & flags.ONLYDIR:
+			# a is watched and not listed yet
+			state['made'] = True
+			os.makedirs(f'{m}/a/n/w')
+		return wd
+	def read(inotify, *args, **kwargs):
+		if when == 'before_the_create_is_read' and state['made'] and not state['moved']:
+			state['moved'] = True
+			os.rename(f'{m}/a/n/w', outside / 'w')
+		return real_read(inotify, *args, **kwargs)
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'add_watch', add_watch)
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+	one = session({'a/x': 'x', 'other/o': 'o'})
+	assert state['made']
+	held = sorted(os.path.relpath(path, m) for path in maps[-1][1].values())
+	if when == 'after':
+		one.settle()
+		os.rename(f'{m}/a/n/w', outside / 'w')
+	one.back_up_next()
+	one.apply(('write', 'other/marker', 'm'))
+	one.back_up_next()
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list, add_watch=real_add)
+	# the watch map alone: the session drops the batch it takes at its start, which holds the create made during the walk
+	assert not stale and not missing, (held, stale, missing)
+
+
+@pytest.mark.parametrize('run', range(3))
+@pytest.mark.parametrize('order', ['interleaved', 'as_made'])
+def test_a_move_self_between_an_ancestors_move_out_and_its_pair(session, job, tmp_path, monkeypatch, order, run):
+	'''
+	The final review's finding 2: a subfolder of a folder made in the batch leaves the tree (its move-out read on the new
+	folder's watch, so no cookie), while a folder above them is renamed inside the tree by another thread, the kernel
+	queueing the subfolder's MOVED_FROM and IN_MOVE_SELF between the ancestor rename's MOVED_FROM and MOVED_TO. The
+	ancestor's move-out holds the subfolder's watch when its IN_MOVE_SELF is read, and its pair then takes the watch to
+	y/n/w: with the old rule, which skipped any watch a move-out held, it stayed there (3 of 3). The order is forced on the
+	read: the two renames are made one after the other, unread, and their events handed over as two threads can queue
+	them. The control hands them over as made (the subfolder's first).
+	'''
+	maps = latest_map(monkeypatch)
+	one = session({'x/keep': 'k', 'other/o': 'o'})
+	m = job.monitor
+	outside = tmp_path / 'outside'
+	outside.mkdir()
+	one.run([('mkdir', 'x/n'), ('mkdir', 'x/n/w')], 'apart')
+	one.settle()
+	w = watch_of(maps[-1][1], f'{m}/x/n/w')
+	flags = rv.inotify_simple.flags
+	real_read = rv.inotify_simple.INotify.read
+	state = {'done': False, 'seen': None}
+	def read(inotify, *args, **kwargs):
+		events = real_read(inotify, *args, **kwargs)
+		if state['done'] or not any(e.mask & flags.MOVED_TO and e.name == 'y' for e in events):
+			return events
+		state['done'] = True
+		sub = [e for e in events if (e.mask & flags.MOVED_FROM and e.name == 'w') or (e.mask & flags.MOVE_SELF and e.wd == w)]
+		first = [e for e in events if e.mask & flags.MOVED_FROM and e.name == 'x']
+		rest = [e for e in events if e not in sub and e not in first]
+		assert len(sub) == 2 and len(first) == 1, events
+		state['seen'] = [(e.wd, str(flags.from_mask(e.mask)), e.name) for e in (first + sub + rest if order == 'interleaved' else events)]
+		return first + sub + rest if order == 'interleaved' else events
+	# before unread(), which puts back the read it found
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'read', read)
+	with one.unread():
+		os.rename(f'{m}/x/n/w', outside / 'w')
+		os.rename(f'{m}/x', f'{m}/y')
+	one.back_up_next()
+	one.apply(('write', 'other/marker', 'm'))
+	one.back_up_next()
+	stale, missing = watch_map_errors(*maps[-1], m, skip_list=one.skip_list)
+	assert state['done'] and not wrong(job) and not stale and not missing, (state['seen'], wrong(job), stale, missing)

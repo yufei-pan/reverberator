@@ -1,5 +1,7 @@
 # Round 22 design: the watcher keeps each watch where the events put it (the watch tree)
 
+**Not built.** This is the record of round 22's first design; what was built is the step back, 2026-11-09-round22-stepback.md.
+
 Version 0.55.2. It fixes the watcher's three older deferred entries in docs/limitations.md, all on 0.55 and 0.55.1:
 - "A folder renamed twice into a folder whose move is being walked can keep old bytes" (round 21 review 4's F2);
 - "A folder moved out of the tree from a new folder keeps its watch" (review 4's F3, round 21's R5 phantom, review 5's F1);

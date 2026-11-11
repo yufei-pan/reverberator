@@ -235,6 +235,10 @@ SHAPES = {
 	# the same, with a folder made again at the path that left
 	'lag_child_out_back': [('mv', 'big', '{outside}/big'), ('mv', 'other', 'o2'), ('mv', '{outside}/big', 'o2/big'), ('mkdir', 'o2/big/dd'),
 		('mv', 'o2/big/dd', '{outside}/dd'), ('mkdir', 'o2/big/dd')],
+	# the final review's finding 1: a folder made in a folder being renamed, and a subfolder in it, both watched by the
+	# rename's pairing walk (not as new); the folder's create, read later, makes it new, and the subfolder's move-out out
+	# of the tree is then read on it and discarded: only its IN_MOVE_SELF tells the move (105 of 816 orders stale on 3ff5027)
+	'pair_then_new_sub_out': [('mv', 'other', 'o2'), ('mkdir', 'o2/n'), ('mkdir', 'o2/n/w'), ('mv', 'o2/n/w', '{outside}/w')],
 }
 NAMES = [name for name in os.environ.get('REVERB_WATCH_SCHED_SHAPES', ','.join(SHAPES)).split(',') if name]
 
@@ -281,7 +285,7 @@ def test_a_schedule_ends_as_the_tree(folders_removed, session, job, tmp_path, mo
 		return real_init(inotify_obj, monitor_path, wdDic, *args, **kwargs)
 	monkeypatch.setattr(rv, 'initializeFolderWatchers', init)
 	one = session(TREE)
-	state = {'visits': 0, 'done': 0, 'armed': False, 'inside': False}
+	state = {'visits': 0, 'done': 0, 'armed': False, 'inside': False, 'failed': []}
 	log = []
 	def visit(where):
 		if not state['armed'] or state['inside']:
@@ -304,6 +308,7 @@ def test_a_schedule_ends_as_the_tree(folders_removed, session, job, tmp_path, mo
 				log.append(('step', at, where, step))
 				if failed:
 					log.append(('failed', failed))
+					state['failed'].append((state['done'] - 1, failed))
 		finally:
 			state['inside'] = False
 	class Events(list):
@@ -336,6 +341,12 @@ def test_a_schedule_ends_as_the_tree(folders_removed, session, job, tmp_path, mo
 	state['armed'] = True
 	wait_until(lambda: state['done'] == len(steps), timeout=20, message='steps not run')
 	state['armed'] = False
+	# a step that fails (OSError) counts as done, so an order can test less than its shape says: with
+	# REVERB_WATCH_SCHED_FAILED_STEPS naming a folder, each such step writes a line there, for a gate run to count by shape
+	failed_steps = os.environ.get('REVERB_WATCH_SCHED_FAILED_STEPS')
+	if failed_steps and state['failed']:
+		with open(os.path.join(failed_steps, f'{os.getpid()}.txt'), 'a') as f:
+			f.writelines(f'{name}\t{"_".join(map(str, vector))}\t{index}\t{error}\n' for index, error in state['failed'])
 	one.back_up_next()
 	time.sleep(0.01)
 	one.back_up_next()
