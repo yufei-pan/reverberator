@@ -40,8 +40,12 @@ H = {'moved_into_a_folder_from_outside': 12, 'poke_between': 12, 'cpp_between': 
 	'nested_out_ancestor': 12, 'moved_sub_out_before_walk': 12, 'back_into_new_then_out': 12, 'pairing_walk_under_new': 12,
 	'renamed_in_new_then_out': 12, 'renamed_in_new_then_out_sub': 12, 'out_of_new_then_out': 12, 'out_of_new_then_out_sub': 12,
 	# the cost pass: the orders that need rules 2 and 3 come after visit 16
-	'new_sub_walked_by_pair_then_out': 28, 'into_renamed_new_then_out': 28}
+	'new_sub_walked_by_pair_then_out': 28, 'into_renamed_new_then_out': 28,
+	# re-review 2: two steps spread over the pairing walk of o2, the four before them all at the first visit (AT_ONCE)
+	'lag_child_out': 40, 'lag_child_out_back': 40}
 H_DEFAULT = 16
+# shapes whose first steps all run at the first visit, so that only the later ones spread over the visits
+AT_ONCE = {'lag_child_out': 4, 'lag_child_out_back': 4}
 SAMPLE = int(os.environ.get('REVERB_WATCH_SCHED_SAMPLE', '100'))
 BIG = 'p' * 200000
 TREE = {'big/a': BIG, 'big/sub/b': BIG, 'big/sub/deep/x': 'x' * 100, 'next/z': 'z' * 100, 'next2/sub/z': 'z' * 100, 'f.txt': 'f' * 300, 'g.txt': 'g' * 300,
@@ -222,6 +226,15 @@ SHAPES = {
 	# copy of a found folder is left to the create that noted it only when no take came between
 	'back_as_new_name': [('mv', 'big', '{outside}/big'), ('mv', '{outside}/big', 'big2'), ('poke', 'big2/a')],
 	'back_as_new_name_take': [('mv', 'big', '{outside}/big'), ('mv', '{outside}/big', 'big2'), ('take',), ('poke', 'big2/a')],
+	# re-review 2: a folder back from outside into a folder being renamed, whose pairing walk meets it (found, mapped at its
+	# old path still) and adds the watch of a folder made in it at its place; that folder then moved out of the tree, read
+	# on the found folder's watch at its lagging path. The move-out's cookie must hold the new watch, which is mapped under
+	# the found place, not under the path the event gives (without it, its IN_MOVE_SELF is skipped and the watch stays)
+	'lag_child_out': [('mv', 'big', '{outside}/big'), ('mv', 'other', 'o2'), ('mv', '{outside}/big', 'o2/big'), ('mkdir', 'o2/big/dd'),
+		('mv', 'o2/big/dd', '{outside}/dd'), ('write', '{outside}/dd/w', 'w')],
+	# the same, with a folder made again at the path that left
+	'lag_child_out_back': [('mv', 'big', '{outside}/big'), ('mv', 'other', 'o2'), ('mv', '{outside}/big', 'o2/big'), ('mkdir', 'o2/big/dd'),
+		('mv', 'o2/big/dd', '{outside}/dd'), ('mkdir', 'o2/big/dd')],
 }
 NAMES = [name for name in os.environ.get('REVERB_WATCH_SCHED_SHAPES', ','.join(SHAPES)).split(',') if name]
 
@@ -230,7 +243,8 @@ def vectors(name):
 	# the first step at the first visit: before it the watcher only reads an idle tree, so a later start is the same schedule
 	steps = len(SHAPES[name])
 	bound = int(os.environ.get('REVERB_WATCH_SCHED_H', H.get(name, H_DEFAULT)))
-	every = [(0, *rest) for rest in itertools.combinations_with_replacement(range(bound), steps - 1)]
+	first = AT_ONCE.get(name, 1)
+	every = [(0,) * first + rest for rest in itertools.combinations_with_replacement(range(bound), steps - first)]
 	return every if not SAMPLE or len(every) <= SAMPLE else sorted(random.Random(name).sample(every, SAMPLE))
 
 

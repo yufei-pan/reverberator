@@ -2994,15 +2994,6 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			for wd, wd_path in moved:
 				notes.doubtful.setdefault(wd, wd_path)
 		return moved
-	def leave_moved_out(path:str):
-		# the watches at or under path, a folder moved out of a folder made since the last take with no watch of its own, go
-		# once the queue is empty, but for those a walk finds in the tree by then. the move-out is in the events' view, so
-		# each the events hold is mapped at or under its path; no set names them all, so it is one pass over the map
-		path_norm = path.rstrip('/') or '/'
-		prefix = path_norm + '/' if path_norm != '/' else '/'
-		for wd, wd_path in wdDic.items():
-			if wd_path == path_norm or wd_path.startswith(prefix):
-				notes.leaving.add(wd)
 	def stamp_found():
 		# the take count this read knew, for each watch a walk of it found: settle() copies its folder only after a take
 		if len(notes.found_takes) != len(notes.found):
@@ -3399,9 +3390,9 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 								to_process.append(ChangeEvent(monTime,True,'scan',eventPath,None))
 					if isDir and event.mask & flags.MOVED_FROM and unwatched and (eventPath.rstrip('/') or '/') in unwatched:
 						# no cookie is kept (the new folder's copy holds what it was), and the kernel tells the moved folder's own
-						# watch (IN_MOVE_SELF, above), which this one lacks, as adding it failed: its subfolders' watches are
-						# looked for by their paths
-						leave_moved_out(eventPath)
+						# watch (IN_MOVE_SELF, above), which this one lacks, as adding it failed: its subfolders' watches, at or
+						# under its path, go once the queue is empty, but for those a walk finds in the tree by then
+						leave(watches_under(wdDic,eventPath))
 					if isDir and event.mask & (flags.DELETE | flags.MOVED_FROM):
 						# gone from here; its new place, if in the tree, is walked when its move-in is read
 						forget_unwatched_under(unwatched,eventPath)
@@ -3436,7 +3427,12 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						continue
 					if DEBUG:
 						watcherTeeLogToTl(monitor_path,f'Move from event detected for {eventPath}')
-					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir,watches_under(wdDic,eventPath) if isDir else ())
+					wds = watches_under(wdDic,eventPath) if isDir else ()
+					if isDir and event.wd in notes.found:
+						# a walk met this folder at another place than its events give it, and watched what it held there:
+						# those watches are mapped under that place, not under eventPath
+						wds = tuple(dict.fromkeys(wds + watches_under(wdDic,os.path.join(notes.found[event.wd],event.name))))
+					cookieDic[event.cookie] = COOKIE_VALUE(event.wd,eventPath,isDir,wds)
 					# they left with it: until it lets them go, a move they report is not renamed in the vault
 					notes.hold(cookieDic[event.cookie].wds)
 					while len(cookieDic) > COOKIE_DICT_MAX_SIZE:

@@ -212,7 +212,7 @@ All live in `watchFolder()` for one watch's life; an overflow's restart starts t
 | Structure | What it holds | What it keeps true |
 |---|---|---|
 | `wdDic` (wd → path) | as 0.55.1 | each path is where the events read so far put the folder, except while the watch is guarded. Only `move_watches()` at an unguarded pairing, the settle (on an empty queue) and removals change a held watch's path; a walk writes only the path of a watch it adds |
-| `cookieDic` (cookie → `COOKIE_VALUE(wd, path, isDir, wds)`) | as 0.55.1: a move-out waiting for its pair; `wds`, the watches mapped at or under its path when its `MOVED_FROM` was read | a cookie holds its `wds` in `outgoing` from its `MOVED_FROM` until it lets them go, once |
+| `cookieDic` (cookie → `COOKIE_VALUE(wd, path, isDir, wds)`) | as 0.55.1: a move-out waiting for its pair; `wds`, the watches mapped at or under its path when its `MOVED_FROM` was read, and, when the watch that reported it is `found`, those under the folder's place below the found place (section 4) | a cookie holds its `wds` in `outgoing` from its `MOVED_FROM` until it lets them go, once |
 | `newDirWDs` (set) | as 0.55.1: the watches of folders made since the last take, whose events are discarded (the batch's copy holds them) | a watch whose folder can leave a new folder by a move read on the new folder's watch is in `newDirWDs` or `found` (or `new_before_take`, section 4): the MOVE_SELF rule's domain (3.3), which the rules below keep. It is not every watch under its folders (review 1's probe found some in neither set), and nothing looks only there for what a path holds |
 | `found` (wd → path) | a held watch a walk met at another path than its own, with the path the walk saw, and the take count the watcher knew at that read (3.4) | the watch is guarded until the next settle, which clears it |
 | `outgoing` (wd → count) | for each watch, how many cookies hold it | the count is the number of cookies still holding the watch; the entry goes at zero |
@@ -317,7 +317,7 @@ and a watch mapped in a new folder and not in `newDirWDs` is in `found`, hence g
 |---|---|---|
 | A walk meets a watch held at another path | puts it there (`wdDic[wd] = folder`), and in `newDirWDs` for a create's walk | leaves it where the events put it, notes the path the walk saw in `found`, and does not add it to `newDirWDs` (3.5) |
 | A walk adds a watch below a folder of `newDirWDs` | in `newDirWDs` only for a create's walk | in `newDirWDs` for any walk (rule 3) |
-| Folder `MOVED_FROM` | cookie with the watches under the path | the same; each of them gains one in `outgoing` |
+| Folder `MOVED_FROM` | cookie with the watches under the path | the same, and when the watch that reports it is `found`, also the watches under the folder's place below the found place (re-review 2, section 4); each of them gains one in `outgoing` |
 | Folder `MOVED_FROM` in a new folder (discard branch) | nothing: the watches stay for good | no cookie, as on 0.55.1. The moved folder's `IN_MOVE_SELF` marks its watch (the next row). For a moved folder whose own watch failed (it is in `unwatched`), the watches at or under the path, by one pass over the map, are `leaving` |
 | A subfolder's `IN_MOVE_SELF` | skipped | for a watch in `newDirWDs` or `found` that no pending move-out holds: a probe of its path. Unless the watch is there, it is `doubtful` with that path (the MOVE_SELF rule, below). Any other is skipped |
 | `MOVED_TO`, cookie known, neither folder's watch guarded | `move` recorded, every path under the old one rewritten, walk | the same (`move_watches()`, 0.55.1's loop; walk with `found`); the cookie lets go |
@@ -577,7 +577,8 @@ What the step back leaves, reasoned, not run, each with its bucket:
   1 read it at 3e87c9c), and kept closed by the settle's full pass over the map. Its walk keeps the mount's events, so
   its watches are not in `newDirWDs`. The route: a move out of the tree, read on the new folder's watch, of a folder
   holding the mount point. It needs a disk mounted below a folder made in the same batch, and a folder inside the new
-  one and above the mount point moved out of the tree in that batch. The moved folder's watch is in `newDirWDs`, so the
+  one and above the mount point moved out of the tree in that batch (the mount point itself cannot be renamed:
+  `rename()` gives `EBUSY`). The moved folder's watch is in `newDirWDs`, so the
   MOVE_SELF rule makes it doubtful; the settle does not find it at its path, so that path left, and the pass over the
   map sends the mount's watches under it to `leaving`, where each is probed at its own path and removed. Fix round 1's
   narrowed pass, among `newDirWDs` and the found watches only, missed them, and the route was open again until fix
@@ -635,6 +636,23 @@ What the step back leaves, reasoned, not run, each with its bucket:
     - The watch numbers of the folders made in one batch period are kept, as a set, until the next take.
     - An `IN_MOVE_SELF` of such a folder's watch that no move-out holds costs one probe, as it does for the current
       period's. That is a rename within the tree of a folder made in the batch before.
+- **A folder made under a found folder's place, then moved out of the tree on that folder's watch: closed**
+  (re-review 2's finding 1; the main session's ruling: Fix now).
+  - **The route:** `mv big /out/big; mv other o2; mv /out/big o2/big; mkdir o2/big/dd; mv o2/big/dd /out/dd`. o2's
+    pairing walk meets big's watch at `o2/big`, while the events still map it at `big` (big's move-out is pending), so
+    the watch is `found`. The walk then adds dd's watch at `o2/big/dd`.
+  - **What went wrong.** dd's move-out comes on big's watch, at the lagging path `big/dd`. The cookie's
+    `watches_under()` of that path missed dd's watch, and dd's `IN_MOVE_SELF` was skipped, as the watch is in no set
+    (it was added below a found folder, not below one of `newDirWDs`). The watch stayed mapped at `o2/big/dd` for
+    good: review 5's F1 route once another folder holds that path. 0.55.1 has the route too (re-review 2: 28 of 103
+    orders).
+  - **The fix.** When the watch that reports a folder's `MOVED_FROM` is `found`, the cookie also holds the watches at
+    or under the folder's place below the found place. Its pairing or expiry then deals with them as with the others.
+  - **Shapes:** `lag_child_out` (then a write in `/out/dd`) and `lag_child_out_back` (a folder made again at
+    `o2/big/dd`). Their first four steps run at the first visit and the last two at every pair of visits up to 40
+    (the schedule file's `AT_ONCE`): 820 orders each. On 898961f, 57 of the 1,640 fail (28 and 29). Each failure keeps
+    dd's watch at `o2/big/dd`, with the folder gone or a new folder's watch beside it. None shows wrong bytes in
+    these shapes. With the fix, all 1,640 pass.
 
 ## 5. What changes for the operator
 
@@ -843,8 +861,9 @@ for `outofnew` and `renamesinnew`; the host's load rose from about 8 to 110 whil
   watches, which alone takes 1.0 to 1.1 ms. Fix round 1 measured the same pass at 0.191 to 0.220 s. Its tree, run
   again beside 898961f (three runs each, alternating), gave 0.355 to 0.370 s against 0.323 to 0.350 s, so the difference
   is the host's, not the code's.
-- **`renamesinnew` does not reach the map pass of `leave_moved_out()`.** That pass runs only for a folder in
-  `unwatched`, and a profile of 20,000 renames shows no call to it. Over nine runs each, the median is 0.505 s on the
+- **`renamesinnew` does not reach the map pass of `leave_moved_out()`** (gone in fix round 3: its one caller takes
+  `watches_under()`, the same pass). That pass runs only for a folder in `unwatched`, and a profile of 20,000 renames
+  shows no call to it. Over nine runs each, the median is 0.505 s on the
   branch against 0.490 s on 0.55.1, and each code's runs overlap the other's.
 - **The rest** overlap 0.55.1, but for the moves into new folders, still about +5% (the cost pass's figure), and the
   overflow's restart walk.
@@ -1146,4 +1165,13 @@ Each ruling that was the main session's, each call this spec made on its own, an
       watches (section 7, fix round 2). The ruling accepted fix round 1's figure for the same pass, 0.19 to 0.22 s
       (about 0.7 ms each); fix round 2's runs put it at about 1 ms.
     - The look for a moved folder with no watch of its own (`leave_moved_out()`, a folder in `unwatched`) is one pass
-      over the map too, as it had leaned on the same premise (fix round 2's call; the case is rare).
+      over the map too, as it had leaned on the same premise (fix round 2's call; the case is rare). Fix round 3
+      removed `leave_moved_out()`: its one caller makes `watches_under()` of the path `leaving`, as the moves into a
+      skipped folder do.
+21. **Re-review 2** (fix round 3; the main session's rulings, all Fix now):
+    - A folder move-out read on a `found` watch: the cookie also holds the watches under the folder's place below the
+      found place (section 4, `lag_child_out` and `lag_child_out_back`).
+    - `leave_moved_out()` goes: its one caller makes `watches_under()` of the path `leaving`.
+    - The schedule file gains `AT_ONCE`, for a shape whose first steps all run at the first visit (the fix round's
+      call, for the reviewer's vectors `(0, 0, 0, 0, i, j)`). The suite samples 100 orders of each of the two shapes, as
+      for any shape over the sample size; the gates run all 1,640.
