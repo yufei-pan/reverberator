@@ -782,8 +782,10 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   after a cut puts the cut batch's tree back is seen by no guard either: the version before's listing misses the names
   on that disk, and the scan's removals of what the cut batch made (the put-back's, and those of a name left a folder on
   one disk and something else on another) can remove an entry that version's forward link names, so once the disk is
-  back that version has lost it. A disk unmounted at that moment is caught, and the scan stops before it removes
-  anything. Reasoned from the code, not run.
+  back that version has lost it. A disk unmounted at that moment is caught: the start's repair checks the pool before
+  every act that trusts a listing (its removals, the judgement of a leftover version folder, and its end, before a
+  backup uses the scan), and stops with nothing removed (the user's pick of 2026-11-13, "Finish the check rule
+  (Recommended)"; a test on a real mergerfs pool shows it). The control-file case is reasoned from the code, not run.
 - **Why:** older than 0.55.5. A flush picks its handles by the disks the pool lists at that moment, and the pool check
   looks for a listed disk that is missing or was mounted again, not for one the pool stopped listing; the scan's guard
   asks the same.
