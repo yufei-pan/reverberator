@@ -26,6 +26,15 @@ def _fail_scandir(monkeypatch, failing_path, err):
 	monkeypatch.setattr(os, 'scandir', scandir)
 
 
+def _fail_lstat(monkeypatch, failing_path, err):
+	original = os.lstat
+	def lstat(path, *args, **kwargs):
+		if isinstance(path, (str, bytes)) and os.path.abspath(os.fsdecode(path)).rstrip('/') == os.path.abspath(failing_path).rstrip('/'):
+			raise OSError(err, os.strerror(err), path)
+		return original(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'lstat', lstat)
+
+
 def test_unreadable_folder_keeps_entries_and_logs_once(job, poll_fast, monkeypatch, capsys):
 	seed_monitor(job, {'a.txt': 'a', **{f'big/f{i}.txt': str(i) for i in range(500)}})
 	_backup(job)[1].close()
@@ -924,14 +933,18 @@ def test_a_mode_000_folder_still_logs_its_error_and_unreadable_lines(job, poll_f
 	assert _row(job, 'locked/b.txt') is not None
 
 
-def test_a_folder_listed_but_never_opened_keeps_its_error_and_unreadable_lines(job, poll_fast, monkeypatch, capsys):
-	# pin, R32: a folder its parent lists and the kernel cannot open, every time, while an lstat still finds it (name trouble on a
-	# FUSE, CIFS or NTFS mount): its contents are not backed up, so it keeps its ERROR line and UNREADABLE alert at every walk, and
-	# its rows stay
+@pytest.mark.parametrize('lookup', ['lstat_finds_it', 'lstat_fails_too'])
+def test_a_folder_listed_but_never_opened_keeps_its_error_and_unreadable_lines(job, poll_fast, monkeypatch, capsys, lookup):
+	# pin, R32 and R44: a folder its parent lists and the kernel cannot open, every time (name trouble on a FUSE, CIFS or NTFS mount):
+	# its contents are not backed up, so it keeps its ERROR line and UNREADABLE alert at every walk, and its rows stay. An lstat of it
+	# may find it, or fail with ENOENT as well, since a name the kernel cannot look up fails both: only the parent's listing says
+	# whether it is gone. Fails on 850ecf5 with the lstat failing too: one INFO line, no ERROR line, no UNREADABLE alert
 	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
 	_settled(job)
 	folder = os.path.join(job.monitor, 'd')
 	_fail_scandir(monkeypatch, folder, errno.ENOENT)
+	if lookup == 'lstat_fails_too':
+		_fail_lstat(monkeypatch, folder, errno.ENOENT)
 	for _ in range(2):
 		lines = _walk_lines(monkeypatch)
 		capsys.readouterr()

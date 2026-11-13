@@ -3748,10 +3748,10 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 	A folder that cannot be read is logged, and (its rel_prefix, error) is appended to errors when given: its entries
 	are missing from the walk, which is not the same as being deleted. The walk root reports rel_prefix as given. A
 	folder gone when the walk reaches it (made and removed while the walk passed, as git or a build does) is a race its
-	delete event or the next full comparison covers: its own listing fails to open with ENOENT or ENOTDIR and an lstat
-	of it agrees, so it gets one info line, at every level, the walk root's too, and is appended as a FolderGone. Any
-	other error, one an lstat does not confirm (a folder listed that cannot be opened, as a FUSE mount's name trouble
-	gives every time), or one met while listing, keeps its error line.
+	delete event or the next full comparison covers: its own listing fails to open with ENOENT or ENOTDIR and its parent
+	no longer lists it (folder_gone()), so it gets one info line, at every level, the walk root's too, and is appended as
+	a FolderGone. Any other error, one its parent's listing does not confirm (a folder listed that cannot be opened or
+	looked up, as a FUSE mount's name trouble gives every time), or one met while listing, keeps its error line.
 
 	Examples:
 		>>> import tempfile
@@ -3799,12 +3799,18 @@ class FolderGone(OSError):
 	'''A walk's error for a folder gone when the walk reached it (iter_tree_entries()): no UNREADABLE line and no unwatched folder.'''
 
 def folder_gone(path:str) -> bool:
-	'''Whether an lstat of path says nothing is there (ENOENT, or ENOTDIR for a folder above it gone); False when it finds something or fails otherwise.'''
+	'''
+	Whether path is gone, as its parent says: the parent's listing no longer names it, or fails with ENOENT or ENOTDIR (the parent is
+	gone, or no longer a folder). A name the parent still lists is not gone, whatever an open or an lstat of it answers: a FUSE, CIFS or
+	NTFS mount can list a name it cannot look up, and fails an lstat of it with ENOENT too, every time. False when the parent cannot
+	be listed for another reason. One listing of the parent, on the error path only.
+	'''
+	parent, name = os.path.split(os.path.abspath(path))
 	try:
-		os.lstat(path)
+		with os.scandir(parent) as entries:
+			return all(entry.name != name for entry in entries)
 	except OSError as e:
 		return e.errno in (errno.ENOENT, errno.ENOTDIR)
-	return False
 
 def unreadable_path(root:str, rel:str) -> str:
 	'''The absolute path of the folder rel (relative to root, '' for root itself).'''
