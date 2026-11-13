@@ -603,6 +603,11 @@ def tree_entries(job):
 	return found
 
 
+def held_open(entries):
+	'''A read-only fd on each path of entries, {inode: path}: the inodes stay allocated while the fds are open, so the number of an entry a batch removes is not given to one it makes (ext4 gives it to the next one made, and that one would count as old). Close them with os.close().'''
+	return [os.open(path, os.O_RDONLY) for path in entries.values()]
+
+
 def test_a_folder_moved_into_its_own_old_place_is_estimated_as_the_copy_the_replay_makes(job, monkeypatch):
 	# fails on the carried-in subtraction ( the estimate took the move out as a rename into the created folder, which the
 	# replay copies whole ): mv D x; mkdir D; mv x D/D, one batch. what the batch writes in bytes and in inodes is at most
@@ -616,11 +621,17 @@ def test_a_folder_moved_into_its_own_old_place_is_estimated_as_the_copy_the_repl
 	entries = batch(job, (True, 'move', 'x', 'D'), (True, 'create', 'D', None), (True, 'move', 'D/D', 'x'))
 	before = tree_entries(job)
 	estimates = estimates_made(monkeypatch)
-	run_backup(job, entries)
+	# the replay removes the old D and makes the new one after it: with the old one's inode freed, ext4 numbers the new D as it, and by number it is not new
+	held = held_open(before)
+	try:
+		run_backup(job, entries)
+	finally:
+		for fd in held:
+			os.close(fd)
 	assert len(estimates) == 1
 	new = {inode: path for inode, path in tree_entries(job).items() if inode not in before}
 	written = sum(charge(path, job.job_vault) for path in new.values())
-	# the folder D/D and its three files and one folder below are copies: they are what the vault grows by
+	# the new D, the copy D/D, its file a and its folder s with b in it are what the vault grows by
 	assert len(new) >= 5 and written >= 200000
 	assert written <= estimates[0][0] and len(new) <= estimates[0][1], (written, len(new), estimates)
 

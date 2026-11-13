@@ -621,7 +621,7 @@ def test_a_disk_none_of_whose_branches_the_user_can_open_is_a_warning_once(job, 
 
 def test_a_folder_shut_to_its_owner_by_the_hand_over_is_synced_on_a_pool(job, tmp_path, capsys, monkeypatch, fake_pool):
 	# the hand-over gives the target its own mode, here without the owner's read: the second sync goes through the disk's
-	# handle of the claim, never through the folder opened again
+	# handle of the claim, the restore folder's place on its branch (held), never through the folder opened again
 	if os.geteuid() != 0:
 		pytest.skip("only root backs up a folder shut to its owner's reads, and restores out of it")
 	seed_monitor(job, {'proj/a.txt': 'a'})
@@ -640,7 +640,8 @@ def test_a_folder_shut_to_its_owner_by_the_hand_over_is_synced_on_a_pool(job, tm
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert (code, err) == (0, ''), stdout
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o300
-	assert 'WARNING' not in stdout and synced == [os.lstat(branches['one']).st_ino] * 2
+	assert 'WARNING' not in stdout
+	assert synced == [os.lstat(held).st_ino] * 2
 
 
 # ---- F2: on a pool the restore's handles open at its folder's place on each branch, or its nearest existing parent, one per
