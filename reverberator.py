@@ -6219,7 +6219,7 @@ def do_backup(backup_entries:dict,
 		swap_current_version(job_vault,os.path.basename(backup_folder))
 		# the link and the list may sit on different disks of a pool: the link is on its disk before the list is placed.
 		# a flush that fails fails the attempt, with the list still in its private folder: the next scan settles the commit.
-		# off a pool there is one disk, which keeps the order of its own changes, and a power cut that loses them leaves a
+		# off a pool there is one filesystem, which keeps the order of its own changes, and a power cut that loses them leaves a
 		# state the next start's scan settles ( finish_r_commit() ): neither this flush nor the list's is needed there
 		# ( docs/limitations.md, "A power cut right after a backup hides its version until the next start" )
 		if on_pool:
@@ -13167,25 +13167,25 @@ class TreeWriter:
 		for from_folder, to_folder in reversed(folders):
 			self.copy_folder_meta_onto(from_folder, to_folder)
 
-	def folder_usage(self, rel:str, rows:bool) -> tuple:
+	def folder_usage(self, rel:str) -> tuple:
 		'''
 		(bytes, inodes) of what the tree's folder at rel holds, which is version n's as the previous version forwards it. From
-		its rows, one query, when they say: rows False means they may not, as a move's rows land on its target before the
-		target is recorded. A folder with no row, as a move that fell back leaves its source, or a row with no record, is walked.
+		its rows, one query, when they say. A folder with no row, as a move that fell back leaves its source, or a row with no
+		record, is walked.
 		'''
-		if rows and self.manifest is not None and self.manifest.lookup(as_folder_entry(rel)) is not None and not self.manifest.has_unrecorded_under(rel):
+		if self.manifest is not None and self.manifest.lookup(as_folder_entry(rel)) is not None and not self.manifest.has_unrecorded_under(rel):
 			return self.manifest.size_under(rel)
 		return tree_usage(self.path(rel))
 
-	def record(self, rel:str, keep:bool, rows:bool = True) -> None:
+	def record(self, rel:str, keep:bool) -> None:
 		'''
 		Before the tree's entry at rel is replaced or removed: version n's entry there goes in the previous version.
 		keep means the tree holds on to it until a new copy is in its place, which may never come when the copy fails, so a
 		file or link is hard linked in, and a folder too, entry by entry, rather than left to the copy (a failed copy keeps the
 		last copy in both versions). Without keep, a file is renamed in and a folder exchanged in, which costs one call. Where
 		both versions already hold real folders, each entry is recorded the same way. Nothing else needs recording: the
-		previous version holds nothing there, or holds its own. rows goes to folder_usage(). On two renames every record is a
-		keep, and the caller removes what the tree holds. flush_if_needed() is the caller's, before it changes the tree.
+		previous version holds nothing there, or holds its own. On two renames every record is a keep, and the caller removes
+		what the tree holds. flush_if_needed() is the caller's, before it changes the tree.
 		'''
 		if self.previous is None:
 			return
@@ -13222,7 +13222,7 @@ class TreeWriter:
 						self.sizes.record_dropped(0, -1)
 					else:
 						# the folder takes the forward link's place in the count, and all of it left the tree
-						size, inodes = self.folder_usage(here, rows)
+						size, inodes = self.folder_usage(here)
 						self.exchange_in(here, os.lstat(tree_path), tree_path)
 						self.sizes.record_dropped(size + FOLDER_BYTES, inodes)
 				elif kind_at(self.kept_path(here)) == 'd' and kind_at(self.path(here)) == 'd':
