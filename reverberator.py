@@ -8753,10 +8753,6 @@ class VaultManifest:
 	SCHEMA_1_COLUMNS = ('path TEXT PRIMARY KEY, kind TEXT, size INTEGER, mtime_ns INTEGER, mode INTEGER, uid INTEGER, gid INTEGER, '
 		'hash TEXT, link TEXT, unchecked INTEGER, dirty INTEGER NOT NULL DEFAULT 0')
 	UNVERIFIED = 'kind = NULL, size = NULL, mtime_ns = NULL, mode = NULL, uid = NULL, gid = NULL, hash = NULL, link = NULL, unchecked = NULL, dirty = 0'
-	# a moved row's dirty mark: kept with a record (the replay vouched for it), dropped without one. a copy's row is dirty with
-	# no record, and the copy holds the monitored file of its old place, not of its new one: the verification would trust it
-	# there ( compare_scopes()'s trusted rels ), so it is read back as an unverified row
-	MOVED_DIRTY = 'dirty = (dirty AND kind IS NOT NULL)'
 
 	def __init__(self, job_vault:str):
 		self.path = os.path.join(job_vault, MANIFEST_FILE_NAME)
@@ -9058,8 +9054,8 @@ class VaultManifest:
 		Mark the file row rel dirty and keep its record: the replay synced an attribute change onto the file, and the record
 		vouches for what is there, so the commit takes its hash and unchecked flag from the record
 		(take_dirty_records()) and reads only the new metadata. A dirty row that has a record is one the replay vouched
-		for: a later add() for rel wipes the record by itself, while move_file() and move_tree() carry it with its dirty mark,
-		as a rename keeps the inode, so the commit reads the new metadata at the new path. An untracked rel is left alone.
+		for: a later add() for rel wipes the record by itself, and a move_file() or move_tree() of it leaves the row
+		unverified, to be read back at its new path. An untracked rel is left alone.
 		Only a file row the replay vouched for is passed: record_vouches() said so, or a moved file whose contents are the
 		monitored file's took its attributes (a folder's row never is).
 		'''
@@ -9086,10 +9082,12 @@ class VaultManifest:
 
 	def move_tree(self, src_folder:str, dst_folder:str):
 		'''
-		Track src_folder and everything under it as dst_folder instead, replacing what dst_folder held. Only the paths
-		change: each row keeps its record, its unchecked flag and its dirty mark, as a rename keeps the inode, its bytes and
-		its metadata, so a row's record still describes the entry at its path. Called only once the version's rename is
-		made: a fallback to a copy leaves the rows where they are.
+		Track src_folder and everything under it as dst_folder instead, replacing what dst_folder held. A row the version
+		holds from before this backup keeps its record and unchecked flag, as a rename keeps the inode, its bytes and its
+		metadata, so its record still describes the entry at its new path. A row this backup wrote (dirty) loses its record
+		and mark and is read back at its new place, as the copy it recorded may hold the monitored file of its old place, and
+		the verification trusts a dirty row for presence only. Called only once the version's rename is made: a fallback to
+		a copy leaves the rows where they are.
 		'''
 		if src_folder.startswith(dst_folder) or dst_folder.startswith(src_folder):
 			# a folder cannot move into itself or onto its parent
@@ -9098,16 +9096,19 @@ class VaultManifest:
 		self.discard(dst_folder[:-1])
 		# substr() counts characters, as len() does on the stored path
 		src, dst = storable_name(src_folder), storable_name(dst_folder)
-		self.conn.execute(f'UPDATE entries SET path = ? || substr(path, ?), {self.MOVED_DIRTY} WHERE path >= ? AND path < ?',
+		self.conn.execute(f'UPDATE entries SET {self.UNVERIFIED} WHERE dirty AND path >= ? AND path < ?', (src, folder_range_end(src)))
+		self.conn.execute('UPDATE entries SET path = ? || substr(path, ?) WHERE path >= ? AND path < ?',
 			(dst, len(src) + 1, src, folder_range_end(src)))
 
 	def move_file(self, src:str, dst:str):
 		'''
-		Track the file src as dst instead, replacing what dst held, as move_tree() does for a folder: its record, unchecked
-		flag and dirty mark go with it. dst is tracked even when src is not.
+		Track the file src as dst instead, replacing what dst held, as move_tree() does for a folder: a row the version holds
+		keeps its record and unchecked flag, one this backup wrote is read back at dst. dst is tracked even when src is not.
 		'''
 		self.discard(dst)
-		if not self.conn.execute(f'UPDATE entries SET path = ?, {self.MOVED_DIRTY} WHERE path = ?', (storable_name(dst), storable_name(src))).rowcount:
+		stored_src = storable_name(src)
+		self.conn.execute(f'UPDATE entries SET {self.UNVERIFIED} WHERE dirty AND path = ?', (stored_src,))
+		if not self.conn.execute('UPDATE entries SET path = ? WHERE path = ?', (storable_name(dst), stored_src)).rowcount:
 			self.add(dst)
 
 	def set_records(self, records):
@@ -14021,8 +14022,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 				else:
 					# the row's record first, which reads the monitored file only: the replay reads the copy's tail, on the
 					# vault's disks, only for a record that does not vouch ( a file whose mtime moved from the recorded one
-					# never does: an mmap write moves only the mtime, so the file is copied and not synced ). a row moved
-					# earlier in the batch carries the record of the inode it moved with
+					# never does: an mmap write moves only the mtime, so the file is copied and not synced ). a row the vault
+					# held that moved earlier in the batch carries the record of the inode it moved with, one this batch
+					# wrote has none ( VaultManifest.move_tree() )
 					vouched = only_sync_attributes and record_vouches(manifest.lookup(event_relative_path),event_source_real_path,file_vault_target_path)
 					if vouched or (only_sync_attributes and same_contents(event_source_real_path,file_vault_target_path)):
 						# we just copy the file metadata

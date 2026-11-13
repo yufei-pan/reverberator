@@ -664,8 +664,9 @@ def test_an_attrib_after_a_move_under_only_sync_attributes_is_right(job):
 
 
 def test_a_vouched_chmod_then_a_move_keeps_the_new_mode(job):
-	# pin (fails on a move that clears the dirty mark): chmod f, vouched for under Only Sync Attributes, then mv f g, one batch:
-	# the version and its row hold the new mode
+	# pin of the move branch's attribute sync, not of a vouched row moving ( the collapse orders no attrib before its move: it
+	# folds the chmod into the move, so the row is clean when it moves, and the branch marks it vouched at its new place ):
+	# chmod f, then mv f g, one batch under Only Sync Attributes: the version and its row hold the new mode
 	seed_monitor(job, {'f': 'f' * 100, 'k': 'k'})
 	run_backup(job)
 	run_backup(job)
@@ -674,6 +675,46 @@ def test_a_vouched_chmod_then_a_move_keeps_the_new_mode(job):
 	os.rename(f'{m}/f', f'{m}/g')
 	v1 = verified(job, (False, 'attrib', 'f', None), (False, 'move', 'g', 'f'))
 	assert mode(resolved(job, v1, 'g')) == 0o600
+	assert rows_match_vault(job.job_vault) == []
+
+
+def test_a_move_synced_with_no_verification_records_its_new_mode(job):
+	# pin of the move branch's mark_vouched(): mv f g; chmod g, one batch under Only Sync Attributes with no touched scopes, so no
+	# verification finds the attribute change: without the mark the row keeps the old mode while the version holds the new one
+	seed_monitor(job, {'f': 'f' * 100, 'k': 'k'})
+	run_backup(job)
+	run_backup(job)
+	m = job.monitor
+	os.rename(f'{m}/f', f'{m}/g')
+	os.chmod(f'{m}/g', 0o600)
+	v1 = run_backup(job, OrderedDict([event_entry(job, 'g', 'move', 'f')]))[-1]
+	assert mode(resolved(job, v1, 'g')) == 0o600
+	assert rows_match_vault(job.job_vault) == []
+
+
+def test_a_row_written_by_the_batch_is_read_back_where_a_move_puts_it(job):
+	# fails on a move that keeps the dirty mark of a row with a record: the replay vouches for P's attribute change, and the
+	# commit would trust that vouch at Q, where the monitored file is another one of the same size and mtime. [attrib P,
+	# move Q <- P] is given to the replay as it is ( the collapse never orders them so ): the version holds the bytes the
+	# monitored Q holds
+	seed_monitor(job, {'P': 'A' * 100, 'k': 'k'})
+	m = job.monitor
+	os.utime(f'{m}/P', ns=(10 ** 18, 10 ** 18))
+	run_backup(job)
+	run_backup(job)
+	# P is now a copy with another mode, and Q another file of the same size and mtime
+	shutil.copy2(f'{m}/P', f'{m}/P.copy')
+	os.rename(f'{m}/P', f'{m}/Q')
+	with open(f'{m}/Q', 'w') as f:
+		f.write('X' * 100)
+	os.utime(f'{m}/Q', ns=(10 ** 18, 10 ** 18))
+	os.rename(f'{m}/P.copy', f'{m}/P')
+	os.chmod(f'{m}/P', 0o600)
+	events = raw(job, (False, 'attrib', 'P', None), (False, 'move', 'Q', 'P'))
+	entries = OrderedDict([event_entry(job, 'P', 'attrib'), event_entry(job, 'Q', 'move', 'P')])
+	v1 = run_backup(job, entries, touched=rv.touched_scopes(events, m))[-1]
+	assert open(resolved(job, v1, 'Q')).read() == 'X' * 100
+	assert_version_is_the_tree(job, v1)
 	assert rows_match_vault(job.job_vault) == []
 
 
