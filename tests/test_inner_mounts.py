@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -709,3 +710,70 @@ def test_an_inner_disk_unmounted_while_scanned_folders_are_walked_commits_nothin
 	assert tables['now'] is real_table
 	assert committed_versions(job) == versions
 	assert os.path.isfile(os.path.join(versions[0], 'disk', 'f.txt'))
+
+
+def _a_table_you_can_change(monkeypatch, table):
+	'''A read_mount_table() that answers what tables['now'] holds, changed by the test as the batch runs.'''
+	tables = {'now': table}
+	monkeypatch.setattr(rv, 'read_mount_table', lambda: list(tables['now']))
+	return tables
+
+
+@pytest.mark.unit
+def test_an_inner_disk_mounted_while_a_full_comparison_copies_is_remembered_by_its_commit(job, poll_fast, monkeypatch):
+	# fails with the commit remembering inner mounts from the table read after the comparison's walk (R35): a full comparison
+	# runs no verification, so no read follows its walk but the commit's. the disk is mounted during the copy phase, so what it
+	# holds is in the version ( the copy of a.txt reads the mount point ), and unmounted before the next batch it would show
+	# deleted in the newest version and be copied again on its return
+	seed_monitor(job, {'a.txt': 'a', 'disk/': None})
+	real_table = rv.read_mount_table()
+	disk = os.path.join(job.monitor, 'disk')
+	mounted = real_table + [(os.path.realpath(disk), (b'9999', b'0:99', b'/', b'/dev/fakedisk', b'xfs'))]
+	tables = _a_table_you_can_change(monkeypatch, real_table)
+	_backup(job)[1].close()
+	assert tracked_inner_mounts(job) == []
+	with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
+		f.write('changed')
+	real = rv.cp_af_copy_path
+	copied = []
+	def copy(source_path, dest_path, *args, **kwargs):
+		copied.append(dest_path)
+		tables['now'] = mounted
+		return real(source_path, dest_path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'cp_af_copy_path', copy)
+	_backup(job)[1].close()
+	assert len(copied) == 1 and len(committed_versions(job)) == 2
+	assert tracked_inner_mounts(job) == ['disk/']
+
+
+def tracked_inner_mounts(job):
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return manifest.inner_mounts
+	finally:
+		manifest.close()
+
+
+@pytest.mark.unit
+def test_a_monitored_mount_gone_while_a_first_version_waits_for_its_locks_commits_no_version(job, poll_fast, monkeypatch):
+	# fails with the start check made on the table given before the first version's locks and vault scan (R37): the monitored
+	# folder is a mount of its own, unmounted while the locks are taken, and shows the empty folder under it. the check looks
+	# at a table read after them, finds another filesystem there, and the job fails, so no empty first version is committed
+	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	real_table = rv.read_mount_table()
+	monitor = os.path.realpath(job.monitor)
+	mounted = real_table + [(monitor, (b'9999', b'0:99', b'/', b'/dev/fakedisk', b'xfs'))]
+	tables = _a_table_you_can_change(monkeypatch, mounted)
+	root_mount = rv.mount_fingerprint(mounted, monitor)
+	real_take = rv.BackupLocks.take
+	def take(self, *args, **kwargs):
+		taken = real_take(self, *args, **kwargs)
+		os.remove(os.path.join(job.monitor, 'a.txt'))
+		shutil.rmtree(os.path.join(job.monitor, 'd'))
+		tables['now'] = real_table
+		return taken
+	monkeypatch.setattr(rv.BackupLocks, 'take', take)
+	with pytest.raises(rv.JobFailure, match='the monitored filesystem changed'):
+		rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=True,
+			keep_n_versions=0, backup_size_limit='0', root_mount=root_mount, mount_table=mounted)
+	assert committed_versions(job) == []

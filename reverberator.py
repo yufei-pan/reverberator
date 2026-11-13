@@ -5851,7 +5851,7 @@ def do_backup(backup_entries:dict,
 	# the old time forward
 	# job: the job's JobControl, None outside the daemon: the wait for the locks shows in its status and ends when it stops running
 	# mount_table: the mount table the batch takes ( backuper(): its waits' last read, or one read after its scans walk ), read
-	# here when None
+	# here when None, and read again here after the locks a vault with no version takes first
 	# a vaultInfo with a tree (design R) holds a cut batch's tree: this backup rolls it forward, a batch with no hand-over that
 	# compares the whole tree and always commits (spec section 3, plan S4); of the entries given only a plain file's change the comparison could not see is used (roll_forward_entries())
 	global DEBUG
@@ -5895,12 +5895,19 @@ def do_backup(backup_entries:dict,
 	# so no restore reads it meanwhile. the comparison runs without them
 	locks = BackupLocks(job_name, job=job)
 	try:
+		if not vaultInfo or not vaultInfo.vault_info_dict:
+			# the scan can change the vault: under the locks, which a vault with no version keeps for its first backup. the
+			# locks can be waited for, and a disk can go meanwhile, so the checks below look at a table read after them
+			if not locks.take():
+				return VaultInfo({}, 0, 0) if vaultInfo is None else vaultInfo, manifest, False
+			vaultInfo = get_vault_info(job_vault_path=job_vault,manifest=manifest)
+			mount_table = current_mount_table()
 		# inner mounts the backup has seen and that are unmounted now are paused: every walk below leaves them out, and
 		# they keep what the vault holds for them
 		if mount_table is None:
 			mount_table = current_mount_table()
-		# the table read after the latest walk of the tree ( drop_unmounted_entries() ), which the commit remembers inner
-		# mounts from: a disk mounted after it is remembered by the next batch
+		# the table read after the delta's walk ( drop_unmounted_entries() ), which a batch that commits no version remembers
+		# inner mounts from, as no copy follows its walk. a commit reads the table again, after its copies
 		walked_table = None
 		check_monitored_mount(monitor_path,mount_table,root_mount)
 		remembered_mounts = manifest.inner_mounts
@@ -5918,11 +5925,6 @@ def do_backup(backup_entries:dict,
 		# waiting for them deadlocks when permits are exhausted (e.g. --threads 1).
 		# do the actual backup
 		# get the latest current version path
-		if not vaultInfo or not vaultInfo.vault_info_dict:
-			# the scan can change the vault: under the locks, which a vault with no version keeps for its first backup
-			if not locks.take():
-				return VaultInfo({}, 0, 0) if vaultInfo is None else vaultInfo, manifest, False
-			vaultInfo = get_vault_info(job_vault_path=job_vault,manifest=manifest)
 		vault_info_dict = vaultInfo.vault_info_dict
 		vault_size = vaultInfo.vault_size
 		vault_inodes = vaultInfo.vault_inodes
@@ -6027,7 +6029,7 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name,f'The comparison of {tree} was interrupted: the next attempt finishes it',error=True)
 					return vaultInfo, manifest, False
 				backup_entries = rolled
-				paused, walked_table = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
+				paused, _ = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
 				# the cut batch may have left anything in the tree, whose root is always real in the previous version: the
 				# verification compares and sweeps all of it, through the writer
 				touched = TouchedScopes([''],[])
@@ -6131,9 +6133,9 @@ def do_backup(backup_entries:dict,
 					return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 			backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
 			def recheck_mounts(fixes):
-				# the verification walked the tree too
-				nonlocal paused, walked_table
-				paused, walked_table = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
+				# the verification walked the tree too: the commit reads the table again after it
+				nonlocal paused
+				paused, _ = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,only_sync_attributes,manifest,monitor_path,writer,skip_list,job_name,reported,
 				touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,pool_guard=pool_guard,unsynced=unsynced)
 		backup_finished = GREEN_LIGHT.is_set()
@@ -6171,9 +6173,9 @@ def do_backup(backup_entries:dict,
 		# commit before the content file: with no commit a first version is removed by the job's vault scan, a later one's
 		# tree waits for the roll-forward, and a list naming neither would describe a version the manifest does not hold
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
-		# a disk mounted while this backup walked is remembered too: by the table read after its last walk, live when none
-		# walked ( the first version )
-		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table() if walked_table is None else walked_table,skip=skip))
+		# a disk mounted while this backup copied is in the version and is remembered too, so the table is read now, after the
+		# copy phase ( a full comparison's verification does not run, so no read since the last walk would show it )
+		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
 		# a commit says its copies are on the disk (spec section 2.6). they are flushed before the change list is written, as the
 		# list's fsync is a checkpoint, which keeps a new file's size and not its data: whenever the batch placed a copy
 		# (manifest.copies_unsynced), through the handles its unit opened before its first write, so a write error another
