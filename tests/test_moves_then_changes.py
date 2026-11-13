@@ -6,12 +6,14 @@ import shutil
 import stat
 import struct
 import time
-from collections import deque
+from collections import deque, OrderedDict
 
 import pytest
 import reverberator as rv
-from tests.harness import charge, seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions, reads_the_file_before
+from tests.harness import charge, event_entry, seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions, reads_the_file_before
 from tests.version_view_ground_truth import WRONG
+from tests import version_view_ground_truth as view_truth
+from tests.vault_oracle import rows_match_vault
 
 pytestmark = pytest.mark.unit
 
@@ -499,6 +501,118 @@ def test_a_chmod_then_a_move_with_attributes_copied_counts_one_copy(job, monkeyp
 	written = charge(os.path.join(v1, 'g'), job.job_vault)
 	assert estimates == [(charge(f'{m}/g', job.job_vault), 1)]
 	assert written <= estimates[0][0]
+
+
+def test_the_row_oracle_finds_a_row_that_does_not_match(job):
+	# a committed vault whose rows are all checked (a full comparison read V0's copies back), then a vault file's mode changed
+	# behind the manifest
+	seed_monitor(job, {'d/f.txt': 'f', 'g.txt': 'g'})
+	run_backup(job)
+	newest = run_backup(job)[-1]
+	assert rows_match_vault(job.job_vault) == []
+	os.chmod(os.path.join(newest, 'd', 'f.txt'), 0o640)
+	found = rows_match_vault(job.job_vault)
+	assert len(found) == 1 and found[0].startswith("'d/f.txt'"), found
+
+
+def test_a_rename_falling_back_to_a_copy_keeps_the_targets_rows_until_then(job):
+	# fails on main (the version before's list is short by T's entries), from fuzz seed 254: one batch moves a folder made in
+	# it onto the place of a tracked folder T of three files (mkdir A/S; rm -r A/T; mv A/S A/T), so the rename falls back to a
+	# copy, its source not being in the version, and then removes A, the folder above T. The removal records A in the version
+	# before, sized from its rows: T's rows must still be there
+	seed_monitor(job, {'A/T/t1': '1' * 5000, 'A/T/t2': '2' * 6000, 'A/T/t3': '3' * 7000, 'A/k.txt': 'k', 'keep.txt': 'k'})
+	run_backup(job)
+	shutil.rmtree(os.path.join(job.monitor, 'A'))
+	entries = OrderedDict([event_entry(job, 'A/T/', 'move', 'A/S/'), event_entry(job, 'A/', 'delete')])
+	run_backup(job, entries)
+	assert view_truth.wrong_lists(job.job_vault) == []
+
+
+def manifest_rows(job, folder):
+	'''{rel below folder: (record, unchecked, dirty)} of the manifest's rows strictly under folder (ending with /).'''
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		end = rv.folder_range_end(folder)
+		return {rv.stored_name(path)[len(folder):]: (tuple(record), unchecked, dirty) for path, *record, unchecked, dirty in manifest.conn.execute(
+			'SELECT path, kind, size, mtime_ns, mode, uid, gid, hash, link, unchecked, dirty FROM entries WHERE path > ? AND path < ?', (folder, end))}
+	finally:
+		manifest.close()
+
+
+def test_a_renamed_folder_keeps_its_rows_records_and_reads_nothing_back(job, monkeypatch):
+	# fails on main: a rename of a folder of 2,000 files; its rows keep their records, unchecked flags and dirty marks, and
+	# neither the batch's verification nor the next full comparison reads any of them back from the vault (main's verification
+	# read each back, lstat and 64 KiB)
+	seed_monitor(job, {f'D/f{i:04}': str(i) for i in range(2000)})
+	run_backup(job)
+	run_backup(job)
+	before = manifest_rows(job, 'D/')
+	assert len(before) == 2000 and all(record[0] == 'f' and unchecked == 0 for record, unchecked, _ in before.values())
+	read_back = []
+	real = rv.read_vault_record
+	monkeypatch.setattr(rv, 'read_vault_record', lambda version_path, rel, *args, **kwargs: read_back.append(rel) or real(version_path, rel, *args, **kwargs))
+	os.rename(os.path.join(job.monitor, 'D'), os.path.join(job.monitor, 'E'))
+	verified(job, (True, 'move', 'E', 'D'))
+	assert manifest_rows(job, 'E/') == before
+	run_backup(job)
+	assert [rel for rel in read_back if rel.startswith('E/') and rel != 'E/'] == []
+
+
+def test_a_swap_in_one_batch_matches_the_tree_and_the_oracle(job):
+	# pin: mv a t; mv b a; mv t b
+	seed_monitor(job, {'a': 'a' * 100, 'b': 'b' * 200, 'k': 'k'})
+	run_backup(job)
+	run_backup(job)
+	m = job.monitor
+	os.rename(f'{m}/a', f'{m}/t')
+	os.rename(f'{m}/b', f'{m}/a')
+	os.rename(f'{m}/t', f'{m}/b')
+	v1 = verified(job, (False, 'move', 't', 'a'), (False, 'move', 'a', 'b'), (False, 'move', 'b', 't'))
+	assert_version_is_the_tree(job, v1)
+	assert rows_match_vault(job.job_vault) == []
+
+
+def test_an_attrib_after_a_move_under_only_sync_attributes_is_right(job):
+	# pin: mv f g; chmod g, one batch: the version and its row
+	seed_monitor(job, {'f': 'f' * 100, 'k': 'k'})
+	run_backup(job)
+	run_backup(job)
+	m = job.monitor
+	os.rename(f'{m}/f', f'{m}/g')
+	os.chmod(f'{m}/g', 0o600)
+	v1 = verified(job, (False, 'move', 'g', 'f'), (False, 'attrib', 'g', None))
+	assert mode(resolved(job, v1, 'g')) == 0o600
+	assert_version_is_the_tree(job, v1)
+	assert rows_match_vault(job.job_vault) == []
+
+
+def test_a_vouched_chmod_then_a_move_keeps_the_new_mode(job):
+	# pin (fails on a move that clears the dirty mark): chmod f, vouched for under Only Sync Attributes, then mv f g, one batch:
+	# the version and its row hold the new mode
+	seed_monitor(job, {'f': 'f' * 100, 'k': 'k'})
+	run_backup(job)
+	run_backup(job)
+	m = job.monitor
+	os.chmod(f'{m}/f', 0o600)
+	os.rename(f'{m}/f', f'{m}/g')
+	v1 = verified(job, (False, 'attrib', 'f', None), (False, 'move', 'g', 'f'))
+	assert mode(resolved(job, v1, 'g')) == 0o600
+	assert rows_match_vault(job.job_vault) == []
+
+
+def test_a_file_moved_onto_an_empty_folder_whose_rename_falls_back_keeps_its_rows_until_then(job):
+	# pin: n, which the version never held (a copy a live move outran), moved onto the empty folder e (rmdir e; mv n e): the
+	# rename falls back to a copy, and e's rows stay until the copy replaces it
+	seed_monitor(job, {'e/': None, 'k': 'k'})
+	run_backup(job)
+	run_backup(job)
+	m = job.monitor
+	os.rmdir(f'{m}/e')
+	with open(f'{m}/e', 'w') as f:
+		f.write('n')
+	v1 = verified(job, (False, 'move', 'e', 'n'))
+	assert_version_is_the_tree(job, v1)
+	assert rows_match_vault(job.job_vault) == []
 
 
 # ---- fix round 2 --------------------------------------------------------------------------------------------------

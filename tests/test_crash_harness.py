@@ -29,7 +29,7 @@ from tests import version_view_ground_truth as view_truth
 from tests.crash_batches import after_retries, apply_batch3, batch3_of, build_base, expected_of, OPTIONS, prepare, put_text, raw_events, restore, restore_monitor, UNREADABLE
 from tests.crash_child import failing_copy_command, in_child, kill_run, retry, run_do_backup
 from tests.harness import create_job
-from tests.vault_oracle import check_vault, compared, entry_view, forward_text, read_view, sizes_by_newest_holder, snapshot_tree, version_number
+from tests.vault_oracle import check_vault, compared, entry_view, forward_text, read_view, rows_match_vault, sizes_by_newest_holder, snapshot_tree, version_number
 
 pytestmark = pytest.mark.skipif(os.geteuid() != 0, reason='the root record is a trusted.* attribute, and a file is chowned')
 
@@ -450,10 +450,13 @@ def retried(vault, point=None, fault=None):
 
 
 def wrong_after_retry(vault, expected=None, allowed_new=frozenset({3})):
-	'''What is wrong with the vault once a retry ran: every version read by the oracle, and each list against what the oracle counts.'''
+	'''
+	What is wrong with the vault once a retry ran: every version read by the oracle, each list against what the oracle counts,
+	and each checked row's record against the entry it names (rows_match_vault()).
+	'''
 	job_vault = vault.job.job_vault
 	want = after_retries(job_vault, vault.expected) if expected is None else expected
-	return check_vault(job_vault, want, set(allowed_new), free_file_meta=free_meta(vault)) + view_truth.wrong_lists(job_vault)
+	return check_vault(job_vault, want, set(allowed_new), free_file_meta=free_meta(vault)) + view_truth.wrong_lists(job_vault) + rows_match_vault(job_vault)
 
 
 def sweep_points(vault, default=DEFAULT_KILL_POINTS):

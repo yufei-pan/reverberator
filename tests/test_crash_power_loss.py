@@ -28,7 +28,7 @@ from tests.crash_child import in_child, kill_run, retry, run_do_backup
 from tests.harness import create_job
 from tests.scratch_images import flush_scratch, LoopImage, needs_f2fs, NotOurLoopImage, our_mount_point, SCRATCH, shut_down_scratch
 from tests.test_crash_harness import kill_points
-from tests.vault_oracle import check_vault, snapshot_tree, version_number
+from tests.vault_oracle import check_vault, rows_match_vault, snapshot_tree, version_number
 
 # the loop image of a run: a sparse file, so what the vault writes is all it takes of tmpfs
 IMAGE_MIB = 512
@@ -226,7 +226,8 @@ def sweep(only_sync, tmp_name, flush_step=None):
 			if (point <= total and not cut.killed) or again.error is not None or again.committed is not True:
 				wrong.append((point, state, cut, again))
 				continue
-			problems = check_vault(job.job_vault, after_retries(job.job_vault, vault.expected), {3}, free_file_meta=only_sync) + view_truth.wrong_lists(job.job_vault)
+			problems = (check_vault(job.job_vault, after_retries(job.job_vault, vault.expected), {3}, free_file_meta=only_sync) + view_truth.wrong_lists(job.job_vault)
+				+ rows_match_vault(job.job_vault))
 			if problems:
 				wrong.append((point, state, problems[:8]))
 		print(f'power loss: {len(points)} of {total} steps run, {len(wrong)} wrong; what the remount left: {dict(states)}')

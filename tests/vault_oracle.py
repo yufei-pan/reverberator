@@ -7,6 +7,9 @@ R ('../'*(depth) + next version's folder name + '/' + its own path) and the back
 previous version's folder name, and any path there, as a move keeps its old path). Any other link is a user's link and is
 read as a link. A vault whose manifest says design R has no backward link left, nor does a walk that went forward meet one
 (spec section 4.3): a link of that form there is a user's.
+
+rows_match_vault(), the row oracle, reads the rows' names and tail hashes with the daemon's own functions, as those are in
+its formats; nothing else here does.
 '''
 import base64
 import hashlib
@@ -366,3 +369,50 @@ def sizes_by_newest_holder(job_vault: str) -> dict:
 						inodes += 1
 		sizes[number] = (size, inodes)
 	return sizes
+
+
+def rows_match_vault(job_vault: str) -> list:
+	'''
+	The rows of the manifest's version whose record does not describe the entry at their path in it, one line each: of the
+	rows that hold a record and are checked (unchecked = 0), the entry's kind, mode, uid and gid; a file's size, mtime and
+	tail hash; a link's text. A folder's mtime is left out, as its row's is the monitored one by the next comparison. A row
+	of 0.54's referenced backups (kind 'r') is left out. [] when every such row matches, or when there is no manifest.
+
+	The rows' names and their tail hash are in the daemon's own formats, so those two are read with its own functions
+	(stored_name(), hash_file()): what is checked is which entry each record describes, not how a hash is made.
+	'''
+	import reverberator as rv
+	path = os.path.join(job_vault, '.reverberator_manifest.sqlite')
+	if not os.path.exists(path):
+		return []
+	conn = sqlite_connect(f'file:{path}?immutable=1', uri=True)
+	try:
+		version = conn.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
+		rows = conn.execute('SELECT path, kind, size, mtime_ns, mode, uid, gid, hash, link FROM entries '
+			"WHERE kind IS NOT NULL AND kind != 'r' AND unchecked = 0").fetchall()
+	finally:
+		conn.close()
+	if version is None:
+		return []
+	top = os.path.join(job_vault, version[0])
+	lines = []
+	for stored, kind, size, mtime_ns, mode, uid, gid, file_hash, link in rows:
+		rel = rv.stored_name(stored)
+		entry = os.path.join(top, rel.rstrip('/'))
+		try:
+			st = os.lstat(entry)
+		except OSError as e:
+			lines.append(f'{rel!r}: its row records a {kind}, and the version holds nothing there ({e.strerror})')
+			continue
+		found = 'd' if stat.S_ISDIR(st.st_mode) else 'l' if stat.S_ISLNK(st.st_mode) else 'f' if stat.S_ISREG(st.st_mode) else 'o'
+		wanted = (kind, mode, uid, gid)
+		held = (found, st.st_mode, st.st_uid, st.st_gid)
+		if found == 'f':
+			wanted += (size, mtime_ns, file_hash)
+			held += (st.st_size, st.st_mtime_ns, rv.hash_file(entry, st.st_size) if kind == 'f' and (st.st_size, st.st_mtime_ns) == (size, mtime_ns) else None)
+		elif found == 'l':
+			wanted += (link,)
+			held += (os.readlink(entry),)
+		if wanted != held:
+			lines.append(f'{rel!r}: its row records {wanted}, the version holds {held}')
+	return lines

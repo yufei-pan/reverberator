@@ -269,9 +269,26 @@ def test_a_drop_of_a_moved_inode_in_its_own_batch_counts_in_it(r_job, run, case,
 	m = r_job.monitor
 	writer_rel = {'move_then_replace': ('f', 'g'), 'move_then_delete': ('f', 'g'), 'folder_move_then_delete': ('d', 'e'), 'folder_move_then_replace': ('d', 'e'), 'move_then_new_at_the_source': ('f', 'g')}[case]
 	real_rename = rv.TreeWriter.rename
-	def rename_then_change(self, src, dst):
-		done = real_rename(self, src, dst)
-		# the tree changes right after the move, by the verbs a later entry of the batch uses
+	writers = []
+	def rename(self, src, dst):
+		writers.append(self)
+		return real_rename(self, src, dst)
+	real_move_file, real_move_tree, real_add = rv.VaultManifest.move_file, rv.VaultManifest.move_tree, rv.VaultManifest.add
+	armed = []
+	def move_file(manifest, *args):
+		real_move_file(manifest, *args)
+		change(writers[-1])
+	def move_tree(manifest, src, dst):
+		real_move_tree(manifest, src, dst)
+		# the folder's own row is added again right after its rows move: the change comes after that
+		armed.append(dst)
+	def add(manifest, rel, *args, **kwargs):
+		real_add(manifest, rel, *args, **kwargs)
+		if armed and rel == armed[-1]:
+			armed.clear()
+			change(writers[-1])
+	def change(self):
+		# the tree changes right after the move and its rows, by the verbs a later entry of the batch uses
 		if case == 'move_then_replace':
 			temp = self.path('g') + '.new'
 			with open(temp, 'w') as f:
@@ -299,8 +316,10 @@ def test_a_drop_of_a_moved_inode_in_its_own_batch_counts_in_it(r_job, run, case,
 			self.record('f', True)
 			self.place(temp, 'f')
 			self.manifest.add('f', dirty=True)
-		return done
-	monkeypatch.setattr(rv.TreeWriter, 'rename', rename_then_change)
+	monkeypatch.setattr(rv.TreeWriter, 'rename', rename)
+	monkeypatch.setattr(rv.VaultManifest, 'move_file', move_file)
+	monkeypatch.setattr(rv.VaultManifest, 'move_tree', move_tree)
+	monkeypatch.setattr(rv.VaultManifest, 'add', add)
 	try:
 		os.rename(os.path.join(m, writer_rel[0]), os.path.join(m, writer_rel[1]))
 		one.backup(rv.change_events_to_backup_entries(deque(raw_events(m, [(writer_rel[0] == 'd', 'move', writer_rel[1], writer_rel[0])])), m))
@@ -473,15 +492,16 @@ def test_a_move_of_a_folder_with_no_files_over_a_folder_counts_the_folder_it_rep
 	assert one.info.vault_info_dict[0].size == 4096 + 2000 + 2 * 4096
 
 
-def test_the_tree_counts_a_moved_file_whose_row_has_no_record(r_job, run):
-	# a move with no verification after it leaves its rows unverified until the next comparison, and a sum of rows alone would count them as no bytes
+def test_the_tree_counts_a_moved_file_by_the_record_it_carries(r_job, run):
+	# a move with no verification after it: the row carries its record to its new path, as the rename keeps the inode, and the
+	# sum of rows counts its bytes there
 	put_text(r_job.monitor, 'f', 'f' * 5000)
 	put_text(r_job.monitor, 'other', 'other')
 	one = run(keep_n_versions=0)
 	one.backup()
 	os.rename(os.path.join(r_job.monitor, 'f'), os.path.join(r_job.monitor, 'g'))
 	one.backup(OrderedDict([rv_entry(r_job, 'g', 'f')]), touched=None)
-	assert one.manifest.lookup('g').kind is None
+	assert one.manifest.lookup('g').kind == 'f' and one.manifest.lookup('g').size == 5000
 	assert one.info.vault_info_dict[1].size == 5005
 
 

@@ -150,7 +150,7 @@ def test_a_batch_that_placed_a_copy_flushes_even_after_a_read_back_after_its_las
 		return real_flush(*args, **kwargs)
 	monkeypatch.setattr(rv, 'flush_copies', flush)
 	errseq.events.clear()
-	# the moved row is unverified, so the verification reads it back after every copy of the batch is in place
+	# the moved row carries its record, and the verification compares it after every copy of the batch is in place, with no sync
 	os.rename(os.path.join(r_job.monitor, 'a/sub'), os.path.join(r_job.monitor, 'e'))
 	put_text(r_job.monitor, 'e/m.txt', 'new')
 	backup_events(r_job, [(True, 'move', 'e', 'a/sub'), (False, 'modify', 'e/m.txt', None)], **KEPT)

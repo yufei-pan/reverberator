@@ -8751,6 +8751,10 @@ class VaultManifest:
 	SCHEMA_1_COLUMNS = ('path TEXT PRIMARY KEY, kind TEXT, size INTEGER, mtime_ns INTEGER, mode INTEGER, uid INTEGER, gid INTEGER, '
 		'hash TEXT, link TEXT, unchecked INTEGER, dirty INTEGER NOT NULL DEFAULT 0')
 	UNVERIFIED = 'kind = NULL, size = NULL, mtime_ns = NULL, mode = NULL, uid = NULL, gid = NULL, hash = NULL, link = NULL, unchecked = NULL, dirty = 0'
+	# a moved row's dirty mark: kept with a record (the replay vouched for it), dropped without one. a copy's row is dirty with
+	# no record, and the copy holds the monitored file of its old place, not of its new one: the verification would trust it
+	# there ( compare_scopes()'s trusted rels ), so it is read back as an unverified row
+	MOVED_DIRTY = 'dirty = (dirty AND kind IS NOT NULL)'
 
 	def __init__(self, job_vault:str):
 		self.path = os.path.join(job_vault, MANIFEST_FILE_NAME)
@@ -9052,8 +9056,10 @@ class VaultManifest:
 		Mark the file row rel dirty and keep its record: the replay synced an attribute change onto the file, and the record
 		vouches for what is there, so the commit takes its hash and unchecked flag from the record
 		(take_dirty_records()) and reads only the new metadata. A dirty row that has a record is one the replay vouched
-		for: any later add(), move_file() or move_tree() for rel wipes the record by itself. An untracked rel is left alone.
-		Only a file row record_vouches() vouched for is passed (a folder's row never is).
+		for: a later add() for rel wipes the record by itself, while move_file() and move_tree() carry it with its dirty mark,
+		as a rename keeps the inode, so the commit reads the new metadata at the new path. An untracked rel is left alone.
+		Only a file row the replay vouched for is passed: record_vouches() said so, or a moved file whose contents are the
+		monitored file's took its attributes (a folder's row never is).
 		'''
 		self.conn.execute('UPDATE entries SET dirty = 1 WHERE path = ?', (storable_name(rel),))
 
@@ -9078,8 +9084,10 @@ class VaultManifest:
 
 	def move_tree(self, src_folder:str, dst_folder:str):
 		'''
-		Track src_folder and everything under it as dst_folder instead, replacing what dst_folder held.
-		The moved rows stay unverified, so the next comparison reads them once.
+		Track src_folder and everything under it as dst_folder instead, replacing what dst_folder held. Only the paths
+		change: each row keeps its record, its unchecked flag and its dirty mark, as a rename keeps the inode, its bytes and
+		its metadata, so a row's record still describes the entry at its path. Called only once the version's rename is
+		made: a fallback to a copy leaves the rows where they are.
 		'''
 		if src_folder.startswith(dst_folder) or dst_folder.startswith(src_folder):
 			# a folder cannot move into itself or onto its parent
@@ -9088,16 +9096,16 @@ class VaultManifest:
 		self.discard(dst_folder[:-1])
 		# substr() counts characters, as len() does on the stored path
 		src, dst = storable_name(src_folder), storable_name(dst_folder)
-		self.conn.execute(f'UPDATE entries SET path = ? || substr(path, ?), {self.UNVERIFIED} WHERE path >= ? AND path < ?',
+		self.conn.execute(f'UPDATE entries SET path = ? || substr(path, ?), {self.MOVED_DIRTY} WHERE path >= ? AND path < ?',
 			(dst, len(src) + 1, src, folder_range_end(src)))
 
 	def move_file(self, src:str, dst:str):
 		'''
-		Track the file src as dst instead, replacing what dst held, as move_tree() does for a folder: unverified. dst is
-		tracked even when src is not.
+		Track the file src as dst instead, replacing what dst held, as move_tree() does for a folder: its record, unchecked
+		flag and dirty mark go with it. dst is tracked even when src is not.
 		'''
 		self.discard(dst)
-		if not self.conn.execute(f'UPDATE entries SET path = ?, {self.UNVERIFIED} WHERE path = ?', (storable_name(dst), storable_name(src))).rowcount:
+		if not self.conn.execute(f'UPDATE entries SET path = ?, {self.MOVED_DIRTY} WHERE path = ?', (storable_name(dst), storable_name(src))).rowcount:
 			self.add(dst)
 
 	def set_records(self, records):
@@ -10210,8 +10218,9 @@ def record_vouches(record:'ManifestRecord', source_path:str, path:str = None) ->
 	Whether a row's record (checked or unchecked) says the copy at path holds the monitored file at source_path: the
 	monitored file has the recorded size, mtime and tail, and the copy (not checked when path is None) still has the
 	recorded size and mtime. A moved mtime never vouches, as a write through a mapping moves only the mtime and raises no
-	event, and a moved row is unverified, so an entry a swap left at another file's place never vouches. One that cannot be
-	looked at does not.
+	event. A row moves with its inode, and only when the version's rename is made, so its record describes the inode at its
+	place: an entry a swap left at another file's place vouches only when the monitored file matches that inode. One that
+	cannot be looked at does not.
 	'''
 	if record is None or record.kind != 'f':
 		return False
@@ -10231,10 +10240,10 @@ def attribs_to_copy(backup_entries:dict, manifest:'VaultManifest', monitor_path:
 	'''
 	The paths of the file attrib entries of backup_entries that the replay copies under only_sync_attributes, read before
 	it from version_path, the latest version: the entry holds other contents than the monitored file, and the row's record
-	does not vouch for it (record_vouches()). A row a move of the batch before the entry lands on or under is unverified by
-	then, and is read where the latest version has it: back through each such move, the last first, as the replay makes the
-	moves in their order in backup_entries before the changes after them (mv d x; mv x/m a reads a/big at d/m/big). The size
-	limit counts these copies.
+	does not vouch for it (record_vouches()). An entry a move of the batch before it lands on or under is read where the
+	latest version has it, with that row's record, as the row travels with the inode to where the attrib applies: back
+	through each such move, the last first, as the replay makes the moves in their order in backup_entries before the
+	changes after them (mv d x; mv x/m a reads a/big at d/m/big). The size limit counts these copies.
 	'''
 	# each move by where it lands, with its place among the entries
 	moved_from = {path: (index, values.source_path) for index, (path, values) in enumerate(backup_entries.items())
@@ -10253,22 +10262,20 @@ def attribs_to_copy(backup_entries:dict, manifest:'VaultManifest', monitor_path:
 				return last
 			path = parent + '/'
 	def latest_place(path, bound):
-		# where the latest version has the entry at path and bound, and whether a move of the batch before it carried it
-		moved = False
+		# where the latest version has the entry at path and bound
 		while moved_from:
 			hop = moved_before(path, bound)
 			if hop is None:
 				break
 			bound, landed, source = hop
-			path, moved = source + path[len(landed):], True
-		return path, moved
+			path = source + path[len(landed):]
+		return path
 	copied = set()
 	for index, (path, values) in enumerate(backup_entries.items()):
 		if values.event != 'attrib' or path.endswith('/'):
 			continue
-		place, moved = latest_place(path, index)
-		rel = os.path.relpath(place, monitor_path)
-		record = None if moved else manifest.lookup(rel)
+		rel = os.path.relpath(latest_place(path, index), monitor_path)
+		record = manifest.lookup(rel)
 		if record_vouches(record, path):
 			continue
 		entry = os.path.join(version_path, rel)
@@ -13305,8 +13312,8 @@ class TreeWriter:
 			# looked at first, so a move that will not happen records nothing
 			if not os.path.lexists(source) or not real_folders_to(self.tree, dst):
 				return False
-			# the move's rows are at dst already
-			self.record(dst, False, rows=False)
+			# dst's own rows, sized from: the move's rows go there only once the rename is made
+			self.record(dst, False)
 			self.flush_if_needed()
 		if os.path.isdir(target) and not os.path.islink(target):
 			remove_entry(target)
@@ -14007,8 +14014,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 					manifest.add(as_folder_entry(event_relative_path),dirty=True)
 				else:
 					# the row's record first, which reads the monitored file only: the replay reads the copy's tail, on the
-					# vault's disks, only for a record that does not vouch ( a moved row never does, nor a file whose mtime
-					# moved from the recorded one: an mmap write moves only the mtime, so the file is copied and not synced )
+					# vault's disks, only for a record that does not vouch ( a file whose mtime moved from the recorded one
+					# never does: an mmap write moves only the mtime, so the file is copied and not synced ). a row moved
+					# earlier in the batch carries the record of the inode it moved with
 					vouched = only_sync_attributes and record_vouches(manifest.lookup(event_relative_path),event_source_real_path,file_vault_target_path)
 					if vouched or (only_sync_attributes and same_contents(event_source_real_path,file_vault_target_path)):
 						# we just copy the file metadata
@@ -14033,6 +14041,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 				# we need to wait for copy threads to finish to allow rename, and the copies they made are recorded under
 				# the names they were made for before those rows move
 				wait_for_async_commands(mcae)
+				# the rows move only once the version's rename is made, and keep their records, as the inodes keep theirs:
+				# every way out of this branch leaves rows that describe what the version holds
 				link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
 				link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
 				if link_target_relative_path.startswith(link_source_relative_path.rstrip('/') + '/'):
@@ -14042,12 +14052,6 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 						'its new place is inside its old one in the version; copying it instead')
 					copy_instead_of_move(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
 					continue
-				if isDir:
-					# also moves all the files and subfolders in the folder
-					manifest.move_tree(as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path))
-					manifest.add(as_folder_entry(link_target_relative_path))
-				else:
-					manifest.move_file(link_source_relative_path,link_target_relative_path)
 				try:
 					if not real_folders_to(backup_folder,link_source_relative_path,missing_ok=True) or not real_folders_to(backup_folder,link_target_relative_path,missing_ok=True):
 						# renaming would reach through the link, out of the version
@@ -14056,14 +14060,21 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 						# an earlier move of the batch left the other kind there ( a file and a folder swapped, which the
 						# collapse cannot order ): renamed, a link would stand where the rows say a folder is
 						raise NotARealFolder(f'{link_source_backup_real_path} is {"not " if isDir else ""}a folder in the version, as an earlier move of the batch left it')
-					if os.path.isdir(link_target_backup_real_path.rstrip('/')) and not os.path.islink(link_target_backup_real_path.rstrip('/')):
-						# the live rename found nothing there, or an empty folder ( rm -rf e; mv d e ): what the version
-						# still holds there is gone, and its rows ( a folder's moved rows replaced them already )
+					# the live rename found nothing there, or an empty folder ( rm -rf e; mv d e ): what the version still holds
+					# there goes with the rename, and its rows after it
+					replaces_folder = os.path.isdir(link_target_backup_real_path.rstrip('/')) and not os.path.islink(link_target_backup_real_path.rstrip('/'))
+					if replaces_folder:
 						backuperTeeLogToTl(path=monitor_path,message=f'Removing {link_target_backup_real_path}, which the move of {link_source_backup_real_path} replaces')
-						if not isDir:
-							manifest.remove_tree(as_folder_entry(link_target_relative_path))
 					if not writer.rename(link_source_relative_path,link_target_relative_path):
 						raise NotRenamed()
+					if isDir:
+						# also moves all the files and subfolders in the folder, replacing the target's rows
+						manifest.move_tree(as_folder_entry(link_source_relative_path),as_folder_entry(link_target_relative_path))
+						manifest.add(as_folder_entry(link_target_relative_path))
+					else:
+						if replaces_folder:
+							manifest.remove_tree(as_folder_entry(link_target_relative_path))
+						manifest.move_file(link_source_relative_path,link_target_relative_path)
 					written.wrote_in(link_source_relative_path)
 					written.wrote_in(link_target_relative_path)
 					if isDir:
@@ -14085,6 +14096,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 						# new copy takes the new attributes and the old inode stays as it was. nothing is written when none differ
 						if only_sync_attributes:
 							writer.file_meta(event_source_real_path,link_target_relative_path,None,unsynced)
+							# its contents are the monitored file's: the commit reads the new metadata and keeps the hash
+							manifest.mark_vouched(link_target_relative_path)
 						else:
 							writer.copy(event_source_real_path,link_target_relative_path,mcae,pending)
 							manifest.add(link_target_relative_path,dirty=True)
@@ -14101,13 +14114,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 					# a live move outran, or a folder the version holds elsewhere ). nothing is wrong, so no traceback
 					backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not renaming {link_source_backup_real_path} to {link_target_backup_real_path}: '
 						'its source or the folder it goes into is not in the version; copying it instead')
-					if not copy_instead_of_move(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae):
-						# the rows move_tree / move_file put at the target go, or a later folder move carries them and the
-						# verification cannot read them
-						if isDir:
-							manifest.remove_tree(as_folder_entry(link_target_relative_path))
-						else:
-							manifest.discard(link_target_relative_path)
+					copy_instead_of_move(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
 				except Exception:
 					backuperTeeLogToTl(path=monitor_path,error=True,message=f'Failed to move {link_source_backup_real_path} to {link_target_backup_real_path}')
 					import traceback
@@ -14116,7 +14123,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 					move_targets.discard(event_relative_path + ('/' if isDir else ''))
 					# if we fail to move, we just copy the file
 					delete_and_copy(isDir,event_source_real_path,event_relative_path,file_vault_target_path,link_source_backup_real_path,link_source_relative_path,mcae)
-				# the copy fallback keeps the rows move_tree moved too, so both ways need the re-check
+				# the copy fallback's rows are its own copies' too, so both ways need the re-check
 				if isDir and skip_list is not None and skip_list.location_dependent:
 					recheck_moved_folder(as_folder_entry(link_target_relative_path),mcae)
 		if need_delete_barrier:

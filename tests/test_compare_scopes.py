@@ -108,6 +108,8 @@ def test_it_reads_the_version_it_is_given(job, capsys):
 	assert rv.hand_over(job.job_vault, v0, v1, manifest).rename('D', 'D2')
 	manifest.move_tree('D/', 'D2/')
 	os.rename(os.path.join(job.monitor, 'D'), os.path.join(job.monitor, 'D2'))
+	# rows with no record, as a 0.55.4 daemon left the rows it moved: the comparison reads the vault for them
+	manifest.set_records([('D2/x.txt', None), ('D2/y.txt', None)])
 	assert manifest.lookup('D2/x.txt').kind is None
 	capsys.readouterr()
 	scopes = rv.TouchedScopes(['D2/'], [])

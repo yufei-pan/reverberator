@@ -909,8 +909,8 @@ def test_a_batch_that_copied_flushes_before_its_change_list_and_commit_point(r_j
 
 def test_a_read_back_after_the_last_copy_leaves_the_flush(r_job, commit_steps):
 	build_base(r_job, **KEPT)
-	# the moved row is unverified, so the comparison reads it back after every copy of the batch is in place, and syncs nothing: the
-	# commit's flush, through the batch's own handles, is what puts its copies on the disk
+	# the moved rows carry their records, and the comparison after every copy of the batch is in place syncs nothing: the commit's
+	# flush, through the batch's own handles, is what puts its copies on the disk
 	backup_events(r_job, move_and_modify(r_job.monitor), **KEPT)
 	assert commit_steps == ['flush', 'list', 'commit']
 	assert open(at(newest_version(r_job), 'e/m.txt')).read() == 'new'
@@ -944,7 +944,7 @@ def test_a_first_version_of_folders_alone_does_not_flush(r_job, commit_steps):
 	(chmod_folder, {}), (chmod_file, {'only_sync_attributes': True})], ids=['move', 'folder_move', 'delete', 'folder_delete', 'new_folder', 'folder_attrib', 'attrib_in_place'])
 def test_a_batch_that_copied_nothing_does_not_flush(r_job, commit_steps, item, options):
 	build_base(r_job, **KEPT)
-	# a moved row is read back by the verification, which syncs nothing
+	# a moved row carries its record, which the verification compares, and syncs nothing
 	backup_events(r_job, item(r_job.monitor), **KEPT, **options)
 	assert commit_steps == ['list', 'commit']
 
@@ -1075,6 +1075,7 @@ def test_a_record_made_by_a_link_adds_no_flush(r_job, commit_steps, new_copies_f
 @pytest.mark.parametrize('item', [move_file, move_folder], ids=['move', 'folder_move'])
 def test_a_record_made_by_a_copy_in_a_move_is_flushed(r_job, commit_steps, no_hard_links, item):
 	build_base(r_job, **KEPT)
-	# the comparison that reads the moved row back syncs nothing: the record's copy is the commit flush's
+	# the record of what the move replaces is a copy where hard links are refused, and the comparison syncs nothing: that copy is the
+	# commit flush's
 	backup_events(r_job, item(r_job.monitor), **KEPT)
 	assert commit_steps == ['flush', 'list', 'commit']

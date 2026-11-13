@@ -10,22 +10,16 @@ REVERB_WATCH_FUZZ=1 REVERB_WATCH_FUZZ_FROM=<seed>. The same seed gives the same 
 watcher, so a failure may need several runs to show again.
 
 Besides the version equalling the tree, the suite's ground truth plugin (tests/version_view_ground_truth.py) checks that no
-older version changed. It also checks each change list's size record, and one fault there is known and deferred: a copy
-fallback after a whole-tree comparison that fell between a rename and its read leaves the version before it with a list that
-says too little. Those lines, a list below the oracle's numbers and never above them, are left out here unless
-REVERB_WATCH_FUZZ_LISTS=1; a list that says too much still fails.
+older version changed, and each change list's size record.
 '''
-import ast
 import os
 import random
-import re
 import shutil
 import time
 
 import pytest
 
 import reverberator as rv
-from tests import version_view_ground_truth as view_truth
 from tests.test_moves_into_new_folders import live_view, session, version_view  # session is the fixture
 
 pytestmark = pytest.mark.inotify
@@ -194,28 +188,4 @@ def test_random_batches_end_as_the_tree(folders_removed, session, job, tmp_path,
 		if version != tree:
 			fail(f'round {rnd}: ' + str({rel: ('MISSING' if rel not in version else 'present', 'MISSING' if rel not in tree else 'present', version.get(rel, [None])[1:2] == tree.get(rel, [None])[1:2])
 				for rel in sorted(set(version) | set(tree)) if version.get(rel) != tree.get(rel)}))
-	if os.environ.get('REVERB_WATCH_FUZZ_LISTS') != '1':
-		view_truth.WRONG[:] = [line for line in view_truth.WRONG if not says_too_little(line)]
 
-
-LIST_LINE = re.compile(r'(?P<version>\S+): its list should be (?P<wanted>\S+), the lists are (?P<lists>\[.*\])$')
-
-
-def says_too_little(line: str) -> bool:
-	'''
-	Whether line is the known fault: a version's change list whose size record is below the oracle's, in bytes and inodes, and
-	never above it. A list that says too much, a missing list or any other line is not, and fails the test.
-
-	>>> says_too_little("V2--t: its list should be V2--t--8.00_KiB-3_ino.modified_contents.nsv, the lists are ['V2--t--4.00_KiB-2_ino.modified_contents.nsv']")
-	True
-	>>> says_too_little("V2--t: its list should be V2--t--8.00_KiB-3_ino.modified_contents.nsv, the lists are ['V2--t--12.00_KiB-3_ino.modified_contents.nsv']")
-	False
-	>>> says_too_little("V2--t: its list should be V2--t--8.00_KiB-3_ino.modified_contents.nsv, the lists are []")
-	False
-	'''
-	match = LIST_LINE.match(line)
-	if match is None:
-		return False
-	wanted = rv.change_list_record(match['wanted'].rpartition('--')[2])
-	lists = [rv.change_list_record(name.rpartition('--')[2]) for name in ast.literal_eval(match['lists'])]
-	return wanted is not None and bool(lists) and all(listed is not None and listed[0] <= wanted[0] and listed[1] <= wanted[1] for listed in lists)
