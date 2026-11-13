@@ -1,12 +1,14 @@
+import errno
 import os
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
 import signal
-from tests.harness import seed_monitor, wait_until, committed_versions, create_job, rule_row, write_rule, wait_for_committed_count, write_fstab
+from tests.harness import seed_monitor, wait_until, committed_versions, create_job, rule_row, run_backup, write_rule, wait_for_committed_count, write_fstab
 from tests.test_log_text import alerting_lines
 
 pytestmark = pytest.mark.unit
@@ -959,3 +961,188 @@ def test_status_shows_a_nameless_job_as_stopped(tmp_path):
 	status = rv.DaemonStatus(None, False, {})
 	text = rv.status_text(rv.status_view(status, rules, '/r/rules.tsv'))
 	assert "!!!  stopped: its name has no letters, digits, '-' or '_' left after cleanup; rename it in /r/rules.tsv" in text
+
+
+# ---- L4: the mount table reads of a batch ----------------------------------------------------------------------------
+
+BATCH_THREAD = 'backuper under test'
+
+
+class IdleFlag(threading.Event):
+	'''The backuper's to_process_flag: idle is set once the backuper waits on it for a batch.'''
+	def __init__(self):
+		super().__init__()
+		self.idle = threading.Event()
+
+	def wait(self, timeout=None):
+		self.idle.set()
+		return super().wait(timeout)
+
+
+def mount_table_reads(monkeypatch, counting_fsyncs=False):
+	'''
+	The read_mount_table() calls made on the backuper's thread while armed: reads, and in_fsync for those made inside
+	fsync_vault_folder(), which reads counts too when counting_fsyncs.
+	'''
+	counts = {'armed': False, 'reads': 0, 'in_fsync': 0}
+	real = rv.read_mount_table
+	def counted():
+		if counts['armed'] and threading.current_thread().name == BATCH_THREAD:
+			frame = sys._getframe(1)
+			while frame is not None and frame.f_code.co_name != 'fsync_vault_folder':
+				frame = frame.f_back
+			if frame is not None:
+				counts['in_fsync'] += 1
+			if frame is None or counting_fsyncs:
+				counts['reads'] += 1
+		return real()
+	monkeypatch.setattr(rv, 'read_mount_table', counted)
+	return counts
+
+
+def one_batch_through_the_backuper(job, monkeypatch, make_events, counts=None, before=None) -> dict:
+	'''
+	The job's backuper, started with nothing queued (it compares the whole tree first), given the batch of ChangeEvents
+	make_events() makes once it waits for one: counts armed from then until the batch's do_backup() returned. before(), when
+	given, runs right before the batch is made.
+	Returns {'guard': the PoolGuard the batch's do_backup() was given, 'unit': (pool, handle count) of the VaultUnit it opened}.
+	'''
+	queue = rv.ChangeEventQueue(job.monitor)
+	lock = threading.Lock()
+	flag = IdleFlag()
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	returned = threading.Event()
+	seen = {'guard': None, 'unit': None}
+	real = rv.do_backup
+	def do_backup(*args, **kwargs):
+		queued = threading.current_thread().name == BATCH_THREAD and flag.idle.is_set()
+		if queued:
+			seen['guard'] = kwargs.get('pool_guard')
+		try:
+			return real(*args, **kwargs)
+		finally:
+			if queued:
+				returned.set()
+	monkeypatch.setattr(rv, 'do_backup', do_backup)
+	class Unit(rv.VaultUnit):
+		def __init__(self, *args, **kwargs):
+			super().__init__(*args, **kwargs)
+			if threading.current_thread().name == BATCH_THREAD and flag.idle.is_set() and self.own and seen['unit'] is None:
+				# the handles it opened, which its close() empties
+				seen['unit'] = (self.pool, len(self.handles))
+	monkeypatch.setattr(rv, 'VaultUnit', Unit)
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag),
+		kwargs=dict(job=control), daemon=True, name=BATCH_THREAD)
+	thread.start()
+	try:
+		wait_until(flag.idle.is_set, message='the backuper never waited for a batch')
+		if before is not None:
+			before()
+		if counts is not None:
+			counts['armed'] = True
+		events = make_events()
+		with lock:
+			queue.read_wall_ns = time.time_ns()
+			for event in events:
+				queue.append(event)
+		flag.set()
+		wait_until(returned.is_set, message='the batch never ran')
+		if counts is not None:
+			counts['armed'] = False
+		assert control.failure is None, control.failure
+	finally:
+		control.fail('test done')
+		thread.join(timeout=5)
+		assert not thread.is_alive()
+	return seen
+
+
+def a_changed_file(job, rel='a.txt'):
+	path = os.path.join(job.monitor, rel)
+	with open(path, 'w') as f:
+		f.write('changed')
+	return rv.ChangeEvent(time.monotonic(), False, 'modify', path, None)
+
+
+def test_a_one_file_batch_reads_the_mount_table_twice(job, poll_fast, monkeypatch):
+	# fails on main (seven): off a pool, through backuper(): one read for both waits, the guard and do_backup(), one after
+	# the verification's walk, which the commit remembers the inner mounts from. the fsyncs' reads are Task 6's
+	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	run_backup(job)
+	counts = mount_table_reads(monkeypatch)
+	one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], counts)
+	assert len(committed_versions(job)) == 2
+	assert counts['reads'] == 2
+
+
+def test_a_batch_with_a_scanned_folder_reads_the_mount_table_three_times(job, poll_fast, monkeypatch):
+	# fails on main: one more, after the scanned folders' walk, for do_backup()
+	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	run_backup(job)
+	counts = mount_table_reads(monkeypatch)
+	def batch():
+		with open(os.path.join(job.monitor, 'd', 'b.txt'), 'w') as f:
+			f.write('changed')
+		return [a_changed_file(job), rv.ChangeEvent(time.monotonic(), True, 'scan', os.path.join(job.monitor, 'd'), None)]
+	one_batch_through_the_backuper(job, monkeypatch, batch, counts)
+	assert len(committed_versions(job)) == 2
+	assert counts['reads'] == 3
+
+
+def pooled_vault(job, fake_pool):
+	'''The vault of job on a fake pool of branches a and b, each holding the job vault: the branches.'''
+	branches = fake_pool.add(job.vault, ['a', 'b'])
+	for branch in branches:
+		os.makedirs(os.path.join(branch, job.job_name), exist_ok=True)
+	return branches
+
+
+def covered_with_a_handle_per_filesystem(job, seen, branches):
+	'''The batch's guard covers the job vault, and its unit opened a handle on each filesystem of the pool's branches (one, here).'''
+	assert seen['guard'].covers(job.job_vault)
+	assert seen['unit'] == (os.path.realpath(job.vault), len({os.stat(branch).st_dev for branch in branches}))
+
+
+def test_a_pool_mounted_while_the_vault_wait_polls_is_covered_by_the_batch(job, fake_pool, monkeypatch, poll_fast):
+	# pin (passes on main; fails with a table read before the waits): the vault's pool is unmounted when the batch's loop
+	# begins (its fstab line names it, so the wait polls) and mounted while the vault's wait polls
+	seed_monitor(job, {'a.txt': 'a'})
+	branches = pooled_vault(job, fake_pool)
+	run_backup(job)
+	write_fstab(job.vault)
+	polled = threading.Event()
+	real = rv.vault_disk_problem
+	def problem(path, *args, **kwargs):
+		found = real(path, *args, **kwargs)
+		if found and threading.current_thread().name == BATCH_THREAD and path == job.vault:
+			polled.set()
+		return found
+	monkeypatch.setattr(rv, 'vault_disk_problem', problem)
+	def mount_it_while_the_wait_polls():
+		fake_pool.drop(job.vault)
+		threading.Thread(target=lambda: (polled.wait(10), fake_pool.mount(job.vault)), daemon=True).start()
+	seen = one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], before=mount_it_while_the_wait_polls)
+	assert polled.is_set() and len(committed_versions(job)) == 2
+	covered_with_a_handle_per_filesystem(job, seen, branches)
+
+
+def test_a_failed_mount_table_read_is_not_kept_for_the_batch(job, fake_pool, monkeypatch, poll_fast):
+	# review focus 4: the read at the vault wait's first poll fails, once: the wait polls again, and the batch's guard sees
+	# the pool from a good read
+	seed_monitor(job, {'a.txt': 'a'})
+	branches = pooled_vault(job, fake_pool)
+	run_backup(job)
+	state = {'armed': False, 'failed': 0, 'after': 0}
+	real = rv.read_mount_table
+	def flaky():
+		if state['armed'] and threading.current_thread().name == BATCH_THREAD:
+			if not state['failed']:
+				state['failed'] += 1
+				raise OSError(errno.EIO, os.strerror(errno.EIO), rv.MOUNTINFO_PATH)
+			state['after'] += 1
+		return real()
+	monkeypatch.setattr(rv, 'read_mount_table', flaky)
+	seen = one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], before=lambda: state.update(armed=True))
+	assert state['failed'] == 1 and state['after'] >= 1 and len(committed_versions(job)) == 2
+	covered_with_a_handle_per_filesystem(job, seen, branches)

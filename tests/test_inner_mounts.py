@@ -4,7 +4,7 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, tracked_manifest, wait_until
+from tests.harness import committed_versions, seed_monitor, tracked_manifest, wait_until
 
 def _privileged():
 	return os.geteuid() == 0 or os.environ.get('REVERB_PRIVILEGED') == '1'
@@ -274,9 +274,20 @@ def _backup(job, entries=None):
 		vault_path=job.vault, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 
 
+def _fake_disk(name):
+	'''The fingerprint of a fake disk called name, the same at every read.'''
+	return (name.encode(), b'0:0', b'/', b'fake:' + name.encode(), b'xfs')
+
+
+def _real_table():
+	with open(rv.MOUNTINFO_PATH, 'rb') as f:
+		return rv.parse_mount_table(f.read())
+
+
 def _fake_mounts(monkeypatch, job, mounted):
-	table = [('/', ('1',))] + [(os.path.join(job.monitor, rel.rstrip('/')), (rel,)) for rel in mounted]
-	monkeypatch.setattr(rv, 'current_mount_table', lambda: table)
+	'''The real mount table, with a fake disk mounted at each folder rel of mounted. At the source: a batch's waits read it, and current_mount_table() goes through it.'''
+	table = _real_table() + [(os.path.join(job.monitor, rel.rstrip('/')), _fake_disk(rel)) for rel in mounted]
+	monkeypatch.setattr(rv, 'read_mount_table', lambda: list(table))
 
 
 @pytest.mark.unit
@@ -514,7 +525,8 @@ def test_a_changed_monitored_filesystem_fails_the_job_before_comparing(job, poll
 		assert control.committed.wait(5)
 		# the monitored disk is lazily unmounted: its inner mount leaves the table, and the path shows another
 		# filesystem, which has no disk folder
-		monkeypatch.setattr(rv, 'current_mount_table', lambda: [('/', ('1',)), (job.monitor, ('other',))])
+		other = _real_table() + [(job.monitor, _fake_disk('other'))]
+		monkeypatch.setattr(rv, 'read_mount_table', lambda: list(other))
 		import shutil
 		shutil.rmtree(os.path.join(job.monitor, 'disk'))
 		with lock:
@@ -668,3 +680,32 @@ def test_an_unreadable_folder_in_a_scanned_disk_is_reported_once(job, poll_fast,
 		rv.GREEN_LIGHT.clear()
 		thread.join(timeout=5)
 		rv.GREEN_LIGHT.set()
+
+
+@pytest.mark.unit
+def test_an_inner_disk_unmounted_while_scanned_folders_are_walked_commits_nothing(job, poll_fast, monkeypatch):
+	# pin, the re-check's run N3 (passes on main; fails with the waits' table handed to do_backup()): a batch of a scan of
+	# disk/, an inner mount, which is unmounted while compare_scanned_folders() walks it. The walk finds the empty folder it
+	# left, and the table read after the walk pauses it, so its deletes are dropped: no version, its files stay in the vault
+	from tests.test_jobs import one_batch_through_the_backuper
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	disk = os.path.join(job.monitor, 'disk')
+	real_table = rv.read_mount_table()
+	mounted = real_table + [(os.path.realpath(disk), (b'9999', b'0:99', b'/', b'/dev/fakedisk', b'xfs'))]
+	tables = {'now': mounted}
+	monkeypatch.setattr(rv, 'read_mount_table', lambda: list(tables['now']))
+	_backup(job)[1].close()
+	versions = committed_versions(job)
+	assert len(versions) == 1
+	real = rv.delta_generate_backup_entries
+	def walk(*args, **kwargs):
+		if kwargs.get('scope_rel') == 'disk/' and tables['now'] is mounted:
+			# unmounted: the mount point shows the empty folder under it
+			os.remove(os.path.join(disk, 'f.txt'))
+			tables['now'] = real_table
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'delta_generate_backup_entries', walk)
+	one_batch_through_the_backuper(job, monkeypatch, lambda: [rv.ChangeEvent(time.monotonic(), True, 'scan', disk, None)])
+	assert tables['now'] is real_table
+	assert committed_versions(job) == versions
+	assert os.path.isfile(os.path.join(versions[0], 'disk', 'f.txt'))

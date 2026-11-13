@@ -1224,7 +1224,7 @@ COOKIE_VALUE = namedtuple('COOKIE_VALUE',['wd','path','isDir','wds'],defaults=((
 GREEN_LIGHT = threading.Event()
 GREEN_LIGHT.set()
 
-def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic, create:bool = False) -> bool:
+def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, clock = time.monotonic, create:bool = False, table:list = None) -> bool:
 	'''
 	Wait until the disk holding path is there, flag is set and path is a directory. Returns False when the job (with
 	job None, GREEN_LIGHT) says stop. The disk is checked live on every poll, as the flag can lag behind it, and the
@@ -1236,15 +1236,31 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS, and once the wait
 	it alerted for ends, one line saying the job goes on. Of the job's waits for one path, only the oldest alerts
 	(JobControl.alerts).
+	table, a one-item list a batch's waits share: the first poll looks at the mount table it holds, or reads one and puts it
+	there when it is empty, and every later poll reads it live and puts that there, so once the wait returns it holds the
+	table the wait saw last, with no wait after it. Only a read that succeeded goes in it.
 	'''
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	started = clock()
 	next_alert = started + DISK_WAIT_GRACE_SECONDS
 	token = None
 	alerted = False
+	polled = False
 	try:
 		while running():
-			reason = vault_disk_problem(path)
+			if table is None:
+				reason = vault_disk_problem(path)
+			else:
+				reason = None
+				if polled or not table:
+					table.clear()
+					try:
+						table.append(read_mount_table())
+					except OSError as e:
+						reason = mount_table_unreadable(e)
+				if reason is None:
+					reason = vault_disk_problem(path, table[0])
+			polled = True
 			if reason is None and create and not os.path.lexists(path):
 				try:
 					os.makedirs(path, exist_ok=True)
@@ -4313,18 +4329,24 @@ def fstab_mount_points(mount_table:list) -> list:
 	mounted = {point for point, _ in mount_table}
 	return [point if point in mounted else os.path.realpath(point) for point in points]
 
-def vault_disk_problem(path:str) -> 'str | None':
+def mount_table_unreadable(e:OSError) -> str:
+	'''What a wait says while the mount table cannot be read.'''
+	return f'the mount table cannot be read: {e.strerror or e}'
+
+def vault_disk_problem(path:str, mount_table:list = None) -> 'str | None':
 	'''
 	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
 	point at or above the path is not mounted (a bare folder left under it is not that disk, and neither is anything
 	mounted below it: telling a disk from a bind mount or a tmpfs there needs rules this host has no use for), when the mount table cannot be
 	read, when a mergerfs pool holding the path has a disk missing (pool_problem()'s text), or when the disk holding it
-	off a pool has failed as a pool's disk can (plain_disk_problem()). path need not exist.
+	off a pool has failed as a pool's disk can (plain_disk_problem()). path need not exist. mount_table, when given, is the
+	table to look at: none is read then.
 	'''
-	try:
-		mount_table = read_mount_table()
-	except OSError as e:
-		return f'the mount table cannot be read: {e.strerror or e}'
+	if mount_table is None:
+		try:
+			mount_table = read_mount_table()
+		except OSError as e:
+			return mount_table_unreadable(e)
 	real = os.path.realpath(path)
 	above = [mount_point for mount_point in fstab_mount_points(mount_table) if real == mount_point or real.startswith(mount_point + '/')]
 	if above:
@@ -4357,10 +4379,11 @@ class PoolGuard:
 	disk of one is missing or was mounted again since; poll() does so at most once every POOL_CHECK_SECONDS, so it can
 	run per entry. Paths on no pool are never checked; while the mount table cannot be read, each path counts as on one.
 	A path is held and asked in its normal spelling (os.path.normpath), as a rule's vault path is not normalised: a guard built on
-	vault// and asked about vault/job must agree.
+	vault// and asked about vault/job must agree. mount_table, when given, is the table the step began with: none is read
+	for the pools' states then.
 	'''
-	def __init__(self, paths, clock = time.monotonic):
-		self.states = [(path, state) for path, state in ((path, pool_state(path)) for path in map(os.path.normpath, paths)) if state is not None]
+	def __init__(self, paths, clock = time.monotonic, mount_table:list = None):
+		self.states = [(path, state) for path, state in ((path, pool_state(path, mount_table)) for path in map(os.path.normpath, paths)) if state is not None]
 		self.clock = clock
 		self.next_check = None
 		self.lock = threading.Lock()
@@ -4830,7 +4853,8 @@ FS_SIGNATURE_MONITOR = fs_signature_monitor()
 
 #%% ---- Backup ----
 def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,monitor_path:str,vault_path:str,vaultInfo:VaultInfo = None,
-			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,pool_guard:'PoolGuard' = None,job:JobControl = None) -> tuple:
+			 manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,pool_guard:'PoolGuard' = None,job:JobControl = None,
+			 mount_table:list = None) -> tuple:
 	'''
 	Fold a batch's scan events (scan_folders, the folders they name) into its backup_entries: each scanned folder is
 	compared with the latest version, and what that finds replaces the batch's entries at or under it. A folder inside
@@ -4840,14 +4864,15 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 	monitored path no longer shows the filesystem root_mount fingerprints. reported holds the unreadable paths this batch
 	already logged. pool_guard goes to each comparison (delta_generate_backup_entries()). With no vaultInfo the vault is
 	scanned, which can change it, so under the job's locks: job (a JobControl) is whose wait that is, and a stop during it
-	returns with nothing compared.
+	returns with nothing compared. mount_table is the batch's (backuper()), read when None.
 	'''
 	scopes = scan_scopes(monitor_path,scan_folders)
 	if scopes == ['']:
 		return vaultInfo, manifest, True
 	if not scopes:
 		return vaultInfo, manifest, False
-	mount_table = current_mount_table()
+	if mount_table is None:
+		mount_table = current_mount_table()
 	check_monitored_mount(monitor_path,mount_table,root_mount)
 	job_vault = os.path.join(vault_path,job_name)
 	if not vaultInfo or not vaultInfo.vault_info_dict:
@@ -5031,24 +5056,32 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		vaultInfo = scanned
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while running():
-			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+			# the mount table the batch's waits read last: one read looks at the vault's disk, the monitored path's, the pools
+			# and the batch's inner mounts, a wait that polls again reading it live ( wait_for_path() ), so no table the batch
+			# takes was read before a wait
+			table = []
+			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready', table=table)
 			if not running():
 				break
 			# an unmounted fstab mount at or above the monitored path, or a disk of its pool out, would show its files as deleted: the batch waits for it too
-			wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
+			wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready', table=table)
 			if not running():
 				break
 			# the pools as the batch begins: a disk that drops from here on stops it ( do_backup() ), by the job's own folder, which is what the writer asks of them
-			pool_guard = PoolGuard([job_vault, monitor_path])
+			pool_guard = PoolGuard([job_vault, monitor_path], mount_table=table[0])
+			# whether scanned folders were walked since the waits
+			walked = False
 			# an unreadable path is reported once for the batch, by its comparison or its backup
 			reported = set()
 			# whether the whole tree is compared right after this batch
 			follow_up = False
 			if scan_folders and not full_comparison:
 				vaultInfo,manifest,full_comparison = compare_scanned_folders(backupEntries,scan_folders,job_name,monitor_path,vault_path,
-					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported,pool_guard=pool_guard,job=job)
+					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported,pool_guard=pool_guard,job=job,
+					mount_table=table[0])
 				if not running():
 					break
+				walked = not full_comparison
 				if full_comparison:
 					backupEntries.clear()
 				elif not backupEntries and touched is None:
@@ -5065,10 +5098,13 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				# begins; a fresh batch, the one taken last, holds every change made before the watcher's read time it
 				# carries. a batch handed back or resumed lost its raw events, and the read time says nothing of them
 				matched_since = time.time_ns() if full_comparison else None if round_tripped else to_process_temp.read_wall_ns
+				# read again after a walk of scanned folders: an inner disk unmounted while it ran is paused by do_backup(), which
+				# drops their deletes
+				batch_table = current_mount_table() if walked else table[0]
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
-					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since,job=job)
+					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since,job=job,mount_table=batch_table)
 				if not committed:
 					# the batch goes back to the queue on the way out. a stop, or the job's own failure, is no failure to commit
 					if running():
@@ -5764,13 +5800,13 @@ def backup_entries_to_change_events(backup_entries:dict) -> list:
 		events.append(ChangeEvent(base + (i * 0.001), is_dir, values.event, path, moved_from))
 	return events
 
-def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str) -> set:
+def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str) -> tuple:
 	'''
 	After a walk of the monitored tree (named by walk in the log): a disk unmounted while it ran was walked as the empty
 	folder it left, so what the walk found under it is dropped from backup_entries, and its rows are linked forward as
 	for a disk paused before the walk. JobFailure is raised when the monitored root itself shows another filesystem than
 	root_mount. mount_table is the one read before the walk, remembered_mounts the inner mounts the manifest recorded.
-	Returns paused with the inner mounts that went away added.
+	Returns (paused with the inner mounts that went away added, the table read after the walk).
 	'''
 	walked_table = current_mount_table()
 	check_monitored_mount(monitor_path,walked_table,root_mount)
@@ -5779,7 +5815,7 @@ def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, 
 	if unmounted:
 		dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in unmounted])
 		backuperTeeLogToTl(job_name,f'Inner mounts unmounted during the {walk}, keeping their last backed-up contents: {", ".join(sorted(unmounted))}; dropped {dropped} backup entries')
-	return paused | unmounted
+	return paused | unmounted, walked_table
 
 def check_walk_errors(job_name:str, monitor_path:str, errors:list, manifest:'VaultManifest' = None, reported:set = None):
 	'''After a first-backup walk of monitor_path: fail the job when its root could not be read, else log each unreadable folder.'''
@@ -5795,7 +5831,7 @@ def do_backup(backup_entries:dict,
 			 only_sync_attributes:bool, keep_n_versions:int , 
 			 backup_size_limit:str,log_journal:bool = False,
 			 vaultInfo:VaultInfo = None,manifest:'VaultManifest' = None,skip_list:'SkipList' = None,root_mount = None,reported:set = None,
-			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None,job:'JobControl' = None):
+			 touched:'TouchedScopes' = None,pool_guard:'PoolGuard' = None,matched_since:int = None,job:'JobControl' = None,mount_table:list = None):
 	# returns (vaultInfo, manifest, committed): pass both back in for the next backup of this job
 	# root_mount: the fingerprint of the mount the monitored path showed when the job started, when it is to be checked
 	# reported: the unreadable paths already logged for this batch, so each is logged once
@@ -5812,6 +5848,8 @@ def do_backup(backup_entries:dict,
 	# only when no inner mount was paused, nothing was logged unreadable and every metadata copy worked; else it carries
 	# the old time forward
 	# job: the job's JobControl, None outside the daemon: the wait for the locks shows in its status and ends when it stops running
+	# mount_table: the mount table the batch takes ( backuper(): its waits' last read, or one read after its scans walk ), read
+	# here when None
 	# a vaultInfo with a tree (design R) holds a cut batch's tree: this backup rolls it forward, a batch with no hand-over that
 	# compares the whole tree and always commits (spec section 3, plan S4); of the entries given only a plain file's change the comparison could not see is used (roll_forward_entries())
 	global DEBUG
@@ -5857,7 +5895,11 @@ def do_backup(backup_entries:dict,
 	try:
 		# inner mounts the backup has seen and that are unmounted now are paused: every walk below leaves them out, and
 		# they keep what the vault holds for them
-		mount_table = current_mount_table()
+		if mount_table is None:
+			mount_table = current_mount_table()
+		# the table read after the latest walk of the tree ( drop_unmounted_entries() ), which the commit remembers inner
+		# mounts from: a disk mounted after it is remembered by the next batch
+		walked_table = None
 		check_monitored_mount(monitor_path,mount_table,root_mount)
 		remembered_mounts = manifest.inner_mounts
 		paused = paused_inner_mounts(monitor_path,remembered_mounts,mount_table,skip)
@@ -5979,7 +6021,7 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name,f'The comparison of {tree} was interrupted: the next attempt finishes it',error=True)
 					return vaultInfo, manifest, False
 				backup_entries = rolled
-				paused = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
+				paused, walked_table = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
 				# the cut batch may have left anything in the tree, whose root is always real in the previous version: the
 				# verification compares and sweeps all of it, through the writer
 				touched = TouchedScopes([''],[])
@@ -5997,7 +6039,7 @@ def do_backup(backup_entries:dict,
 					backup_entries.clear()
 					backuperTeeLogToTl(job_name, 'Delta generation interrupted; not creating a new version', error=True)
 					return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
-				paused = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
+				paused, walked_table = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
 				if log_journal:
 					log_to_journal(journalPath,monitor_path,f'delta_generated_{len(backup_entries)}_differences',monitor_path)
 					log_events_to_journal(backup_entries,journalPath)
@@ -6015,7 +6057,7 @@ def do_backup(backup_entries:dict,
 				pool_guard.require()
 				manifest.begin()
 				manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
-				manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
+				manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table() if walked_table is None else walked_table,skip=skip))
 				# the matched time moves only when the whole tree was compared: a batch that came with entries, which all
 				# dropped out, or whose events collapsed to none compared a part of it. an older matched time is always true,
 				# and only widens the next full comparison's extended-attribute bound
@@ -6087,8 +6129,8 @@ def do_backup(backup_entries:dict,
 			backuperTeeLogToTl(job_name,f'Creating a reverb backup of {monitor_path} to {backup_folder}',ok=True)
 			def recheck_mounts(fixes):
 				# the verification walked the tree too
-				nonlocal paused
-				paused = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
+				nonlocal paused, walked_table
+				paused, walked_table = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification')
 			do_reverb_backup(backup_entries,backup_folder,only_sync_attributes,manifest,monitor_path,writer,skip_list,job_name,reported,
 				touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,pool_guard=pool_guard,unsynced=unsynced)
 		backup_finished = GREEN_LIGHT.is_set()
@@ -6126,8 +6168,9 @@ def do_backup(backup_entries:dict,
 		# commit before the content file: with no commit a first version is removed by the job's vault scan, a later one's
 		# tree waits for the roll-forward, and a list naming neither would describe a version the manifest does not hold
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
-		# a disk mounted while this backup walked is remembered too
-		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
+		# a disk mounted while this backup walked is remembered too: by the table read after its last walk, live when none
+		# walked ( the first version )
+		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table() if walked_table is None else walked_table,skip=skip))
 		# a commit says its copies are on the disk (spec section 2.6). they are flushed before the change list is written, as the
 		# list's fsync is a checkpoint, which keeps a new file's size and not its data: whenever the batch placed a copy
 		# (manifest.copies_unsynced), through the handles its unit opened before its first write, so a write error another
