@@ -1196,6 +1196,94 @@ def test_a_skipped_tree_rename_repair_leaves_every_version_exact(request):
 	assert reached, 'no run reached the state the repair is for: this test pins nothing'
 
 
+# --- a disk lost during the start's repair ---
+
+def a_start_losing_a_disk(shape: Shape, work: str, kill: int, when: str) -> dict:
+	"""
+	The batch cut at step kill with every disk checkpointed there (the power cut loses nothing; what is left is the cut batch's tree), the pool back, and
+	the daemon's start: its scan alone in a child (get_vault_info(), which the first batch reuses), that moves the second disk's mount away, with mount
+	--move, as the tree's repair begins (when 'begins': before remove_shadowed_links(), its first act) or as it ends (when 'ends': after put_back_recorded(),
+	its last). The pool then shows nothing of what that disk holds, and the guard sees nothing mounted at its place. The mount is put back, the pool
+	started again and the retry run as the daemon's restart runs it. Gives: whether the cut happened, whether the repair ran and lost the disk, how the
+	start ended (its traceback, None when it returned), how the retry ended, and what is wrong in the vault after it (the oracles' lines).
+	"""
+	job = shape.job_paths()
+	found = {}
+	with Pool(shape.root, work, shape.disks, shape.template, shape.mergerfs_options) as pool:
+		gone = pool.branches[1]
+		away = os.path.join(work, 'away')
+		lost = os.path.join(work, 'lost')
+		os.makedirs(away, exist_ok=True)
+		points = CutPoints(job.job_vault, pool.branches, kill, {kill: pool.branches})
+		cut = in_child(job, None, lambda: shape.work(job, points), real_flushes(points), points=points)
+		found['cut'] = cut.killed
+		pool.power_back()
+		def lose():
+			subprocess.run(['mount', '--move', gone, away], check=True)
+			open(lost, 'w').close()
+		def fault(module):
+			real_flushes()(module)
+			name = 'remove_shadowed_links' if when == 'begins' else 'put_back_recorded'
+			real = getattr(module, name)
+			def wrapper(*args, **kwargs):
+				if when == 'begins':
+					lose()
+				result = real(*args, **kwargs)
+				if when == 'ends':
+					lose()
+				return result
+			setattr(module, name, wrapper)
+		def start():
+			rv.get_vault_info(job.job_vault)
+			return True
+		try:
+			scan = in_child(job, None, start, fault)
+		finally:
+			if os.path.ismount(away):
+				subprocess.run(['mount', '--move', away, gone], check=True)
+		found['lost'] = os.path.exists(lost)
+		found['start'] = scan.error
+		# mergerfs holds what it saw while the disk was out for a moment: it starts again, as it does after a power cut
+		pool.stop()
+		pool.start()
+		again = shape.again(job, real_flushes())
+		found['retry'] = (again.committed, again.error)
+		found['wrong'] = judged(shape, job, work, f'start {kill} {when}') + judged_rows(job)
+		if found['wrong'] and shape.keep_failed():
+			pool.keep_images(os.path.join(shape.base, 'failed', f'{shape.name}-start-{when}'))
+	return found
+
+
+@needs_mergerfs
+@pytest.mark.parametrize('when', ['begins', 'ends'])
+def test_a_disk_lost_during_the_starts_repair_fails_the_start_and_leaves_every_version_exact(when, request):
+	# RR-C2-1 on a real pool, which the fake pool of tests/test_vault_units.py only stands for: a disk that goes after the scan read the vault hides what it
+	# holds from every listing through the pool, and before the scan checked the pool again (it does, as the repair ends) a forward link could be put back
+	# where the disk holds the real entry and the first batch, which reuses the scan's result and makes its own guard once the disk is back, commit it:
+	# version n restored as the newer bytes. The start must fail instead, with the tree as the repair left it, and the retry with the disk back must
+	# find every version exact (the oracle, the row oracle, a file of each version through the commands): the next scan takes a link put back beside a
+	# real entry away (remove_shadowed_links()). 'ends' is the check alone: nothing runs after the disk goes, so the start fails with PoolNotReady, and on
+	# 065fa15 it returns. 'begins' is the shape of the finding: the repair that follows works on a view with the disk gone, and on a real pool an
+	# operation on an entry only that disk holds may fail first, so the start fails with PoolNotReady or with another error, never with a result
+	shape = built_shape('mixed-2', request)
+	trace, _ = steps_of(shape)
+	# the cut right before the change list is made: the batch's tree holds everything, and nothing commits it
+	listed = next(number for number, step in enumerate(trace, 1) if step[0] == 'mkdir' and step[1].startswith(rv.CHANGE_LIST_FOLDER_PREFIX))
+	work = os.path.join(shape.base, 'work', f'{shape.name}-start-{when}')
+	try:
+		found = in_worker_result(lambda: a_start_losing_a_disk(shape, work, listed - 1, when))
+	finally:
+		shutil.rmtree(os.path.join(shape.base, 'work'), ignore_errors=True)
+	print(f'a disk lost as the start\'s repair {when}: {found}')
+	assert found['cut'] is True
+	assert found['lost'], 'the start\'s repair did not run: no tree was left, and this test pins nothing'
+	assert found['start'] is not None, 'the start returned a result with a disk of the pool gone'
+	if when == 'ends':
+		assert 'PoolNotReady' in found['start'], found['start']
+	assert found['retry'] == (True, None), found['retry']
+	assert not found['wrong'], found['wrong'][:3]
+
+
 # --- the one state placement decides ---
 
 FORCED_TRIES = 12
