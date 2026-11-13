@@ -6081,7 +6081,7 @@ def do_backup(backup_entries:dict,
 			tree_now = latest_version_info.path if tree is None else tree
 			attrib_copies = attribs_to_copy(backup_entries,manifest,monitor_path,tree_now) if only_sync_attributes else frozenset()
 			# vault_inodes already holds the tree, and only what the batch adds is new: a delete frees nothing on design R
-			estimated_backup_size, estimated_backup_inode = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = tree_now,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies,manifest = manifest)
+			estimated_backup_size, estimated_backup_inode = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = tree_now,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies)
 			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes {estimated_backup_inode}')
 			this_version_number = latest_version_info.version_number + 1
 			vault_fs_size, vault_fs_inode = get_path_fs_info(vault_path)
@@ -10970,14 +10970,18 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int) -> tupl
 		inodes += 1
 	return size, inodes
 
-def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset(),manifest:'VaultManifest' = None):
+def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset()):
 	'''
 	What the vault grows by as the replay copies the backup entries, in bytes and in inodes: each regular file charged what
 	its copy takes in the vault (vault_charge(), with the block size of the vault's filesystem, read once), by one walk of
 	the copied entries (get_unskipped_size_inodes()). On design R a delete frees nothing (the entry goes into the previous
 	version as its record, until that version is pruned), and every copy puts a new inode in the tree while the old one
 	stays in the previous version, so each copy counts its inodes wherever it counts its bytes and a delete counts none. A
-	version's own small blocks and links are left out ( docs/limitations.md ).
+	move counts nothing: the replay renames it. One it copies (Only Sync Attributes off, its mode, owner or mtime changed) is
+	left out too, as a version's own small blocks and links are ( docs/limitations.md ): its source row is looked up at the
+	move's path in the batch, before the replay moves any row, so the row is missing when a folder above moved earlier
+	( mv d x; mv x/m a ) and another file's when the batch refilled the path ( mv x y; mv d x; mv x/m a ), and a copy the
+	replay never makes prunes versions for good, where an estimate too low only passes the limit until the next prune.
 
 	Parameters:
 		backup_entries (dict): The backup entries
@@ -10986,9 +10990,6 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 		monitor_path (str): The path of the monitored path
 		skip_list (SkipList): The job's skip list; with patterns, folders are measured without their skipped contents
 		copied (set): The attrib entries the replay copies under only_sync_attributes ( attribs_to_copy() )
-		manifest (VaultManifest): The vault's rows: with it, and only_sync_attributes off, a plain file's move whose
-			monitored mode, owner or mtime differs from its source row's record is counted, as the replay copies it.
-			Without it no move is counted
 
 	Returns:
 		tuple: The bytes and the inodes the batch adds to the vault
@@ -10999,28 +11000,11 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	total_inodes = 0
 	# the copies land in the vault's filesystem, whose block is what a file's last bytes take there
 	block = os.statvfs(last_vault_version_path).f_frsize
-	def copied_move(entry, values):
-		# the replay copies a moved file whose attributes differ when they are not only synced ( do_reverb_backup() ): told by
-		# one lstat against its source row's record. one whose only difference is an extended attribute is left out, as
-		# reading every moved file's would cost more than the estimate gains; so is one with no record to tell by, as on main
-		# ( a source that moved earlier in the batch has no row at its new place yet: mv d x; mv x/m a ). counted as a copy it
-		# would prune old versions for a copy the replay may never make; left out, the vault passes its limit until the next prune
-		if manifest is None or only_sync_attributes or entry.endswith('/') or values.source_path is None:
-			return False
-		try:
-			st = os.lstat(entry)
-		except OSError:
-			return False
-		if not stat.S_ISREG(st.st_mode):
-			return False
-		record = manifest.lookup(os.path.relpath(values.source_path, monitor_path))
-		return record is not None and record.mode is not None and (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns) != (record.mode, record.uid, record.gid, record.mtime_ns)
-	def copies(entry, values):
+	def copies(entry, event):
 		# what the replay copies: a create or a modify, and a file's attrib unless Only Sync Attributes vouches for the vault's
 		# copy. a folder's attrib copies nothing: the replay gives the folder its metadata alone
-		event = values.event
-		return event in ('create', 'modify') or (event == 'attrib' and not entry.endswith('/') and (not only_sync_attributes or entry in copied)) or (event == 'move' and copied_move(entry, values))
-	taken = {entry: values.event for entry, values in backup_entries.items() if copies(entry, values)}
+		return event in ('create', 'modify') or (event == 'attrib' and not entry.endswith('/') and (not only_sync_attributes or entry in copied))
+	taken = {entry: values.event for entry, values in backup_entries.items() if copies(entry, values.event)}
 	# a folder create holds what is below it in the walks: a full comparison queues an entry for every folder and file
 	# of a new tree, so a create inside a created folder adds none of its own
 	created_folders = {entry for entry, event in taken.items() if event == 'create' and entry.endswith('/')}
@@ -11034,9 +11018,9 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 			total_size += entry_size
 			total_inodes += entry_inodes
 	# what a move lands on inside a created folder arrives by the move, and its create copies it not ( mkdir n; mv d n/d ),
-	# unless the replay copies the moved file itself, or the move's new place is inside its old one ( mv D x; mkdir D; mv x D/D ):
-	# the version cannot rename an entry into itself, so the replay copies it whole
-	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and entry not in taken and created_folders and inside_folders(entry, created_folders)
+	# unless the move's new place is inside its old one ( mv D x; mkdir D; mv x D/D ): the version cannot rename an entry into
+	# itself, so the replay copies it whole
+	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and created_folders and inside_folders(entry, created_folders)
 		and not entry.rstrip('/').startswith(values.source_path.rstrip('/') + '/')]
 	# one inside another is taken out with it ( mv d n/d; mv y n/d/y )
 	carried_folders = {entry for entry in carried_in if entry.endswith('/')}

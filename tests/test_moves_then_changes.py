@@ -484,23 +484,21 @@ def test_chmod_then_mv_links_the_moved_file(job, logged, monkeypatch, only_sync_
 	assert_moved_cleanly(logged)
 
 
-def test_a_chmod_then_a_move_with_attributes_copied_counts_one_copy(job, monkeypatch):
-	# fails on main (counts neither): without Only Sync Attributes the replay copies the moved file whose mode changed, so the
-	# estimate counts its bytes and its one new inode
+def test_the_estimate_leaves_out_a_moved_file_the_replay_copies(job, monkeypatch):
+	# pin (passes on main; R38): without Only Sync Attributes the replay copies a moved file whose mode changed, and the estimate
+	# counts nothing for it, as for every move. telling a copied move by its source row looks the row up at the move's path in
+	# the batch, before the replay moves any row, and counts a copy the replay never makes when a folder above moved earlier or
+	# the batch refilled the path, which prunes versions for good; left out, the vault passes its limit until the next prune
 	seed_monitor(job, {'f': 'f' * 10000, 'k': 'k'})
 	run_backup(job, only_sync_attributes=False)
 	m = job.monitor
 	os.chmod(f'{m}/f', 0o600)
 	os.rename(f'{m}/f', f'{m}/g')
-	estimates = []
-	real = rv.get_backup_size_inode
-	monkeypatch.setattr(rv, 'get_backup_size_inode', lambda *args, **kwargs: estimates.append(real(*args, **kwargs)) or estimates[-1])
+	estimates = estimates_made(monkeypatch)
 	copies = copies_made(monkeypatch)
 	v1 = run_backup(job, batch(job, (False, 'attrib', 'f', None), (False, 'move', 'g', 'f')), only_sync_attributes=False)[-1]
 	assert copies == [os.path.join(v1, 'g')]
-	written = charge(os.path.join(v1, 'g'), job.job_vault)
-	assert estimates == [(charge(f'{m}/g', job.job_vault), 1)]
-	assert written <= estimates[0][0]
+	assert estimates == [(0, 0)]
 
 
 def estimates_made(monkeypatch):
@@ -543,6 +541,53 @@ def test_a_size_limit_prunes_no_version_for_a_file_moved_out_of_a_folder_renamed
 	os.rename(f'{m}/d', f'{m}/x')
 	os.rename(f'{m}/x/m', f'{m}/a')
 	after = run_backup(job, batch(job, (True, 'move', 'x', 'd'), (False, 'move', 'a', 'x/m')), only_sync_attributes=False, backup_size_limit=str(limit))
+	assert len(after) == len(before) + 1
+
+
+def seed_a_folder_moved_onto_the_place_of_one_holding_an_m_of_other_metadata(job):
+	# x/m is small, mode 0600 and old; d/m is 2 MiB, mode 0644 and new: two files named m with nothing in common. the first
+	# backup puts both in the vault, so each has a row
+	seed_monitor(job, {'x/m': 'o' * 100, 'd/m': 'm' * (2 << 20), 'k': 'k'})
+	old = os.path.join(job.monitor, 'x/m')
+	os.chmod(old, 0o600)
+	os.utime(old, ns=(10 ** 18, 10 ** 18))
+	run_backup(job, only_sync_attributes=False)
+
+
+def refill_x_and_take_m_out(job):
+	# mv x y; mv d x; mv x/m a: the replay renames three times and copies nothing. x/m is where the old x's m row is until the
+	# replay renames, and the file now at x/m is the old d/m
+	m = job.monitor
+	os.rename(f'{m}/x', f'{m}/y')
+	os.rename(f'{m}/d', f'{m}/x')
+	os.rename(f'{m}/x/m', f'{m}/a')
+	return batch(job, (True, 'move', 'y', 'x'), (True, 'move', 'x', 'd'), (False, 'move', 'a', 'x/m'))
+
+
+def test_a_file_moved_out_of_a_folder_that_took_the_place_of_another_estimates_no_copy(job, monkeypatch):
+	# fails at c73d6a2 (R38: the estimate looked the move's source row up at x/m, found the old x's m, whose mode and mtime
+	# differ from a's, and counted a copy of a's 2 MiB that the replay never makes) and passes on main. the estimate infers no
+	# copy from a move: what the replay copies of one (Only Sync Attributes off, its metadata changed) is left out, as on main
+	seed_a_folder_moved_onto_the_place_of_one_holding_an_m_of_other_metadata(job)
+	entries = refill_x_and_take_m_out(job)
+	estimates = estimates_made(monkeypatch)
+	copies = copies_made(monkeypatch)
+	run_backup(job, entries, only_sync_attributes=False)
+	assert copies == []
+	assert estimates == [(0, 0)]
+
+
+def test_a_size_limit_prunes_no_version_for_a_file_moved_out_of_a_folder_that_took_the_place_of_another(job):
+	# fails at c73d6a2 (the same count): a vault 500 KiB under its size limit holds its versions, as the batch writes nothing.
+	# counted as a copy of 2 MiB, the estimate would prune them all for it
+	seed_a_folder_moved_onto_the_place_of_one_holding_an_m_of_other_metadata(job)
+	for i in range(5):
+		with open(os.path.join(job.monitor, 'k'), 'w') as f:
+			f.write(str(i) * 100000)
+		run_backup(job, batch(job, (False, 'modify', 'k', None)), only_sync_attributes=False)
+	limit = rv.get_vault_info(job.job_vault).vault_size + (500 << 10)
+	before = committed_versions(job)
+	after = run_backup(job, refill_x_and_take_m_out(job), only_sync_attributes=False, backup_size_limit=str(limit))
 	assert len(after) == len(before) + 1
 
 
