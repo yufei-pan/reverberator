@@ -175,6 +175,13 @@ def charge(path: str, vault: str) -> int:
 	return min(st.st_blocks * 512, (st.st_size + block - 1) // block * block)
 
 
+def header_counter(job_vault: str) -> int:
+	'''The change counter of the job vault's manifest (bytes 24 to 27 of its header, big-endian), which every transaction that writes the database moves.'''
+	with open(os.path.join(job_vault, rv.MANIFEST_FILE_NAME), 'rb') as f:
+		header = f.read(28)
+	return int.from_bytes(header[24:28], 'big')
+
+
 def content_file_path(version_dir: str) -> str:
 	size_s = rv.format_bytes(get_path_size(version_dir), use_1024_bytes=True, to_str=True).replace(' ', '_')
 	ino_s = rv.format_bytes(path_inodes(version_dir), use_1024_bytes=False, to_str=True).replace(' ', '')

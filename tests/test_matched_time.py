@@ -6,8 +6,9 @@ from collections import OrderedDict
 
 import pytest
 import reverberator as rv
+from collections import deque
 from tests.harness import (reads_the_file_before, scripted_watch, seed_monitor, run_backup, event_entry, latest_version, wait_until,
-	wait_for_committed_count, write_pending)
+	wait_for_committed_count, write_pending, header_counter, committed_versions)
 from tests.test_inner_mounts import _fake_mounts
 from tests.test_moves_then_changes import user_xattrs_or_skip
 from tests.test_verify_replay import start_backuper, stop_backuper
@@ -500,3 +501,104 @@ def test_a_moved_folder_keeps_the_watches_it_had(job, monkeypatch):
 	# the walk of e hands back the watches e and e/s had: none is added or counted twice
 	assert counts == [(3, 3)]
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/e/s/x')]
+
+
+def journal_state(job):
+	st = os.stat(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME + '-journal'))
+	return st.st_size, st.st_mtime_ns
+
+
+def all_checked(job):
+	'''V0 of a.txt and d/b.txt, then a full comparison that reads V0's copies back: no row is left unchecked.'''
+	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	run_backup(job, matched_since=100)
+	run_backup(job, matched_since=200)
+	assert matched(job)[1] == 200
+
+
+def collapsed(job, *events, touching=()):
+	'''
+	A batch of raw events (event, rel) whose entries collapse to none, backed up with its touched scopes, as the backuper runs
+	one; touching adds rels to those scopes, as events the collapse took out would.
+	'''
+	raw = deque(rv.ChangeEvent(float(i), False, event, os.path.join(job.monitor, rel), None) for i, (event, rel) in enumerate(events, 1))
+	entries = rv.change_events_to_backup_entries(deque(raw), job.monitor)
+	assert not entries
+	scopes = rv.touched_scopes(deque(list(raw) + [rv.ChangeEvent(9.0, False, 'attrib', os.path.join(job.monitor, rel), None) for rel in touching]), job.monitor)
+	return run_backup(job, entries, touched=scopes, matched_since=time.time_ns())
+
+
+def test_a_collapsed_batch_with_no_difference_commits_nothing(job):
+	# fails on main: a file made and removed, its batch backed up with its touched scopes and no entries
+	all_checked(job)
+	before, before_journal, matched_before, versions_before = header_counter(job.job_vault), journal_state(job), matched(job), len(committed_versions(job))
+	time.sleep(0.01)
+	tmp = os.path.join(job.monitor, 'tmp.txt')
+	open(tmp, 'w').write('t')
+	os.remove(tmp)
+	collapsed(job, ('create', 'tmp.txt'), ('delete', 'tmp.txt'))
+	assert header_counter(job.job_vault) == before
+	assert journal_state(job) == before_journal
+	assert matched(job) == matched_before and len(committed_versions(job)) == versions_before
+
+
+def test_a_full_comparison_with_no_difference_moves_the_counter_once(job, monkeypatch):
+	# fails on main (two): the comparison's commit rewrites the version row, then the no-differences commit writes the rest
+	all_checked(job)
+	moved = []
+	real = rv.VaultManifest.commit
+	def commit(self, *args, **kwargs):
+		counter = header_counter(job.job_vault)
+		real(self, *args, **kwargs)
+		moved.append(header_counter(job.job_vault) != counter)
+	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
+	since = time.time_ns()
+	run_backup(job, matched_since=since)
+	assert sum(moved) == 1 and matched(job)[1] == since
+
+
+def test_a_collapsed_batch_reading_a_copy_back_commits_its_record(job):
+	# pin: a row set unchecked by hand in the touched scope: the comparison reads the copy back, and its record commits
+	all_checked(job)
+	manifest = rv.VaultManifest(job.job_vault)
+	manifest.conn.execute("UPDATE entries SET unchecked = 1 WHERE path = 'a.txt'")
+	manifest.close()
+	before = header_counter(job.job_vault)
+	tmp = os.path.join(job.monitor, 'a.txt.tmp')
+	open(tmp, 'w').write('t')
+	os.remove(tmp)
+	collapsed(job, ('create', 'a.txt.tmp'), ('delete', 'a.txt.tmp'), touching=['a.txt'])
+	assert header_counter(job.job_vault) != before
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		assert manifest.lookup('a.txt').unchecked == 0
+	finally:
+		manifest.close()
+
+
+def test_a_skip_list_change_commits_its_fingerprint_with_no_difference(job):
+	# pin
+	all_checked(job)
+	skip_list = rv.SkipList(job.monitor, ['*.tmp'])
+	run_backup(job, skip_list=skip_list)
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		assert manifest.skip_fingerprint == skip_list.fingerprint
+	finally:
+		manifest.close()
+
+
+def test_a_starts_full_comparison_with_no_difference_moves_the_matched_time(job, poll_fast):
+	# pin: the start's own full comparison is a full comparison, so its matched time moves though nothing differs
+	all_checked(job)
+	before = time.time_ns()
+	startup = rv.JobStartup(job.job_name, job.monitor)
+	startup.watching.set()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, rv.ChangeEventQueue(job.monitor), threading.Lock(),
+		job.monitor, job.vault, 'N/A', threading.Event()), kwargs=dict(startup=startup), daemon=True)
+	thread.start()
+	try:
+		wait_until(lambda: matched(job)[1] >= before, message='the start moved no matched time')
+	finally:
+		stop_backuper(thread)
+	assert len(committed_versions(job)) == 1 and before <= matched(job)[1] <= time.time_ns()

@@ -5823,6 +5823,8 @@ def do_backup(backup_entries:dict,
 	global BACKUP_ENTRY_VALUES_HEADER
 	# this function will do the actual backup
 	skip = None if skip_list is None else skip_list.skips
+	# a batch with no entries and no touched scopes compares the whole tree; taken before any entry drops out
+	came_empty = not backup_entries
 	job_vault = os.path.join(vault_path,job_name)
 	if pool_guard is None:
 		pool_guard = PoolGuard([job_vault, monitor_path])
@@ -6014,7 +6016,12 @@ def do_backup(backup_entries:dict,
 				manifest.begin()
 				manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 				manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip))
-				manifest.record_matched(latest_version_info.path,matched_since if not paused and not reported else None,latest_version_info.path)
+				# the matched time moves only when the whole tree was compared: a batch that came with entries, which all
+				# dropped out, or whose events collapsed to none compared a part of it. an older matched time is always true,
+				# and only widens the next full comparison's extended-attribute bound
+				full = came_empty and touched is None and not paused and not reported
+				manifest.record_matched(latest_version_info.path,matched_since if full else None,latest_version_info.path)
+				# with nothing written, this commit makes no I/O ( VaultManifest.commit() )
 				manifest.commit()
 				if vaultInfo is None:
 					vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
@@ -8789,7 +8796,11 @@ class VaultManifest:
 			self.conn.execute('BEGIN')
 
 	def commit(self, version_path:str = None):
-		'''Commit, recording that the rows now describe version_path when it is given.'''
+		'''
+		Commit, recording that the rows now describe version_path when it is given. A transaction that wrote nothing to the
+		database commits with no I/O (its header's change counter and its journal stay), so each meta value below is
+		written only when it differs from the one recorded.
+		'''
 		if version_path is not None:
 			self._set_version(version_path)
 		if self.conn.in_transaction:
@@ -8804,7 +8815,13 @@ class VaultManifest:
 		return self.conn.in_transaction
 
 	def _set_version(self, version_path:str):
-		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)", (os.path.basename(os.path.normpath(version_path)),))
+		self._set_meta('version', os.path.basename(os.path.normpath(version_path)))
+
+	def _set_meta(self, key:str, value:str):
+		'''Record value at key, unless it is recorded there already; the caller holds the transaction.'''
+		row = self.conn.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+		if row is None or row[0] != value:
+			self.conn.execute('INSERT OR REPLACE INTO meta VALUES (?, ?)', (key, value))
 
 	@property
 	def skip_fingerprint(self):
@@ -8814,7 +8831,7 @@ class VaultManifest:
 
 	def set_skip_fingerprint(self, fingerprint:str):
 		'''Record fingerprint; the caller holds the transaction.'''
-		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('skip_fingerprint', ?)", (fingerprint,))
+		self._set_meta('skip_fingerprint', fingerprint)
 
 	@property
 	def inner_mounts(self) -> list:
@@ -8824,7 +8841,7 @@ class VaultManifest:
 
 	def set_inner_mounts(self, rels:list):
 		'''Record the inner mount points (folder rels ending with /); the caller holds the transaction.'''
-		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('inner_mounts', ?)", (json.dumps([storable_name(rel) for rel in rels]),))
+		self._set_meta('inner_mounts', json.dumps([storable_name(rel) for rel in rels]))
 
 	# matched, JSON [version folder name, wall clock ns]: from when the vault is known to match the whole tree, as that
 	# version holds it ( full_comparison_since() ). written only by do_backup()'s commits, in their transaction, never by
@@ -8840,14 +8857,15 @@ class VaultManifest:
 		'''
 		Record that the vault matches the whole tree from since (wall clock ns) on, as version_path holds it. With no
 		since, the time recorded for base_path, the version version_path builds on, is carried over to version_path;
-		nothing is written when the key names another version or there is none. The caller holds the transaction.
+		nothing is written when the key names another version or there is none, or when it holds that value already
+		(carried over onto the version it names). The caller holds the transaction.
 		'''
 		if since is None:
 			recorded = self.matched
 			if base_path is None or recorded is None or recorded[0] != os.path.basename(os.path.normpath(base_path)):
 				return
 			since = recorded[1]
-		self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('matched', ?)", (json.dumps([os.path.basename(os.path.normpath(version_path)), since]),))
+		self._set_meta('matched', json.dumps([os.path.basename(os.path.normpath(version_path)), since]))
 
 	# goes with the 0.54 reader
 	@property
