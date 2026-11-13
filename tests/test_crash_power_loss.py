@@ -127,7 +127,7 @@ def test_the_helper_refuses_a_loop_device_of_someone_else(monkeypatch, tmp_path)
 	answers['findmnt'] = '/dev/nvme0n1 /mnt/fast2\n'
 	with pytest.raises(NotOurLoopImage):
 		flush_scratch(str(scratch))
-	assert 'f2fs_io' not in ran and 'sync' not in ran
+	assert 'sync' not in ran
 
 
 def test_a_loop_device_taken_by_another_run_between_find_and_set_up_is_tried_again(monkeypatch, tmp_path):
@@ -153,13 +153,15 @@ def test_a_loop_device_taken_by_another_run_between_find_and_set_up_is_tried_aga
 
 
 def test_no_test_calls_f2fs_io_or_syncfs_but_through_the_helper():
+	# the shutdown is the kernel's ioctl now (FS_IOC_SHUTDOWN on f2fs and ext4, XFS_IOC_GOINGDOWN on XFS, one number: 0x8004587D), issued from
+	# Python by scratch_images.py alone, so the guard names the ioctl as well as f2fs_io, which no test runs any more
 	tests = os.path.dirname(os.path.abspath(__file__))
 	for name in sorted(os.listdir(tests)):
 		if not name.endswith('.py') or name in ('scratch_images.py', os.path.basename(__file__)):
 			continue
 		with open(os.path.join(tests, name), encoding='utf-8') as f:
 			text = f.read()
-		assert not re.search(r"""['"]f2fs_io['"]|['"]sync['"],\s*['"]-f['"]""", text), name
+		assert not re.search(r"""['"]f2fs_io['"]|['"]sync['"],\s*['"]-f['"]|FS_IOC_SHUTDOWN|0x8004587[dD]|GOINGDOWN""", text), name
 
 
 @needs_f2fs
