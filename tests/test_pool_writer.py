@@ -21,6 +21,7 @@ import pytest
 
 import reverberator as rv
 from tests import version_view_ground_truth as view_truth
+from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.crash_batches import after_retries, backup_events, batch3_of, OPTIONS, prepare, put_text, restore
 from tests.crash_child import in_child, kill_run, retry
 from tests.harness import committed_versions, create_job, event_entry, run_backup, seed_monitor, write_rule
@@ -799,6 +800,8 @@ def test_a_job_vault_on_a_real_mount_of_its_own_on_a_branch_commits_and_is_synce
 	# with a real tmpfs mounted at the job vault's folder on a branch of a real mergerfs pool. The unit opens its handle at that
 	# folder, on the tmpfs, and the commit flush syncs through it. On 0.55.4 the handle was the branch root's, on the branch's f2fs,
 	# and every sync raised "is not on a filesystem this step opened"
+	# conftest stubs the helper that opens and uses the handles for every test; this one runs it, with the binding below it recorded
+	monkeypatch.setattr(rv, 'sync_vault_filesystems', REAL_SYNC_VAULT_FILESYSTEMS)
 	with real_pool() as root:
 		job = create_job(root)
 		branches = rv.read_pool_branches(job.vault)
@@ -806,8 +809,9 @@ def test_a_job_vault_on_a_real_mount_of_its_own_on_a_branch_commits_and_is_synce
 			os.makedirs(os.path.join(branch, job.job_name), exist_ok=True)
 		with ScratchTmpfs(os.path.join(branches[0], job.job_name)) as own:
 			synced = []
-			real_syncfs = rv.LIBC_SYNCFS
-			monkeypatch.setattr(rv, 'LIBC_SYNCFS', lambda fd: synced.append(os.fstat(fd).st_dev) or real_syncfs(fd))
+			# conftest's binding without the syncfs: it only checks that the fd is open, so no live disk is synced
+			stand_in = rv.LIBC_SYNCFS
+			monkeypatch.setattr(rv, 'LIBC_SYNCFS', lambda fd: synced.append(os.fstat(fd).st_dev) or stand_in(fd))
 			seed_monitor(job, {'a.txt': 'a' * 5000, 'd/b.txt': 'b'})
 			run_backup(job)
 			put_text(job.monitor, 'a.txt', 'a2' * 5000)
