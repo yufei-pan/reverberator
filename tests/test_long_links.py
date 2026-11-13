@@ -326,3 +326,34 @@ def test_real_a_full_comparison_meeting_only_a_link_the_vault_refuses_makes_no_v
 	out = capsys.readouterr()
 	assert warned(out.out + out.err, link) == 1
 	assert not [name for name in os.listdir(rv.staging_path(job.job_vault)) if name.startswith('.link-probe-')]
+
+
+def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_still_commits_one_version(job, capsys):
+	# fails before the fix of TreeWriter.discard_temp() (on main too): the removal of the link's partial copy raises ENAMETOOLONG,
+	# which fails every batch. Now the narrowed limitation: the probe sits in staging, at a short path, and passes; the copy,
+	# written under its temporary name (54 bytes after its slash), passes Linux's 4,096-byte path limit in a folder whose path
+	# in the vault reaches 4,041 bytes, and the link is left out with its line. Such a folder holds no regular file, as one
+	# would fail every backup
+	seed_monitor(job, {'a': 'a'})
+	versions = run_backup(job)
+	# the version folder's name keeps its length from V0 to V9
+	version = versions[-1]
+	grow = len(version) - len(job.monitor)
+	folder, depth = job.monitor, 0
+	while 4041 - (len(folder) + grow) > 250:
+		folder = os.path.join(folder, f'{depth:03d}' + 'n' * 196)
+		depth += 1
+	folder = os.path.join(folder, 'n' * (4041 - len(folder) - grow - 1))
+	assert len(folder) + grow == 4041
+	os.makedirs(folder)
+	# the folders are in the vault before the link comes
+	versions = run_backup(job)
+	link = os.path.join(folder, 'l')
+	made(link, 'short')
+	capsys.readouterr()
+	for _ in range(2):
+		before = len(versions)
+		versions = run_backup(job)
+		assert len(versions) == before + 1 and not os.path.lexists(os.path.join(versions[-1], os.path.relpath(link, job.monitor)))
+		out = capsys.readouterr()
+		assert warned(out.out + out.err, link) == 1

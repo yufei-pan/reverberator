@@ -13086,8 +13086,17 @@ class TreeWriter:
 		replace_entry(temp, self.path(dest_rel))
 
 	def discard_temp(self, temp:str) -> None:
-		'''Remove the partial copy at temp, as a copy that will not be finished leaves it.'''
-		remove_entry(temp)
+		'''
+		Remove the partial copy at temp, as a copy that will not be finished leaves it. One whose path the vault's filesystem
+		refuses as too long (ENAMETOOLONG: in a folder whose path in the vault reaches 4,041 bytes, as the temporary name takes
+		54 bytes after its slash) was never made, and its copy failed for it: nothing is there to remove, and the copy's own
+		failure decides (finish_copies()).
+		'''
+		try:
+			remove_entry(temp)
+		except OSError as e:
+			if e.errno != errno.ENAMETOOLONG:
+				raise
 
 	def remove_now(self, rel:str) -> None:
 		'''Remove what is at rel, a folder with everything in it, now. A link is unlinked, never followed.'''
