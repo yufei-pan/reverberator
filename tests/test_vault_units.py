@@ -23,7 +23,8 @@ from tests.crash_batches import backup_events, put_text
 from tests.errseq import open_folders
 from tests.harness import committed_versions, create_job, run_backup, vault_unit, wait_for_committed_count, wait_until, write_fstab, write_rule
 from tests.scratch_images import needs_mount, ScratchTmpfs
-from tests.vault_oracle import check_vault, snapshot_tree, version_number
+from tests import version_view_ground_truth as view_truth
+from tests.vault_oracle import check_vault, rows_match_vault, snapshot_tree, version_number
 
 pytestmark = pytest.mark.unit
 
@@ -1051,62 +1052,337 @@ def test_the_roll_forward_copies_nothing_a_link_of_the_monitored_tree_leads_to(r
 	assert contents_of(newest)['d'] == ('l', str(outside / 'd'))
 
 
-# ---- what the roll-forward does not copy again keeps its unchecked row, and a saved event is replayed through no link
+# ---- F1: the scan makes a cut batch's tree version n's again (put_back_recorded()), before anything reads its rows
 
-@pytest.mark.parametrize('mount', ['stays', 'paused_at_the_retry', 'goes_during_the_walk'])
-def test_a_cut_batchs_copy_under_an_inner_mount_paused_at_the_roll_forward_is_read_at_the_next_full_comparison(r_job, monkeypatch, tmp_path, mount):
-	# An attribute change with Only Sync Attributes off copies its file; the batch is cut after the copy, whose bytes did not reach the
-	# disk (NUL at its size and mtime, as after an f2fs checkpoint). At the retry the file's inner mount is not mounted yet: the
-	# roll-forward cannot copy it again, and its row, checked until now, must be unchecked, or no comparison reads the copy back and the
-	# newest version holds the file all NUL until it next changes. The mount going during the roll-forward's walk is the same: the
-	# forced modify is dropped (drop_unmounted_entries()). 'stays' is a pin (the roll-forward copies the file again).
-	# Without prepare_roll_forward()'s mark, the other two fail on 436b9c3 with the newest version all NUL.
+class InnerDisk:
+	'''
+	The monitored folder disk as an inner mount of a fake mount table. Unmounted, its folder is the empty one it leaves, and what it
+	held waits at aside.
+	'''
+	def __init__(self, job, monkeypatch, aside):
+		self.job, self.monkeypatch, self.aside = job, monkeypatch, aside
+		self.folder = os.path.join(job.monitor, 'disk')
+		os.makedirs(self.folder, exist_ok=True)
+		self.table('disk/')
+
+	def table(self, *rels):
+		table = [('/', ('1',))] + [(os.path.join(self.job.monitor, rel.rstrip('/')), (rel,)) for rel in rels]
+		self.monkeypatch.setattr(rv, 'current_mount_table', lambda: table)
+
+	def unmount(self):
+		os.rename(self.folder, self.aside)
+		os.mkdir(self.folder)
+		self.table()
+
+	def mount(self):
+		os.rmdir(self.folder)
+		os.rename(self.aside, self.folder)
+		self.table('disk/')
+
+
+def an_attribute_copy_cut(job, monkeypatch, tmp_path):
+	'''
+	A file on the inner disk, backed up and read back checked (as after any restart of the daemon, the full comparison reads the copies
+	back); then a chmod, which with Only Sync Attributes off copies the file, in a batch cut after the copy, whose bytes did not reach
+	the disk (NUL at its size and mtime, as after an f2fs checkpoint). (the InnerDisk, the monitored file, its bytes, version n's
+	folder, the file's row in version n)
+	'''
 	data = b''.join(f'z{i:07d}\n'.encode() for i in range(40000))
-	path = os.path.join(r_job.monitor, 'disk', 'file.bin')
-	os.makedirs(os.path.dirname(path))
+	disk = InnerDisk(job, monkeypatch, os.path.join(str(tmp_path), 'aside'))
+	path = os.path.join(disk.folder, 'file.bin')
 	with open(path, 'wb') as f:
 		f.write(data)
-	put_text(r_job.monitor, 'a.txt', 'a0')
-	def mounted(*rels):
-		table = [('/', ('1',))] + [(os.path.join(r_job.monitor, rel.rstrip('/')), (rel,)) for rel in rels]
-		monkeypatch.setattr(rv, 'current_mount_table', lambda: table)
-	mounted('disk/')
-	run_backup(r_job, only_sync_attributes=False, **KEPT)
-	# as after any restart of the daemon: a full comparison reads the copies back and records them checked
-	run_backup(r_job, only_sync_attributes=False, **KEPT)
-	assert len(committed_versions(r_job)) == 1
+	put_text(job.monitor, 'a.txt', 'a0')
+	run_backup(job, only_sync_attributes=False, **KEPT)
+	run_backup(job, only_sync_attributes=False, **KEPT)
+	assert len(committed_versions(job)) == 1
+	row = rows(job)['disk/file.bin']
+	assert row.unchecked == 0
 	os.chmod(path, 0o600)
-	cut_before_the_commit(r_job, [(False, 'attrib', 'disk/file.bin', None)], monkeypatch, only_sync_attributes=False)
-	copy = os.path.join(tree_of(r_job), 'disk', 'file.bin')
-	st = os.lstat(copy)
-	assert st.st_nlink == 1, 'the cut batch placed its own copy'
+	cut_before_the_commit(job, [(False, 'attrib', 'disk/file.bin', None)], monkeypatch, only_sync_attributes=False)
+	copy = os.path.join(tree_of(job), 'disk', 'file.bin')
+	assert os.lstat(copy).st_nlink == 1, 'the cut batch placed its own copy'
 	all_nul(copy)
-	aside = os.path.join(str(tmp_path), 'aside')
-	def unmount():
-		# the inner disk is not mounted: its folder is the empty one it leaves
-		os.rename(os.path.join(r_job.monitor, 'disk'), aside)
-		os.mkdir(os.path.join(r_job.monitor, 'disk'))
-		mounted()
+	return disk, path, data, committed_versions(job)[-1], row
+
+
+def unreadable_below(monkeypatch, folder):
+	'''
+	Every look into folder fails with EACCES (its listing, and an lstat of anything in it), as a folder of mode 000 does for a user
+	other than root, while the folder itself can still be looked at. A real mode 000 would not do: root reads it, and a daemon run as
+	uid 65534 gives its own copy of the folder that mode and then cannot measure its own version.
+	'''
+	real_scandir, real_lstat = os.scandir, os.lstat
+	inside = folder + os.sep
+	def denied(path):
+		raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+	def scandir(path='.'):
+		if isinstance(path, str) and (path.rstrip(os.sep) == folder or path.startswith(inside)):
+			denied(path)
+		return real_scandir(path)
+	def lstat(path, *args, **kwargs):
+		if isinstance(path, str) and path.startswith(inside):
+			denied(path)
+		return real_lstat(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'scandir', scandir)
+	monkeypatch.setattr(rv.os, 'lstat', lstat)
+
+
+@pytest.mark.parametrize('mount', ['stays', 'paused_at_the_retry', 'goes_during_the_walk', 'unreadable_folder'])
+def test_a_cut_batchs_file_the_roll_forward_cannot_copy_again_holds_version_ns_entry(r_job, monkeypatch, tmp_path, mount):
+	# At the retry the roll-forward cannot copy the cut batch's file again: its inner mount is not mounted yet, it goes during the
+	# roll-forward's walk (drop_unmounted_entries() drops the forced modify), or its monitored folder cannot be read
+	# (unreadable_below(): what a folder of mode 000 is to a user other than root). The scan put version n's entry back at the
+	# name, so the newest version holds version n's inode under version n's row, and the next full comparison, the mount back, reads
+	# nothing back and copies the file. 'stays' is a pin: the roll-forward copies the file again. The other three fail on 82732dd:
+	# the newest version holds the cut copy, all NUL, under a row marked unchecked
+	disk, path, data, previous, row = an_attribute_copy_cut(r_job, monkeypatch, tmp_path)
 	if mount == 'paused_at_the_retry':
-		# not mounted yet when the daemon comes back
-		unmount()
+		disk.unmount()
 	elif mount == 'goes_during_the_walk':
 		real = rv.roll_forward_entries
 		def walked(*args, **kwargs):
 			found = real(*args, **kwargs)
 			# what drop_unmounted_entries() reads next: the disk was unmounted while the comparison ran
-			unmount()
+			disk.unmount()
 			return found
 		monkeypatch.setattr(rv, 'roll_forward_entries', walked)
-	roll_forward(r_job, only_sync_attributes=False)
+	if mount == 'unreadable_folder':
+		with monkeypatch.context() as denied:
+			unreadable_below(denied, disk.folder)
+			roll_forward(r_job, only_sync_attributes=False)
+	else:
+		roll_forward(r_job, only_sync_attributes=False)
+	held = os.path.join(committed_versions(r_job)[-1], 'disk', 'file.bin')
 	if mount != 'stays':
-		os.rmdir(os.path.join(r_job.monitor, 'disk'))
-		os.rename(aside, os.path.join(r_job.monitor, 'disk'))
-	mounted('disk/')
-	# the next full comparison, with the disk there
+		assert os.lstat(held).st_ino == os.lstat(os.path.join(previous, 'disk', 'file.bin')).st_ino, 'the newest version holds a copy, not version n\'s entry'
+		assert read_bytes(held) == data
+		assert rows(r_job)['disk/file.bin'] == row
+		if mount != 'unreadable_folder':
+			disk.mount()
+	reads, copies = recording_reads_and_copies(monkeypatch)
 	run_backup(r_job, only_sync_attributes=False, **KEPT)
-	held = read_bytes(os.path.join(committed_versions(r_job)[-1], 'disk', 'file.bin'))
-	assert held == data, 'the newest version holds the file ' + ('all NUL' if not any(held) else 'wrong')
+	held = os.path.join(committed_versions(r_job)[-1], 'disk', 'file.bin')
+	if mount != 'stays':
+		assert 'disk/file.bin' not in reads and path in copies
+	assert read_bytes(held) == data, 'the newest version holds the file ' + ('all NUL' if not any(read_bytes(held)) else 'wrong')
+
+
+# a name of another kind on the inner disk, the cut batch's change there, and the file it wrote
+OTHER_KINDS = {
+	# a user's link replaced by a file
+	'link_to_file': dict(file='disk/x', events=[(False, 'delete', 'disk/x', None), (False, 'create', 'disk/x', None)]),
+	# a folder (with a file in it) replaced by a file
+	'folder_to_file': dict(file='disk/d', events=[(False, 'delete', 'disk/d/inner.txt', None), (True, 'delete', 'disk/d', None), (False, 'create', 'disk/d', None)]),
+	# a file replaced by a folder holding a new file
+	'file_to_folder': dict(file='disk/small.txt/a', events=[(False, 'delete', 'disk/small.txt', None), (True, 'create', 'disk/small.txt', None),
+		(False, 'create', 'disk/small.txt/a', None)]),
+}
+
+
+@pytest.mark.parametrize('shape', sorted(OTHER_KINDS))
+def test_a_paused_mounts_name_of_another_kind_gets_version_ns_entry_back(r_job, monkeypatch, tmp_path, shape):
+	# the cut batch changed a name's kind on the inner disk, which is not mounted at the retry: the roll-forward passes over it, and
+	# the newest version holds there what version n held, a folder with its mode and times, until the next full comparison with
+	# the disk back. Fails on 82732dd: the newest version holds the cut batch's entry (the file, or the folder and its new file)
+	disk = InnerDisk(r_job, monkeypatch, os.path.join(str(tmp_path), 'aside'))
+	put_text(r_job.monitor, 'disk/small.txt', 's0')
+	put_text(r_job.monitor, 'disk/d/inner.txt', 'i0')
+	os.symlink('small.txt', os.path.join(disk.folder, 'x'))
+	put_text(r_job.monitor, 'top.txt', 't0')
+	run_backup(r_job, **KEPT)
+	held_before = contents_of(os.path.join(committed_versions(r_job)[-1], 'disk'))
+	folder_before = os.lstat(os.path.join(committed_versions(r_job)[-1], 'disk', 'd'))
+	if shape == 'folder_to_file':
+		shutil.rmtree(os.path.join(disk.folder, 'd'))
+	else:
+		os.remove(os.path.join(disk.folder, 'x' if shape == 'link_to_file' else 'small.txt'))
+	put_text(r_job.monitor, OTHER_KINDS[shape]['file'], big_text('n1'))
+	put_text(r_job.monitor, 'top.txt', 't1')
+	cut_before_the_commit(r_job, OTHER_KINDS[shape]['events'] + [(False, 'modify', 'top.txt', None)], monkeypatch)
+	assert os.path.isfile(os.path.join(tree_of(r_job), OTHER_KINDS[shape]['file']))
+	disk.unmount()
+	roll_forward(r_job)
+	newest = committed_versions(r_job)[-1]
+	assert contents_of(os.path.join(newest, 'disk')) == held_before
+	folder = os.lstat(os.path.join(newest, 'disk', 'd'))
+	assert (folder.st_mode, folder.st_mtime_ns) == (folder_before.st_mode, folder_before.st_mtime_ns)
+	assert read_bytes(os.path.join(newest, 'top.txt')) == b't1'
+	disk.mount()
+	run_backup(r_job, **KEPT)
+	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
+
+
+def test_a_folder_moved_under_a_paused_mount_and_cut_comes_back_where_it_was(r_job, monkeypatch, tmp_path):
+	# the design review's probe B: mv disk/a disk/b on the inner disk, the batch cut before its commit, retried with the disk not
+	# mounted. The newest version holds disk/a as version n held it and no disk/b, under rows that name disk/a, and every list
+	# names what the oracle counts. Fails on 82732dd: the newest version holds disk/b, its rows name disk/a
+	disk = InnerDisk(r_job, monkeypatch, os.path.join(str(tmp_path), 'aside'))
+	put_text(r_job.monitor, 'disk/a/x.txt', 'x0')
+	put_text(r_job.monitor, 'disk/a/y.txt', big_text('y0'))
+	put_text(r_job.monitor, 'top.txt', 't0')
+	run_backup(r_job, **KEPT)
+	held_before = contents_of(committed_versions(r_job)[-1])
+	os.rename(os.path.join(disk.folder, 'a'), os.path.join(disk.folder, 'b'))
+	cut_before_the_commit(r_job, [(True, 'move', 'disk/b', 'disk/a')], monkeypatch)
+	assert os.path.isdir(os.path.join(tree_of(r_job), 'disk', 'b'))
+	disk.unmount()
+	roll_forward(r_job)
+	assert contents_of(committed_versions(r_job)[-1]) == held_before
+	named = sorted(rel for rel in rows(r_job) if rel.startswith('disk/'))
+	assert named == ['disk/', 'disk/a/', 'disk/a/x.txt', 'disk/a/y.txt']
+	assert rows_match_vault(r_job.job_vault) == []
+	assert view_truth.wrong_lists(r_job.job_vault) == []
+
+
+def test_a_cut_create_unreadable_at_the_retry_is_left_out_with_its_line(r_job, monkeypatch, capsys):
+	# the design re-check's run N4, the manifest standing: a file the cut batch made, its copy's middle lost (a stand-in writes it
+	# damaged), and its source mode 000 at the retry (uid 65534 only, as root reads it; the VM gate deselects it by name). The scan
+	# removes what the batch made, so the newest version holds nothing there, with one UNREADABLE line, and once the file can be read
+	# the next full comparison copies it. Fails on 82732dd: the newest version keeps the damaged copy, through both comparisons
+	base(r_job)
+	path = os.path.join(r_job.monitor, 'new.bin')
+	put_text(r_job.monitor, 'new.bin', big_text('n1'))
+	put_text(r_job.monitor, 'small.txt', 's1')
+	cut_before_the_commit(r_job, [(False, 'create', 'new.bin', None), (False, 'modify', 'small.txt', None)], monkeypatch)
+	overwrite_middle(os.path.join(tree_of(r_job), 'new.bin'))
+	os.chmod(path, 0)
+	try:
+		capsys.readouterr()
+		roll_forward(r_job)
+		out = capsys.readouterr().out
+	finally:
+		os.chmod(path, 0o644)
+	newest = committed_versions(r_job)[-1]
+	assert not os.path.lexists(os.path.join(newest, 'new.bin'))
+	assert read_bytes(os.path.join(newest, 'small.txt')) == b's1'
+	assert len([line for line in out.splitlines() if 'UNREADABLE' in line and path in line]) == 1, out
+	run_backup(r_job, **KEPT)
+	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'new.bin')) == read_bytes(path)
+
+
+def test_a_put_back_where_hard_links_are_refused_copies_and_flushes_once(r_job, monkeypatch, tmp_path):
+	# a vault that refuses hard links at the retry (EMLINK; a FUSE or network filesystem, or a pool answering EXDEV between its disks):
+	# the put-back copies version n's entry, and the scan flushes the vault's disks once, through its own unit, before the attempt
+	# goes on. The disk is not mounted at the retry, so the newest version keeps that copy. Fails on 82732dd: no put-back, no flush
+	disk, path, data, previous, row = an_attribute_copy_cut(r_job, monkeypatch, tmp_path)
+	disk.unmount()
+	callers = []
+	real_flush = rv.flush_or_fail
+	def flush(*args, **kwargs):
+		callers.append(sys._getframe(1).f_code.co_name)
+		return real_flush(*args, **kwargs)
+	def refused(source, dest, *args, **kwargs):
+		raise OSError(errno.EMLINK, os.strerror(errno.EMLINK), source, None, dest)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'flush_or_fail', flush)
+		patched.setattr(rv.os, 'link', refused)
+		roll_forward(r_job, only_sync_attributes=False)
+	assert callers.count('prepare_roll_forward') == 1, callers
+	held = os.path.join(committed_versions(r_job)[-1], 'disk', 'file.bin')
+	assert os.lstat(held).st_ino != os.lstat(os.path.join(previous, 'disk', 'file.bin')).st_ino
+	assert read_bytes(held) == data
+
+
+def test_a_pool_cut_after_the_put_back_links_every_recorded_entry_again(r_job, fake_pool, monkeypatch):
+	# on a pool there is no same-inode shortcut: mergerfs makes up the inode number it shows, and after a cut each disk comes back at
+	# its own point. A scan cut after its put-back (nothing after it ran) leaves the tree as version n's; the next scan unlinks and
+	# links every recorded file and link again, and ends by dropping the pool's cache. Fails on 82732dd: no put-back
+	pool_vault(r_job, fake_pool)
+	put_text(r_job.monitor, 'big.txt', big_text('b0'))
+	put_text(r_job.monitor, 'd/inner.txt', 'i0')
+	os.symlink('big.txt', os.path.join(r_job.monitor, 'ln'))
+	run_backup(r_job, **KEPT)
+	put_text(r_job.monitor, 'big.txt', big_text('b1'))
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	os.remove(os.path.join(r_job.monitor, 'ln'))
+	os.symlink('d/inner.txt', os.path.join(r_job.monitor, 'ln'))
+	cut_before_the_commit(r_job, [(False, 'modify', 'big.txt', None), (False, 'modify', 'd/inner.txt', None), (False, 'delete', 'ln', None),
+		(False, 'create', 'ln', None)], monkeypatch)
+	tree = tree_of(r_job)
+	rv.get_vault_info(r_job.job_vault)
+	linked, forgotten = [], []
+	real_link, real_forget = rv.link_or_copy, rv.forget_pool_cache
+	def link(source, dest):
+		if dest.startswith(tree + os.sep):
+			linked.append(os.path.relpath(dest, tree))
+		return real_link(source, dest)
+	def forget(path):
+		forgotten.append(path)
+		return real_forget(path)
+	with monkeypatch.context() as recording:
+		recording.setattr(rv, 'link_or_copy', link)
+		recording.setattr(rv, 'forget_pool_cache', forget)
+		rv.get_vault_info(r_job.job_vault)
+	assert sorted(linked) == ['big.txt', 'd/inner.txt', 'ln']
+	assert forgotten and forgotten[-1] == tree
+	roll_forward(r_job)
+	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
+
+
+@pytest.mark.parametrize('unreadable', ['file', 'folder'])
+def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkeypatch, unreadable):
+	# pin, the design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
+	# its forward link to staging first; a cut between them leaves version n's folder in the tree only. With the manifest lost no
+	# row gives the link back, and the source cannot be read at the retry: a file in the folder (mode 000), or a folder in it with
+	# files (unreadable_below()). The newest version keeps them, as the put-back removes what the batch made only over a standing
+	# manifest. It fails on a put-back that removes over a lost manifest; 0.55.4 kept them too
+	put_text(r_job.monitor, 'd/x.bin', big_text('x0'))
+	put_text(r_job.monitor, 'd/sub/s.txt', 's0')
+	put_text(r_job.monitor, 'd/sub/t.txt', 't0')
+	put_text(r_job.monitor, 'top.txt', 't0')
+	run_backup(r_job, **KEPT)
+	held_before = contents_of(committed_versions(r_job)[-1])
+	no_exchange(monkeypatch)
+	def cut_between(self, rel, st, holder):
+		# the first of the two renames, then the cut
+		self.two_renames = True
+		os.rename(self.kept_path(rel), self.staged())
+		raise Cut()
+	with monkeypatch.context() as cut:
+		cut.setattr(rv.TreeWriter, 'exchange_in', cut_between)
+		with pytest.raises(Cut):
+			backup_events(r_job, [(True, 'delete', 'd', None)], **KEPT)
+	previous = committed_versions(r_job)[-1]
+	assert not os.path.lexists(os.path.join(previous, 'd')) and os.path.isdir(os.path.join(tree_of(r_job), 'd'))
+	lose_the_manifest(r_job)
+	with monkeypatch.context() as denied:
+		if unreadable == 'file':
+			os.chmod(os.path.join(r_job.monitor, 'd/x.bin'), 0)
+		else:
+			unreadable_below(denied, os.path.join(r_job.monitor, 'd/sub'))
+		try:
+			roll_forward(r_job)
+		finally:
+			os.chmod(os.path.join(r_job.monitor, 'd/x.bin'), 0o644)
+	held = contents_of(committed_versions(r_job)[-1])
+	assert {rel: held.get(rel) for rel in held_before} == held_before
+	# the version before keeps nothing at d: the link the cut left in staging goes with staging, and over a lost manifest no row
+	# gives it back, as on 0.55.4 (a pool's case is the entry "A manifest lost in the same cut as a split on a pool"). The ground
+	# truth's lines for it are looked at and taken out; any other line still fails the test
+	lost = [line for line in view_truth.WRONG if line.startswith(f"{os.path.basename(previous)}:'d")]
+	assert lost and all(line.endswith('None after it') for line in lost), lost
+	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost]
+
+
+def test_a_recorded_folders_failed_metadata_copy_fails_the_attempt(r_job, monkeypatch):
+	# the put-back gives each recorded folder of the tree its metadata in version n; a copy of it that fails fails the scan, and
+	# with it the attempt, and the next attempt puts back again and commits right. Fails on 82732dd: no put-back, nothing fails
+	base(r_job)
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'd/inner.txt', None)], monkeypatch)
+	tree = tree_of(r_job)
+	def fails(source, dest, failed=None):
+		if failed is not None:
+			failed.append(source)
+		return False
+	with monkeypatch.context() as failing:
+		failing.setattr(rv, 'copy_file_meta', fails)
+		with pytest.raises(rv.JobFailure):
+			rv.get_vault_info(r_job.job_vault)
+	assert tree_of(r_job) == tree
+	roll_forward(r_job)
+	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
 
 
 # ---- 9. no markers

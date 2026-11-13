@@ -1031,14 +1031,14 @@ def put_a_file_back(vault):
 	put_text(vault.job.monitor, 'a/x.txt', 'ax2', base['a/x.txt'].mtime_ns)
 
 
-def test_no_copy_again_and_no_unchecked_marks_fails_the_oracle(plain_r_vault):
-	# the roll-forward guards a cut batch's file twice: it copies it again, and marks its row unchecked for what it cannot copy (a file
-	# under a paused inner mount): either alone leaves this vault right, so both go
+def test_no_copy_again_and_no_put_back_fails_the_oracle(plain_r_vault):
+	# pin: a mutation test. the roll-forward guards a cut batch's file twice: the scan puts version n's entry back at each name the
+	# batch recorded (put_back_recorded()), and the roll-forward copies it again: either alone leaves this vault right, so both go
 	vault = plain_r_vault
 	def neither(rv):
 		real = rv.prepare_roll_forward
+		rv.put_back_recorded = lambda previous, tree, recorded, remove_made: False
 		rv.prepare_roll_forward = lambda info, manifest: (real(info, manifest), [])[1]
-		rv.VaultManifest.mark_unchecked = lambda self, rels: None
 	found = first_wrong(vault, neither, change=lambda: put_a_file_back(vault))
 	assert found is not None and any("'a/x.txt'" in line for line in found[1]), found
 

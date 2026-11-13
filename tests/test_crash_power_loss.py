@@ -363,6 +363,25 @@ def test_a_cut_after_the_change_list_is_written_keeps_every_copy_right():
 			assert f.read() == wanted
 
 
+def power_goes_before_the_flush(job_vault, mount, rel):
+	'''A fault for a batch: at its commit flush the cut batch's tree is checkpointed (a folder's fsync), then the power goes.'''
+	def fault(module):
+		flushing_for_real(module)
+		def flush(*args, **kwargs):
+			# the checkpoint: the cut batch's tree, the newest version folder, holds the copy, and its fsync checkpoints the disk
+			tree = max((name for name in os.listdir(job_vault) if version_number(name) is not None), key=version_number)
+			assert os.path.isfile(os.path.join(job_vault, tree, rel)), tree
+			fd = os.open(os.path.join(job_vault, tree), os.O_RDONLY | os.O_DIRECTORY)
+			try:
+				os.fsync(fd)
+			finally:
+				os.close(fd)
+			shut_down_scratch(mount)
+			os.killpg(0, signal.SIGKILL)
+		module.flush_copies = flush
+	return fault
+
+
 @needs_f2fs
 def test_a_power_cut_after_a_checkpoint_before_the_commit_flush_copies_an_attribute_changes_copy_again():
 	# tests 7 and 8 of the flush round under a real power loss. A chmod with Only Sync Attributes off copies a file whose row does
@@ -372,22 +391,6 @@ def test_a_power_cut_after_a_checkpoint_before_the_commit_flush_copies_an_attrib
 	options = {'only_sync_attributes': False}
 	rel = 'probe.bin'
 	wanted = random.Random(2).randbytes(256 << 10) + bytes(128 << 10)
-	def power_goes_before_the_flush(job_vault, mount):
-		def fault(module):
-			flushing_for_real(module)
-			def flush(*args, **kwargs):
-				# the checkpoint: the cut batch's tree, the newest version folder, holds the copy, and its fsync checkpoints the disk
-				tree = max((name for name in os.listdir(job_vault) if version_number(name) is not None), key=version_number)
-				assert os.path.isfile(os.path.join(job_vault, tree, rel)), tree
-				fd = os.open(os.path.join(job_vault, tree), os.O_RDONLY | os.O_DIRECTORY)
-				try:
-					os.fsync(fd)
-				finally:
-					os.close(fd)
-				shut_down_scratch(mount)
-				os.killpg(0, signal.SIGKILL)
-			module.flush_copies = flush
-		return fault
 	with LoopImage(os.path.join(SCRATCH, 'power-loss-before-flush'), 256) as image:
 		root = tempfile.mkdtemp(prefix='reverb-crash-', dir=image.mount_point)
 		job = create_job(root)
@@ -403,7 +406,7 @@ def test_a_power_cut_after_a_checkpoint_before_the_commit_flush_copies_an_attrib
 		os.chmod(path, 0o640)
 		raw = raw_events(job.monitor, [(False, 'attrib', rel, None)])
 		flush_scratch(root)
-		cut = in_child(job, None, batch(raw), power_goes_before_the_flush(job.job_vault, image.mount_point))
+		cut = in_child(job, None, batch(raw), power_goes_before_the_flush(job.job_vault, image.mount_point, rel))
 		assert cut.killed, cut
 		image.remount()
 		again = retry(job, fault=flushing_for_real, options=options)
@@ -413,3 +416,59 @@ def test_a_power_cut_after_a_checkpoint_before_the_commit_flush_copies_an_attrib
 		folder = next(name for name in os.listdir(job.job_vault) if version_number(name) == newest)
 		with open(os.path.join(job.job_vault, folder, rel), 'rb') as f:
 			assert f.read() == wanted
+
+
+def newest_bytes(job_vault, rel):
+	newest = max((name for name in os.listdir(job_vault) if version_number(name) is not None and os.path.isdir(os.path.join(job_vault, name))), key=version_number)
+	with open(os.path.join(job_vault, newest, rel), 'rb') as f:
+		return f.read()
+
+
+@needs_f2fs
+def test_a_power_cut_before_the_flush_under_a_paused_mount_keeps_version_ns_bytes(monkeypatch):
+	# F1 under a real power loss. The file is on a folder the fake mount table calls an inner mount; a chmod with Only Sync Attributes
+	# off copies it, the checkpoint keeps the copy's size and mtime and not its data, and the power goes before the commit flush. The
+	# retry runs with that mount not mounted, so the roll-forward cannot copy the file again; then a full comparison with it back.
+	# The scan put version n's entry back at the name, under version n's row: the newest version holds the file's bytes after both,
+	# and the comparison finds the chmod and copies it. On 82732dd the retry kept the cut copy, all NUL, with a row read from it
+	# (the new mode), and the comparison read it back and kept it (the file ends in 128 KiB of zeros)
+	options = {'only_sync_attributes': False}
+	rel = 'disk/probe.bin'
+	wanted = random.Random(3).randbytes(256 << 10) + bytes(128 << 10)
+	with LoopImage(os.path.join(SCRATCH, 'power-loss-paused-mount'), 256) as image:
+		root = tempfile.mkdtemp(prefix='reverb-crash-', dir=image.mount_point)
+		job = create_job(root)
+		disk, aside = os.path.join(job.monitor, 'disk'), os.path.join(root, 'aside')
+		def mounted(*rels):
+			table = [('/', ('1',))] + [(os.path.join(job.monitor, name.rstrip('/')), (name,)) for name in rels]
+			monkeypatch.setattr(rv, 'current_mount_table', lambda: table)
+		mounted('disk/')
+		build_base(job, **options)
+		os.makedirs(disk, exist_ok=True)
+		path = os.path.join(job.monitor, rel)
+		with open(path, 'wb') as f:
+			f.write(wanted)
+		raw = raw_events(job.monitor, [(True, 'create', 'disk', None), (False, 'create', rel, None)])
+		def batch(raw):
+			return lambda: run_do_backup(job, rv.change_events_to_backup_entries(deque(raw), job.monitor), options, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns())
+		first = in_child(job, None, batch(raw), flushing_for_real)
+		assert first.committed is True, first
+		os.chmod(path, 0o640)
+		raw = raw_events(job.monitor, [(False, 'attrib', rel, None)])
+		flush_scratch(root)
+		cut = in_child(job, None, batch(raw), power_goes_before_the_flush(job.job_vault, image.mount_point, rel))
+		assert cut.killed, cut
+		image.remount()
+		# the inner disk is not mounted when the daemon comes back: its folder is the empty one it leaves
+		os.rename(disk, aside)
+		os.mkdir(disk)
+		mounted()
+		again = retry(job, fault=flushing_for_real, options=options)
+		assert again.error is None and again.committed is True, again
+		assert newest_bytes(job.job_vault, rel) == wanted, 'after the retry'
+		os.rmdir(disk)
+		os.rename(aside, disk)
+		mounted('disk/')
+		again = retry(job, fault=flushing_for_real, options=options)
+		assert again.error is None and again.committed is True, again
+		assert newest_bytes(job.job_vault, rel) == wanted, 'after the full comparison with the mount back'

@@ -6743,6 +6743,66 @@ def give_back_folder_times(previous:str, manifest:'VaultManifest') -> list:
 		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
 	return recorded
 
+def put_back_recorded(previous:str, tree:str, recorded:list, remove_made:bool) -> bool:
+	'''
+	The tree of a cut batch made version n's again before anything reads its rows or compares it (spec section 1): what the batch
+	changed or made there may be its own copy, which a write error some other sync saw, or a power cut, can have left wrong at its
+	right size, mtime and tail, and no later look could tell. recorded is what give_back_folder_times() returns, each folder right
+	before what is in it; previous holds version n's entry at each of those names.
+	1. Each recorded file or link: whatever the tree holds there goes, and version n's entry is linked there (link_or_copy(), a link
+	   as itself). Off a pool nothing is done where the tree holds that inode already; a pool shows an inode number of its own making,
+	   and after a cut each disk comes back at its own point, so there every one is linked again. Each recorded folder: a real folder
+	   of the tree stays; anything else there goes and a folder is made, which its entries, recorded names of their own (record()
+	   recorded such a folder whole), then fill.
+	2. With remove_made, what the batch made goes: each entry of a recorded folder of the tree, or of its root, whose name the
+	   previous version's folder does not list (a create, a move's target, a partial copy). That rests on the previous version listing
+	   every entry the tree should keep, a forward link a cut left in staging given back (put_back_forward_links(), which needs the
+	   manifest's rows): over a lost manifest it would remove version n's own entry there, so the caller passes False then.
+	3. Each recorded folder of the tree, innermost first, gets its folder's metadata in previous (copy_file_meta()), as the links
+	   made in it moved its times and the batch may have changed its mode or owner. One that fails raises JobFailure.
+	On a pool the pool's cache is dropped once anything changed (forget_pool_cache()). A cut anywhere in it leaves previous as it was,
+	so the next scan does it again. Returns whether any link_or_copy() copied, where hard links are refused, which the caller then
+	flushes. Raises OSError or JobFailure.
+	'''
+	pooled = vault_disks(tree)[0]
+	copied = changed = False
+	for rel in recorded:
+		name = rel.rstrip('/')
+		kept, held = os.path.join(previous, name), os.path.join(tree, name)
+		if rel.endswith('/'):
+			if kind_at(held) != 'd':
+				remove_entry(held)
+				os.mkdir(held)
+				changed = True
+			continue
+		if not pooled:
+			try:
+				st, kept_st = os.lstat(held), os.lstat(kept)
+				if (st.st_dev, st.st_ino) == (kept_st.st_dev, kept_st.st_ino):
+					continue
+			except (FileNotFoundError, NotADirectoryError):
+				pass
+		remove_entry(held)
+		copied = not link_or_copy(kept, held) or copied
+		changed = True
+	if remove_made:
+		for folder in [''] + [rel.rstrip('/') for rel in recorded if rel.endswith('/')]:
+			listed = set(os.listdir(os.path.join(previous, folder)))
+			for name in os.listdir(os.path.join(tree, folder)):
+				if name not in listed:
+					remove_entry(os.path.join(tree, folder, name))
+					changed = True
+	failed = []
+	for rel in reversed(recorded):
+		if rel.endswith('/'):
+			copy_file_meta(os.path.join(previous, rel.rstrip('/')), os.path.join(tree, rel.rstrip('/')), failed)
+			changed = True
+	if pooled and changed:
+		forget_pool_cache(tree)
+	if failed:
+		raise JobFailure(f'copying the metadata of {", ".join(failed)} onto the tree {tree} failed; the next attempt puts it back again')
+	return copied
+
 def forget_pool_cache(path:str) -> None:
 	'''
 	The mergerfs pool holding path drops what it and the kernel hold of its entries, after a change made directly on a disk: for about a second an entry
@@ -6849,28 +6909,29 @@ def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest') -> 
 
 def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> list:
 	'''
-	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4), so the versions read exact
-	from here on, and a restore can run before the monitored path is back. Each real folder of the previous version gets its
-	times back (give_back_folder_times()). Returns what the batch recorded there before it changed the tree: its real folders,
-	ending with /, its regular files and its links, each of the kind it was. The tree may hold a regular file at each of those names
-	now (a file may have replaced a link or a folder), which a write error some other sync saw, or a power cut, may have left
-	wrong at its right size, mtime and tail: the roll-forward copies again each that the monitored tree holds as a regular file
-	(roll_forward_entries()), and the rows of the regular files are marked unchecked, in a transaction of its own, for the one it
-	does not: a file under an inner mount that is paused at the roll-forward keeps its row, whose copy in the tree the next full
-	comparison that has the mount back reads (the row said version n's copy, and the tree may hold another now). A link a cut exchange left
-	in a folder's place in the tree is no concern of it: the comparison and the sweep of the whole tree take it. A record cut between
-	two renames gets its link back first (put_back_forward_links()), and a link hiding what a record put in on another disk goes before that
-	(remove_shadowed_links()); a lost manifest has no rows to tell it by. A name of the tree left of two kinds goes (remove_mixed_names()). Idempotent: a cut here repeats it. Raises OSError or sqlite3.Error.
+	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4) and inside its unit of vault work
+	(get_vault_info()), so the versions read exact from here on, and a restore can run before the monitored path is back. A record
+	cut between two renames gets its link back first (put_back_forward_links()), and a link hiding what a record put in on another
+	disk goes before that (remove_shadowed_links()); a lost manifest has no rows to tell it by. A name of the tree left of two kinds
+	goes (remove_mixed_names()). Each real folder of the previous version gets its times back (give_back_folder_times()), and the
+	tree is made version n's again (put_back_recorded()): each name the batch recorded holds version n's entry, and, with the
+	manifest describing the previous version, what the batch made is gone, so the comparison finds every change since version n,
+	the batch's own included, and nothing reads a copy the batch made. Where that took a copy (hard links refused), the vault's
+	disks are flushed through the scan's own handles before the attempt goes on. Returns what the batch recorded in the previous
+	version: its real folders, ending with /, its regular files and its links, each of the kind it was, of which the roll-forward
+	copies again each regular file of the monitored tree (roll_forward_entries()). Idempotent: a cut here repeats it. Raises
+	OSError, sqlite3.Error or JobFailure.
 	'''
 	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
+	described = manifest.describes(previous)
 	remove_shadowed_links(previous)
-	if manifest.describes(previous):
+	if described:
 		put_back_forward_links(previous, info.tree, manifest)
 	remove_mixed_names(previous, info.tree)
 	recorded = give_back_folder_times(previous, manifest)
-	manifest.begin()
-	manifest.mark_unchecked(rel for rel in recorded if not rel.endswith('/'))
-	manifest.commit()
+	if put_back_recorded(previous, info.tree, recorded, described):
+		job_vault = os.path.dirname(os.path.normpath(previous))
+		flush_or_fail(job_vault, os.path.basename(job_vault), f'{info.tree} is not made ready for its roll-forward; the next attempt puts it back again')
 	return recorded
 
 def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
@@ -6878,8 +6939,9 @@ def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 	The rows of version n as far as they say what is in the tree of a cut batch: each row's mode and owner, a folder's mtime and a
 	link's text are read from the tree, and a row whose entry is gone or of another kind has no record, which the comparison
 	treats as a new entry. That batch may have changed any of them, and the monitored tree may have gone back since: a
-	comparison with the old row would say nothing differs. A file the batch wrote over is copied again
-	(roll_forward_entries()), or, where that cannot be, left to its unchecked mark (prepare_roll_forward()). The caller holds the transaction, as these rows stand only if the version commits: a repeated
+	comparison with the old row would say nothing differs. Over a standing manifest the scan made each name the batch recorded
+	version n's entry again (prepare_roll_forward()), so a row read here reads version n's entry, and what the roll-forward does not
+	copy again keeps version n's record. The caller holds the transaction, as these rows stand only if the version commits: a repeated
 	roll-forward needs version n's folder times again. One look at each row, on a path that a crash alone takes.
 	'''
 	changed = []
@@ -6909,12 +6971,13 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 		changed_since_wall:int = None, pool_guard:'PoolGuard' = None) -> OrderedDict:
 	'''
 	What the roll-forward of the tree info.tree replays (plan S4): what a full comparison finds between the monitored tree and that
-	tree, and one thing more. Each file the cut batch wrote into the tree is copied again, never read back: a write error that
-	some other sync saw before this attempt's handles opened, or a power cut, may have left its copy wrong at its right size, mtime
-	and tail, and nothing can tell. Those are the names it recorded in the previous version (info.recorded, prepare_roll_forward():
-	a file may have replaced a link there, whose row, read from the tree, has no record to tell it by, or a folder, which has no row
-	at the file's name until the manifest is rebuilt from the tree), and, over a manifest that does not describe the previous version,
-	as a lost one, whose rows are listed from the tree, what it made there too (new_in_tree()). Each of them whose monitored path is
+	tree, and one thing more. Each name the cut batch recorded in the previous version (info.recorded) holds version n's entry
+	again (prepare_roll_forward()), but the change the batch made there can be one no comparison sees, a rewrite at its size with
+	its mtime set back: each such file is copied again, never read back (a file may have replaced a link there, whose row, read from
+	the tree, has no record to tell it by, or a folder, which has no row at the file's name until the manifest is rebuilt from the
+	tree). Over a manifest that does not describe the previous version, as a lost one, whose rows are listed from the tree, the scan
+	left what the batch made in the tree, and that is copied again too (new_in_tree()): a write error that some other sync saw before
+	this attempt's handles opened, or a power cut, may have left it wrong at its right size, mtime and tail. Each of them whose monitored path is
 	a regular file now, through real folders of the monitored tree only (a link above it leads out of that tree: what it leads to is
 	no entry of it), is trusted by the comparison, as present and of its kind, and replayed as a modify; one that is not is compared
 	as any other entry. A roll-forward is the first batch of an attempt, the full comparison every start runs, so it is given no
@@ -8990,10 +9053,6 @@ class VaultManifest:
 	def set_folder_mtimes(self, pairs):
 		'''Record the mtime of each folder row of (mtime_ns, folder rel ending with /) pairs that holds a record; the caller holds the transaction.'''
 		self.conn.executemany("UPDATE entries SET mtime_ns = ? WHERE path = ? AND kind = 'd'", ((mtime_ns, storable_name(rel)) for mtime_ns, rel in pairs))
-
-	def mark_unchecked(self, rels):
-		'''Mark the file records of rels unchecked, keeping the rest: each is a new copy of what it records, which delta generation reads back.'''
-		self.conn.executemany("UPDATE entries SET unchecked = 1 WHERE path = ? AND kind = 'f'", ((storable_name(rel),) for rel in rels))
 
 	def take_dirty_records(self, limit:int) -> list:
 		'''The rels of the dirty rows, each with its record, as (rel, record or None): the record is kept only for a row mark_vouched() marked.'''
