@@ -230,8 +230,7 @@ def test_unknown_schema_is_started_over(job):
 
 def test_upgraded_database_reads_nothing_from_the_vault(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
-	run_backup(job)
-	# the second backup reads the copies back once, so every row is recorded and checked
+	# V0 records each row checked at its commit (nothing reads a copy back, L9): a second backup would change no row and no meta pair
 	run_backup(job)
 	rows, meta = contents(job)
 	os.remove(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME))
