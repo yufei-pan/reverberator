@@ -73,7 +73,7 @@ def test_trusted_rels_are_not_read_from_the_vault(job, monkeypatch):
 	entries = OrderedDict()
 	rv.compare_scopes(entries, manifest, v0, job.monitor, rv.TouchedScopes(['D/'], ['p.txt', 'q.txt']), trusted=trusted)
 	assert events(job, entries) == {'D/gone.txt': 'delete', 'q.txt': 'delete'}
-	# not recorded, so the copies stay for the next comparison to read back
+	# not recorded here: the backup records each at its commit, as checked, and nothing reads a copy back (L9)
 	assert manifest.dirty_rels() == trusted
 	manifest.rollback()
 

@@ -515,7 +515,7 @@ def journal_state(job):
 
 
 def all_checked(job):
-	'''V0 of a.txt and d/b.txt, then a full comparison that reads V0's copies back: no row is left unchecked.'''
+	'''V0 of a.txt and d/b.txt, its rows recorded checked at its commit (nothing reads a copy back, L9), then a full comparison that finds no difference and records its matched time, 200.'''
 	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
 	run_backup(job, matched_since=100)
 	run_backup(job, matched_since=200)
