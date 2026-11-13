@@ -513,23 +513,15 @@ class SkipList:
 			return ''
 		return folder_path[len(root) + 1:] + '/'
 
-def skip_list_change(recorded, current:str, explicit_none:bool) -> str:
-	'''Compare a job's recorded skip list fingerprint (None when never recorded) with the current one.
+def skip_list_refused(recorded, current:str, explicit_none:bool) -> bool:
+	'''Whether a job's current skip list fingerprint is refused: its recorded one (None when never recorded) was not empty and the current one is, with no explicit "none".
 	Dropping a recorded list needs an explicit "none" so a missing or empty file cannot silently back up everything.
-	>>> skip_list_change(None, '', False), skip_list_change('a', 'a', False)
-	('unchanged', 'unchanged')
-	>>> skip_list_change(None, 'a', False), skip_list_change('a', 'b', True)
-	('changed', 'changed')
-	>>> skip_list_change('a', '', False), skip_list_change('a', '', True)
-	('refuse', 'changed')
+	>>> skip_list_refused(None, '', False), skip_list_refused('a', 'a', False), skip_list_refused('a', 'b', False)
+	(False, False, False)
+	>>> skip_list_refused('a', '', False), skip_list_refused('a', '', True)
+	(True, False)
 	'''
-	if recorded is None:
-		return 'unchanged' if current == '' else 'changed'
-	if recorded == current:
-		return 'unchanged'
-	if current == '' and not explicit_none:
-		return 'refuse'
-	return 'changed'
+	return bool(recorded) and current == '' and not explicit_none
 
 class JobStartup:
 	'''
@@ -554,7 +546,7 @@ class JobStartup:
 	def load(self, recorded_fingerprint) -> bool:
 		'''
 		Load the list and compare it with the vault's recorded fingerprint; False when the job must not run: the list
-		cannot be loaded, or it would drop the patterns the vault was backed up with (skip_list_change() says 'refuse').
+		cannot be loaded, or it would drop the patterns the vault was backed up with (skip_list_refused()).
 		Every start compares the whole tree, so a list changed otherwise needs nothing more.
 		'''
 		ok = False
@@ -571,7 +563,7 @@ class JobStartup:
 				self.failure_reason = f'cannot load skip list file {self.skip_list_path}: {e}'
 				backuperTeeLogToTl(self.job_name,f'Cannot load skip list file {self.skip_list_path} for job {self.job_name}: {e}. Not backing up this job',error=True)
 				return False
-			if skip_list_change(recorded_fingerprint, skip_list.fingerprint, self.explicit_none) == 'refuse':
+			if skip_list_refused(recorded_fingerprint, skip_list.fingerprint, self.explicit_none):
 				reason = f'{self.skip_list_path} has no patterns' if self.skip_list_path is not None else 'its Skip List File names no file'
 				self.permanent = True
 				self.failure_reason = f'backed up with skip patterns, but {reason}: set its Skip List File to none to back up everything'
@@ -1630,7 +1622,8 @@ def run_daemon():
 		full_comparison_interval = read_full_comparison_interval(reverb_rule.full_comparison_interval, job_name)
 		backup_size_limit = reverb_rule.backup_size_limit
 		vault_path_signature = reverb_rule.vault_fs_signature
-		# kept across the job's attempts, so a retry loses nothing queued
+		# the queue every attempt's threads share: what a failed attempt left in it is absorbed by the next attempt's start, which
+		# compares the whole tree, so nothing is replayed from it
 		to_process = ChangeEventQueue(monitor_path)
 		to_process_lock = threading.Lock()
 		to_process_flag = threading.Event()
@@ -4811,8 +4804,8 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 
 def remove_pending_file(job_name:str, job_vault:str) -> None:
 	'''
-	Remove the pending transactions file (PENDING_TRANSACTIONS_FILE_NAME) a stop of 0.55.4 or older left in job_vault: no
-	release reads it, as every start compares the whole tree. One unlink, which finds nothing after the first start; a
+	Remove the pending transactions file (PENDING_TRANSACTIONS_FILE_NAME) a stop of 0.55.4 or older left in job_vault: from
+	0.55.5 on no release reads it, as every start compares the whole tree (0.55.4 replayed it). One unlink, which finds nothing after the first start; a
 	removal says so on one line, and one that fails is a warning, and the start goes on.
 	'''
 	path = os.path.join(job_vault, PENDING_TRANSACTIONS_FILE_NAME)
@@ -4917,12 +4910,9 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		if not running():
 			return
 		with to_process_lock:
-			if to_process:
-				backuperTeeLogToTl(job_name, f'Found {len(to_process)} events queued at startup')
 			to_process_temp = to_process.take()
 		if to_process_temp:
 			if to_process_temp.full_scan_requested:
-				backuperTeeLogToTl(job_name, 'Events queued at startup contain a full_scan request, forcing delta generation')
 				full_comparison = True
 			else:
 				backupEntries = change_events_to_backup_entries(to_process_temp,monitor_path)
@@ -10309,7 +10299,7 @@ def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list
 
 # what a comparison covers: subtrees are folder rels ending with /, each compared with everything under it ('' for the
 # whole tree), and paths are file rels or folder rels ending with /, each compared alone. changed_since, when not None,
-# is the time on the monotonic clock from which a batch's changes date ( -inf when it is not known ), and
+# is the time on the monotonic clock from which a batch's changes date, and
 # changed_since_wall, when not None, the time in ns on the wall clock: an entry whose ctime is not before the earlier,
 # VERIFY_CTIME_MARGIN_SECONDS to spare, has its extended attributes compared too ( ctime_bound() ). folders are the
 # rels ( no trailing / ) of the monitored folders the batch made, removed or renamed an entry in, at their places once its

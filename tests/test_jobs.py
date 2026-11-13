@@ -656,23 +656,6 @@ def test_job_attempt_starter_passes_the_backuper_keywords(monkeypatch):
 	assert got == [dict(full_comparison_interval=3600.0)]
 
 
-def test_an_interrupted_full_comparison_saves_nothing(job, poll_fast, monkeypatch):
-	seed_monitor(job, {'a.txt': 'a'})
-	def interrupted(*args, **kwargs):
-		rv.GREEN_LIGHT.clear()
-		return None, None, False
-	monkeypatch.setattr(rv, 'do_backup', interrupted)
-	queue = rv.ChangeEventQueue(job.monitor)
-	queue.append(rv.ChangeEvent(1.0, False, 'full_scan', job.monitor, None))
-	control = rv.JobControl(job.job_name)
-	control.start_attempt()
-	thread, queue = _run_backuper(job, control, to_process=queue)
-	thread.join(timeout=5)
-	rv.GREEN_LIGHT.set()
-	# the next start compares the whole tree again
-	assert not thread.is_alive() and not os.path.lexists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
-
-
 def test_ignored_and_unknown_watch_events_log_quietly(monkeypatch, poll_fast):
 	flags = rv.inotify_simple.flags
 	class FakeEvent:

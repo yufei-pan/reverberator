@@ -100,17 +100,17 @@ def test_names_starting_with_hash_or_bang(tmp_path):
 
 
 @pytest.mark.parametrize('recorded,current,explicit_none,expected', [
-	(None, '', False, 'unchanged'),
-	(None, 'f1', False, 'changed'),
-	('f1', 'f1', False, 'unchanged'),
-	('', '', False, 'unchanged'),
-	('f1', 'f2', False, 'changed'),
-	('', 'f1', False, 'changed'),
-	('f1', '', False, 'refuse'),
-	('f1', '', True, 'changed'),
+	(None, '', False, False),
+	(None, 'f1', False, False),
+	('f1', 'f1', False, False),
+	('', '', False, False),
+	('f1', 'f2', False, False),
+	('', 'f1', False, False),
+	('f1', '', False, True),
+	('f1', '', True, False),
 ])
-def test_skip_list_change(recorded, current, explicit_none, expected):
-	assert rv.skip_list_change(recorded, current, explicit_none) == expected
+def test_skip_list_refused(recorded, current, explicit_none, expected):
+	assert rv.skip_list_refused(recorded, current, explicit_none) is expected
 
 
 def _backup(job, entries=None, skip_list=None, backup_size_limit='0'):
