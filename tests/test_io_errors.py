@@ -696,6 +696,29 @@ def test_an_untracked_delete_over_a_lost_manifest_makes_no_version(job, poll_fas
 	assert committed is True and committed_versions(job) == before
 
 
+def test_a_file_gone_between_the_check_and_its_open_is_gone_not_unreadable(job, poll_fast, monkeypatch, capsys):
+	# fails at 15b3108: the open's FileNotFoundError is taken for an unreadable file, and the batch logs a false UNREADABLE line,
+	# which alerts. The file is looked at, then gone at the open (faked once: the entry is not there at that moment)
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	_settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	open(path, 'w').write('b, longer')
+	real_open = os.open
+	gone = []
+	def opening(target, flags, *args, **kwargs):
+		if not gone and os.fspath(target) == path and flags & os.O_NONBLOCK:
+			gone.append(True)
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), target)
+		return real_open(target, flags, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', opening)
+	capsys.readouterr()
+	_events(job, [(False, 'modify', 'b.txt', None)])
+	out = capsys.readouterr()
+	assert gone and 'UNREADABLE' not in out.out + out.err
+	# the replay's own line for a path gone, as the lstat's ENOENT gets
+	assert (out.out + out.err).count('Not tracking b.txt: source no longer exists') == 1
+
+
 @needs_unreadable
 def test_an_unreadable_file_beside_a_real_change_commits(job, poll_fast, capsys):
 	# pin: the check stops at the readable change; the unreadable file keeps its last copy, with its line

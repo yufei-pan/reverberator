@@ -7750,6 +7750,10 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			return False
 		try:
 			os.close(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+		except (FileNotFoundError, NotADirectoryError):
+			# gone between the lstat and the open
+			lines.append(('gone', path, None))
+			continue
 		except OSError as e:
 			lines.append(('unreadable', path, e))
 			continue
