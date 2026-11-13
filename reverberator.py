@@ -4855,15 +4855,21 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		scopes = touched_scopes(batch, monitor_path)
 		return scopes if scopes.subtrees or scopes.paths else None
 	try:
+		job_vault = os.path.join(vault_path,job_name)
+		def wait_for_vault(flag, table = None):
+			# the rule's Vault Path, then the job's own folder in it: a disk fstab names at the folder's place on a pool's branch
+			# lies below the Vault Path's place there, so only a wait on the folder sees it missing, and the job waits for it as
+			# for any disk, instead of failing its scan and retrying. the folder is made once its disk is there, like the Vault Path
+			wait_for_path(job, flag, vault_path, 'vault filesystem not ready', table=table)
+			wait_for_path(job, None, job_vault, 'job vault not made yet', create=True, table=table)
 		# made once its disk is there, never under a bare mount point (a bare folder there is not the disk's, so this
 		# runs even for a path that shows); registered after, so the signature monitor checks the new folder at once
 		if not wait_for_path(job, None, vault_path, 'vault path not made yet', create=True):
 			return
 		vault_fs_flag = FS_SIGNATURE_MONITOR.register(vault_path,vault_path_signature)
-		wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+		wait_for_vault(vault_fs_flag)
 		# the vault is scanned before the monitored path is waited for (the scan only reads the vault): what a killed
 		# copy left in it goes now, though the path may be long in coming back. a scan that fails fails the attempt
-		job_vault = os.path.join(vault_path,job_name)
 		def scan():
 			# the scan can change the vault: under the job's backup and restore locks, so no restore reads it meanwhile. they
 			# are held through a conversion from 0.54, and go before the wait for the monitored path: a disk that died is when a
@@ -4927,7 +4933,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			# and the batch's inner mounts, a wait that polls again reading it live ( wait_for_path() ), so no table the batch
 			# takes was read before a wait
 			table = []
-			wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready', table=table)
+			wait_for_vault(vault_fs_flag, table)
 			if not running():
 				break
 			# an unmounted fstab mount at or above the monitored path, or a disk of its pool out, would show its files as deleted: the batch waits for it too
@@ -4992,7 +4998,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				while running() and not to_process_flag.is_set() and not comparison_due():
 					# an idle job waits, with its marker, while a filesystem it needs is not ready, as a pool missing a disk
 					if not vault_fs_flag.is_set():
-						wait_for_path(job, vault_fs_flag, vault_path, 'vault filesystem not ready')
+						wait_for_vault(vault_fs_flag)
 					elif not monitor_fs_flag.is_set():
 						wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 					else:

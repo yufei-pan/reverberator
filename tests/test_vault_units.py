@@ -21,7 +21,7 @@ import pytest
 import reverberator as rv
 from tests.crash_batches import backup_events, put_text
 from tests.errseq import open_folders
-from tests.harness import committed_versions, create_job, run_backup, vault_unit, write_fstab, write_rule
+from tests.harness import committed_versions, create_job, run_backup, vault_unit, wait_for_committed_count, wait_until, write_fstab, write_rule
 from tests.scratch_images import needs_mount, ScratchTmpfs
 from tests.vault_oracle import check_vault, snapshot_tree, version_number
 
@@ -504,9 +504,23 @@ def test_a_write_error_on_a_branchs_own_filesystem_fails_the_batch(r_job, fake_p
 	assert committed_versions(r_job) == before
 
 
-def test_a_nested_vault_disk_fstab_names_that_is_not_mounted_is_waited_for(r_job, fake_pool, errseq, other_filesystem):
-	# fails at 15b3108: nothing waits for it, and the batch commits into the bare mount point, which the disk hides once it is
-	# mounted again
+def unmount_nested_disk(fake_pool, own, place):
+	'''The disk of its own at place leaves the mount table, and the branch's folder at its place is the bare mount point.'''
+	os.remove(place)
+	os.mkdir(place)
+	fake_pool.drop(own)
+
+
+def mount_nested_disk(fake_pool, own, place):
+	os.rmdir(place)
+	os.symlink(own, place)
+	fake_pool.mount(own)
+
+
+def test_a_batch_on_a_nested_vault_disk_fstab_names_that_is_not_mounted_fails_with_the_disk_named(r_job, fake_pool, errseq, other_filesystem):
+	# pin: the guard of every scan and batch, for a disk that drops while a batch runs. It holds at 15b3108's R40 and at its fix
+	# round 2 (the wait below); a batch never begins while the disk is out, but what the batch writes into the bare mount point is
+	# hidden when the disk is mounted again, so the guard fails it whatever the waits did
 	own = own_filesystem_on_a_branch(r_job, fake_pool, other_filesystem)
 	place = os.path.join(fake_pool.branch_path('a'), r_job.job_name)
 	write_fstab(place)
@@ -515,23 +529,69 @@ def test_a_nested_vault_disk_fstab_names_that_is_not_mounted_is_waited_for(r_job
 	# mounted: nothing is missing
 	assert rv.vault_disk_problem(r_job.job_vault) is None
 	before = committed_versions(r_job)
-	# the nested disk is not mounted: its line leaves the table, and the branch's folder at its place is the bare mount point
-	os.remove(place)
-	os.mkdir(place)
-	fake_pool.drop(own)
+	unmount_nested_disk(fake_pool, own, place)
 	assert rv.vault_disk_problem(r_job.job_vault) == f'disk {place} of pool {pool} is not mounted'
 	with pytest.raises(rv.PoolNotReady) as failed:
 		backup_events(r_job, modify_big(r_job), **KEPT)
 	assert failed.value.args[0] == f'disk {place} of pool {pool} is not mounted'
 	assert committed_versions(r_job) == before
-	assert os.listdir(place) == []
 	# it is mounted again: the job goes on
-	os.rmdir(place)
-	os.symlink(own, place)
-	fake_pool.mount(own)
+	mount_nested_disk(fake_pool, own, place)
 	assert rv.vault_disk_problem(r_job.job_vault) is None
 	backup_events(r_job, modify_big(r_job), **KEPT)
 	assert len(committed_versions(r_job)) == len(before) + 1
+
+
+def test_an_attempt_waits_for_a_nested_vault_disk_fstab_names_that_is_not_mounted(r_job, fake_pool, errseq, other_filesystem, capsys):
+	# fails at 5bfa874: the waits ask about the rule's Vault Path, whose place on each branch lies above the disk's mount point, so
+	# none holds the job: the start's scan raises PoolNotReady, the attempt fails, and run_job() retries after its delay (60 s,
+	# doubling to an hour) with a FAILED alert each time, the job down for what is left of the delay once the disk is back
+	own = own_filesystem_on_a_branch(r_job, fake_pool, other_filesystem)
+	place = os.path.join(fake_pool.branch_path('a'), r_job.job_name)
+	write_fstab(place)
+	base(r_job)
+	pool = os.path.realpath(r_job.vault)
+	before = committed_versions(r_job)
+	# a change the start's full comparison backs up once the disk is back
+	modify_big(r_job)
+	unmount_nested_disk(fake_pool, own, place)
+	capsys.readouterr()
+	queue, lock = rv.ChangeEventQueue(r_job.monitor), threading.Lock()
+	ready = threading.Event()
+	ready.set()
+	control = rv.JobControl(r_job.job_name)
+	control.start_attempt()
+	startup = rv.JobStartup(r_job.job_name, r_job.monitor)
+	startup.watching.set()
+	thread = threading.Thread(target=rv.backuper, args=(r_job.job_name, queue, lock, r_job.monitor, r_job.vault, 'N/A', threading.Event(), ready),
+		kwargs=dict(startup=startup, job=control, keep_n_versions=0), daemon=True)
+	thread.start()
+	text = ''
+	def logged():
+		nonlocal text
+		out = capsys.readouterr()
+		text += out.out + out.err
+		return text
+	try:
+		# the job waits for the job vault, with the disk's reason, and stays in the wait: it does not fail, log a FAILED line or commit
+		reason = f'disk {place} of pool {pool} is not mounted'
+		wait_until(lambda: [wait[1:3] for wait in control._waits] == [[r_job.job_vault, reason]] or control.failure is not None, timeout=10,
+			message='the attempt never waited for the job vault')
+		assert control.failure is None, f'the attempt failed instead of waiting: {control.failure.reason}'
+		time.sleep(0.5)
+		assert thread.is_alive() and control.failure is None
+		assert [wait[1:3] for wait in control._waits] == [[r_job.job_vault, reason]]
+		assert 'FAILED' not in logged() and 'Job failed' not in text and 'Cannot scan the vault' not in text
+		assert committed_versions(r_job) == before
+		# it is mounted again: the wait ends and the start backs up the change
+		mount_nested_disk(fake_pool, own, place)
+		wait_for_committed_count(r_job, len(before) + 1)
+		assert control.failure is None and control._waits == []
+		assert 'FAILED' not in logged() and 'Job failed' not in text
+	finally:
+		control.fail('stop')
+		thread.join(timeout=10)
+	assert not thread.is_alive()
 
 
 def test_a_job_vault_made_later_under_a_nested_mount_is_synced_through_its_parents_handle(tmp_path, fake_pool, errseq, monkeypatch, other_filesystem):
