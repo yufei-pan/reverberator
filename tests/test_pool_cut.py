@@ -223,7 +223,7 @@ def test_a_vault_off_a_pool_has_no_links_to_look_for(tmp_path, monkeypatch):
 	job_vault, newest = a_vault(str(tmp_path), {'g': 'y'})
 	monkeypatch.setattr(rv, 'entries_on_disks', lambda disks, folder: pytest.fail('a walk off a pool'))
 	rv.remove_shadowed_links(newest)
-	rv.remove_mixed_names(newest, newest)
+	rv.remove_mixed_names(newest, newest, rv.PoolGuard([job_vault]))
 
 
 def test_a_missing_row_under_a_real_folder_gets_its_link_back(tmp_path, fake_pool):
@@ -266,7 +266,7 @@ def test_a_name_of_two_kinds_in_the_tree_goes_on_every_disk(split_vault):
 	on_disk(b, f'{V2}/same/y')
 	on_disk(a, f'{V2}/same/deep')
 	on_disk(b, f'{V2}/same/deep/in')
-	rv.remove_mixed_names(newest, tree)
+	rv.remove_mixed_names(newest, tree, rv.PoolGuard([job_vault]))
 	assert not os.path.lexists(os.path.join(a, V2, 'r')) and not os.path.lexists(os.path.join(b, V2, 'r'))
 	assert os.path.isfile(os.path.join(a, V2, 'same/x')) and os.path.isfile(os.path.join(b, V2, 'same/y'))
 	assert not os.path.lexists(os.path.join(a, V2, 'same/deep')) and not os.path.lexists(os.path.join(b, V2, 'same/deep'))
@@ -281,7 +281,7 @@ def test_a_name_the_previous_version_forwards_to_is_left_alone(tmp_path, fake_po
 	os.symlink(rv.forward_text('d', V2), os.path.join(newest, 'd'))
 	on_disk(a, f'{V2}/d')
 	on_disk(b, f'{V2}/d/in')
-	rv.remove_mixed_names(newest, tree)
+	rv.remove_mixed_names(newest, tree, rv.PoolGuard([job_vault]))
 	assert os.path.isfile(os.path.join(a, V2, 'd')) and os.path.isfile(os.path.join(b, V2, 'd/in'))
 
 

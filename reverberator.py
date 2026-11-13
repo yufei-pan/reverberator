@@ -6922,18 +6922,21 @@ def remove_shadowed_links(previous:str) -> None:
 	if removed:
 		forget_pool_cache(previous)
 
-def remove_mixed_names(previous:str, tree:str) -> None:
+def remove_mixed_names(previous:str, tree:str, guard:PoolGuard) -> None:
 	'''
 	A name of the tree that is a folder on one disk and something else on another, as an apply phase cut half way leaves a change of its kind. Neither kind can
 	be worked on through the pool, which would give a folder's mode to the file, whose inode an older version shares. It goes on every disk, and the comparison
 	copies it again. The records of a phase were on every disk before it began, so the previous version holds what was there; the walk leaves out what
-	that version forwards, as nothing changed there. Off a pool there is nothing to do. Raises OSError.
+	that version forwards, as nothing changed there. The link is read through the pool, where a branch that is gone hides the links it holds: the read answers
+	"no such name", as for a name the previous version never had, and a name that version forwards would count as not forwarded, its copies on the other disks
+	version n's only ones. So the names to remove are collected first, and guard.require() runs before the first removal: PoolNotReady, with every copy as it was.
+	Off a pool there is nothing to do. Raises OSError or PoolNotReady.
 	'''
 	pooled, disks = vault_disks(tree)
 	if not pooled:
 		return
 	number = vault_version_number(os.path.basename(os.path.normpath(previous)))
-	removed = False
+	mixed = []
 	pending = ['']
 	while pending:
 		folder = pending.pop()
@@ -6948,10 +6951,11 @@ def remove_mixed_names(previous:str, tree:str) -> None:
 			if folders == len(found):
 				pending.append(rel)
 			elif folders:
-				for entry in found:
-					remove_entry(entry.path)
-				removed = True
-	if removed:
+				mixed.extend(entry.path for entry in found)
+	if mixed:
+		guard.require()
+		for path in mixed:
+			remove_entry(path)
 		forget_pool_cache(tree)
 
 def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest') -> None:
@@ -6988,15 +6992,15 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGua
 	the batch's own included, and nothing reads a copy the batch made. Where that took a copy (hard links refused), the vault's
 	disks are flushed through the scan's own handles before the attempt goes on. Returns what the batch recorded in the previous
 	version: its real folders, ending with /, its regular files and its links, each of the kind it was, of which the roll-forward
-	copies again each regular file of the monitored tree (roll_forward_entries()). Idempotent: a cut here repeats it. Raises
-	OSError, sqlite3.Error or JobFailure.
+	copies again each regular file of the monitored tree (roll_forward_entries()). Idempotent: a cut here repeats it. A removal on a pool
+	waits for guard.require() (remove_mixed_names(), put_back_recorded()). Raises OSError, sqlite3.Error, JobFailure or PoolNotReady.
 	'''
 	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
 	described = manifest.describes(previous)
 	remove_shadowed_links(previous)
 	if described:
 		put_back_forward_links(previous, info.tree, manifest)
-	remove_mixed_names(previous, info.tree)
+	remove_mixed_names(previous, info.tree, guard)
 	recorded = give_back_folder_times(previous, manifest)
 	if put_back_recorded(previous, info.tree, recorded, described, guard):
 		job_vault = os.path.dirname(os.path.normpath(previous))

@@ -1354,6 +1354,50 @@ def test_a_pool_branch_gone_while_the_put_back_lists_a_folder_fails_the_scan_and
 	assert read_bytes(held) == b'o0'
 
 
+def test_a_pool_branch_gone_while_a_mixed_name_is_checked_fails_the_scan_and_removes_no_copy(r_job, fake_pool, monkeypatch):
+	# a name of the tree that is a folder on one disk and a file on another goes on every disk (remove_mixed_names()), unless version n forwards to
+	# it, which it reads through the pool: a branch that is gone takes the forward link it holds away, and that read answers "no such name", which
+	# reads as "not forwarded" (R46). Here the third of three branches holds the link of an unchanged name, whose copies on the two others are
+	# version n's only ones, and it goes between the disks' listing and that read. The scan checks the pool before the first removal: PoolNotReady,
+	# every copy in place. Fails on fd4d4e2: the copies on both disks are removed and the scan goes on
+	branches = fake_pool.add(r_job.vault, ['a', 'b', 'c'])
+	for branch in branches:
+		os.makedirs(os.path.join(branch, r_job.job_name), exist_ok=True)
+	put_text(r_job.monitor, 'd/other.txt', 'o0')
+	base(r_job)
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'd/inner.txt', None)], monkeypatch)
+	tree = tree_of(r_job)
+	link = os.path.join(committed_versions(r_job)[-1], 'd', 'other.txt')
+	assert os.path.islink(link), 'version n holds a forward link to the unchanged name'
+	# the tree on the disks: d is a folder on each, and other.txt a file on the first and a folder on the second
+	on_a = os.path.join(branches[0], r_job.job_name, os.path.basename(tree), 'd', 'other.txt')
+	on_b = os.path.join(branches[1], r_job.job_name, os.path.basename(tree), 'd', 'other.txt')
+	os.makedirs(os.path.dirname(on_a))
+	with open(on_a, 'w') as f:
+		f.write('o0')
+	os.makedirs(on_b)
+	with open(os.path.join(on_b, 'in'), 'w') as f:
+		f.write('in')
+	real_mixed, real_readlink, armed, dropped = rv.remove_mixed_names, os.readlink, [], []
+	def mixed(*args):
+		armed.append(True)
+		return real_mixed(*args)
+	def readlink(path, *args, **kwargs):
+		if armed and not dropped and os.fspath(path) == link:
+			# the branch holding the link goes: through the pool the name is no more
+			dropped.append(path)
+			fake_pool.drop(branches[2])
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+		return real_readlink(path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'remove_mixed_names', mixed)
+	monkeypatch.setattr(rv.os, 'readlink', readlink)
+	with pytest.raises(rv.PoolNotReady):
+		rv.get_vault_info(r_job.job_vault)
+	assert dropped
+	assert read_bytes(on_a) == b'o0' and read_bytes(os.path.join(on_b, 'in')) == b'in'
+
+
 @pytest.mark.parametrize('unreadable', ['file', 'folder'])
 def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkeypatch, unreadable):
 	# pin, the design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
