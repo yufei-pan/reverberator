@@ -518,9 +518,8 @@ def mount_nested_disk(fake_pool, own, place):
 
 
 def test_a_batch_on_a_nested_vault_disk_fstab_names_that_is_not_mounted_fails_with_the_disk_named(r_job, fake_pool, errseq, other_filesystem):
-	# pin (apart from the text's suffix, which its own commit adds): the guard of a scan and a batch, for a disk that drops while a
-	# batch runs, held before the waits below (40d0124): what a batch writes into the bare mount point is hidden when the disk is
-	# mounted again, so the guard fails it whatever the waits did
+	# pin: the guard of a scan and a batch, for a disk that drops while a batch runs; it held before the waits below. What a batch
+	# writes into the bare mount point is hidden when the disk is mounted again, so the guard fails it whatever the waits did
 	own = own_filesystem_on_a_branch(r_job, fake_pool, other_filesystem)
 	place = os.path.join(fake_pool.branch_path('a'), r_job.job_name)
 	write_fstab(place)
