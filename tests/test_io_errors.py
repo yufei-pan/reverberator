@@ -548,7 +548,7 @@ KEPT = dict(only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 
 
 def _settled(job):
-	'''V0 of the tree, and a full comparison that reads its unchecked copies back: a vault whose next comparison writes nothing.'''
+	'''V0 of the tree, and a full comparison that finds nothing: a vault whose next comparison writes nothing.'''
 	from tests.harness import run_backup
 	run_backup(job)
 	run_backup(job)

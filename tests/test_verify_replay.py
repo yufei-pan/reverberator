@@ -1,10 +1,12 @@
 import os
 import shutil
 import stat
+import sys
 from collections import deque, OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import create_job, seed_monitor, run_backup, latest_version, reads_the_file_before, write_tree as write_plain_tree
+from tests.crash_batches import backup_events
+from tests.harness import create_job, mark_unchecked_by_hand, seed_monitor, run_backup, latest_version, reads_the_file_before, write_tree as write_plain_tree
 from tests.vault_oracle import compared, read_view
 
 pytestmark = pytest.mark.unit
@@ -357,14 +359,68 @@ def test_verification_handles_non_utf8_names(tmp_path):
 	assert fixes | {(f'D/{BAD}', 'delete')} <= set(changes(job, version))
 
 
-def test_fresh_copies_keep_unchecked(tmp_path):
+def test_fresh_copies_are_recorded_checked(tmp_path):
+	# the commit flushed the copy before its commit point, so its row says so (L9)
 	before, after, events_spec, _ = SEQUENCES['a']
 	job, version = replay_sequence(tmp_path, before, after, events_spec)
 	manifest = rv.VaultManifest(job.job_vault)
 	try:
-		assert manifest.lookup('D/new.txt').unchecked == 1
+		assert manifest.lookup('D/new.txt').unchecked == 0
 	finally:
 		manifest.close()
+
+
+def reading_back(monkeypatch):
+	'''The rels read back from the vault from now on: every read_vault_record() but a commit's record of its own copies (record_dirty_entries()).'''
+	reads = []
+	real = rv.read_vault_record
+	def read(version_path, rel, *args, **kwargs):
+		if not sys._getframe(1).f_code.co_qualname.startswith('record_dirty_entries.'):
+			reads.append(rel)
+		return real(version_path, rel, *args, **kwargs)
+	monkeypatch.setattr(rv, 'read_vault_record', read)
+	return reads
+
+
+def unchecked_rows(job):
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return {rel for rel in manifest.files if manifest.lookup(rel).unchecked}
+	finally:
+		manifest.close()
+
+
+def test_a_batchs_copies_are_recorded_checked_and_never_read_back(job, monkeypatch):
+	# fails on 2c47969: a batch's 20 copies were recorded unchecked, and the next full comparison read each back (an lstat and its
+	# last 64 KiB) and wrote its row again
+	seed_monitor(job, {'keep.txt': 'k'})
+	run_backup(job)
+	names = [f'new/f{i:02d}.txt' for i in range(20)]
+	seed_monitor(job, {name: name * 10000 for name in names})
+	backup_events(job, [(True, 'create', 'new', None)] + [(False, 'create', name, None) for name in names])
+	assert unchecked_rows(job) == set()
+	reads = reading_back(monkeypatch)
+	written = []
+	real_set = rv.VaultManifest.set_records
+	monkeypatch.setattr(rv.VaultManifest, 'set_records', lambda self, records: real_set(self, [written.append(rel) or (rel, record) for rel, record in records]))
+	run_backup(job)
+	assert reads == []
+	assert [rel for rel in written if rel in names] == []
+
+
+def test_a_row_an_older_release_marked_unchecked_is_read_back_once(job, monkeypatch):
+	# pin: a row marked unchecked by hand, as 0.55.4 marked every new copy: the next full comparison reads its copy back and records
+	# it checked, and the one after reads nothing
+	seed_monitor(job, {'a.txt': 'a' * 100000, 'b.txt': 'b'})
+	run_backup(job)
+	run_backup(job)
+	mark_unchecked_by_hand(job, ['a.txt'])
+	reads = reading_back(monkeypatch)
+	run_backup(job)
+	assert reads == ['a.txt'] and unchecked_rows(job) == set()
+	reads.clear()
+	run_backup(job)
+	assert reads == []
 
 
 def test_the_verification_syncs_attributes_the_replay_missed(tmp_path):

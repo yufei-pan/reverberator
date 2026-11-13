@@ -122,6 +122,19 @@ def tracked_manifest(job_vault: str, version_dir: str, files=(), folders=()) -> 
 	return manifest
 
 
+def mark_unchecked_by_hand(job: JobPaths, rels=None) -> None:
+	'''The file rows of rels (every file row when None) marked unchecked, as a release before 0.55.5 marked each new copy.'''
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		if rels is None:
+			manifest.conn.execute("UPDATE entries SET unchecked = 1 WHERE kind = 'f'")
+		else:
+			manifest.conn.executemany('UPDATE entries SET unchecked = 1 WHERE path = ?', ((rv.storable_name(rel),) for rel in rels))
+		manifest.conn.commit()
+	finally:
+		manifest.close()
+
+
 def rule_row(job: JobPaths, min_snapshot: str = '1', max_snapshot: str = '86400',
 		mon_fs_signature: str = 'N/A', vault_fs_signature: str = 'N/A',
 		keep_one_complete_backup: str = 'True', only_sync_attributes: str = 'True',

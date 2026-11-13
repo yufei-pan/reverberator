@@ -2,7 +2,7 @@ import os
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup, latest_version
+from tests.harness import mark_unchecked_by_hand, seed_monitor, run_backup, latest_version
 
 pytestmark = pytest.mark.unit
 
@@ -80,6 +80,8 @@ def test_trusted_rels_are_not_read_from_the_vault(job, monkeypatch):
 
 def test_it_leaves_the_transaction_open(job, monkeypatch):
 	v0, manifest = backed_up(job, {'a.txt': 'a', 'D/x.txt': 'x'})
+	# copies an older release left unchecked, which the comparison reads back
+	mark_unchecked_by_hand(job)
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
 	before = rows(manifest)
 	manifest.begin()

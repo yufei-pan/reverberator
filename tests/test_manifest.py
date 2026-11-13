@@ -9,7 +9,7 @@ import pytest
 import reverberator as rv
 from tests.conftest import REAL_LIBC_SYNCFS, REAL_SYNC_VAULT_FILESYSTEMS
 from tests.scratch_images import LoopImage, needs_f2fs, SCRATCH
-from tests.harness import create_job, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry, reads_the_file_before, vault_unit
+from tests.harness import create_job, mark_unchecked_by_hand, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry, reads_the_file_before, vault_unit
 from tests.test_names import contents, database, schema, schema_1_job
 
 pytestmark = pytest.mark.unit
@@ -40,14 +40,15 @@ def test_backup_records_what_the_new_version_holds(job):
 	record = manifest.lookup('a.txt')
 	copy = os.lstat(os.path.join(v0, 'a.txt'))
 	assert (record.kind, record.size, record.mtime_ns, record.hash) == ('f', 5, copy.st_mtime_ns, rv.hash_file(os.path.join(v0, 'a.txt'), 5))
-	# read right after copying, so possibly from memory: the next start reads it back from the disk
-	assert record.unchecked == 1
+	# the commit flushed the copy before its commit point, so the record a read right after the copy makes is checked
+	assert record.unchecked == 0
 	manifest.close()
 
 
-def test_cold_start_reads_each_copy_back_once_then_only_the_monitored_side(job, monkeypatch):
+def test_a_start_reads_each_copy_an_older_release_left_unchecked_back_once_then_only_the_monitored_side(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	run_backup(job)
+	mark_unchecked_by_hand(job)
 	reads = count_vault_reads(monkeypatch)
 	assert len(run_backup(job)) == 1
 	assert sorted(reads) == ['a.txt', 'sub/b.txt']
@@ -111,8 +112,10 @@ def test_a_comparison_makes_no_sync_however_many_copies_it_checks(job, monkeypat
 	calls = recording_sync(monkeypatch)
 	run_backup(job)
 	# the commit's flush, of the copies it placed: no comparison ran
-	assert calls == [job.job_vault] and set(unchecked_flags(job).values()) == {1}
+	assert calls == [job.job_vault] and set(unchecked_flags(job).values()) == {0}
 	calls.clear()
+	# as an older release left them
+	mark_unchecked_by_hand(job)
 	run_backup(job)                                   # the next start reads all seven back
 	assert calls == []
 	assert set(unchecked_flags(job).values()) == {0}
@@ -125,12 +128,12 @@ def test_a_comparison_storing_no_checked_file_record_makes_no_sync(job, monkeypa
 	calls = recording_sync(monkeypatch)
 	run_backup(job)                                   # every row is checked: nothing is read back
 	assert calls == []
-	# a batch's own new copy is read back fresh, so it is recorded unchecked
+	# a batch's own new copy, which its commit flushes, is recorded checked
 	seed_monitor(job, {'b.txt': 'b'})
 	run_backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]), touched=rv.TouchedScopes(['b.txt/'], ['b.txt'], None, None))
 	# the commit's flush alone
 	assert calls == [job.job_vault]
-	assert unchecked_flags(job)['b.txt'] == 1
+	assert unchecked_flags(job)['b.txt'] == 0
 
 
 @needs_f2fs
@@ -150,9 +153,11 @@ def test_the_real_sync_succeeds_on_the_test_filesystem(monkeypatch):
 
 
 def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
-	# a crash mid copy can leave the size and mtime in place over space whose bytes never reached the disk
+	# a crash mid copy can leave the size and mtime in place over space whose bytes never reached the disk: a row an older release
+	# marked unchecked is read back, and its copy is copied again
 	seed_monitor(job, {'a.txt': 'hello'})
 	copy = os.path.join(run_backup(job)[0], 'a.txt')
+	mark_unchecked_by_hand(job, ['a.txt'])
 	st = os.lstat(copy)
 	with open(copy, 'r+b') as f:
 		f.write(b'\0' * st.st_size)
@@ -203,7 +208,8 @@ def test_moved_folder_is_read_from_the_vault_again(job, monkeypatch):
 	]))
 	reads = count_vault_reads(monkeypatch)
 	assert len(run_backup(job)) == 2
-	assert sorted(reads) == ['moved/', 'moved/x.txt']
+	# the folder's row the move wrote; its file keeps the checked record its copy had (L3, L9)
+	assert sorted(reads) == ['moved/']
 
 
 def test_folder_moved_to_another_depth_needs_no_copy(job):

@@ -21,7 +21,7 @@ import pytest
 import reverberator as rv
 from tests.crash_batches import backup_events, put_text
 from tests.errseq import open_folders
-from tests.harness import committed_versions, create_job, run_backup, vault_unit, wait_for_committed_count, wait_until, write_fstab, write_rule
+from tests.harness import committed_versions, create_job, mark_unchecked_by_hand, run_backup, vault_unit, wait_for_committed_count, wait_until, write_fstab, write_rule
 from tests.scratch_images import needs_mount, ScratchTmpfs
 from tests import version_view_ground_truth as view_truth
 from tests.vault_oracle import check_vault, rows_match_vault, snapshot_tree, version_number
@@ -131,6 +131,8 @@ def test_the_commit_flush_hears_a_write_error_another_sync_saw_first(r_job, errs
 
 def test_a_comparison_that_reads_copies_back_makes_no_sync(r_job, errseq):
 	base(r_job)
+	# copies an older release left unchecked
+	mark_unchecked_by_hand(r_job)
 	unchecked = rows(r_job)
 	assert {rel for rel, record in unchecked.items() if record.kind == 'f' and record.unchecked} == {'big.txt', 'small.txt', 'd/inner.txt'}
 	errseq.events.clear()
@@ -826,14 +828,14 @@ def all_nul(path):
 def recording_reads_and_copies(monkeypatch):
 	'''
 	(the rels read back from the vault to be recorded checked, the sources copied), from now on. The record a commit makes of its
-	own new copy reads it too, as unchecked (read_copied_record()), and is no read-back.
+	own new copy reads it too (record_dirty_entries()), and is no read-back.
 	'''
 	reads, copies = [], []
 	real_read, real_command = rv.read_vault_record, rv.copy_command
-	def read(version_path, rel, known=None, unchecked=0):
-		if not unchecked:
+	def read(version_path, rel, known=None):
+		if not sys._getframe(1).f_code.co_qualname.startswith('record_dirty_entries.'):
 			reads.append(rel)
-		return real_read(version_path, rel, known, unchecked)
+		return real_read(version_path, rel, known)
 	monkeypatch.setattr(rv, 'read_vault_record', read)
 	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: copies.append(source) or real_command(source, dest))
 	return reads, copies

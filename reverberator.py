@@ -8649,8 +8649,9 @@ class VaultManifest:
 	tree against the recorded size, mtime, mode, owner and tail hash, so it reads the vault only for unverified rows
 	(no record yet), which it then records. Rows a backup writes are dirty until they are recorded from the new
 	version, before its changes commit. kind is d (folder), f (regular file), o (other file type), l (symlink, its
-	target in link) or r (a referenced backup's link to the monitored file itself). A file copied by a backup stays
-	unchecked until delta generation reads the copy back from the vault, as a crash can keep its bytes from the disk.
+	target in link) or r (a referenced backup's link to the monitored file itself). A file copied by a backup is recorded
+	checked at its commit, which flushed it first; a row an older release marked unchecked is read back by the next delta
+	generation that walks it, and recorded checked.
 	Paths and link targets are stored through storable_name() and read back through stored_name(), so a name that is
 	not UTF-8 is tracked like any other; rows sort by stored path, in which a folder still comes right before the paths
 	under it. The copy_version column, 0.54's, stays in the table unused until the release that drops the 0.54 reader.
@@ -10214,12 +10215,12 @@ def attribs_to_copy(backup_entries:dict, manifest:'VaultManifest', monitor_path:
 			copied.add(path)
 	return copied
 
-def read_vault_record(version_path:str, rel:str, known:'ManifestRecord' = None, unchecked:int = 0):
+def read_vault_record(version_path:str, rel:str, known:'ManifestRecord' = None):
 	'''
 	Record what the tree version_path holds at rel. It holds no daemon link, so a link there is a user's, recorded as the link.
 	known, the row's record when the replay vouched for it, spares the read of the data: a file with known's size and mtime
-	is recorded with known's hash and unchecked flag, and its new mode and owner. A file it hashes itself gets the unchecked
-	flag given. Returns None when there is nothing readable there.
+	is recorded with known's hash and unchecked flag, and its new mode and owner. A file it hashes itself is recorded checked:
+	every copy a version commits is flushed before its commit (do_backup()). Returns None when there is nothing readable there.
 	'''
 	entry = os.path.abspath(os.path.join(version_path, rel))
 	try:
@@ -10235,31 +10236,25 @@ def read_vault_record(version_path:str, rel:str, known:'ManifestRecord' = None, 
 		if kind == 'f' and known is not None and known.kind == 'f' and (st.st_size, st.st_mtime_ns) == (known.size, known.mtime_ns):
 			return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, known.hash, None, known.unchecked)
 		file_hash = hash_file(entry, st.st_size) if kind == 'f' else None
-		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, unchecked if kind == 'f' else 0)
+		return ManifestRecord(kind, st.st_size, st.st_mtime_ns, st.st_mode, st.st_uid, st.st_gid, file_hash, None, 0)
 	except OSError:
 		return None
-
-def read_copied_record(version_path:str, rel:str, known:'ManifestRecord' = None):
-	'''
-	read_vault_record() for an entry a backup just wrote: its file is still unchecked, as it was read from memory. A file read
-	from known keeps the record as read: it is the copy known describes, which is checked or not as known says.
-	'''
-	return read_vault_record(version_path, rel, known, 1)
 
 def record_dirty_entries(manifest:VaultManifest, version_path:str):
 	'''
 	Record what version_path, the tree this backup is writing, holds for the rows it wrote, reading them on a compare pool
-	(read_copied_record()). A row the replay vouched for (VaultManifest.mark_vouched()) is recorded from its kept record
-	without reading the copy's data, and keeps that record's unchecked flag, so a checked copy stays checked (its new
-	metadata is read from the file), but only while the file keeps the record's size and mtime: otherwise the row is
-	hashed and recorded unchecked, as any other.
+	(read_vault_record()), each checked: the commit flushes every copy before its commit point (do_backup()), through handles
+	opened before the copy was written, so a read-back could find nothing that flush did not. A row the replay vouched for
+	(VaultManifest.mark_vouched()) is recorded from its kept record without reading the copy's data, and keeps that record's
+	unchecked flag (its new metadata is read from the file), but only while the file keeps the record's size and mtime:
+	otherwise the row is hashed, as any other.
 	'''
 	with ThreadPoolExecutor(max_workers=COMPARE_THREADS) as pool:
 		while GREEN_LIGHT.is_set():
 			rows = manifest.take_dirty_records(MANIFEST_BATCH_SIZE)
 			if not rows:
 				return
-			manifest.set_records(zip((rel for rel, _ in rows), pool.map(lambda row: read_copied_record(version_path, row[0], row[1]), rows)))
+			manifest.set_records(zip((rel for rel, _ in rows), pool.map(lambda row: read_vault_record(version_path, row[0], row[1]), rows)))
 
 def compare_monitor_entry(monitor_entry:str, monitor_stat:os.stat_result, record:ManifestRecord, folder_times:bool = False):
 	'''
@@ -10305,7 +10300,8 @@ def compare_entry(monitor_entry:str, rel:str, record:ManifestRecord, version_pat
 			return 'create', None
 		record = found
 	elif record.unchecked:
-		# a crash soon after a backup can leave its copies at the right size and mtime over bytes that never reached the disk
+		# a row an older release marked unchecked, to have its copy read back once: a crash soon after a backup could leave a
+		# copy at the right size and mtime over bytes that never reached the disk
 		found = read_vault_record(version_path, rel)
 		if found is None or (found.size, found.mtime_ns, found.hash) != (record.size, record.mtime_ns, record.hash):
 			backuperTeeLogToTl(path=monitor_entry,error=True,message=f'Vault copy at {os.path.join(version_path, rel)} does not match its record, copying again')
@@ -10431,12 +10427,13 @@ def compare_scopes(backup_entries:dict, manifest:VaultManifest, version_path:str
 	in the caller's transaction: nothing is begun, committed or rolled back here, so the rows can be the ones a backup
 	is still writing, and version_path the version it is writing. Returns the number of tracked entries compared.
 
-	The vault is read, at version_path only, for unverified rows and unchecked copies, and what is read is recorded, as
-	delta_generate_backup_entries() describes. The trusted rels are rows this backup wrote from the monitored tree and
-	has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder from a file,
-	and never read back, so their copies stay unchecked. A file read back is recorded checked with no sync of its own:
-	every copy a version commits was flushed through its batch's handles before its commit (do_backup()), and a cut
-	batch's files are trusted and copied again by its roll-forward (roll_forward_entries()).
+	The vault is read, at version_path only, for unverified rows and for copies an older release left unchecked, and what
+	is read is recorded, as delta_generate_backup_entries() describes. The trusted rels are rows this backup wrote from the
+	monitored tree and has not recorded yet: they are compared for presence, and for kind as far as their rel tells a folder
+	from a file, and never read back, as the commit records them (record_dirty_entries()). A file read back is recorded
+	checked with no sync of its own: every copy a version commits was flushed through its batch's handles before its commit
+	(do_backup()), and a cut batch's tree holds version n's entries again before anything is compared (prepare_roll_forward()),
+	its files trusted and copied again by its roll-forward (roll_forward_entries()).
 	Without attributes, attribute-only differences are left out. With scopes.changed_since or changed_since_wall, the
 	extended attributes of the entries changed since then, by their ctime (ctime_bound()), are compared too
 	(compare_entry()), never those of a trusted row. With folder_times, folders' mtimes are compared too
@@ -10745,8 +10742,8 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	(compare_scopes() over the whole tree, or scope_rel) in a transaction of its own, which it commits.
 
 	Unchanged entries are recognised from the recorded size, mtime, mode, owner and tail hash, so only the monitored
-	side is read. The vault is read for unverified rows, which then get recorded, and for unchecked copies, which a
-	crash may have left without their bytes.
+	side is read. The vault is read for unverified rows, which then get recorded, and for copies an older release left
+	unchecked, which a crash before it flushed them may have left without their bytes.
 	A folder that cannot be read keeps its tracked entries and is logged as UNREADABLE; when the monitored root itself
 	cannot be read, JobFailure is raised before anything is recorded as deleted.
 	With scope_rel, a folder rel ending with /, only that folder is compared: it is looked up like any entry, and only
@@ -14061,7 +14058,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 	def verify():
 		# what the batch's events touched is compared with the monitored tree, and the version fixed where they differ:
 		# the collapse into one entry per path cannot replay every order of moves, re-creations and deletes. the rows this
-		# replay copied are compared for presence only, so their copies stay unchecked. a mode or owner that differs
+		# replay copied are compared for presence only, as the commit records them. a mode or owner that differs
 		# ( compare_monitor_entry(), from the lstat it makes anyway ), or the extended attributes of an entry whose ctime
 		# says the batch changed it ( ctime_bound() ), are synced as an attrib's replay syncs them, onto the
 		# latest copy, wherever it lives: what the replay missed of an attribute change

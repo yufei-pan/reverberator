@@ -148,3 +148,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: since 0.46 every replayed batch was followed by a full comparison (2026-10-27), so the replay only kept the pending moves as renames, and for that it cost a second version at every restart with changes pending (a live job's restart, 2026-11-10), a walk of the whole tree for its resume check, a file format with its own escaping, time offsets and memory checks, a hand-back path, and five entries of limitations.
 - Original design was wrong because: the replay was designed before the rule that every restart compares the whole tree; once the rule came, the saved state answered a question the comparison already answered, and was kept for the one thing only it did.
 - Lesson: when a restart redoes the work in full anyway, drop the saved state that would resume it: a second path to the same result costs a format, its checks and its bugs, for the little only it does.
+
+## 2026-11-12 reverberator 0.55.5: a copy flushed before its commit is recorded checked
+- Changed: the commit records each copy checked; before, it marked each unchecked, and the next comparison that walked it read its last 64 KiB back and wrote its row again.
+- Why we had to change: since 0.55 every committed copy is flushed through handles opened before it was written, so the read-back could find nothing, and it cost a 64 KiB read and a row write per copied file.
+- Original design was wrong because: the mark stood in for a flush the commit did not make yet; once the flush came, the mark stayed.
+- Lesson: when a guarantee moves upstream, remove the downstream check that stood in for it, or every write pays twice.

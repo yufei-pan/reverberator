@@ -10,7 +10,7 @@ from collections import deque, OrderedDict
 
 import pytest
 import reverberator as rv
-from tests.harness import charge, event_entry, seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions, reads_the_file_before
+from tests.harness import charge, event_entry, mark_unchecked_by_hand, seed_monitor, run_backup, wait_for_committed_count, latest_version, committed_versions, reads_the_file_before
 from tests.version_view_ground_truth import WRONG
 from tests import version_view_ground_truth as view_truth
 from tests.vault_oracle import rows_match_vault
@@ -1900,8 +1900,10 @@ def test_a_vouched_chmod_reads_no_vault_data_and_keeps_its_hash_and_unchecked_fl
 
 
 def test_a_vouched_chmod_of_an_unchecked_copy_keeps_it_unchecked(job, monkeypatch):
+	# a copy an older release marked unchecked, not read back yet
 	seed_monitor(job, {'x': 'x' * 100000, 'keep': 'k'})
-	run_backup(job)                            # not read back yet: unchecked
+	run_backup(job)
+	mark_unchecked_by_hand(job, ['x'])
 	assert record_of(job, 'x').unchecked == 1
 	os.chmod(f'{job.monitor}/x', 0o600)
 	hashed = vault_hashes(job, monkeypatch)
@@ -1925,7 +1927,8 @@ def test_a_vouched_row_whose_chain_end_changed_before_the_commit_is_hashed(job, 
 	hashed = vault_hashes(job, monkeypatch)
 	verified(job, (False, 'attrib', 'x', None))
 	after = record_of(job, 'x')
-	assert hashed and after.mtime_ns == 10 ** 18 and after.unchecked == 1
+	# hashed from the copy, which the commit flushed: recorded checked
+	assert hashed and after.mtime_ns == 10 ** 18 and after.unchecked == 0
 
 
 def test_a_touch_then_a_chmod_in_one_batch_is_recorded_from_the_new_copy(job, monkeypatch):
@@ -1939,7 +1942,7 @@ def test_a_touch_then_a_chmod_in_one_batch_is_recorded_from_the_new_copy(job, mo
 	version = verified(job, (False, 'attrib', 'x', None), (False, 'attrib', 'x', None))
 	after = record_of(job, 'x')
 	assert not os.path.islink(os.path.join(version, 'x')) and hashed
-	assert (after.mtime_ns, stat.S_IMODE(after.mode), after.unchecked) == (10 ** 18, 0o600, 1)
+	assert (after.mtime_ns, stat.S_IMODE(after.mode), after.unchecked) == (10 ** 18, 0o600, 0)
 	assert after.hash == rv.hash_file(f'{m}/x', os.lstat(f'{m}/x').st_size)
 
 
