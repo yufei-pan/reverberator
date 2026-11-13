@@ -7715,7 +7715,10 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   replay copies it); so does a path that cannot be looked at, and a path gone, which the replay passes over;
 	3. only when every entry is still in doubt, each symlink: it changes the version when newest_path, the newest version
 	   (the tree before the hand-over), holds an entry at its place, as leaving the link out removes that entry, and otherwise
-	   unless the vault refuses its text (link_refused_by_vault()).
+	   unless the vault refuses its text (link_refused_by_vault()). On a pool (pool_guard.covers(job_vault)) a symlink always
+	   counts as a change and is never probed, as on 0.55.4: the probe sits in staging, on the branch staging is on, and a pool
+	   of mixed filesystems may copy the link onto another disk, which refuses a text the probe's disk takes, or takes one it
+	   refuses.
 	When none would (True), each entry has been logged as the copy or the replay would log it: UNREADABLE and NOT BACKED UP
 	once per batch through reported, and the replay's own line for a path gone. A file that turns unreadable or goes between
 	this check and its copy still makes a version that changes nothing (a known limitation), and so does a link whose copy's
@@ -7737,6 +7740,8 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			lines.append(('unreadable', path, e))
 			continue
 		if stat.S_ISLNK(mode):
+			if pool_guard.covers(job_vault):
+				return False
 			links.append(path)
 			continue
 		if not stat.S_ISREG(mode):
@@ -7758,7 +7763,7 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			continue
 		except OSError:
 			return False
-		if not link_refused_by_vault(text, job_vault, pool_guard):
+		if not link_refused_by_vault(text, job_vault):
 			return False
 		lines.append(('refused', path, None))
 	for kind, path, error in lines:
@@ -7774,14 +7779,13 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			job_log(job_name, f'NOT BACKED UP: {path}: a symlink whose text or path is longer than the vault\'s filesystem takes; left out of this version')
 	return True
 
-def link_refused_by_vault(text:str, job_vault:str, pool_guard:'PoolGuard') -> bool:
+def link_refused_by_vault(text:str, job_vault:str) -> bool:
 	'''
 	Whether the vault's filesystem refuses a symlink of text as too long (ENAMETOOLONG), asked of it by doing: a link of text
-	made in the job vault's staging folder (made when it is not there) and unlinked at once, after pool_guard.require(), as
-	nothing is written into the vault while a disk of its pool is out. Any other error is False, as would a copy of it be
-	tried, which says what it is; a probe a cut leaves behind is a leftover of staging, which the scan empties.
+	made in the job vault's staging folder (made when it is not there) and unlinked at once. For a vault on one filesystem
+	only, not a pool's (entries_all_drop_out() leaves a link on a pool alone). Any other error is False, as would a copy of it
+	be tried, which says what it is; a probe a cut leaves behind is a leftover of staging, which the scan empties.
 	'''
-	pool_guard.require()
 	staging = staging_path(job_vault)
 	probe = os.path.join(staging, f'.link-probe-{uuid.uuid4().hex}')
 	try:

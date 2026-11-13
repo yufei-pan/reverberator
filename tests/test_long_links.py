@@ -357,3 +357,22 @@ def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_still_commits_on
 		assert len(versions) == before + 1 and not os.path.lexists(os.path.join(versions[-1], os.path.relpath(link, job.monitor)))
 		out = capsys.readouterr()
 		assert warned(out.out + out.err, link) == 1
+
+
+def test_a_link_on_a_pool_vault_is_not_probed_and_the_batch_is_not_cleared(job, fake_pool, monkeypatch, capsys):
+	# fails at 15b3108: the probe in staging answers for the vault, where a pool of mixed filesystems may copy the link onto
+	# another disk, and with it refused (faked here) the batch is cleared: no version. On a pool a link counts as a change, as
+	# on 0.55.4: no probe, and the batch commits the version where the copy leaves the link out with its line
+	fake_pool.add(job.vault, ['a', 'b'])
+	seed_monitor(job, {'a': 'a', 'd/b': 'b'})
+	versions = run_backup(job)
+	run_backup(job)
+	link = os.path.join(job.monitor, 'd/l')
+	made(link, 't' * 100)
+	refuse(monkeypatch)
+	probes = refuse_the_probe(monkeypatch, job)
+	capsys.readouterr()
+	after = backup(job, ('d/l', 'create'))
+	assert probes == [] and len(after) == len(versions) + 1 and not tracked(job, 'd/l')
+	out = capsys.readouterr()
+	assert warned(out.out + out.err, link) == 1
