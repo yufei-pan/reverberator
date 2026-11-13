@@ -377,7 +377,7 @@ def test_a_batch_never_blocks_history(job, capsys):
 	assert _free('backup') and _free('restore')
 
 
-def test_a_stop_while_waiting_returns_at_once_and_keeps_the_batch_queued(job, monkeypatch, tmp_path):
+def test_a_stop_while_waiting_returns_at_once_and_saves_nothing(job, monkeypatch, tmp_path):
 	_three_versions(job)
 	lines = _logged_lines(monkeypatch)
 	restore = []
@@ -409,7 +409,8 @@ def test_a_stop_while_waiting_returns_at_once_and_keeps_the_batch_queued(job, mo
 	stopper.join(5)
 	assert stopped and returned - stopped[0] < 2
 	assert _numbers(job) == [0, 1, 2]
-	assert [event.path for event in to_process.take()] == [os.path.join(job.monitor, 'a.txt')]
+	# the batch is not handed back, and no pending file is written: the next start compares the whole tree
+	assert len(to_process) == 0 and not os.path.lexists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
 	assert _free('backup') and _free('restore')
 
 

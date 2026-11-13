@@ -537,8 +537,8 @@ def test_a_changed_monitored_filesystem_fails_the_job_before_comparing(job, poll
 		assert not thread.is_alive()
 		assert control.failure is not None and not control.failure.permanent
 		assert f'the monitored filesystem changed under {job.monitor}' in control.failure.reason
-		# the batch waits for the job's next attempt, and nothing was recorded as deleted
-		assert [e.event for e in queue] == [event]
+		# nothing is handed back, as the job's next attempt compares the whole tree first; nothing was recorded as deleted
+		assert len(queue) == 0
 		assert len(committed_versions(job)) == 1
 	finally:
 		rv.GREEN_LIGHT.clear()
