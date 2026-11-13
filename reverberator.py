@@ -14033,8 +14033,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 				# we need to wait for copy threads to finish to allow rename, and the copies they made are recorded under
 				# the names they were made for before those rows move
 				wait_for_async_commands(mcae)
-				# the rows move only once the version's rename is made, and keep their records, as the inodes keep theirs:
-				# every way out of this branch leaves rows that describe what the version holds
+				# the rows move only once the version's rename is made. a row the version already held keeps its record, as the
+				# inode keeps its bytes, and a row this batch wrote is read back at its new place: every way out of this branch
+				# leaves rows that describe what the version holds
 				link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
 				link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
 				if link_target_relative_path.startswith(link_source_relative_path.rstrip('/') + '/'):
