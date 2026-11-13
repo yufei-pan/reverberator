@@ -1859,11 +1859,12 @@ def vault_disks(path:str, roots:bool = False) -> tuple:
 	'''
 	(pooled, disks): the (disk, folder) of each disk holding the vault folder at path, and whether they are the branches of
 	a mergerfs pool. A disk is named by the mount point holding it (the kernel reports a write error once per mounted
-	filesystem), or by the branch or path itself when the mount table has none; branches that are folders of one filesystem
-	name the same disk. On a pool, whose own sync and folder sync do not reach the disks, that is (the branch's disk, the
-	folder on the branch) for each branch the pool lists, whether it holds the folder or not, and with roots each pair gains
-	the branch itself, (disk, folder on the branch, branch), for a caller that opens a place on the branch never above it;
-	a branch list that cannot be read raises its OSError. Off a pool it is [(the disk holding path, path)], with roots
+	filesystem), or by the path itself when the mount table has none; folders of one filesystem name the same disk. On a
+	pool, whose own sync and folder sync do not reach the disks, that is (the disk holding the folder on the branch, the
+	folder on the branch) for each branch the pool lists, whether it holds the folder or not: the filesystem the folder is
+	on, so a mount nested under a branch at the folder's place is named, not the branch's own disk. With roots each pair
+	gains the branch itself, (disk, folder on the branch, branch), for a caller that opens a place on the branch never above
+	it; a branch list that cannot be read raises its OSError. Off a pool it is [(the disk holding path, path)], with roots
 	[(that disk, path, path)]. The mount table is read once.
 	'''
 	table = read_mount_table()
@@ -1871,7 +1872,8 @@ def vault_disks(path:str, roots:bool = False) -> tuple:
 	if pool is None:
 		return False, [(disk_name(table, path), path) + ((path,) if roots else ())]
 	rel = os.path.relpath(os.path.realpath(path), pool)
-	return True, [(disk_name(table, branch), os.path.join(branch, rel)) + ((branch,) if roots else ()) for branch in read_pool_branches(pool)]
+	folders = [(branch, os.path.join(branch, rel)) for branch in read_pool_branches(pool)]
+	return True, [(disk_name(table, folder), folder) + ((branch,) if roots else ()) for branch, folder in folders]
 
 def on_vault_branches(path:str, action, denied:list = None) -> None:
 	'''
@@ -1977,7 +1979,8 @@ class VaultUnit:
 		# off a pool: the job vault's fd, and its filesystem once a sync asked (an fstat a unit that never syncs does without)
 		self.fd = None
 		self.dev = None
-		# on a pool: the mount point and the job vault's place below it, and {st_dev: (branch, fd)}, one per filesystem
+		# on a pool: the mount point and the job vault's place below it, and {st_dev: (the folder the fd was opened on, fd)}, one
+		# per filesystem: the folder names the disk for an alert (a nested mount's, not its branch's)
 		self.pool = None
 		self.rel = None
 		self.handles = {}
@@ -2004,10 +2007,11 @@ class VaultUnit:
 		VAULT_UNITS[self.key] = self
 
 	def open_branch(self, branch:str) -> None:
-		'''An fd of the job vault's folder on the branch, or its nearest existing parent, kept unless another branch's is of its filesystem.'''
+		'''An fd of the job vault's folder on the branch, or its nearest existing parent, kept with that folder unless another branch's is of its filesystem.'''
 		fd = None
 		try:
-			fd = os.open(nearest_existing_folder(branch, self.rel), os.O_RDONLY | os.O_DIRECTORY)
+			place = nearest_existing_folder(branch, self.rel)
+			fd = os.open(place, os.O_RDONLY | os.O_DIRECTORY)
 			dev = os.fstat(fd).st_dev
 		except OSError as e:
 			if fd is not None:
@@ -2017,7 +2021,7 @@ class VaultUnit:
 		if dev in self.handles:
 			os.close(fd)
 		else:
-			self.handles[dev] = (branch, fd)
+			self.handles[dev] = (place, fd)
 
 	def holding(self) -> list:
 		'''
@@ -4205,8 +4209,8 @@ def vault_disk_problem(path:str, mount_table:list = None) -> 'str | None':
 	if above:
 		longest = max(above, key=len)
 		if not any(point == longest for point, _ in mount_table):
-			return f'{longest} is not mounted ({FSTAB_PATH} names it)'
-	return pool_problem(path, mount_table=mount_table) or plain_disk_problem(path, mount_table)
+			return longest
+	return None
 
 def plain_disk_problem(path:str, mount_table:list) -> 'str | None':
 	'''
@@ -15986,10 +15990,12 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 	filesystem of its own on a branch (a mount nested under it) is synced through a handle of that filesystem, and a copy
 	that lands on a branch where folder was not yet is covered as well, as its folder is made on the filesystem of the
 	nearest parent that was there. Branches whose handles are of one filesystem keep one, by fstat().st_dev, as the
-	kernel keeps a writeback error once per filesystem, each named by its disk for the messages, so a disk whose branches
-	lead to two filesystems has two. A branch not there is passed over. One the restoring user cannot open is left out:
-	a warning naming it, once per restore (report.cannot_sync()), unless its place is on a filesystem another branch's
-	handle is of, which syncs it. One that fails to open otherwise keeps that OSError, for its syncs to fail with. .handles
+	kernel keeps a writeback error once per filesystem, each named by the disk holding its place (vault_disks()), so a
+	disk whose branches lead to two filesystems has two. A branch not there is passed over. A place the user can go through
+	but not read (mode 0711) is opened as the branch itself, as 0.55.4 did, while the place is on its filesystem. One the
+	restoring user cannot open is left out: a warning naming it, once per restore (report.cannot_sync()), unless its
+	place is on a filesystem another branch's handle is of, which syncs it. One that fails to open otherwise keeps that
+	OSError, for its syncs to fail with. .handles
 	is the OSError when the disks cannot be listed, for the syncs to fail with too. .devs is the filesystems the handles
 	are of, which sync_restore() checks the pool against later: a filesystem that holds folder on a branch then and no
 	handle is of (a disk that joined, or one mounted at a folder on the way) has no handle, and one opened now would miss
@@ -16007,7 +16013,14 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 		place = nearest_existing_folder(branch, os.path.relpath(held, branch))
 		opened = None
 		try:
-			opened = os.open(place, os.O_RDONLY | os.O_DIRECTORY)
+			try:
+				opened = os.open(place, os.O_RDONLY | os.O_DIRECTORY)
+			except PermissionError:
+				# a place the user can go through but not read (mode 0711): the branch itself, as 0.55.4 opened, serves while the
+				# place is on its filesystem, as a mount shut to the user at the place is not
+				opened = os.open(branch, os.O_RDONLY | os.O_DIRECTORY)
+				if os.fstat(opened).st_dev != os.stat(place).st_dev:
+					raise
 			dev = os.fstat(opened).st_dev
 		except OSError as e:
 			if opened is not None:

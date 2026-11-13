@@ -463,8 +463,7 @@ def own_filesystem_on_a_branch(job, fake_pool, other_filesystem):
 	that folder.
 	'''
 	branches = fake_pool.add(job.vault, ['a', 'b'])
-	own = os.path.join(other_filesystem, 'own')
-	os.makedirs(own)
+	own = fake_pool.add_mount(os.path.join(other_filesystem, 'own'))
 	os.symlink(own, os.path.join(branches[0], job.job_name))
 	os.makedirs(os.path.join(branches[1], job.job_name))
 	return own
@@ -497,8 +496,10 @@ def test_a_write_error_on_a_branchs_own_filesystem_fails_the_batch(r_job, fake_p
 	with pytest.raises(rv.JobFailure) as failed:
 		backup_events(r_job, modify_big(r_job), **KEPT)
 	assert ran
-	# heard through the handle of that filesystem, opened before the batch wrote: one alert, and nothing commits
-	assert len(vault_write_errors(capsys.readouterr().out)) == 1
+	# heard through the handle of that filesystem, opened before the batch wrote: one alert, naming the disk that failed (the
+	# nested mount, not the healthy disk of the branch holding it; fails at 15b3108), and nothing commits
+	lines = vault_write_errors(capsys.readouterr().out)
+	assert len(lines) == 1 and f'disk {own} failed a sync' in lines[0], lines
 	assert 'is not on a filesystem this step opened' not in failed.value.reason
 	assert committed_versions(r_job) == before
 

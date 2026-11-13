@@ -661,10 +661,9 @@ def at_the_first_copy(monkeypatch, then):
 	return ran
 
 
-def nested_at(branch, other_filesystem):
-	'''The restore's folder's place on branch (out/proj), a filesystem of its own: the folder on /dev/shm it leads to.'''
-	nested = os.path.join(other_filesystem, os.path.basename(branch))
-	os.makedirs(nested)
+def nested_at(fake_pool, branch, other_filesystem):
+	'''The restore's folder's place on branch (out/proj), a filesystem of its own: the folder on /dev/shm it leads to, a mount in the fake table; its real path.'''
+	nested = fake_pool.add_mount(os.path.join(other_filesystem, os.path.basename(branch)))
 	os.makedirs(os.path.join(branch, 'out'), exist_ok=True)
 	os.symlink(nested, os.path.join(branch, 'out', 'proj'))
 	return nested
@@ -678,25 +677,26 @@ def test_a_restore_onto_a_nested_mount_of_a_branch_reports_its_write_error(job, 
 	# fails on main (says done): its one handle is the branch root's, on another filesystem than the folder's place
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
-	nested = nested_at(branches['one'], other_filesystem)
+	nested = nested_at(fake_pool, branches['one'], other_filesystem)
 	ran = at_the_first_copy(monkeypatch, lambda: errseq.fail(nested))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert ran and code == rv.EXIT_COMMAND_FAILED
 	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
-	assert len(failed) == 1 and failed[0].startswith(write_error_line(os.path.realpath(tmp_path / 'disks' / 'one')))
+	# it names the disk that failed, the nested mount, not the branch's own (healthy) disk
+	assert len(failed) == 1 and failed[0].startswith(write_error_line(nested))
 	assert marker_of(os.path.join(out, 'proj')).get('recopy') == 'sync failed'
 
 
-def test_a_restore_syncs_both_filesystems_of_one_disk_name(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+def test_a_restore_syncs_both_filesystems_of_branches_of_one_disk(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
 	# fails on main: one handle per disk name, the first branch's that opens, so the second filesystem is never synced
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one-a', 'one-b']})
-	nested = nested_at(branches['one-b'], other_filesystem)
+	nested = nested_at(fake_pool, branches['one-b'], other_filesystem)
 	ran = at_the_first_copy(monkeypatch, lambda: errseq.fail(nested))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert ran and code == rv.EXIT_COMMAND_FAILED
 	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
-	assert len(failed) == 1 and failed[0].startswith(write_error_line(os.path.realpath(tmp_path / 'disks' / 'one')))
+	assert len(failed) == 1 and failed[0].startswith(write_error_line(nested))
 	# both filesystems of the disk were synced
 	assert {event[3] for event in errseq.events if event[0] == 'syncfs'} == {os.stat(branches['one-a']).st_dev, os.stat(nested).st_dev}
 
@@ -707,11 +707,39 @@ def test_a_mount_made_at_the_restore_folders_place_during_the_restore_fails_it(j
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
 	target = os.path.join(out, 'proj')
 	# at the claim the folder's place on the branch is not there; at the first copy a mount is made there, and the copy lands on it
-	ran = at_the_first_copy(monkeypatch, lambda: nested_at(branches['one'], other_filesystem))
+	made = []
+	ran = at_the_first_copy(monkeypatch, lambda: made.append(nested_at(fake_pool, branches['one'], other_filesystem)))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert ran and code == rv.EXIT_COMMAND_FAILED
-	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [joined_line(os.path.realpath(tmp_path / 'disks' / 'one'))]
+	# it names the disk that was mounted, not the branch's own one, which was in the pool already
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [joined_line(made[0])]
 	assert marker_of(target).get('recopy') == 'sync failed'
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root opens any folder')
+def test_a_place_the_user_can_go_through_but_not_read_is_synced_through_its_branch(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails at 15b3108: the open of the place raises EACCES, the restore warns, hears no write error there and says done (0.55.4
+	# opened the branch and failed it)
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
+	# on branch two the restore folder's parent, out, can be gone through and written in by the restoring user, not read
+	parent = os.path.join(branches['two'], 'out')
+	os.makedirs(parent)
+	os.chmod(parent, 0o311)
+	landed = os.path.join(parent, 'proj')
+
+	def lands():
+		# the copy lands on branch two, whose folder is made there, and the disk meets a write error
+		os.mkdir(landed)
+		errseq.fail(landed)
+	ran = at_the_first_copy(monkeypatch, lands)
+	try:
+		code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	finally:
+		os.chmod(parent, 0o755)
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
+	assert len(failed) == 1 and failed[0].startswith(write_error_line(os.path.realpath(os.path.dirname(branches['two']))))
 
 
 def test_disks_that_cannot_be_listed_are_not_called_a_write_error(job, tmp_path, capsys, monkeypatch):
