@@ -23,6 +23,15 @@ F2FS_OPTIONS = ('loop,lazytime,noatime,background_gc=on,gc_merge,nodiscard,user_
 	'extent_cache,mode=lfs,active_logs=6,checkpoint_merge,fsync_mode=posix')
 needs_f2fs = pytest.mark.skipif(not SCRATCH or os.geteuid() != 0 or not shutil.which('mkfs.f2fs'),
 	reason='needs REVERB_SCRATCH, root and mkfs.f2fs')
+# how LoopImage makes each filesystem it can make, and mounts it: the power-loss sweeps run on all three (spec section 5.2), as
+# design R rests on what each keeps of a rename across a power cut
+MKFS = {'f2fs': ['mkfs.f2fs', '-q', '-f', '-O', F2FS_FEATURES], 'ext4': ['mkfs.ext4', '-q', '-F'], 'xfs': ['mkfs.xfs', '-q', '-f']}
+MOUNT_OPTIONS = {'f2fs': F2FS_OPTIONS.removeprefix('loop,')}
+# FS_IOC_SHUTDOWN, _IOR('X', 125, __u32): f2fs's F2FS_IOC_SHUTDOWN, ext4's EXT4_IOC_SHUTDOWN and XFS's XFS_IOC_GOINGDOWN are this one
+# number, and flag 2 is each one's stop with nothing more written (F2FS_GOING_DOWN_NOSYNC: no checkpoint; EXT4_GOING_FLAGS_NOLOGFLUSH,
+# XFS_FSOP_GOING_FLAGS_NOLOGFLUSH: no log flush), as a power loss leaves it
+FS_IOC_SHUTDOWN = 0x8004587D
+SHUTDOWN_NO_FLUSH = 2
 
 
 # CAP_SYS_ADMIN's bit in a capability set (linux/capability.h): mount and dm need it, and root in a container lacks it
@@ -49,6 +58,10 @@ def missing(*tools: str, scratch: bool = True, dm: bool = False) -> list:
 	return lacking
 
 
+EXT4_MISSING = missing('mkfs.ext4', 'losetup', 'mount', 'umount', 'findmnt')
+needs_ext4 = pytest.mark.skipif(bool(EXT4_MISSING), reason=f'needs {", ".join(EXT4_MISSING)}, for ext4 on a loop image')
+XFS_MISSING = missing('mkfs.xfs', 'losetup', 'mount', 'umount', 'findmnt')
+needs_xfs = pytest.mark.skipif(bool(XFS_MISSING), reason=f'needs {", ".join(XFS_MISSING)}, for XFS on a loop image')
 DM_MISSING = missing('dmsetup', 'losetup', 'blockdev', 'mkfs.ext4', 'mount', 'umount', 'sync', dm=True)
 needs_dm = pytest.mark.skipif(bool(DM_MISSING), reason=f'needs {", ".join(DM_MISSING)}, for ext4 on dm-linear over a loop image')
 MOUNT_MISSING = missing('mount', 'umount', 'findmnt', scratch=False)
@@ -126,10 +139,15 @@ def flush_scratch(path: str) -> None:
 
 def shut_down_scratch(path: str) -> None:
 	'''
-	f2fs_io shutdown 2 of the loop image holding path (our_mount_point()): the filesystem stops with no checkpoint, and what
-	it held dirty is lost, as at a power loss. The only way a test calls f2fs_io.
+	The shutdown ioctl, with nothing more written (FS_IOC_SHUTDOWN, flag 2, as f2fs_io shutdown 2 issues it), of the loop image
+	holding path (our_mount_point()): the filesystem stops with no checkpoint or log flush, and what it held dirty is lost, as
+	at a power loss. f2fs, ext4 and XFS. The only way a test shuts a filesystem down.
 	'''
-	subprocess.run(['f2fs_io', 'shutdown', '2', our_mount_point(path)], check=True, stdout=subprocess.DEVNULL)
+	fd = os.open(our_mount_point(path), os.O_RDONLY | os.O_DIRECTORY)
+	try:
+		fcntl.ioctl(fd, FS_IOC_SHUTDOWN, struct.pack('=I', SHUTDOWN_NO_FLUSH))
+	finally:
+		os.close(fd)
 
 
 def attach_loop(image: str) -> str:
@@ -147,19 +165,25 @@ def attach_loop(image: str) -> str:
 
 class LoopImage:
 	'''
-	A new f2fs of size_mib on a loop device this process attached, as f2fs_mount() has it, which can be mounted again after a shutdown.
-	source, when given, is an image to start from, copied sparse, in place of a new one; mount_point, a folder of the caller's to mount it
-	at, in place of one beside the image. keep, set before the end, is where the image goes then, in place of being removed.
+	A new filesystem of size_mib on a loop device this process attached, which can be mounted again after a shutdown: f2fs by
+	default, with the live disks' features and options as f2fs_mount() has them, or 'ext4' or 'xfs' as mkfs makes them (MKFS), with
+	the default options; XFS needs 300 MiB at least. source, when given, is an image to start from, copied sparse, in place of a new
+	one; mount_point, a folder of the caller's to mount it at, in place of one beside the image. keep, set before the end, is where
+	the image goes then, in place of being removed.
 	'''
-	def __init__(self, tmp: str, size_mib: int, source: str = None, mount_point: str = None):
+	def __init__(self, tmp: str, size_mib: int, source: str = None, mount_point: str = None, filesystem: str = 'f2fs'):
+		if filesystem not in MKFS:
+			raise ValueError(f'no loop image of {filesystem!r}: {", ".join(MKFS)}')
 		self.tmp = tmp
 		self.size_mib = size_mib
 		self.source = source
 		self.given_mount_point = mount_point
+		self.filesystem = filesystem
 		self.keep = None
 
 	def mount(self) -> None:
-		subprocess.run(['mount', '-t', 'f2fs', '-o', F2FS_OPTIONS.removeprefix('loop,'), self.device, self.mount_point], check=True)
+		options = MOUNT_OPTIONS.get(self.filesystem)
+		subprocess.run(['mount', '-t', self.filesystem, *(['-o', options] if options else []), self.device, self.mount_point], check=True)
 
 	def attach(self) -> None:
 		'''The image on a loop device (attach_loop()), which this process may then flush and shut down.'''
@@ -192,7 +216,7 @@ class LoopImage:
 			else:
 				with open(self.image, 'wb') as f:
 					f.truncate(self.size_mib << 20)
-				subprocess.run(['mkfs.f2fs', '-q', '-f', '-O', F2FS_FEATURES, self.image], check=True, stdout=subprocess.DEVNULL)
+				subprocess.run([*MKFS[self.filesystem], self.image], check=True, stdout=subprocess.DEVNULL)
 			os.makedirs(self.mount_point, exist_ok=True)
 			self.attach()
 			self.mount()

@@ -1,7 +1,8 @@
 '''
 The power loss model of the crash runs (spec section 9), behind REVERB_SCRATCH: a fresh f2fs loop image with the live disks'
-features and mount options; a child runs batch 3 and at step c the filesystem stops with no checkpoint (f2fs_io shutdown 2);
-then umount, mount, the scan and a retry, and the oracle reads every version. The vault's syncs flush the loop image for real
+features and mount options; a child runs batch 3 and at step c the filesystem stops with no checkpoint (the shutdown ioctl with
+flag 2, as f2fs_io shutdown 2); then umount, mount, the scan and a retry, and the oracle reads every version. The sweeps run on
+ext4 and XFS images too (spec section 5.2): design R rests on what each keeps of a rename across a power cut. The vault's syncs flush the loop image for real
 here, as a committed copy means its bytes are on the disk.
 
 The shutdown and the flush go through tests/scratch_images.py, which refuses anything but a loop image this process attached
@@ -26,12 +27,14 @@ from tests import scratch_images, version_view_ground_truth as view_truth
 from tests.crash_batches import after_retries, build_base, prepare, raw_events, restore
 from tests.crash_child import in_child, kill_run, retry, run_do_backup
 from tests.harness import create_job
-from tests.scratch_images import flush_scratch, LoopImage, needs_f2fs, NotOurLoopImage, our_mount_point, SCRATCH, shut_down_scratch
+from tests.scratch_images import flush_scratch, LoopImage, needs_ext4, needs_f2fs, needs_xfs, NotOurLoopImage, our_mount_point, SCRATCH, shut_down_scratch
 from tests.test_crash_harness import kill_points
 from tests.vault_oracle import check_vault, rows_match_vault, snapshot_tree, version_number
 
-# the loop image of a run: a sparse file, so what the vault writes is all it takes of tmpfs
+# the loop image of a run: a sparse file, so what the vault writes is all it takes of tmpfs. XFS needs 300 MiB at least
 IMAGE_MIB = 512
+# the filesystems a sweep runs on, each skipped with what it lacks
+FILESYSTEMS = [pytest.param('f2fs', marks=needs_f2fs), pytest.param('ext4', marks=needs_ext4), pytest.param('xfs', marks=needs_xfs)]
 
 
 def flushing_for_real(module):
@@ -192,13 +195,14 @@ def old_list_name(job_vault, number):
 	return next(name for name in os.listdir(job_vault) if rv.change_list_names(name, folder))
 
 
-def sweep(only_sync, tmp_name, flush_step=None):
+def sweep(only_sync, tmp_name, flush_step=None, filesystem='f2fs'):
 	"""
-	Batch 3 at each step, the power going there; a retry, and the oracle. flush_step(step) names the step before which the
-	filesystem was last checkpointed, None to have none: with none, most steps only roll back to before the batch.
+	Batch 3 at each step, the power going there; a retry, and the oracle, on a loop image of filesystem. flush_step(step) names the
+	step before which the filesystem was last checkpointed (synced), None to have none: with none, most steps only roll back to
+	before the batch.
 	"""
 	options = {'only_sync_attributes': only_sync}
-	with LoopImage(os.path.join(SCRATCH, tmp_name), IMAGE_MIB) as image:
+	with LoopImage(os.path.join(SCRATCH, tmp_name), IMAGE_MIB, filesystem=filesystem) as image:
 		root = tempfile.mkdtemp(prefix='reverb-crash-', dir=image.mount_point)
 		vault = prepare(root, **options)
 		job = vault.job
@@ -230,20 +234,20 @@ def sweep(only_sync, tmp_name, flush_step=None):
 				+ rows_match_vault(job.job_vault))
 			if problems:
 				wrong.append((point, state, problems[:8]))
-		print(f'power loss: {len(points)} of {total} steps run, {len(wrong)} wrong; what the remount left: {dict(states)}')
+		print(f'power loss on {filesystem}: {len(points)} of {total} steps run, {len(wrong)} wrong; what the remount left: {dict(states)}')
 		assert not wrong, f'{len(wrong)} of {len(points)} steps wrong: {wrong[:4]}'
 
 
-@needs_f2fs
-def test_every_step_survives_a_power_loss(only_sync):
-	sweep(only_sync, 'power-loss')
+@pytest.mark.parametrize('filesystem', FILESYSTEMS)
+def test_every_step_survives_a_power_loss(only_sync, filesystem):
+	sweep(only_sync, 'power-loss', filesystem=filesystem)
 
 
-@needs_f2fs
+@pytest.mark.parametrize('filesystem', FILESYSTEMS)
 @pytest.mark.parametrize('flush_step', [lambda step: max(1, step // 2), lambda step: max(1, step - 1)], ids=['midway', 'just_before'])
-def test_every_step_survives_a_power_loss_after_a_checkpoint(only_sync, flush_step):
+def test_every_step_survives_a_power_loss_after_a_checkpoint(only_sync, flush_step, filesystem):
 	# with no checkpoint the run mostly rolls back to before the batch: here the state at an earlier step is on the disk, and what came after it is lost
-	sweep(only_sync, 'power-loss-checkpoint', flush_step)
+	sweep(only_sync, 'power-loss-checkpoint', flush_step, filesystem)
 
 
 def keeping_the_placement_and_losing_the_rename(job_vault):
@@ -259,10 +263,10 @@ def keeping_the_placement_and_losing_the_rename(job_vault):
 	return fault
 
 
-@needs_f2fs
-def test_a_power_loss_that_keeps_the_placement_and_loses_the_rename_is_finished():
+@pytest.mark.parametrize('filesystem', FILESYSTEMS)
+def test_a_power_loss_that_keeps_the_placement_and_loses_the_rename_is_finished(filesystem):
 	# a kernel may keep them in either order, as nothing syncs between them: this f2fs never showed this one by itself
-	with LoopImage(os.path.join(SCRATCH, 'power-loss-order'), IMAGE_MIB) as image:
+	with LoopImage(os.path.join(SCRATCH, 'power-loss-order'), IMAGE_MIB, filesystem=filesystem) as image:
 		root = tempfile.mkdtemp(prefix='reverb-crash-', dir=image.mount_point)
 		vault = prepare(root)
 		job = vault.job

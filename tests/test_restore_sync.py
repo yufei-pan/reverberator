@@ -19,6 +19,8 @@ import time
 import pytest
 import reverberator as rv
 from tests.harness import create_job, seed_monitor, run_backup, write_rule
+from tests.scratch_images import needs_mount, ScratchTmpfs
+from tests.test_pool_writer import needs_mergerfs, real_pool
 
 pytestmark = pytest.mark.unit
 
@@ -1422,3 +1424,27 @@ def test_a_stopped_recopy_on_a_vault_missing_a_disk_keeps_its_own_line(job, tmp_
 		code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0')
 	assert (code, stdout) == (rv.EXIT_COMMAND_FAILED, '')
 	assert err == recopy_line(target) + '\n'
+
+
+@needs_mergerfs
+@needs_mount
+def test_a_restore_onto_a_real_mount_of_its_own_on_a_branch_is_synced_through_it(job, tmp_path, capsys, monkeypatch):
+	# F2's test 6, the restore's case (the test VM): test_a_restore_onto_a_nested_mount_of_a_branch_reports_its_write_error with a
+	# real tmpfs mounted on a branch of a real mergerfs pool, at the restore's folder out (proj, the restore's own folder, must
+	# not be there before it). The restore opens its handle at the nearest existing parent of its folder's place on that branch, on
+	# the tmpfs, and syncs through it. On 0.55.4 its handles were the branch roots', on the branches' f2fs, and the tmpfs was never synced
+	backed_up(job)
+	with real_pool() as root:
+		pool = os.path.join(root, 'vault')
+		branches = rv.read_pool_branches(pool)
+		for branch in branches:
+			os.makedirs(os.path.join(branch, 'out'), exist_ok=True)
+		with ScratchTmpfs(os.path.join(branches[0], 'out')) as own:
+			synced = []
+			monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(os.fstat(fd).st_dev))
+			code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.join(pool, 'out'), '--version', '0')
+			assert (code, err) == (0, ''), stdout
+			assert os.stat(own.folder).st_dev in synced
+			for rel in FILES:
+				with open(os.path.join(pool, 'out', rel), 'rb') as f, open(os.path.join(job.monitor, rel), 'rb') as g:
+					assert f.read() == g.read(), rel

@@ -21,10 +21,10 @@ import pytest
 
 import reverberator as rv
 from tests import version_view_ground_truth as view_truth
-from tests.crash_batches import after_retries, batch3_of, OPTIONS, prepare, put_text, restore
+from tests.crash_batches import after_retries, backup_events, batch3_of, OPTIONS, prepare, put_text, restore
 from tests.crash_child import in_child, kill_run, retry
-from tests.harness import create_job, event_entry, run_backup, seed_monitor, write_rule
-from tests.scratch_images import LoopImage, needs_f2fs, SCRATCH
+from tests.harness import committed_versions, create_job, event_entry, run_backup, seed_monitor, write_rule
+from tests.scratch_images import LoopImage, needs_f2fs, needs_mount, SCRATCH, ScratchTmpfs
 from tests.test_r_sizes import assert_sizes, Run
 from tests.test_migration import cli_differences, expected, folders_of, migrate, plain_links, SMALL
 from tests.test_tree_writer import a_vault, V1, V2
@@ -790,3 +790,28 @@ def test_sizes_on_a_vault_read_as_no_pool_whose_attributes_lag_match_the_oracle(
 			assert writers and all(writer.two_renames for writer in writers)
 		finally:
 			one.close()
+
+
+@needs_mergerfs
+@needs_mount
+def test_a_job_vault_on_a_real_mount_of_its_own_on_a_branch_commits_and_is_synced_through_it(monkeypatch):
+	# F2's test 6, the daemon's case (the test VM): test_vault_units.py's test_a_job_vault_on_a_filesystem_of_its_own_on_a_branch_commits
+	# with a real tmpfs mounted at the job vault's folder on a branch of a real mergerfs pool. The unit opens its handle at that
+	# folder, on the tmpfs, and the commit flush syncs through it. On 0.55.4 the handle was the branch root's, on the branch's f2fs,
+	# and every sync raised "is not on a filesystem this step opened"
+	with real_pool() as root:
+		job = create_job(root)
+		branches = rv.read_pool_branches(job.vault)
+		for branch in branches:
+			os.makedirs(os.path.join(branch, job.job_name), exist_ok=True)
+		with ScratchTmpfs(os.path.join(branches[0], job.job_name)) as own:
+			synced = []
+			real_syncfs = rv.LIBC_SYNCFS
+			monkeypatch.setattr(rv, 'LIBC_SYNCFS', lambda fd: synced.append(os.fstat(fd).st_dev) or real_syncfs(fd))
+			seed_monitor(job, {'a.txt': 'a' * 5000, 'd/b.txt': 'b'})
+			run_backup(job)
+			put_text(job.monitor, 'a.txt', 'a2' * 5000)
+			synced.clear()
+			backup_events(job, [(False, 'modify', 'a.txt', None)])
+			assert len(committed_versions(job)) == 2
+			assert os.stat(own.folder).st_dev in synced
