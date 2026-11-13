@@ -216,7 +216,17 @@ def test_a_unit_inside_one_of_the_same_vault_uses_its_handles_and_closes_nothing
 	assert [event[0] for event in errseq.events].count('close') == 1 and open_folders(path) == []
 
 
-def test_the_commit_flushes_the_job_vault_after_the_swap(job, monkeypatch):
+def pooled_job_vault(job, fake_pool):
+	'''job's vault on a fake pool of branches a and b, each holding the job vault.'''
+	for branch in fake_pool.add(job.vault, ['a', 'b']):
+		os.makedirs(os.path.join(branch, job.job_name), exist_ok=True)
+
+
+@pytest.mark.parametrize('pooled', [True, False], ids=['pool', 'off_pool'])
+def test_the_commit_flushes_the_job_vault_after_the_swap_on_a_pool(job, fake_pool, monkeypatch, pooled):
+	# off a pool there is one disk, which keeps its own order: no flush after the commit point
+	if pooled:
+		pooled_job_vault(job, fake_pool)
 	seed_monitor(job, {'a.txt': 'a'})
 	steps = []
 	def recording(owner, name):
@@ -240,8 +250,11 @@ def test_the_commit_flushes_the_job_vault_after_the_swap(job, monkeypatch):
 	assert committed
 	names = [name for name, _ in steps]
 	start = names.index('prepare_change_list')
-	assert names[start:start + 5] == ['prepare_change_list', 'commit', 'swap_current_version', 'fsync_vault_folder', 'place_change_list']
-	assert steps[start + 3][1] == (job.job_vault,)
+	if pooled:
+		assert names[start:start + 5] == ['prepare_change_list', 'commit', 'swap_current_version', 'fsync_vault_folder', 'place_change_list']
+		assert steps[start + 3][1] == (job.job_vault,)
+	else:
+		assert names[start:] == ['prepare_change_list', 'commit', 'swap_current_version', 'place_change_list']
 
 
 def test_the_change_list_and_the_salt_are_flushed_through_the_helper(tmp_path, monkeypatch):
@@ -256,9 +269,10 @@ def test_the_change_list_and_the_salt_are_flushed_through_the_helper(tmp_path, m
 	assert flushed == [job_vault, job_vault]
 
 
-def test_a_failed_flush_after_the_swap_fails_the_attempt_and_the_next_scan_finishes_it(tmp_path, monkeypatch, capsys):
-	# the list would be placed ahead of a link that is not on its disk: it stays in its private folder instead
+def test_a_failed_flush_after_the_swap_fails_the_attempt_and_the_next_scan_finishes_it(tmp_path, fake_pool, monkeypatch, capsys):
+	# on a pool, the list would be placed ahead of a link that is not on its disk: it stays in its private folder instead
 	job = three_versions(tmp_path)
+	pooled_job_vault(job, fake_pool)
 	state = []
 	real_swap, real_flush = rv.swap_current_version, rv.fsync_vault_folder
 	def swapping(job_vault, text):
@@ -462,7 +476,7 @@ def test_the_scan_and_a_restart_leave_the_journal_alone(tmp_path):
 	assert removed == [] and scanned == [0, 1, 2] and os.path.exists(journal) and vault_names(job) == before
 
 
-def test_a_new_change_list_is_synced_with_its_folder(job, monkeypatch):
+def test_a_new_change_list_is_synced_and_off_a_pool_its_folder_is_not(job, monkeypatch):
 	seed_monitor(job, {'a': 'a'})
 	synced = []
 	real_fsync = os.fsync
@@ -476,8 +490,9 @@ def test_a_new_change_list_is_synced_with_its_folder(job, monkeypatch):
 	written = [path for path in synced if os.path.basename(path) == os.path.basename(change_list)
 		and os.path.basename(os.path.dirname(path)).startswith(rv.CHANGE_LIST_FOLDER_PREFIX)]
 	assert len(written) == 1
-	# (the folder is synced before too, when the manifest's journal first appears)
-	assert any(at > synced.index(written[0]) for at, path in enumerate(synced) if path == os.path.realpath(job.job_vault))
+	# off a pool the folder holding its name is not synced after it: one disk keeps its own order, and a power cut that loses
+	# the placement leaves it for the next start's scan (it is synced before, when the manifest's journal first appears)
+	assert not any(at > synced.index(written[0]) for at, path in enumerate(synced) if path == os.path.realpath(job.job_vault))
 
 
 def test_a_change_list_appears_whole_or_not_at_all(job, monkeypatch):

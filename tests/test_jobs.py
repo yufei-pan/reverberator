@@ -1066,21 +1066,22 @@ def a_changed_file(job, rel='a.txt'):
 
 
 def test_a_one_file_batch_reads_the_mount_table_twice(job, poll_fast, monkeypatch):
-	# fails on main (seven): off a pool, through backuper(): one read for both waits, the guard and do_backup(), one after
-	# the verification's walk, which the commit remembers the inner mounts from. the fsyncs' reads are Task 6's
+	# fails on main: off a pool, through backuper(): one read for both waits, the guard and do_backup(), one after the
+	# verification's walk, which the commit remembers the inner mounts from (main: seven, and two in the fsyncs after the
+	# commit, which go off a pool)
 	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
 	run_backup(job)
-	counts = mount_table_reads(monkeypatch)
+	counts = mount_table_reads(monkeypatch, counting_fsyncs=True)
 	one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], counts)
 	assert len(committed_versions(job)) == 2
 	assert counts['reads'] == 2
 
 
 def test_a_batch_with_a_scanned_folder_reads_the_mount_table_three_times(job, poll_fast, monkeypatch):
-	# fails on main: one more, after the scanned folders' walk, for do_backup()
+	# fails on main: one more, after the scanned folders' walk, for do_backup() (main: eight, and two in the fsyncs)
 	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
 	run_backup(job)
-	counts = mount_table_reads(monkeypatch)
+	counts = mount_table_reads(monkeypatch, counting_fsyncs=True)
 	def batch():
 		with open(os.path.join(job.monitor, 'd', 'b.txt'), 'w') as f:
 			f.write('changed')

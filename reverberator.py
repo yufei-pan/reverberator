@@ -2166,19 +2166,21 @@ def prepare_change_list(content_file_name:str, rows:list) -> str:
 		raise
 	return temp_path
 
-def place_change_list(content_file_name:str, temp_path:str) -> None:
+def place_change_list(content_file_name:str, temp_path:str, sync:bool = True) -> None:
 	'''
 	A change list prepare_change_list() wrote at temp_path renamed into place, the last step of its version's commit (the
-	commit point is the manifest's commit, spec section 2.6), then the job vault fsynced and the private folder removed. A
-	failed sync of the folder after the rename is only logged, as the version is committed by then. A rename that fails
-	raises, and leaves the list in its private folder: the job's next scan places it (finish_r_commit()).
+	commit point is the manifest's commit, spec section 2.6), then, with sync, the job vault fsynced, and the private folder
+	removed. A failed sync of the folder after the rename is only logged, as the version is committed by then. A rename that
+	fails raises, and leaves the list in its private folder: the job's next scan places it (finish_r_commit()). A batch off a
+	pool passes no sync (do_backup()).
 	'''
 	job_vault = os.path.dirname(os.path.abspath(content_file_name))
 	os.replace(temp_path,content_file_name)
-	try:
-		fsync_vault_folder(job_vault)
-	except OSError as e:
-		backuperTeeLogToTl(content_file_name,f'Could not sync the folder of {content_file_name} to disk: {e}',warning=True)
+	if sync:
+		try:
+			fsync_vault_folder(job_vault)
+		except OSError as e:
+			backuperTeeLogToTl(content_file_name,f'Could not sync the folder of {content_file_name} to disk: {e}',warning=True)
 	discard_change_list(temp_path)
 
 def discard_change_list(temp_path:str) -> None:
@@ -5937,6 +5939,10 @@ def do_backup(backup_entries:dict,
 		verified = []
 		# design R's writer of this batch, once the tree is handed over
 		writer = None
+		# asked once for the batch, of the guard built when it began, before the first version's path splits off, as both reach
+		# the commit: it stops the batch on a pool going or a disk dropping, but does not see a pool that appears meanwhile (the
+		# next batch's guard does), so this answer holds for the whole batch
+		on_pool = pool_guard.covers(job_vault)
 		if not vault_info_dict:
 			# the locks are held since the scan above
 			backuperTeeLogToTl(job_name,f'Failed to get any version for {job_vault}, treating the vault as new.',error=True)
@@ -6106,9 +6112,6 @@ def do_backup(backup_entries:dict,
 					break
 			this_timestamp = datetime.datetime.now().astimezone().strftime(VAULT_TIMESTAMP_FORMAT)
 			backup_folder = os.path.join(job_vault,f'V{this_version_number}--{this_timestamp}')
-			# asked once for the batch, of the guard built when it began: it stops the batch on a pool going or a disk dropping, but does not see a
-			# pool that appears meanwhile (the next batch's guard does), so this answer holds for the whole batch
-			on_pool = pool_guard.covers(job_vault)
 			if tree is not None:
 				# it is handed over already, and what it recorded stands, so a record only acts where a forward link still does
 				backup_folder = tree
@@ -6213,18 +6216,22 @@ def do_backup(backup_entries:dict,
 		manifest.commit(backup_folder)
 		swap_current_version(job_vault,os.path.basename(backup_folder))
 		# the link and the list may sit on different disks of a pool: the link is on its disk before the list is placed.
-		# a flush that fails fails the attempt, with the list still in its private folder: the next scan settles the commit
-		try:
-			fsync_vault_folder(job_vault)
-		except OSError as e:
-			raise JobFailure(f'cannot sync {job_vault} to disk after moving current_version: {e}; not placing the change list of {backup_folder}')
+		# a flush that fails fails the attempt, with the list still in its private folder: the next scan settles the commit.
+		# off a pool there is one disk, which keeps the order of its own changes, and a power cut that loses them leaves a
+		# state the next start's scan settles ( finish_r_commit() ): neither this flush nor the list's is needed there
+		# ( docs/limitations.md, "A power cut right after a backup hides its version until the next start" )
+		if on_pool:
+			try:
+				fsync_vault_folder(job_vault)
+			except OSError as e:
+				raise JobFailure(f'cannot sync {job_vault} to disk after moving current_version: {e}; not placing the change list of {backup_folder}')
 		# a disk dropped since the check above
 		pool_guard.require()
 		if writer is not None:
 			# needs no sync of its own: a power loss may keep the new list and lose this, and the scan renames it whenever the
 			# old name is still there (finish_previous_list())
 			os.rename(previous_list,previous_new_list)
-		place_change_list(content_file_name,prepared_list)
+		place_change_list(content_file_name,prepared_list,sync=on_pool)
 		# a vault this daemon committed to has versions: one that later shows none went away under it
 		VAULTS_WITH_VERSIONS.add(os.path.abspath(job_vault))
 		backuperTeeLogToTl(job_name,f'Created new backup at {backup_folder} with {content_file_name}',ok=True)

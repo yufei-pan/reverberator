@@ -896,3 +896,93 @@ def test_neither_the_daemon_nor_a_restore_writes_a_marker(r_job, errseq, monkeyp
 	alerts = vault_write_errors(out)
 	assert len(alerts) == 1 and 'nothing is committed past it, and the next attempt copies again what this one changed' in alerts[0]
 	assert markers() == []
+
+
+# ---- L2: no folder fsyncs off a pool after the commit point ----------------------------------------------------------
+
+def after_the_commit_point(monkeypatch):
+	'''
+	The fsync_vault_folder() calls (their paths) and the read_mount_table() calls made once VaultManifest.commit() was called
+	with a version, the commit point, until the test disarms it.
+	'''
+	seen = {'armed': False, 'fsyncs': [], 'reads': 0}
+	real_commit, real_fsync, real_read = rv.VaultManifest.commit, rv.fsync_vault_folder, rv.read_mount_table
+	def commit(self, version_path=None):
+		if version_path is not None:
+			seen['armed'] = True
+		return real_commit(self, version_path)
+	def fsync(path, *args, **kwargs):
+		if seen['armed']:
+			seen['fsyncs'].append(path)
+		return real_fsync(path, *args, **kwargs)
+	def read():
+		if seen['armed']:
+			seen['reads'] += 1
+		return real_read()
+	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
+	monkeypatch.setattr(rv, 'fsync_vault_folder', fsync)
+	monkeypatch.setattr(rv, 'read_mount_table', read)
+	return seen
+
+
+def first_version_and_a_one_file_batch(job, seen):
+	'''After the commit point of V0, then of a one-file batch: (fsyncs, reads) of each.'''
+	put_text(job.monitor, 'a.txt', 'a')
+	put_text(job.monitor, 'k.txt', 'k')
+	found = []
+	for entries in (None, OrderedDict([(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues(datetime.datetime.now().isoformat(), 'modify', None))])):
+		if entries is not None:
+			put_text(job.monitor, 'a.txt', 'changed')
+		seen.update(armed=False, fsyncs=[], reads=0)
+		run_backup(job, entries)
+		found.append((seen['fsyncs'], seen['reads']))
+	return found
+
+
+def test_an_off_pool_batch_makes_no_folder_fsync_after_its_commit(r_job, monkeypatch):
+	# fails on main: both the first version and a one-file batch fsync the job vault twice after the commit, after
+	# swap_current_version() and in place_change_list(), each reading the mount table
+	seen = after_the_commit_point(monkeypatch)
+	assert first_version_and_a_one_file_batch(r_job, seen) == [([], 0), ([], 0)]
+
+
+def test_a_pool_batch_fsyncs_both_after_its_commit(r_job, fake_pool, monkeypatch):
+	# pin: on a pool each disk keeps its own order, so both fsyncs stay, a first version's included
+	pool_vault(r_job, fake_pool)
+	seen = after_the_commit_point(monkeypatch)
+	assert [fsyncs for fsyncs, _ in first_version_and_a_one_file_batch(r_job, seen)] == [[r_job.job_vault] * 2] * 2
+
+
+class Cut(Exception):
+	pass
+
+
+@pytest.mark.parametrize('pooled', [False, True], ids=['off_pool', 'pool'])
+def test_finishing_a_cut_commit_fsyncs_both_off_a_pool_too(r_job, fake_pool, monkeypatch, pooled):
+	# pin: the scan's finish of a commit cut before its list was placed, which runs once after a crash, fsyncs the job vault
+	# after the swap and after the placement, on every filesystem
+	if pooled:
+		pool_vault(r_job, fake_pool)
+	put_text(r_job.monitor, 'a.txt', 'a')
+	run_backup(r_job)
+	put_text(r_job.monitor, 'a.txt', 'changed')
+	real_place = rv.place_change_list
+	def cut(*args, **kwargs):
+		raise Cut()
+	monkeypatch.setattr(rv, 'place_change_list', cut)
+	with pytest.raises(Cut):
+		run_backup(r_job, OrderedDict([(os.path.join(r_job.monitor, 'a.txt'), rv.BackupEntryValues(datetime.datetime.now().isoformat(), 'modify', None))]))
+	monkeypatch.setattr(rv, 'place_change_list', real_place)
+	assert len(committed_versions(r_job)) == 1
+	fsyncs = []
+	real_fsync = rv.fsync_vault_folder
+	def fsync(path, *args, **kwargs):
+		frame = sys._getframe(1)
+		while frame is not None and frame.f_code.co_name != 'finish_r_commit':
+			frame = frame.f_back
+		if frame is not None:
+			fsyncs.append(path)
+		return real_fsync(path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'fsync_vault_folder', fsync)
+	assert list(rv.get_vault_info(r_job.job_vault).vault_info_dict) == [0, 1]
+	assert fsyncs == [r_job.job_vault] * 2 and len(committed_versions(r_job)) == 2
