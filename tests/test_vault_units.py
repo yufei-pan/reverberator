@@ -21,7 +21,7 @@ import pytest
 import reverberator as rv
 from tests.crash_batches import backup_events, put_text
 from tests.errseq import open_folders
-from tests.harness import committed_versions, create_job, run_backup, vault_unit, write_rule
+from tests.harness import committed_versions, create_job, run_backup, vault_unit, write_fstab, write_rule
 from tests.scratch_images import needs_mount, ScratchTmpfs
 from tests.vault_oracle import check_vault, snapshot_tree, version_number
 
@@ -502,6 +502,36 @@ def test_a_write_error_on_a_branchs_own_filesystem_fails_the_batch(r_job, fake_p
 	assert len(lines) == 1 and f'disk {own} failed a sync' in lines[0], lines
 	assert 'is not on a filesystem this step opened' not in failed.value.reason
 	assert committed_versions(r_job) == before
+
+
+def test_a_nested_vault_disk_fstab_names_that_is_not_mounted_is_waited_for(r_job, fake_pool, errseq, other_filesystem):
+	# fails at 15b3108: nothing waits for it, and the batch commits into the bare mount point, which the disk hides once it is
+	# mounted again
+	own = own_filesystem_on_a_branch(r_job, fake_pool, other_filesystem)
+	place = os.path.join(fake_pool.branch_path('a'), r_job.job_name)
+	write_fstab(place)
+	base(r_job)
+	pool = os.path.realpath(r_job.vault)
+	# mounted: nothing is missing
+	assert rv.vault_disk_problem(r_job.job_vault) is None
+	before = committed_versions(r_job)
+	# the nested disk is not mounted: its line leaves the table, and the branch's folder at its place is the bare mount point
+	os.remove(place)
+	os.mkdir(place)
+	fake_pool.drop(own)
+	assert rv.vault_disk_problem(r_job.job_vault) == f'disk {place} of pool {pool} is not mounted'
+	with pytest.raises(rv.PoolNotReady) as failed:
+		backup_events(r_job, modify_big(r_job), **KEPT)
+	assert failed.value.args[0] == f'disk {place} of pool {pool} is not mounted'
+	assert committed_versions(r_job) == before
+	assert os.listdir(place) == []
+	# it is mounted again: the job goes on
+	os.rmdir(place)
+	os.symlink(own, place)
+	fake_pool.mount(own)
+	assert rv.vault_disk_problem(r_job.job_vault) is None
+	backup_events(r_job, modify_big(r_job), **KEPT)
+	assert len(committed_versions(r_job)) == len(before) + 1
 
 
 def test_a_job_vault_made_later_under_a_nested_mount_is_synced_through_its_parents_handle(tmp_path, fake_pool, errseq, monkeypatch, other_filesystem):

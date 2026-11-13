@@ -4083,7 +4083,8 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 	The state of the mergerfs pool holding path: its branches' mount ids, and what is wrong (pool_problem()'s texts).
 	None when path is on no mergerfs mount; no branch list is read then. A branch is missing when nothing is mounted at
 	its resolved path, when its statx fails, as for a shut-down XFS that is still mounted, or when it is an f2fs whose
-	checkpoint reports an error.
+	checkpoint reports an error. A disk fstab names under a branch, at or above path's place on it, that is not mounted is
+	a missing disk of the pool too (unmounted_fstab_point()).
 	'''
 	if mount_table is None:
 		try:
@@ -4118,6 +4119,17 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 			failed.append(f'disk {branch} of pool {pool} cannot be read: {e.strerror or e}')
 			mount_id = None
 		ids.append((branch, mount_id))
+	# a disk of its own nested under a branch, where a pool's path leads (F2 serves a job vault on one): fstab names it and no
+	# mount is there, so the branch's own mount says nothing of it, and what a batch writes into the bare mount point is hidden
+	# when the disk is mounted again. The rule of vault_disk_problem(), on the path's place on each branch; a point at or
+	# above a branch is the branch's own check above
+	inner = [point for point in fstab_mount_points(mount_table) if any(point.startswith(branch.rstrip('/') + '/') for branch, _ in ids)]
+	if inner:
+		rel = os.path.relpath(os.path.realpath(path), pool)
+		for branch, _ in ids:
+			missing = unmounted_fstab_point(os.path.realpath(os.path.join(branch, rel)), mount_table, inner)
+			if missing is not None and missing not in unmounted:
+				unmounted.append(missing)
 	problems = []
 	if len(unmounted) == 1:
 		problems.append(f'disk {unmounted[0]} of pool {pool} is not mounted')
@@ -4195,7 +4207,8 @@ def vault_disk_problem(path:str, mount_table:list = None) -> 'str | None':
 	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
 	point at or above the path is not mounted (a bare folder left under it is not that disk, and neither is anything
 	mounted below it: telling a disk from a bind mount or a tmpfs there needs rules this host has no use for), when the mount table cannot be
-	read, when a mergerfs pool holding the path has a disk missing (pool_problem()'s text), or when the disk holding it
+	read, when a mergerfs pool holding the path has a disk missing (pool_problem()'s text, a disk fstab names under a
+	branch at the path's place on it included), or when the disk holding it
 	off a pool has failed as a pool's disk can (plain_disk_problem()). path need not exist. mount_table, when given, is the
 	table to look at: none is read then.
 	'''
@@ -4204,8 +4217,23 @@ def vault_disk_problem(path:str, mount_table:list = None) -> 'str | None':
 			mount_table = read_mount_table()
 		except OSError as e:
 			return mount_table_unreadable(e)
-	real = os.path.realpath(path)
-	above = [mount_point for mount_point in fstab_mount_points(mount_table) if real == mount_point or real.startswith(mount_point + '/')]
+	missing = unmounted_fstab_point(os.path.realpath(path), mount_table, fstab_mount_points(mount_table))
+	if missing is not None:
+		return f'{missing} is not mounted ({FSTAB_PATH} names it)'
+	return pool_problem(path, mount_table=mount_table) or plain_disk_problem(path, mount_table)
+
+def unmounted_fstab_point(real:str, mount_table:list, points:list) -> 'str | None':
+	'''
+	The longest of points (fstab mount points, fstab_mount_points()) at or above real (a resolved path) when mount_table
+	has no mount there: the disk fstab names for it is not mounted. None when it is mounted, or none is above real.
+
+	Examples:
+		>>> unmounted_fstab_point('/mnt/a/x', [('/', ())], ['/mnt/a', '/mnt'])
+		'/mnt/a'
+		>>> unmounted_fstab_point('/mnt/a/x', [('/', ()), ('/mnt/a', ())], ['/mnt/a', '/mnt'])
+		>>> unmounted_fstab_point('/mnt/ab', [('/', ())], ['/mnt/a'])
+	'''
+	above = [point for point in points if real == point or real.startswith(point + '/')]
 	if above:
 		longest = max(above, key=len)
 		if not any(point == longest for point, _ in mount_table):
