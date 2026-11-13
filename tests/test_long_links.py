@@ -7,6 +7,7 @@ The refusal is cp's own line, made by a fake copy command, wherever the filesyst
 tests marked real put the long link on /dev/shm and the other side on the basetemp, and run where the basetemp refuses
 it (an XFS basetemp).
 '''
+import errno
 import os
 import shutil
 import stat
@@ -265,3 +266,63 @@ def test_real_a_restore_to_a_filesystem_that_refuses_the_link_finishes(shm, tmp_
 	files = tmp_path / 'files'
 	files.mkdir()
 	check_file_restore(job, capsys, str(files), 'proj/sub/l')
+
+
+# ---- F4: a full comparison whose only difference is a link the vault refuses for its text commits no version. The check probes
+# the text with a link of its own in staging, once every other entry dropped out, unless the newest version holds an entry at
+# the link's place (leaving the link out then removes that entry, test_the_previous_version_keeps_its_own_link_of_that_name)
+
+def made(link, text):
+	'''A symlink of text at link, its folder's mtime kept: the link is the only difference a full comparison finds.'''
+	folder = os.stat(os.path.dirname(link))
+	os.symlink(text, link)
+	os.utime(os.path.dirname(link), ns=(folder.st_atime_ns, folder.st_mtime_ns))
+
+
+def refuse_the_probe(monkeypatch, job):
+	'''The check's probe link in staging refused as too long, as the vault's filesystem refuses the link's text: the probes made.'''
+	staging = os.path.realpath(rv.staging_path(job.job_vault))
+	real = os.symlink
+	probes = []
+
+	def symlink(text, path, *args, **kwargs):
+		if os.path.realpath(os.path.dirname(os.fspath(path))) == staging and os.path.basename(os.fspath(path)).startswith('.link-probe-'):
+			probes.append(text)
+			raise OSError(errno.ENAMETOOLONG, os.strerror(errno.ENAMETOOLONG), path)
+		return real(text, path, *args, **kwargs)
+	monkeypatch.setattr(os, 'symlink', symlink)
+	return probes
+
+
+def test_a_full_comparison_meeting_only_a_refused_link_makes_no_version(job, monkeypatch, capsys):
+	# fails on main: the copy leaves the link out with its line, and the batch commits a version that changes nothing
+	seed_monitor(job, {'a': 'a', 'd/b': 'b'})
+	versions = run_backup(job)
+	run_backup(job)
+	link = os.path.join(job.monitor, 'd/l')
+	made(link, 't' * 100)
+	refuse(monkeypatch)
+	probes = refuse_the_probe(monkeypatch, job)
+	capsys.readouterr()
+	assert run_backup(job) == versions
+	assert probes == ['t' * 100] and not tracked(job, 'd/l')
+	out = capsys.readouterr()
+	assert warned(out.out + out.err, link) == 1
+	# nothing is left in staging by the probe
+	assert not [name for name in os.listdir(rv.staging_path(job.job_vault)) if name.startswith('.link-probe-')]
+
+
+def test_real_a_full_comparison_meeting_only_a_link_the_vault_refuses_makes_no_version(job, shm, capsys):
+	# fails on main: on the vault's XFS the copy is refused, the link left out with its line, and the batch commits a version
+	# that changes nothing
+	job = job._replace(monitor=os.path.join(shm, 'monitor'))
+	seed_monitor(job, {'a': 'a', 'd/b': 'b'})
+	link = os.path.join(job.monitor, 'd/l')
+	os.symlink('t' * LONG, link)
+	versions = run_backup(job)
+	capsys.readouterr()
+	# the start's full comparison meets it again
+	assert run_backup(job) == versions
+	out = capsys.readouterr()
+	assert warned(out.out + out.err, link) == 1
+	assert not [name for name in os.listdir(rv.staging_path(job.job_vault)) if name.startswith('.link-probe-')]

@@ -537,3 +537,256 @@ def test_failed_removal_shows_the_first_line_and_counts_the_rest():
 	there = '/'
 	lines = [f"rm: cannot remove 'f{i}': Operation not permitted" for i in range(1000)]
 	assert rv.failed_removal([(FakeTask(1, lines), there)]) == f"removing {there} from the version failed: {lines[0]} (and 999 more)"
+
+
+# ---- F4: a batch whose every entry drops out (an unreadable file, a path gone, a link the vault refuses) is compared as one
+# with none, and commits nothing when that finds nothing else. As uid 65534 a mode-000 file is unreadable; as root it reads,
+# so the VM gate deselects these by name
+
+needs_unreadable = pytest.mark.skipif(os.geteuid() == 0, reason='as root a mode-000 file reads: Docker runs this as uid 65534')
+KEPT = dict(only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
+
+
+def _settled(job):
+	'''V0 of the tree, and a full comparison that reads its unchecked copies back: a vault whose next comparison writes nothing.'''
+	from tests.harness import run_backup
+	run_backup(job)
+	run_backup(job)
+	return committed_versions(job)
+
+
+def _full(job):
+	'''A full comparison, as a start or the interval runs it: whether it committed.'''
+	_, manifest, committed = _backup(job)
+	manifest.close()
+	return committed
+
+
+def _events(job, events, **options):
+	'''A batch of raw events (is_dir, event, rel, moved_from rel), collapsed and verified by what they touched.'''
+	from tests.crash_batches import backup_events
+	backup_events(job, events, **{**KEPT, **options})
+
+
+def _lines(capsys, kind, path):
+	out = capsys.readouterr()
+	return (out.out + out.err).count(f'{kind}: {path}: ')
+
+
+@needs_unreadable
+@pytest.mark.parametrize('changed', [True, False], ids=['size_changed', 'unchanged'])
+def test_a_full_comparison_meeting_only_an_unreadable_file_makes_no_version(job, poll_fast, capsys, changed):
+	# fails on main: the comparison calls it a modify (its size changed, or its hash cannot be read), its copy keeps the last
+	# copy with an UNREADABLE line, and the batch commits a version that changes nothing
+	from tests.harness import header_counter
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	if changed:
+		stat = os.stat(path)
+		open(path, 'w').write('b, longer')
+		os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+	os.chmod(path, 0)
+	counter = header_counter(job.job_vault)
+	capsys.readouterr()
+	assert _full(job) is True
+	assert committed_versions(job) == before
+	# with nothing to write, the manifest is not written either
+	assert header_counter(job.job_vault) == counter
+	assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
+@needs_unreadable
+def test_an_attrib_of_an_unreadable_file_under_only_sync_attributes_makes_no_version(job, poll_fast, capsys):
+	# fails on main: its record cannot vouch for the copy, as its tail cannot be read, so the replay copies it, the copy keeps the
+	# last copy, and the batch commits a version that changes nothing
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	os.chmod(path, 0)
+	capsys.readouterr()
+	_events(job, [(False, 'attrib', 'b.txt', None)], only_sync_attributes=True)
+	assert committed_versions(job) == before
+	assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
+def test_a_create_of_a_file_gone_since_still_commits_the_removal_it_hid(job, poll_fast):
+	# pin (the design review's probe H): create tmp; mv tmp f; rm f, with f in the vault, beside the create of a file gone since.
+	# Every entry drops out, and the comparison of the places the batch touched still finds f deleted
+	seed_monitor(job, {'a.txt': 'a', 'f': 'f'})
+	before = _settled(job)
+	os.remove(os.path.join(job.monitor, 'f'))
+	_events(job, [(False, 'create', 'gone.txt', None), (False, 'create', 'tmp', None), (False, 'move', 'f', 'tmp'), (False, 'delete', 'f', None)])
+	versions = committed_versions(job)
+	assert len(versions) == len(before) + 1
+	assert not os.path.lexists(os.path.join(versions[-1], 'f')) and os.path.lexists(os.path.join(before[-1], 'f'))
+
+
+@needs_unreadable
+def test_a_scanned_folder_meeting_only_an_unreadable_file_makes_no_version_and_one_comparison(job, poll_fast, monkeypatch, capsys):
+	# fails on main: the folder's comparison finds the file, and the batch commits a version that changes nothing
+	from tests.harness import wait_until
+	seed_monitor(job, {'a.txt': 'a', 'disk/b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'disk', 'b.txt')
+	open(path, 'w').write('b, longer')
+	os.chmod(path, 0)
+	compared = []
+	real = rv.compare_scopes
+	def compare_scopes(found, manifest, version_path, monitor_path, scopes, *args, **kwargs):
+		compared.append((list(scopes.subtrees), list(scopes.paths)))
+		return real(found, manifest, version_path, monitor_path, scopes, *args, **kwargs)
+	monkeypatch.setattr(rv, 'compare_scopes', compare_scopes)
+	queue, lock = rv.ChangeEventQueue(job.monitor), threading.Lock()
+	queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	capsys.readouterr()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', threading.Event()),
+		kwargs=dict(job=control), daemon=True)
+	thread.start()
+	try:
+		wait_until(lambda: control.committed.is_set(), message='the batch did not end')
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=10)
+		rv.GREEN_LIGHT.set()
+	assert committed_versions(job) == before
+	# the folder's own comparison, and no comparison of the batch again
+	assert compared == [(['disk/'], [])]
+	assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
+def test_a_move_into_a_paused_inner_mount_from_an_untracked_path_makes_no_version(job, poll_fast, monkeypatch):
+	# fails on main: the paused drop makes the move a delete of its source, which the vault does not track, after the drop of
+	# such deletes ran, and the batch commits a version that changes nothing
+	from tests.test_inner_mounts import _fake_mounts
+	from tests.harness import event_entry
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	before = _settled(job)
+	os.remove(os.path.join(job.monitor, 'disk', 'f.txt'))
+	_fake_mounts(monkeypatch, job, [])
+	# a file the vault never held, moved into the disk before it went
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'disk/new.txt', 'move', 'new.txt')]))
+	manifest.close()
+	assert committed is True and committed_versions(job) == before
+
+
+def test_a_create_of_a_folder_removed_before_the_check_makes_no_version(job, poll_fast):
+	# fails on main: its replay finds nothing to copy, and the batch commits a version that changes nothing
+	from tests.harness import event_entry
+	seed_monitor(job, {'a.txt': 'a'})
+	before = _settled(job)
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'made-and-gone/', 'create')]))
+	manifest.close()
+	assert committed is True and committed_versions(job) == before
+
+
+def test_an_untracked_delete_over_a_lost_manifest_makes_no_version(job, poll_fast):
+	# fails on main: the drop of deletes the vault does not track needs a manifest that describes the newest version, and the
+	# batch commits a version that changes nothing
+	from tests.harness import event_entry
+	from tests.test_vault_units import lose_the_manifest
+	seed_monitor(job, {'a.txt': 'a'})
+	before = _settled(job)
+	lose_the_manifest(job)
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'never-backed-up.txt', 'delete')]))
+	manifest.close()
+	assert committed is True and committed_versions(job) == before
+
+
+@needs_unreadable
+def test_an_unreadable_file_beside_a_real_change_commits(job, poll_fast, capsys):
+	# pin: the check stops at the readable change; the unreadable file keeps its last copy, with its line
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	open(path, 'w').write('b, longer')
+	os.chmod(path, 0)
+	open(os.path.join(job.monitor, 'a.txt'), 'w').write('a changed')
+	capsys.readouterr()
+	_events(job, [(False, 'modify', 'b.txt', None), (False, 'modify', 'a.txt', None)])
+	versions = committed_versions(job)
+	assert len(versions) == len(before) + 1
+	assert open(os.path.join(versions[-1], 'a.txt')).read() == 'a changed' and open(os.path.join(versions[-1], 'b.txt')).read() == 'b'
+	assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
+def test_a_one_file_batch_checks_its_file_once_and_probes_nothing(job, poll_fast, monkeypatch):
+	# fails on main, which makes no check: one lstat, one open and one close of the file before the estimate, and no probe
+	seed_monitor(job, {'a.txt': 'a'})
+	_settled(job)
+	path = os.path.join(job.monitor, 'a.txt')
+	open(path, 'w').write('a changed')
+	calls, fds = [], set()
+	estimating = []
+	real_lstat, real_open, real_close, real_symlink = os.lstat, os.open, os.close, os.symlink
+	def lstat(target, *args, **kwargs):
+		if not estimating and os.fspath(target) == path:
+			calls.append('lstat')
+		return real_lstat(target, *args, **kwargs)
+	def opening(target, flags, *args, **kwargs):
+		fd = real_open(target, flags, *args, **kwargs)
+		if not estimating and os.fspath(target) == path:
+			calls.append('open')
+			fds.add(fd)
+		return fd
+	def closing(fd):
+		if not estimating and fd in fds:
+			fds.discard(fd)
+			calls.append('close')
+		return real_close(fd)
+	def symlink(text, target, *args, **kwargs):
+		if os.path.basename(os.fspath(target)).startswith('.link-probe-'):
+			calls.append('probe')
+		return real_symlink(text, target, *args, **kwargs)
+	real_estimate = rv.get_backup_size_inode
+	def estimate(*args, **kwargs):
+		estimating.append(True)
+		return real_estimate(*args, **kwargs)
+	monkeypatch.setattr(os, 'lstat', lstat)
+	monkeypatch.setattr(os, 'open', opening)
+	monkeypatch.setattr(os, 'close', closing)
+	monkeypatch.setattr(os, 'symlink', symlink)
+	monkeypatch.setattr(rv, 'get_backup_size_inode', estimate)
+	_events(job, [(False, 'modify', 'a.txt', None)])
+	assert estimating and calls == ['lstat', 'open', 'close']
+
+
+@needs_unreadable
+def test_an_unreadable_file_written_again_and_again_makes_no_version(job, poll_fast, capsys):
+	# review focus 2 (fails on main, one version a batch): another user's file, written again and again, as three event batches
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	for round in range(3):
+		os.chmod(path, 0o600)
+		open(path, 'w').write('b' * (round + 2))
+		os.chmod(path, 0)
+		capsys.readouterr()
+		_events(job, [(False, 'modify', 'b.txt', None)])
+		assert committed_versions(job) == before
+		assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
+@pytest.mark.parametrize('kind', ['fifo', 'socket'])
+def test_a_batch_of_only_a_fifo_or_a_socket_commits_it(job, poll_fast, monkeypatch, kind):
+	# review focus 3: the check counts another kind as a change, and the version holds it, as cp -a copies it as itself
+	import socket
+	import stat as stats
+	seed_monitor(job, {'a.txt': 'a'})
+	before = _settled(job)
+	if kind == 'fifo':
+		os.mkfifo(os.path.join(job.monitor, 'entry'))
+	else:
+		# a socket's path must fit in sun_path's 108 bytes: bound by its name, from the monitored folder
+		monkeypatch.chdir(job.monitor)
+		bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		bound.bind('entry')
+		bound.close()
+	_events(job, [(False, 'create', 'entry', None)])
+	versions = committed_versions(job)
+	assert len(versions) == len(before) + 1
+	mode = os.lstat(os.path.join(versions[-1], 'entry')).st_mode
+	assert (stats.S_ISFIFO if kind == 'fifo' else stats.S_ISSOCK)(mode)

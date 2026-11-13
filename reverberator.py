@@ -4448,13 +4448,27 @@ def scan_scopes(monitor_path:str, folders) -> list:
 			scopes.append(rel)
 	return scopes
 
-def drop_untracked_deletes(backup_entries:dict, manifest:'VaultManifest', monitor_path:str) -> int:
+def drop_untracked_deletes(backup_entries:dict, manifest:'VaultManifest', monitor_path:str, newest_path:str = None) -> int:
 	'''
 	Drop the delete entries of paths the manifest does not track ( no row at the path, at the path with /, or under it ),
 	which have nothing in the vault to delete; returns how many went. Every other entry and the order stay.
 	A move-out carried over a phantom is deleted at the pair timeout, after the phantom's removal took its path from the vault.
+	With newest_path, the newest version's folder, for a manifest that does not describe it (a lost one, before the batch
+	lists the version again), a delete drops when an lstat finds nothing at its path there: the newest version is the real
+	tree. An lstat that fails otherwise keeps the delete.
 	'''
-	untracked = [path for path, values in backup_entries.items() if values.event == 'delete' and not manifest.tracks(os.path.relpath(path, monitor_path))]
+	def untracked(path):
+		rel = os.path.relpath(path, monitor_path)
+		if newest_path is None:
+			return not manifest.tracks(rel)
+		try:
+			os.lstat(os.path.join(newest_path, rel.rstrip('/')))
+		except (FileNotFoundError, NotADirectoryError):
+			return True
+		except OSError:
+			return False
+		return False
+	untracked = [path for path, values in backup_entries.items() if values.event == 'delete' and untracked(path)]
 	for path in untracked:
 		del backup_entries[path]
 	return len(untracked)
@@ -5679,8 +5693,9 @@ def do_backup(backup_entries:dict,
 	except BaseException:
 		unit.close()
 		raise
-	# the job's backup and restore locks, held from before anything in the vault is changed to the end of this backup,
-	# so no restore reads it meanwhile. the comparison runs without them
+	# the job's backup and restore locks, held from before the versions are changed to the end of this backup, so no restore
+	# reads them while they change. the comparison, which commits what it read of the vault, and the check's probe link in
+	# staging (entries_all_drop_out()), which no restore reads, run without them
 	locks = BackupLocks(job_name, job=job)
 	try:
 		if not vaultInfo or not vaultInfo.vault_info_dict:
@@ -5801,12 +5816,28 @@ def do_backup(backup_entries:dict,
 				vault_size -= removed_size
 				vault_inodes -= removed_inodes
 				return next(iter(vault_info_dict), None) != oldest
-			if tree is None and backup_entries and manifest.describes(latest_version_info.path):
+			def all_drop_out() -> None:
+				# a batch whose every entry would leave the version as it holds it is compared as one with none
+				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,job_vault,pool_guard,job_name,reported):
+					backuperTeeLogToTl(job_name,f'Each of the {len(backup_entries)} backup entries would be left out of a version: comparing the batch as one with none')
+					backup_entries.clear()
+			if tree is None and backup_entries:
+				if paused:
+					# what the watcher saw in a paused folder before its disk went is compared when the disk is back
+					dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in paused])
+					if dropped:
+						backuperTeeLogToTl(job_name,f'Dropped {dropped} backup entries in unmounted inner mounts')
+						if not backup_entries:
+							backuperTeeLogToTl(job_name,'No backup entries left outside unmounted inner mounts',ok=True)
 				# a delete of what the vault holds no path of would make a version with no change. dropping it is safe: deletes
-				# replay first, onto a version that holds only the tracked rows, so such a delete would remove nothing
-				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path)
+				# replay first, onto a version that holds only the tracked rows, so such a delete would remove nothing. after
+				# the paused drop, as a move into a paused folder deletes its source, which may be untracked. a manifest that
+				# does not describe the newest version is not asked: the newest version is
+				describes = manifest.describes(latest_version_info.path)
+				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path,None if describes else latest_version_info.path)
 				if dropped:
 					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
+				all_drop_out()
 			if tree is not None:
 				backuperTeeLogToTl(job_name,f'Rolling forward {tree}, the tree of a batch that was cut')
 				rolled = roll_forward_entries(vaultInfo,manifest,monitor_path,skip=None if skip_list is None else skip_list.skips,paused=paused,job_name=job_name,reported=reported,
@@ -5821,7 +5852,11 @@ def do_backup(backup_entries:dict,
 				# the cut batch may have left anything in the tree, whose root is always real in the previous version: the
 				# verification compares and sweeps all of it, through the writer
 				touched = TouchedScopes([''],[])
-			elif not backup_entries:
+			elif not backup_entries and (came_empty or touched is not None):
+				# a batch that came with no entries is compared as it came: the places it touched, or the whole tree for a full
+				# comparison. one whose entries all dropped out above is compared at the places it touched, where a change its
+				# collapse hid can be found; one that came with none (a batch of compared scan folders, whose entries were that
+				# comparison's) is not compared again, as with no touched scopes that would walk the whole tree
 				if touched is None:
 					backuperTeeLogToTl(job_name,'Empty backup entries, Delta generating backup entries')
 				else:
@@ -5836,16 +5871,10 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name, 'Delta generation interrupted; not creating a new version', error=True)
 					return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
 				paused, walked_table = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'comparison')
+				all_drop_out()
 				if log_journal:
 					log_to_journal(journalPath,monitor_path,f'delta_generated_{len(backup_entries)}_differences',monitor_path)
 					log_events_to_journal(backup_entries,journalPath)
-			elif paused:
-				# what the watcher saw in a paused folder before its disk went is compared when the disk is back
-				dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in paused])
-				if dropped:
-					backuperTeeLogToTl(job_name,f'Dropped {dropped} backup entries in unmounted inner mounts')
-					if not backup_entries:
-						backuperTeeLogToTl(job_name,'No backup entries left outside unmounted inner mounts',ok=True)
 			if not backup_entries and tree is None:
 				backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
 				# no differences after a complete walk, or none left outside paused folders: the tree matches the
@@ -7650,6 +7679,97 @@ def source_readable(path:str) -> bool:
 	except OSError:
 		return False
 	return True
+
+def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str, job_vault:str, pool_guard:'PoolGuard', job_name:str, reported:set) -> bool:
+	'''
+	Whether every entry of backup_entries, a batch with no tree to roll forward, would drop out of its version: the replay
+	would leave the version as it holds it, so the batch is compared as one with none (do_backup()). In three passes,
+	cheapest first, stopping at the first entry that would change the version (False):
+	1. a delete or a move changes it, with no syscall (an untracked delete has gone already, drop_untracked_deletes());
+	2. every other entry (a create, a modify or an attrib, of a folder too) has its monitored path looked at, one lstat: a
+	   folder changes it, as does a regular file that opens (as source_readable() opens it) and an entry of another kind (a
+	   FIFO, a socket, a device, which cp -a copies as itself). A regular file that does not open drops out, as its copy keeps
+	   the last copy (an attrib too, under Only Sync Attributes: its record cannot vouch, as its tail cannot be read, so the
+	   replay copies it); so does a path that cannot be looked at, and a path gone, which the replay passes over;
+	3. only when every entry is still in doubt, each symlink: it changes the version when newest_path, the newest version
+	   (the tree before the hand-over), holds an entry at its place, as leaving the link out removes that entry, and otherwise
+	   unless the vault refuses its text (link_refused_by_vault()).
+	When none would (True), each entry has been logged as the copy or the replay would log it: UNREADABLE and NOT BACKED UP
+	once per batch through reported, and the replay's own line for a path gone. A file that turns unreadable or goes between
+	this check and its copy still makes a version that changes nothing (a known limitation), and so does a link whose copy's
+	temporary name passes the vault's path limit, as the probe sits in staging, at a shorter path.
+	'''
+	if any(values.event in ('delete', 'move') for values in backup_entries.values()):
+		return False
+	# the lines the drop-outs get, written once every entry is known to drop out
+	lines = []
+	links = []
+	for key in backup_entries:
+		path = key.rstrip('/')
+		try:
+			mode = os.lstat(path).st_mode
+		except (FileNotFoundError, NotADirectoryError):
+			lines.append(('gone', path, None))
+			continue
+		except OSError as e:
+			lines.append(('unreadable', path, e))
+			continue
+		if stat.S_ISLNK(mode):
+			links.append(path)
+			continue
+		if not stat.S_ISREG(mode):
+			return False
+		try:
+			os.close(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+		except OSError as e:
+			lines.append(('unreadable', path, e))
+			continue
+		return False
+	for path in links:
+		rel = os.path.relpath(path, monitor_path)
+		if os.path.lexists(os.path.join(newest_path, rel)):
+			return False
+		try:
+			text = os.readlink(path)
+		except (FileNotFoundError, NotADirectoryError):
+			lines.append(('gone', path, None))
+			continue
+		except OSError:
+			return False
+		if not link_refused_by_vault(text, job_vault, pool_guard):
+			return False
+		lines.append(('refused', path, None))
+	for kind, path, error in lines:
+		if kind == 'gone':
+			backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not tracking {os.path.relpath(path, monitor_path)}: source no longer exists')
+			continue
+		if path in reported:
+			continue
+		reported.add(path)
+		if kind == 'unreadable':
+			job_log(job_name, f'UNREADABLE: {path}: {error}; keeping its last backed-up copy')
+		else:
+			job_log(job_name, f'NOT BACKED UP: {path}: a symlink whose text or path is longer than the vault\'s filesystem takes; left out of this version')
+	return True
+
+def link_refused_by_vault(text:str, job_vault:str, pool_guard:'PoolGuard') -> bool:
+	'''
+	Whether the vault's filesystem refuses a symlink of text as too long (ENAMETOOLONG), asked of it by doing: a link of text
+	made in the job vault's staging folder (made when it is not there) and unlinked at once, after pool_guard.require(), as
+	nothing is written into the vault while a disk of its pool is out. Any other error is False, as would a copy of it be
+	tried, which says what it is; a probe a cut leaves behind is a leftover of staging, which the scan empties.
+	'''
+	pool_guard.require()
+	staging = staging_path(job_vault)
+	probe = os.path.join(staging, f'.link-probe-{uuid.uuid4().hex}')
+	try:
+		os.makedirs(staging, exist_ok=True)
+		os.symlink(text, probe)
+	except OSError as e:
+		return e.errno == errno.ENAMETOOLONG
+	with contextlib.suppress(OSError):
+		os.unlink(probe)
+	return False
 
 def copy_command(source_path:str, dest_path:str) -> list:
 	'''
