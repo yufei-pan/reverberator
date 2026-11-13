@@ -5839,9 +5839,11 @@ def do_backup(backup_entries:dict,
 				vault_inodes -= removed_inodes
 				return next(iter(vault_info_dict), None) != oldest
 			def all_drop_out() -> None:
-				# a batch whose every entry would leave the version as it holds it is compared as one with none
+				# a batch whose every entry would leave the version as it holds it is dropped and goes on as one with none: compared at
+				# the places it touched when it came with entries, or committing no version when no comparison follows it (a batch of
+				# scanned folders, or the findings of a comparison, which are checked again)
 				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,job_vault,pool_guard,job_name,reported):
-					backuperTeeLogToTl(job_name,f'Each of the {len(backup_entries)} backup entries would be left out of a version: comparing the batch as one with none')
+					backuperTeeLogToTl(job_name,f'Each of the {len(backup_entries)} backup entries would be left out of a version: dropping them')
 					backup_entries.clear()
 			if tree is None and backup_entries:
 				if paused:
