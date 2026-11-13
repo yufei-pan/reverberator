@@ -21,6 +21,9 @@ ExecStart=/usr/bin/env python3 /opt/reverberator/reverberator.py /etc/reverberat
 #ExecStartPre=-/usr/bin/chronyc waitsync 30 0.1
 #TimeoutStartSec=360
 Environment=PYTHONUNBUFFERED=1
+# Two malloc arenas for all threads: with the daemon's trims after its start and each backup, idle memory stays near 35 MB
+# (87 MB in 0.55.4). Never without the trims: 1 to 4 arenas alone keep 107 to 111 MB.
+Environment=MALLOC_ARENA_MAX=2
 Restart=on-failure
 RestartSec=5
 # Exit status 3: every job is stopped until its rule or skip list is fixed, so restarting would only fail again.

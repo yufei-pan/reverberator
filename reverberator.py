@@ -1536,6 +1536,8 @@ def run_daemon():
 	signal.signal(signal.SIGINT, signal_handler)
 	signal.signal(signal.SIGTERM, signal_handler)
 	args, argString = get_args()
+	# the compile of this file and the parse are garbage now: about 29 MB glibc would keep
+	trim_heap()
 	tl = LockedLogger(Tee_Logger.teeLogger(systemLogFileDir=args.log_dir, programName=args.program_name, compressLogAfterMonths=0, deleteLogAfterYears=args.log_delete_years, suppressPrintout=args.quiet, noLog=args.no_log,callerStackDepth=4,in_place_compression='xz'))
 	tl.teeprint(log_text(argString))
 	if args.verbose:
@@ -1893,6 +1895,31 @@ def on_vault_branches(path:str, action, denied:list = None) -> None:
 LIBC_SYNCFS = ctypes.CDLL(None, use_errno=True).syncfs
 LIBC_SYNCFS.argtypes = [ctypes.c_int]
 LIBC_SYNCFS.restype = ctypes.c_int
+
+# glibc keeps the memory its allocators freed (the compile of this file at the start, a batch's lists, each compare thread's
+# arena) until told to give it back: about 59 of the 87 MB 0.55.4 held idle (the footprint report, spec section 6). None for
+# a libc without it
+try:
+	LIBC_MALLOC_TRIM = ctypes.CDLL(None).malloc_trim
+	LIBC_MALLOC_TRIM.argtypes = [ctypes.c_size_t]
+	LIBC_MALLOC_TRIM.restype = ctypes.c_int
+except (OSError, AttributeError):
+	LIBC_MALLOC_TRIM = None
+
+def trim_heap() -> None:
+	'''Give the free memory glibc's allocators hold back to the system (malloc_trim(0), 0.3 to 4 ms); nothing on a libc without it.'''
+	if LIBC_MALLOC_TRIM is not None:
+		LIBC_MALLOC_TRIM(0)
+
+def release_idle_memory(manifest:'VaultManifest') -> None:
+	'''
+	A job just committed and goes idle: sqlite gives back the page cache of its manifest's connection (PRAGMA shrink_memory,
+	about 2 MB a connection; the next comparison reads it again from the OS page cache), unless a transaction is open, then glibc
+	gives back what it freed (trim_heap()).
+	'''
+	if manifest is not None and not manifest.in_transaction:
+		manifest.conn.execute('PRAGMA shrink_memory')
+	trim_heap()
 
 def syncfs_fd(fd:int, path:str = None) -> None:
 	'''
@@ -4995,6 +5022,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					# done, as a full comparison finding no differences is
 					if job is not None:
 						job.mark_committed()
+						release_idle_memory(manifest)
 			else:
 				# do_backup compares the whole tree for an empty batch, and only what its events touched for a batch whose
 				# events collapsed to no entry
@@ -5024,6 +5052,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					last_full_comparison = time.monotonic()
 				if job is not None:
 					job.mark_committed()
+					release_idle_memory(manifest)
 			backupEntries.clear()
 			scan_folders = []
 			touched = None
