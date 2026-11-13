@@ -338,8 +338,12 @@ def test_a_leftover_pending_file_is_removed_and_the_start_makes_one_version(job,
 
 
 def test_a_failed_attempt_is_followed_by_one_full_comparison(job, poll_fast, monkeypatch):
-	# pin: the next attempt after a failed one compares the whole tree once, and makes one version
-	seed_monitor(job, {'a.txt': 'a'})
+	# pin: a failed attempt leaves an event queued (the watcher queued it while its batch ran, so that batch did not take it) and
+	# a file changes with no event (during the retry delay, nothing watches): the next attempt compares the whole tree once and
+	# makes one version holding both. Without the start's full scan (the append in backuper()) the queued event alone would
+	# decide, and the file changed with no event would be missed
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b', 'c.txt': 'c'})
+	_age(job)
 	_v0(job)
 	queue, lock = rv.ChangeEventQueue(job.monitor), threading.Lock()
 	ready = threading.Event()
@@ -353,11 +357,15 @@ def test_a_failed_attempt_is_followed_by_one_full_comparison(job, poll_fast, mon
 			kwargs=dict(startup=startup, job=control), daemon=True)
 		thread.start()
 		return thread
+	a, b, c = (os.path.join(job.monitor, name) for name in ('a.txt', 'b.txt', 'c.txt'))
 	real = rv.do_backup
 	batches = []
 	def do_backup(backup_entries, **kwargs):
 		batches.append((len(backup_entries), kwargs.get('touched')))
 		if fail:
+			# an event the watcher queued while the failing batch ran
+			with lock:
+				queue.append(rv.ChangeEvent(time.monotonic(), False, 'modify', b, None))
 			raise rv.JobFailure('the disk went')
 		return real(backup_entries, **kwargs)
 	monkeypatch.setattr(rv, 'do_backup', do_backup)
@@ -365,15 +373,17 @@ def test_a_failed_attempt_is_followed_by_one_full_comparison(job, poll_fast, mon
 	flag = IdleFlag()
 	thread = attempt(flag)
 	wait_until(flag.idle.is_set, message='the first attempt never went idle')
-	# a batch of the first attempt fails
+	# a batch of the first attempt fails, with an event queued behind it
 	fail = True
-	a = os.path.join(job.monitor, 'a.txt')
-	open(a, 'w').write('changed')
+	open(a, 'w').write('a changed')
+	open(b, 'w').write('b changed')
 	with lock:
 		queue.append(rv.ChangeEvent(time.monotonic(), False, 'modify', a, None))
 	flag.set()
 	thread.join(timeout=10)
-	assert not thread.is_alive() and control.failure is not None and len(committed_versions(job)) == 1
+	assert not thread.is_alive() and control.failure is not None and len(committed_versions(job)) == 1 and len(queue) == 1
+	# a change nothing saw, while no attempt ran
+	open(c, 'w').write('c changed in the retry delay')
 	# the next attempt
 	fail = False
 	del batches[:]
@@ -383,10 +393,11 @@ def test_a_failed_attempt_is_followed_by_one_full_comparison(job, poll_fast, mon
 		wait_until(flag.idle.is_set, message='the next attempt never went idle')
 	finally:
 		_stop(thread)
-	# one batch, a full comparison (no entries, no touched scopes), and one version holding the change
+	# one batch, a full comparison (no entries, no touched scopes), and one version holding all three changes
 	assert batches == [(0, None)]
 	versions = committed_versions(job)
-	assert len(versions) == 2 and _read(os.path.join(versions[-1], 'a.txt')) == 'changed'
+	assert len(versions) == 2
+	assert [_read(os.path.join(versions[-1], name)) for name in ('a.txt', 'b.txt', 'c.txt')] == ['a changed', 'b changed', 'c changed in the retry delay']
 
 
 def test_a_rewrite_keeping_size_mtime_and_tail_before_a_stop_is_not_in_the_starts_version(job, poll_fast):
