@@ -6801,7 +6801,7 @@ def give_back_folder_times(previous:str, manifest:'VaultManifest') -> list:
 		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
 	return recorded
 
-def put_back_recorded(previous:str, tree:str, recorded:list, remove_made:bool) -> bool:
+def put_back_recorded(previous:str, tree:str, recorded:list, remove_made:bool, guard:PoolGuard) -> bool:
 	'''
 	The tree of a cut batch made version n's again before anything reads its rows or compares it (spec section 1): what the batch
 	changed or made there may be its own copy, which a write error some other sync saw, or a power cut, can have left wrong at its
@@ -6815,12 +6815,15 @@ def put_back_recorded(previous:str, tree:str, recorded:list, remove_made:bool) -
 	2. With remove_made, what the batch made goes: each entry of a recorded folder of the tree, or of its root, whose name the
 	   previous version's folder does not list (a create, a move's target, a partial copy). That rests on the previous version listing
 	   every entry the tree should keep, a forward link a cut left in staging given back (put_back_forward_links(), which needs the
-	   manifest's rows): over a lost manifest it would remove version n's own entry there, so the caller passes False then.
+	   manifest's rows): over a lost manifest it would remove version n's own entry there, so the caller passes False then. It rests
+	   on every disk of a pool being there as well: a branch that is gone hides the forward links on it, and the tree's entry that one
+	   names is the only copy. So each folder's listing of previous is followed by guard.require() before that folder's removals, as
+	   remove_stale_change_lists() does before its own: PoolNotReady, with version n's entries as they were.
 	3. Each recorded folder of the tree, innermost first, gets its folder's metadata in previous (copy_file_meta()), as the links
 	   made in it moved its times and the batch may have changed its mode or owner. One that fails raises JobFailure.
 	On a pool the pool's cache is dropped once anything changed (forget_pool_cache()). A cut anywhere in it leaves previous as it was,
 	so the next scan does it again. Returns whether any link_or_copy() copied, where hard links are refused, which the caller then
-	flushes. Raises OSError or JobFailure.
+	flushes. Raises OSError, JobFailure or PoolNotReady.
 	'''
 	pooled = vault_disks(tree)[0]
 	copied = changed = False
@@ -6846,10 +6849,12 @@ def put_back_recorded(previous:str, tree:str, recorded:list, remove_made:bool) -
 	if remove_made:
 		for folder in [''] + [rel.rstrip('/') for rel in recorded if rel.endswith('/')]:
 			listed = set(os.listdir(os.path.join(previous, folder)))
-			for name in os.listdir(os.path.join(tree, folder)):
-				if name not in listed:
-					remove_entry(os.path.join(tree, folder, name))
-					changed = True
+			made = [name for name in os.listdir(os.path.join(tree, folder)) if name not in listed]
+			if made:
+				guard.require()
+			for name in made:
+				remove_entry(os.path.join(tree, folder, name))
+				changed = True
 	failed = []
 	for rel in reversed(recorded):
 		if rel.endswith('/'):
@@ -6965,7 +6970,7 @@ def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest') -> 
 	if put_back:
 		forget_pool_cache(previous)
 
-def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> list:
+def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGuard) -> list:
 	'''
 	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4) and inside its unit of vault work
 	(get_vault_info()), so the versions read exact from here on, and a restore can run before the monitored path is back. A record
@@ -6987,7 +6992,7 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest') -> list:
 		put_back_forward_links(previous, info.tree, manifest)
 	remove_mixed_names(previous, info.tree)
 	recorded = give_back_folder_times(previous, manifest)
-	if put_back_recorded(previous, info.tree, recorded, described):
+	if put_back_recorded(previous, info.tree, recorded, described, guard):
 		job_vault = os.path.dirname(os.path.normpath(previous))
 		flush_or_fail(job_vault, os.path.basename(job_vault), f'{info.tree} is not made ready for its roll-forward; the next attempt puts it back again')
 	return recorded
@@ -7361,7 +7366,7 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	info = VaultInfo(vault_info_dict, sum(entry.size for entry in vault_info_dict.values()), sum(entry.inode for entry in vault_info_dict.values()), tree)
 	if tree is not None:
 		try:
-			info = info._replace(recorded=prepare_roll_forward(info, manifest))
+			info = info._replace(recorded=prepare_roll_forward(info, manifest, guard))
 		except (OSError, sqlite3.Error) as e:
 			raise VaultScanError(f'cannot make the tree {tree} ready for its roll-forward: {e}')
 	return info

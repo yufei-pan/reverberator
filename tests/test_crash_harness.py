@@ -1037,8 +1037,8 @@ def test_no_copy_again_and_no_put_back_fails_the_oracle(plain_r_vault):
 	vault = plain_r_vault
 	def neither(rv):
 		real = rv.prepare_roll_forward
-		rv.put_back_recorded = lambda previous, tree, recorded, remove_made: False
-		rv.prepare_roll_forward = lambda info, manifest: (real(info, manifest), [])[1]
+		rv.put_back_recorded = lambda previous, tree, recorded, remove_made, guard: False
+		rv.prepare_roll_forward = lambda info, manifest, guard: (real(info, manifest, guard), [])[1]
 	found = first_wrong(vault, neither, change=lambda: put_a_file_back(vault))
 	assert found is not None and any("'a/x.txt'" in line for line in found[1]), found
 

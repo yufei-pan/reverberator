@@ -1322,6 +1322,38 @@ def test_a_pool_cut_after_the_put_back_links_every_recorded_entry_again(r_job, f
 	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
 
 
+def test_a_pool_branch_gone_while_the_put_back_lists_a_folder_fails_the_scan_and_removes_nothing(r_job, fake_pool, monkeypatch):
+	# on a pool a branch that goes after the scan read the vault and before the put-back lists a recorded folder of version n hides what that
+	# branch holds: here the forward link of an unchanged name, whose entry in the tree is the only copy (R45). The listing then lacks the
+	# name and pass 2 takes it for one the batch made. The put-back checks the pool after each folder's listing and before its removals, as
+	# the removal of a stale list does: PoolNotReady, with every entry of the tree as it was. Fails on 850ecf5: the entry is deleted
+	branches = pool_vault(r_job, fake_pool)
+	put_text(r_job.monitor, 'd/other.txt', 'o0')
+	base(r_job)
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'd/inner.txt', None)], monkeypatch)
+	tree = tree_of(r_job)
+	previous = committed_versions(r_job)[-1]
+	assert os.path.islink(os.path.join(previous, 'd', 'other.txt')), 'version n holds a forward link to the unchanged name'
+	held = os.path.join(tree, 'd', 'other.txt')
+	assert read_bytes(held) == b'o0'
+	hidden = os.path.join(previous, 'd')
+	real_listdir, dropped = os.listdir, []
+	def listdir(path='.'):
+		names = real_listdir(path)
+		if isinstance(path, str) and path.rstrip(os.sep) == hidden and not dropped:
+			# the branch holding the link goes while it is listed
+			dropped.append(path)
+			fake_pool.drop(branches[1])
+			return [name for name in names if name != 'other.txt']
+		return names
+	monkeypatch.setattr(rv.os, 'listdir', listdir)
+	with pytest.raises(rv.PoolNotReady):
+		rv.get_vault_info(r_job.job_vault)
+	assert dropped
+	assert read_bytes(held) == b'o0'
+
+
 @pytest.mark.parametrize('unreadable', ['file', 'folder'])
 def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkeypatch, unreadable):
 	# pin, the design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
