@@ -6992,8 +6992,13 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGua
 	the batch's own included, and nothing reads a copy the batch made. Where that took a copy (hard links refused), the vault's
 	disks are flushed through the scan's own handles before the attempt goes on. Returns what the batch recorded in the previous
 	version: its real folders, ending with /, its regular files and its links, each of the kind it was, of which the roll-forward
-	copies again each regular file of the monitored tree (roll_forward_entries()). Idempotent: a cut here repeats it. A removal on a pool
-	waits for guard.require() (remove_mixed_names(), put_back_recorded()). Raises OSError, sqlite3.Error, JobFailure or PoolNotReady.
+	copies again each regular file of the monitored tree (roll_forward_entries()). Idempotent: a cut here repeats it. On a pool a
+	disk gone since the scan's whole read hides what it holds from every listing through the pool, so each act that trusts a listing
+	is checked (guard.require()): the removals of remove_mixed_names() and of put_back_recorded()'s pass 2 wait for it (R46, R45),
+	and the end of the repair is the last act, so that no link put back, nor list of what the batch recorded, reaches a batch that
+	reuses the scan unless every disk was there all along. remove_shadowed_links() reads each disk directly and removes a link only
+	beside a real entry it saw, so a disk gone makes it do less and it needs none. Raises OSError, sqlite3.Error, JobFailure or
+	PoolNotReady.
 	'''
 	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
 	described = manifest.describes(previous)
@@ -7005,6 +7010,10 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGua
 	if put_back_recorded(previous, info.tree, recorded, described, guard):
 		job_vault = os.path.dirname(os.path.normpath(previous))
 		flush_or_fail(job_vault, os.path.basename(job_vault), f'{info.tree} is not made ready for its roll-forward; the next attempt puts it back again')
+	# every step above read the previous version through the pool, where a disk gone since the whole read hides what it holds: a link
+	# put back beside an entry it hides, a short list of what the batch recorded. The scan's result is used by a batch whose own guard
+	# begins after the disk is back, so the check is here: with every disk there all along, the view stood (as read_vault_whole() does)
+	guard.require()
 	return recorded
 
 def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
@@ -7304,7 +7313,8 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	names is finished. Then the private list folders and staging are emptied. Of the one orphan there may be, at the one
 	after the newest version: a skeleton, empty or holding only links that name their own place (is_skeleton()), goes, with
 	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
-	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt. A lone V0 orphan goes. Any other orphan is an error, before
+	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt; on a
+	pool the scan checks it after judging the orphan, before anything goes, and again as the tree's repair ends. A lone V0 orphan goes. Any other orphan is an error, before
 	anything is removed. A lost manifest names nothing: its private list goes, and the orphan is judged the same way, so a cut tree stays.
 	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54. A vault with no version and no orphan
 	is one started over: the manifest's version is forgotten (a conversion begun is no more to finish), and the next batch is V0.
@@ -7357,6 +7367,9 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 				tree = orphan
 		except OSError as e:
 			raise VaultScanError(f'cannot read {orphan}, nothing in the vault is removed: {e}')
+		# the judgement above is an absence (no real entry shows) on a view taken after the whole read: a disk gone meanwhile hides what
+		# the tree holds, and the skeleton's removal below, or the next batch beside a tree taken for none, would act on it
+		guard.require()
 	remove_unfinished_change_lists(job_vault, listing)
 	empty_staging(job_vault)
 	if manifest.layout() == 'r':

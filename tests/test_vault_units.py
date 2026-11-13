@@ -336,9 +336,9 @@ def test_the_conversion_hears_it(tmp_path, v054, heard_at_the_first_sync, monkey
 		manifest.close()
 
 
-def pool_vault(job, fake_pool):
-	'''The vault of job on a fake pool of branches a and b, each holding the job vault: the branches.'''
-	branches = fake_pool.add(job.vault, ['a', 'b'])
+def pool_vault(job, fake_pool, names=('a', 'b')):
+	'''The vault of job on a fake pool of branches a and b (or of names), each holding the job vault: the branches.'''
+	branches = fake_pool.add(job.vault, list(names))
 	for branch in branches:
 		os.makedirs(os.path.join(branch, job.job_name), exist_ok=True)
 	return branches
@@ -1396,6 +1396,104 @@ def test_a_pool_branch_gone_while_a_mixed_name_is_checked_fails_the_scan_and_rem
 		rv.get_vault_info(r_job.job_vault)
 	assert dropped
 	assert read_bytes(on_a) == b'o0' and read_bytes(os.path.join(on_b, 'in')) == b'in'
+
+
+def test_a_pool_branch_gone_as_the_orphan_is_judged_fails_the_scan_and_removes_nothing(r_job, fake_pool, monkeypatch):
+	# the scan takes an orphan for a skeleton when no real entry shows in it, an absence, on a view taken after its whole read. Branch c
+	# holds all the cut batch's tree holds and goes as the orphan is judged: through the pool the folder is empty, the scan returned
+	# no tree, removed the folder, and the first batch made a second version folder of the same number (a tree whose disk came back
+	# before the removal went with it). The scan checks the pool after the judgement and before anything is removed: PoolNotReady,
+	# the orphan as it was, and the scan with every disk there finds the tree. Fails on 065fa15: the scan returns, tree None
+	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
+	base(r_job)
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'd/inner.txt', None)], monkeypatch)
+	tree = tree_of(r_job)
+	on_c = os.path.join(branches[2], r_job.job_name, os.path.basename(tree))
+	before = sorted(os.path.relpath(os.path.join(folder, name), tree) for folder, folders, files in os.walk(tree) for name in folders + files)
+	assert 'd/inner.txt' in before
+	real_is_skeleton, dropped = rv.is_skeleton, []
+	def is_skeleton(path):
+		if os.fspath(path) == tree and not dropped:
+			dropped.append(path)
+			fake_pool.drop(branches[2])
+			# stands for all of the tree living on c: through the pool its folder is empty
+			os.makedirs(os.path.dirname(on_c), exist_ok=True)
+			os.rename(tree, on_c)
+			os.mkdir(tree)
+		return real_is_skeleton(path)
+	with monkeypatch.context() as hooked:
+		hooked.setattr(rv, 'is_skeleton', is_skeleton)
+		with pytest.raises(rv.PoolNotReady):
+			rv.get_vault_info(r_job.job_vault)
+	assert dropped
+	assert os.path.isdir(tree) and os.listdir(tree) == [], 'the orphan the scan judged stands, as the pool showed it'
+	assert sorted(os.path.relpath(os.path.join(folder, name), on_c) for folder, folders, files in os.walk(on_c) for name in folders + files) == before
+	# c is back, with the folder as one: every disk there, the scan finds the tree and the batch rolls it forward
+	fake_pool.mount(branches[2])
+	os.rmdir(tree)
+	os.rename(on_c, tree)
+	assert rv.get_vault_info(r_job.job_vault).tree == tree
+	roll_forward(r_job)
+	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'd', 'inner.txt')) == b'i1'
+
+
+@pytest.mark.parametrize('back', [True, False], ids=['mounted-again', 'still-gone'])
+def test_a_pool_branch_gone_while_the_put_back_writes_a_link_fails_the_scan_that_a_batch_would_reuse(r_job, fake_pool, monkeypatch, back):
+	# RR-C2-1: version n's own copy of a recorded name is real on branch c, and c goes as put_back_forward_links() looks at the name: through
+	# the pool nothing is there, and a link to the tree's copy is written. Nothing checks the pool when nothing is removed, the scan
+	# returns, the job waits for c, and the first batch, which reuses the scan and makes its own guard once c is back, would commit with the
+	# link in c's real entry's place: version n restores as the newer bytes. The scan's last act checks the pool, so it fails with
+	# PoolNotReady (c mounted again meanwhile, or still out) and no batch gets the view. Fails on 065fa15: the scan returns
+	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
+	put_text(r_job.monitor, 'd/other.txt', 'o0')
+	base(r_job)
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'd/inner.txt', None)], monkeypatch)
+	tree = tree_of(r_job)
+	previous = committed_versions(r_job)[-1]
+	own = os.path.join(previous, 'd', 'inner.txt')
+	assert os.path.isfile(own) and not os.path.islink(own) and read_bytes(own) == b'i0'
+	assert read_bytes(os.path.join(tree, 'd', 'inner.txt')) == b'i1'
+	on_c = os.path.join(branches[2], r_job.job_name, os.path.basename(previous), 'd', 'inner.txt')
+	folder_times = os.stat(os.path.dirname(own))
+	real_put_back, real_lexists = rv.put_back_forward_links, os.path.lexists
+	armed, dropped = [], []
+	def put_back(*args):
+		armed.append(True)
+		try:
+			return real_put_back(*args)
+		finally:
+			armed.clear()
+			if dropped and back:
+				fake_pool.mount(branches[2])
+	def lexists(path):
+		if armed and not dropped and os.fspath(path) == own:
+			dropped.append(path)
+			fake_pool.drop(branches[2])
+			# stands for the entry living on c: through the pool it is no more
+			os.makedirs(os.path.dirname(on_c), exist_ok=True)
+			os.rename(own, on_c)
+			return False
+		return real_lexists(path)
+	with monkeypatch.context() as hooked:
+		hooked.setattr(rv, 'put_back_forward_links', put_back)
+		hooked.setattr(rv.os.path, 'lexists', lexists)
+		with pytest.raises(rv.PoolNotReady):
+			rv.get_vault_info(r_job.job_vault)
+	assert dropped and os.path.islink(own), 'the put-back wrote the link the scan then refused to hand over'
+	assert read_bytes(on_c) == b'i0'
+	# every disk there, c's entry shown, as the next scan sees it (it takes the link away): the batch commits both versions exact
+	if not back:
+		fake_pool.mount(branches[2])
+	os.remove(own)
+	os.rename(on_c, own)
+	# the moves above are the emulation's, not a change of version n: its folder keeps its times
+	os.utime(os.path.dirname(own), ns=(folder_times.st_atime_ns, folder_times.st_mtime_ns))
+	roll_forward(r_job)
+	versions = committed_versions(r_job)
+	assert read_bytes(os.path.join(versions[0], 'd', 'inner.txt')) == b'i0'
+	assert read_bytes(os.path.join(versions[-1], 'd', 'inner.txt')) == b'i1'
 
 
 @pytest.mark.parametrize('unreadable', ['file', 'folder'])
