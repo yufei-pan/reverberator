@@ -741,17 +741,20 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   cut copy as its backed-up copy: if the cut damaged that copy, the newest version holds wrong bytes for it, with no
   line but the file's UNREADABLE one, until the file changes again. With the database standing, the start removes such
   a copy and the file is left out with its line. Third, on a vault filesystem with no RENAME_EXCHANGE (off a pool too), a
-  batch cut between the two renames that record a folder in the version before it leaves that version with nothing at
-  that folder once the database is lost: the start empties staging, where the cut left the folder's forward link, and
-  no row gives it back. 0.55.4 does the same.
+  batch cut between the two renames that put a folder into the version before it (a folder it records, or makes real
+  there to change something in it: a batch that only deletes `p/d` makes `p` real) leaves that version with nothing at
+  that folder once the database is lost, and what the batch deleted or replaced under it is then in no version: the
+  start empties staging, where the cut left the folder's forward link, and no row gives it back. 0.55.4 does the same
+  (run on both).
 - **Why:** the inner mounts are recorded in the database only, so a rebuilt database has none to pause. And without the
   database the start cannot tell a file the cut batch made from one of the version before whose forward link a cut
   between two renames left in staging (on a pool, or a filesystem with no exchange): removing the first would remove the
   second, which is data loss (the design re-check's run N5), so the start keeps both, as 0.55.4 does. The fix belongs at
-  the source for all three: the version's own state kept outside the database, with the version (its inner mounts, and
-  the forward links a cut staged), so a rebuilt manifest pauses the mounts and the start can tell the cut batch's files
-  apart and give a staged link back.
-- **Revisit when:** the round after 0.55.5.
+  the source: the version's own state kept outside the database, with the version: its inner mounts, and the forward
+  links a cut staged, which already name their places.
+- **Revisit when:** the round after 0.55.5. For the third case, and off a pool the second: a forward link the cut left
+  in staging names its own place in its text (`forward_text()`), so the scan could give it back to the version before
+  ahead of `empty_staging()`, with no database (reasoned, not run).
 
 ### An entry whose path in the vault passes 4,095 bytes fails every backup
 
@@ -770,16 +773,22 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.5, with the fix at source: a shorter temporary name, and an entry whose path the
   vault refuses left out at the record step with its NOT BACKED UP line.
 
-### A disk taken out of a pool while a batch runs is not synced
+### A disk taken out of a pool through its control file goes unseen
 
 - **Kind:** deferred.
 - **What the operator sees:** on a vault on a mergerfs pool, when a disk is taken out of the pool through mergerfs's
   control file while a batch runs, the batch's flush syncs only the disks the pool lists by then: what the batch wrote to
-  that disk is not synced, and the batch is not failed but commits, with no alert. Reasoned from the code, not run.
+  that disk is not synced, and the batch is not failed but commits, with no alert. The same removal while the start
+  after a cut puts the cut batch's tree back is seen by no guard either: the version before's listing misses the names
+  on that disk, and the scan's removals of what the cut batch made (the put-back's, and those of a name left a folder on
+  one disk and something else on another) can remove an entry that version's forward link names, so once the disk is
+  back that version has lost it. A disk unmounted at that moment is caught, and the scan stops before it removes
+  anything. Reasoned from the code, not run.
 - **Why:** older than 0.55.5. A flush picks its handles by the disks the pool lists at that moment, and the pool check
-  looks for a listed disk that is missing or was mounted again, not for one the pool stopped listing.
-- **Revisit when:** the round after 0.55.5: check it by a run, and fail the batch when a disk its unit opened has left
-  the pool.
+  looks for a listed disk that is missing or was mounted again, not for one the pool stopped listing; the scan's guard
+  asks the same.
+- **Revisit when:** the round after 0.55.5: check it by a run, and fail the batch, or stop the scan, when a disk it began
+  with has left the pool.
 
 ### A restore does not notice its filesystem change under it
 
@@ -818,3 +827,52 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   is an answer; a read error is none, and an absence counts as evidence only when the source answered.
 - **Revisit when:** the round after 0.55.5: a read error other than "no such file" is a problem that the wait names and
   waits on.
+
+### An xattr change made while down, in a folder renamed during the start's walk
+
+- **Kind:** deferred.
+- **What the operator sees:** an extended-attribute-only change made while the daemon is down, to an entry in a folder
+  that is then renamed while the start's full comparison walks the tree (between its parent's listing and its own), is
+  never compared: the walk finds the folder gone, and the rename's batch compares extended attributes only from its own
+  time, then records its matched time past the change. The change is missing from the versions until the entry changes
+  again, with no line. Run on this round's code, before and after its L10 change.
+- **Why:** older than 0.55.5, and a narrow window: a folder renamed in the moment the walk passes it, after an xattr-only
+  change made while nothing watched.
+- **Revisit when:** the round after 0.55.5.
+
+### A name its parent lists but the kernel cannot look up drops out of a batch's comparison
+
+- **Kind:** deferred.
+- **What the operator sees:** on a monitored filesystem that can list a name it cannot look up (name trouble on a CIFS
+  or sshfs mount, say, whose lstat of the name answers ENOENT every time), a batch whose comparison walks such a name as
+  a scope it touched (a folder or a path of the batch's events) takes it as gone: its rows are deleted, so the
+  new version lacks it and everything under it, with no line; older versions keep it. The whole-tree walk tells it apart:
+  a folder its parent still lists is not gone, and keeps its ERROR and UNREADABLE lines at every walk.
+- **Why:** older than 0.55.5. The scope walks (`iter_scope_entries()`, `scope_path_entry()`) take an lstat's ENOENT as
+  gone, which is the normal answer for every folder and file a batch deleted or moved away; asking the parent's listing
+  each time, as the whole-tree walk does on its error path, would list a parent once per deleted entry, about 8 ms for
+  a parent of 100,000 names.
+- **Revisit when:** the round after 0.55.5: the same parent-listing rule in the scope walks, with one listing per parent
+  kept for the comparison.
+
+### A walk lists a parent once per folder gone under it
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost: a walk tells a folder that vanished as it reached it by listing its
+  parent once (on the error path only), so a mass deletion of many sibling folders while a walk passes lists that
+  parent once per folder: about 8 ms a listing for a parent of 100,000 names, so the time grows with the square of the
+  folders deleted. A rare case: a mass deletion during a full comparison.
+- **Why:** each listing answers for one folder, which keeps the rule to one call on the error path.
+- **Revisit when:** the round after 0.55.5: one listing per parent per walk, listed again only when the kept listing
+  still names the folder.
+
+### The footprint gate does not catch a missing trim after a commit
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing, today: the daemon trims its heap after each commit. The test that holds its idle
+  memory down (`tests/test_footprint.py`) measures after a restart and one backup, so it fails when the trim after the
+  start goes, not when the trim after each commit does: that one could be lost without a test failing, and the memory
+  a busy job keeps between backups would go unchecked.
+- **Why:** a growth gate needs a burst of changes and a bound for what memory may keep after it, and that bound is not
+  measured yet.
+- **Revisit when:** the round after 0.55.5: a gate after a burst of changes, once its bound is measured.
