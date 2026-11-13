@@ -19,7 +19,7 @@ import TSVZ
 import xxhash
 import reverberator as rv
 from tests import harness
-from tests.harness import create_job, get_path_size, seed_monitor, run_backup, event_entry, write_rule, write_committed_version, link_text_taking_a_block
+from tests.harness import create_job, get_path_size, path_inodes, seed_monitor, run_backup, event_entry, write_rule, write_committed_version, link_text_taking_a_block
 from tests.test_log_text import alerting_lines
 from tests import chain_ground_truth
 from tests.vault_oracle import read_view
@@ -1688,7 +1688,7 @@ def books_job(tmp_path, long, tree=None):
 def du_versions(job):
 	'''What the job's version folders take, (bytes, inodes), each inode once: du of them all in one call.'''
 	paths = [version.path for version in rv.list_versions(job.job_vault)]
-	return get_path_size(*paths), rv.get_path_inodes(*paths)
+	return get_path_size(*paths), path_inodes(*paths)
 
 
 def recorded(job):

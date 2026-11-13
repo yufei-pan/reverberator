@@ -107,5 +107,6 @@ def test_the_estimate_runs_no_du(job, monkeypatch):
 	ran = []
 	monkeypatch.setattr(rv.multiCMD, 'run_command', lambda command, *args, **kwargs: ran.append(command) or run_command(command, *args, **kwargs))
 	assert estimate(job, 'd/', 'd/f', 'd/f', event='create')[1] == 2
-	assert estimate(job, 'd/', event='modify')[1] == 0
+	# a folder's modify is walked, and copies what it holds: its inodes count as its bytes do
+	assert estimate(job, 'd/', event='modify')[1] == 2
 	assert ran == []

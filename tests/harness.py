@@ -156,6 +156,13 @@ def get_path_size(*paths: str) -> int:
 	return int(last) if last.isdigit() else 0
 
 
+def path_inodes(*paths: str) -> int:
+	'''The inodes du counts in paths, each counted once: a test tool, as the daemon runs no du.'''
+	out = subprocess.run(['du', '--inodes', '-csP', *paths], capture_output=True, text=True).stdout
+	last = out.rstrip('\n').rpartition('\n')[2].partition('\t')[0]
+	return int(last) if last.isdigit() else 0
+
+
 def charge(path: str, vault: str) -> int:
 	'''
 	What the size estimate charges for the entry at path, copied into vault: a regular file the smaller of its blocks and
@@ -170,7 +177,7 @@ def charge(path: str, vault: str) -> int:
 
 def content_file_path(version_dir: str) -> str:
 	size_s = rv.format_bytes(get_path_size(version_dir), use_1024_bytes=True, to_str=True).replace(' ', '_')
-	ino_s = rv.format_bytes(rv.get_path_inodes(version_dir), use_1024_bytes=False, to_str=True).replace(' ', '')
+	ino_s = rv.format_bytes(path_inodes(version_dir), use_1024_bytes=False, to_str=True).replace(' ', '')
 	return f'{version_dir}--{size_s}B-{ino_s}_ino{rv.CONTENT_FILE_EXTENSION_NAME}'
 
 

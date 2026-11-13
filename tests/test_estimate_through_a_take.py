@@ -5,11 +5,12 @@ the watcher's next read clears newDirWDs, and the move into it read later is a m
 writes (the bytes of what is written, the inodes it makes) and no more: written <= estimate <= what the vault grew by.
 '''
 import os
+from collections import OrderedDict
 
 import pytest
 
 import reverberator as rv
-from tests.harness import wait_until
+from tests.harness import event_entry, path_inodes, run_backup, seed_monitor, wait_until
 from tests.test_moves_into_new_folders import (ATTRIB_ROWS, ESTIMATE_ROWS, SEED, live_view, session, take_at_append,  # noqa: F401 (fixture)
 	vault_bytes, version_view)
 
@@ -17,7 +18,7 @@ pytestmark = pytest.mark.inotify
 
 ROWS = ESTIMATE_ROWS + [
 	# a file under a subfolder of the carried folder rewritten, and a chmod there (no copy under Only Sync Attributes)
-	('a deep file rewritten and a chmod', [('write', 'n/big/sub/b', 'y' * (5 << 20)), ('chmod', 'n/big/a', 0o600)], 5 << 20, 2),
+	('a deep file rewritten and a chmod', [('write', 'n/big/sub/b', 'y' * (5 << 20)), ('chmod', 'n/big/a', 0o600)], 5 << 20, 3),
 	# a new folder inside a new folder inside the carried folder, files at both levels
 	('nested new folders', [('mkdir', 'n/big/s1'), ('write', 'n/big/s1/p', 'p' * (3 << 20)), ('mkdir', 'n/big/s1/s2'),
 		('write', 'n/big/s1/s2/q', 'q' * (3 << 20))], 6 << 20, 6),
@@ -69,8 +70,9 @@ def test_the_put_back_through_a_take(session, job, monkeypatch, patterns, row, w
 	print(f'ROW {row} {patterns}: estimate {est_size} inodes {est_inodes}, written {written}, grew {grew}, probes {probes}, entries {entries}')
 	assert version_view(job) == live_view(job)
 	assert written <= est_size <= grew, (est_size, written, grew)
-	# made counts n and one probe: the batch has one probe more (the settle after the take)
-	assert est_inodes == made + probes - 1, (est_inodes, made, probes)
+	# made counts n and one probe: the batch has one probe more (the settle after the take), and the marker's copy when its write
+	# came in this batch
+	assert est_inodes == made + probes - 1 + (entries.get('marker') in ('create', 'modify')), (est_inodes, made, probes)
 
 
 @pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['no_skip_list', 'skip_list'])
@@ -118,3 +120,76 @@ def test_file_rows_through_a_take(session, job, monkeypatch, patterns, row, step
 	print(f'ROW {row} {patterns}: estimate {est_size} inodes {est_inodes}, written {written}, grew {grew}, entries {entries}')
 	assert version_view(job) == live_view(job)
 	assert written <= est_size <= grew, (est_size, written, grew)
+
+
+def du_calls_made(monkeypatch):
+	'''The du commands the daemon runs from now on.'''
+	calls = []
+	real = rv.multiCMD.run_command
+	def spy(command, *args, **kwargs):
+		if command and os.path.basename(str(command[0])) == 'du':
+			calls.append(command)
+		return real(command, *args, **kwargs)
+	monkeypatch.setattr(rv.multiCMD, 'run_command', spy)
+	return calls
+
+
+def tree_inodes(top):
+	'''The inodes of top and of every entry below it but links, by a walk that never follows one.'''
+	found = {os.lstat(top).st_ino}
+	for folder, folders, files in os.walk(top):
+		for name in folders + files:
+			st = os.lstat(os.path.join(folder, name))
+			if not os.path.islink(os.path.join(folder, name)):
+				found.add(st.st_ino)
+	return found
+
+
+def a_delete_create_modify_batch(job, monkeypatch):
+	'''
+	V0 of a folder of K = 5 entries (gone/ and four files) and two files, then one batch that deletes the folder, creates M = 3
+	files and modifies P = 2: the estimate, the du commands, the tree's inodes but links before and after, and the vault's
+	inodes before and after.
+	'''
+	seed_monitor(job, {**{f'gone/g{i}': 'g' for i in range(4)}, 'm0': 'a', 'm1': 'b'})
+	run_backup(job)
+	m = job.monitor
+	for i in range(4):
+		os.remove(f'{m}/gone/g{i}')
+	os.rmdir(f'{m}/gone')
+	for i in range(3):
+		with open(f'{m}/c{i}', 'w') as f:
+			f.write('c' * 100)
+	for i in range(2):
+		with open(f'{m}/m{i}', 'w') as f:
+			f.write('changed' * 100)
+	before = tree_inodes(rv.list_versions(job.job_vault)[-1].path)
+	vault_before = path_inodes(job.job_vault)
+	estimates = spy_on_estimates(monkeypatch)
+	du_calls = du_calls_made(monkeypatch)
+	entries = OrderedDict([event_entry(job, 'gone/', 'delete')] + [event_entry(job, f'c{i}', 'create') for i in range(3)]
+		+ [event_entry(job, f'm{i}', 'modify') for i in range(2)])
+	run_backup(job, entries)
+	assert len(estimates) == 1, estimates
+	(est_size, est_inodes), _ = estimates[0]
+	after = tree_inodes(rv.list_versions(job.job_vault)[-1].path)
+	return est_inodes, du_calls, len(after - before), path_inodes(job.job_vault) - vault_before
+
+
+def test_a_batch_that_deletes_creates_and_modifies_estimates_the_copies_inodes(job, monkeypatch):
+	# fails on main (M - K): a delete frees no inode on design R, a modify's copy adds one, and no du runs
+	est_inodes, du_calls, _, _ = a_delete_create_modify_batch(job, monkeypatch)
+	assert est_inodes == 3 + 2
+	assert du_calls == []
+
+
+def test_the_inodes_a_batch_writes_are_at_most_its_estimate(job, monkeypatch):
+	# fails on main: the batch's new inodes in the tree, links left out, against its estimate
+	est_inodes, _, new_inodes, _ = a_delete_create_modify_batch(job, monkeypatch)
+	assert new_inodes <= est_inodes and new_inodes == 3 + 2
+
+
+def test_the_estimate_is_at_most_what_the_vault_inode_count_grew_by(job, monkeypatch):
+	# pin
+	est_inodes, _, _, grew = a_delete_create_modify_batch(job, monkeypatch)
+	assert est_inodes <= grew

@@ -1045,31 +1045,47 @@ def test_a_moved_in_folder_a_location_pattern_now_leaves_out_part_of(session, jo
 
 # the rows of the review: what a batch writes under a folder moved into a new one, its bytes and the inodes it makes (the new
 # folder, what is made, and the probe file of the session)
+# made: the inodes the batch makes where big is carried into n by its move (test_estimate_through_a_take.py): n, one probe, and a
+# copy of each file the writes make or change, a folder for each they make
 ESTIMATE_ROWS = [
-	('one file rewritten', [('write', 'n/big/a', 'x' * (5 << 20))], 5 << 20, 2),
+	('one file rewritten', [('write', 'n/big/a', 'x' * (5 << 20))], 5 << 20, 3),
 	('three new files', [('write', f'n/big/{name}', name * (5 << 20)) for name in 'pqr'], 15 << 20, 5),
 	('a new folder of two files', [('mkdir', 'n/big/new'), ('write', 'n/big/new/p', 'p' * (5 << 20)), ('write', 'n/big/new/q', 'q' * (5 << 20))], 10 << 20, 5),
 ]
 
 
-@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['no_skip_list', 'skip_list'])
-@pytest.mark.parametrize('row,writes,written,made', ESTIMATE_ROWS, ids=[row[0] for row in ESTIMATE_ROWS])
-def test_the_size_estimate_counts_what_is_written_under_a_folder_moved_into_a_new_one(session, job, monkeypatch, patterns, row, writes, written, made):
-	# the folder is taken out of the new folder's size, with what is written in it: that is copied, and a limit would make no room
-	one = session(patterns=patterns)
+def spy_on_estimates_and_probes(monkeypatch):
+	'''The estimates from now on, each with the count of the batch's probe creates.'''
 	estimates = []
 	real = rv.get_backup_size_inode
 	def spy(*args, **kwargs):
-		estimates.append(real(*args, **kwargs))
-		return estimates[-1]
+		probes = sum(1 for path, values in kwargs['backup_entries'].items() if os.path.basename(path).startswith('.probe') and values.event == 'create')
+		estimates.append((real(*args, **kwargs), probes))
+		return estimates[-1][0]
 	monkeypatch.setattr(rv, 'get_backup_size_inode', spy)
+	return estimates
+
+
+def names_in(top):
+	'''top and every name below it, as the replay copies a created folder: each name its own inode.'''
+	return 1 + sum(len(folders) + len(files) for _, folders, files in os.walk(top))
+
+
+@pytest.mark.parametrize('patterns', [(), ('no_such_folder/',)], ids=['no_skip_list', 'skip_list'])
+@pytest.mark.parametrize('row,writes,written,made', ESTIMATE_ROWS, ids=[row[0] for row in ESTIMATE_ROWS])
+def test_the_size_estimate_counts_what_is_written_under_a_folder_moved_into_a_new_one(session, job, monkeypatch, patterns, row, writes, written, made):
+	# the folder is taken out of the new folder's size, with what is written in it: that is copied, and a limit would make no room.
+	# the watcher reads the move into the new n as part of n's create, so n is copied whole: its inodes are every name in it
+	one = session(patterns=patterns)
+	estimates = spy_on_estimates_and_probes(monkeypatch)
 	size = vault_bytes(job)
 	one.run([('mkdir', 'n'), ('mv', 'big', 'n/big')] + writes, 'apart')
 	one.back_up_next()
 	assert len(estimates) == 1
+	(est_size, est_inodes), probes = estimates[0]
 	grew = vault_bytes(job) - size
-	assert written <= estimates[0][0] <= grew
-	assert estimates[0][1] == made
+	assert written <= est_size <= grew
+	assert est_inodes == names_in(os.path.join(job.monitor, 'n')) + probes
 
 
 ATTRIB_ROWS = [
@@ -1085,16 +1101,12 @@ def test_the_size_estimate_counts_the_attribute_copies_under_a_folder_moved_into
 	# an attrib that copies the file (a new mtime, or any change without Only Sync Attributes) is counted as the same change in an
 	# existing folder is: a limit makes room for the 15 MiB
 	one = session({**SEED, **{f'big/{name}': name * (5 << 19) for name in ('h1', 'h2', 'h3')}}, patterns=patterns, only_sync_attributes=only_sync_attributes)
-	estimates = []
-	real = rv.get_backup_size_inode
-	def spy(*args, **kwargs):
-		estimates.append(real(*args, **kwargs))
-		return estimates[-1]
-	monkeypatch.setattr(rv, 'get_backup_size_inode', spy)
+	estimates = spy_on_estimates_and_probes(monkeypatch)
 	size = vault_bytes(job)
 	one.run([('mkdir', 'n'), ('mv', 'big', 'n/big')] + changes, 'apart')
 	one.back_up_next()
 	assert len(estimates) == 1
+	(est_size, est_inodes), probes = estimates[0]
 	grew = vault_bytes(job) - size
-	assert 15 << 20 <= estimates[0][0] <= grew
-	assert estimates[0][1] == 2
+	assert 15 << 20 <= est_size <= grew
+	assert est_inodes == names_in(os.path.join(job.monitor, 'n')) + probes

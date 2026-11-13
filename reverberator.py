@@ -1200,8 +1200,6 @@ MERGERFS_FORGET_XATTR = 'user.mergerfs.cmd.invalidate-all-nodes'
 # how often a PoolGuard's poll() checks the pools while a step writes into a version
 POOL_CHECK_SECONDS = 1.0
 
-ARG_MAX = os.sysconf('SC_ARG_MAX')
-ARGUMENT_LIMIT = (ARG_MAX - 4096) // 2048
 
 COOKIE_DICT_MAX_SIZE = 16384
 # queued change events are kept zlib compressed in blocks of this many, about 15 bytes an event instead of about 210
@@ -6025,12 +6023,10 @@ def do_backup(backup_entries:dict,
 			# what the size limit counts is against the tree, wherever it is now
 			tree_now = latest_version_info.path if tree is None else tree
 			attrib_copies = attribs_to_copy(backup_entries,manifest,monitor_path,tree_now) if only_sync_attributes else frozenset()
-			estimated_backup_size, estimated_backup_inode_change = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = tree_now,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies)
-			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes change {estimated_backup_inode_change}')
+			# vault_inodes already holds the tree, and only what the batch adds is new: a delete frees nothing on design R
+			estimated_backup_size, estimated_backup_inode = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = tree_now,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies,manifest = manifest)
+			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes {estimated_backup_inode}')
 			this_version_number = latest_version_info.version_number + 1
-			# vault_inodes already holds the tree, and only what the batch adds is new (a batch that removes some adds nothing to count on)
-			estimated_backup_inode = max(0, estimated_backup_inode_change)
-			backuperTeeLogToTl(job_name,f'Estimated backup inodes {estimated_backup_inode}')
 			vault_fs_size, vault_fs_inode = get_path_fs_info(vault_path)
 			backuperTeeLogToTl(job_name,f'Got vault fs size {vault_fs_size} and vault fs inode {vault_fs_inode}')
 			backup_limit_size, backup_limit_inode = get_backup_limits_from_str(backup_size_limit=backup_size_limit,vault_fs_size=vault_fs_size,vault_fs_inode=vault_fs_inode)
@@ -8453,20 +8449,6 @@ def copy_file_meta(source_file:str,backup_file_path:str,failed:list = None):
 		backuperTeeLogToTl(path=source_file,error=True,message=traceback.format_exc())
 		return False
 
-def get_path_inodes(*path:str):
-	global DEBUG
-	# this function gets the number of inodes in a path
-	# df --inodes -s <path>
-	if DEBUG:
-		startTime = time.perf_counter()
-	rtn = multiCMD.run_command(['du','--inodes','-csP',*path],quiet=True)
-	if DEBUG:
-		backuperTeeLogToTl(path='get_path_inodes',message=f'took {time.perf_counter()-startTime} seconds')
-	if rtn and rtn[-1] and rtn[-1].partition('\t')[0].isdigit():
-		return int(rtn[-1].partition('\t')[0])
-	else:
-		return 0
-
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False,str_format='.2f'):
 	"""
 	Format the size in bytes to a human-readable format or vice versa.
@@ -10886,7 +10868,7 @@ def vault_charge(st:os.stat_result, block:int) -> int:
 		return min(st.st_blocks * 512, -(-st.st_size // block) * block)
 	return st.st_blocks * 512
 
-def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, count_size:bool = True, count_inodes:bool = True) -> tuple:
+def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int) -> tuple:
 	'''
 	What path takes once copied into a vault with blocks of block bytes (vault_charge()) and its inode count, and for a
 	folder (ending with /) those of what the skip list (None: nothing is skipped) leaves below it, for a copy that leaves
@@ -10897,8 +10879,7 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, count_s
 		st = os.lstat(path)
 	except OSError:
 		return 0, 0
-	size = vault_charge(st, block) if count_size else 0
-	inodes = 1 if count_inodes else 0
+	size, inodes = vault_charge(st, block), 1
 	if not path.endswith('/'):
 		return size, inodes
 	walk = iter_tree_entries(path, skip_list.folder_rel(path), skip=skip_list.skips) if skip_list else iter_tree_entries(path)
@@ -10907,17 +10888,18 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, count_s
 			st = os.lstat(entry_path)
 		except OSError:
 			continue
-		if count_size:
-			size += vault_charge(st, block)
-		if count_inodes:
-			inodes += 1
+		size += vault_charge(st, block)
+		inodes += 1
 	return size, inodes
 
-def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset()):
+def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset(),manifest:'VaultManifest' = None):
 	'''
-	This function gets the size of the backup entries: what the vault grows by as the replay copies them, each regular
-	file charged what its copy takes in the vault (vault_charge(), with the block size of the vault's filesystem, read
-	once), by one walk of the sized entries (get_unskipped_size_inodes()).
+	What the vault grows by as the replay copies the backup entries, in bytes and in inodes: each regular file charged what
+	its copy takes in the vault (vault_charge(), with the block size of the vault's filesystem, read once), by one walk of
+	the copied entries (get_unskipped_size_inodes()). On design R a delete frees nothing (the entry goes into the previous
+	version as its record, until that version is pruned), and every copy puts a new inode in the tree while the old one
+	stays in the previous version, so each copy counts its inodes wherever it counts its bytes and a delete counts none. A
+	version's own small blocks and links are left out ( docs/limitations.md ).
 
 	Parameters:
 		backup_entries (dict): The backup entries
@@ -10926,76 +10908,72 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 		monitor_path (str): The path of the monitored path
 		skip_list (SkipList): The job's skip list; with patterns, folders are measured without their skipped contents
 		copied (set): The attrib entries the replay copies under only_sync_attributes ( attribs_to_copy() )
+		manifest (VaultManifest): The vault's rows: with it, and only_sync_attributes off, a plain file's move whose
+			monitored mode, owner or mtime differs from its source row's record is counted, as the replay copies it.
+			Without it no move is counted
 
 	Returns:
-		tuple: The size and inode change compared to previous backup of the backup entries
+		tuple: The bytes and the inodes the batch adds to the vault
 	'''
 	# BACKUP_ENTRY_VALUES_HEADER = ['iso_time','event','source_path']
 	# event can be create, modify, attrib, move, delete
 	total_size = 0
-	total_inode_change = 0
-	path_pending_to_get_inode_del = []
+	total_inodes = 0
 	# the copies land in the vault's filesystem, whose block is what a file's last bytes take there
 	block = os.statvfs(last_vault_version_path).f_frsize
-	def copies(entry, event):
+	def copied_move(entry, values):
+		# the replay copies a moved file whose attributes differ when they are not only synced ( do_reverb_backup() ): told by
+		# one lstat against its source row's record. one whose only difference is an extended attribute is left out, as
+		# reading every moved file's would cost more than the estimate gains; one with no record to tell by is counted
+		if manifest is None or only_sync_attributes or entry.endswith('/') or values.source_path is None:
+			return False
+		try:
+			st = os.lstat(entry)
+		except OSError:
+			return False
+		if not stat.S_ISREG(st.st_mode):
+			return False
+		record = manifest.lookup(os.path.relpath(values.source_path, monitor_path))
+		return record is None or record.mode is None or (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns) != (record.mode, record.uid, record.gid, record.mtime_ns)
+	def copies(entry, values):
 		# what the replay copies: a create or a modify, and a file's attrib unless Only Sync Attributes vouches for the vault's
 		# copy. a folder's attrib copies nothing: the replay gives the folder its metadata alone
-		return event in ('create', 'modify') or (event == 'attrib' and not entry.endswith('/') and (not only_sync_attributes or entry in copied))
-	# a folder create holds the inodes below it in the walks: a full comparison queues an entry for every folder and file
+		event = values.event
+		return event in ('create', 'modify') or (event == 'attrib' and not entry.endswith('/') and (not only_sync_attributes or entry in copied)) or (event == 'move' and copied_move(entry, values))
+	taken = {entry: values.event for entry, values in backup_entries.items() if copies(entry, values)}
+	# a folder create holds what is below it in the walks: a full comparison queues an entry for every folder and file
 	# of a new tree, so a create inside a created folder adds none of its own
-	created_folders = {entry for entry, values in backup_entries.items() if values.event == 'create' and entry.endswith('/')}
+	created_folders = {entry for entry, event in taken.items() if event == 'create' and entry.endswith('/')}
 	# entries lie below the monitored folder, so only parents from it down can hold them
 	parents_from = len(monitor_path.rstrip('/'))
-	# a walk of a folder counts what is in it, so an entry inside a sized folder is not counted again. a sized folder modify
-	# holds only the bytes
-	sized_folders = created_folders | {entry for entry, values in backup_entries.items() if values.event == 'modify' and entry.endswith('/')}
-	for entry in backup_entries:
-		event = backup_entries[entry].event
-		if event == 'delete':
-			if entry.endswith('/'):
-				# this is a directory
-				vault_entry_path = os.path.join(last_vault_version_path,os.path.relpath(entry,monitor_path))
-				path_pending_to_get_inode_del.append(vault_entry_path)
-				if len(path_pending_to_get_inode_del) > ARGUMENT_LIMIT:
-					total_inode_change -= get_path_inodes(*path_pending_to_get_inode_del)
-					path_pending_to_get_inode_del = []
-			else:
-				# this is a file
-				total_inode_change -= 1
-			# size will not decrease as we are not backing up the full content, but inodes will decrease as we are using symlinks
-		elif copies(entry, event):
-			count_size = not inside_folders(entry, sized_folders, parents_from)
-			# we do not count inode change for attrib / modify / move events
-			count_inodes = event == 'create' and not inside_folders(entry, created_folders, parents_from)
-			if count_size or count_inodes:
-				entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block, count_size, count_inodes)
-				total_size += entry_size
-				total_inode_change += entry_inodes
-	if path_pending_to_get_inode_del:
-		total_inode_change -= get_path_inodes(*path_pending_to_get_inode_del)
-	# what a move lands on inside a created folder arrives by the move, and its create copies it not ( mkdir n; mv d n/d )
-	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and created_folders and inside_folders(entry, created_folders)]
+	# a walk of a folder counts what is in it, so an entry inside a sized folder is not counted again
+	sized_folders = created_folders | {entry for entry, event in taken.items() if event == 'modify' and entry.endswith('/')}
+	for entry in taken:
+		if not inside_folders(entry, sized_folders, parents_from):
+			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block)
+			total_size += entry_size
+			total_inodes += entry_inodes
+	# what a move lands on inside a created folder arrives by the move, and its create copies it not ( mkdir n; mv d n/d ),
+	# unless the replay copies the moved file itself
+	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and entry not in taken and created_folders and inside_folders(entry, created_folders)]
 	# one inside another is taken out with it ( mv d n/d; mv y n/d/y )
 	carried_folders = {entry for entry in carried_in if entry.endswith('/')}
 	carried_in = [entry for entry in carried_in if not inside_folders(entry, carried_folders)]
 	for entry in carried_in:
 		entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block)
 		total_size -= entry_size
-		total_inode_change -= entry_inodes
+		total_inodes -= entry_inodes
 	# what the batch copies under a carried folder went out with the folder: the new folder's walk counted it, and so did the
-	# folder just taken out. put back as the walks count: the bytes of each entry not inside a folder of these that is walked,
-	# the inodes of each create not inside a folder of these that is made. a batch that carried no folder in looks at no entry
-	written = {entry: values.event for entry, values in backup_entries.items() if copies(entry, values.event) and inside_folders(entry, carried_folders)} if carried_folders else {}
+	# folder just taken out. put back as the walks count: each entry not inside a folder of these that is walked. a batch
+	# that carried no folder in looks at no entry
+	written = [entry for entry in taken if inside_folders(entry, carried_folders)] if carried_folders else []
 	written_folders = {entry for entry in written if entry.endswith('/')}
-	made_folders = {entry for entry in written_folders if written[entry] == 'create'}
-	for entry, event in written.items():
-		count_size = not inside_folders(entry, written_folders)
-		count_inodes = event == 'create' and not inside_folders(entry, made_folders)
-		if count_size or count_inodes:
-			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block, count_size, count_inodes)
+	for entry in written:
+		if not inside_folders(entry, written_folders):
+			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block)
 			total_size += entry_size
-			total_inode_change += entry_inodes
-	return total_size, total_inode_change
+			total_inodes += entry_inodes
+	return total_size, total_inodes
 
 def get_path_fs_info(path:str):
 	# this function gets the filesystem usage information of a path
