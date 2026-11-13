@@ -696,6 +696,21 @@ def test_an_untracked_delete_over_a_lost_manifest_makes_no_version(job, poll_fas
 	assert committed is True and committed_versions(job) == before
 
 
+def test_a_tracked_delete_over_a_lost_manifest_is_still_removed(job, poll_fast):
+	# pin: with the manifest lost the drop of deletes asks the newest version, which holds the file, so the delete is a change
+	from tests.harness import event_entry
+	from tests.test_vault_units import lose_the_manifest
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	lose_the_manifest(job)
+	os.remove(os.path.join(job.monitor, 'b.txt'))
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'b.txt', 'delete')]))
+	manifest.close()
+	versions = committed_versions(job)
+	assert committed is True and len(versions) == len(before) + 1
+	assert not os.path.lexists(os.path.join(versions[-1], 'b.txt')) and os.path.lexists(os.path.join(before[-1], 'b.txt'))
+
+
 def test_a_file_gone_between_the_check_and_its_open_is_gone_not_unreadable(job, poll_fast, monkeypatch, capsys):
 	# fails at 15b3108: the open's FileNotFoundError is taken for an unreadable file, and the batch logs a false UNREADABLE line,
 	# which alerts. The file is looked at, then gone at the open (faked once: the entry is not there at that moment)
@@ -795,7 +810,7 @@ def test_an_unreadable_file_written_again_and_again_makes_no_version(job, poll_f
 
 @pytest.mark.parametrize('kind', ['fifo', 'socket'])
 def test_a_batch_of_only_a_fifo_or_a_socket_commits_it(job, poll_fast, monkeypatch, kind):
-	# review focus 3: the check counts another kind as a change, and the version holds it, as cp -a copies it as itself
+	# pin (review focus 3): the check counts another kind as a change, and the version holds it, as cp -a copies it as itself
 	import socket
 	import stat as stats
 	seed_monitor(job, {'a.txt': 'a'})

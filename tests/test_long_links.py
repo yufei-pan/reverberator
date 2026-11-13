@@ -308,8 +308,6 @@ def test_a_full_comparison_meeting_only_a_refused_link_makes_no_version(job, mon
 	assert probes == ['t' * 100] and not tracked(job, 'd/l')
 	out = capsys.readouterr()
 	assert warned(out.out + out.err, link) == 1
-	# nothing is left in staging by the probe
-	assert not [name for name in os.listdir(rv.staging_path(job.job_vault)) if name.startswith('.link-probe-')]
 
 
 def test_real_a_full_comparison_meeting_only_a_link_the_vault_refuses_makes_no_version(job, shm, capsys):
@@ -325,10 +323,9 @@ def test_real_a_full_comparison_meeting_only_a_link_the_vault_refuses_makes_no_v
 	assert run_backup(job) == versions
 	out = capsys.readouterr()
 	assert warned(out.out + out.err, link) == 1
-	assert not [name for name in os.listdir(rv.staging_path(job.job_vault)) if name.startswith('.link-probe-')]
 
 
-def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_still_commits_one_version(job, capsys):
+def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_still_commits_one_version(job, capsys, monkeypatch):
 	# fails before the fix of TreeWriter.discard_temp() (on main too): the removal of the link's partial copy raises ENAMETOOLONG,
 	# which fails every batch. Now the narrowed limitation: the probe sits in staging, at a short path, and passes; the copy,
 	# written under its temporary name (54 bytes after its slash), passes Linux's 4,096-byte path limit in a folder whose path
@@ -350,6 +347,14 @@ def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_still_commits_on
 	versions = run_backup(job)
 	link = os.path.join(folder, 'l')
 	made(link, 'short')
+	# the probes made, as the check meets the link
+	probes = []
+	real_symlink = os.symlink
+	def symlink(text, path, *args, **kwargs):
+		if os.path.basename(os.fspath(path)).startswith('.link-probe-'):
+			probes.append(text)
+		return real_symlink(text, path, *args, **kwargs)
+	monkeypatch.setattr(os, 'symlink', symlink)
 	capsys.readouterr()
 	for _ in range(2):
 		before = len(versions)
@@ -357,6 +362,9 @@ def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_still_commits_on
 		assert len(versions) == before + 1 and not os.path.lexists(os.path.join(versions[-1], os.path.relpath(link, job.monitor)))
 		out = capsys.readouterr()
 		assert warned(out.out + out.err, link) == 1
+	# each check made its probe, which the vault took, and unlinked it: nothing is left in staging
+	assert probes == ['short'] * 2
+	assert not [name for name in os.listdir(rv.staging_path(job.job_vault)) if name.startswith('.link-probe-')]
 
 
 def test_a_link_on_a_pool_vault_is_not_probed_and_the_batch_is_not_cleared(job, fake_pool, monkeypatch, capsys):
