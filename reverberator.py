@@ -12551,7 +12551,8 @@ def record_root_meta(monitor_path:str, version_path:str) -> bool:
 	whole-job restore gives the top folder the version folder's own. A record too big for one attribute of a folder
 	(the root's attributes take about 1.4 times their size in it) is written without them, saying so. Either is logged
 	on the first batch of a monitored path that has it, not again while it lasts, and an info line says when it works
-	again. Returns whether a record was written.
+	again. A record equal byte for byte to the one version_path holds is not written again (the root's atime moves at most
+	once a day on relatime). Returns whether version_path holds a record, written now or equal already.
 	'''
 	job = (monitor_path, os.path.dirname(version_path))
 	def tell(state:str, message:str, **kind):
@@ -12572,8 +12573,16 @@ def record_root_meta(monitor_path:str, version_path:str) -> bool:
 				if e.errno != errno.ENODATA:
 					raise
 		meta = RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs)
+		record = encode_root_meta(meta)
 		try:
-			os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(meta), follow_symlinks=False)
+			# the tree keeps the last batch's record: one equal byte for byte, the full one, needs no write. A trimmed one never
+			# equals it, so it is written, and said, as before
+			kept = os.getxattr(version_path, ROOT_META_XATTR, follow_symlinks=False)
+		except OSError:
+			kept = None
+		try:
+			if kept != record:
+				os.setxattr(version_path, ROOT_META_XATTR, record, follow_symlinks=False)
 		except OSError as e:
 			if not xattrs or e.errno not in (errno.ENOSPC, errno.E2BIG, errno.ERANGE):
 				raise

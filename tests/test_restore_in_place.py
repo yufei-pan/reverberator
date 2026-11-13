@@ -6,10 +6,11 @@ import re
 import shutil
 import stat
 import sys
-from collections import deque
+import time
+from collections import deque, OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, run_backup, write_rule, rule_row
+from tests.harness import seed_monitor, run_backup, write_rule, rule_row, event_entry
 from tests.test_restore import Terminal, write, backup, versions, version_path, restore, destination, tree, partial_files
 from tests.test_status_command import write_state, daemon_record, job_record
 
@@ -1312,7 +1313,8 @@ def test_a_record_that_cannot_be_written_logs_once_per_job_and_says_when_it_work
 	failing[0] = False
 	assert rv.record_root_meta(job.monitor, version) and rv.record_root_meta(job.monitor, version)
 	assert len(text()) == 2 and 'again' in text()[1] and not lines[-1][1].get('error')
-	# failing again is news again
+	# failing again is news again; the root changes first, as an equal record is not written again
+	os.chmod(job.monitor, 0o750)
 	failing[0] = True
 	assert not rv.record_root_meta(job.monitor, version)
 	assert len(text()) == 3 and 'Cannot keep the metadata' in text()[2]
@@ -1386,3 +1388,132 @@ def test_two_vaults_backing_up_one_root_are_told_apart_when_one_cannot_keep_the_
 	assert len(messages) == 1 and messages[0].get('error') and 'Cannot keep the metadata' in messages[0]['message']
 	assert not [m for m in messages if 'again' in m['message']]
 	rv.ROOT_META_TROUBLE.clear()
+
+
+def root_meta_store(monkeypatch, limit=None):
+	'''
+	ROOT_META_XATTR kept in a dict by real path, so these tests run without root (trusted.* needs it): os.getxattr and
+	os.setxattr of that one name go to the dict, every other name to the filesystem. A value longer than limit raises ENOSPC.
+	Returns the dict and the writes of that name in order, (real path, the name of the function that called setxattr).
+	'''
+	store, writes = {}, []
+	real_get, real_set = os.getxattr, os.setxattr
+	def getxattr(path, name, *args, **kwargs):
+		if name != rv.ROOT_META_XATTR:
+			return real_get(path, name, *args, **kwargs)
+		try:
+			return store[os.path.realpath(path)]
+		except KeyError:
+			raise OSError(errno.ENODATA, os.strerror(errno.ENODATA), path) from None
+	def setxattr(path, name, value, *args, **kwargs):
+		if name != rv.ROOT_META_XATTR:
+			return real_set(path, name, value, *args, **kwargs)
+		writes.append((os.path.realpath(path), sys._getframe(1).f_code.co_name))
+		if limit is not None and len(value) > limit:
+			raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), path)
+		store[os.path.realpath(path)] = bytes(value)
+	monkeypatch.setattr(os, 'getxattr', getxattr)
+	monkeypatch.setattr(os, 'setxattr', setxattr)
+	monkeypatch.setattr(rv, 'ROOT_META_TROUBLE', {})
+	return store, writes
+
+
+def still_root(root):
+	'''Sets root's atime 10 s past its mtime and ctime, so relatime moves it in no walk of the next day (no trace of the test's own reads).'''
+	st = os.lstat(root)
+	os.utime(root, ns=(max(st.st_mtime_ns, time.time_ns()) + 10 ** 10, st.st_mtime_ns))
+
+
+def root_now(root):
+	'''The RootMeta record_root_meta() would write for root now.'''
+	st = os.lstat(root)
+	xattrs = {name: os.getxattr(root, name, follow_symlinks=False) for name in rv.xattr_names(root)}
+	return rv.RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs)
+
+
+def one_file_batch(job, i):
+	'''A batch of one file in a subfolder, sub/f.txt written anew: the root's own times stay. The newest version's folder.'''
+	with open(os.path.join(job.monitor, 'sub', 'f.txt'), 'w') as f:
+		f.write('x' * (i + 2))
+	return run_backup(job, OrderedDict([event_entry(job, 'sub/f.txt', 'modify')]))[-1]
+
+
+def a_root_with_v0(job, **xattrs):
+	seed_monitor(job, {'sub/f.txt': 'a'})
+	for name, value in xattrs.items():
+		os.setxattr(job.monitor, name, value)
+	still_root(job.monitor)
+	return run_backup(job)[-1]
+
+
+def root_meta_writes(writes, since=0):
+	return [w for w in writes[since:] if w[1] == 'record_root_meta']
+
+
+def test_an_unchanged_root_record_is_not_written_again(job, monkeypatch):
+	# fails on main: record_root_meta() writes every batch
+	store, writes = root_meta_store(monkeypatch)
+	a_root_with_v0(job)
+	after_v0 = len(writes)
+	assert root_meta_writes(writes) and after_v0
+	for i in range(3):
+		newest = one_file_batch(job, i)
+	assert root_meta_writes(writes, after_v0) == []
+	assert rv.load_root_meta(newest) == root_now(job.monitor)
+
+
+def test_a_chmod_of_the_root_writes_its_record(job, monkeypatch):
+	# pin: a chmod of the root, then one batch: one write from record_root_meta, the newest version's record has the new mode
+	store, writes = root_meta_store(monkeypatch)
+	a_root_with_v0(job)
+	os.chmod(job.monitor, 0o750)
+	still_root(job.monitor)
+	after = len(writes)
+	newest = one_file_batch(job, 0)
+	assert len(root_meta_writes(writes, after)) == 1
+	assert rv.load_root_meta(newest).mode == 0o750 and rv.load_root_meta(newest) == root_now(job.monitor)
+
+
+def trimmed_lines(lines):
+	return [kwargs for args, kwargs in lines if 'do not fit' in kwargs.get('message', '')]
+
+
+def test_a_trimmed_record_is_written_every_batch_and_said_once(job, monkeypatch):
+	# pin: a root whose user.big of 3000 bytes does not fit (a limit of 3,500 bytes): each batch writes the trimmed record
+	store, writes = root_meta_store(monkeypatch, limit=3500)
+	lines = logged(monkeypatch)
+	a_root_with_v0(job, **{'user.big': b'x' * 3000})
+	for i in range(3):
+		after = len(writes)
+		newest = one_file_batch(job, i)
+		assert root_meta_writes(writes, after)
+		assert rv.load_root_meta(newest) == root_now(job.monitor)._replace(xattrs={})
+	assert len(trimmed_lines(lines)) == 1
+
+
+def test_a_trimmed_record_after_a_restart_is_said_once_more(job, monkeypatch):
+	# pin: as above, then a restart (ROOT_META_TROUBLE emptied) with the trimmed record on the tree: the next batch says it once
+	store, writes = root_meta_store(monkeypatch, limit=3500)
+	lines = logged(monkeypatch)
+	a_root_with_v0(job, **{'user.big': b'x' * 3000})
+	one_file_batch(job, 0)
+	assert len(trimmed_lines(lines)) == 1
+	rv.ROOT_META_TROUBLE.clear()
+	one_file_batch(job, 1)
+	one_file_batch(job, 2)
+	assert len(trimmed_lines(lines)) == 2
+
+
+def test_a_skip_ends_a_failed_state_with_its_line(job, monkeypatch):
+	# fails on main (it writes): a 'failed' state with an equal record on the tree: the next batch writes nothing, says
+	# "is kept on ... again" once, and the state is gone
+	store, writes = root_meta_store(monkeypatch)
+	a_root_with_v0(job)
+	rv.ROOT_META_TROUBLE[(job.monitor, job.job_vault)] = 'failed'
+	lines = logged(monkeypatch)
+	after = len(writes)
+	one_file_batch(job, 0)
+	assert root_meta_writes(writes, after) == []
+	again = [kwargs for args, kwargs in lines if 'is kept on' in kwargs.get('message', '') and 'again' in kwargs['message']]
+	assert len(again) == 1 and not again[0].get('error')
+	assert rv.ROOT_META_TROUBLE == {}
