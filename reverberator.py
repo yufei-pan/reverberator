@@ -10999,7 +10999,9 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	def copied_move(entry, values):
 		# the replay copies a moved file whose attributes differ when they are not only synced ( do_reverb_backup() ): told by
 		# one lstat against its source row's record. one whose only difference is an extended attribute is left out, as
-		# reading every moved file's would cost more than the estimate gains; one with no record to tell by is counted
+		# reading every moved file's would cost more than the estimate gains; so is one with no record to tell by, as on main
+		# ( a source that moved earlier in the batch has no row at its new place yet: mv d x; mv x/m a ). counted as a copy it
+		# would prune old versions for a copy the replay may never make; left out, the vault passes its limit until the next prune
 		if manifest is None or only_sync_attributes or entry.endswith('/') or values.source_path is None:
 			return False
 		try:
@@ -11009,7 +11011,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 		if not stat.S_ISREG(st.st_mode):
 			return False
 		record = manifest.lookup(os.path.relpath(values.source_path, monitor_path))
-		return record is None or record.mode is None or (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns) != (record.mode, record.uid, record.gid, record.mtime_ns)
+		return record is not None and record.mode is not None and (st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns) != (record.mode, record.uid, record.gid, record.mtime_ns)
 	def copies(entry, values):
 		# what the replay copies: a create or a modify, and a file's attrib unless Only Sync Attributes vouches for the vault's
 		# copy. a folder's attrib copies nothing: the replay gives the folder its metadata alone
@@ -11029,8 +11031,10 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 			total_size += entry_size
 			total_inodes += entry_inodes
 	# what a move lands on inside a created folder arrives by the move, and its create copies it not ( mkdir n; mv d n/d ),
-	# unless the replay copies the moved file itself
-	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and entry not in taken and created_folders and inside_folders(entry, created_folders)]
+	# unless the replay copies the moved file itself, or the move's new place is inside its old one ( mv D x; mkdir D; mv x D/D ):
+	# the version cannot rename an entry into itself, so the replay copies it whole
+	carried_in = [entry for entry, values in backup_entries.items() if values.event == 'move' and entry not in taken and created_folders and inside_folders(entry, created_folders)
+		and not entry.rstrip('/').startswith(values.source_path.rstrip('/') + '/')]
 	# one inside another is taken out with it ( mv d n/d; mv y n/d/y )
 	carried_folders = {entry for entry in carried_in if entry.endswith('/')}
 	carried_in = [entry for entry in carried_in if not inside_folders(entry, carried_folders)]

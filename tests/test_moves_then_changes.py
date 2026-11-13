@@ -503,6 +503,83 @@ def test_a_chmod_then_a_move_with_attributes_copied_counts_one_copy(job, monkeyp
 	assert written <= estimates[0][0]
 
 
+def estimates_made(monkeypatch):
+	'''The (bytes, inodes) of each size estimate the backuper makes from now on.'''
+	estimates = []
+	real = rv.get_backup_size_inode
+	monkeypatch.setattr(rv, 'get_backup_size_inode', lambda *args, **kwargs: estimates.append(real(*args, **kwargs)) or estimates[-1])
+	return estimates
+
+
+def test_a_file_moved_out_of_a_folder_renamed_in_the_same_batch_estimates_no_copy(job, monkeypatch):
+	# pin (passes on main; fails with a move whose source row has no record counted as a copy): mv d x; mv x/m a, Only Sync
+	# Attributes off. m's row is still at d/m when the batch is estimated, as rows move once the replay renames, so x/m has no
+	# record; the replay renames twice and copies nothing
+	seed_monitor(job, {'d/m': 'm' * (2 << 20), 'k': 'k'})
+	run_backup(job, only_sync_attributes=False)
+	m = job.monitor
+	os.rename(f'{m}/d', f'{m}/x')
+	os.rename(f'{m}/x/m', f'{m}/a')
+	entries = batch(job, (True, 'move', 'x', 'd'), (False, 'move', 'a', 'x/m'))
+	estimates = estimates_made(monkeypatch)
+	copies = copies_made(monkeypatch)
+	run_backup(job, entries, only_sync_attributes=False)
+	assert copies == []
+	assert estimates == [(0, 0)]
+
+
+def test_a_size_limit_prunes_no_version_for_a_file_moved_out_of_a_folder_renamed_in_the_same_batch(job):
+	# pin (passes on main; fails with the same count): a vault 500 KiB under its size limit holds its versions, as the batch
+	# writes nothing. counted as a copy of 2 MiB, the estimate would prune them all for it
+	seed_monitor(job, {'d/m': 'm' * (2 << 20), 'k': 'k'})
+	run_backup(job, only_sync_attributes=False)
+	for i in range(5):
+		with open(os.path.join(job.monitor, 'k'), 'w') as f:
+			f.write(str(i) * 100000)
+		run_backup(job, batch(job, (False, 'modify', 'k', None)), only_sync_attributes=False)
+	limit = rv.get_vault_info(job.job_vault).vault_size + (500 << 10)
+	before = committed_versions(job)
+	m = job.monitor
+	os.rename(f'{m}/d', f'{m}/x')
+	os.rename(f'{m}/x/m', f'{m}/a')
+	after = run_backup(job, batch(job, (True, 'move', 'x', 'd'), (False, 'move', 'a', 'x/m')), only_sync_attributes=False, backup_size_limit=str(limit))
+	assert len(after) == len(before) + 1
+
+
+def tree_entries(job):
+	'''{inode: path} of every entry of the newest version, the tree, links left out.'''
+	top = rv.list_versions(job.job_vault)[-1].path
+	found = {os.lstat(top).st_ino: top}
+	for folder, dirs, files in os.walk(top):
+		for name in dirs + files:
+			path = os.path.join(folder, name)
+			if not os.path.islink(path):
+				found[os.lstat(path).st_ino] = path
+	return found
+
+
+def test_a_folder_moved_into_its_own_old_place_is_estimated_as_the_copy_the_replay_makes(job, monkeypatch):
+	# fails on the carried-in subtraction ( the estimate took the move out as a rename into the created folder, which the
+	# replay copies whole ): mv D x; mkdir D; mv x D/D, one batch. what the batch writes in bytes and in inodes is at most
+	# its estimate
+	seed_monitor(job, {'D/a': 'a' * 100000, 'D/s/b': 'b' * 100000, 'k': 'k'})
+	run_backup(job)
+	m = job.monitor
+	os.rename(f'{m}/D', f'{m}/x')
+	os.mkdir(f'{m}/D')
+	os.rename(f'{m}/x', f'{m}/D/D')
+	entries = batch(job, (True, 'move', 'x', 'D'), (True, 'create', 'D', None), (True, 'move', 'D/D', 'x'))
+	before = tree_entries(job)
+	estimates = estimates_made(monkeypatch)
+	run_backup(job, entries)
+	assert len(estimates) == 1
+	new = {inode: path for inode, path in tree_entries(job).items() if inode not in before}
+	written = sum(charge(path, job.job_vault) for path in new.values())
+	# the folder D/D and its three files and one folder below are copies: they are what the vault grows by
+	assert len(new) >= 5 and written >= 200000
+	assert written <= estimates[0][0] and len(new) <= estimates[0][1], (written, len(new), estimates)
+
+
 def test_the_row_oracle_finds_a_row_that_does_not_match(job):
 	# a committed vault whose rows are all checked (a full comparison read V0's copies back), then a vault file's mode changed
 	# behind the manifest
