@@ -15,12 +15,14 @@ seed and every run go in a JSONL under REVERB_SCRATCH; a failed run keeps its im
 '''
 import contextlib
 import errno
+import functools
 import json
 import os
 import pickle
 import random
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -39,7 +41,7 @@ from tests.scratch_images import flush_scratch, LoopImage, SCRATCH, shut_down_sc
 from tests.test_migration import cli_differences, expected as views_by_number, folders_of, migrate, plain_links, SMALL
 from tests.test_pool_writer import MERGERFS_OPTIONS, needs_mergerfs, pool_writer
 from tests.test_tree_writer import a_vault as a_vault_of_two_names
-from tests.vault_oracle import check_vault, read_view, recorded_design_r, sha256_of, snapshot_tree, version_number
+from tests.vault_oracle import check_vault, read_view, recorded_design_r, rows_match_vault, sha256_of, snapshot_tree, version_number
 
 pytestmark = pytest.mark.skipif(os.geteuid() != 0, reason='the root record is a trusted.* attribute, and a file is chowned')
 
@@ -823,8 +825,16 @@ def judged(shape: Shape, job, work: str, seed: str) -> list:
 		return [f'the vault cannot be read: {type(e).__name__}: {e}']
 
 
-def one_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, retry_fault=None) -> list:
-	'''What is wrong after the run (kill, cuts), as lines. Empty means it passed.'''
+def judged_rows(job) -> list:
+	'''What the manifest's checked rows say that the entries they describe do not (the row oracle), as lines: a vault whose rows cannot be read is a wrong run, as in judged().'''
+	try:
+		return [f'row: {line}' for line in rows_match_vault(job.job_vault)]
+	except (OSError, sqlite3.Error) as e:
+		return [f'the rows cannot be read: {type(e).__name__}: {e}']
+
+
+def one_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, retry_fault=None, rows: bool = False) -> list:
+	'''What is wrong after the run (kill, cuts), as lines. Empty means it passed. With rows, the row oracle reads the vault too.'''
 	job = shape.job_paths()
 	lines = []
 	with Pool(shape.root, work, shape.disks, shape.template, shape.mergerfs_options) as pool:
@@ -850,6 +860,8 @@ def one_run(shape: Shape, work: str, kill: int, cuts: tuple, cut_fault=None, ret
 			lines.append(f'the retry: {again.error or again}')
 		else:
 			lines += judged(shape, job, work, f'{kill} {cuts}')
+			if rows:
+				lines += judged_rows(job)
 		if lines and shape.keep_failed():
 			pool.keep_images(os.path.join(shape.base, 'failed', f'{shape.name}-{kill}-{"-".join(map(str, cuts))}'))
 	return lines
@@ -1050,21 +1062,26 @@ def no_pre_record_flush(module):
 	module.TreeWriter.pre_record = pre_record
 
 
-def caught(name: str, request, plan, tag: str, cut_fault=None, retry_fault=None) -> bool:
+def wrong_runs(name: str, request, plan, tag: str, cut_fault=None, retry_fault=None, runner=None) -> list:
 	"""
-	Whether a run of plan(trace, disks) goes wrong with these faults, on a template or a later one: where a pool put a file decides whether some windows show
-	at all, as the comparison copies again all but a file that cannot be read.
+	The runs of plan(trace, disks) that go wrong with these faults, on the first template where any do, or on every one of CONTROL_TEMPLATES: where a pool
+	put a file decides whether some windows show at all, as the comparison copies again all but a file that cannot be read. [] when none does.
 	"""
 	for attempt in range(CONTROL_TEMPLATES):
 		BUILT.discard(name)
 		shape = built_shape(name, request)
 		trace, held = steps_of(shape, cut_fault)
 		runs = plan(trace, shape.disks)
-		wrong = run_all(shape, runs, held, tag, cut_fault, retry_fault)
+		wrong = run_all(shape, runs, held, tag, cut_fault, retry_fault, runner)
 		print(f'{tag}, template {attempt + 1}: {len(wrong)} of {len(runs)} runs wrong')
 		if wrong:
-			return True
-	return False
+			return wrong
+	return []
+
+
+def caught(name: str, request, plan, tag: str, cut_fault=None, retry_fault=None) -> bool:
+	"""Whether a run of plan(trace, disks) goes wrong with these faults, on a template or a later one (wrong_runs())."""
+	return bool(wrong_runs(name, request, plan, tag, cut_fault, retry_fault))
 
 
 def test_the_pre_record_fault_takes_away_the_flush_and_nothing_else(tmp_path, fake_pool, monkeypatch):
@@ -1122,12 +1139,61 @@ def skipping(name: str):
 # them into the tree, as it gives each forward link the cut lost back first (put_back_forward_links(), below). In the sweep's two runs that reach the
 # state (the cut at the rename, one disk checkpointed before it and one after), the one file whose last copy is on the disk with the old name, the one
 # that cannot be read and keeps its last copy, is still in the new version, where 0.55.4 lost it, and every version reads exact (the oracle, the
-# rows, the commands); 0 of 275 runs wrong in 12 templates. The repair itself is pinned by the tests of it above, which fail with it taken out.
+# rows, the commands); 0 of 275 runs wrong in 12 templates. The repair itself is pinned by the tests of it above, which fail with it taken out, and the
+# test after this one pins what is left to the scan without it.
 @needs_mergerfs
 @pytest.mark.parametrize('name, repair', [('mixed-2', 'remove_shadowed_links'), ('mixed-2', 'put_back_forward_links'), ('mixed-2', 'remove_mixed_names'),
 	('conversion-2', 'finish_conversion_renames')])
 def test_a_skipped_repair_is_caught(name, repair, request):
 	assert caught(name, request, apply_runs if repair == 'remove_mixed_names' else control_runs, f'-control-{repair}', retry_fault=skipping(repair))
+
+
+def skipping_the_tree_rename_and_noting_it(folder: str):
+	"""
+	A retry fault: finish_tree_rename() skipped, run with os.rename stubbed so that it says whether it would have renamed a tree on a disk. Each call
+	that would have puts a line in folder/<pid>, a file of the retry's own process: the run is in the state the repair is for.
+	"""
+	def fault(module):
+		real = module.finish_tree_rename
+		def skipped(*args):
+			would = []
+			real_rename = module.os.rename
+			module.os.rename = lambda source, dest, *more, **options: would.append(os.fspath(source))
+			try:
+				real(*args)
+			finally:
+				module.os.rename = real_rename
+			if would:
+				with open(os.path.join(folder, str(os.getpid())), 'a') as f:
+					f.write(json.dumps(would) + '\n')
+			return False
+		module.finish_tree_rename = skipped
+	return fault
+
+
+@needs_mergerfs
+def test_a_skipped_tree_rename_repair_leaves_every_version_exact(request):
+	# the opposite of the controls above, on the state finish_tree_rename() is for: a hand-over's tree renamed on one disk only, the other disk still
+	# holding the previous version's real entries under the old name. With the manifest standing the scan's put-back makes the tree version n's again,
+	# linking each real entry of the previous version into it after giving the lost forward links back, so every version reads exact without the repair:
+	# the oracle, the row oracle (rows_match_vault()) and a restored file of each version, in every run of the controls on 12 templates. The count
+	# says the runs did reach the state (the repair would have renamed a tree), which the cut at the rename does with one disk checkpointed before it and
+	# one after; a change that makes the repair needed again fails this test, and the case goes back to the controls above. Root and mergerfs only
+	reached_in = os.path.join(SCRATCH, 'pool-cut', 'tree-rename-reached')
+	shutil.rmtree(reached_in, ignore_errors=True)
+	os.makedirs(reached_in)
+	try:
+		wrong = wrong_runs('mixed-2', request, control_runs, '-control-finish_tree_rename-exact', retry_fault=skipping_the_tree_rename_and_noting_it(reached_in),
+			runner=functools.partial(one_run, rows=True))
+		reached = 0
+		for name in os.listdir(reached_in):
+			with open(os.path.join(reached_in, name)) as f:
+				reached += len(f.readlines())
+	finally:
+		shutil.rmtree(reached_in, ignore_errors=True)
+	print(f'the repair would have renamed a tree in {reached} calls of the retry')
+	assert not wrong, f'{len(wrong)} runs wrong with the repair skipped: {wrong[:3]}'
+	assert reached, 'no run reached the state the repair is for: this test pins nothing'
 
 
 # --- the one state placement decides ---
