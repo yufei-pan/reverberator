@@ -68,18 +68,15 @@ def test_restart_finishes_incomplete_keeps_committed(job, run_reverberator):
 	assert sorted(os.listdir(orphan)) == ['a.txt'] and open(os.path.join(orphan, 'a.txt')).read() == 'hello'
 
 
-def test_pending_resume_and_discard(job, run_reverberator):
+def test_a_pending_file_an_older_release_left_is_removed_at_the_start(job, run_reverberator):
 	seed_monitor(job, {'a.txt': 'hello'})
 	write_rule(job)
 	a = os.path.join(job.monitor, 'a.txt')
 	os.makedirs(job.job_vault, exist_ok=True)
 	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
-	os.utime(job.monitor, (1000, 1000))
-	os.utime(a, (1000, 1000))
-	os.utime(pending, (2000, 2000))
 	run_reverberator(job.rule_path)
 	wait_for_committed_count(job, 1, timeout=10)
-	wait_until(lambda: not os.path.exists(pending), timeout=10, message='pending file not consumed')
+	wait_until(lambda: not os.path.exists(pending), timeout=10, message='the pending file was not removed')
 
 
 def test_skip_list_relative_to_rule_file_keeps_matches_out(job, run_reverberator):

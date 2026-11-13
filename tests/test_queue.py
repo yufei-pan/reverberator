@@ -22,9 +22,7 @@ def test_queue_keeps_order_across_packed_blocks(monkeypatch):
 	taken = queue.take()
 	assert (len(queue), list(taken)) == (0, events)
 	queue.append(_ev(20, 'modify', '/m/late'))
-	# a backup that did not commit hands its batch back in front of what arrived since
-	queue.prepend(events[:4])
-	assert list(queue) == events[:4] + [_ev(20, 'modify', '/m/late')]
+	assert list(queue) == [_ev(20, 'modify', '/m/late')]
 
 
 def test_queue_compacts_as_it_grows(monkeypatch):

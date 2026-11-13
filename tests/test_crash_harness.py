@@ -726,21 +726,19 @@ def test_a_comparison_of_scanned_folders_leaves_a_cut_batch_to_the_whole_compari
 	assert full is True and info.tree is not None and not entries
 
 
-def test_a_cut_batch_that_held_moves_ends_exact_with_or_without_its_saved_entries(plain_r_vault):
-	# the comparison of the whole tree says what the roll-forward replays: the entries the pending transactions give at the next start
-	# change nothing, with or without them. batch 3 holds moves of files and folders, among them a swap
+def test_a_cut_batch_that_held_moves_ends_exact_after_its_roll_forward(plain_r_vault):
+	# the comparison of the whole tree says what the roll-forward replays. batch 3 holds moves of files and folders, among them a swap
 	vault = plain_r_vault
 	job_vault = vault.job.job_vault
 	total = cut_batch(vault).steps
 	for point in (total // 3, total // 2, total - 3):
-		for given in (True, False):
-			restore(vault)
-			assert cut_batch(vault, point).killed
-			outcome = cut_batch(vault) if given else retried(vault)
-			assert outcome.error is None and outcome.committed is True, outcome
-			assert wrong_after_retry(vault) == [], (point, given)
-			folder = folder_of(job_vault, 3)
-			assert read_view(job_vault, folder)[f'w/x{UNREADABLE}'] == vault.base[2][f'w/x{UNREADABLE}']
+		restore(vault)
+		assert cut_batch(vault, point).killed
+		outcome = retried(vault)
+		assert outcome.error is None and outcome.committed is True, outcome
+		assert wrong_after_retry(vault) == [], point
+		folder = folder_of(job_vault, 3)
+		assert read_view(job_vault, folder)[f'w/x{UNREADABLE}'] == vault.base[2][f'w/x{UNREADABLE}']
 
 
 BIG = 200 * 1024
@@ -748,7 +746,7 @@ STAMP = 1700000000_000000000
 
 
 def canonical_monitor(monitor):
-	'''The monitored tree the saved-entry tests start from, every mtime fixed, so a version made of it matches it again at each cut point.'''
+	'''The monitored tree the cut-batch tests start from, every mtime fixed, so a version made of it matches it again at each cut point.'''
 	for rel in ('a.txt', 'dd', 'big.bin'):
 		path = os.path.join(monitor, rel)
 		if os.path.isdir(path) and not os.path.islink(path):
@@ -803,8 +801,8 @@ def file_is_gone(monitor):
 	os.remove(os.path.join(monitor, 'dd/f'))
 
 
-# (what the batch changes, its events, what happens to the tree while the daemon is down); the saved entries are given again at the next start
-SAVED_ENTRIES = {
+# (what the batch changes, its events, what happens to the tree while the daemon is down)
+CUT_BATCHES = {
 	'rewrite': (lambda m: (put_text(m, 'a.txt', 'a1'), rewrite_in_place(m)), [(False, 'modify', 'a.txt', None), (False, 'modify', 'big.bin', None)], lambda m: None),
 	'rewrite_by_delete_and_create': (rewrite_by_delete_and_create, [(False, 'delete', 'big.bin', None), (False, 'create', 'big.bin', None)], lambda m: None),
 	'rewrite_by_rename_over': (lambda m: os.replace(os.path.join(m, 'spare.bin'), os.path.join(m, 'big.bin')), [(False, 'move', 'big.bin', 'spare.bin')], lambda m: None),
@@ -816,11 +814,17 @@ SAVED_ENTRIES = {
 }
 
 
-@pytest.mark.parametrize('scenario', SAVED_ENTRIES)
-def test_a_cut_batch_is_rolled_forward_with_its_saved_entries_given_again(tmp_path, scenario):
-	# a stop cuts the batch at each step; the tree changes while the daemon is down (or not); the next start is given the saved
-	# entries again. The comparison says what the tree is, and of the entries only a plain file's change it cannot see is added
-	change, events, after = SAVED_ENTRIES[scenario]
+# the batches whose change only the watcher saw: big.bin rewritten at its size, its mtime put back
+WATCHER_ONLY = {'rewrite', 'rewrite_by_delete_and_create', 'rewrite_by_rename_over'}
+
+
+@pytest.mark.parametrize('scenario', CUT_BATCHES)
+def test_a_cut_batch_is_rolled_forward_by_the_next_starts_comparison(tmp_path, scenario):
+	# a stop cuts the batch at each step; the tree changes while the daemon is down (or not); the next start saves nothing and
+	# is given no entries: its full comparison says what the tree is, and each name the cut batch recorded is copied again. A
+	# rewrite only the watcher saw is in the version when the cut batch had recorded big.bin, and missed otherwise: the
+	# blind spot of "A rewrite made while down that keeps size and mtime", whose event the stop dropped
+	change, events, after = CUT_BATCHES[scenario]
 	job = create_job(str(tmp_path))
 	canonical_monitor(job.monitor)
 	before = snapshot_tree(job.monitor)
@@ -845,15 +849,19 @@ def test_a_cut_batch_is_rolled_forward_with_its_saved_entries_given_again(tmp_pa
 			continue
 		if not cut.killed:
 			break
-		if rv.get_vault_info(job.job_vault).tree is None:
+		info = rv.get_vault_info(job.job_vault)
+		if info.tree is None:
 			continue
 		after(job.monitor)
-		again = in_child(job, None, work)
+		again = in_child(job, None, lambda: run_do_backup(job, OrderedDict(), matched_since=time.time_ns()))
 		rolled += 1
 		if again.error is not None or again.committed is not True:
 			wrong.append((point, again))
 			continue
-		problems = check_vault(job.job_vault, {0: before, 1: snapshot_tree(job.monitor)}, set()) + view_truth.wrong_lists(job.job_vault)
+		expected = snapshot_tree(job.monitor)
+		if scenario in WATCHER_ONLY and 'big.bin' not in info.recorded:
+			expected['big.bin'] = before['big.bin']
+		problems = check_vault(job.job_vault, {0: before, 1: expected}, set()) + view_truth.wrong_lists(job.job_vault)
 		if problems:
 			wrong.append((point, problems[:4]))
 	assert rolled > 0

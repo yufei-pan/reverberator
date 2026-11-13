@@ -424,40 +424,6 @@ def test_change_list_round_trips_bad_names(job, poll_fast):
 	assert change_rows(version)[-1] == (path('old\udcfa'), 'create', None)
 
 
-def test_pending_transactions_round_trip_bad_names(job, tmp_path):
-	escape = rv.NAME_ESCAPE
-	put(job.monitor, b'bad\xff.txt')
-	path = lambda rel: os.path.join(job.monitor, rel)
-	events = [
-		rv.ChangeEvent(5.0, False, 'create', path('bad\udcff.txt'), None),
-		rv.ChangeEvent(5.0, False, 'move', path('d\udcff/x\udcfe'), path('bad\udcfd')),
-		rv.ChangeEvent(6.0, True, 'delete', path('e\udcfc') + '/', None),
-		rv.ChangeEvent(7.0, False, 'modify', path('two\nlines\udcfb'), None),
-		rv.ChangeEvent(8.0, False, 'modify', path('x' + escape + '\U0010ffff'), None),
-		rv.ChangeEvent(9.0, False, 'move', path('x\U0010ff80'), path('y' + escape)),
-	]
-	os.makedirs(job.job_vault)
-	rv.persist_pending_transactions(job.job_name, job.vault, deque(events))
-	pending = os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME)
-	assert b'?' not in raw(pending) and raw_rows(pending)[0][3] == os.fsencode(job.monitor) + b'/bad' + STORED_FF + b'.txt'
-	assert [row[3:] for row in written(pending)] == [[rv.storable_name(event.path), rv.storable_name(event.moved_from or '')] for event in events]
-	for folder, names, files in os.walk(job.monitor):
-		for name in [folder] + [os.path.join(folder, name) for name in files]:
-			os.utime(name, (1000, 1000))
-	os.utime(pending, (2000, 2000))
-	loaded = rv.ChangeEventQueue(job.monitor)
-	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, loaded) is True
-	assert [(event.event, event.is_dir, event.path, event.moved_from) for event in loaded] == [
-		(event.event, event.is_dir, event.path, event.moved_from) for event in events]
-	assert not os.path.exists(pending)
-	# as 0.39 wrote them, with no escape in any name
-	rv.persist_pending_transactions(job.job_name, job.vault, deque([rv.ChangeEvent(1.0, False, 'modify', path('café'), None)]))
-	os.utime(pending, (2000, 2000))
-	loaded = rv.ChangeEventQueue(job.monitor)
-	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, loaded) is True
-	assert [event.path for event in loaded] == [path('café')]
-
-
 def test_retention_with_bad_names(job, poll_fast):
 	put(job.monitor, b'bad\xff.txt', 'old')
 	put(job.monitor, b'd\xff/x\xfe', 'nested')

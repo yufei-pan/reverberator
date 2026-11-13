@@ -40,7 +40,7 @@ def test_marker_helpers_exact_text(capsys):
 	assert rv.daemon_error_log('every job is stopped') == 'reverberator EXITING with error: every job is stopped'
 
 
-def test_backuper_failure_stops_only_its_job_and_keeps_events(job, poll_fast, monkeypatch):
+def test_backuper_failure_stops_only_its_job_and_saves_nothing(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	def broken(*args, **kwargs):
 		raise OSError(5, 'Input/output error')
@@ -53,7 +53,8 @@ def test_backuper_failure_stops_only_its_job_and_keeps_events(job, poll_fast, mo
 	thread.join(timeout=5)
 	assert not thread.is_alive() and rv.GREEN_LIGHT.is_set()
 	assert 'Input/output error' in control.failure.reason and not control.failure.permanent
-	assert len(queue) == 1
+	# the batch is not handed back: the job's next attempt compares the whole tree first
+	assert len(queue) == 0
 	assert not os.path.exists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
 
 
@@ -225,55 +226,28 @@ def test_run_job_starts_an_attempt_only_after_the_last_one_ended(monkeypatch, po
 	assert alive_at_start == [[], [False], [False, False]]
 
 
-def _run_job_in_thread(control, start_attempt, persist_pending):
+def _run_job_in_thread(control, start_attempt):
 	result = []
-	thread = threading.Thread(target=lambda: result.append(rv.run_job(control, start_attempt, persist_pending=persist_pending)), daemon=True)
+	thread = threading.Thread(target=lambda: result.append(rv.run_job(control, start_attempt)), daemon=True)
 	thread.start()
 	return thread, result
 
 
-def test_run_job_saves_the_queue_when_stopped_in_its_retry_delay(job, monkeypatch, poll_fast):
+def test_run_job_stopped_in_its_retry_delay_exits_and_saves_nothing(job, monkeypatch, poll_fast):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 3600)
-	queue = rv.ChangeEventQueue(job.monitor)
-	lock = threading.Lock()
-	a = os.path.join(job.monitor, 'a.txt')
-	queue.append(rv.ChangeEvent(1.0, False, 'modify', a, None))
 	failed = threading.Event()
 	def start_attempt(control, attempt):
 		control.fail('disk gone')
 		failed.set()
 		return []
-	thread, result = _run_job_in_thread(rv.JobControl(job.job_name), start_attempt,
-		lambda: rv.persist_failed_job_queue(job.job_name, job.monitor, job.vault, queue, lock))
+	thread, result = _run_job_in_thread(rv.JobControl(job.job_name), start_attempt)
 	assert failed.wait(2)
-	pending = os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME)
-	assert not os.path.exists(pending)
 	rv.GREEN_LIGHT.clear()
 	thread.join(timeout=5)
 	rv.GREEN_LIGHT.set()
+	# the next start compares the whole tree, which covers whatever the failed job had queued
 	assert result == ['exit']
-	text = open(pending).read()
-	# the job was not watched while it waited: the next start compares the whole tree, which covers the queued change
-	assert '\x00full_scan\x00' in text
-
-
-def test_run_job_leaves_a_healthy_stop_to_the_backuper(poll_fast):
-	saved = []
-	control = rv.JobControl('j')
-	def start_attempt(job, attempt):
-		def idle():
-			while job.should_run():
-				time.sleep(0.01)
-		thread = threading.Thread(target=idle, name='j backuper', daemon=True)
-		thread.start()
-		return [thread]
-	thread, result = _run_job_in_thread(control, start_attempt, lambda: saved.append(True))
-	wait_until(control.running.is_set, timeout=2)
-	rv.GREEN_LIGHT.clear()
-	thread.join(timeout=5)
-	rv.GREEN_LIGHT.set()
-	# its backuper saved a complete queue, as the job was watched until the stop
-	assert result == ['exit'] and saved == []
+	assert not os.path.exists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
 
 
 def test_apply_job_timing_from_env(monkeypatch):
@@ -682,7 +656,7 @@ def test_job_attempt_starter_passes_the_backuper_keywords(monkeypatch):
 	assert got == [dict(full_comparison_interval=3600.0)]
 
 
-def test_interrupted_full_comparison_is_requeued(job, poll_fast, monkeypatch):
+def test_an_interrupted_full_comparison_saves_nothing(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	def interrupted(*args, **kwargs):
 		rv.GREEN_LIGHT.clear()
@@ -695,15 +669,8 @@ def test_interrupted_full_comparison_is_requeued(job, poll_fast, monkeypatch):
 	thread, queue = _run_backuper(job, control, to_process=queue)
 	thread.join(timeout=5)
 	rv.GREEN_LIGHT.set()
-	pending = os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME)
-	assert 'full_scan' in open(pending).read()
-
-
-def test_untrusted_fingerprint_forces_a_comparison(job):
-	startup = rv.JobStartup(job.job_name, job.monitor)
-	assert startup.load('', trusted=False) is True and startup.change == 'changed'
-	refused = rv.JobStartup(job.job_name, job.monitor)
-	assert refused.load('recorded', trusted=False) is False
+	# the next start compares the whole tree again
+	assert not thread.is_alive() and not os.path.lexists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
 
 
 def test_ignored_and_unknown_watch_events_log_quietly(monkeypatch, poll_fast):
@@ -819,7 +786,7 @@ def test_supervise_job_records_a_crash_and_stops_the_others(monkeypatch):
 	monkeypatch.setattr(rv, 'run_job', crashing)
 	results = [None]
 	try:
-		rv.supervise_job(results, 0, rv.JobControl('j'), None, None)
+		rv.supervise_job(results, 0, rv.JobControl('j'), None)
 		assert results == ['crashed'] and not rv.GREEN_LIGHT.is_set()
 	finally:
 		rv.GREEN_LIGHT.set()

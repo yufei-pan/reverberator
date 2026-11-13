@@ -224,10 +224,6 @@ class ChangeEventQueue:
 	events the backup conversion would skip anyway, and once longer than QUEUE_KEEP_EVENTS it becomes one full scan
 	when memory runs short. A queued full scan absorbs every later event, as the backuper compares the whole tree for it.
 	A 'scan' event (compare that one folder with the vault) is kept like any other event.
-	round_tripped says that some of the events lost their raw form: a batch handed back after a backup that did not
-	commit, or loaded from the pending transactions, holds only its collapsed entries (backup_entries_to_change_events()).
-	prepend() sets it for events other than scans, the pending load for any rows (a batch of scans only, resumed after a
-	restart, cannot tell what changed while the daemon was down), and take() moves it to the batch it takes.
 	first_wall_ns is the wall clock time, in ns, at which the first event came into an empty queue (None while empty),
 	which take() moves along too: with the first event's monotonic time, the batch's verification tells which entries it
 	changed even when the wall clock stepped between ( ctime_bound() ).
@@ -255,9 +251,6 @@ class ChangeEventQueue:
 		>>> taken = queue.take()
 		>>> (len(taken), len(queue))
 		(3, 0)
-		>>> queue.prepend([ChangeEvent(3.0, False, 'modify', '/m/new', None)])
-		>>> queue.round_tripped, queue.take().round_tripped, queue.round_tripped
-		(True, True, False)
 		>>> queue.append(ChangeEvent(4.0, False, 'full_scan', '/m', None))
 		>>> queue.append(ChangeEvent(5.0, False, 'modify', '/m/log', None))
 		>>> [event.event for event in queue]
@@ -269,10 +262,10 @@ class ChangeEventQueue:
 		>>> queue.take().pending_move_outs, queue.pending_move_outs
 		({'/m/gone'}, {'/m/gone'})
 		>>> queue.takes
-		4
+		3
 		>>> queue.clear()
 		>>> queue.takes
-		4
+		3
 	'''
 	def __init__(self, monitor_path:str = ''):
 		self.monitor_path = monitor_path
@@ -282,7 +275,6 @@ class ChangeEventQueue:
 		self.clear()
 
 	def clear(self):
-		self.round_tripped = False
 		self.first_wall_ns = None
 		# (event count, zlib compressed marshal of the events' fields), oldest first
 		self._blocks = []
@@ -373,29 +365,12 @@ class ChangeEventQueue:
 		available, _, _ = read_memory_state()
 		return available is None or self._count * COMPACTION_EVENT_BYTES <= available * QUEUE_MEMORY_SHARE
 
-	def prepend(self, events):
-		'''Put events back in front of the queue, as a backup that did not commit hands its batch back.'''
-		if self._full_scan is not None:
-			return
-		events = list(events)
-		if any(event.event != 'scan' for event in events):
-			# scans name folders compared whole, which lose nothing
-			self.round_tripped = True
-		for event in events:
-			if event.event == 'full_scan':
-				self.append(event)
-				return
-		blocks = [self._pack(events[i:i + QUEUE_BLOCK_EVENTS]) for i in range(0, len(events), QUEUE_BLOCK_EVENTS)]
-		self._blocks[:0] = blocks
-		self._packed_bytes += sum(len(block) for _, block in blocks)
-		self._count += len(events)
-
 	def take(self) -> 'ChangeEventQueue':
 		'''Move every queued event into a new queue and empty this one, as the backuper takes its batch.'''
 		taken = ChangeEventQueue(self.monitor_path)
 		taken._blocks, taken._recent, taken._count = self._blocks, self._recent, self._count
 		taken._packed_bytes, taken._full_scan = self._packed_bytes, self._full_scan
-		taken.round_tripped, taken.first_wall_ns = self.round_tripped, self.first_wall_ns
+		taken.first_wall_ns = self.first_wall_ns
 		taken.read_wall_ns = self.read_wall_ns
 		taken.pending_move_outs = set(self.pending_move_outs)
 		self.clear()
@@ -560,7 +535,8 @@ class JobStartup:
 	'''
 	Loads a job's skip list once, after its filesystems are ready, and shares it between the job's two threads.
 	The backuper loads it and sets loaded either way; the watcher waits for loaded before adding any watch, and sets
-	watching once its watches are in place, so the backuper decides on resuming pending transactions after both.
+	watching once its watches are in place. The backuper starts the start's full comparison only after both: its matched
+	time is taken before it walks, so every change made while it walks must come as an event, which needs the watches.
 	'''
 	def __init__(self, job_name:str, monitor_path:str, skip_list_path:str = None, explicit_none:bool = False):
 		self.job_name = job_name
@@ -568,8 +544,6 @@ class JobStartup:
 		self.skip_list_path = skip_list_path
 		self.explicit_none = explicit_none
 		self.skip_list = None
-		# 'unchanged' or 'changed' against the fingerprint recorded in the vault, once loaded
-		self.change = None
 		self.failed = False
 		# once load failed: why, and whether only a config change can fix it (so the job is not retried)
 		self.failure_reason = None
@@ -577,11 +551,11 @@ class JobStartup:
 		self.loaded = threading.Event()
 		self.watching = threading.Event()
 
-	def load(self, recorded_fingerprint, trusted:bool = True) -> bool:
+	def load(self, recorded_fingerprint) -> bool:
 		'''
-		Load the list and compare it with the vault's recorded fingerprint; False when the job must not run.
-		When the recorded fingerprint is not trusted (the manifest does not describe the latest version), a list that
-		looks unchanged counts as changed, so the whole tree is compared.
+		Load the list and compare it with the vault's recorded fingerprint; False when the job must not run: the list
+		cannot be loaded, or it would drop the patterns the vault was backed up with (skip_list_change() says 'refuse').
+		Every start compares the whole tree, so a list changed otherwise needs nothing more.
 		'''
 		ok = False
 		try:
@@ -597,10 +571,7 @@ class JobStartup:
 				self.failure_reason = f'cannot load skip list file {self.skip_list_path}: {e}'
 				backuperTeeLogToTl(self.job_name,f'Cannot load skip list file {self.skip_list_path} for job {self.job_name}: {e}. Not backing up this job',error=True)
 				return False
-			self.change = skip_list_change(recorded_fingerprint, skip_list.fingerprint, self.explicit_none)
-			if self.change == 'unchanged' and not trusted:
-				self.change = 'changed'
-			if self.change == 'refuse':
+			if skip_list_change(recorded_fingerprint, skip_list.fingerprint, self.explicit_none) == 'refuse':
 				reason = f'{self.skip_list_path} has no patterns' if self.skip_list_path is not None else 'its Skip List File names no file'
 				self.permanent = True
 				self.failure_reason = f'backed up with skip patterns, but {reason}: set its Skip List File to none to back up everything'
@@ -1205,9 +1176,8 @@ COOKIE_DICT_MAX_SIZE = 16384
 # queued change events are kept zlib compressed in blocks of this many, about 15 bytes an event instead of about 210
 QUEUE_BLOCK_EVENTS = 4096
 QUEUED_EVENT_BYTES = 210
-# compacting holds about this much per queued event at most, and writing pending transactions out about this much per row
+# compacting holds about this much per queued event at most
 COMPACTION_EVENT_BYTES = 250
-PENDING_ROW_BYTES = 700
 # a queue this long drops the events the backup conversion would skip, and again each time it doubles
 QUEUE_COMPACT_EVENTS = 16384
 # a queue longer than this becomes one full scan when memory runs short: tasks stall on memory for MEMORY_STALL_PERCENT
@@ -1366,16 +1336,15 @@ Job Name (Unique Key)	Path Monitoring	Vault Path	Monitoring File System Signatur
 tl = LockedLogger(Tee_Logger.teeLogger(systemLogFileDir='/dev/null', programName='reverberator', compressLogAfterMonths=0, deleteLogAfterYears=0, suppressPrintout=False,noLog=True))
 
 #%% ---- Main CLI Functions ----
-def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pending = None) -> str:
+def run_job(job:JobControl, start_attempt, clock = time.monotonic) -> str:
 	'''
 	Supervise one job: run its attempts until the daemon stops ('exit') or the job fails for good ('stopped').
 
 	start_attempt(job, attempt) starts an attempt's threads and returns them. An attempt ends when the job fails or one
 	of its threads ends, and all of its threads have exited before anything else happens, so the next attempt never
 	races them. A failure only a config change can fix stops the job. Any other is retried after job_retry_delay, which
-	grows with each failed attempt in a row and starts over once an attempt ran JOB_RETRY_RESET_SECONDS.
-	persist_pending() runs when the daemon stops after the job failed, as the backuper keeps a failed job's queue in
-	memory for its next attempt.
+	grows with each failed attempt in a row and starts over once an attempt ran JOB_RETRY_RESET_SECONDS. Each attempt
+	compares the whole tree first, so a failed one's queue, kept in memory, needs nothing saved at a stop.
 	'''
 	global GREEN_LIGHT
 	failures = 0
@@ -1427,8 +1396,6 @@ def run_job(job:JobControl, start_attempt, clock = time.monotonic, persist_pendi
 		deadline = time.monotonic() + delay
 		while GREEN_LIGHT.is_set() and time.monotonic() < deadline:
 			time.sleep(max(min(POLL_WAIT_SECONDS, deadline - time.monotonic()), 0))
-	if job.failure is not None and persist_pending is not None:
-		persist_pending()
 	return 'exit'
 
 class MonitorGate:
@@ -1529,27 +1496,17 @@ def job_attempt_starter(job_name:str, startup_args:tuple, watcher_args:tuple, ba
 		return started
 	return start_attempt
 
-def persist_failed_job_queue(job_name:str, monitor_path:str, vault_path:str, to_process:ChangeEventQueue, to_process_lock:threading.Lock):
-	'''
-	Save a failed job's queue as its pending transactions when the daemon stops.
-	Nothing was watched since the job failed, so replaying the queue would miss what changed meanwhile: it is saved as
-	a full scan request (which the queue folds everything queued into), as the job's next attempt would have done.
-	'''
-	with to_process_lock:
-		to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
-	persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
-
-def supervise_job(results:list, index:int, job:JobControl, start_attempt, persist_pending):
+def supervise_job(results:list, index:int, job:JobControl, start_attempt):
 	'''A job's supervisor thread: runs the job and records how it ended in results[index].'''
 	global GREEN_LIGHT
 	try:
-		results[index] = run_job(job, start_attempt, persist_pending=persist_pending)
+		results[index] = run_job(job, start_attempt)
 	except Exception as e:
 		import traceback
 		tl.teeerror(log_text(traceback.format_exc()))
 		daemon_error_log(f'supervisor of job {job.job_name} crashed: {type(e).__name__}: {e}')
 		results[index] = 'crashed'
-		# the other jobs stop cleanly and save their pending transactions; main exits 1
+		# the other jobs stop cleanly; main exits 1
 		GREEN_LIGHT.clear()
 
 COMMANDS = ('status', 'history', 'restore')
@@ -1629,7 +1586,7 @@ def run_daemon():
 		if job_name == '':
 			# a name with nothing left would make the vault root the job's vault: stopped at once, before anything touches it
 			# the marker calls it by its row, as the log alerts only accept a name of letters, digits, '-' and '_'
-			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name,f'row-{index + 1}'),nameless_start(args.rule_path,reverb_rule),None),name=f'row-{index + 1} supervisor',daemon=True)
+			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name,f'row-{index + 1}'),nameless_start(args.rule_path,reverb_rule)),name=f'row-{index + 1} supervisor',daemon=True)
 			supervisor.start()
 			supervisors.append(supervisor)
 			continue
@@ -1638,7 +1595,7 @@ def run_daemon():
 			def start_colliding(job:JobControl, attempt:int, job_name = job_name) -> list:
 				job.fail(f'{colliding[job_name]} rows clean up to the job name {job_name}', permanent=True)
 				return []
-			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_colliding,None),name=f'{job_name} supervisor',daemon=True)
+			supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_colliding),name=f'{job_name} supervisor',daemon=True)
 			supervisor.start()
 			supervisors.append(supervisor)
 			continue
@@ -1678,7 +1635,7 @@ def run_daemon():
 		to_process_lock = threading.Lock()
 		to_process_flag = threading.Event()
 		monitor_fs_flag = FS_SIGNATURE_MONITOR.register(monitor_path,monitor_path_signature)
-		# every attempt loads the skip list again once the job's filesystems are ready, then decides on resuming pending transactions
+		# every attempt loads the skip list again once the job's filesystems are ready, then compares the whole tree
 		startup_args = (job_name, monitor_path, resolve_skip_list_path(reverb_rule.skip_list_file, args.rule_path), reverb_rule.skip_list_file.strip().lower() == 'none')
 		watcher_args = (monitor_fs_flag,monitor_path,to_process,to_process_lock,to_process_flag,irm,min_snapshot_delay_seconds,max_shapshot_delay_seconds)
 		backuper_args = (job_name,to_process,to_process_lock,monitor_path,vault_path,vault_path_signature,to_process_flag,monitor_fs_flag,only_sync_attributes,keep_n_versions,backup_size_limit,args.journal)
@@ -1687,10 +1644,9 @@ def run_daemon():
 			gate = MonitorGate(monitor_path, monitor_fs_flag, monitor_path_signature)
 		start_attempt = job_attempt_starter(job_name, startup_args, watcher_args, backuper_args, gate, monitor_path_signature,
 			dict(full_comparison_interval=full_comparison_interval))
-		persist_pending = functools.partial(persist_failed_job_queue, job_name, monitor_path, vault_path, to_process, to_process_lock)
 		interval_text = f'{full_comparison_interval:.15g}s' if full_comparison_interval else 'off'
 		tl.info(log_text(f'Backup thread will use only sync attributes: {only_sync_attributes}, keep n versions: {keep_n_versions}, backup size limit: {backup_size_limit}, full comparison interval: {interval_text}'))
-		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt,persist_pending),name=f'{job_name} supervisor',daemon=True)
+		supervisor = threading.Thread(target=supervise_job,args=(results,index,JobControl(job_name),start_attempt),name=f'{job_name} supervisor',daemon=True)
 		supervisor.start()
 		supervisors.append(supervisor)
 		tl.teeok(log_text(f'Started job {job_name} watching {monitor_path}:{monitor_path_signature} into vault {vault_path}:{vault_path_signature}'))
@@ -3816,128 +3772,6 @@ def log_unreadable(job_name:str, root:str, errors:list, reported:set = None):
 		job_log(job_name, f'UNREADABLE: {path}: {error}; keeping its last backed-up copy')
 
 
-def load_pending_transactions_for_resume(job_name:str, monitor_path:str, vault_path:str, to_process:ChangeEventQueue, skip_list:'SkipList' = None) -> bool:
-	# stored inside the per-job vault folder so jobs sharing a vault path do not clobber each other
-	pending_transactions_path = os.path.join(vault_path, job_name, PENDING_TRANSACTIONS_FILE_NAME)
-	if not os.path.exists(pending_transactions_path):
-		return False
-	try:
-		pending_mtime = os.path.getmtime(pending_transactions_path)
-	except Exception as e:
-		backuperTeeLogToTl(job_name, f'Failed to read pending transactions timestamp for {pending_transactions_path}: {e}', error=True)
-		return False
-	latest_monitor_change = get_monitor_path_most_recent_change_time(monitor_path, skip_list)
-	# Resume only when the latest monitor-path mtime is at least 1 second older
-	# than the pending file (no filesystem changes after the pending snapshot).
-	should_resume = latest_monitor_change <= pending_mtime - 1.0
-	if not should_resume:
-		backuperTeeLogToTl(job_name, 'Pending transactions file exists but did not pass resume timestamp check. Falling back to delta generation.')
-		try:
-			os.remove(pending_transactions_path)
-		except Exception as e:
-			backuperTeeLogToTl(job_name, f'Failed to remove skipped pending transactions file {pending_transactions_path}: {e}', error=True)
-		return False
-	loaded_count = 0
-	available, _, _ = read_memory_state()
-	# reading the file holds every row as Python lists, about four times the file's size
-	if available is not None and os.path.getsize(pending_transactions_path) * 4 > available * QUEUE_MEMORY_SHARE:
-		backuperTeeLogToTl(job_name, f'Pending transactions file {pending_transactions_path} is too large for the memory available, requesting a full scan instead', error=True)
-		to_process.append(ChangeEvent(time.monotonic(), False, 'full_scan', monitor_path, None))
-		try:
-			os.remove(pending_transactions_path)
-		except Exception as e:
-			backuperTeeLogToTl(job_name, f'Failed to remove pending transactions file {pending_transactions_path}: {e}', error=True)
-		return True
-	try:
-		pending_rows_raw = TSVZ.readTabularFile(
-			pending_transactions_path,
-			header=CHANGED_EVENT_HEADER,
-			verifyHeader=True,
-			strict=False,
-			verbose=False,
-			defaults=[],
-			correctColumnNum=len(CHANGED_EVENT_HEADER)
-		)
-		with open(pending_transactions_path, 'rb') as f:
-			# one line per row after the header
-			written_rows = sum(chunk.count(b'\n') for chunk in iter(lambda: f.read(1 << 20), b'')) - 1
-		if pending_rows_raw and len(pending_rows_raw) != written_rows:
-			# rows are keyed by their time when read back, and files written before times were spaced apart lose
-			# every row sharing one. replaying the rest would skip those changes, so compare the whole tree instead
-			backuperTeeLogToTl(job_name, f'Read {len(pending_rows_raw)} of {written_rows} pending transactions, requesting a full scan instead')
-			pending_rows_raw = {}
-			to_process.append(ChangeEvent(time.monotonic(), False, 'full_scan', monitor_path, None))
-			loaded_count += 1
-		times = [float(row[0]) for row in pending_rows_raw.values()]
-		# the times are of the monotonic clock, which starts again at each boot: rows written before this boot, or with a
-		# time this boot's clock has not reached, are moved by one offset, so the newest is when the file was written on
-		# this boot's clock ( now, for a file dated in the future ), and their order and spacing stay
-		offset = 0.0
-		if times and (pending_mtime < time.time() - time.monotonic() - 1.0 or max(times) > time.monotonic()):
-			offset = time.monotonic() - (time.time() - min(pending_mtime, time.time())) - max(times)
-			if pending_mtime > time.time():
-				why = 'are dated in the future, so the clock was set back since they were written'
-			elif pending_mtime < time.time() - time.monotonic() - 1.0:
-				why = 'were written before this boot'
-			else:
-				why = "hold times this boot's clock has not reached"
-			backuperTeeLogToTl(job_name, f'Pending transactions {pending_transactions_path} {why}, moving their times by {offset:.0f}s')
-		for event_time, row in zip(times, pending_rows_raw.values()):
-			# the paths as pending_transaction_rows() wrote them
-			moved_from = row[4]
-			if moved_from == '':
-				moved_from = None
-			to_process.append(ChangeEvent(
-				event_time + offset,
-				row[1] in (True, 'True', 'true', '1', 1),
-				row[2],
-				stored_name(row[3]),
-				None if moved_from is None else stored_name(moved_from)
-			))
-			loaded_count += 1
-		if pending_rows_raw and not to_process.full_scan_requested:
-			# a batch handed back before the stop was saved as its collapsed entries only, and a batch of scans only cannot
-			# tell what changed while the daemon was down, outside the folders it names: the whole tree is compared after it
-			to_process.round_tripped = True
-		try:
-			os.remove(pending_transactions_path)
-		except Exception as e:
-			backuperTeeLogToTl(job_name, f'Failed to remove pending transactions file {pending_transactions_path}: {e}', error=True)
-		backuperTeeLogToTl(job_name, f'Loaded {loaded_count} pending transactions from {pending_transactions_path}')
-	except Exception as e:
-		backuperTeeLogToTl(job_name, f'Failed to load pending transactions from {pending_transactions_path}: {e}', error=True)
-		to_process.clear()
-		try:
-			os.remove(pending_transactions_path)
-		except Exception as e:
-			backuperTeeLogToTl(job_name, f'Failed to remove pending transactions file {pending_transactions_path}: {e}', error=True)
-		loaded_count = 0
-	return loaded_count > 0
-
-def get_monitor_path_most_recent_change_time(monitor_path:str, skip_list:'SkipList' = None) -> float:
-	latest_mtime = 0.0
-	paths_to_scan = [monitor_path]
-	while paths_to_scan:
-		current_path = paths_to_scan.pop()
-		try:
-			current_stat = os.stat(current_path, follow_symlinks=False)
-			latest_mtime = max(latest_mtime, current_stat.st_mtime)
-		except Exception as e:
-			watcherTeeLogToTl(monitor_path, f'Error reading stat for {current_path}: {e}', error=True)
-			# what cannot be read cannot be shown unchanged
-			return float('inf')
-		if os.path.isdir(current_path) and not os.path.islink(current_path):
-			try:
-				with os.scandir(current_path) as entries:
-					for entry in entries:
-						if skip_list is not None and skip_list.skips_path(entry.path, entry.is_dir(follow_symlinks=False)):
-							continue
-						paths_to_scan.append(entry.path)
-			except Exception as e:
-				watcherTeeLogToTl(monitor_path, f'Error scanning {current_path}: {e}', error=True)
-				return float('inf')
-	return latest_mtime
-
 def check_fs_signature(path:str,signature:str):
 	'''
 	Return whether path still lives on the filesystem identified by signature.
@@ -4929,10 +4763,21 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 		raise
 	return vaultInfo, manifest, False
 
-def scan_events(scan_folders:list) -> list:
-	'''The scan events naming scan_folders, to hand a batch that did not commit back to the queue.'''
-	base = time.monotonic()
-	return [ChangeEvent(base + (i * 0.001),True,'scan',folder,None) for i, folder in enumerate(scan_folders)]
+def remove_pending_file(job_name:str, job_vault:str) -> None:
+	'''
+	Remove the pending transactions file (PENDING_TRANSACTIONS_FILE_NAME) a stop of 0.55.4 or older left in job_vault: no
+	release reads it, as every start compares the whole tree. One unlink, which finds nothing after the first start; a
+	removal says so on one line, and one that fails is a warning, and the start goes on.
+	'''
+	path = os.path.join(job_vault, PENDING_TRANSACTIONS_FILE_NAME)
+	try:
+		os.remove(path)
+	except FileNotFoundError:
+		return
+	except OSError as e:
+		backuperTeeLogToTl(job_name, f'Could not remove {path}, a pending file of an older release, which nothing reads: {e}', warning=True)
+		return
+	backuperTeeLogToTl(job_name, f'Removed {path}, a pending file of an older release: every start compares the whole tree')
 
 def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,monitor_path:str,vault_path:str,vault_path_signature:str,
 			 to_process_flag:threading.Event,monitor_fs_flag:threading.Event=None,
@@ -4952,18 +4797,16 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	vault_fs_flag = None
 	manifest = None
 	skip_list = None
-	# the batch taken and not committed yet: however the backuper stops, it goes back to the front of the queue, a full
-	# comparison as a full scan request
+	# the batch taken and not committed yet: a stop drops it, as it drops the queue, and after a failed attempt the next one
+	# compares the whole tree first, as every start does
 	backupEntries = OrderedDict()
 	# the folders its scan events name, compared with the vault before it is backed up
 	scan_folders = []
 	# what its raw events touched, verified after its replay; None for a full comparison or a batch of scans only
 	touched = None
 	full_comparison = False
-	# whether the batch is one handed back or resumed, whose events are only its collapsed entries
-	round_tripped = False
-	# when the last full comparison of any kind (the start's, a follow-up, a scans escalation, a lost-events full scan or the
-	# interval's own) committed, counted from its end. it is in memory: a restart begins with a full comparison anyway. a
+	# when the last full comparison of any kind (the start's, a scans escalation, a lost-events full scan or the interval's
+	# own) committed, counted from its end. it is in memory: a restart begins with a full comparison anyway. a
 	# batch that runs delays the next one, as the interval is not checked until the batch has returned
 	last_full_comparison = time.monotonic()
 	def comparison_due():
@@ -4999,6 +4842,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			finally:
 				locks.release()
 		scanned = scan() if running() and os.path.isdir(job_vault) else None
+		remove_pending_file(job_name, job_vault)
 		wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 		# batches are compared with the vault only while the monitored path shows the filesystem it shows now
 		root_mount = mount_fingerprint(current_mount_table(),os.path.realpath(monitor_path))
@@ -5008,54 +4852,23 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			if os.path.isdir(job_vault):
 				manifest = VaultManifest(job_vault)
 				recorded = manifest.skip_fingerprint
-			trusted = True
-			if manifest is not None:
-				# a manifest that does not describe the latest version cannot vouch for the fingerprint it recorded
-				if scanned is None:
-					scanned = scan()
-				latest_version = {} if scanned is None else scanned.vault_info_dict
-				trusted = not latest_version or manifest.describes(latest_version[next(reversed(latest_version))].path)
-			if not startup.load(recorded,trusted):
+			if not startup.load(recorded):
 				# only this job stops: its watcher sees the failure and exits too
 				if job is not None:
 					job.fail(startup.failure_reason, permanent=startup.permanent)
 				return
 			skip_list = startup.skip_list
-			# events the watcher queues from here on are not missed by a replay of the pending transactions
+			# the start's full comparison takes its matched time before it walks, so every change made while it walks must
+			# come as an event: it waits for the watches
 			while running() and not startup.watching.is_set():
 				startup.watching.wait(POLL_WAIT_SECONDS)
 			if not running():
-				# stopping before deciding: leave the pending transactions file for the next start, unless the watcher
-				# already queued events, as saving those alone over it would drop the rest
-				with to_process_lock:
-					if to_process:
-						to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 				return
-			restored = ChangeEventQueue(monitor_path)
-			resumed = False
-			if startup.change == 'unchanged':
-				resumed = load_pending_transactions_for_resume(job_name, monitor_path, vault_path, restored, skip_list)
-			else:
-				backuperTeeLogToTl(job_name,'Skip list differs from the one the last backup used, comparing the whole tree',ok=True)
-				pending_transactions_path = os.path.join(job_vault,PENDING_TRANSACTIONS_FILE_NAME)
-				if os.path.lexists(pending_transactions_path):
-					# they were filtered by the old list
-					backuperTeeLogToTl(job_name,f'Discarding pending transactions {pending_transactions_path} as the skip list changed')
-					try:
-						os.remove(pending_transactions_path)
-					except OSError as e:
-						backuperTeeLogToTl(job_name,f'Failed to remove pending transactions file {pending_transactions_path}: {e}',error=True)
 			with to_process_lock:
-				if resumed:
-					to_process.prepend(list(restored))
-					if restored.round_tripped:
-						# prepend() sets it for events other than scans only
-						to_process.round_tripped = True
-				else:
-					# a full scan absorbs whatever the watcher queued meanwhile
-					to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
+				# every start compares the whole tree: a full scan absorbs whatever the watcher queued meanwhile, and what a
+				# failed attempt left queued
+				to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 		if not running():
-			# stopping: the restored events stay queued for the pending transactions
 			return
 		with to_process_lock:
 			if to_process:
@@ -5069,7 +4882,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				backupEntries = change_events_to_backup_entries(to_process_temp,monitor_path)
 				scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
 				touched = batch_scopes(to_process_temp)
-				round_tripped = to_process_temp.round_tripped
 				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 		# the start's scan: the first batch does not scan again
 		vaultInfo = scanned
@@ -5092,8 +4904,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			walked = False
 			# an unreadable path is reported once for the batch, by its comparison or its backup
 			reported = set()
-			# whether the whole tree is compared right after this batch
-			follow_up = False
 			if scan_folders and not full_comparison:
 				vaultInfo,manifest,full_comparison = compare_scanned_folders(backupEntries,scan_folders,job_name,monitor_path,vault_path,
 					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported,pool_guard=pool_guard,job=job,
@@ -5114,9 +4924,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				full_comparison = full_comparison or (not backupEntries and touched is None)
 			if backupEntries or full_comparison or touched is not None:
 				# from when the attempt sees the whole tree: a full comparison's walk sees every change made before it
-				# begins; a fresh batch, the one taken last, holds every change made before the watcher's read time it
-				# carries. a batch handed back or resumed lost its raw events, and the read time says nothing of them
-				matched_since = time.time_ns() if full_comparison else None if round_tripped else to_process_temp.read_wall_ns
+				# begins; a batch, the one taken last, holds every change made before the watcher's read time it carries
+				matched_since = time.time_ns() if full_comparison else to_process_temp.read_wall_ns
 				# read again after a walk of scanned folders: an inner disk unmounted while it ran is paused by do_backup(), which
 				# drops their deletes
 				batch_table = current_mount_table() if walked else table[0]
@@ -5125,7 +4934,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,
 					  reported=reported,touched=None if full_comparison else touched,pool_guard=pool_guard,matched_since=matched_since,job=job,mount_table=batch_table)
 				if not committed:
-					# the batch goes back to the queue on the way out. a stop, or the job's own failure, is no failure to commit
+					# a stop, or the job's own failure, is no failure to commit
 					if running():
 						if job is None:
 							backuperTeeLogToTl(job_name,'Backup did not commit while daemon is running; requesting shutdown',error=True)
@@ -5138,20 +4947,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					last_full_comparison = time.monotonic()
 				if job is not None:
 					job.mark_committed()
-			if round_tripped and not full_comparison:
-				# the collapse can drop a path its entries no longer name, as git's ref deleted after a rename over it:
-				# the verification compared only what they name, so the whole tree is compared next, as at a start
-				# with nothing to resume. a batch of scans only, resumed, cannot tell what changed while the daemon was
-				# down outside its folders. it runs now, without waiting for the watcher's signal, and the queue is left
-				# to the watcher: its new folders' events are recorded again only once it sees its batch taken
-				backuperTeeLogToTl(job_name,'The batch was handed back or resumed: comparing the whole tree next')
-				follow_up = True
 			backupEntries.clear()
 			scan_folders = []
 			touched = None
-			# a stop before it runs saves it as a full scan request, as any full comparison
-			full_comparison = follow_up
-			round_tripped = False
+			full_comparison = False
 			# a batch whose events collapsed to no entry is backed up too, as what they touched can differ from the vault
 			while not backupEntries and not full_comparison and not scan_folders and touched is None and running():
 				while running() and not to_process_flag.is_set() and not comparison_due():
@@ -5182,7 +4981,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 					backupEntries = change_events_to_backup_entries(to_process_temp,monitor_path)
 					scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
 					touched = batch_scopes(to_process_temp)
-					round_tripped = to_process_temp.round_tripped
 					backuperTeeLogToTl(job_name,f'Converted {len(to_process_temp)} events to {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
 			if log_journal:
 				journalPath = os.path.join(vault_path,job_name,'journal.tsv')
@@ -5201,22 +4999,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		else:
 			job.fail(f'{type(e).__name__}: {e}')
 	finally:
-		if full_comparison or backupEntries or scan_folders or touched is not None:
-			# for the job's next attempt, or the pending transactions when the daemon stops. the scans go back too, so
-			# their folders are compared again with what is there then. a batch whose events collapsed to no entry has
-			# none to hand back for what they touched: the whole tree is compared instead
-			with to_process_lock:
-				if full_comparison or (touched is not None and not backupEntries):
-					to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
-				else:
-					to_process.prepend(backup_entries_to_change_events(backupEntries) + scan_events(scan_folders))
 		if manifest is not None:
 			manifest.close()
 		if vault_fs_flag is not None:
 			FS_SIGNATURE_MONITOR.unregister(vault_path,vault_path_signature,vault_fs_flag)
-		# on a job failure the daemon goes on: the queue stays in memory for the job's next attempt
-		if job is None or not GREEN_LIGHT.is_set():
-			persist_pending_transactions(job_name=job_name, vault_path=vault_path, to_process=to_process, to_process_lock=to_process_lock)
 
 def backuperTeeLogToTl(path:str,message:str,error=False,ok=False,warning=False,debug=False):
 	global tl
@@ -5254,8 +5040,7 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 	compared as either kind too: such a path is gone from the tree, and its delete may come only in a later batch.
 	changed_since is the monotonic time of the first event: an inode the batch changed (its extended attributes too, or a
 	rename of it) has a ctime from about then on. changed_since_wall is the wall clock time a ChangeEventQueue took when
-	its first event came in (first_wall_ns), None for events of another kind. A batch handed back or resumed
-	(round_tripped) holds its collapsed entries only, timed as they were handed back, so it gives -inf, for every entry.
+	its first event came in (first_wall_ns), None for events of another kind.
 	folders are the folders whose times the batch moved, each event's folder (a create's, delete's or move's, the
 	move's source's too) followed through the folder moves after it (WrittenFolders).
 
@@ -5323,8 +5108,7 @@ def touched_scopes(events, monitor_path:str) -> 'TouchedScopes':
 		# by a subtree above it, or for a folder by its own subtree
 		folders = scope_folders(rel)
 		return any(folder in kept for folder in (folders if rel.endswith('/') else folders[:-1]))
-	changed_since = float('-inf') if first is not None and getattr(events, 'round_tripped', False) else first
-	return TouchedScopes(subtrees, sorted(rel for rel in paths if not covered(rel)), changed_since,
+	return TouchedScopes(subtrees, sorted(rel for rel in paths if not covered(rel)), first,
 		getattr(events, 'first_wall_ns', None) if first is not None else None, tuple(folders.rels))
 
 def ctime_bound(changed_since:float, changed_since_wall:int = None) -> int:
@@ -5332,16 +5116,14 @@ def ctime_bound(changed_since:float, changed_since_wall:int = None) -> int:
 	The ctime, in ns, from which an entry counts as changed by a batch whose changes date from changed_since on the
 	monotonic clock and changed_since_wall (ns) on the wall clock (TouchedScopes): the earlier of changed_since_wall and
 	now less the time since changed_since, so a wall clock step either way between the two hides no change, less
-	VERIFY_CTIME_MARGIN_SECONDS. 0, every entry, for a changed_since of -inf; None when neither is known.
+	VERIFY_CTIME_MARGIN_SECONDS. None when neither is known.
 
 	Examples:
-		>>> ctime_bound(None), ctime_bound(float('-inf')), ctime_bound(None, 10 ** 12) == 10 ** 12 - VERIFY_CTIME_MARGIN_SECONDS * 10 ** 9
-		(None, 0, True)
+		>>> ctime_bound(None), ctime_bound(None, 10 ** 12) == 10 ** 12 - VERIFY_CTIME_MARGIN_SECONDS * 10 ** 9
+		(None, True)
 		>>> abs(ctime_bound(time.monotonic()) - (time.time_ns() - VERIFY_CTIME_MARGIN_SECONDS * 10 ** 9)) < 10 ** 8
 		True
 	'''
-	if changed_since == float('-inf'):
-		return 0
 	since = [] if changed_since_wall is None else [changed_since_wall]
 	if changed_since is not None:
 		since.append(time.time_ns() - int((time.monotonic() - changed_since) * 10 ** 9))
@@ -5807,18 +5589,6 @@ def log_events_to_journal(backup_entries:dict,journal_path:str):
 	lines = [entry_row(path,entry) for path,entry in backup_entries.items()]
 	TSVZ.appendLinesTabularFile(journal_path,lines,header = BACKUP_JOURNAL_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl)
 
-def backup_entries_to_change_events(backup_entries:dict) -> list:
-	'''
-	Convert in-flight backup entries back to ChangeEvents for pending persistence.
-	'''
-	events = []
-	base = time.monotonic()
-	for i, (path, values) in enumerate(backup_entries.items()):
-		is_dir = path.endswith('/')
-		moved_from = values.source_path if values.event == 'move' else None
-		events.append(ChangeEvent(base + (i * 0.001), is_dir, values.event, path, moved_from))
-	return events
-
 def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str) -> tuple:
 	'''
 	After a walk of the monitored tree (named by walk in the log): a disk unmounted while it ran was walked as the empty
@@ -5870,7 +5640,8 @@ def do_backup(backup_entries:dict,
 	# mount_table: the mount table the batch takes ( backuper(): its waits' last read, or one read after its scans walk ), read
 	# here when None, and read again here after the locks a vault with no version takes first
 	# a vaultInfo with a tree (design R) holds a cut batch's tree: this backup rolls it forward, a batch with no hand-over that
-	# compares the whole tree and always commits (spec section 3, plan S4); of the entries given only a plain file's change the comparison could not see is used (roll_forward_entries())
+	# compares the whole tree and always commits (spec section 3, plan S4); it is the first batch of an attempt, the start's full
+	# comparison, and the entries given are not used (roll_forward_entries())
 	global DEBUG
 	global BACKUP_SEMAPHORE
 	global BACKUP_JOURNAL_HEADER
@@ -6038,7 +5809,7 @@ def do_backup(backup_entries:dict,
 					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
 			if tree is not None:
 				backuperTeeLogToTl(job_name,f'Rolling forward {tree}, the tree of a batch that was cut')
-				rolled = roll_forward_entries(vaultInfo,manifest,monitor_path,backup_entries,skip=None if skip_list is None else skip_list.skips,paused=paused,job_name=job_name,reported=reported,
+				rolled = roll_forward_entries(vaultInfo,manifest,monitor_path,skip=None if skip_list is None else skip_list.skips,paused=paused,job_name=job_name,reported=reported,
 					changed_since_wall=full_comparison_since(vault_info_dict,manifest.matched),pool_guard=pool_guard)
 				if not GREEN_LIGHT.is_set():
 					# the tree stays, and the next attempt compares it whole again
@@ -6060,7 +5831,7 @@ def do_backup(backup_entries:dict,
 				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported,
 					scope_rel='' if touched is None else touched,paused=paused,pool_guard=pool_guard,changed_since_wall=full_comparison_since(vault_info_dict,manifest.matched))
 				if not GREEN_LIGHT.is_set():
-					# a partial delta would be kept as pending transactions, and a restart replays those instead of comparing again
+					# a partial delta is no batch: the next start compares the whole tree again
 					backup_entries.clear()
 					backuperTeeLogToTl(job_name, 'Delta generation interrupted; not creating a new version', error=True)
 					return VaultInfo(vault_info_dict, vault_size, vault_inodes), manifest, False
@@ -6385,86 +6156,6 @@ def scan_gets_r_rules(job_vault:str, manifest:'VaultManifest' = None) -> bool:
 		reason = f'{e}: cannot tell the layout of {job_vault} (if it stays, remove {os.path.join(job_vault, MANIFEST_FILE_NAME)}: only a listing of the vault is lost, unless a backup was cut off, whose folder times it holds)'
 		backuperTeeLogToTl(job_vault, f'Cannot read the vault, nothing in it is removed: {reason}', error=True)
 		raise VaultScanError(reason)
-
-def pending_transaction_rows(events) -> list:
-	'''
-	Rows to persist the queued events with.
-
-	Examples:
-		>>> [row[0] for row in pending_transaction_rows([ChangeEvent(5.0, False, 'create', '/m/a', None), ChangeEvent(5.0, False, 'create', '/m/b', None)])]
-		[5.0, 5.000001]
-		>>> pending_transaction_rows([ChangeEvent(1.0, False, 'move', '/m/b\\udcff', '/m/a')])[0][3:]
-		['/m/b\\U0010fe00\\U0010ffff', '/m/a']
-	'''
-	rows = []
-	last_time = None
-	for event in events:
-		# rows are keyed by their time when read back, and events from one inotify read share it: space them apart
-		event_time = event.monotonic_time
-		if last_time is not None and event_time <= last_time:
-			event_time = last_time + 1e-6
-		last_time = event_time
-		# TSVZ writes a lone surrogate as '?': the paths go in as storable_name() gives them
-		rows.append([
-			event_time,
-			event.is_dir,
-			event.event,
-			storable_name(event.path),
-			storable_name(event.moved_from) if event.moved_from is not None else ''
-		])
-	return rows
-
-def persist_pending_transactions(job_name:str, vault_path:str, to_process:'ChangeEventQueue', to_process_lock:threading.Lock=None):
-	def rows_for(queue):
-		available, _, _ = read_memory_state()
-		if available is not None and len(queue) * PENDING_ROW_BYTES > available * QUEUE_MEMORY_SHARE:
-			# writing every row holds them all as Python objects: a full scan at the next start covers them instead
-			backuperTeeLogToTl(job_name, f'{len(queue)} pending transactions are too many to write out with the memory available, saving a full scan request instead', error=True)
-			return pending_transaction_rows([ChangeEvent(time.monotonic(), False, 'full_scan', getattr(queue, 'monitor_path', ''), None)])
-		return pending_transaction_rows(queue)
-	if to_process_lock is not None:
-		with to_process_lock:
-			pending_rows = rows_for(to_process)
-	else:
-		pending_rows = rows_for(to_process)
-	if not pending_rows:
-		return
-	job_vault = os.path.join(vault_path, job_name)
-	# the vault is checked live (the backuper unregistered its flag before this): a stop while a change or a scheduled
-	# comparison waits for a vault that is not there must not make folders under its mount point. the queued changes are
-	# dropped, as the next start compares the whole tree anyway
-	# the disk first: it names the cause (a dead pool fails isdir, an unmounted mount point is usually missing)
-	if (problem := vault_disk_problem(vault_path)) is not None:
-		why = f'is not ready: {problem}'
-	elif not os.path.lexists(vault_path):
-		why = 'does not exist'
-	elif not os.path.isdir(vault_path):
-		why = 'is not a folder'
-	else:
-		why = None
-	if why is not None:
-		# a full scan request alone is what a failed job's queue folds into: nothing queued is lost
-		what = 'a full comparison request' if all(row[2] == 'full_scan' for row in pending_rows) else f'{len(pending_rows)} pending transactions'
-		backuperTeeLogToTl(job_name, f'Not saving {what}: vault path {vault_path} {why}; the next start compares the whole tree', warning=True)
-		return
-	pending_transactions_path = os.path.join(job_vault, PENDING_TRANSACTIONS_FILE_NAME)
-	try:
-		os.makedirs(job_vault, exist_ok=True)
-		if os.path.exists(pending_transactions_path):
-			os.remove(pending_transactions_path)
-		TSVZ.appendLinesTabularFile(
-			pending_transactions_path,
-			pending_rows,
-			header=CHANGED_EVENT_HEADER,
-			createIfNotExist=True,
-			verifyHeader=True,
-			strict=False,
-			teeLogger=tl,
-			verbose=False
-		)
-		backuperTeeLogToTl(job_name, f'Saved {len(pending_rows)} pending transactions to {pending_transactions_path}')
-	except Exception as e:
-		backuperTeeLogToTl(job_name, f'Failed to save pending transactions to {pending_transactions_path}: {e}', error=True)
 
 # what a change list's name holds after its version folder's name and --: the size and inodes it records, as
 # change_list_path() writes them (format_bytes(), its spaces as _ or left out), and the change list extension
@@ -7149,24 +6840,20 @@ def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 			changed.append((rel, found))
 	manifest.set_records(changed)
 
-def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:str, given:dict, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None,
+def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:str, skip = None, paused:set = frozenset(), job_name:str = '', reported:set = None,
 		changed_since_wall:int = None, pool_guard:'PoolGuard' = None) -> OrderedDict:
 	'''
 	What the roll-forward of the tree info.tree replays (plan S4): what a full comparison finds between the monitored tree and that
-	tree, and two things more. Each file the cut batch wrote into the tree is copied again, never read back: a write error that
+	tree, and one thing more. Each file the cut batch wrote into the tree is copied again, never read back: a write error that
 	some other sync saw before this attempt's handles opened, or a power cut, may have left its copy wrong at its right size, mtime
 	and tail, and nothing can tell. Those are the names it recorded in the previous version (info.recorded, prepare_roll_forward():
 	a file may have replaced a link there, whose row, read from the tree, has no record to tell it by, or a folder, which has no row
 	at the file's name until the manifest is rebuilt from the tree), and, over a manifest that does not describe the previous version,
 	as a lost one, whose rows are listed from the tree, what it made there too (new_in_tree()). Each of them whose monitored path is
 	a regular file now, through real folders of the monitored tree only (a link above it leads out of that tree: what it leads to is
-	no entry of it), is trusted by the comparison, as present and of its kind, and replayed as a modify; one that is not is compared as any other entry. And from the
-	entries a stop saved (given): each plain file "modify", "create" or "move" that the comparison did not find, under either form
-	of its key, while the monitored path is a regular file now, replayed as a modify. A file rewritten at its size, with its mtime
-	set back, looks the same to the comparison however it was written (in place, removed and made again, or a file renamed over
-	it), and only the watcher saw it; a copy of an unchanged file is only a spare one. No other saved entry is used (no folder,
-	delete or attribute change): the comparison covers the whole tree, and an entry it did not find would fight what it
-	found, as a file that became a folder since would. delta_generate_backup_entries() is never called on it, as it commits naming the
+	no entry of it), is trusted by the comparison, as present and of its kind, and replayed as a modify; one that is not is compared
+	as any other entry. A roll-forward is the first batch of an attempt, the full comparison every start runs, so it is given no
+	entries. delta_generate_backup_entries() is never called on it, as it commits naming the
 	version it compares, and it would name the tree. All of it is in a transaction the commit of the version ends, or a cut rolls back. A
 	stop leaves the comparison partial, for the caller to throw away. JobFailure rolls back and goes on up. skip, paused, job_name,
 	reported and changed_since_wall are compare_scopes()'s; pool_guard's pools must have stayed whole.
@@ -7197,13 +6884,6 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 			continue
 		if is_regular_file(path):
 			found[path] = BackupEntryValues(datetime.datetime.now().isoformat(), 'modify', None)
-	for path, values in given.items():
-		if values.event not in ('modify', 'create', 'move') or path.endswith('/') or path in found or path + '/' in found:
-			continue
-		# a plain file of the monitored tree, through no link (what a link above it leads to is no entry of it); gone, or a parent
-		# of it a file now: the comparison says what is there
-		if real_folders_to(monitor_path, os.path.relpath(path, monitor_path)) and is_regular_file(path):
-			found[path] = values._replace(event='modify', source_path=None)
 	return found
 
 def is_regular_file(path:str) -> bool:

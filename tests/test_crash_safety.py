@@ -60,21 +60,6 @@ class TestGetVaultInfoOrphans(unittest.TestCase):
 			self.assertTrue(os.path.isdir(orphan))
 
 
-class TestBackupEntriesToChangeEvents(unittest.TestCase):
-	def test_move_and_dir_flags(self):
-		entries = {
-			'/tmp/a': rv.BackupEntryValues('t', 'modify', None),
-			'/tmp/d/': rv.BackupEntryValues('t', 'create', None),
-			'/tmp/b': rv.BackupEntryValues('t', 'move', '/tmp/a'),
-		}
-		events = rv.backup_entries_to_change_events(entries)
-		by_path = {e.path: e for e in events}
-		self.assertFalse(by_path['/tmp/a'].is_dir)
-		self.assertTrue(by_path['/tmp/d/'].is_dir)
-		self.assertEqual(by_path['/tmp/b'].event, 'move')
-		self.assertEqual(by_path['/tmp/b'].moved_from, '/tmp/a')
-
-
 class TestWatcherInitFailure(unittest.TestCase):
 	def test_watcher_clears_green_light_when_watchfolder_fails(self):
 		rv.GREEN_LIGHT.set()
@@ -137,16 +122,15 @@ class TestWatcherInitFailure(unittest.TestCase):
 
 
 class TestBackuperCommitFailure(unittest.TestCase):
-	def test_uncommitted_backup_while_green_light_set_requeues_and_clears_green_light(self):
+	def test_uncommitted_backup_while_green_light_set_clears_green_light_and_requeues_nothing(self):
 		with tempfile.TemporaryDirectory() as tmp:
 			rv.GREEN_LIGHT.set()
 			os.makedirs(os.path.join(tmp, 'monitor'))
 			original_do_backup = rv.do_backup
 			try:
 				rv.do_backup = lambda *a, **k: (None, None, False)
-				to_process = deque([
-					rv.ChangeEvent(1, False, 'modify', os.path.join(tmp, 'monitor', 'f.txt'), None)
-				])
+				to_process = rv.ChangeEventQueue(os.path.join(tmp, 'monitor'))
+				to_process.append(rv.ChangeEvent(1, False, 'modify', os.path.join(tmp, 'monitor', 'f.txt'), None))
 				monitor_fs_flag = threading.Event()
 				monitor_fs_flag.set()
 				rv.backuper(
@@ -159,7 +143,9 @@ class TestBackuperCommitFailure(unittest.TestCase):
 					threading.Event(),
 					monitor_fs_flag,
 				)
-				self.assertEqual(len(to_process), 1)
+				# the batch is not handed back: the next start compares the whole tree
+				self.assertEqual(len(to_process), 0)
+				self.assertFalse(os.path.lexists(os.path.join(tmp, 'vault', 'job', rv.PENDING_TRANSACTIONS_FILE_NAME)))
 				self.assertFalse(rv.GREEN_LIGHT.is_set())
 			finally:
 				rv.do_backup = original_do_backup
@@ -167,12 +153,6 @@ class TestBackuperCommitFailure(unittest.TestCase):
 
 
 class TestDoBackupCommitGate(unittest.TestCase):
-	def test_incomplete_flag_skips_content_file(self):
-		entries = {'/tmp/x': rv.BackupEntryValues('t', 'modify', None)}
-		events = rv.backup_entries_to_change_events(entries)
-		self.assertEqual(len(events), 1)
-		self.assertEqual(events[0].event, 'modify')
-
 	def test_cleared_green_light_skips_content_file_and_current_version(self):
 		with tempfile.TemporaryDirectory() as tmp:
 			monitor_path = os.path.join(tmp, 'monitor')

@@ -683,9 +683,9 @@ def recording_reads_and_copies(monkeypatch):
 	return reads, copies
 
 
-def roll_forward(job, given=None, **options):
-	'''The next attempt: the scan finds the cut batch's tree, and the batch rolls it forward. given: the entries a stop saved.'''
-	_, manifest, committed = rv.do_backup(OrderedDict() if given is None else given, job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(),
+def roll_forward(job, **options):
+	'''The next attempt: the scan finds the cut batch's tree, and its first batch, the start's full comparison, rolls it forward.'''
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(),
 		only_sync_attributes=options.get('only_sync_attributes', False), keep_n_versions=0, backup_size_limit='0')
 	manifest.close()
 	assert committed is True
@@ -952,26 +952,6 @@ def test_a_cut_batchs_copy_under_an_inner_mount_paused_at_the_roll_forward_is_re
 	run_backup(r_job, only_sync_attributes=False, **KEPT)
 	held = read_bytes(os.path.join(committed_versions(r_job)[-1], 'disk', 'file.bin'))
 	assert held == data, 'the newest version holds the file ' + ('all NUL' if not any(held) else 'wrong')
-
-
-def test_the_roll_forward_replays_no_saved_event_through_a_link_of_the_monitored_tree(r_job, monkeypatch, tmp_path):
-	# A stop saved an event for a new file in a/. Before the retry a was moved out and a link put in its place: the file is a regular
-	# file only as seen through the link, and replaying it as a modify copies what the link leads to into the version (on 436b9c3).
-	put_text(r_job.monitor, 'a/old.txt', 'o0')
-	base(r_job)
-	cut_before_the_commit(r_job, modify_big(r_job), monkeypatch)
-	outside = tmp_path / 'outside'
-	outside.mkdir()
-	shutil.move(os.path.join(r_job.monitor, 'a'), str(outside / 'a'))
-	put_text(str(outside), 'a/new.txt', big_text('n1'))
-	os.symlink(str(outside / 'a'), os.path.join(r_job.monitor, 'a'))
-	given = OrderedDict({os.path.join(r_job.monitor, 'a', 'new.txt'): rv.BackupEntryValues(datetime.datetime.now().isoformat(), 'create', None)})
-	reads, copies = recording_reads_and_copies(monkeypatch)
-	roll_forward(r_job, given)
-	assert [source for source in copies if source.startswith(os.path.join(r_job.monitor, 'a') + os.sep)] == []
-	newest = committed_versions(r_job)[-1]
-	assert contents_of(newest) == contents_of(r_job.monitor)
-	assert contents_of(newest)['a'] == ('l', str(outside / 'a'))
 
 
 # ---- 9. no markers

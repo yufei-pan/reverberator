@@ -327,10 +327,6 @@ def test_touched_scopes(job):
 	# a job monitoring the root of the filesystem
 	assert rv.touched_scopes([rv.ChangeEvent(1.0, False, 'modify', '/etc/x', None), rv.ChangeEvent(2.0, True, 'create', '/srv', None),
 		rv.ChangeEvent(3.0, True, 'attrib', '/', None)], '/') == rv.TouchedScopes(['etc/x/', 'srv/'], ['etc/x', 'srv'], 1.0)
-	# a batch handed back holds its collapsed entries only, timed as they were handed back: every entry's are compared
-	queue = rv.ChangeEventQueue(job.monitor)
-	queue.prepend(raw_events(job, [('modify', 'a.txt', None, False)]))
-	assert rv.touched_scopes(queue.take(), job.monitor).changed_since == float('-inf')
 
 
 def test_verification_respects_skip_list_and_paused_mounts(tmp_path, monkeypatch):
@@ -809,55 +805,6 @@ def record_backups(monkeypatch):
 	return calls
 
 
-def test_a_resumed_batch_is_followed_by_a_full_comparison(job, monkeypatch):
-	from tests.harness import write_pending, wait_until, wait_for_committed_count
-	import time
-	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
-	run_backup(job)
-	a = os.path.join(job.monitor, 'a.txt')
-	with open(a, 'w') as f:
-		f.write('changed')
-	pending = write_pending(job, [rv.ChangeEvent(time.monotonic(), False, 'modify', a, None)])
-	for path in (job.monitor, a, os.path.join(job.monitor, 'b.txt')):
-		os.utime(path, (time.time() - 30, time.time() - 30))
-	queue = rv.ChangeEventQueue(job.monitor)
-	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue) is True
-	assert queue.round_tripped
-	calls = record_backups(monkeypatch)
-	thread, lock, flag = start_backuper(job, queue)
-	try:
-		wait_for_committed_count(job, 2)
-		# with no watcher to signal the backuper again
-		wait_until(lambda: (0, None) in calls, message='no full comparison after the resumed batch')
-		assert calls[0][0] == 1
-		# the comparison is the batch's own, not a flag left for later batches
-		assert not queue.round_tripped
-	finally:
-		stop_backuper(thread)
-
-
-def test_a_requeued_batch_is_followed_by_a_full_comparison(job, monkeypatch):
-	from tests.harness import wait_until, wait_for_committed_count
-	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
-	run_backup(job)
-	a = os.path.join(job.monitor, 'a.txt')
-	with open(a, 'w') as f:
-		f.write('changed')
-	queue = rv.ChangeEventQueue(job.monitor)
-	queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'b.txt'), None))
-	assert not queue.round_tripped
-	# the batch a backup that did not commit hands back
-	queue.prepend(rv.backup_entries_to_change_events(OrderedDict([(a, rv.BackupEntryValues('t', 'modify', None))])))
-	assert queue.round_tripped
-	calls = record_backups(monkeypatch)
-	thread, lock, flag = start_backuper(job, queue)
-	try:
-		wait_for_committed_count(job, 2)
-		wait_until(lambda: (0, None) in calls, message='no full comparison after the requeued batch')
-	finally:
-		stop_backuper(thread)
-
-
 def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job, monkeypatch):
 	from tests.harness import wait_for_committed_count
 	import time
@@ -1004,7 +951,7 @@ def test_scans_with_an_empty_collapse_compare_the_touched_places_too(job):
 	assert_version_matches_tree(job, versions[-1])
 
 
-def test_an_empty_collapse_that_does_not_commit_asks_for_a_full_comparison(job, monkeypatch):
+def test_an_empty_collapse_that_does_not_commit_leaves_nothing_queued(job, monkeypatch):
 	from tests.harness import wait_until
 	seed_monitor(job, {'refs/X': 'old ref'})
 	run_backup(job)
@@ -1026,36 +973,13 @@ def test_an_empty_collapse_that_does_not_commit_asks_for_a_full_comparison(job, 
 			for event in replace_then_delete(job):
 				queue.append(event)
 		flag.set()
-		# its events are gone from the queue, and nothing names what they touched but a full comparison
+		# its events are gone from the queue, and nothing is handed back: the next attempt compares the whole tree first
 		thread.join(timeout=10)
 		assert not thread.is_alive() and len(calls) == 2 and calls[1] is not None
-		assert queued_full_scan(queue, lock)
+		with lock:
+			assert len(queue) == 0
 	finally:
 		stop_backuper(thread)
-
-
-def test_git_pattern_round_tripped_ends_clean(tmp_path):
-	from tests.harness import wait_until, wait_for_committed_count
-	before, after, events_spec, _ = SEQUENCES['git']
-	job = create_job(str(tmp_path))
-	write_tree(job.monitor, before)
-	run_backup(job)
-	make_tree(job, before, after)
-	entries = rv.change_events_to_backup_entries(deque(raw_events(job, events_spec)), job.monitor)
-	# the pending round trip keeps only the collapsed entries, which do not name X
-	queue = rv.ChangeEventQueue(job.monitor)
-	queue.prepend(rv.backup_entries_to_change_events(entries))
-	thread, lock, flag = start_backuper(job, queue)
-	try:
-		wait_for_committed_count(job, 2)
-		assert os.path.lexists(os.path.join(rv.list_versions(job.job_vault)[1].path, 'refs/X'))
-		# the full comparison follows by itself
-		wait_for_committed_count(job, 3)
-	finally:
-		stop_backuper(thread)
-	latest = rv.list_versions(job.job_vault)[-1]
-	assert not os.path.lexists(os.path.join(latest.path, 'refs/X'))
-	assert_version_matches_tree(job, latest)
 
 
 def test_an_event_on_the_root_gives_no_entry_and_no_row(tmp_path):
@@ -1343,14 +1267,6 @@ def test_a_folder_replaced_by_a_file_logs_one_line(tmp_path, monkeypatch):
 	assert_version_matches_tree(job, version)
 	logged = [message for message, error, _ in lines[0] if 'big' in message and (error or 'in its place' in message)]
 	assert len(logged) == 1 and 'in its place' in logged[0], logged
-
-
-def test_scans_handed_back_alone_are_not_round_tripped(job):
-	queue = rv.ChangeEventQueue(job.monitor)
-	queue.prepend(rv.scan_events([os.path.join(job.monitor, 'disk')]))
-	assert not queue.round_tripped
-	queue.prepend(rv.backup_entries_to_change_events(OrderedDict([(os.path.join(job.monitor, 'a.txt'), rv.BackupEntryValues('t', 'modify', None))])))
-	assert queue.round_tripped
 
 
 @pytest.mark.parametrize('name', ['file_over_folder', 'gone_folder_named_as_a_folder'])

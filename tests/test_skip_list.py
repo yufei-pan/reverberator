@@ -2,7 +2,7 @@ from collections import OrderedDict
 import os
 import pytest
 import reverberator as rv
-from tests.harness import charge, seed_monitor, write_tree, write_pending, committed_versions
+from tests.harness import charge, seed_monitor, write_tree, committed_versions
 
 pytestmark = pytest.mark.unit
 
@@ -178,30 +178,6 @@ def test_new_folder_copy_leaves_out_skipped(job, poll_fast):
 	assert os.path.isfile(os.path.join(v1, 'newdir', 'keep.txt'))
 	assert not os.path.lexists(os.path.join(v1, 'newdir', 'x.tmp'))
 	assert not os.path.lexists(os.path.join(v1, 'newdir', 'cache'))
-
-
-def _age_tree(job, skipped_file):
-	for path in (job.monitor, os.path.join(job.monitor, 'a.txt'), os.path.join(job.monitor, 'cache')):
-		os.utime(path, (1000, 1000))
-	os.utime(skipped_file, (5000, 5000))
-
-
-def test_resume_check_ignores_changes_in_skipped_paths(job):
-	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x'})
-	_age_tree(job, os.path.join(job.monitor, 'cache', 'x.bin'))
-	assert rv.get_monitor_path_most_recent_change_time(job.monitor) == 5000
-	assert rv.get_monitor_path_most_recent_change_time(job.monitor, rv.SkipList(job.monitor, ['cache/'])) == 1000
-
-
-def test_pending_resumes_when_only_skipped_paths_changed(job):
-	seed_monitor(job, {'a.txt': 'a', 'cache/x.bin': 'x'})
-	a = os.path.join(job.monitor, 'a.txt')
-	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
-	_age_tree(job, os.path.join(job.monitor, 'cache', 'x.bin'))
-	os.utime(pending, (2000, 2000))
-	queue = rv.ChangeEventQueue(job.monitor)
-	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue, rv.SkipList(job.monitor, ['cache/'])) is True
-	assert [event.path for event in queue] == [a]
 
 
 def test_manifest_skip_fingerprint_round_trip(job):

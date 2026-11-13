@@ -55,12 +55,6 @@ def test_unreadable_folder_in_first_backup_is_reported(job, poll_fast, monkeypat
 	assert 'UNREADABLE: ' + os.path.join(job.monitor, 'locked') in out.out + out.err
 
 
-def test_resume_check_refuses_after_a_read_error(job, monkeypatch):
-	seed_monitor(job, {'d/a.txt': 'a'})
-	_fail_scandir(monkeypatch, os.path.join(job.monitor, 'd'), errno.EIO)
-	assert rv.get_monitor_path_most_recent_change_time(job.monitor) == float('inf')
-
-
 def test_new_unreadable_folder_is_logged_once(job, poll_fast, monkeypatch, capsys):
 	seed_monitor(job, {'a.txt': 'a'})
 	_backup(job)[1].close()

@@ -121,19 +121,6 @@ def test_self_destruct_skipped():
 	assert len(entries) == 0
 
 
-def test_backup_entries_round_trip_move_and_dir():
-	original = rv.change_events_to_backup_entries(deque([
-		_ev(1, True, 'create', f'{P}/d', None),
-		_ev(2, False, 'move', f'{P}/b', f'{P}/a'),
-	]))
-	events = rv.backup_entries_to_change_events(original)
-	by_path = {e.path.rstrip('/') + ('/' if e.is_dir else ''): e for e in events}
-	assert by_path[f'{P}/d/'].is_dir is True
-	assert by_path[f'{P}/d/'].event == 'create'
-	assert by_path[f'{P}/b'].event == 'move'
-	assert by_path[f'{P}/b'].moved_from == f'{P}/a'
-
-
 def test_full_scan_replaces_queued_events_and_absorbs_later_ones():
 	# the backuper compares the whole tree for a batch holding a full scan, which covers every other event in it
 	queue = rv.ChangeEventQueue('/m')
@@ -141,8 +128,6 @@ def test_full_scan_replaces_queued_events_and_absorbs_later_ones():
 	rv.append_change_event(queue, lock, rv.ChangeEvent(1.0, False, 'create', '/m/a', None))
 	rv.append_change_event(queue, lock, rv.ChangeEvent(2.0, False, 'full_scan', '/m', None))
 	rv.append_change_event(queue, lock, rv.ChangeEvent(3.0, False, 'modify', '/m/b', None))
-	assert list(queue) == [rv.ChangeEvent(2.0, False, 'full_scan', '/m', None)]
-	queue.prepend([rv.ChangeEvent(0.5, False, 'modify', '/m/c', None)])
 	assert list(queue) == [rv.ChangeEvent(2.0, False, 'full_scan', '/m', None)] and queue.full_scan_requested
 
 

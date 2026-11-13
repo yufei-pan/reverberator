@@ -1648,7 +1648,7 @@ def test_the_ctime_bound_is_the_earlier_of_the_two_clocks(monkeypatch):
 	assert abs(rv.ctime_bound(time.monotonic(), now) - (now - 60 * 10 ** 9 - margin)) < 10 ** 8
 	# a full comparison's bound is a wall time alone
 	assert rv.ctime_bound(None, now) == now - margin
-	assert rv.ctime_bound(float('-inf'), now) == 0 and rv.ctime_bound(None) is None
+	assert rv.ctime_bound(None) is None
 
 
 def test_an_xattr_changed_before_a_forward_clock_step_is_compared(job, logged, monkeypatch):

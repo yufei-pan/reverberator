@@ -1,3 +1,4 @@
+import errno
 import os
 import shutil
 import threading
@@ -38,15 +39,6 @@ def _stop(thread):
 	rv.GREEN_LIGHT.set()
 
 
-def _resumable_pending(job, path):
-	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', path, None)])
-	for dirpath, dirnames, filenames in os.walk(job.monitor):
-		for name in [dirpath] + [os.path.join(dirpath, n) for n in dirnames + filenames]:
-			os.utime(name, (1000, 1000))
-	os.utime(pending, (2000, 2000))
-	return pending
-
-
 def _age(job):
 	for dirpath, dirnames, filenames in os.walk(job.monitor):
 		for name in [dirpath] + [os.path.join(dirpath, n) for n in dirnames + filenames]:
@@ -65,10 +57,10 @@ def _count_deltas(monkeypatch):
 	return calls
 
 
-def test_load_without_list_is_empty_and_unchanged(job):
+def test_load_without_list_is_empty(job):
 	startup = rv.JobStartup(job.job_name, job.monitor)
 	assert startup.load(None) is True and startup.loaded.is_set() and not startup.failed
-	assert not startup.skip_list and startup.change == 'unchanged'
+	assert not startup.skip_list
 
 
 def test_load_missing_list_fails(job):
@@ -91,7 +83,7 @@ def test_load_refuses_losing_patterns_without_none(job):
 	assert rv.JobStartup(job.job_name, job.monitor).load('recorded') is False
 	assert rv.JobStartup(job.job_name, job.monitor, _skip_file(job, '# nothing\n')).load('recorded') is False
 	explicit = rv.JobStartup(job.job_name, job.monitor, explicit_none=True)
-	assert explicit.load('recorded') is True and explicit.change == 'changed'
+	assert explicit.load('recorded') is True and not explicit.skip_list
 
 
 def test_backuper_loads_list_after_filesystem_ready(job, poll_fast):
@@ -160,78 +152,24 @@ def test_watcher_exits_without_stopping_others_when_list_failed(job, poll_fast):
 	assert rv.GREEN_LIGHT.is_set()
 
 
-def test_changed_list_discards_pending_and_compares(job, poll_fast, monkeypatch):
+def test_a_changed_list_is_applied_by_the_starts_comparison(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a', 'cache/x': 'x'})
 	_v0(job)
-	pending = _resumable_pending(job, os.path.join(job.monitor, 'a.txt'))
 	deltas = _count_deltas(monkeypatch)
 	startup = rv.JobStartup(job.job_name, job.monitor, _skip_file(job, 'cache/\n'))
 	startup.watching.set()
 	thread = _run_backuper(job, startup)
 	try:
 		versions = wait_for_committed_count(job, 2)
-		assert not os.path.exists(pending) and deltas
+		assert deltas
 		assert not os.path.lexists(os.path.join(versions[1], 'cache'))
 	finally:
 		_stop(thread)
 
 
-def test_unchanged_list_resumes_pending(job, poll_fast, monkeypatch):
-	seed_monitor(job, {'a.txt': 'a'})
-	_v0(job, rv.SkipList(job.monitor, ['*.tmp']))
-	a = os.path.join(job.monitor, 'a.txt')
-	open(a, 'w').write('changed')
-	pending = _resumable_pending(job, a)
-	deltas = _count_deltas(monkeypatch)
-	startup = rv.JobStartup(job.job_name, job.monitor, _skip_file(job, '*.tmp\n'))
-	startup.watching.set()
-	thread = _run_backuper(job, startup)
-	try:
-		versions = wait_for_committed_count(job, 2)
-		# the resumed batch is backed up as it is; only the full comparison that follows it compares the tree
-		assert not os.path.exists(pending) and all(count >= 2 for count in deltas)
-		assert open(os.path.join(versions[1], 'a.txt')).read() == 'changed'
-	finally:
-		_stop(thread)
-
-
-def test_upgrade_without_skip_list_resumes_pending(job, poll_fast, monkeypatch):
+def test_a_stop_before_the_watches_are_in_place_saves_nothing_and_makes_no_version(job, poll_fast):
 	seed_monitor(job, {'a.txt': 'a'})
 	_v0(job)
-	manifest = rv.VaultManifest(job.job_vault)
-	manifest.conn.execute("DELETE FROM meta WHERE key = 'skip_fingerprint'")
-	manifest.close()
-	a = os.path.join(job.monitor, 'a.txt')
-	open(a, 'w').write('changed')
-	pending = _resumable_pending(job, a)
-	deltas = _count_deltas(monkeypatch)
-	startup = rv.JobStartup(job.job_name, job.monitor)
-	startup.watching.set()
-	thread = _run_backuper(job, startup)
-	try:
-		wait_for_committed_count(job, 2)
-		# the resumed batch is backed up as it is; only the full comparison that follows it compares the tree
-		assert not os.path.exists(pending) and all(count >= 2 for count in deltas)
-	finally:
-		_stop(thread)
-
-
-def test_stop_before_watches_are_in_place_keeps_pending(job, poll_fast):
-	seed_monitor(job, {'a.txt': 'a'})
-	_v0(job)
-	pending = _resumable_pending(job, os.path.join(job.monitor, 'a.txt'))
-	startup = rv.JobStartup(job.job_name, job.monitor)
-	thread = _run_backuper(job, startup)
-	wait_until(startup.loaded.is_set)
-	_stop(thread)
-	assert not thread.is_alive() and os.path.exists(pending)
-	assert 'full_scan' not in open(pending).read()
-
-
-def test_stop_before_deciding_saves_queued_events_as_full_scan(job, poll_fast):
-	seed_monitor(job, {'a.txt': 'a'})
-	_v0(job)
-	pending = _resumable_pending(job, os.path.join(job.monitor, 'a.txt'))
 	queue = rv.ChangeEventQueue(job.monitor)
 	lock = threading.Lock()
 	startup = rv.JobStartup(job.job_name, job.monitor)
@@ -241,73 +179,266 @@ def test_stop_before_deciding_saves_queued_events_as_full_scan(job, poll_fast):
 		threading.Event(), flag), kwargs=dict(startup=startup), daemon=True)
 	thread.start()
 	wait_until(startup.loaded.is_set)
-	# the watcher queued an event, then the daemon stopped before the backuper saw its watches were in place
+	# the watcher queued an event, then the daemon stopped before the backuper saw its watches were in place: the next start
+	# compares the whole tree, so nothing is saved
 	with lock:
 		queue.append(rv.ChangeEvent(5.0, False, 'create', os.path.join(job.monitor, 'b.txt'), None))
 	_stop(thread)
-	assert not thread.is_alive() and 'full_scan' in open(pending).read()
+	assert not thread.is_alive() and not os.path.lexists(_pending(job))
+	assert len(committed_versions(job)) == 1
 
 
 def test_the_vault_scan_runs_while_the_job_waits_for_its_monitored_path(job, poll_fast):
 	# a job restarted with its monitored path missing still has what a killed batch left taken away, by the scan, before
-	# the path comes back
+	# the path comes back; a pending file an older release left goes then too
 	seed_monitor(job, {'a.txt': 'a'})
 	_v0(job)
 	orphan = write_scan_leftover(job)
+	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None)])
 	shutil.rmtree(job.monitor)
 	startup = rv.JobStartup(job.job_name, job.monitor)
 	startup.watching.set()
 	thread = _run_backuper(job, startup)
 	try:
-		wait_until(lambda: not os.path.lexists(orphan))
+		wait_until(lambda: not os.path.lexists(orphan) and not os.path.lexists(pending))
 		assert thread.is_alive() and not startup.loaded.is_set()
 		assert len(committed_versions(job)) == 1
 	finally:
 		_stop(thread)
 
 
-def test_a_restart_with_only_scans_pending_compares_the_whole_tree(job, poll_fast):
-	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b', 'disk/x': 'x'})
-	_age(job)                                               # every monitored entry at mtime 1000, before V0
-	_v0(job)
-	# while the daemon is down, outside the scanned folder
-	os.chmod(os.path.join(job.monitor, 'a.txt'), 0o600)
-	b = os.path.join(job.monitor, 'b.txt')
-	open(b, 'w').write('changed while down')
-	os.utime(b, (1000, 1000))
-	pending = write_pending(job, [rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None)])
-	os.utime(pending, (2000, 2000))
+# ---- F3: every start is one full comparison, and the pending file goes. A stop saves nothing and a start resumes nothing:
+# each start runs the one full comparison it ran anyway and makes one version. A pending file an older release left is
+# removed at the start. The tree's mtimes are set back after each change (_age()), so 0.55.4's resume check passes and it
+# replays what it saved.
+
+class IdleFlag(threading.Event):
+	'''A backuper's batch flag that says when the backuper first waits on it: idle, every batch it took before done.'''
+	def __init__(self):
+		super().__init__()
+		self.idle = threading.Event()
+
+	def wait(self, timeout=None):
+		self.idle.set()
+		return super().wait(timeout)
+
+
+def _start(job, flag):
+	'''A backuper as a start runs it, its watches in place, on a fresh queue, with flag as its batch flag: (thread, queue, lock).'''
+	queue, lock = rv.ChangeEventQueue(job.monitor), threading.Lock()
 	startup = rv.JobStartup(job.job_name, job.monitor)
 	startup.watching.set()
-	thread = _run_backuper(job, startup)
+	ready = threading.Event()
+	ready.set()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag, ready),
+		kwargs=dict(startup=startup), daemon=True)
+	thread.start()
+	return thread, queue, lock
+
+
+def _start_until_idle(job):
+	'''A start run until its backuper is idle, then stopped.'''
+	flag = IdleFlag()
+	thread, _, _ = _start(job, flag)
 	try:
-		v1 = wait_for_committed_count(job, 2)[1]
+		wait_until(flag.idle.is_set, message='the start never went idle')
 	finally:
 		_stop(thread)
-	assert not os.path.exists(pending)
-	assert open(os.path.join(v1, 'b.txt')).read() == 'changed while down'
-	assert os.stat(os.path.join(v1, 'a.txt')).st_mode & 0o777 == 0o600
 
 
-def test_a_resumed_scan_with_differences_is_followed_by_a_full_comparison(job, poll_fast):
-	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b', 'disk/x': 'x'})
+def _logged(monkeypatch):
+	'''(message, level) of each line the backuper logs, in the list returned.'''
+	lines = []
+	real = rv.backuperTeeLogToTl
+	def spy(path, message, **kwargs):
+		lines.append((message, next((level for level in ('error', 'warning', 'ok') if kwargs.get(level)), 'info')))
+		return real(path, message, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', spy)
+	return lines
+
+
+def _pending(job):
+	return os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME)
+
+
+def _read(path):
+	with open(path) as f:
+		return f.read()
+
+
+def test_a_stop_saves_nothing_and_the_start_makes_one_version(job, poll_fast):
+	# fails on main: its stop writes the queued changes to the pending file; its start replays them as a version (the move a
+	# rename), then compares the whole tree into a second one
+	from tests.test_moves_then_changes import user_xattrs_or_skip
+	user_xattrs_or_skip(job.monitor)
+	seed_monitor(job, {'moved.txt': 'm', 'written.txt': 'w', 'chmod.txt': 'c', 'xattr.txt': 'x', 'removed.txt': 'r'})
 	_age(job)
 	_v0(job)
-	b, x = os.path.join(job.monitor, 'b.txt'), os.path.join(job.monitor, 'disk', 'x')
-	for path, text in ((b, 'changed while down'), (x, 'x changed while down')):
-		open(path, 'w').write(text)
-		os.utime(path, (1000, 1000))
-	pending = write_pending(job, [rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None)])
-	os.utime(pending, (2000, 2000))
-	startup = rv.JobStartup(job.job_name, job.monitor)
-	startup.watching.set()
-	thread = _run_backuper(job, startup)
+	moved_inode = os.lstat(os.path.join(committed_versions(job)[-1], 'moved.txt')).st_ino
+	flag = IdleFlag()
+	thread, queue, lock = _start(job, flag)
 	try:
-		v1, v2 = wait_for_committed_count(job, 3)[1:3]     # the resumed scan's version, then the follow-up's
+		wait_until(flag.idle.is_set, message='the start never went idle')
+		assert len(committed_versions(job)) == 1
+		# changes the watcher queued and the backuper has not taken, then the stop
+		path = lambda rel: os.path.join(job.monitor, rel)
+		os.rename(path('moved.txt'), path('moved-to.txt'))
+		open(path('written.txt'), 'w').write('written before the stop')
+		os.chmod(path('chmod.txt'), 0o600)
+		os.setxattr(path('xattr.txt'), 'user.before_stop', b'1')
+		with lock:
+			for event in (rv.ChangeEvent(time.monotonic(), False, 'move', path('moved-to.txt'), path('moved.txt')),
+					rv.ChangeEvent(time.monotonic(), False, 'modify', path('written.txt'), None),
+					rv.ChangeEvent(time.monotonic(), False, 'attrib', path('chmod.txt'), None),
+					rv.ChangeEvent(time.monotonic(), False, 'attrib', path('xattr.txt'), None)):
+				queue.append(event)
 	finally:
 		_stop(thread)
-	assert open(os.path.join(v1, 'disk', 'x')).read() == 'x changed while down'
-	assert open(os.path.join(v2, 'b.txt')).read() == 'changed while down'
+	assert not os.path.lexists(_pending(job))
+	# while the daemon is down
+	open(path('new.txt'), 'w').write('new while down')
+	os.remove(path('removed.txt'))
+	_age(job)
+	_start_until_idle(job)
+	versions = committed_versions(job)
+	assert len(versions) == 2
+	newest = versions[-1]
+	assert sorted(os.listdir(newest)) == ['chmod.txt', 'moved-to.txt', 'new.txt', 'written.txt', 'xattr.txt']
+	assert _read(os.path.join(newest, 'written.txt')) == 'written before the stop' and _read(os.path.join(newest, 'new.txt')) == 'new while down'
+	assert os.stat(os.path.join(newest, 'chmod.txt')).st_mode & 0o777 == 0o600
+	assert os.getxattr(os.path.join(newest, 'xattr.txt'), 'user.before_stop') == b'1'
+	# the move is copied, not renamed: the comparison finds a delete and a create
+	assert _read(os.path.join(newest, 'moved-to.txt')) == 'm' and os.lstat(os.path.join(newest, 'moved-to.txt')).st_ino != moved_inode
 	manifest = rv.VaultManifest(job.job_vault)
-	assert manifest.matched[0] == os.path.basename(v2)      # the follow-up advanced it; the resumed batch carried nothing
-	manifest.close()
+	try:
+		assert manifest.matched[0] == os.path.basename(newest)
+	finally:
+		manifest.close()
+
+
+def test_a_leftover_pending_file_is_removed_and_the_start_makes_one_version(job, poll_fast, monkeypatch):
+	# fails on main: it replays the file as a version of its own, then compares the whole tree into a second one
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	_age(job)
+	_v0(job)
+	a, b = os.path.join(job.monitor, 'a.txt'), os.path.join(job.monitor, 'b.txt')
+	open(a, 'w').write('a changed before the stop')
+	open(b, 'w').write('b changed while down')
+	_age(job)
+	# as 0.55.4 writes it at a stop, newer than every change of the tree
+	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
+	os.utime(pending, (2000, 2000))
+	lines = _logged(monkeypatch)
+	_start_until_idle(job)
+	assert [message for message, _ in lines if pending in message] == [f'Removed {pending}, a pending file of an older release: every start compares the whole tree']
+	assert not os.path.lexists(pending)
+	versions = committed_versions(job)
+	assert len(versions) == 2
+	assert _read(os.path.join(versions[-1], 'a.txt')) == 'a changed before the stop' and _read(os.path.join(versions[-1], 'b.txt')) == 'b changed while down'
+
+
+def test_a_failed_attempt_is_followed_by_one_full_comparison(job, poll_fast, monkeypatch):
+	# pin: the next attempt after a failed one compares the whole tree once, and makes one version
+	seed_monitor(job, {'a.txt': 'a'})
+	_v0(job)
+	queue, lock = rv.ChangeEventQueue(job.monitor), threading.Lock()
+	ready = threading.Event()
+	ready.set()
+	control = rv.JobControl(job.job_name)
+	def attempt(flag):
+		control.start_attempt()
+		startup = rv.JobStartup(job.job_name, job.monitor)
+		startup.watching.set()
+		thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag, ready),
+			kwargs=dict(startup=startup, job=control), daemon=True)
+		thread.start()
+		return thread
+	real = rv.do_backup
+	batches = []
+	def do_backup(backup_entries, **kwargs):
+		batches.append((len(backup_entries), kwargs.get('touched')))
+		if fail:
+			raise rv.JobFailure('the disk went')
+		return real(backup_entries, **kwargs)
+	monkeypatch.setattr(rv, 'do_backup', do_backup)
+	fail = False
+	flag = IdleFlag()
+	thread = attempt(flag)
+	wait_until(flag.idle.is_set, message='the first attempt never went idle')
+	# a batch of the first attempt fails
+	fail = True
+	a = os.path.join(job.monitor, 'a.txt')
+	open(a, 'w').write('changed')
+	with lock:
+		queue.append(rv.ChangeEvent(time.monotonic(), False, 'modify', a, None))
+	flag.set()
+	thread.join(timeout=10)
+	assert not thread.is_alive() and control.failure is not None and len(committed_versions(job)) == 1
+	# the next attempt
+	fail = False
+	del batches[:]
+	flag = IdleFlag()
+	thread = attempt(flag)
+	try:
+		wait_until(flag.idle.is_set, message='the next attempt never went idle')
+	finally:
+		_stop(thread)
+	# one batch, a full comparison (no entries, no touched scopes), and one version holding the change
+	assert batches == [(0, None)]
+	versions = committed_versions(job)
+	assert len(versions) == 2 and _read(os.path.join(versions[-1], 'a.txt')) == 'changed'
+
+
+def test_a_rewrite_keeping_size_mtime_and_tail_before_a_stop_is_not_in_the_starts_version(job, poll_fast):
+	# fails on main: its start replays the rewrite's modify from the pending file and copies the file. A pin of the sentence
+	# the rewrite entry gains: the start's full comparison cannot see such a rewrite, whose event the stop dropped
+	tail = 64 * 1024
+	seed_monitor(job, {'big.txt': 'h' * tail + 't' * tail})
+	_age(job)
+	_v0(job)
+	flag = IdleFlag()
+	thread, queue, lock = _start(job, flag)
+	big = os.path.join(job.monitor, 'big.txt')
+	try:
+		wait_until(flag.idle.is_set, message='the start never went idle')
+		# rewritten in place before its last 64 KiB, its size and mtime kept
+		before = os.stat(big)
+		with open(big, 'r+') as f:
+			f.write('H' * 1024)
+		os.utime(big, ns=(before.st_atime_ns, before.st_mtime_ns))
+		with lock:
+			queue.append(rv.ChangeEvent(time.monotonic(), False, 'modify', big, None))
+	finally:
+		_stop(thread)
+	_age(job)
+	_start_until_idle(job)
+	assert _read(os.path.join(committed_versions(job)[-1], 'big.txt'))[:1024] == 'h' * 1024
+
+
+def test_a_leftover_pending_file_that_cannot_be_removed_stops_nothing(job, poll_fast, monkeypatch):
+	# review focus 5: one warning naming it, and the start's one full comparison and one version
+	seed_monitor(job, {'a.txt': 'a'})
+	_age(job)
+	_v0(job)
+	a = os.path.join(job.monitor, 'a.txt')
+	open(a, 'w').write('changed while down')
+	_age(job)
+	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
+	os.utime(pending, (2000, 2000))
+	real_remove = os.remove
+	def remove(path, *args, **kwargs):
+		if os.path.basename(os.fspath(path)) == rv.PENDING_TRANSACTIONS_FILE_NAME:
+			raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+		return real_remove(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'remove', remove)
+	lines = _logged(monkeypatch)
+	flag = IdleFlag()
+	thread, _, _ = _start(job, flag)
+	try:
+		wait_until(flag.idle.is_set, message='the start never went idle')
+		assert thread.is_alive()
+	finally:
+		_stop(thread)
+	assert [level for message, level in lines if pending in message] == ['warning']
+	versions = committed_versions(job)
+	assert len(versions) == 2 and _read(os.path.join(versions[-1], 'a.txt')) == 'changed while down'

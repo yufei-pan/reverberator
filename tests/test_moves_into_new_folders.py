@@ -957,28 +957,6 @@ def test_a_take_waits_for_the_walk_of_a_folder_moved_into_an_existing_folder(ses
 	assert inodes_of(job)['other/big/a'] == inodes['big/a']
 
 
-def test_a_batch_handed_back_replays_its_move_once(session, job):
-	one = session()
-	inodes = inodes_of(job)
-	before = version_view(job)
-	previous = latest_version(job).path
-	one.run([('mv', 'big', 'other/big'), ('write', 'other/big/z', 'z')], 'apart')
-	batch = one.take()
-	first = rv.change_events_to_backup_entries(batch, job.monitor)
-	# as a backup that did not commit hands its batch back, with what came meanwhile behind it
-	one.apply(('append', 'other/big/z', 'more'))
-	wait_until(lambda: one.events(), message='nothing queued')
-	with one.lock:
-		one.queue.prepend(rv.backup_entries_to_change_events(first))
-	again = one.take()
-	assert again.round_tripped
-	entries = rv.change_events_to_backup_entries(again, job.monitor)
-	assert [(rel.rstrip('/'), values.event) for rel, values in entries.items() if values.event == 'move'] == [(os.path.join(job.monitor, 'other/big'), 'move')]
-	one.back_up(again)
-	assert_held_as_the_tree(job, before, previous)
-	assert inodes_of(job)['other/big/a'] == inodes['big/a']
-
-
 def test_a_batch_read_before_the_first_version_is_right(job, poll_fast, monkeypatch):
 	# nothing is in the vault yet: the batch becomes V0, whatever its moves say
 	seed_monitor(job, SEED)

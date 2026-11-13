@@ -8,7 +8,7 @@ import pytest
 import reverberator as rv
 from collections import deque
 from tests.harness import (reads_the_file_before, scripted_watch, seed_monitor, run_backup, event_entry, latest_version, wait_until,
-	wait_for_committed_count, write_pending, header_counter, committed_versions)
+	wait_for_committed_count, header_counter, committed_versions)
 from tests.test_inner_mounts import _fake_mounts
 from tests.test_moves_then_changes import user_xattrs_or_skip
 from tests.test_verify_replay import start_backuper, stop_backuper
@@ -261,15 +261,20 @@ def test_the_backuper_passes_each_batch_its_matched_time(job, monkeypatch):
 	try:
 		wait_for_committed_count(job, 2)
 		open(os.path.join(job.monitor, 'b.txt'), 'w').write('changed')
-		before = time.time_ns()
 		with lock:
-			queue.prepend(rv.backup_entries_to_change_events(OrderedDict([event_entry(job, 'b.txt', 'modify')])))
+			queue.append(rv.ChangeEvent(2.0, False, 'modify', os.path.join(job.monitor, 'b.txt'), None))
 			queue.read_wall_ns = 222
 		flag.set()
-		wait_until(lambda: len(calls) == 3, message='no follow-up full comparison')
+		wait_until(lambda: len(calls) == 2, message='no second batch')
+		# a full comparison's is its own start
+		before = time.time_ns()
+		with lock:
+			queue.append(rv.ChangeEvent(3.0, False, 'full_scan', job.monitor, None))
+		flag.set()
+		wait_until(lambda: len(calls) == 3, message='no full comparison')
 	finally:
 		stop_backuper(thread)
-	assert calls[:2] == [111, None] and before <= calls[2] <= time.time_ns()
+	assert calls[:2] == [111, 222] and before <= calls[2] <= time.time_ns()
 
 
 def test_a_restarts_full_comparison_records_a_key(job, poll_fast):
@@ -289,28 +294,29 @@ def test_a_restarts_full_comparison_records_a_key(job, poll_fast):
 	assert matched(job)[0] == name(v0) and before <= matched(job)[1] <= time.time_ns()
 
 
-def test_an_xattr_set_while_down_reaches_the_follow_up_version(job, monkeypatch):
+def test_an_xattr_set_while_down_reaches_the_starts_version(job, poll_fast):
 	user_xattrs_or_skip(job.monitor)
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
 	for path in (job.monitor, os.path.join(job.monitor, 'a.txt'), os.path.join(job.monitor, 'b.txt')):
 		os.utime(path, (1000, 1000))
 	run_backup(job, matched_since=time.time_ns())
-	# while the daemon is down: an xattr of b, and a write to a its pending batch holds
+	# while the daemon is down: an xattr of b, and a write to a, its mtime set back
 	os.setxattr(os.path.join(job.monitor, 'b.txt'), 'user.down', b'1')
 	a = os.path.join(job.monitor, 'a.txt')
 	open(a, 'w').write('changed')
 	os.utime(a, (1000, 1000))
-	pending = write_pending(job, [rv.ChangeEvent(time.monotonic(), False, 'modify', a, None)])
-	os.utime(pending, (2000, 2000))
-	queue = rv.ChangeEventQueue(job.monitor)
-	assert rv.load_pending_transactions_for_resume(job.job_name, job.monitor, job.vault, queue)
-	queue.read_wall_ns = time.time_ns() + 3600 * 10 ** 9   # a resumed batch's stamp is never used
-	thread, lock, flag = start_backuper(job, queue)
+	# the start's full comparison: one version holding both
+	startup = rv.JobStartup(job.job_name, job.monitor)
+	startup.watching.set()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, rv.ChangeEventQueue(job.monitor), threading.Lock(),
+		job.monitor, job.vault, 'N/A', threading.Event()), kwargs=dict(startup=startup), daemon=True)
+	thread.start()
 	try:
-		v2 = wait_for_committed_count(job, 3)[2]
+		v1 = wait_for_committed_count(job, 2)[1]
 	finally:
 		stop_backuper(thread)
-	assert os.getxattr(os.path.join(v2, 'b.txt'), 'user.down') == b'1'
+	assert os.getxattr(os.path.join(v1, 'b.txt'), 'user.down') == b'1'
+	assert open(os.path.join(v1, 'a.txt')).read() == 'changed'
 
 
 def test_a_move_out_pending_at_a_max_delay_hand_over_still_pairs(job, monkeypatch):
