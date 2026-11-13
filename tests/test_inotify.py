@@ -588,6 +588,59 @@ def test_an_unreadable_folder_gives_its_watch_back_and_is_left_unwatched(tmp_pat
 	assert unwatched == {u}
 
 
+def _removed_at_its_listing(monkeypatch, folder):
+	'''folder is removed when a listing of it is opened, just before the kernel's open: a folder made and removed while a walk passed.'''
+	real = os.scandir
+	def scandir(path='.'):
+		if isinstance(path, str) and os.path.abspath(path) == folder and os.path.isdir(folder):
+			shutil.rmtree(folder)
+		return real(path)
+	monkeypatch.setattr(os, 'scandir', scandir)
+
+
+def _watcher_lines(monkeypatch):
+	'''The watcher's log lines from now on, as (message, whether an error line).'''
+	lines = []
+	monkeypatch.setattr(rv, 'watcherTeeLogToTl', lambda monitor_path, message, error=False, ok=False: lines.append((message, error)))
+	return lines
+
+
+def test_the_watchers_walk_logs_no_unreadable_line_for_a_subfolder_gone_before_its_turn(tmp_path, monkeypatch):
+	# a folder the walk listed and that went before the walk opened it: one info line, its watch given back, nothing left unwatched.
+	# Fails on 82732dd: an "Error scanning" ERROR line and a "Not watching unreadable folder" ERROR line
+	for rel in ('k/s', 'u/v'):
+		os.makedirs(tmp_path / rel)
+	root, k, u = str(tmp_path), str(tmp_path / 'k'), str(tmp_path / 'u')
+	_removed_at_its_listing(monkeypatch, u)
+	lines = _watcher_lines(monkeypatch)
+	irm = rv.inotify_resource_manager()
+	wdDic, unwatched = {}, set()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		assert rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched) != -1
+		assert sorted(path.rstrip('/') for path in wdDic.values()) == [root, k, os.path.join(k, 's')]
+		assert irm.current_user_watches == len(wdDic) == _kernel_watches(inotify_obj)
+	assert unwatched == set()
+	assert [message for message, error in lines if error] == []
+	assert len([message for message, _ in lines if message.startswith(f'{u} was gone when the walk reached it: ')]) == 1
+
+
+def test_a_new_folder_gone_before_its_walk_opens_it_is_one_info_line(tmp_path, monkeypatch):
+	# review focus 1: the watcher walks each new folder as its create comes (a mkdir by git or a build), and one removed before the
+	# walk opens it gets one info line: no ERROR line, no "Not watching unreadable folder" line, and it is not left unwatched.
+	# Fails on 82732dd: "Error scanning ..." at ERROR
+	new = str(tmp_path / 'new')
+	os.makedirs(os.path.join(new, 'sub'))
+	_removed_at_its_listing(monkeypatch, new)
+	lines = _watcher_lines(monkeypatch)
+	irm = rv.inotify_resource_manager()
+	wdDic, unwatched = {}, set()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		rv.initializeFolderWatchers(inotify_obj, new, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
+	assert unwatched == set()
+	assert [message for message, error in lines if error] == []
+	assert len([message for message, _ in lines if message.startswith(f'{new} was gone when the walk reached it: ')]) == 1
+
+
 @pytest.mark.parametrize('code, left_unwatched', [(errno.EACCES, True), (errno.ENOSPC, True), (errno.ENOENT, False), (errno.ENOTDIR, False)],
 	ids=['EACCES', 'ENOSPC', 'ENOENT', 'ENOTDIR'])
 def test_a_folder_whose_watch_fails_is_left_unwatched_unless_it_is_gone(tmp_path, code, left_unwatched):

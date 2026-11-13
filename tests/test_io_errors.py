@@ -1,6 +1,7 @@
 import errno
 import os
 import shutil
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -828,3 +829,123 @@ def test_a_batch_of_only_a_fifo_or_a_socket_commits_it(job, poll_fast, monkeypat
 	assert len(versions) == len(before) + 1
 	mode = os.lstat(os.path.join(versions[-1], 'entry')).st_mode
 	assert (stats.S_ISFIFO if kind == 'fifo' else stats.S_ISSOCK)(mode)
+
+
+# ---- L10: a folder gone when a walk reaches it is no error
+
+def _removed_at_its_listing(monkeypatch, folder):
+	'''folder is removed when a listing of it is opened, just before the kernel's open: a folder made and removed while a walk passed.'''
+	real = os.scandir
+	def scandir(path='.'):
+		if isinstance(path, str) and os.path.abspath(path).rstrip('/') == folder and os.path.isdir(folder):
+			shutil.rmtree(folder)
+		return real(path)
+	monkeypatch.setattr(os, 'scandir', scandir)
+
+
+def _walk_lines(monkeypatch):
+	'''The walk's log lines from now on (iter_tree_entries() logs as the watcher), as (message, whether an error line).'''
+	lines = []
+	real = rv.watcherTeeLogToTl
+	def record(monitor_path, message, error=False, ok=False):
+		lines.append((message, error))
+		return real(monitor_path, message, error=error, ok=ok)
+	monkeypatch.setattr(rv, 'watcherTeeLogToTl', record)
+	return lines
+
+
+def _gone_lines(lines, folder):
+	return [message for message, error in lines if message.startswith(f'{folder} was gone when the walk reached it: ') and not error]
+
+
+def _scan_errors(lines):
+	return [message for message, error in lines if error and message.startswith('Error scanning')]
+
+
+def _row(job, rel):
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return manifest.lookup(rel)
+	finally:
+		manifest.close()
+
+
+def test_a_folder_removed_between_its_parents_listing_and_its_own_is_one_info_line(job, poll_fast, monkeypatch, capsys):
+	# a full comparison meets a folder its parent listed and that went before its own listing opened (git's objects/xx, a build's
+	# scratch): one info line, no ERROR line, no UNREADABLE alert, and its rows kept for its delete event or the next comparison.
+	# Fails on 82732dd: "Error scanning <path>: [Errno 2] ..." at ERROR, and an UNREADABLE line
+	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x', 'd/sub/y.txt': 'y'})
+	_settled(job)
+	folder = os.path.join(job.monitor, 'd')
+	_removed_at_its_listing(monkeypatch, folder)
+	lines = _walk_lines(monkeypatch)
+	capsys.readouterr()
+	_full(job)
+	assert len(_gone_lines(lines, folder)) == 1
+	assert _scan_errors(lines) == []
+	assert _lines(capsys, 'UNREADABLE', folder) == 0
+	assert _row(job, 'd/x.txt') is not None and _row(job, 'd/sub/y.txt') is not None
+
+
+def test_a_touched_folder_removed_after_its_lstat_is_one_info_line(job, poll_fast, monkeypatch, capsys):
+	# a batch's comparison of a folder its events touched: the folder looked at (iter_scope_entries()'s lstat), then gone before its
+	# listing opened. Fails on 82732dd: "Error scanning <path>: [Errno 2] ..." at ERROR, and an UNREADABLE line
+	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
+	_settled(job)
+	seed_monitor(job, {'d/new/n.txt': 'n'})
+	folder = os.path.join(job.monitor, 'd', 'new')
+	real = rv.iter_tree_entries
+	def walk(path, *args, **kwargs):
+		# the walk of the scope, right after its lstat
+		if sys._getframe(1).f_code.co_name == 'iter_scope_entries' and os.path.abspath(path).rstrip('/') == folder and os.path.isdir(folder):
+			shutil.rmtree(folder)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'iter_tree_entries', walk)
+	lines = _walk_lines(monkeypatch)
+	capsys.readouterr()
+	_events(job, [(True, 'create', 'd/new', None), (False, 'create', 'd/new/n.txt', None)])
+	assert len(_gone_lines(lines, folder)) == 1
+	assert _scan_errors(lines) == []
+	assert _lines(capsys, 'UNREADABLE', folder) == 0
+
+
+def test_a_mode_000_folder_still_logs_its_error_and_unreadable_lines(job, poll_fast, monkeypatch, capsys):
+	# pin: a folder the walk cannot open while it is there (EACCES, what a folder of mode 000 is to a user other than root, given by a
+	# stand-in so root sees it too) keeps its ERROR line and its UNREADABLE alert, and its rows
+	seed_monitor(job, {'a.txt': 'a', 'locked/b.txt': 'b'})
+	_settled(job)
+	folder = os.path.join(job.monitor, 'locked')
+	_fail_scandir(monkeypatch, folder, errno.EACCES)
+	lines = _walk_lines(monkeypatch)
+	capsys.readouterr()
+	_full(job)
+	assert len(_scan_errors(lines)) == 1 and _gone_lines(lines, folder) == []
+	assert _lines(capsys, 'UNREADABLE', folder) == 1
+	assert _row(job, 'locked/b.txt') is not None
+
+
+def test_a_folder_listed_but_never_opened_keeps_its_error_and_unreadable_lines(job, poll_fast, monkeypatch, capsys):
+	# pin, R32: a folder its parent lists and the kernel cannot open, every time, while an lstat still finds it (name trouble on a
+	# FUSE, CIFS or NTFS mount): its contents are not backed up, so it keeps its ERROR line and UNREADABLE alert at every walk, and
+	# its rows stay
+	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
+	_settled(job)
+	folder = os.path.join(job.monitor, 'd')
+	_fail_scandir(monkeypatch, folder, errno.ENOENT)
+	for _ in range(2):
+		lines = _walk_lines(monkeypatch)
+		capsys.readouterr()
+		_full(job)
+		assert len(_scan_errors(lines)) == 1 and _gone_lines(lines, folder) == []
+		assert _lines(capsys, 'UNREADABLE', folder) == 1
+	assert _row(job, 'd/x.txt') is not None
+
+
+def test_a_monitored_root_gone_at_the_walk_still_fails_the_attempt(job, poll_fast, monkeypatch):
+	# pin: the monitored root gone when the comparison's walk opens it fails the attempt, before anything is recorded as deleted
+	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
+	before = _settled(job)
+	_removed_at_its_listing(monkeypatch, job.monitor.rstrip('/'))
+	with pytest.raises(rv.JobFailure):
+		_backup(job)
+	assert committed_versions(job) == before

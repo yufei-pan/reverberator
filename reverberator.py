@@ -3593,7 +3593,9 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 			# held before this walk ( a subfolder renamed after the walk listed its parent ): its own rename or delete
 			# event handles it, and the events already queued on its watch still come
 			continue
-		watcherTeeLogToTl(monitor_path,f'Not watching unreadable folder {folder}: {error}',error=True)
+		if not isinstance(error, FolderGone):
+			# a folder gone when the walk reached it has had its line, an info one ( iter_tree_entries() )
+			watcherTeeLogToTl(monitor_path,f'Not watching unreadable folder {folder}: {error}',error=True)
 		# only while the watch is still the folder's here: one moved ahead of the walk (renamed before it was read, into a
 		# folder not walked yet) is found again at its new name, and add_watch hands back the same watch for it
 		if wd is not None and wdDic.get(wd, '').rstrip('/') == folder:
@@ -3717,7 +3719,12 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 	the entry can move to another branch).
 	skip(rel_path) -> bool leaves an entry out; a skipped folder is not descended into.
 	A folder that cannot be read is logged, and (its rel_prefix, error) is appended to errors when given: its entries
-	are missing from the walk, which is not the same as being deleted. The walk root reports rel_prefix as given.
+	are missing from the walk, which is not the same as being deleted. The walk root reports rel_prefix as given. A
+	folder gone when the walk reaches it (made and removed while the walk passed, as git or a build does) is a race its
+	delete event or the next full comparison covers: its own listing fails to open with ENOENT or ENOTDIR and an lstat
+	of it agrees, so it gets one info line, at every level, the walk root's too, and is appended as a FolderGone. Any
+	other error, one an lstat does not confirm (a folder listed that cannot be opened, as a FUSE mount's name trouble
+	gives every time), or one met while listing, keeps its error line.
 
 	Examples:
 		>>> import tempfile
@@ -3733,8 +3740,11 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 		['d/', 'link']
 		>>> import shutil; shutil.rmtree(root)
 	'''
+	# None until the folder's own listing is open
+	listing = None
 	try:
-		with os.scandir(path) as entries:
+		listing = os.scandir(path)
+		with listing as entries:
 			if list_folders_first:
 				entries = list(entries)
 			for entry in entries:
@@ -3749,18 +3759,37 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 						continue
 					yield entry.path, rel_path, False
 	except Exception as e:
+		if listing is None and isinstance(e, OSError) and e.errno in (errno.ENOENT, errno.ENOTDIR) and folder_gone(path):
+			if errors is not None:
+				errors.append((rel_prefix, FolderGone(e.errno, e.strerror, path)))
+			watcherTeeLogToTl(path,f'{path} was gone when the walk reached it: {e}')
+			return
 		if errors is not None:
 			errors.append((rel_prefix, e))
 		watcherTeeLogToTl(path,f'Error scanning {path}: {e}',error=True)
+
+class FolderGone(OSError):
+	'''A walk's error for a folder gone when the walk reached it (iter_tree_entries()): no UNREADABLE line and no unwatched folder.'''
+
+def folder_gone(path:str) -> bool:
+	'''Whether an lstat of path says nothing is there (ENOENT, or ENOTDIR for a folder above it gone); False when it finds something or fails otherwise.'''
+	try:
+		os.lstat(path)
+	except OSError as e:
+		return e.errno in (errno.ENOENT, errno.ENOTDIR)
+	return False
 
 def unreadable_path(root:str, rel:str) -> str:
 	'''The absolute path of the folder rel (relative to root, '' for root itself).'''
 	return os.path.join(root, rel).rstrip('/') or '/'
 
 def log_unreadable(job_name:str, root:str, errors:list, reported:set = None):
-	'''Log one UNREADABLE line for each unreadable folder in errors, as collected by a walk of root.
-	reported holds the paths already logged by this backup, so a folder walked twice is logged once.'''
+	'''Log one UNREADABLE line for each unreadable folder in errors, as collected by a walk of root, but a folder gone when the walk
+	reached it (FolderGone), which is no unreadable folder. reported holds the paths already logged by this backup, so a folder
+	walked twice is logged once.'''
 	for rel, error in errors:
+		if isinstance(error, FolderGone):
+			continue
 		path = unreadable_path(root, rel)
 		if reported is not None:
 			if path in reported:
