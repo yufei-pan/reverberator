@@ -219,9 +219,11 @@ def test_a_tree_is_kept_for_the_next_attempt(r_job):
 	assert info.tree == tree
 	assert list(info.vault_info_dict) == [0, 1, 2]
 	assert os.path.isdir(os.path.join(tree, 'a'))
-	# the tree's own contents, and the cut batch's record reaches version 2
+	# the scan made the tree version 2's again at the name the batch recorded (F1's put-back): the copy being written is gone and the
+	# tree holds version 2's own file there, the same inode, which the cut batch's record put in version 2
 	with open(os.path.join(tree, 'a/x.txt')) as f:
-		assert f.read() == 'being written'
+		assert f.read() == 'ax2'
+	assert os.lstat(os.path.join(tree, 'a/x.txt')).st_ino == os.lstat(os.path.join(folder_of(r_job, 2), 'a/x.txt')).st_ino
 	assert kept_versions_wrong(r_job, expected) == []
 
 
