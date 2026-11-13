@@ -4861,9 +4861,10 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 	try:
 		job_vault = os.path.join(vault_path,job_name)
 		def wait_for_vault(flag, table = None):
-			# the rule's Vault Path, then the job's own folder in it: a disk fstab names at the folder's place on a pool's branch
-			# lies below the Vault Path's place there, so only a wait on the folder sees it missing, and the job waits for it as
-			# for any disk, instead of failing its scan and retrying. the folder is made once its disk is there, like the Vault Path
+			# the rule's Vault Path, then the job's own folder in it: a disk fstab names at the folder's place (off a pool, or at its
+			# place on a pool's branch) lies below the Vault Path's, so only a wait on the folder sees it missing, and the job waits
+			# for it as for any disk, instead of failing its scan and retrying; it waits the same while a file stands at that place.
+			# the folder is made once its disk is there, like the Vault Path
 			wait_for_path(job, flag, vault_path, 'vault filesystem not ready', table=table)
 			wait_for_path(job, None, job_vault, 'job vault not made yet', create=True, table=table)
 		# made once its disk is there, never under a bare mount point (a bare folder there is not the disk's, so this
@@ -4890,7 +4891,8 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				return info
 			finally:
 				locks.release()
-		scanned = scan() if running() and os.path.isdir(job_vault) else None
+		# the waits made the job vault, or the job is stopping
+		scanned = scan() if running() else None
 		remove_pending_file(job_name, job_vault)
 		wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 		# batches are compared with the vault only while the monitored path shows the filesystem it shows now
