@@ -364,7 +364,7 @@ def no_root_record(rv):
 
 
 def no_list_placed(rv):
-	rv.place_change_list = lambda content_file_name, prepared_list: None
+	rv.place_change_list = lambda content_file_name, prepared_list, sync=True: None
 
 
 @pytest.mark.parametrize('fault', [wrong_contents, no_root_record, no_list_placed], ids=lambda fault: fault.__name__)

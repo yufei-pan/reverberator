@@ -510,9 +510,9 @@ def test_the_commit_renames_the_previous_list_and_names_it_first(r_job, run, mon
 		if os.path.basename(src) == old_list:
 			order.append(('rename', os.path.basename(dst)))
 		return real_rename(src, dst, **kwargs)
-	def place(*args):
+	def place(*args, **kwargs):
 		order.append('place')
-		return real_place(*args)
+		return real_place(*args, **kwargs)
 	monkeypatch.setattr(rv.VaultManifest, 'commit', commit)
 	monkeypatch.setattr(rv, 'swap_current_version', swap)
 	monkeypatch.setattr(rv.os, 'rename', rename)
@@ -542,9 +542,9 @@ def test_the_commit_syncs_nothing_between_the_previous_list_and_the_new_one(r_jo
 	def sync(path):
 		order.append('sync')
 		return real_sync(path)
-	def place(*args):
+	def place(*args, **kwargs):
 		order.append('place')
-		return real_place(*args)
+		return real_place(*args, **kwargs)
 	monkeypatch.setattr(rv.os, 'rename', rename)
 	monkeypatch.setattr(rv, 'fsync_vault_folder', sync)
 	monkeypatch.setattr(rv, 'place_change_list', place)
