@@ -86,6 +86,12 @@ def test_an_idle_daemon_gives_back_what_its_start_and_its_backup_freed(tmp_path,
 	rule = write_rule(job, min_snapshot='1')
 	state_dir = process_env['REVERB_STATE_DIR']
 	process_env['MALLOC_ARENA_MAX'] = '2'
+	# the unit starts reverberator.py as a script, compiled at every start: about 29 MB of garbage to give back. This daemon imports it
+	# (daemon_without_syncfs.py), and an import reads a cached .pyc when a valid one stands beside it (any import of reverberator by
+	# a pytest run, or by hand, writes one): no compile, no garbage, and the gate passes with no trim at all. So the child looks for its
+	# cache in a folder of its own, empty, and neither start writes one
+	process_env['PYTHONPYCACHEPREFIX'] = str(tmp_path / 'pycache')
+	process_env['PYTHONDONTWRITEBYTECODE'] = '1'
 	# the first start makes V0; the measured one is a restart, as the report's: the scan and the full comparison of the whole tree
 	first = run_reverberator(rule)
 	wait_until(lambda: last_success(state_dir, job.job_name) is not None, timeout=START_SECONDS, message='the first start committed no backup')
