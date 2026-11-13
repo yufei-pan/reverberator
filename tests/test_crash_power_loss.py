@@ -271,6 +271,10 @@ def test_a_power_loss_that_keeps_the_placement_and_loses_the_rename_is_finished(
 		old_list = old_list_name(job.job_vault, 2)
 		cut = kill_run(job, fault=keeping_the_placement_and_losing_the_rename(job.job_vault))
 		assert cut.error is None and cut.committed is True, cut
+		# stands for the checkpoint f2fs makes within its interval: off a pool nothing syncs the placement since L2 (the
+		# commit makes no folder fsync after it), so without this the cut would lose it too, and the state this test is
+		# about (the placement kept, the previous list's rename lost: the fault skipped it) would not be made
+		flush_scratch(root)
 		shut_down_scratch(image.mount_point)
 		image.remount()
 		assert state_after(job.job_vault, old_list) == 'list of 3 placed, previous list under its old name'
