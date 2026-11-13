@@ -81,10 +81,10 @@ def disk_named(path):
 
 def test_the_vault_sync_on_a_pool_syncs_each_filesystem_holding_it_once(tmp_path, fake_pool, errseq):
 	job_path, (a, b, c) = pool_with_job(tmp_path, fake_pool, ['a', 'c'])
-	# the fake pool's branches are folders of one filesystem: one handle, at the first branch's root, and one sync
+	# the fake pool's branches are folders of one filesystem: one handle, at the job's folder on the first branch, and one sync
 	with vault_unit(job_path):
 		assert REAL_SYNC_VAULT_FILESYSTEMS(job_path, 'job') == {}
-	assert errseq.synced() == [(a, 0)]
+	assert errseq.synced() == [(os.path.join(a, 'job'), 0)]
 
 
 def test_the_vault_sync_on_a_pool_names_the_disk_of_a_failed_sync(tmp_path, fake_pool, errseq, capsys):

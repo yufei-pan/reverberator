@@ -433,12 +433,117 @@ def test_a_disk_that_joins_the_pool_holding_the_job_vault_fails_the_sync(r_job, 
 	errseq.events.clear()
 	with pytest.raises(rv.PoolNotReady):
 		backup_events(r_job, [], **KEPT)
-	# the flush synced the one filesystem holding the job vault once, through a handle the unit opened at a branch's root before
-	# the batch wrote, and passed the disk without it over; then the pool's guard fails the batch, as disks joined
+	# the flush synced the one filesystem holding the job vault once, through a handle the unit opened at the job vault's folder
+	# on a branch before the batch wrote, and passed the disk without it over; then the pool's guard fails the batch, as disks
+	# joined
 	synced = [event for event in errseq.events[marks[0]:] if event[0] == 'syncfs']
 	assert len(synced) == 1 and synced[0][4] == 0
-	roots = {os.path.realpath(path) for path in fake_pool.pools[pool][:2]}
-	assert [path for kind, path, fd in (event for event in errseq.events[:marks[0]] if event[0] == 'open') if fd == synced[0][1] and os.path.realpath(path) in roots]
+	places = {os.path.join(os.path.realpath(path), r_job.job_name) for path in fake_pool.pools[pool][:2]}
+	assert [path for kind, path, fd in (event for event in errseq.events[:marks[0]] if event[0] == 'open') if fd == synced[0][1] and path in places]
+
+
+# ---- F2: a pool vault's handles open where the job vault is, so a job vault on a filesystem of its own on a branch (a mount
+# nested under the branch, a btrfs subvolume) is synced through a handle of that filesystem. A symlink to a folder on /dev/shm
+# stands in for the nested mount, as os.open() and os.stat() follow it to another st_dev
+
+def synced_through(events):
+	'''The real path each syncfs of events went through, as its fd was opened, in order.'''
+	opened, paths = {}, []
+	for event in events:
+		if event[0] == 'open':
+			opened[event[2]] = os.path.join(os.path.realpath(os.path.dirname(event[1])), os.path.basename(event[1]))
+		elif event[0] == 'syncfs':
+			paths.append(opened.get(event[1]))
+	return paths
+
+
+def own_filesystem_on_a_branch(job, fake_pool, other_filesystem):
+	'''
+	The vault of job on a fake pool of branches a and b, each holding the job vault, its folder on a a filesystem of its own:
+	that folder.
+	'''
+	branches = fake_pool.add(job.vault, ['a', 'b'])
+	own = os.path.join(other_filesystem, 'own')
+	os.makedirs(own)
+	os.symlink(own, os.path.join(branches[0], job.job_name))
+	os.makedirs(os.path.join(branches[1], job.job_name))
+	return own
+
+
+def test_a_job_vault_on_a_filesystem_of_its_own_on_a_branch_commits(r_job, fake_pool, errseq, other_filesystem):
+	# fails on main: every sync raises "is not on a filesystem this step opened", as the handle is the branch root's
+	own = own_filesystem_on_a_branch(r_job, fake_pool, other_filesystem)
+	base(r_job)
+	before = committed_versions(r_job)
+	errseq.events.clear()
+	backup_events(r_job, modify_big(r_job), **KEPT)
+	assert len(committed_versions(r_job)) == len(before) + 1
+	# the commit flush synced both filesystems once each, the one of its own through the handle the unit opened at the job
+	# vault's folder on a
+	synced = [event for event in errseq.events if event[0] == 'syncfs']
+	assert {event[3] for event in synced} == {os.stat(own).st_dev, os.stat(r_job.monitor).st_dev}
+	assert all(event[4] == 0 for event in synced)
+	assert os.path.join(fake_pool.branch_path('a'), r_job.job_name) in synced_through(errseq.events)
+	assert open_folders(own) == []
+
+
+def test_a_write_error_on_a_branchs_own_filesystem_fails_the_batch(r_job, fake_pool, errseq, monkeypatch, capsys, other_filesystem):
+	# fails on main: its sync raises "is not on a filesystem this step opened" (no write error is heard, no alert)
+	own = own_filesystem_on_a_branch(r_job, fake_pool, other_filesystem)
+	base(r_job)
+	before = committed_versions(r_job)
+	ran = at_the_commit_flush(monkeypatch, lambda: (errseq.fail(own), errseq.seen_elsewhere(own)))
+	capsys.readouterr()
+	with pytest.raises(rv.JobFailure) as failed:
+		backup_events(r_job, modify_big(r_job), **KEPT)
+	assert ran
+	# heard through the handle of that filesystem, opened before the batch wrote: one alert, and nothing commits
+	assert len(vault_write_errors(capsys.readouterr().out)) == 1
+	assert 'is not on a filesystem this step opened' not in failed.value.reason
+	assert committed_versions(r_job) == before
+
+
+def test_a_job_vault_made_later_under_a_nested_mount_is_synced_through_its_parents_handle(tmp_path, fake_pool, errseq, monkeypatch, other_filesystem):
+	# fails on main: its handle is the branch root's, on another filesystem, so the sync raises "is not on a filesystem this step
+	# opened"
+	root = str(tmp_path / 'r')
+	job = create_job(root)
+	# the vault a folder of a pool; on branch a the folder above the job vault, mnt, is a filesystem of its own, without the job
+	# vault when the unit opens; on b the job vault is there
+	branches = fake_pool.add(str(tmp_path / 'pool'), ['a', 'b'])
+	vault = str(tmp_path / 'pool' / 'mnt')
+	job = job._replace(vault=vault, job_vault=os.path.join(vault, job.job_name))
+	os.makedirs(job.vault)
+	nested = os.path.join(other_filesystem, 'mnt')
+	os.makedirs(nested)
+	os.symlink(nested, os.path.join(branches[0], 'mnt'))
+	os.makedirs(os.path.join(branches[1], 'mnt', job.job_name))
+	base(job)
+	before = committed_versions(job)
+	# a copy lands on a, where the job vault was not yet: its folder is made on the nested filesystem
+	ran = at_the_commit_flush(monkeypatch, lambda: os.makedirs(os.path.join(nested, job.job_name)))
+	errseq.events.clear()
+	backup_events(job, modify_big(job), **KEPT)
+	assert ran and len(committed_versions(job)) == len(before) + 1
+	# synced through the handle opened at a/mnt, no error
+	assert all(event[4] == 0 for event in errseq.events if event[0] == 'syncfs')
+	assert os.path.join(branches[0], 'mnt') in synced_through(errseq.events)
+
+
+def test_the_nearest_existing_folder_stops_at_the_branch(tmp_path):
+	branch = str(tmp_path / 'branch')
+	os.makedirs(os.path.join(branch, 'x'))
+	put_text(branch, 'x/file', 'f')
+	# nothing of rel there: the branch itself
+	assert rv.nearest_existing_folder(branch, 'vault/job') == branch
+	# a file at rel's place: its parent
+	assert rv.nearest_existing_folder(branch, 'x/file') == os.path.join(branch, 'x')
+	assert rv.nearest_existing_folder(branch, 'x/file/below') == os.path.join(branch, 'x')
+	# the folder itself when it is there
+	assert rv.nearest_existing_folder(branch, 'x') == os.path.join(branch, 'x')
+	# never above the branch, even when the branch itself is not there
+	gone = str(tmp_path / 'gone')
+	assert rv.nearest_existing_folder(gone, 'vault/job') == gone
 
 
 # ---- 5, in the VM: a disk swapped at its mount point, off a pool and on one (root, to mount a tmpfs)

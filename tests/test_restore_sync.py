@@ -2,7 +2,8 @@
 0.55.2: a restore syncs the target's filesystem before its marker goes (before the folders are handed over), and again
 after, before the command returns; a file target once, once it is in place. Every sync goes through handles opened before
 the first copy, so it reports every writeback error since: off a pool the target as this run claimed it (a file target's
-folder, opened before the copy), on a pool a branch of each disk. The marker says what the target holds is not known to be
+folder, opened before the copy), on a pool one per filesystem, at the target's place on each branch or its nearest existing
+parent. The marker says what the target holds is not known to be
 on disk until a sync succeeds; a sync that fails is a failure of the restore that names the disk, the record stays, and
 the run again copies everything again while --accept is refused. A run stopped before its sync syncs on its way out, so a
 run again keeps what it copied; one killed before it leaves a record that a run again copies everything again over. A
@@ -295,14 +296,17 @@ def test_a_failed_sync_of_a_file_target_fails_the_restore(job, tmp_path, capsys,
 	assert len(failed) == 1 and failed[0].startswith('FAILED proj/a.txt: ') and 'write error' in failed[0] and disk_of(out) in failed[0]
 
 
-def pooled(tmp_path, fake_pool, disks):
+def pooled(tmp_path, fake_pool, disks, other=None):
 	'''
 	The folder to restore into, out, on a mergerfs pool (FakePool) over the branches of disks, {disk: [branch names]}: each
-	disk a mount of its own and its branches folders of it, as two branches of one disk are. (out, {branch name: its path}).
+	disk a mount of its own and its branches folders of it, as two branches of one disk are. The fake mounts are folders of
+	the basetemp's filesystem, and a restore keeps one handle per filesystem: with other, a folder on another filesystem
+	(other_filesystem), the disks after the first are mounts made there, a filesystem other than the first disk's, as a real
+	disk is. (out, {branch name: its path}).
 	'''
 	branches = {}
-	for disk, names in disks.items():
-		mount = fake_pool.add_mount(str(tmp_path / 'disks' / disk))
+	for index, (disk, names) in enumerate(disks.items()):
+		mount = fake_pool.add_mount(os.path.join(other, disk) if other is not None and index else str(tmp_path / 'disks' / disk))
 		for name in names:
 			branches[name] = os.path.join(mount, name)
 	fake_pool.add(str(tmp_path / 'pool'), list(branches.values()))
@@ -315,12 +319,15 @@ def pooled(tmp_path, fake_pool, disks):
 
 
 def opened_branches(monkeypatch, branches, events):
-	'''Append ('opened', path, fd) to events for each open of one of branches, and 'copy' for each copy the restore starts.'''
+	'''
+	Append ('opened', path, fd) to events for each open of one of branches, or of a folder on one, and 'copy' for each copy the
+	restore starts.
+	'''
 	real_open = os.open
 
 	def opening(path, flags, *args, **kwargs):
 		fd = real_open(path, flags, *args, **kwargs)
-		if os.fspath(path) in branches.values():
+		if any(os.fspath(path) == branch or os.fspath(path).startswith(branch + os.sep) for branch in branches.values()):
 			events.append(('opened', os.fspath(path), fd))
 		return fd
 	monkeypatch.setattr(os, 'open', opening)
@@ -329,9 +336,9 @@ def opened_branches(monkeypatch, branches, events):
 
 
 @pytest.mark.parametrize('kind', ['folder', 'file'])
-def test_a_pools_disks_are_opened_before_the_first_copy_and_every_sync_goes_through_them(job, tmp_path, capsys, monkeypatch, fake_pool, kind):
+def test_a_pools_disks_are_opened_before_the_first_copy_and_every_sync_goes_through_them(job, tmp_path, capsys, monkeypatch, fake_pool, kind, other_filesystem):
 	backed_up(job)
-	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']})
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
 	events = []
 	opened_branches(monkeypatch, branches, events)
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: events.append(('sync', fd)))
@@ -340,7 +347,7 @@ def test_a_pools_disks_are_opened_before_the_first_copy_and_every_sync_goes_thro
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj' + ('/a.txt' if kind == 'file' else ''), out, '--version', '0')
 	assert (code, err) == (0, ''), stdout
 	opened = [event for event in events if event[0] == 'opened']
-	# each disk's branch itself, once, before the first copy
+	# each disk's branch, as the nearest existing parent of the target's place on it, once, before the first copy
 	assert sorted(path for _, path, _ in opened) == sorted(branches.values())
 	assert events.index(opened[-1]) < events.index('copy')
 	# a folder target's two syncs, a file target's one: each of every disk, through those fds
@@ -348,9 +355,9 @@ def test_a_pools_disks_are_opened_before_the_first_copy_and_every_sync_goes_thro
 	assert sorted(synced) == sorted([fd for _, _, fd in opened] * (2 if kind == 'folder' else 1))
 
 
-def test_a_copy_landing_on_a_disk_without_the_target_at_the_claim_is_synced(job, tmp_path, capsys, monkeypatch, fake_pool):
+def test_a_copy_landing_on_a_disk_without_the_target_at_the_claim_is_synced(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
-	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']})
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
 	# at the claim the target's folder is on disk one alone; mergerfs puts the first copy's folder on disk two
 	os.makedirs(os.path.join(branches['one'], 'out', 'proj'))
 	events = []
@@ -364,32 +371,34 @@ def test_a_copy_landing_on_a_disk_without_the_target_at_the_claim_is_synced(job,
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: events.append(('sync', fd, os.fstat(fd).st_ino)))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert (code, err) == (0, ''), stdout
-	# disk two synced too, through its branch as opened before the copy that put the folder there
+	# disk two synced too, through its branch (the nearest existing parent of the target's place there) as opened before the
+	# copy that put the folder there
 	opened = {event[2] for event in events if event[0] == 'opened'}
 	synced = [event for event in events if event[0] == 'sync']
 	assert {fd for _, fd, _ in synced} <= opened
 	assert os.lstat(branches['two']).st_ino in {ino for _, _, ino in synced}
 
 
-def a_disk_joins(fake_pool, tmp_path, holds=True):
+def a_disk_joins(fake_pool, tmp_path, other, holds=True):
 	'''
-	A new disk joins the pool (a branch added at run time), and mergerfs puts the restore's folder on it unless holds is
-	False, as it does once a copy lands there: (the disk, its branch).
+	A new disk, a mount made in other (a folder on another filesystem than the pool's disks), joins the pool (a branch added at
+	run time), and mergerfs puts the restore's folder on it unless holds is False, as it does once a copy lands there: (the
+	disk, its branch).
 	'''
-	branch = fake_pool.join(str(tmp_path / 'pool'), str(tmp_path / 'disks' / 'new'), 'new')
+	branch = fake_pool.join(str(tmp_path / 'pool'), os.path.join(other, 'new'), 'new')
 	if holds:
 		os.makedirs(os.path.join(branch, 'out', 'proj'))
-	return os.path.realpath(tmp_path / 'disks' / 'new'), branch
+	return os.path.realpath(os.path.join(other, 'new')), branch
 
 
-def joining_at_the_first_copy(monkeypatch, fake_pool, tmp_path, holds=True):
+def joining_at_the_first_copy(monkeypatch, fake_pool, tmp_path, other, holds=True):
 	'''The restore's first copy starts as a disk joins the pool (a_disk_joins()): the (disk, branch) once it did, in the list returned.'''
 	joined = []
 	copy_command = rv.copy_command
 
 	def joining(source, dest):
 		if not joined:
-			joined.append(a_disk_joins(fake_pool, tmp_path, holds))
+			joined.append(a_disk_joins(fake_pool, tmp_path, other, holds))
 		return copy_command(source, dest)
 	monkeypatch.setattr(rv, 'copy_command', joining)
 	return joined
@@ -399,11 +408,11 @@ def joined_line(disk):
 	return f'FAILED proj: the disk {disk} joined the pool while the restore ran: what was restored onto it is not known to be on disk'
 
 
-def test_a_disk_that_joined_the_pool_after_the_claim_fails_the_restore_and_a_run_again_finishes(job, tmp_path, capsys, monkeypatch, fake_pool):
+def test_a_disk_that_joined_the_pool_after_the_claim_fails_the_restore_and_a_run_again_finishes(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
 	target = os.path.join(out, 'proj')
-	joined = joining_at_the_first_copy(monkeypatch, fake_pool, tmp_path)
+	joined = joining_at_the_first_copy(monkeypatch, fake_pool, tmp_path, other_filesystem)
 	synced = []
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(os.fstat(fd).st_ino))
 	# an fd opened now would miss a writeback error another sync of that disk met first
@@ -417,17 +426,17 @@ def test_a_disk_that_joined_the_pool_after_the_claim_fails_the_restore_and_a_run
 	assert marker_of(target).get('recopy') == 'sync failed' and 'unsynced' not in marker_of(target)
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o700
 	assert f'What {target} holds is not known to be on disk: run the same restore again, which copies everything again' in stdout
-	# the run again opens that disk at its own claim, and finishes
+	# the run again opens that disk at its own claim, at the target's place there, and finishes
 	synced.clear()
 	made = copies(monkeypatch)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert (code, err) == (0, ''), stdout
 	assert sorted(os.path.relpath(source, rv.list_versions(job.job_vault)[0].path) for source in made) == sorted(FILES)
-	assert sorted(synced) == sorted([os.lstat(branches['one']).st_ino, os.lstat(branch).st_ino] * 2)
+	assert sorted(synced) == sorted([os.lstat(branches['one']).st_ino, os.lstat(os.path.join(branch, 'out', 'proj')).st_ino] * 2)
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and whole(target)
 
 
-def test_a_disk_mounted_onto_a_listed_branchs_folder_after_the_claim_fails_the_restore(job, tmp_path, capsys, monkeypatch, fake_pool):
+def test_a_disk_mounted_onto_a_listed_branchs_folder_after_the_claim_fails_the_restore(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	# two branches that are folders of the root filesystem at the claim, which names one disk for both
 	fake_pool.add(str(tmp_path / 'pool'), ['one', 'two'])
@@ -436,26 +445,30 @@ def test_a_disk_mounted_onto_a_listed_branchs_folder_after_the_claim_fails_the_r
 	out = tmp_path / 'pool' / 'out'
 	out.mkdir()
 	copy_command = rv.copy_command
-	held = os.path.join(fake_pool.branch_path('two'), 'out', 'proj')
+	two = fake_pool.branch_path('two')
+	disk = os.path.join(other_filesystem, 'two')
 
 	def mounting(source, dest):
-		if not os.path.lexists(held):
-			# a disk mounted at the branch's folder, which mergerfs then puts the copy on
-			fake_pool.mount('two')
-			os.makedirs(held)
+		if not os.path.islink(two):
+			# a disk mounted at the branch's folder, which mergerfs then puts the copy on: a symlink to a folder on another
+			# filesystem stands in for it, as os.stat() follows it to another st_dev, and the fake table names its mount
+			os.rename(two, two + '.before')
+			os.makedirs(os.path.join(disk, 'out', 'proj'))
+			os.symlink(disk, two)
+			fake_pool.add_mount(disk)
 		return copy_command(source, dest)
 	monkeypatch.setattr(rv, 'copy_command', mounting)
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: None)
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', str(out), '--version', '0')
 	assert code == rv.EXIT_COMMAND_FAILED
-	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [joined_line(fake_pool.branch_path('two'))]
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [joined_line(os.path.realpath(disk))]
 	assert marker_of(os.path.join(str(out), 'proj')).get('recopy') == 'sync failed'
 
 
-def test_a_disk_that_joined_the_pool_without_the_restores_folder_is_passed_over(job, tmp_path, capsys, monkeypatch, fake_pool):
+def test_a_disk_that_joined_the_pool_without_the_restores_folder_is_passed_over(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
-	joined = joining_at_the_first_copy(monkeypatch, fake_pool, tmp_path, holds=False)
+	joined = joining_at_the_first_copy(monkeypatch, fake_pool, tmp_path, other_filesystem, holds=False)
 	synced = []
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(os.fstat(fd).st_ino))
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
@@ -466,7 +479,7 @@ def test_a_disk_that_joined_the_pool_without_the_restores_folder_is_passed_over(
 
 
 @pytest.mark.parametrize('sync', ['accept', 'stop'])
-def test_a_disk_that_joined_the_pool_fails_the_sync_of_accept_and_of_a_stop_too(job, tmp_path, capsys, monkeypatch, fake_pool, sync):
+def test_a_disk_that_joined_the_pool_fails_the_sync_of_accept_and_of_a_stop_too(job, tmp_path, capsys, monkeypatch, fake_pool, sync, other_filesystem):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
 	target = os.path.join(out, 'proj')
@@ -479,7 +492,7 @@ def test_a_disk_that_joined_the_pool_fails_the_sync_of_accept_and_of_a_stop_too(
 		def joining(folder, held):
 			# once accept holds the target: its handles are open
 			if not joined:
-				joined.append(a_disk_joins(fake_pool, tmp_path))
+				joined.append(a_disk_joins(fake_pool, tmp_path, other_filesystem))
 			return remove_stale_partials(folder, held)
 		monkeypatch.setattr(rv, 'remove_stale_partials', joining)
 		code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0', '--accept')
@@ -488,7 +501,7 @@ def test_a_disk_that_joined_the_pool_fails_the_sync_of_accept_and_of_a_stop_too(
 		failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
 		assert err == failed[0] + '\n'
 	else:
-		joined = joining_at_the_first_copy(monkeypatch, fake_pool, tmp_path)
+		joined = joining_at_the_first_copy(monkeypatch, fake_pool, tmp_path, other_filesystem)
 		code, stdout, err = stopped_at_its_second_copy(job, tmp_path, capsys, monkeypatch, out)
 		assert (code, stdout) == (rv.EXIT_COMMAND_FAILED, '')
 		lines = err.splitlines()
@@ -528,9 +541,9 @@ def test_a_branch_that_failed_to_open_at_the_claim_is_not_called_a_write_error(j
 	assert marker_of(target).get('recopy') == 'sync failed'
 
 
-def test_a_stop_on_a_pool_syncs_through_the_handles_opened_at_the_claim(job, tmp_path, capsys, monkeypatch, fake_pool):
+def test_a_stop_on_a_pool_syncs_through_the_handles_opened_at_the_claim(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
-	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']})
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
 	target = os.path.join(out, 'proj')
 	events = []
 	opened_branches(monkeypatch, branches, events)
@@ -586,12 +599,12 @@ def deny(monkeypatch, paths):
 	monkeypatch.setattr(os, 'open', opening)
 
 
-def test_a_disk_none_of_whose_branches_the_user_can_open_is_a_warning_once(job, tmp_path, capsys, monkeypatch, fake_pool):
+def test_a_disk_none_of_whose_branches_the_user_can_open_is_a_warning_once(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
-	out, branches = pooled(tmp_path, fake_pool, {'one': ['one-a', 'one-b'], 'two': ['two']})
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one-a', 'one-b'], 'two': ['two']}, other_filesystem)
 	target = os.path.join(out, 'proj')
-	# disk one's first branch shut out, its second fine; disk two's only branch shut out, as a mode without read for the
-	# user shuts a folder it can still go through
+	# disk one's first branch shut out, its second fine, so its filesystem is synced through the second; disk two's only
+	# branch shut out, as a mode without read for the user shuts a folder it can still go through
 	deny(monkeypatch, {branches['one-a'], branches['two']})
 	synced = []
 	monkeypatch.setattr(rv, 'syncfs_fd', lambda fd, path=None: synced.append(os.fstat(fd).st_ino))
@@ -628,6 +641,77 @@ def test_a_folder_shut_to_its_owner_by_the_hand_over_is_synced_on_a_pool(job, tm
 	assert (code, err) == (0, ''), stdout
 	assert stat.S_IMODE(os.lstat(target).st_mode) == 0o300
 	assert 'WARNING' not in stdout and synced == [os.lstat(branches['one']).st_ino] * 2
+
+
+# ---- F2: on a pool the restore's handles open at its folder's place on each branch, or its nearest existing parent, one per
+# filesystem, and every one is synced; its check for a joined disk goes by filesystem. A symlink to a folder on /dev/shm stands
+# in for a mount nested under a branch, as os.open() and os.stat() follow it to another st_dev
+
+def at_the_first_copy(monkeypatch, then):
+	'''then() runs once, as the restore's first copy starts: the list returned holds True once it ran.'''
+	ran = []
+	copy_command = rv.copy_command
+
+	def copying(source, dest):
+		if not ran:
+			ran.append(True)
+			then()
+		return copy_command(source, dest)
+	monkeypatch.setattr(rv, 'copy_command', copying)
+	return ran
+
+
+def nested_at(branch, other_filesystem):
+	'''The restore's folder's place on branch (out/proj), a filesystem of its own: the folder on /dev/shm it leads to.'''
+	nested = os.path.join(other_filesystem, os.path.basename(branch))
+	os.makedirs(nested)
+	os.makedirs(os.path.join(branch, 'out'), exist_ok=True)
+	os.symlink(nested, os.path.join(branch, 'out', 'proj'))
+	return nested
+
+
+def write_error_line(disk):
+	return f'FAILED proj: the disk {disk} reported a write error as the restore was written out to it ('
+
+
+def test_a_restore_onto_a_nested_mount_of_a_branch_reports_its_write_error(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails on main (says done): its one handle is the branch root's, on another filesystem than the folder's place
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
+	nested = nested_at(branches['one'], other_filesystem)
+	ran = at_the_first_copy(monkeypatch, lambda: errseq.fail(nested))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED
+	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
+	assert len(failed) == 1 and failed[0].startswith(write_error_line(os.path.realpath(tmp_path / 'disks' / 'one')))
+	assert marker_of(os.path.join(out, 'proj')).get('recopy') == 'sync failed'
+
+
+def test_a_restore_syncs_both_filesystems_of_one_disk_name(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails on main: one handle per disk name, the first branch's that opens, so the second filesystem is never synced
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one-a', 'one-b']})
+	nested = nested_at(branches['one-b'], other_filesystem)
+	ran = at_the_first_copy(monkeypatch, lambda: errseq.fail(nested))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED
+	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
+	assert len(failed) == 1 and failed[0].startswith(write_error_line(os.path.realpath(tmp_path / 'disks' / 'one')))
+	# both filesystems of the disk were synced
+	assert {event[3] for event in errseq.events if event[0] == 'syncfs'} == {os.stat(branches['one-a']).st_dev, os.stat(nested).st_dev}
+
+
+def test_a_mount_made_at_the_restore_folders_place_during_the_restore_fails_it(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails on main (says done): its check for a joined disk goes by disk name, which a mount at a listed branch's folder keeps
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
+	target = os.path.join(out, 'proj')
+	# at the claim the folder's place on the branch is not there; at the first copy a mount is made there, and the copy lands on it
+	ran = at_the_first_copy(monkeypatch, lambda: nested_at(branches['one'], other_filesystem))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [joined_line(os.path.realpath(tmp_path / 'disks' / 'one'))]
+	assert marker_of(target).get('recopy') == 'sync failed'
 
 
 def test_disks_that_cannot_be_listed_are_not_called_a_write_error(job, tmp_path, capsys, monkeypatch):

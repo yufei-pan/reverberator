@@ -1905,16 +1905,17 @@ def vault_disks(path:str, roots:bool = False) -> tuple:
 	a mergerfs pool. A disk is named by the mount point holding it (the kernel reports a write error once per mounted
 	filesystem), or by the branch or path itself when the mount table has none; branches that are folders of one filesystem
 	name the same disk. On a pool, whose own sync and folder sync do not reach the disks, that is (the branch's disk, the
-	folder on the branch) for each branch the pool lists, whether it holds the folder or not, or with roots (the branch's
-	disk, the branch itself); a branch list that cannot be read raises its OSError. Off a pool it is [(the disk holding
-	path, path)]. The mount table is read once.
+	folder on the branch) for each branch the pool lists, whether it holds the folder or not, and with roots each pair gains
+	the branch itself, (disk, folder on the branch, branch), for a caller that opens a place on the branch never above it;
+	a branch list that cannot be read raises its OSError. Off a pool it is [(the disk holding path, path)], with roots
+	[(that disk, path, path)]. The mount table is read once.
 	'''
 	table = read_mount_table()
 	pool = mergerfs_mount(table, path)
 	if pool is None:
-		return False, [(disk_name(table, path), path)]
+		return False, [(disk_name(table, path), path) + ((path,) if roots else ())]
 	rel = os.path.relpath(os.path.realpath(path), pool)
-	return True, [(disk_name(table, branch), branch if roots else os.path.join(branch, rel)) for branch in read_pool_branches(pool)]
+	return True, [(disk_name(table, branch), os.path.join(branch, rel)) + ((branch,) if roots else ()) for branch in read_pool_branches(pool)]
 
 def on_vault_branches(path:str, action, denied:list = None) -> None:
 	'''
@@ -1969,6 +1970,19 @@ def sync_each_disk(disks:list, sync) -> dict:
 		synced = [run(disk) for disk in folders]
 	return dict(synced)
 
+def nearest_existing_folder(branch:str, rel:str) -> str:
+	'''
+	The folder at rel on branch when it is one, else its nearest parent that is one, never above branch (branch itself at
+	worst, there or not): where a handle of the filesystem that holds, or will hold, rel on the branch opens, as a folder
+	made there later lands on the filesystem of the nearest parent that was there.
+	'''
+	parts = [part for part in os.path.normpath(rel).split(os.sep) if part not in ('', '.')]
+	for count in range(len(parts), 0, -1):
+		folder = os.path.join(branch, *parts[:count])
+		if os.path.isdir(folder):
+			return folder
+	return branch
+
 # the units of vault work open now (VaultUnit), each by the thread that opened it and its job vault: {(thread id,
 # vault_unit_key()): VaultUnit}. A unit is opened, synced and closed on one thread, and each job's backuper runs on a
 # thread of its own, so two jobs' units never meet here
@@ -1989,11 +2003,14 @@ class VaultUnit:
 
 	Whether the job vault is on a mergerfs pool, and its branches, are what guard, the step's PoolGuard, found when the step
 	began: no mount table is read. Off a pool the handle is one fd of the job vault. On a pool it is an fd of each branch
-	the pool listed, at the branch's root, as a restore opens them (open_restore_disks()), so a copy that lands on a disk
-	where the job vault was not yet is heard too; branches that are folders of one filesystem share one fd, by
-	fstat().st_dev, as the kernel keeps the error once per filesystem. A handle that cannot be opened keeps its OSError,
-	which every sync that needs it raises. A unit made while one of the same job vault is open on this thread is that one:
-	it opens and closes nothing (get_vault_info() inside do_backup(), say).
+	the pool listed, at the job vault's folder on it, or its nearest existing parent (nearest_existing_folder()), as a
+	restore opens them (open_restore_disks()): so a job vault on a filesystem of its own on a branch (a mount nested under
+	it, a btrfs subvolume) is heard through a handle of that filesystem, and a copy that lands on a disk where the job vault
+	was not yet is heard too, as its folder is made on the filesystem of the nearest parent that was there. Branches whose
+	handles are of one filesystem share one fd, by fstat().st_dev, as the kernel keeps the error once per filesystem. A
+	handle that cannot be opened keeps its OSError, which every sync that needs it raises. A unit made while one of the
+	same job vault is open on this thread is that one: it opens and closes nothing (get_vault_info() inside do_backup(),
+	say).
 	'''
 	def __init__(self, job_vault:str, guard:'PoolGuard'):
 		self.key = (threading.get_ident(), vault_unit_key(job_vault))
@@ -2031,10 +2048,10 @@ class VaultUnit:
 		VAULT_UNITS[self.key] = self
 
 	def open_branch(self, branch:str) -> None:
-		'''An fd of the branch's root, kept unless another branch's is of its filesystem.'''
+		'''An fd of the job vault's folder on the branch, or its nearest existing parent, kept unless another branch's is of its filesystem.'''
 		fd = None
 		try:
-			fd = os.open(branch, os.O_RDONLY | os.O_DIRECTORY)
+			fd = os.open(nearest_existing_folder(branch, self.rel), os.O_RDONLY | os.O_DIRECTORY)
 			dev = os.fstat(fd).st_dev
 		except OSError as e:
 			if fd is not None:
@@ -16143,9 +16160,10 @@ def claim_restore_target(target:str, check = None) -> int:
 		raise
 	return fd
 
-# what a restore's syncs go through: handles, [(disk, fd or OSError)] (or the OSError of listing the disks), and listed, the
-# disks the pool listed at the claim (None off a pool), as open_restore_disks() makes them
-RestoreDisks = namedtuple('RestoreDisks', ['handles', 'listed'])
+# what a restore's syncs go through, as open_restore_disks() makes them: handles, [(disk, fd or OSError)], one per filesystem
+# (or the OSError of listing the disks); devs, the st_dev of each filesystem a handle is of (None off a pool); passed, the
+# folder's place on each branch left out at the claim, which sync_restore()'s look for a joined disk passes over
+RestoreDisks = namedtuple('RestoreDisks', ['handles', 'devs', 'passed'])
 
 def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> RestoreDisks:
 	'''
@@ -16153,45 +16171,58 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 	an fd opened after a writeback error hears of it only while no other sync of that disk has (any syncfs marks it seen,
 	the daemon's own vault flush included), while one through an fd opened before it always does. folder is the restore's
 	folder (the folder target, or the folder holding a file target) and fd that folder as this run opened it.
-	.handles is [(disk, fd or OSError)], one per disk: off a mergerfs pool [(the disk holding folder, fd)]. On a pool,
-	whose own sync does not reach the disks, each disk the pool lists with an fd of the first of its branches
-	(vault_disks(roots=True)) that opens: the branch itself, not folder on it, so a copy that lands on a disk where folder
-	was not yet is covered as well, as a syncfs of any fd of a filesystem syncs all of it. A branch not there is passed
-	over; a disk none of whose branches the restoring user can open is a warning naming each, once per restore
-	(report.cannot_sync()), and is left out; one whose branch failed to open otherwise keeps that OSError, for its syncs to
-	fail with. It is the OSError when the disks cannot be listed, for the syncs to fail with too. .listed is every disk the
-	pool listed, those left out and failed included, which sync_restore() compares the pool with later: a disk that joined
-	it since has no handle, and one opened now would miss an error another sync of it has seen. close_restore_disks()
-	closes what this opened.
+	.handles is [(disk, fd or OSError)]: off a mergerfs pool [(the disk holding folder, fd)]. On a pool, whose own sync
+	does not reach the disks, an fd of folder's place on each branch the pool lists, or of its nearest existing parent,
+	never above the branch (nearest_existing_folder(), as the daemon's VaultUnit opens its own): so a folder on a
+	filesystem of its own on a branch (a mount nested under it) is synced through a handle of that filesystem, and a copy
+	that lands on a branch where folder was not yet is covered as well, as its folder is made on the filesystem of the
+	nearest parent that was there. Branches whose handles are of one filesystem keep one, by fstat().st_dev, as the
+	kernel keeps a writeback error once per filesystem, each named by its disk for the messages, so a disk whose branches
+	lead to two filesystems has two. A branch not there is passed over. One the restoring user cannot open is left out:
+	a warning naming it, once per restore (report.cannot_sync()), unless its place is on a filesystem another branch's
+	handle is of, which syncs it. One that fails to open otherwise keeps that OSError, for its syncs to fail with. .handles
+	is the OSError when the disks cannot be listed, for the syncs to fail with too. .devs is the filesystems the handles
+	are of, which sync_restore() checks the pool against later: a filesystem that holds folder on a branch then and no
+	handle is of (a disk that joined, or one mounted at a folder on the way) has no handle, and one opened now would miss
+	an error another sync of it has seen. .passed is the folder's place on each branch left out (that check passes them
+	over, as they are failed or warned of already). close_restore_disks() closes what this opened.
 	'''
 	try:
 		pooled, disks = vault_disks(folder, roots=True)
 	except OSError as e:
-		return RestoreDisks(e, None)
+		return RestoreDisks(e, None, frozenset())
 	if not pooled:
-		return RestoreDisks([(disks[0][0], fd)], None)
-	branches = {}
-	for disk, branch in disks:
-		branches.setdefault(disk, []).append(branch)
-	handles = []
-	for disk, listed in branches.items():
-		denied, failure = [], None
-		for branch in listed:
-			try:
-				handles.append((disk, os.open(branch, os.O_RDONLY | os.O_DIRECTORY)))
-				break
-			except (FileNotFoundError, NotADirectoryError):
-				continue
-			except PermissionError as e:
-				denied.append((branch, e))
-			except OSError as e:
-				failure = failure or e
+		return RestoreDisks([(disks[0][0], fd)], None, frozenset())
+	handles, devs, passed, denied = [], set(), set(), []
+	for disk, held, branch in disks:
+		place = nearest_existing_folder(branch, os.path.relpath(held, branch))
+		opened = None
+		try:
+			opened = os.open(place, os.O_RDONLY | os.O_DIRECTORY)
+			dev = os.fstat(opened).st_dev
+		except OSError as e:
+			if opened is not None:
+				os.close(opened)
+			if isinstance(e, PermissionError):
+				denied.append((held, place, e))
+			elif not isinstance(e, (FileNotFoundError, NotADirectoryError)):
+				handles.append((disk, e))
+				passed.add(held)
+			continue
+		if dev in devs:
+			os.close(opened)
 		else:
-			if failure is not None:
-				handles.append((disk, failure))
-			for branch, error in denied if failure is None else ():
-				report.cannot_sync(rel, branch, error)
-	return RestoreDisks(handles, frozenset(branches))
+			devs.add(dev)
+			handles.append((disk, opened))
+	for held, place, error in denied:
+		passed.add(held)
+		try:
+			if os.stat(place).st_dev in devs:
+				continue
+		except OSError:
+			pass
+		report.cannot_sync(rel, place, error)
+	return RestoreDisks(handles, frozenset(devs), frozenset(passed))
 
 def close_restore_disks(disks, fd:int) -> None:
 	'''Close the fds open_restore_disks() opened for disks (None when it never ran): every one but fd, the folder it was given.'''
@@ -16203,40 +16234,43 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 	'''
 	Write out everything dirty on the disks holding the restore's folder (the folder target, or the folder holding a file
 	target), so what the restore reports done is on disk: syncfs_fd() of each of disks.handles, the handles
-	open_restore_disks() opened before the first copy, and never of a path opened now, so each reports every writeback
-	error its disk met since, even one another process's sync met first. A pool's disks are synced side by side
-	(sync_each_disk()). The daemon needs no word of an error a restore's sync took: each of its batches syncs through
-	handles opened before its own writes (VaultUnit), which hear it whoever saw it first. On a pool
-	the pool is listed again, as a disk may have joined it since the claim (a branch added, or a disk mounted where a
-	branch's folder was): it has no handle, and one opened now would miss an error another sync of it already saw, so one
-	that holds the restore's folder now (a copy may have landed there) fails the restore, saying so; one that does not
-	is passed over, as nothing can have landed there. A disk whose sync failed, or whose branch could not be opened, or
-	that joined, or disks that could not be listed, is a failure of rel that no run again fixes as it is, as a run again
-	opens that disk at its own claim; False then, once every disk was tried. after_hand_over is the sync once the files
-	were synced and the folders handed over, so what it failed to write is their folders' owners, modes and times and the
-	marker's removal, which its failure says.
+	open_restore_disks() opened before the first copy, one per filesystem, and never of a path opened now, so each reports
+	every writeback error its filesystem met since, even one another process's sync met first. A pool's handles are
+	synced side by side (sync_each_disk(), keyed by their place in the list, as a disk's name can come twice), each
+	failure naming its disk. The daemon needs no word of an error a restore's sync took: each of its batches syncs through
+	handles opened before its own writes (VaultUnit), which hear it whoever saw it first. On a pool the pool is listed
+	again, as a disk may have joined it since the claim (a branch added, or a disk mounted where a branch's folder was or
+	at a folder on the way to it): each branch whose folder is there now (os.stat()) on a filesystem no handle is of has
+	no handle, and one opened now would miss an error another sync of it already saw, so it fails the restore, naming
+	its disk, as a copy may have landed there; one without the folder is passed over, as nothing can have landed there,
+	and so is a branch left out at the claim (disks.passed). A handle whose sync failed, or that could not be opened, a
+	disk that joined, or disks that could not be listed, is a failure of rel that no run again fixes as it is, as a run
+	again opens that disk at its own claim; False then, once every handle was tried. after_hand_over is the sync once the
+	files were synced and the folders handed over, so what it failed to write is their folders' owners, modes and times
+	and the marker's removal, which its failure says.
 	'''
 	if isinstance(disks.handles, OSError):
 		report.fail(rel, f'the disks holding {folder} could not be listed to write the restore out to them: {disks.handles}', rerun=False)
 		return False
 
-	def sync(disk:str, handles:list):
-		# None, or why the disk is not known to hold what was restored
-		if isinstance(handles[0], OSError):
-			return f'the disk {disk} could not be opened to write the restore out to it ({handles[0]}): what was restored may not be on it'
+	def sync(index:int, handles:list):
+		# None, or why the disk is not known to hold what was restored: handles is the one (disk, fd or OSError) of a filesystem
+		disk, handle = handles[0]
+		if isinstance(handle, OSError):
+			return f'the disk {disk} could not be opened to write the restore out to it ({handle}): what was restored may not be on it'
 		try:
-			syncfs_fd(handles[0], folder)
+			syncfs_fd(handle, folder)
 		except OSError as e:
 			if after_hand_over:
 				return f"the disk {disk} reported a write error as the restore's last changes were written out to it ({e}): the files restored are on disk, but their folders' owners, modes and times and the marker's removal may not be"
 			return f'the disk {disk} reported a write error as the restore was written out to it ({e}): what was restored may not be on it'
 		return None
 	synced = True
-	for disk, message in sync_each_disk(disks.handles, sync).items():
+	for message in sync_each_disk(list(enumerate(disks.handles)), sync).values():
 		if message is not None:
 			report.fail(rel, message, rerun=False)
 			synced = False
-	if disks.listed is not None:
+	if disks.devs is not None:
 		try:
 			pooled, now = vault_disks(folder)
 		except OSError as e:
@@ -16245,10 +16279,11 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 			return False
 		joined = set()
 		for disk, held in now if pooled else ():
-			if disk in disks.listed or disk in joined:
+			if held in disks.passed or disk in joined:
 				continue
 			try:
-				os.lstat(held)
+				if os.stat(held).st_dev in disks.devs:
+					continue
 			except (FileNotFoundError, NotADirectoryError):
 				# nothing can have landed there
 				continue
@@ -16292,7 +16327,8 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 	marker a run leaves names those it knows of (RESTORE_MARKER_UNSET_LIMIT at most).
 	Every sync of the run goes through the handles open_restore_disks() opened once, before the first copy, and closed
 	when the run ends: off a mergerfs pool the target as claimed, or a file target's folder, opened before the copy; on a
-	pool an fd of a branch of each of its disks, opened at the claim (or before a file target's copy). A sync through an
+	pool an fd of each filesystem holding the target's place on a branch, or its nearest existing parent, opened at the
+	claim (or before a file target's copy). A sync through an
 	fd opened after a writeback error may not hear of it, as another sync of the disk (the daemon's own vault flush) may
 	have met it first; one opened before always does. The marker's record of what is on disk lives as follows. Written at
 	the claim, before any copy, it holds "unsynced". Once a sync of the target succeeds after the copies, the marker is
