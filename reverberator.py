@@ -4077,7 +4077,7 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 	None when path is on no mergerfs mount; no branch list is read then. A branch is missing when nothing is mounted at
 	its resolved path, when its statx fails, as for a shut-down XFS that is still mounted, or when it is an f2fs whose
 	checkpoint reports an error. A disk fstab names under a branch, at or above path's place on it, that is not mounted is
-	a missing disk of the pool too (unmounted_fstab_point()).
+	a missing disk of the pool too (unmounted_fstab_point()), its text saying fstab names it.
 	'''
 	if mount_table is None:
 		try:
@@ -4116,18 +4116,22 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 	# mount is there, so the branch's own mount says nothing of it, and what a batch writes into the bare mount point is hidden
 	# when the disk is mounted again. The rule of vault_disk_problem(), on the path's place on each branch; a point at or
 	# above a branch is the branch's own check above
+	nested = []
 	inner = [point for point in fstab_mount_points(mount_table) if any(point.startswith(branch.rstrip('/') + '/') for branch, _ in ids)]
 	if inner:
 		rel = os.path.relpath(os.path.realpath(path), pool)
 		for branch, _ in ids:
 			missing = unmounted_fstab_point(os.path.realpath(os.path.join(branch, rel)), mount_table, inner)
-			if missing is not None and missing not in unmounted:
-				unmounted.append(missing)
+			if missing is not None and missing not in unmounted + nested:
+				nested.append(missing)
 	problems = []
-	if len(unmounted) == 1:
-		problems.append(f'disk {unmounted[0]} of pool {pool} is not mounted')
-	elif unmounted:
-		problems.append(f'disks {", ".join(unmounted)} of pool {pool} are not mounted')
+	# a nested one says fstab names it, as the reason of a disk off a pool does (vault_disk_problem()): a plain folder under a
+	# branch is not otherwise a disk
+	for disks, named in ((unmounted, ''), (nested, f' ({FSTAB_PATH} names it)')):
+		if len(disks) == 1:
+			problems.append(f'disk {disks[0]} of pool {pool} is not mounted{named}')
+		elif disks:
+			problems.append(f'disks {", ".join(disks)} of pool {pool} are not mounted{named}')
 	problems.extend(failed)
 	return PoolState(pool, tuple(ids), '; '.join(problems) or None, pool_id)
 

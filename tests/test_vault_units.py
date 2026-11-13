@@ -530,10 +530,10 @@ def test_a_batch_on_a_nested_vault_disk_fstab_names_that_is_not_mounted_fails_wi
 	assert rv.vault_disk_problem(r_job.job_vault) is None
 	before = committed_versions(r_job)
 	unmount_nested_disk(fake_pool, own, place)
-	assert rv.vault_disk_problem(r_job.job_vault) == f'disk {place} of pool {pool} is not mounted'
+	assert rv.vault_disk_problem(r_job.job_vault) == f'disk {place} of pool {pool} is not mounted ({rv.FSTAB_PATH} names it)'
 	with pytest.raises(rv.PoolNotReady) as failed:
 		backup_events(r_job, modify_big(r_job), **KEPT)
-	assert failed.value.args[0] == f'disk {place} of pool {pool} is not mounted'
+	assert failed.value.args[0] == f'disk {place} of pool {pool} is not mounted ({rv.FSTAB_PATH} names it)'
 	assert committed_versions(r_job) == before
 	# it is mounted again: the job goes on
 	mount_nested_disk(fake_pool, own, place)
@@ -574,7 +574,7 @@ def test_an_attempt_waits_for_a_nested_vault_disk_fstab_names_that_is_not_mounte
 		return text
 	try:
 		# the job waits for the job vault, with the disk's reason, and stays in the wait: it does not fail, log a FAILED line or commit
-		reason = f'disk {place} of pool {pool} is not mounted'
+		reason = f'disk {place} of pool {pool} is not mounted ({rv.FSTAB_PATH} names it)'
 		wait_until(lambda: [wait[1:3] for wait in control._waits] == [[r_job.job_vault, reason]] or control.failure is not None, timeout=10,
 			message='the attempt never waited for the job vault')
 		assert control.failure is None, f'the attempt failed instead of waiting: {control.failure.reason}'
@@ -592,6 +592,18 @@ def test_an_attempt_waits_for_a_nested_vault_disk_fstab_names_that_is_not_mounte
 		control.fail('stop')
 		thread.join(timeout=10)
 	assert not thread.is_alive()
+
+
+def test_a_nested_disk_fstab_names_says_so_beside_a_branch_that_is_out(r_job, fake_pool):
+	# the nested disk's text carries "(/etc/fstab names it)", as the reason of a disk off a pool does; a branch that is out has none
+	a, b = fake_pool.add(r_job.vault, ['a', 'b'])
+	place = os.path.join(b, r_job.job_name)
+	os.makedirs(place)
+	write_fstab(place)
+	pool = os.path.realpath(r_job.vault)
+	assert rv.vault_disk_problem(r_job.job_vault) == f'disk {place} of pool {pool} is not mounted ({rv.FSTAB_PATH} names it)'
+	fake_pool.drop(a)
+	assert rv.vault_disk_problem(r_job.job_vault) == f'disk {a} of pool {pool} is not mounted; disk {place} of pool {pool} is not mounted ({rv.FSTAB_PATH} names it)'
 
 
 def test_a_job_vault_made_later_under_a_nested_mount_is_synced_through_its_parents_handle(tmp_path, fake_pool, errseq, monkeypatch, other_filesystem):
