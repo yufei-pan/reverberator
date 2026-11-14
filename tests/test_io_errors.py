@@ -962,3 +962,118 @@ def test_a_monitored_root_gone_at_the_walk_still_fails_the_attempt(job, poll_fas
 	with pytest.raises(rv.JobFailure):
 		_backup(job)
 	assert committed_versions(job) == before
+
+
+# ---- F4's check meets two cases the copy answers otherwise (the final review's measurement, F-fix): a file another process
+# holds a write lease on, and an entry under a folder the version has no row of
+
+# a holder of a write lease, as knfsd (a write delegation), Samba (kernel oplocks) or any F_SETLEASE caller is: it lets the
+# lease go some time after the break begins, as a client returns a delegation. A blocking open waits for that; one with
+# O_NONBLOCK fails at once with EWOULDBLOCK, though the break still begins (fcntl(2)). 1.5 s is longer than the check's
+# comparison after the drop takes (milliseconds), so the comparison's own check meets the lease too
+LEASE_HOLDER = '''
+import fcntl, os, signal, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+	fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+except OSError as e:
+	print('refused', e.errno, flush=True)
+	sys.exit(0)
+def broken(*_):
+	time.sleep(1.5)
+	fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+signal.signal(signal.SIGIO, broken)
+print('held', flush=True)
+sys.stdin.read()
+'''
+
+
+def test_a_file_under_another_processs_write_lease_is_backed_up_as_on_main(job, poll_fast, capsys):
+	# fails on 260f399: the check's open (O_NONBLOCK) fails at once with EWOULDBLOCK, the file is classed unreadable, and the batch
+	# is dropped with an UNREADABLE line and no copy, where main's blocking cp waits for the lease to break and backs it up. A real
+	# lease, taken by a helper process (it needs the file's owner and no other open of it)
+	import subprocess
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	with open(path, 'w') as f:
+		f.write('b, longer')
+	holder = subprocess.Popen([sys.executable, '-c', LEASE_HOLDER, path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+	try:
+		said = holder.stdout.readline().strip()
+		if said != 'held':
+			pytest.skip(f'this filesystem takes no write lease ({said})')
+		capsys.readouterr()
+		_events(job, [(False, 'modify', 'b.txt', None)])
+	finally:
+		holder.stdin.close()
+		holder.wait(timeout=30)
+	versions = committed_versions(job)
+	assert len(versions) == len(before) + 1
+	with open(os.path.join(versions[-1], 'b.txt')) as f:
+		assert f.read() == 'b, longer'
+	assert _lines(capsys, 'UNREADABLE', path) == 0
+
+
+@needs_unreadable
+def test_an_unreadable_file_under_a_folder_the_version_has_no_row_of_commits_the_folder(job, poll_fast, capsys):
+	# fails on 260f399: a folder the version could not make once (ENOSPC) has no row, and the version lacks it, as here, where the
+	# folder came after the last version. copy_path() copies it whole for an entry below it, as main does for every batch: the
+	# check never asked, dropped a batch of only an unreadable file under it, and the folder's readable files stayed out of the newest
+	# version until a readable event under it or the next full comparison
+	from tests.harness import event_entry
+	seed_monitor(job, {'a.txt': 'a'})
+	before = _settled(job)
+	seed_monitor(job, {'d/r.txt': 'r', 'd/u.txt': 'u'})
+	path = os.path.join(job.monitor, 'd', 'u.txt')
+	os.chmod(path, 0)
+	capsys.readouterr()
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'd/u.txt', 'modify')]))
+	manifest.close()
+	assert committed is True
+	versions = committed_versions(job)
+	assert len(versions) == len(before) + 1
+	with open(os.path.join(versions[-1], 'd', 'r.txt')) as f:
+		assert f.read() == 'r'
+	assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
+@needs_unreadable
+def test_an_unreadable_file_under_a_folder_the_version_has_a_row_of_still_makes_no_version(job, poll_fast, capsys):
+	# pin: the folder has its row, so the check's one lookup finds it and the entry drops out as before
+	from tests.harness import event_entry
+	seed_monitor(job, {'a.txt': 'a', 'd/r.txt': 'r', 'd/u.txt': 'u'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'd', 'u.txt')
+	with open(path, 'w') as f:
+		f.write('u, longer')
+	os.chmod(path, 0)
+	capsys.readouterr()
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'd/u.txt', 'modify')]))
+	manifest.close()
+	assert committed is True and committed_versions(job) == before
+	assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
+@needs_unreadable
+def test_an_unreadable_file_under_a_folder_over_a_lost_manifest_commits_as_on_main(job, poll_fast, capsys):
+	# fails on 260f399: a manifest that does not describe the newest version answers no lookup, so the folder's row cannot be asked and
+	# the entry counts as a change, as it did on main (the batch lists the version again, and its copy keeps the last copy)
+	from tests.harness import event_entry
+	from tests.test_vault_units import lose_the_manifest
+	seed_monitor(job, {'a.txt': 'a', 'd/r.txt': 'r', 'd/u.txt': 'u'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'd', 'u.txt')
+	with open(path, 'w') as f:
+		f.write('u, longer')
+	os.chmod(path, 0)
+	lose_the_manifest(job)
+	capsys.readouterr()
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'd/u.txt', 'modify')]))
+	manifest.close()
+	assert committed is True
+	versions = committed_versions(job)
+	assert len(versions) == len(before) + 1
+	with open(os.path.join(versions[-1], 'd', 'u.txt')) as f:
+		assert f.read() == 'u'
+	assert _lines(capsys, 'UNREADABLE', path) == 1
