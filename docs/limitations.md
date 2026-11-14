@@ -734,6 +734,26 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.5, with the fix at the copy: a batch whose every copy left its file out commits
   nothing, which needs `do_backup()`'s order of hand-over and copy changed.
 
+### A file under another process's write lease makes a full comparison log an error
+
+- **Kind:** deferred.
+- **What the operator sees:** a monitored regular file that another process holds a write lease on (an NFS server's write
+  delegation, Samba with kernel oplocks, any program using `F_SETLEASE`), met by a full comparison while its size and mtime
+  are still the recorded ones, gets `Error comparing <path>: [Errno 11] Resource temporarily unavailable`, an error line,
+  and is copied again: that comparison commits a version whose contents are the same as the one before (with Keep N
+  Versions it pushes the oldest one out). The open still tells the holder to let go (fcntl(2)), so a later comparison
+  reads the file once the lease is gone, unless it is taken again. A batch
+  check of 0.55.5 (`entries_all_drop_out()`) waits for such a file instead, as the copy's blocking `cp` does. Run on
+  0.55.5 and 0.55.4 with a real lease in a test container; this host had no lease in `/proc/locks` when checked
+  (2026-11-13).
+- **Why:** older than 0.55.5: the comparison reads the file's tail (`hash_file()`) through a non-blocking open, so that a
+  FIFO put at a file's place cannot hold the comparison; for a regular file the kernel answers that open with
+  EWOULDBLOCK while another process holds a write lease, where a blocking open waits up to the lease-break time (45 s by
+  default) and then reads.
+- **Revisit when:** the round after 0.55.5: on EWOULDBLOCK only, reopen the same file blocking once it is known to be a
+  regular file (through an `O_PATH` handle that `fstat` says is regular), so the read waits for the lease to break as `cp`
+  does.
+
 ### A power cut right after a backup hides its version until the next start
 
 - **Kind:** known limitation.
