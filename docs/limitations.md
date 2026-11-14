@@ -383,18 +383,31 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** it costs noticeable space.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
-### A vouched chmod keeps a checked copy checked
+### An attribute sync in place is recorded checked without a flush
 
 - **Kind:** known limitation.
-- **What the operator sees:** under Only Sync Attributes, after a chmod or chown whose record vouches for the vault copy,
-  the copy stays recorded checked, and no comparison syncs or reads it back. If a power loss or a metadata write error
-  loses the copy's new mode or owner in the seconds after the commit, the vault keeps the old mode or owner while its
-  record says the new one, until the file next changes, and restores give the old mode or owner. The data is
-  unaffected; folders and symlinks already worked this way.
-- **Why:** marking such copies unchecked would make the next full comparison read each one back, the vault reads this round
-  removed for a chmod or chown over a large tree, for a loss confined to a few seconds after a commit.
-- **Revisit when:** a restore is seen giving an old mode or owner after a power loss or a write error.
-- **Approved:** 2026-10-28, the user's choice "Keep checked, known limitation (Recommended)".
+- **What the operator sees:** under Only Sync Attributes, a file's attribute-only change that is synced onto the vault's
+  copy in place is recorded checked, and no comparison reads the copy back: a chmod, chown or change of extended
+  attributes (ACLs among them) whose record vouches for the copy (which keeps that record's checked or unchecked mark),
+  one whose copy the replay finds with the file's size, mtime and last 64 KiB though no record vouches for it, and a
+  moved file whose mode, owner or extended attributes differ from its copy's. Off a mergerfs pool, a batch that wrote no
+  copy is not flushed before its commit (`do_backup()` flushes a batch that placed a copy, rolled a cut batch forward,
+  or renamed in two steps, as every batch on a pool does). If a power loss or a metadata write error loses the copy's new
+  mode, owner or extended attributes after the commit, before the vault's filesystem has written them out (reasoned, not
+  run), the vault keeps the old ones while its record says the new, until the file next changes, and restores give the
+  old ones. A file's size, mtime and bytes are not at risk: such a sync is made only onto a copy that already has the
+  file's size and mtime, and a file whose mtime moved (a touch, `rsync -t`) is copied, and that copy flushed. Folders
+  (their times too) and symlinks already worked this way, with Only Sync Attributes on or off. 0.55.4 recorded a sync
+  no record vouched for unchecked, and a moved file's row unverified, so a later comparison read the copy back and
+  would put a lost change right; a vouched chmod or chown worked as now.
+- **Why:** marking such rows for a read-back would make the next comparison read each copy back, the vault reads round 12
+  removed for a chmod or chown over a large tree and 0.55.5 for every copy, and flushing each such batch would cost an
+  attribute-only batch a sync of the vault's disks (on f2fs a checkpoint), for a loss confined to a power cut or a write
+  error right after a commit.
+- **Revisit when:** a restore is seen giving an old mode, owner or extended attributes after a power loss or a write
+  error.
+- **Approved:** 2026-10-28, the user's choice "Keep checked, known limitation (Recommended)"; 2026-11-13, "Widen the
+  entry (Recommended)", for every attribute sync made in place, vouched for or not.
 
 ### Vault disks mounted outside fstab
 
@@ -703,6 +716,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   - a file readable when the batch is checked and unreadable or gone when it is copied a moment later;
   - on a mergerfs pool, a symlink the vault's filesystem can't hold, with its NOT BACKED UP line: there the check counts
     every symlink as a change, as 0.55.4 did.
+
+  A file that opens but cannot be read makes such a version too, at every comparison that meets it: a deferred fix, in
+  its own entry ("A file that opens but cannot be read makes a version at every comparison").
 - **Why:** the check that keeps such batches from committing runs before the copy, and probes a link's text, not the
   path its copy is written under. Telling that path apart needs the new version's name and a length rule, for a rare
   link; closing the race would need the check and the copy to be one step. On a pool the probe, made in staging, can
@@ -711,6 +727,25 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** such a link is seen in a monitored tree, or such empty versions are seen.
 - **Approved:** 2026-11-12, "Leave that case out (Recommended)"; 2026-11-13, on the race: "Accept the race
   (Recommended)"; 2026-11-13, on the pool case: "Widen the entry (Recommended)".
+
+### A file that opens but cannot be read makes a version at every comparison
+
+- **Kind:** deferred.
+- **What the operator sees:** a regular file that opens but whose read fails (a bad sector under it, say, or a read
+  error of a FUSE or network filesystem), when it is the only difference a full comparison finds or the only entry of a
+  batch, makes one version that changes nothing each time, with its UNREADABLE line, the file keeping its last backed-up
+  copy: at every full comparison (every start, each Full Comparison Interval, when events were lost) and at every batch
+  of its events. With Keep N Versions each such version pushes the oldest one out: in a probe with Keep 3, three full
+  comparisons left the three kept versions holding one content of the file where they had held three. A file that does
+  not open makes no version. This is not the race the approved entry above accepts: the read fails every time, so it
+  comes back at every comparison. 0.55.4 does the same (run on both, with a stand-in for cp that fails as GNU cp does on
+  a read error; not run on a failing device).
+- **Why:** older than 0.55.5: 0.55.4 makes such a version for every unreadable file. 0.55.5's check before the copy
+  (`entries_all_drop_out()`) drops a file that does not open, but only opens it; the read fails later, at the copy, after
+  the tree is handed to the new version. Reading the file whole at the check would read it twice whenever the batch goes
+  on.
+- **Revisit when:** the round after 0.55.5, with the fix at the copy: a batch whose every copy left its file out commits
+  nothing, which needs `do_backup()`'s order of hand-over and copy changed.
 
 ### A power cut right after a backup hides its version until the next start
 
@@ -818,6 +853,20 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   again after it; 0.55.5 moved the look after the locks for a job's first version only.
 - **Revisit when:** the round after 0.55.5: look again once the locks are held, as a first version does.
 
+### A disk unmounted inside the tree while a first version walks it
+
+- **Kind:** deferred.
+- **What the operator sees:** a disk mounted inside the monitored tree (an inner mount) and unmounted while a job's
+  first version walks the tree leaves out of that version the files under it that the walk had not reached or copied
+  yet, with no line saying so: the walk reads the empty folder the disk left. The versions after it lack them too while
+  the disk stays away (paused, as an inner mount that is not mounted), until a comparison with the disk mounted again
+  finds and copies them: the one the watcher asks for when it is mounted again, or the next full comparison (every
+  start; the Full Comparison Interval). The later walks look for an inner mount gone during them
+  (`drop_unmounted_entries()`, with its line `Inner mounts unmounted during the ...`); a first version's does not.
+  Reasoned from the code, not run.
+- **Why:** older than 0.55.5: 0.55.4 walks a first version the same.
+- **Revisit when:** the round after 0.55.5: the same look after a first version's walk.
+
 ### An /etc/fstab that cannot be read names no disk
 
 - **Kind:** deferred.
@@ -830,6 +879,40 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   is an answer; a read error is none, and an absence counts as evidence only when the source answered.
 - **Revisit when:** the round after 0.55.5: a read error other than "no such file" is a problem that the wait names and
   waits on.
+
+### A disk fstab mounts under a pool's disk, below a monitored path's place, is not paused
+
+- **Kind:** deferred.
+- **What the operator sees:** on a mergerfs pool, a disk that /etc/fstab mounts under one of the pool's disks, below a
+  monitored path's place on that disk, is not an inner mount of the monitored path: the mount table shows it under the
+  pool's disk, not under the pool, and the fstab rule on a pool looks only at mount points at or above the path's place
+  (the README's "fstab mounts"). While that disk is not mounted, the pool shows the bare folder it covers, and a full
+  comparison takes its files as deleted, with routine lines only (`Deleted file/folder ...`): the new version lacks them
+  while it is away (older versions keep them), and once it is mounted again they are copied again, whole, by the next
+  comparison that walks them. When it is unmounted while a walk passes through it, the folders the walk reaches after
+  that read as gone, with one INFO line each, where 0.55.4 logged UNREADABLE (an alert) and held the vault's matched
+  time: their rows stay for that version, but the matched time moves past them, so an xattr-only change made in them
+  while nothing watched can be missed until the entry next changes. No live job has such a disk (checked 2026-11-13).
+  Reasoned from the code, not run.
+- **Why:** the deleted files are older than 0.55.5 (0.55.4 the same); the walk's part is new in it, from its rule for a
+  folder gone mid-walk, which is no error (L10). Nothing the daemon reads under the monitored path tells it that such a
+  disk is part of the tree.
+- **Revisit when:** the round after 0.55.5: such a disk paused as an inner mount of the monitored path, its files kept and
+  the matched time held, as for a disk mounted inside the tree.
+
+### On a pool, every pool check reads /etc/fstab again
+
+- **Kind:** deferred.
+- **What the operator sees:** nothing but cost. For a job whose monitored tree or vault is on a mergerfs pool, each check
+  of the pool (every check of a batch's pool guard, one a second at most during a long walk or copy, and every look of a
+  wait) reads /etc/fstab again, and a wait's look reads it twice. A one-file batch with its tree on a pool reads it 9
+  times where 0.55.4 read it twice: about 1.9 ms a batch on the mount table and fstab reads, where about 1.4 ms was
+  within reach (0.55.4 spent about 2.5 ms, as it read the mount table more often).
+- **Why:** new in 0.55.5. The rule for a disk fstab mounts under a pool's disk (R40) is in `pool_state()`, which every
+  guard check and every wait calls, and `vault_disk_problem()` reads fstab once more for its own rule before it asks
+  `pool_state()`. The answer matters only where fstab names a mount point under a pool's disk.
+- **Revisit when:** the next round's lightness list: one fstab read per look, as L4 did for the mount table (the wait
+  hands the points it read to `pool_state()`, and a guard keeps those under its disks from when its step began).
 
 ### An xattr change made while down, in a folder renamed during the start's walk
 
@@ -850,13 +933,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   or sshfs mount, say, whose lstat of the name answers ENOENT every time), a batch whose comparison walks such a name as
   a scope it touched (a folder or a path of the batch's events) takes it as gone: its rows are deleted, so the
   new version lacks it and everything under it, with no line; older versions keep it. The whole-tree walk tells it apart:
-  a folder its parent still lists is not gone, and keeps its ERROR and UNREADABLE lines at every walk.
+  a folder its parent still lists is not gone, and keeps its ERROR and UNREADABLE lines at every walk. The watcher has
+  the same blind spot: such a folder gets no watch, and as its error is an ENOENT it is not counted unwatched, so it does
+  not hold the matched time as an unwatched folder does ("A paused inner mount or an unwatched folder holds the matched
+  time"). An xattr-only change made in it while it cannot be looked up can then be missed by the next full comparison
+  once it reads again, until the entry next changes. 0.55.4 does the same.
 - **Why:** older than 0.55.5. The scope walks (`iter_scope_entries()`, `scope_path_entry()`) take an lstat's ENOENT as
   gone, which is the normal answer for every folder and file a batch deleted or moved away; asking the parent's listing
   each time, as the whole-tree walk does on its error path, would list a parent once per deleted entry, about 8 ms for
-  a parent of 100,000 names.
+  a parent of 100,000 names. The watcher's walk (`initializeFolderWatchers()`) counts a folder unwatched by its error's
+  errno, and ENOENT is a folder gone's.
 - **Revisit when:** the round after 0.55.5: the same parent-listing rule in the scope walks, with one listing per parent
-  kept for the comparison.
+  kept for the comparison, and in the watcher's walk (a folder is unwatched unless its error is a `FolderGone`).
 
 ### A walk lists a parent once per folder gone under it
 
