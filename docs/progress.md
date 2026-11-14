@@ -7,7 +7,9 @@ done (with its commit or release) or as dropped (with the user's words and the d
 specs, plans and commit messages, not here.
 
 First written on 2026-11-14, with 0.55.5 live (main 720e518), from every spec and plan in `docs/superpowers/`: each
-part's state was taken from the code and the commits, not from notes. An audit against the user's own messages follows.
+part's state was taken from the code and the commits, not from notes. An audit against the user's own messages
+(2026-11-14) added P16, Q8 and three candidates, moved P9 to the candidates, and corrected P7, P8, Q5 and the closed
+list.
 
 ## The goal, in the user's words
 
@@ -42,26 +44,25 @@ with "the no-copy move into a new folder gets its own design round after".
 **P4. Remove the backuper's dead branch** at `reverberator.py` ~4988-4995. **P5. Remove the lost-manifest branch of
 `drop_untracked_deletes(newest_path=)`.** **P6. Remove `remove_pending_file()`.** Source: round 0.55.5's final review
 and its second opinions (parts that can go; not in a spec). State: not started. Next: the round after 0.55.5. Behind
-them: "simpler and smarter is better"; ruled "can go, next round" by the main session.
+them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own housekeeping, with no
+pick of the user's.
 
 **P7. The live measurement after design R.** Source: `plans/2026-11-05-round20.md`, Rollout; the round 19 spec's real
 writes after release. State: open; no result is recorded since 0.55 went live on 2026-11-06. Next: measure on the
 current release: writes per backup of the busiest job and per day (the vault disks' lifetime write counters) against
 the spec's 24 to 36 MiB a cycle and 0.6 to 0.85 GiB a day, f2fs GC's share, prune times, idle CPU, peak memory.
-Behind it: the goal (light), and the spec's targets.
+Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
+when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
 **P8. 0.55.5's memory at the uptime of 0.55.4's baseline.** Source: `plans/2026-11-13-r0555.md`, Task 15 and the
-rollout. State: one reading: anonymous 104.8 MB, no swap, peak 158 MB, 95 s after the start's last commit
-(2026-11-14). Next: read again at two days' uptime, about 2026-11-16, against 0.55.4's 163 MB anonymous (18 MB in
-memory, 145 MB swapped) and 150 MB peak. The README (line 90) says idle memory stays near 35 MB, which the tests
-measured: if the live figure stays far above it, find what holds the memory and correct the line. housekeepd takes
+rollout. State: two readings on 2026-11-14: 95 s after the start's last commit, anonymous 104.8 MB, none of it in
+swap, peak 158 MB; at 14 hours (15:20), anonymous 91.2 MB (18.5 MB in memory, 72.7 MB in swap), resident 30.9 MB, peak
+158 MB. Next: read again at two days' uptime, about 2026-11-16, against 0.55.4's 163 MB anonymous (18 MB in memory,
+145 MB swapped) and 150 MB peak. The README (line 90) says idle memory stays near 35 MB, which the tests measured: live,
+only the resident part is near it, as swap holds the rest. If the anonymous total stays far above it, find what holds
+the memory and correct the line. housekeepd takes
 the reading (case 572, from 2026-11-16, the user's pick "Leave housekeepd a note (Recommended)"). Behind it: the
 user's pick "Trim, shrink, 2 arenas (Recommended)" (2026-11-13).
-
-**P9. One pass over the watches per folder move, by an index of paths.** Source: `specs/2026-11-09-round22-stepback.md`
-("could go later by an index of paths (the lightness round)"). State: not started; 0.55.5's lightness items (L1 to L10)
-did not take it, and the code still makes both passes (`reverberator.py` :2989, :3438, :3652). Next: the next
-lightness list. Behind it: the goal (light).
 
 **P10 to P13. Four parts of round 22's first watcher design that the step back never took up.** Source:
 `specs/2026-11-08-round22-watcher-design.md`. Its top says it was not built; the step back replaced its watcher work
@@ -82,14 +83,22 @@ keep is hard-linked, not exchanged), 3 (the staging rule, the lost-manifest row)
 filesystem with no exchange is treated as a pool, not only mergerfs), 6 (the estimate changed) and 13 (line numbers),
 where the round 20 plan's proposed spec edits were applied only in part; the 0.55.5 spec's L4 summary table (three and
 four mount-table reads, not two and three) and its 5.9 (L10 decides "gone" by listing the parent, not by an lstat).
-State: open. Next: one docs commit.
+State: open. Next: one docs commit. Behind it: the main session's own housekeeping, with no pick of the user's.
 
 **P15. Every test module carries its layer marker.** Source: `specs/2026-08-12-full-test-suite-design.md`, Goals and
 "1 Pytest config". State: partly done. Eight modules carry none (`test_crash_power_loss`, `test_r_batch`,
 `test_r_readers`, `test_r_scan`, `test_r_sizes`, `test_sysctl_limits`, `test_tree_writes`, `test_version_walk`: 226
 tests), so `pytest -m unit` leaves out most of design R's unit tests; `test_crash_safety.py` and
 `test_backup_replay_ordering.py` are still `unittest` classes, which the spec said to move "when touching them". Next:
-the next round that touches the tests.
+the next round that touches the tests. Behind it: that spec's goals; no pick of the user's is on record for it.
+
+**P16. Check whether a folder whose own metadata copy failed heals in later versions.** Source: the user's pick
+2026-11-03, "Not an issue, check healing (Recommended)", on a folder that keeps the setgid or default ACL it inherited
+when its own metadata copy fails (an ERROR line, and the folder listed as unsynced). State: not started; no spec, plan
+or commit has a result. Round 18 (0.54) and design R changed how folder metadata is copied since, so the check runs on
+the current release. The entry "A folder whose extended attributes alone fail to copy keeps the wrong ones" covers
+only the xattr case. Next: the round after 0.55.5: force such a failure in a test, then see what the next versions
+hold. Behind it: that pick.
 
 ## Questions waiting for the user
 
@@ -104,9 +113,11 @@ the next round that touches the tests.
   object, not a name: move it with the object, and only once the object has moved."; add "When a guarantee moves
   upstream, remove the downstream check that stood in for it." Design R's lesson (its section 15) is in
   `docs/lessons.md` but not in the shared file either.
-- **Q5.** Round 22's costs above 0.55.1, accepted by the main session (the step back's item 20) without a pick of the
-  user's: move-outs +7 to 8%, moves into new folders +5%, a move out of a new folder about 1 ms, a folder moved out for
-  good 0.3 to 0.7 ms, the move-out peak 11.77 MiB against 0.89.
+- **Q5.** Three of round 22's costs above 0.55.1, accepted by the main session (the step back's item 20) without a pick
+  of the user's: move-outs +7 to 8%, a folder moved out for good 0.3 to 0.7 ms, the move-out peak 11.77 MiB against
+  0.89. The question of 2026-11-10 said "Every other move and rename benchmarks the same as live". The others were
+  picked: a move out of a new folder about 1 ms and moves into new folders about 5% slower ("Keep the full check
+  (Recommended)", 2026-11-10).
 - **Q6.** 0.55.5's calls to confirm at its rollout, not yet answered: RF2-1 ruled Not an issue (a millisecond race, as
   in 0.55.4); the behaviour changes with no pick of their own (the waits for an fstab disk at the job vault or under a
   pool disk, the job vault folder made before the first scan, a too-long link copy left out, a first version locks
@@ -114,6 +125,10 @@ the next round that touches the tests.
   file by its filesystem); docs text beyond the approved wording.
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address; whether it went is not known.
+- **Q8.** Chain Length (rule column 14) and Copy threads (column 15), which the user asked for (2026-10-27, "make this
+  max chain length configurable?"; 2026-11-04, "do we add this as a per job config item in the job file? so user can
+  also tune their own?"), do nothing since 0.55: design R has no chains and no per-job copy threads. The README says so
+  (line 8); no pick of the user's does.
 
 ## Candidates, never agreed
 
@@ -122,6 +137,16 @@ Kept so they are not lost; none is planned until the user picks it.
   slimmer watch records, `python -OO`, `PYTHONMALLOC=malloc`.
 - One key in place of the restore marker's two (0.55.5's L8: it saves no I/O; "Not this round").
 - Size-based skipping (the skip-list spec's non-goal, "a separate, possible later feature").
+- One pass over the watches per folder move, by an index of each folder's subfolders held all the time (the round 22
+  step back's "could go later by an index of paths"; the code makes both passes, `reverberator.py` :2989, :3438,
+  :3652). Not agreed: the user picked "Keep the full check (Recommended)" over such an index on 2026-11-10.
+- A way to ask the daemon for a full comparison on demand (offered with 0.43; the user's pick 2026-10-22, "Not now
+  (Recommended)").
+- Hard links in place of forward links for an older version's unchanged files: noted at the user's request on
+  2026-10-21 ("let's also put down a note for a future feature of supporting hard links instead of only using soft
+  links"; the names-chains spec, "Future"). Not built: design R refers to unchanged entries by forward links (symlinks)
+  and uses hard links only to record moved entries. It would lift the 40-link limit on browsing old versions by hand, at
+  about an inode write per unchanged entry per version.
 - Two mergerfs oddities round 22's first design saw on a scratch pool and did not run down: a folder mtime a few ms
   off, and `add_watch` through an open parent making the pool list folders that were not there.
 - Cases round 22 reasoned about and never ran: a mount below a new folder whose parent moved out, the overflow
@@ -131,6 +156,8 @@ Kept so they are not lost; none is planned until the user picks it.
 
 - `mv q a; rm a` (the round 13 spec, left "for the user"): Not an issue, the user's pick 2026-11-14, "Not an issue
   (Recommended)": the check after every batch removes the old file; the test comment says so.
+- P9, one pass over the watches per folder move by an index of paths: not an agreed part (the user's pick 2026-11-10,
+  "Keep the full check (Recommended)"); moved to the candidates on 2026-11-14.
 
 Releases, newest first (the spec and plan of each are in `docs/superpowers/`):
 - 0.55.5, 2026-11-14 (9fcbcfa; main 720e518): four deferred fixes and the lightness round.
@@ -139,6 +166,7 @@ Releases, newest first (the spec and plan of each are in `docs/superpowers/`):
 - 0.55.2, 2026-11-09 (bca4b9c): the restore sync, the XFS size estimate, refused long links.
 - 0.55.1, 2026-11-07: watcher fixes; the no-copy move dropped ("Drop the feature (Recommended)", 2026-11-07).
 - 0.55, 2026-11-06: design R with pools P2 (round 20).
+- 0.54.2, 2026-11-05 (b4baf1f): the watcher's take fixes.
 - 0.54.1, 2026-11-04 (c6d5b95): backups wait for restores.
 - 0.54, 2026-11-04 (eb5f786): folder times kept in every version.
 - 0.50 to 0.53, 2026-11-03: rounds 14 to 17 (copy and prune threads, pool power-loss prune); no spec files.
@@ -146,5 +174,3 @@ Releases, newest first (the spec and plan of each are in `docs/superpowers/`):
 - 0.45 pool disks, 0.44 user links, 0.43 batch replay, 0.42 whole output, 0.41 whole log lines, 0.40 names and chains,
   0.39 status, history and restore, 0.38 reliability, 0.37 skip list; the crash-safety round and the full test suite
   before them.
-- The "hard links as well as symlinks" idea (names-chains spec, "Future", noted at the user's request on 2026-10-21):
-  built by design R.
