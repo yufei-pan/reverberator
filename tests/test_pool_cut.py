@@ -1297,14 +1297,18 @@ def a_start_losing_a_disk(shape: Shape, work: str, kill: int, when: str) -> dict
 @needs_mergerfs
 @pytest.mark.parametrize('when', ['begins', 'ends'])
 def test_a_disk_lost_during_the_starts_repair_fails_the_start_and_leaves_every_version_exact(when, request):
-	# RR-C2-1 on a real pool, which the fake pool of tests/test_vault_units.py only stands for: a disk that goes after the scan read the vault hides what it
-	# holds from every listing through the pool, and before the scan checked the pool again (it does, as the repair ends) a forward link could be put back
-	# where the disk holds the real entry and the first batch, which reuses the scan's result and makes its own guard once the disk is back, commit it:
-	# version n restored as the newer bytes. The start must fail instead, with the tree as the repair left it, and the retry with the disk back must
-	# find every version exact (the oracle, the row oracle, a file of each version through the commands): the next scan takes a link put back beside a
-	# real entry away (remove_shadowed_links()). 'ends' is the check alone: nothing runs after the disk goes, so the start fails with PoolNotReady, and on
-	# 065fa15 it returns. 'begins' is the shape of the finding: the repair that follows works on a view with the disk gone, and on a real pool an
-	# operation on an entry only that disk holds may fail first, so the start fails with PoolNotReady or with another error, never with a result
+	# a disk lost during the start's repair, on a real pool, which the fake pool of tests/test_vault_units.py only stands for: a disk that goes
+	# after the scan read the vault hides what it holds from every listing through the pool, and the scan checks the pool before each act of the
+	# repair that trusts a listing and as the repair ends, before a first batch that reuses the scan (and makes its own guard once the disk is back)
+	# can get its result. The start must fail, with the tree as the repair left it, and the retry with the disk back must find every version exact
+	# (the oracle, the row oracle, a file of each version through the commands). 'ends' is the end check alone: nothing runs after the disk goes, so
+	# the start fails with PoolNotReady, and on 065fa15 it returns (RR-C2-1's end). 'begins' loses the disk before the repair's first act: whatever
+	# the pool shows of that disk's part, the start fails (with PoolNotReady at the first check, or with the error of an operation on an entry only
+	# that disk holds), never with a result, and the retry finds every version exact. It does not pin RR-C2-1's state, a forward link put back
+	# beside the real entry the lost disk holds: the pool's category.create=pfrd probably places a link written while the disk is away in the bare
+	# mount point, which is hidden when the disk is mounted again (not checked), so no link need stand beside a real entry here, and the test asks
+	# nothing of one. That state is pinned on a fake pool, where the put-back is made to look at the entry as the disk goes
+	# (tests/test_vault_units.py, the put-back looking for a link to write)
 	shape = built_shape('mixed-2', request)
 	trace, _ = steps_of(shape)
 	# the cut right before the change list is made: the batch's tree holds everything, and nothing commits it
