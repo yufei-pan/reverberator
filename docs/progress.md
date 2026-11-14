@@ -54,7 +54,8 @@ Behind it: the goal (light), and the spec's targets.
 rollout. State: one reading: anonymous 104.8 MB, no swap, peak 158 MB, 95 s after the start's last commit
 (2026-11-14). Next: read again at two days' uptime, about 2026-11-16, against 0.55.4's 163 MB anonymous (18 MB in
 memory, 145 MB swapped) and 150 MB peak. The README (line 90) says idle memory stays near 35 MB, which the tests
-measured: if the live figure stays far above it, find what holds the memory and correct the line. Behind it: the
+measured: if the live figure stays far above it, find what holds the memory and correct the line. housekeepd takes
+the reading (case 572, from 2026-11-16, the user's pick "Leave housekeepd a note (Recommended)"). Behind it: the
 user's pick "Trim, shrink, 2 arenas (Recommended)" (2026-11-13).
 
 **P9. One pass over the watches per folder move, by an index of paths.** Source: `specs/2026-11-09-round22-stepback.md`
@@ -64,7 +65,8 @@ lightness list. Behind it: the goal (light).
 
 **P10 to P13. Four parts of round 22's first watcher design that the step back never took up.** Source:
 `specs/2026-11-08-round22-watcher-design.md`. Its top says it was not built; the step back replaced its watcher work
-and says nothing of these. State: open, waiting for the user (question Q2).
+and says nothing of these. State: not started. Next: the round after 0.55.5. Behind them: the user's pick
+2026-11-14, "Carry all four (Recommended)".
 - **P10. A tree walk without recursion** (its 2.3): `iter_tree_entries()` recurses by `yield from` (:3783). A tree
   deeper than about 1,000 levels leaves its deepest folders unwatched, and the comparison, restore and vault walks
   through the same function stop at the same depth.
@@ -91,10 +93,6 @@ the next round that touches the tests.
 
 ## Questions waiting for the user
 
-- **Q1.** `mv q a; rm a` (the round 13 spec: "outside this round, for the user"): the replay alone keeps the old `a`
-  until the check after the batch removes it, so the committed version is right; `tests/test_rename_heavy_batches.py:219`
-  says "left open". Recommended: Not an issue, as that check runs after every batch.
-- **Q2.** P10 to P13: carry them into a round, or drop them.
 - **Q3.** Four notes the names-chains spec (2026-10-21, "Left as they are") never wrote down: the commands redirect
   stdout and stderr process-wide while they load the rules (~14814); `get_path_fs_info` logs through the backuper's
   logger in the commands (~11106); folders that cannot be locked (NFS) are not kept apart, and a microsecond window
@@ -130,6 +128,9 @@ Kept so they are not lost; none is planned until the user picks it.
   restart's walk meeting a folder made in the batch, the settle's placement window.
 
 ## Closed
+
+- `mv q a; rm a` (the round 13 spec, left "for the user"): Not an issue, the user's pick 2026-11-14, "Not an issue
+  (Recommended)": the check after every batch removes the old file; the test comment says so.
 
 Releases, newest first (the spec and plan of each are in `docs/superpowers/`):
 - 0.55.5, 2026-11-14 (9fcbcfa; main 720e518): four deferred fixes and the lightness round.

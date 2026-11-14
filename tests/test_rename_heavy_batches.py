@@ -216,7 +216,8 @@ OLDER_MOVED_AWAY = {'backup_save_then_folder_moves': 'y', 'older_folder_out_afte
 	'older_folder_out_between_chain': 'e/g', 'backup_save_then_folder_moved_then_removed': 'y', 'older_folder_out_then_removed': 'e/g',
 	'folder_moved_then_backup_save_then_removed': 'y', 'folder_moved_away_and_remade_then_removed': 'e/g',
 	'saved_file_into_a_folder_moved_away_and_remade_then_removed': 'e/g'}
-# without the verification these keep the version's older file under a move onto it then removed ( mv q a; rm a ), left open
+# without the verification these keep the version's older file under a move onto it then removed ( mv q a; rm a ); not an
+# issue (the user's pick 2026-11-14), as the verification after every batch removes it
 BARE_DIFFERS = {'move_onto_then_rm', 'moved_onto_first'}
 
 
