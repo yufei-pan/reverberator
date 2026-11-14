@@ -106,7 +106,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   synced after an mmap write (old bytes under the new mtime) stays wrong until the file is written again. And (4) a file
   written only through mmap (a chat app's MMKV files) is backed up only at its next normal write, a restart, or the job's
   Full Comparison Interval if one is set.
-- **Why:** no inotify or fanotify flag reports mmap stores (round 10's research: scratchpad r10/mmap/report.md); the
+- **Why:** no inotify or fanotify flag reports mmap stores (round 10's research); the
   kernel moves the mtime only on the first store into a clean page.
 - **Revisit when:** a kernel interface reports mmap stores, or a job's files are seen stale this way.
 - **Approved:** 2026-10-26, "let's defer. let's see if we can catch something, or if we can know if a file is mmaped";
@@ -448,7 +448,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   PostgreSQL or MySQL data folder) is copied file by file, each when its turn comes, while the application goes on
   writing. A version can then hold the database and its write-ahead log from different moments, or a file copied
   in the middle of a write. Restored, such a copy may lack the newest changes or not open at all. On 2026-11-02
-  two hourly versions of snowluma's `messages.db` (93 MiB) were checked: in each of them the database and its
+  two hourly versions of an application's `messages.db` (93 MiB) were checked: in each of them the database and its
   `-wal` were copied up to 20 minutes apart, and both opened and passed SQLite's integrity check, so the risk is
   real but small in practice.
 - **Why:** a consistent copy of files that change together needs one instant for all of them: a filesystem snapshot
@@ -460,7 +460,7 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   up that cannot be dumped.
 - **Approved:** 2026-11-02, "Known limitation + README line (Recommended)", after the user asked "for general user's
   use case, should we accept as limitation? or should we plan / rig something up?". The same day the user chose
-  "Skip messages.db" for docker_volumes (in /etc/reverb_skip_docker_volumes.txt, with its -wal and -shm; restic's own
+  "Skip messages.db" for docker_volumes (in that job's skip list, with its -wal and -shm; restic's own
   copies still hold it) and "Leave restic as it is (Recommended)".
 
 ### A folder whose extended attributes alone fail to copy keeps the wrong ones
