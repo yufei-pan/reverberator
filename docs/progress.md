@@ -8,8 +8,8 @@ specs, plans and commit messages, not here.
 
 First written on 2026-11-14, with 0.55.5 live (main 720e518), from every spec and plan in `docs/superpowers/`: each
 part's state was taken from the code and the commits, not from notes. An audit against the user's own messages
-(2026-11-14) added P16, Q8 and three candidates, moved P9 to the candidates, and corrected P7, P8, Q5 and the closed
-list.
+(2026-11-14) added P16, Q8 (closed the same day) and three candidates, moved P9 to the candidates, and corrected P7, P8,
+Q5 and the closed list.
 
 ## The goal, in the user's words
 
@@ -125,10 +125,6 @@ hold. Behind it: that pick.
   file by its filesystem); docs text beyond the approved wording.
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address; whether it went is not known.
-- **Q8.** Chain Length (rule column 14) and Copy threads (column 15), which the user asked for (2026-10-27, "make this
-  max chain length configurable?"; 2026-11-04, "do we add this as a per job config item in the job file? so user can
-  also tune their own?"), do nothing since 0.55: design R has no chains and no per-job copy threads. The README says so
-  (line 8); no pick of the user's does.
 
 ## Candidates, never agreed
 
@@ -158,6 +154,8 @@ Kept so they are not lost; none is planned until the user picks it.
   (Recommended)": the check after every batch removes the old file; the test comment says so.
 - P9, one pass over the watches per folder move by an index of paths: not an agreed part (the user's pick 2026-11-10,
   "Keep the full check (Recommended)"); moved to the candidates on 2026-11-14.
+- Q8, rule columns 14 and 15 (Chain Length, Copy threads), asked for on 2026-10-27 and 2026-11-04 and inert since
+  0.55: kept accepted and ignored, as the README says, the user's pick 2026-11-14, "Keep them ignored (Recommended)".
 
 Releases, newest first (the spec and plan of each are in `docs/superpowers/`):
 - 0.55.5, 2026-11-14 (9fcbcfa; main 720e518): four deferred fixes and the lightness round.
