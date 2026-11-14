@@ -383,31 +383,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** it costs noticeable space.
 - **Approved:** 2026-10-28, the user's choice "Known limitation (Recommended)".
 
-### An attribute sync in place is recorded checked without a flush
+### A vouched chmod keeps a checked copy checked
 
 - **Kind:** known limitation.
-- **What the operator sees:** under Only Sync Attributes, a file's attribute-only change that is synced onto the vault's
-  copy in place is recorded checked, and no comparison reads the copy back: a chmod, chown or change of extended
-  attributes (ACLs among them) whose record vouches for the copy (which keeps that record's checked or unchecked mark),
-  one whose copy the replay finds with the file's size, mtime and last 64 KiB though no record vouches for it, and a
-  moved file whose mode, owner or extended attributes differ from its copy's. Off a mergerfs pool, a batch that wrote no
-  copy is not flushed before its commit (`do_backup()` flushes a batch that placed a copy, rolled a cut batch forward,
-  or renamed in two steps, as every batch on a pool does). If a power loss or a metadata write error loses the copy's new
-  mode, owner or extended attributes after the commit, before the vault's filesystem has written them out (reasoned, not
-  run), the vault keeps the old ones while its record says the new, until the file next changes, and restores give the
-  old ones. A file's size, mtime and bytes are not at risk: such a sync is made only onto a copy that already has the
-  file's size and mtime, and a file whose mtime moved (a touch, `rsync -t`) is copied, and that copy flushed. Folders
-  (their times too) and symlinks already worked this way, with Only Sync Attributes on or off. 0.55.4 recorded a sync
-  no record vouched for unchecked, and a moved file's row unverified, so a later comparison read the copy back and
-  would put a lost change right; a vouched chmod or chown worked as now.
-- **Why:** marking such rows for a read-back would make the next comparison read each copy back, the vault reads round 12
-  removed for a chmod or chown over a large tree and 0.55.5 for every copy, and flushing each such batch would cost an
-  attribute-only batch a sync of the vault's disks (on f2fs a checkpoint), for a loss confined to a power cut or a write
-  error right after a commit.
-- **Revisit when:** a restore is seen giving an old mode, owner or extended attributes after a power loss or a write
-  error.
-- **Approved:** 2026-10-28, the user's choice "Keep checked, known limitation (Recommended)"; 2026-11-13, "Widen the
-  entry (Recommended)", for every attribute sync made in place, vouched for or not.
+- **What the operator sees:** under Only Sync Attributes, after a chmod or chown whose record vouches for the vault copy,
+  the copy stays recorded checked, and no comparison syncs or reads it back. If a power loss or a metadata write error
+  loses the copy's new mode or owner in the seconds after the commit, the vault keeps the old mode or owner while its
+  record says the new one, until the file next changes, and restores give the old mode or owner. The data is
+  unaffected; folders and symlinks already worked this way.
+- **Why:** marking such copies unchecked would make the next full comparison read each one back, the vault reads this round
+  removed for a chmod or chown over a large tree, for a loss confined to a few seconds after a commit.
+- **Revisit when:** a restore is seen giving an old mode or owner after a power loss or a write error.
+- **Approved:** 2026-10-28, the user's choice "Keep checked, known limitation (Recommended)".
 
 ### Vault disks mounted outside fstab
 
