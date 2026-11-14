@@ -1001,8 +1001,10 @@ def test_a_file_under_another_processs_write_lease_is_backed_up_as_on_main(job, 
 	holder = subprocess.Popen([sys.executable, '-c', LEASE_HOLDER, path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 	try:
 		said = holder.stdout.readline().strip()
-		if said != 'held':
+		if said.startswith('refused'):
 			pytest.skip(f'this filesystem takes no write lease ({said})')
+		# a helper that died before saying anything is a failure of the test, not of the filesystem
+		assert said == 'held', f'the lease helper said {said!r} and exited {holder.poll()}'
 		capsys.readouterr()
 		_events(job, [(False, 'modify', 'b.txt', None)])
 	finally:
@@ -1015,32 +1017,65 @@ def test_a_file_under_another_processs_write_lease_is_backed_up_as_on_main(job, 
 	assert _lines(capsys, 'UNREADABLE', path) == 0
 
 
-@needs_unreadable
-def test_an_unreadable_file_under_a_folder_the_version_has_no_row_of_commits_the_folder(job, poll_fast, capsys):
-	# fails on 260f399: a folder the version could not make once (ENOSPC) has no row, and the version lacks it, as here, where the
-	# folder came after the last version. copy_path() copies it whole for an entry below it, as main does for every batch: the
-	# check never asked, dropped a batch of only an unreadable file under it, and the folder's readable files stayed out of the newest
-	# version until a readable event under it or the next full comparison
-	from tests.harness import event_entry
+def _a_version_lacking_the_folder_with_the_files(job, monkeypatch):
+	'''
+	The state a folder with no row comes from: a batch's copy walk of p/ could not list p/s (EIO), so the newest version holds p/s
+	and not p/s/t, whose files are in the monitored tree. Returns the versions before the next batch.
+	'''
+	from tests.harness import commit_with_a_subfolder_unlisted
 	seed_monitor(job, {'a.txt': 'a'})
-	before = _settled(job)
-	seed_monitor(job, {'d/r.txt': 'r', 'd/u.txt': 'u'})
-	path = os.path.join(job.monitor, 'd', 'u.txt')
+	_settled(job)
+	seed_monitor(job, {'p/s/t/r.txt': 'r', 'p/s/t/u.txt': 'u'})
+	versions = commit_with_a_subfolder_unlisted(job, monkeypatch, 'p/', 'p/s')
+	assert os.path.isdir(os.path.join(versions[-1], 'p', 's')) and not os.path.lexists(os.path.join(versions[-1], 'p', 's', 't'))
+	return versions
+
+
+@needs_unreadable
+def test_an_unreadable_file_under_a_folder_the_version_has_no_row_of_commits_the_folder(job, poll_fast, monkeypatch, capsys):
+	# fails on 260f399: a folder's copy walk that could not list p/s (EIO) left p/s/t out of the version, with no row. copy_path() copies
+	# it whole for an entry below it, as main does for every batch: the check never asked, dropped a batch of only an unreadable file
+	# under it, and the folder's readable file stayed out of the newest version until a readable event under it or the next full
+	# comparison
+	from tests.harness import event_entry
+	before = _a_version_lacking_the_folder_with_the_files(job, monkeypatch)
+	path = os.path.join(job.monitor, 'p', 's', 't', 'u.txt')
 	os.chmod(path, 0)
 	capsys.readouterr()
-	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'd/u.txt', 'modify')]))
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'p/s/t/u.txt', 'modify')]))
 	manifest.close()
 	assert committed is True
 	versions = committed_versions(job)
 	assert len(versions) == len(before) + 1
-	with open(os.path.join(versions[-1], 'd', 'r.txt')) as f:
+	with open(os.path.join(versions[-1], 'p', 's', 't', 'r.txt')) as f:
 		assert f.read() == 'r'
 	assert _lines(capsys, 'UNREADABLE', path) == 1
 
 
+@pytest.mark.parametrize('event, copies_the_folder', [('attrib', True), ('modify', False)], ids=['attrib', 'modify'])
+def test_a_path_gone_under_a_folder_the_version_has_no_row_of_commits_the_folder_for_an_attrib_only(job, poll_fast, monkeypatch, capsys, event, copies_the_folder):
+	# the replay's attrib branch copies an untracked folder whole before it looks at the entry, so an attrib entry whose path is gone,
+	# under a folder the newest version lacks, is a change; a create or a modify of a gone path returns at copy_path()'s lexists check,
+	# before the folder, and drops out. fails on ea4f8a3 for the attrib (the check looked at the entry first: gone, dropped)
+	from tests.harness import event_entry
+	before = _a_version_lacking_the_folder_with_the_files(job, monkeypatch)
+	os.remove(os.path.join(job.monitor, 'p', 's', 't', 'u.txt'))
+	capsys.readouterr()
+	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'p/s/t/u.txt', event)]))
+	manifest.close()
+	assert committed is True
+	versions = committed_versions(job)
+	if copies_the_folder:
+		assert len(versions) == len(before) + 1
+		with open(os.path.join(versions[-1], 'p', 's', 't', 'r.txt')) as f:
+			assert f.read() == 'r'
+	else:
+		assert versions == before
+
+
 @needs_unreadable
 def test_an_unreadable_file_under_a_folder_the_version_has_a_row_of_still_makes_no_version(job, poll_fast, capsys):
-	# pin: the folder has its row, so the check's one lookup finds it and the entry drops out as before
+	# pin: the folder is a real folder in the newest version (it has its row), so the check's one lstat of it says so and the entry drops out as before
 	from tests.harness import event_entry
 	seed_monitor(job, {'a.txt': 'a', 'd/r.txt': 'r', 'd/u.txt': 'u'})
 	before = _settled(job)
@@ -1056,9 +1091,11 @@ def test_an_unreadable_file_under_a_folder_the_version_has_a_row_of_still_makes_
 
 
 @needs_unreadable
-def test_an_unreadable_file_under_a_folder_over_a_lost_manifest_commits_as_on_main(job, poll_fast, capsys):
-	# fails on 260f399: a manifest that does not describe the newest version answers no lookup, so the folder's row cannot be asked and
-	# the entry counts as a change, as it did on main (the batch lists the version again, and its copy keeps the last copy)
+def test_an_unreadable_file_under_a_folder_over_a_lost_manifest_still_makes_no_version(job, poll_fast, capsys):
+	# fails on ea4f8a3: a manifest that does not describe the newest version answered no lookup there, so every entry under a folder
+	# counted as a change and the batch made a version that changes nothing. The check asks the newest tree: the replay's rows come
+	# from it (do_backup() lists a lost manifest from that tree before the replay), and the folder the version holds is a real folder
+	# there, so the file drops out, as on 260f399 and as with a manifest that describes the version
 	from tests.harness import event_entry
 	from tests.test_vault_units import lose_the_manifest
 	seed_monitor(job, {'a.txt': 'a', 'd/r.txt': 'r', 'd/u.txt': 'u'})
@@ -1071,9 +1108,5 @@ def test_an_unreadable_file_under_a_folder_over_a_lost_manifest_commits_as_on_ma
 	capsys.readouterr()
 	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'd/u.txt', 'modify')]))
 	manifest.close()
-	assert committed is True
-	versions = committed_versions(job)
-	assert len(versions) == len(before) + 1
-	with open(os.path.join(versions[-1], 'd', 'u.txt')) as f:
-		assert f.read() == 'u'
+	assert committed is True and committed_versions(job) == before
 	assert _lines(capsys, 'UNREADABLE', path) == 1

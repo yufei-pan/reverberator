@@ -5918,7 +5918,7 @@ def do_backup(backup_entries:dict,
 				# a batch whose every entry would leave the version as it holds it is dropped and goes on as one with none: compared at
 				# the places it touched when it came with entries, or committing no version when no comparison follows it (a batch of
 				# scanned folders, or the findings of a comparison, which are checked again)
-				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,manifest,job_vault,pool_guard,job_name,reported):
+				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,job_vault,pool_guard,job_name,reported):
 					backuperTeeLogToTl(job_name,f'Each of the {len(backup_entries)} backup entries would be left out of a version: dropping them')
 					backup_entries.clear()
 			if tree is None and backup_entries:
@@ -7889,7 +7889,7 @@ def source_readable(path:str) -> bool:
 		return False
 	return True
 
-def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str, manifest:'VaultManifest', job_vault:str, pool_guard:'PoolGuard', job_name:str, reported:set) -> bool:
+def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str, job_vault:str, pool_guard:'PoolGuard', job_name:str, reported:set) -> bool:
 	'''
 	Whether every entry of backup_entries, a batch with no tree to roll forward, would drop out of its version: the replay
 	would leave the version as it holds it, so the batch is compared as one with none (do_backup()). In three passes,
@@ -7900,13 +7900,16 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   FIFO, a socket, a device, which cp -a copies as itself). A regular file that does not open drops out, as its copy keeps
 	   the last copy (an attrib too, under Only Sync Attributes: its record cannot vouch, as its tail cannot be read, so the
 	   replay copies it); so does a path that cannot be looked at, and a path gone, which the replay passes over. Two things
-	   keep an entry in the batch though its file does not open or its link is probed: an open that fails at once with
+	   keep an entry in the batch though its file does not open, or before its link is probed: an open that fails at once with
 	   EWOULDBLOCK (BlockingIOError), as when another process holds a write lease on the file (an NFS server's delegation,
 	   Samba's oplocks), which the O_NONBLOCK open of the check cannot wait for but the blocking cp of the copy does, and
-	   the copy then backs it up; and a parent folder the manifest has no row of (copy_path()'s untracked_folder_above(): a
-	   folder the version could not make has none, and rows are made from the top down, so the parent's row says it in one
-	   lookup), as the copy then copies that folder whole. A manifest that does not describe newest_path has no say, so
-	   such an entry counts as a change too;
+	   the copy then backs it up; and a parent folder that newest_path does not hold as a real folder (one lstat of it,
+	   once per parent): the replay's rows are the newest tree's (do_backup() lists a manifest that does not describe it
+	   first), so a parent with no row is one the tree lacks, and copy_path()'s untracked_folder_above() then copies that
+	   folder whole. It comes from a folder's copy walk that cannot list a subfolder (EIO, say), which leaves that
+	   subfolder's own folders out of the version, with no rows. An attrib entry asks it before its own lstat, as the
+	   replay's attrib branch copies the folder before it looks at the entry: one that is gone or cannot be looked at counts
+	   as a change there, where a create or a modify of a gone path drops out (copy_path() returns at its lexists check first);
 	3. only when every entry is still in doubt, each symlink: it changes the version when newest_path, the newest version
 	   (the tree before the hand-over), holds an entry at its place, as leaving the link out removes that entry, and otherwise
 	   unless the vault refuses its text (link_refused_by_vault()). On a pool (pool_guard.covers(job_vault)) a symlink always
@@ -7920,25 +7923,31 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	'''
 	if any(values.event in ('delete', 'move') for values in backup_entries.values()):
 		return False
-	# whether copy_path() would copy a folder whole for the entry at path: its parent has no row ( untracked_folder_above() ). the
-	# parents found with a row are kept, as an entry's siblings share the lookup
-	tracked = set()
+	# whether copy_path() would copy a folder whole for the entry at path: its parent is no real folder in newest_path, so the replay
+	# has no row of it ( untracked_folder_above() ). the parents found real are kept, as an entry's siblings share the lstat
+	real_parents = set()
 	def under_untracked_folder(path):
 		parts = os.path.relpath(path, monitor_path).split('/')[:-1]
 		if not parts:
 			return False
-		folder = '/'.join(parts) + '/'
-		if folder in tracked:
+		parent = os.path.join(newest_path, *parts)
+		if parent in real_parents:
 			return False
-		if manifest.describes(newest_path) and manifest.lookup(folder) is not None:
-			tracked.add(folder)
-			return False
-		return True
+		try:
+			real = stat.S_ISDIR(os.lstat(parent).st_mode)
+		except OSError:
+			# the tree shows no folder there, so no row of one: the copy makes the folder
+			return True
+		if real:
+			real_parents.add(parent)
+		return not real
 	# the lines the drop-outs get, written once every entry is known to drop out
 	lines = []
 	links = []
-	for key in backup_entries:
+	for key, values in backup_entries.items():
 		path = key.rstrip('/')
+		if values.event == 'attrib' and under_untracked_folder(path):
+			return False
 		try:
 			mode = os.lstat(path).st_mode
 		except (FileNotFoundError, NotADirectoryError):
@@ -13829,7 +13838,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 			if manifest.lookup(folder) is None:
 				return folder
 	def copy_untracked_folder(folder_rel,mcae):
-		# a folder the version could not make once ( ENOSPC, say ) has no row: making it bare for an entry below it would
+		# a folder with no row in the version ( a folder's copy walk that cannot list a subfolder, EIO say, leaves that subfolder's own
+		# folders out of the version, with no rows ): making it bare for an entry below it would
 		# leave its other entries out of every version. its create is replayed instead, tracking and copying all of it
 		backuperTeeLogToTl(path=monitor_path,message=f'Copying {os.path.join(monitor_path,folder_rel)} whole: no row tracks it in the version')
 		return copy_path(isDir=True,monitor_path=monitor_path,source_real_path=os.path.join(monitor_path,folder_rel),source_relative_path=folder_rel,mcae=mcae)

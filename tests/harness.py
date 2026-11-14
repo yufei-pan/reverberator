@@ -366,6 +366,26 @@ def run_backup(job: JobPaths, entries=None, **kwargs) -> list:
 	return committed_versions(job)
 
 
+def commit_with_a_subfolder_unlisted(job: JobPaths, monkeypatch, folder: str, subfolder: str) -> list:
+	'''
+	One committed batch that creates folder (a path ending with /) while the copy walk's scandir of subfolder (below it) fails with EIO,
+	as a disk with a bad sector does: the version then holds subfolder, with a row, and the folders in it are in no version and have
+	no rows, whatever the monitored tree holds there (what a later batch meets). The scandir answers again afterwards.
+	'''
+	failing = os.path.abspath(os.path.join(job.monitor, subfolder)).rstrip('/')
+	broken = [True]
+	scandir = os.scandir
+	def failing_scandir(path='.'):
+		if broken[0] and os.path.abspath(path).rstrip('/') == failing:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return scandir(path)
+	monkeypatch.setattr(os, 'scandir', failing_scandir)
+	try:
+		return run_backup(job, OrderedDict([event_entry(job, folder, 'create')]))
+	finally:
+		broken[0] = False
+
+
 def vault_unit(job_vault: str) -> 'rv.VaultUnit':
 	'''
 	A unit of vault work on job_vault, as a step of the daemon opens it before its first write (rv.VaultUnit), for a test that runs

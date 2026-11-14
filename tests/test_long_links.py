@@ -387,20 +387,23 @@ def test_a_link_on_a_pool_vault_is_not_probed_and_the_batch_is_not_cleared(job, 
 
 
 def test_a_refused_link_under_a_folder_the_version_has_no_row_of_commits_the_folder(job, monkeypatch, capsys):
-	# fails on 260f399: a folder the version could not make once (ENOSPC) has no row, and the version lacks it, as here, where the folder
-	# came after the last version. copy_path() copies it whole for an entry below it, as main does for every batch: the check never
-	# asked, dropped a batch of only a link the vault refuses under it, and the folder's readable file stayed out of the newest version
+	# fails on 260f399: a folder's copy walk that could not list p/s (EIO) left p/s/t out of the version, with no row. copy_path() copies it
+	# whole for an entry below it, as main does for every batch: the check never asked, dropped a batch of only a link the vault refuses
+	# under it, and the folder's readable file stayed out of the newest version
+	from tests.harness import commit_with_a_subfolder_unlisted
 	seed_monitor(job, {'a': 'a'})
-	versions = run_backup(job)
 	run_backup(job)
-	seed_monitor(job, {'d/b': 'b'})
-	link = os.path.join(job.monitor, 'd/l')
+	run_backup(job)
+	seed_monitor(job, {'p/s/t/b': 'b'})
+	link = os.path.join(job.monitor, 'p/s/t/l')
 	os.symlink('t' * 100, link)
+	versions = commit_with_a_subfolder_unlisted(job, monkeypatch, 'p/', 'p/s')
+	assert os.path.isdir(os.path.join(versions[-1], 'p/s')) and not os.path.lexists(os.path.join(versions[-1], 'p/s/t'))
 	refuse(monkeypatch)
 	probes = refuse_the_probe(monkeypatch, job)
 	capsys.readouterr()
-	after = backup(job, ('d/l', 'create'))
+	after = backup(job, ('p/s/t/l', 'create'))
 	assert len(after) == len(versions) + 1 and probes == []
-	assert read(os.path.join(after[-1], 'd/b')) == 'b' and not os.path.lexists(os.path.join(after[-1], 'd/l'))
+	assert read(os.path.join(after[-1], 'p/s/t/b')) == 'b' and not os.path.lexists(os.path.join(after[-1], 'p/s/t/l'))
 	out = capsys.readouterr()
 	assert warned(out.out + out.err, link) == 1
