@@ -849,6 +849,19 @@ def roll_forward(job, **options):
 	assert committed is True
 
 
+def first_batch(job, info):
+	'''The daemon's first batch after its start: it reuses the start's scan (do_backup() with a vaultInfo).'''
+	_, manifest, committed = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, matched_since=time.time_ns(),
+		only_sync_attributes=False, keep_n_versions=0, backup_size_limit='0', vaultInfo=info)
+	manifest.close()
+	return committed
+
+
+def folders_numbered(job, number):
+	'''The version folders of job's vault with this number, committed or not.'''
+	return sorted(name for name in os.listdir(job.job_vault) if version_number(name) == number and os.path.isdir(os.path.join(job.job_vault, name)))
+
+
 def read_bytes(path):
 	with open(path, 'rb') as f:
 		return f.read()
@@ -1439,12 +1452,13 @@ def test_a_pool_branch_gone_as_the_orphan_is_judged_fails_the_scan_and_removes_n
 
 
 @pytest.mark.parametrize('back', [True, False], ids=['mounted-again', 'still-gone'])
-def test_a_pool_branch_gone_while_the_put_back_writes_a_link_fails_the_scan_that_a_batch_would_reuse(r_job, fake_pool, monkeypatch, back):
+def test_a_pool_branch_gone_while_the_put_back_looks_for_a_link_to_write_fails_the_scan_with_no_link_written(r_job, fake_pool, monkeypatch, back):
 	# RR-C2-1: version n's own copy of a recorded name is real on branch c, and c goes as put_back_forward_links() looks at the name: through
-	# the pool nothing is there, and a link to the tree's copy is written. Nothing checks the pool when nothing is removed, the scan
-	# returns, the job waits for c, and the first batch, which reuses the scan and makes its own guard once c is back, would commit with the
-	# link in c's real entry's place: version n restores as the newer bytes. The scan's last act checks the pool, so it fails with
-	# PoolNotReady (c mounted again meanwhile, or still out) and no batch gets the view. Fails on 065fa15: the scan returns
+	# the pool nothing is there, and a link to the tree's copy is due. Written, it stays when the scan then fails (the end check): a restore run
+	# by hand while c is out follows it to the cut batch's bytes, and a first batch that reused a scan which returned, with its own guard made
+	# once c is back, would commit it in c's real entry's place (version n restored as the newer bytes). The put-back judges which links are due
+	# first and checks the pool before the first one is written: PoolNotReady (c mounted again meanwhile, or still out) and no link written.
+	# Fails on f88b07b: the link is written (the scan fails after it, at its end)
 	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
 	put_text(r_job.monitor, 'd/other.txt', 'o0')
 	base(r_job)
@@ -1481,15 +1495,173 @@ def test_a_pool_branch_gone_while_the_put_back_writes_a_link_fails_the_scan_that
 		hooked.setattr(rv.os.path, 'lexists', lexists)
 		with pytest.raises(rv.PoolNotReady):
 			rv.get_vault_info(r_job.job_vault)
-	assert dropped and os.path.islink(own), 'the put-back wrote the link the scan then refused to hand over'
+	assert dropped
+	assert not os.path.lexists(own), 'the put-back wrote a link, which the scan then refused to hand over'
 	assert read_bytes(on_c) == b'i0'
-	# every disk there, c's entry shown, as the next scan sees it (it takes the link away): the batch commits both versions exact
+	# every disk there, c's entry shown, as the next scan sees it: the batch commits both versions exact
 	if not back:
 		fake_pool.mount(branches[2])
-	os.remove(own)
 	os.rename(on_c, own)
-	# the moves above are the emulation's, not a change of version n: its folder keeps its times
+	# the move above is the emulation's, not a change of version n: its folder keeps its times
 	os.utime(os.path.dirname(own), ns=(folder_times.st_atime_ns, folder_times.st_mtime_ns))
+	roll_forward(r_job)
+	versions = committed_versions(r_job)
+	assert read_bytes(os.path.join(versions[0], 'd', 'inner.txt')) == b'i0'
+	assert read_bytes(os.path.join(versions[-1], 'd', 'inner.txt')) == b'i1'
+
+
+def skeleton_beside_v0(job):
+	'''A hand-over's skeleton at V1 beside the committed V0, cut before its exchange: links naming their own place. (its path, its name)'''
+	stamp = (datetime.datetime.now().astimezone() - datetime.timedelta(hours=1)).strftime(rv.VAULT_TIMESTAMP_FORMAT)
+	name = f'V1--{stamp}'
+	skeleton = os.path.join(job.job_vault, name)
+	os.mkdir(skeleton)
+	for rel in ('small.txt', 'big.txt'):
+		os.symlink(rv.forward_text(rel, name), os.path.join(skeleton, rel))
+	return skeleton, name
+
+
+@pytest.mark.parametrize('when', ['give_back_folder_times', 'remove_orphan'])
+def test_a_pool_branch_gone_while_a_skeleton_is_removed_fails_the_scan_that_a_batch_would_reuse(r_job, fake_pool, monkeypatch, when):
+	# RR-C3-1: a disk of the pool goes after the scan took an orphan for a skeleton and before its removal is over (while the previous version's
+	# folders are given their times back, or as the rm -rf runs). Branch c holds a part of the skeleton, its link big.txt, which the removal through
+	# the pool does not reach: the scan returned no tree and no error, the job waited for c, and the first batch made a second V1 beside what c kept
+	# (every later start then fails on "two version folders ... are numbered 1" until the operator moves one). The scan checks the pool right before
+	# the removal, which covers the walk, and right after it: PoolNotReady, and with c back the next scan removes what is left, so the first batch
+	# makes the one V1. Fails on f88b07b: the scan returns, tree None
+	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
+	base(r_job)
+	skeleton, name = skeleton_beside_v0(r_job)
+	on_c = os.path.join(branches[2], r_job.job_name, name)
+	real, dropped = getattr(rv, when), []
+	def hooked(*args):
+		if not dropped:
+			dropped.append(args)
+			fake_pool.drop(branches[2])
+			# stands for the skeleton's folder and its link big.txt being on c too: through the pool c's part is gone
+			os.makedirs(on_c)
+			os.rename(os.path.join(skeleton, 'big.txt'), os.path.join(on_c, 'big.txt'))
+		return real(*args)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, when, hooked)
+		with pytest.raises(rv.PoolNotReady):
+			rv.get_vault_info(r_job.job_vault)
+	assert dropped
+	if when == 'give_back_folder_times':
+		assert os.path.isdir(skeleton), 'the check comes before the removal'
+	# c is back with its part of the skeleton
+	fake_pool.mount(branches[2])
+	if os.path.isdir(skeleton):
+		os.rename(os.path.join(on_c, 'big.txt'), os.path.join(skeleton, 'big.txt'))
+		os.rmdir(on_c)
+	else:
+		os.rename(on_c, skeleton)
+	put_text(r_job.monitor, 'small.txt', 's1')
+	info = rv.get_vault_info(r_job.job_vault)
+	assert info.tree is None and not os.path.lexists(skeleton)
+	assert first_batch(r_job, info) is True
+	assert len(folders_numbered(r_job, 1)) == 1
+	rv.get_vault_info(r_job.job_vault)
+
+
+def test_a_pool_branch_gone_while_a_skeleton_is_walked_keeps_the_folder_times_version_n_is_given_back(r_job, fake_pool, monkeypatch):
+	# RR-C3-1's other harm: version n's folder d, moved by the cut batch's renames, lives on branch c, which goes as the walk that gives the
+	# folders their times back starts. The walk does not see d, and the skeleton, which holds nothing on c, goes with no check: no later scan has
+	# a skeleton to give the times back for, and d keeps the cut batch's time for every version that follows it. The check before the removal
+	# keeps the skeleton and fails the scan, and the next one, with c back, gives d its time. Fails on f88b07b: the scan returns, d's time is wrong
+	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
+	base(r_job)
+	v0 = committed_versions(r_job)[-1]
+	right = os.lstat(os.path.join(v0, 'd')).st_mtime_ns
+	os.utime(os.path.join(v0, 'd'), ns=(right, right + 1000 * 10**9))
+	skeleton, name = skeleton_beside_v0(r_job)
+	on_c = os.path.join(branches[2], r_job.job_name, os.path.basename(v0), 'd')
+	real, dropped = rv.give_back_folder_times, []
+	def hooked(*args):
+		if not dropped:
+			dropped.append(args)
+			fake_pool.drop(branches[2])
+			# stands for d living on c: through the pool it is no more
+			os.makedirs(os.path.dirname(on_c))
+			os.rename(os.path.join(v0, 'd'), on_c)
+		return real(*args)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'give_back_folder_times', hooked)
+		with pytest.raises(rv.PoolNotReady):
+			rv.get_vault_info(r_job.job_vault)
+	assert dropped and os.path.isdir(skeleton), 'the skeleton stays for the scan that gives the times back'
+	fake_pool.mount(branches[2])
+	os.rename(on_c, os.path.join(v0, 'd'))
+	rv.get_vault_info(r_job.job_vault)
+	assert os.lstat(os.path.join(v0, 'd')).st_mtime_ns == right
+
+
+def test_a_pool_branch_gone_as_a_skeleton_in_staging_is_judged_fails_the_scan_and_renames_nothing(r_job, fake_pool, monkeypatch):
+	# a hand-over cut between its second and third renames leaves the tree under the new name and the skeleton in staging, which the scan renames
+	# into the version's place when nothing shows there: an absence through the pool, and the rename an act on it. A disk that goes as the scan looks
+	# hides what it holds (the version's folder, which only it shows), and the scan has made its guard by then. The guard is checked before the
+	# rename: PoolNotReady, the skeleton in staging and no folder at the version's place. Fails on f88b07b: the skeleton is renamed in (and the scan
+	# fails after it, at its whole read)
+	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
+	base(r_job)
+	v0 = committed_versions(r_job)[-1]
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	real_rename = os.rename
+	def cut_before_the_skeleton_goes_in(source, dest, *args, **kwargs):
+		if os.path.basename(os.fspath(source)).startswith(rv.SKELETON_PREFIX):
+			raise Cut()
+		return real_rename(source, dest, *args, **kwargs)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv.os, 'rename', cut_before_the_skeleton_goes_in)
+		with pytest.raises(Cut):
+			backup_events(r_job, [(False, 'modify', 'd/inner.txt', None)], **KEPT)
+	skeleton = os.path.join(r_job.job_vault, rv.STAGING_NAME, rv.SKELETON_PREFIX + os.path.basename(v0))
+	assert os.path.isdir(skeleton) and not os.path.lexists(v0), 'the cut state: the tree is under its new name, and its skeleton is in staging'
+	real_lexists, dropped = os.path.lexists, []
+	def lexists(path):
+		if os.fspath(path) == v0 and not dropped:
+			dropped.append(path)
+			fake_pool.drop(branches[2])
+		return real_lexists(path)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv.os.path, 'lexists', lexists)
+		with pytest.raises(rv.PoolNotReady):
+			rv.get_vault_info(r_job.job_vault)
+	assert dropped
+	assert os.path.isdir(skeleton) and not os.path.lexists(v0), 'the skeleton was renamed in on a view with a disk gone'
+	# c is back: the scan finishes the rename, and the batch rolls the tree forward with both versions exact
+	fake_pool.mount(branches[2])
+	roll_forward(r_job)
+	versions = committed_versions(r_job)
+	assert read_bytes(os.path.join(versions[0], 'd', 'inner.txt')) == b'i0'
+	assert read_bytes(os.path.join(versions[-1], 'd', 'inner.txt')) == b'i1'
+
+
+def test_a_pool_branch_gone_before_the_put_back_acts_fails_the_scan_with_the_tree_as_the_batch_left_it(r_job, fake_pool, monkeypatch):
+	# pin: pass 1 of the put-back replaces what the tree holds at each recorded name with version n's entry, on the view the walk that listed the names
+	# (give_back_folder_times()) took. A disk gone since is checked before the first act, so that scan's claim, that each act that trusts a listing is
+	# checked, holds for it too: PoolNotReady, with the tree's copy as the cut batch wrote it. Fails on f88b07b: the copy is version n's by then, and
+	# only the check at the end of the repair fails the scan
+	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
+	base(r_job)
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'd/inner.txt', None)], monkeypatch)
+	tree = tree_of(r_job)
+	held = os.path.join(tree, 'd', 'inner.txt')
+	assert read_bytes(held) == b'i1'
+	real, dropped = rv.give_back_folder_times, []
+	def walked(*args):
+		recorded = real(*args)
+		dropped.append(args)
+		fake_pool.drop(branches[2])
+		return recorded
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'give_back_folder_times', walked)
+		with pytest.raises(rv.PoolNotReady):
+			rv.get_vault_info(r_job.job_vault)
+	assert dropped
+	assert read_bytes(held) == b'i1', 'the put-back replaced the tree\'s copy on a view with a disk gone'
+	fake_pool.mount(branches[2])
 	roll_forward(r_job)
 	versions = committed_versions(r_job)
 	assert read_bytes(os.path.join(versions[0], 'd', 'inner.txt')) == b'i0'

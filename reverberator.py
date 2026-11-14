@@ -6813,7 +6813,8 @@ def put_back_recorded(previous:str, tree:str, recorded:list, remove_made:bool, g
 	changed or made there may be its own copy, which a write error some other sync saw, or a power cut, can have left wrong at its
 	right size, mtime and tail, and no later look could tell. recorded is what give_back_folder_times() returns, each folder right
 	before what is in it; previous holds version n's entry at each of those names.
-	1. Each recorded file or link: whatever the tree holds there goes, and version n's entry is linked there (link_or_copy(), a link
+	1. Before its first act the pool is checked (guard.require()), as recorded is what a walk through the pool listed: PoolNotReady, with the
+	   tree as the batch left it. Each recorded file or link: whatever the tree holds there goes, and version n's entry is linked there (link_or_copy(), a link
 	   as itself). Off a pool nothing is done where the tree holds that inode already; a pool shows an inode number of its own making,
 	   and after a cut each disk comes back at its own point, so there every one is linked again. Each recorded folder: a real folder
 	   of the tree stays; anything else there goes and a folder is made, which its entries, recorded names of their own (record()
@@ -6833,6 +6834,8 @@ def put_back_recorded(previous:str, tree:str, recorded:list, remove_made:bool, g
 	'''
 	pooled = vault_disks(tree)[0]
 	copied = changed = False
+	# recorded is what a walk through the pool listed, and pass 1 removes what the tree holds at each of its names: no act before the pool is checked
+	guard.require()
 	for rel in recorded:
 		name = rel.rstrip('/')
 		kept, held = os.path.join(previous, name), os.path.join(tree, name)
@@ -6958,11 +6961,14 @@ def remove_mixed_names(previous:str, tree:str, guard:PoolGuard) -> None:
 			remove_entry(path)
 		forget_pool_cache(tree)
 
-def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest') -> None:
+def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest', guard:PoolGuard) -> None:
 	'''
 	A cut between two renames leaves the previous version with nothing at a path whose link was moved to staging (TreeWriter.exchange_in()):
 	each row of that version under a real folder of it, with no entry there, gets its forward link again when the tree holds the entry, which
-	is unchanged, as its record never ended. The folder's time is give_back_folder_times()'s. Raises OSError.
+	is unchanged, as its record never ended. The folder's time is give_back_folder_times()'s. On a pool "no entry there" is an absence, which a
+	disk that is gone makes true of what it holds: a link written beside that entry stays when the check at the end of the repair then fails the
+	scan, and a restore run by hand while the disk is out follows it to the cut batch's bytes. So the links due are judged first, and
+	guard.require() runs before the first is written: PoolNotReady, with nothing written. Raises OSError or PoolNotReady.
 	'''
 	errors = []
 	real = {''}
@@ -6970,14 +6976,13 @@ def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest') -> 
 	if errors:
 		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
 	name = os.path.basename(os.path.normpath(tree))
-	put_back = False
-	for row in itertools.chain(manifest.iter_folders(), manifest.iter_files()):
-		rel = row.rstrip('/')
-		if os.path.dirname(rel) in real and not os.path.lexists(os.path.join(previous, rel)) and os.path.lexists(os.path.join(tree, rel)):
+	due = [rel for rel in (row.rstrip('/') for row in itertools.chain(manifest.iter_folders(), manifest.iter_files()))
+		if os.path.dirname(rel) in real and not os.path.lexists(os.path.join(previous, rel)) and os.path.lexists(os.path.join(tree, rel))]
+	if due:
+		guard.require()
+		for rel in due:
 			os.symlink(forward_text(rel, name), os.path.join(previous, rel))
-			put_back = True
-	# a pool copying the folders above a link to another disk moves their mtimes, which an lstat would not show for a second, and they go unmended
-	if put_back:
+		# a pool copying the folders above a link to another disk moves their mtimes, which an lstat would not show for a second, and they go unmended
 		forget_pool_cache(previous)
 
 def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGuard) -> list:
@@ -6994,25 +6999,27 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGua
 	version: its real folders, ending with /, its regular files and its links, each of the kind it was, of which the roll-forward
 	copies again each regular file of the monitored tree (roll_forward_entries()). Idempotent: a cut here repeats it. On a pool a
 	disk gone since the scan's whole read hides what it holds from every listing through the pool, so each act that trusts a listing
-	is checked (guard.require()): the removals of remove_mixed_names() and of put_back_recorded()'s pass 2 wait for it (R46, R45),
-	and the end of the repair is the last act, so that no link put back, nor list of what the batch recorded, reaches a batch that
-	reuses the scan unless every disk was there all along. remove_shadowed_links() reads each disk directly and removes a link only
-	beside a real entry it saw, so a disk gone makes it do less and it needs none. Raises OSError, sqlite3.Error, JobFailure or
-	PoolNotReady.
+	is checked (guard.require()) before it: the links of put_back_forward_links() are judged first and checked before the first is
+	written, the removals of remove_mixed_names() and of put_back_recorded()'s pass 2 wait for it (R46, R45), and pass 1 of the put-back
+	is checked before its first act. The times given back by give_back_folder_times() and pass 3's folder metadata are acts on what
+	a walk saw, which the next scan does again; the end of the repair is the last act, so that no list of what the batch recorded, nor
+	any of these, reaches a batch that reuses the scan unless every disk was there all along. remove_shadowed_links() reads each disk
+	directly and removes a link only beside a real entry it saw, so a disk gone makes it do less and it needs none. Raises OSError,
+	sqlite3.Error, JobFailure or PoolNotReady.
 	'''
 	previous = info.vault_info_dict[next(reversed(info.vault_info_dict))].path
 	described = manifest.describes(previous)
 	remove_shadowed_links(previous)
 	if described:
-		put_back_forward_links(previous, info.tree, manifest)
+		put_back_forward_links(previous, info.tree, manifest, guard)
 	remove_mixed_names(previous, info.tree, guard)
 	recorded = give_back_folder_times(previous, manifest)
 	if put_back_recorded(previous, info.tree, recorded, described, guard):
 		job_vault = os.path.dirname(os.path.normpath(previous))
 		flush_or_fail(job_vault, os.path.basename(job_vault), f'{info.tree} is not made ready for its roll-forward; the next attempt puts it back again')
-	# every step above read the previous version through the pool, where a disk gone since the whole read hides what it holds: a link
-	# put back beside an entry it hides, a short list of what the batch recorded. The scan's result is used by a batch whose own guard
-	# begins after the disk is back, so the check is here: with every disk there all along, the view stood (as read_vault_whole() does)
+	# every step above read the previous version through the pool, where a disk gone since the whole read hides what it holds: a short
+	# list of what the batch recorded, folders not given their times. The scan's result is used by a batch whose own guard begins after
+	# the disk is back, so the check is here: with every disk there all along, the view stood (as read_vault_whole() does)
 	guard.require()
 	return recorded
 
@@ -7218,11 +7225,13 @@ def version_without_folder(job_vault:str) -> 'str | None':
 	wanting = [parsed for parsed in map(parse_change_list_name, names) if parsed is not None and parsed[1] not in names]
 	return max(wanting)[1] if wanting else None
 
-def finish_tree_rename(job_vault:str, name:str) -> bool:
+def finish_tree_rename(job_vault:str, name:str, guard:PoolGuard) -> bool:
 	'''
 	The rename of the tree of the version in folder name to its new name may be on one disk and not on another, as each comes back from a cut at its own
 	last checkpoint. Each disk whose folder under the old name holds more than the links of a skeleton has it renamed there, directly on the disk. A
-	skeleton's own rename came after a flush, so it never meets a tree cut half way. A new version with its change list is committed: a skeleton left beside it is stale, and nothing is renamed. Whether a disk changed. Raises OSError.
+	skeleton's own rename came after a flush, so it never meets a tree cut half way. A new version with its change list is committed: a skeleton left beside it is stale, and nothing is renamed.
+	That a new version has no list is an absence through the pool, which a disk that is gone makes true of the list it holds, so guard.require() runs before each rename:
+	PoolNotReady, with nothing renamed after it. Whether a disk changed. Raises OSError or PoolNotReady.
 	'''
 	number = vault_version_number(name)
 	listed = os.listdir(job_vault)
@@ -7236,6 +7245,7 @@ def finish_tree_rename(job_vault:str, name:str) -> bool:
 		with os.scandir(folder) as entries:
 			held = [entry for entry in entries]
 		if held and not all(entry.is_symlink() and forwards_to_version(entry.path, entry.name, number + 1) for entry in held):
+			guard.require()
 			os.rename(folder, os.path.join(branch, new_names[0]))
 			changed.append(branch)
 	on_vault_branches(job_vault, finish)
@@ -7251,13 +7261,14 @@ def version_being_converted(job_vault:str, manifest:'VaultManifest') -> 'str | N
 	return max(waiting, key=vault_version_number) if waiting else version_without_folder(job_vault)
 
 # goes with the 0.54 reader
-def finish_conversion_renames(job_vault:str, manifest:'VaultManifest', names:list) -> bool:
+def finish_conversion_renames(job_vault:str, manifest:'VaultManifest', names:list, guard:PoolGuard) -> bool:
 	'''
 	What a conversion's renames left, names being what staging shows (materialize_version()), directly on each disk, as a rename may be on one and not on another:
 	- the old tree out on a disk or more and the tree not yet known to be out of all of them (CONVERTED_NAME shows, or the version shows no folder): it goes back, and the version is converted again;
 	- the converted tree ready (READY_NAME): it goes in, under the version's name, as the old tree is out on every disk. On its way it may be on either side.
 	  With no old tree beside it and the version showing it is a leftover of the first case, whose removal was cut off, and it goes with staging.
-	Whether anything moved. Raises OSError.
+	Which of them to do is read through the pool (what staging shows, whether the version's folder does), where a disk that is gone hides what it holds, so
+	guard.require() runs before the first rename: PoolNotReady, with nothing renamed. Whether anything moved. Raises OSError or PoolNotReady.
 	'''
 	going_in = READY_NAME in names and CONVERTED_NAME not in names
 	source = READY_NAME if going_in else REPLACED_NAME
@@ -7271,11 +7282,12 @@ def finish_conversion_renames(job_vault:str, manifest:'VaultManifest', names:lis
 		staged = os.path.join(staging_path(branch), source)
 		if os.path.lexists(staged):
 			os.rename(staged, os.path.join(branch, name))
+	guard.require()
 	on_vault_branches(job_vault, finish)
 	forget_pool_cache(job_vault)
 	return True
 
-def repair_pool_vault(job_vault:str, manifest:'VaultManifest') -> None:
+def repair_pool_vault(job_vault:str, manifest:'VaultManifest', guard:PoolGuard) -> None:
 	'''
 	What a cut between two renames left, before the vault is read, as a version then has a list and no folder (spec section 5):
 	- a hand-over's tree still under its old name on a disk gets its new name there (finish_tree_rename()), and every disk is flushed;
@@ -7283,7 +7295,9 @@ def repair_pool_vault(job_vault:str, manifest:'VaultManifest') -> None:
 	- a conversion's renames, on a vault still being converted, are finished one way or the other (finish_conversion_renames()), as one tree is built at
 	  a time. A vault on design R has no such tree: a list with no folder there is a prune's.
 	Anything else in staging goes as usual, a skeleton whose version stands among it. Then every disk is flushed. Run again it changes nothing.
-	Raises OSError, or JobFailure when a flush fails.
+	Each rename is judged by a listing through the pool, which a disk that is gone hides what it holds from, and so is checked first (guard.require(), the
+	scan's own guard, made before this runs): PoolNotReady, with nothing renamed after the disk went; a rename a disk got before is a cut's state, which
+	the next scan finishes. Raises OSError, PoolNotReady, or JobFailure when a flush fails.
 	'''
 	staging = staging_path(job_vault)
 	try:
@@ -7294,14 +7308,15 @@ def repair_pool_vault(job_vault:str, manifest:'VaultManifest') -> None:
 	stopped = f'the scan of {job_vault} stops here; the next attempt goes on with it'
 	for name in names:
 		version = os.path.join(job_vault, name.removeprefix(SKELETON_PREFIX))
-		if name.startswith(SKELETON_PREFIX) and os.path.lexists(version) and finish_tree_rename(job_vault, name.removeprefix(SKELETON_PREFIX)):
+		if name.startswith(SKELETON_PREFIX) and os.path.lexists(version) and finish_tree_rename(job_vault, name.removeprefix(SKELETON_PREFIX), guard):
 			flush_or_fail(job_vault, os.path.basename(job_vault), stopped)
 		if name.startswith(SKELETON_PREFIX) and not os.path.lexists(version):
+			guard.require()
 			st = os.lstat(os.path.join(staging, name))
 			os.rename(os.path.join(staging, name), version)
 			os.utime(version, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
 			repaired = True
-	if manifest.layout() != 'r' and finish_conversion_renames(job_vault, manifest, names):
+	if manifest.layout() != 'r' and finish_conversion_renames(job_vault, manifest, names, guard):
 		repaired = True
 	if repaired:
 		flush_or_fail(job_vault, os.path.basename(job_vault), stopped)
@@ -7313,8 +7328,11 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	names is finished. Then the private list folders and staging are emptied. Of the one orphan there may be, at the one
 	after the newest version: a skeleton, empty or holding only links that name their own place (is_skeleton()), goes, with
 	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
-	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt; on a
-	pool the scan checks it after judging the orphan, before anything goes, and again as the tree's repair ends. A lone V0 orphan goes. Any other orphan is an error, before
+	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt. On a
+	pool the scan checks the pool before the skeleton goes (which covers the judgement and the walk that gives the folder times back) and right
+	after, and before every act of the tree's repair that trusts a listing (the staging repair, repair_pool_vault(), first), the last being the
+	end of prepare_roll_forward(): a batch that reuses the scan, with a guard of its own made once every disk is back, never gets the view of a
+	scan taken with a disk gone. A lone V0 orphan goes. Any other orphan is an error, before
 	anything is removed. A lost manifest names nothing: its private list goes, and the orphan is judged the same way, so a cut tree stays.
 	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54. A vault with no version and no orphan
 	is one started over: the manifest's version is forgotten (a conversion begun is no more to finish), and the next batch is V0.
@@ -7323,7 +7341,7 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	'''
 	guard = PoolGuard([job_vault])
 	try:
-		repair_pool_vault(job_vault, manifest)
+		repair_pool_vault(job_vault, manifest, guard)
 	except OSError as e:
 		raise VaultScanError(f'cannot finish a cut rename in {job_vault}: {e}')
 	listing = read_vault_whole(job_vault, guard, judge_orphans=False)
@@ -7367,9 +7385,6 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 				tree = orphan
 		except OSError as e:
 			raise VaultScanError(f'cannot read {orphan}, nothing in the vault is removed: {e}')
-		# the judgement above is an absence (no real entry shows) on a view taken after the whole read: a disk gone meanwhile hides what
-		# the tree holds, and the skeleton's removal below, or the next batch beside a tree taken for none, would act on it
-		guard.require()
 	remove_unfinished_change_lists(job_vault, listing)
 	empty_staging(job_vault)
 	if manifest.layout() == 'r':
@@ -7380,7 +7395,14 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 				give_back_folder_times(listing.versions[newest].path, manifest)
 			except OSError as e:
 				raise VaultScanError(f'cannot give back the folder times of {listing.versions[newest].path}: {e}')
+		# the judgement above (no real entry shows) and the walk that gave the folder times back are views taken after the whole read: a disk
+		# gone meanwhile hides what the tree holds, which the removal would take for nothing (or the tree itself, when the disk is back before
+		# the rm -rf), and folders it holds would keep the cut batch's times. So the check comes before the removal, and the skeleton stays
+		# for the next scan; and after it, as a disk that goes during the rm -rf keeps its part, which a batch would make a second version
+		# folder of the same number beside (every later start then fails on it until a person moves one)
+		guard.require()
 		why = remove_orphan(job_vault, skeleton)
+		guard.require()
 		if why is not None:
 			raise VaultScanError(f'cannot remove the incomplete version {skeleton} ({why}), and a backup would make a version of its number beside it')
 	remove_stale_change_lists(job_vault, listing, guard)

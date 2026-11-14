@@ -247,7 +247,7 @@ def test_a_missing_row_under_a_real_folder_gets_its_link_back(tmp_path, fake_poo
 		# no row of this version, and no entry of the tree: nothing to put back
 		with open(os.path.join(tree, 'new'), 'w') as f:
 			f.write('new')
-		rv.put_back_forward_links(newest.path, tree, manifest)
+		rv.put_back_forward_links(newest.path, tree, manifest, rv.PoolGuard([job.job_vault]))
 		rv.give_back_folder_times(newest.path, manifest)
 	finally:
 		manifest.close()
@@ -305,12 +305,12 @@ def test_a_skeleton_in_staging_is_finished(tmp_path, fake_pool, flushes):
 	del flushes[:]
 	manifest = rv.VaultManifest(job_vault)
 	try:
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 		assert not os.path.lexists(skeleton)
 		assert read_view(job_vault, V1) == before
 		assert flushes == [1]
 		# run again it changes nothing
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 		assert flushes == [1]
 	finally:
 		manifest.close()
@@ -324,12 +324,33 @@ def test_a_tree_renamed_on_one_disk_only_gets_its_name_on_the_other(split_vault,
 	on_disk(b, f'{V1}/there/x')
 	manifest = rv.VaultManifest(job_vault)
 	try:
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 	finally:
 		manifest.close()
 	assert os.path.isfile(os.path.join(a, V2, 'here')) and os.path.isfile(os.path.join(b, V2, 'there/x'))
 	assert not os.path.lexists(os.path.join(b, V1))
 	assert flushes
+
+
+def test_a_disk_gone_before_a_tree_is_renamed_fails_the_repair_and_renames_nothing(split_vault, fake_pool, flushes):
+	# the repair judges by a listing through the pool (a new version with no change list, which a disk that is gone makes true of the list it
+	# holds) and renames on each disk directly: the scan's guard is checked before each rename. Disk a goes after the guard is made and before the
+	# rename on b: PoolNotReady, and b's folder still has the old name. Fails when the check comes after the rename (b's tree is under its new name)
+	job_vault, newest, a, b = split_vault
+	os.mkdir(os.path.join(job_vault, V2))
+	os.makedirs(os.path.join(job_vault, rv.STAGING_NAME, rv.SKELETON_PREFIX + V1))
+	on_disk(a, f'{V2}/here')
+	on_disk(b, f'{V1}/there/x')
+	manifest = rv.VaultManifest(job_vault)
+	try:
+		guard = rv.PoolGuard([job_vault])
+		fake_pool.drop(a)
+		with pytest.raises(rv.PoolNotReady):
+			rv.repair_pool_vault(job_vault, manifest, guard)
+	finally:
+		manifest.close()
+	assert os.path.isfile(os.path.join(b, V1, 'there/x')) and not os.path.lexists(os.path.join(b, V2))
+	assert not flushes
 
 
 def test_a_skeleton_on_its_way_in_is_no_tree(split_vault, flushes):
@@ -338,14 +359,14 @@ def test_a_skeleton_on_its_way_in_is_no_tree(split_vault, flushes):
 	os.mkdir(os.path.join(job_vault, V2))
 	os.makedirs(os.path.join(job_vault, rv.STAGING_NAME, rv.SKELETON_PREFIX + V1))
 	link = link_on_disk(a, 'g')
-	assert rv.finish_tree_rename(job_vault, V1) is False
+	assert rv.finish_tree_rename(job_vault, V1, rv.PoolGuard([job_vault])) is False
 	assert os.path.islink(link)
 
 
 def test_no_new_folder_means_no_tree_to_rename(split_vault):
 	job_vault, newest, a, b = split_vault
 	on_disk(b, f'{V1}/there/x')
-	assert rv.finish_tree_rename(job_vault, V1) is False
+	assert rv.finish_tree_rename(job_vault, V1, rv.PoolGuard([job_vault])) is False
 	assert os.path.isfile(os.path.join(b, V1, 'there/x'))
 
 
@@ -367,7 +388,7 @@ def test_a_skeleton_left_beside_a_committed_version_is_no_tree_to_rename(tmp_pat
 		pass
 	manifest = rv.VaultManifest(job_vault)
 	try:
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 	finally:
 		manifest.close()
 	assert os.path.isfile(os.path.join(b, V1, 'old-record'))
@@ -403,7 +424,7 @@ def test_a_cut_migration_is_renamed_into_place(tmp_path, flushes):
 		manifest.begin()
 		manifest.begin_migration({V1: [1, 2]})
 		manifest.commit()
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 	finally:
 		manifest.close()
 	assert os.path.isfile(os.path.join(newest, 'g'))
@@ -418,11 +439,30 @@ def test_a_ready_tree_goes_in_on_each_disk(tmp_path, fake_pool, flushes):
 		on_disk(a, f'{V1}/landed')
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.READY_NAME}/waiting')
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.REPLACED_NAME}/old')
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 	finally:
 		manifest.close()
 	assert os.path.isfile(os.path.join(a, V1, 'landed')) and os.path.isfile(os.path.join(b, V1, 'waiting'))
 	assert os.path.isfile(os.path.join(b, rv.STAGING_NAME, rv.REPLACED_NAME, 'old'))
+
+
+def test_a_disk_gone_before_a_conversion_is_renamed_fails_the_repair_and_renames_nothing(tmp_path, fake_pool, flushes):
+	# a conversion's renames are judged by what staging shows through the pool, then made on each disk: the guard is checked before the first.
+	# Fails when the check comes after the renames (b's ready tree is in)
+	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
+	try:
+		conversion_in_staging(job_vault, {rv.READY_NAME: 'x', rv.REPLACED_NAME: 'x'})
+		on_disk(a, f'{V1}/landed')
+		on_disk(b, f'{rv.STAGING_NAME}/{rv.READY_NAME}/waiting')
+		on_disk(b, f'{rv.STAGING_NAME}/{rv.REPLACED_NAME}/old')
+		guard = rv.PoolGuard([job_vault])
+		fake_pool.drop(a)
+		with pytest.raises(rv.PoolNotReady):
+			rv.repair_pool_vault(job_vault, manifest, guard)
+	finally:
+		manifest.close()
+	assert os.path.isfile(os.path.join(b, rv.STAGING_NAME, rv.READY_NAME, 'waiting')) and not os.path.lexists(os.path.join(b, V1, 'waiting'))
+	assert not flushes
 
 
 def test_an_old_tree_out_on_one_disk_only_comes_back(tmp_path, fake_pool, flushes):
@@ -433,7 +473,7 @@ def test_an_old_tree_out_on_one_disk_only_comes_back(tmp_path, fake_pool, flushe
 		on_disk(a, f'{V1}/stayed')
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.REPLACED_NAME}/left')
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.CONVERTED_NAME}/built')
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 	finally:
 		manifest.close()
 	assert os.path.isfile(os.path.join(a, V1, 'stayed')) and os.path.isfile(os.path.join(b, V1, 'left'))
@@ -445,7 +485,7 @@ def test_a_conversion_whose_tree_is_in_leaves_the_old_one_to_staging(tmp_path, f
 	try:
 		conversion_in_staging(job_vault, {rv.REPLACED_NAME: 'x'})
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.REPLACED_NAME}/old')
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 	finally:
 		manifest.close()
 	assert flushes == []
@@ -492,7 +532,7 @@ def test_a_conversion_split_in_the_middle_goes_back(tmp_path, fake_pool, flushes
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.READY_NAME}/built')
 		on_disk(a, f'{rv.STAGING_NAME}/{rv.REPLACED_NAME}/left-a')
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.REPLACED_NAME}/left-b')
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 	finally:
 		manifest.close()
 	assert os.path.isfile(os.path.join(a, V1, 'left-a')) and os.path.isfile(os.path.join(b, V1, 'left-b'))
@@ -506,8 +546,8 @@ def test_a_lone_ready_tree_beside_the_version_is_a_leftover(tmp_path, fake_pool,
 		conversion_in_staging(job_vault, {rv.READY_NAME: 'x'})
 		on_disk(a, f'{V1}/whole')
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.READY_NAME}/half')
-		rv.repair_pool_vault(job_vault, manifest)
-		assert rv.finish_conversion_renames(job_vault, manifest, [rv.READY_NAME]) is False
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
+		assert rv.finish_conversion_renames(job_vault, manifest, [rv.READY_NAME], rv.PoolGuard([job_vault])) is False
 	finally:
 		manifest.close()
 	assert os.path.isfile(os.path.join(a, V1, 'whole')) and os.path.isfile(os.path.join(b, rv.STAGING_NAME, rv.READY_NAME, 'half'))
@@ -523,7 +563,7 @@ def test_a_lone_ready_tree_with_the_version_gone_goes_in(tmp_path, fake_pool, fl
 		conversion_in_staging(job_vault, {rv.READY_NAME: 'x'})
 		on_disk(a, f'{rv.STAGING_NAME}/{rv.READY_NAME}/here')
 		on_disk(b, f'{rv.STAGING_NAME}/{rv.READY_NAME}/there')
-		rv.repair_pool_vault(job_vault, manifest)
+		rv.repair_pool_vault(job_vault, manifest, rv.PoolGuard([job_vault]))
 	finally:
 		manifest.close()
 	assert os.path.isfile(os.path.join(a, V1, 'here')) and os.path.isfile(os.path.join(b, V1, 'there'))
