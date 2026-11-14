@@ -7329,10 +7329,12 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	after the newest version: a skeleton, empty or holding only links that name their own place (is_skeleton()), goes, with
 	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
 	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt. On a
-	pool the scan checks the pool before the skeleton goes (which covers the judgement and the walk that gives the folder times back) and right
-	after, and before every act of the tree's repair that trusts a listing (the staging repair, repair_pool_vault(), first), the last being the
-	end of prepare_roll_forward(): a batch that reuses the scan, with a guard of its own made once every disk is back, never gets the view of a
-	scan taken with a disk gone. A lone V0 orphan goes. Any other orphan is an error, before
+	pool the scan checks the pool before each act that a listing through it decides, as a disk gone makes an absence true: the staging
+	repair's renames (repair_pool_vault(), for any vault with leftovers in staging), the skeleton's removal, right before it (which covers the
+	judgement and the walk that gives the folder times back) and right after, and the tree's repair, whose last check is at the end of
+	prepare_roll_forward(): a batch that reuses the scan, with a guard of its own made once every disk is back, never gets the view of a
+	scan taken with a disk gone. What goes by its name alone (the private list folders, staging once repaired, the 0.54 files) is garbage
+	whatever the pool shows, and goes unchecked. A lone V0 orphan goes. Any other orphan is an error, before
 	anything is removed. A lost manifest names nothing: its private list goes, and the orphan is judged the same way, so a cut tree stays.
 	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54. A vault with no version and no orphan
 	is one started over: the manifest's version is forgotten (a conversion begun is no more to finish), and the next batch is V0.
