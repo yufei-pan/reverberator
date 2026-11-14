@@ -20,6 +20,40 @@ Q5 and the closed list.
   introduce more efficient methods if that reduces usage for users that do not need to manually browse the folders and
   do not need to able to copy out entire versions from the backup store"
 
+## Standing decisions
+
+The user's rulings on how the project is worked, as opposed to what gets built. A line changes only on the user's word.
+- Questions go to the user through the question tool, with choices: "why are you not asking me questions via the
+  tool?" (2026-10-18).
+- While the user is away, work goes on and questions wait for their return: "good night. please continue working and
+  ask me questions when I am back" (2026-11-04); "keep working until I ask you for questions thanks." (2026-11-07).
+- Work happens in a worktree, never in the checkout the live service runs from: "Separate worktree (Recommended)"
+  (2026-10-18).
+- Each release is merged and rolled out on the user's pick for it; the agent restarts the live service by the runbook
+  (rule-file backup, restart, health check): "I restart it with the runbook (Recommended)" (2026-10-23), the latest
+  "Roll out now (Recommended)" (2026-11-14). Twice the pick let a release roll out when green without waiting
+  ("Merge, restart, then push (Recommended)", 2026-11-07, for 0.55.1; "Roll it out when green", 2026-11-10, for the
+  flush round).
+- The repo is public: no private hosts, paths, job names or disk details in tracked files or commit messages, and a
+  scrub check of the new commits before every push; the user's name and email stay. Their words: "yeah maybe let's
+  also scrub the personally identifiable information from the repo" and "you can note my name and that email is public
+  so it is fine to keep." (2026-11-05); "Scrub first, then push (Recommended)" (2026-11-06); "Push after scrub
+  (Recommended)" (2026-11-14).
+- Main is pushed after a healthy restart onto it: "Push after a healthy restart (Recommended)" (2026-10-28).
+- The suite runs in parallel: "yeah set up pytest-xdist so the suite runs in parallel" (2026-11-05).
+- pytest never runs as root on the host (a hook the user approved on 2026-11-08); root, loop and mount tests run in
+  reverberator's own test VM: "A test VM of its own (Recommended)" (2026-11-09).
+- The test VM is stopped and cleaned up after a run once it is not needed: "maybe shutdown / clean after your stuff when
+  you do not need it anymore" (2026-11-09). It has 8 GB guaranteed, growing to 16 GB while the host has room: "for vm,
+  can we set ballooning memory?" and "Balloon 8–16 GB (Recommended)" (2026-11-11).
+- Parallel test runs follow a headroom rule: another capped run starts while at least 8 GB would still be free after it
+  and memory pressure (full avg60) is under 5; under 5 GB free, or at 5, the newest run stops and goes back in the
+  queue. Their words: "maybe let's dynamically adjust how parallel we run stuff?" and "Headroom rule (Recommended)"
+  (2026-11-11).
+- Release gates include the mergerfs and power-loss tests: "Bring both back (Recommended)" (2026-11-08).
+- A cold measurement comes from the live backups after a deploy, not from flushing the host's page cache: "Use the live
+  backups (Recommended)" (2026-11-03).
+
 ## Open parts
 
 **P1. The deferred entries of `docs/limitations.md`.** Source: the 17 entries whose kind is deferred. State: not
