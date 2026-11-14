@@ -5962,7 +5962,7 @@ def do_backup(backup_entries:dict,
 				else:
 					# events that cancel out in the collapse ( a file replaced, then deleted ) can still have changed the
 					# tree: what they touched is compared, and what differs is replayed and verified as a batch is
-					backuperTeeLogToTl(job_name,'The batch collapsed to no backup entries, comparing the places it touched with the vault')
+					backuperTeeLogToTl(job_name,'The batch has no backup entries left, comparing the places it touched with the vault')
 				delta_generate_backup_entries(backupEntries=backup_entries,latest_version_info=latest_version_info,monitor_path=monitor_path,manifest=manifest,skip_list=skip_list,job_name=job_name,reported=reported,
 					scope_rel='' if touched is None else touched,paused=paused,pool_guard=pool_guard,changed_since_wall=full_comparison_since(vault_info_dict,manifest.matched))
 				if not GREEN_LIGHT.is_set():
@@ -14096,8 +14096,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 				# the names they were made for before those rows move
 				wait_for_async_commands(mcae)
 				# the rows move only once the version's rename is made. a row the version already held keeps its record, as the
-				# inode keeps its bytes, and a row this batch wrote is read back at its new place: every way out of this branch
-				# leaves rows that describe what the version holds
+				# inode keeps its bytes, and a row this batch wrote is read back at its new place. a way out before TreeWriter.rename()
+				# removed the target leaves the rows as the version holds them. after it, an os.rename error other than ENOENT leaves the
+				# target's rows, which the version no longer holds: the copy fallback replaces them when it copies, and otherwise the
+				# batch's touched-scope verification compares them with the monitored tree
 				link_source_backup_real_path = os.path.join(backup_folder,link_source_relative_path)
 				link_target_backup_real_path = os.path.join(backup_folder,link_target_relative_path)
 				if link_target_relative_path.startswith(link_source_relative_path.rstrip('/') + '/'):
