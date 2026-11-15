@@ -61,8 +61,9 @@ The user's rulings on how the project is worked, as opposed to what gets built. 
 (`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
 (2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports
 are in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
-corrected, 4 rejected with reasons in its commits). Its questions are Q9 to Q15 below. Next: the plan, on the
-recommended options; no building before the questions and P7's readings, by chief's order of 2026-11-15. Behind it: a deferral is planned work; the user's pick 2026-11-14,
+corrected, 4 rejected with reasons in its commits). Its questions are Q9 to Q15 below. Now: a fresh agent writes the plan
+(`plans/2026-11-15-r0556.md`, committed as it goes) on the recommended options, marking the tasks an answer would change.
+No building before the questions and P7's readings, by chief's order of 2026-11-15. Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
