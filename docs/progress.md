@@ -69,11 +69,9 @@ decisions, the rest are below. The plan is written
 (`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a table at its top and a [Q<n>] mark on each
 task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (the healing test) runs second so Q15
 can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
-stays as written). Next: building, by subagent-driven development, on the recommended options: chief said to build
-meanwhile while it asks the user Q9, Q13 and Q14 (2026-11-15). Whether that lifts chief's earlier order of the same day
-(the spec, its questions and that night's P7 readings before any building) is asked of chief: until it answers, building
-waits for P7's 24-hour reading (2026-11-15 23:01 PST), because the worktree sits in the busiest job's tree and a build
-there adds to the writes it measures. Behind it: a deferral is planned work; the user's pick 2026-11-14,
+stays as written). Next: building, by subagent-driven development, on the recommended options while chief asks the
+user Q9, Q13 and Q14, once P7's 24-hour reading is in (2026-11-15 23:01 PST) (chief's decision,
+2026-11-15). Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
