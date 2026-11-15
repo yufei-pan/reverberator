@@ -64,13 +64,13 @@ limits are kept outside this public repo, in the agent's private notes beside it
 (`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
 (2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports
 are in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
-corrected, 4 rejected with reasons in its commits). Its questions were Q9 to Q15: Q10 to Q12 are closed by chief's
-decisions, the rest are below. The plan is written
+corrected, 4 rejected with reasons in its commits). Its questions were Q9 to Q15: Q9 to Q14 are closed (the user's picks and
+chief's decisions), Q15 is below. The plan is written
 (`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a table at its top and a [Q<n>] mark on each
 task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (the healing test) runs second so Q15
 can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
-stays as written). Next: building, by subagent-driven development, on the recommended options while chief asks the
-user Q9, Q13 and Q14, once P7's 24-hour reading is in (2026-11-15 23:01 PST) (chief's decision,
+stays as written). Next: building, by subagent-driven development, on the recommended options, which Q9 to Q14's
+answers all took, once P7's 24-hour reading is in (2026-11-15 23:01 PST) (chief's decision,
 2026-11-15). Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
@@ -181,40 +181,11 @@ it: the main session's call (2026-11-14).
 ## Questions waiting for the user
 
 Round 0.55.6's questions, from its spec (`specs/2026-11-14-r0556-design.md` section 26, 1e96eeb, where each is written
-out at length). Q9, Q13 and Q14 are with the user: chief asks them and sends the answers (2026-11-15); chief decided
-Q10 to Q12 (Closed). Q15 waits for the healing test's results. What waits on each: its
+out at length). Q9 to Q14 are closed: the user answered Q9, Q13 and Q14, and chief decided Q10 to Q12 (2026-11-15).
+Q15 waits for the healing test's results. What waits on it: its
 `docs/limitations.md` entry and, for an option other than the recommended one, the part it adds to the plan. The plan
-is written on the recommended options and marks the tasks an answer would change. Each recommended known limitation
-here leaves a wrong result, which the ladder calls always worth fixing: picking it overrides the ladder.
+is written on the recommended options and marks the tasks an answer would change.
 
-- **Q9. A file whose read fails only before its last 64 KiB** (D1's rest). The operator sees: when it is the only
-  change of a batch or a full comparison, one version that changes nothing at each full comparison and each batch of its
-  events, with its UNREADABLE alert; under Keep N each pushes the oldest real version out. The round fixes the rest of
-  the entry (a file whose tail fails). Why not fix: a whole-file read at the check (a second read of the first file of
-  every batch, uncached for a large one), or a take-back at the commit path, the rollback path the user declined on
-  2026-11-13: "Accept the race (Recommended)", over "undoing the version after the copy instead of checking before,
-  which adds a rollback path". Revisit when: one file's UNREADABLE alert repeats at full comparisons and `history`
-  shows a new version each time. Drops: "Fixes round (Recommended)" (2026-11-14) put this entry's fix in the round.
-  - (a) A known limitation (Recommended).
-  - (b) The whole-file read at the check.
-  - (c) Keep it deferred: the take-back designed in a round of its own.
-- **Q13. A name a network filesystem lists but cannot look up, in a batch's scopes** (D13's scope half). The operator
-  sees: on CIFS or sshfs with such name trouble, a batch whose events name that very path takes it as deleted: the new
-  version lacks it and all under it, with no line; older versions keep it. The watcher's half and the whole-tree walk
-  are fixed in the round. Why not fix: the fix lists the parent of every path a batch finds gone, on every delete's path
-  (about 8 ms a batch in a folder of 100,000 names, about 0.1 ms in one of 1,000). Revisit when: a job monitors a CIFS
-  or sshfs mount. The user's words: "Fixes round (Recommended)" (2026-11-14) put the entry in the round; on another
-  rare case (2026-10-26): "if unable to do this cleanly I think it also make sense to put as limitations".
-  - (a) A known limitation, the watcher's half built (Recommended).
-  - (b) The parent-listing rule in the scope walks.
-- **Q14. A restore target that cannot be locked (NFS)** (P17's one case left). The operator sees: two restores run at
-  once into one NFS folder both run, where on a local disk the second is refused; two different versions restored there
-  leave files of both, each saying done. Why not fix: it needs a second kind of lock (a POSIX lock on a lock file in the
-  target) for two runs into one NFS folder at once. Revisit when: restores into an NFS folder are run side by side. The
-  user's words: the round's option (2026-11-14), "I'd also check the four names-chains notes myself and come back only
-  for any I'd leave as limitations"; this is the one.
-  - (a) A known limitation, with one README line (Recommended).
-  - (b) A POSIX lock on a lock file in the target where flock fails.
 - **Q15. A folder metadata copy that fails once and does not heal** (P16 step 2; asked only with the healing test's
   results, for each case it finds not healing; reasoned: the source's own extended attributes). The operator sees: the
   folder keeps wrong extended attributes in every later version until its metadata is copied again for another reason.
@@ -264,6 +235,18 @@ Kept so they are not lost; none is planned until the user picks it.
   decision, 2026-11-15, on the user's words on a rare case, "if unable to do this cleanly I think it also make sense to
   put as limitations" (2026-10-26): both fixes add a walk, or a part with its own state, for a three-way coincidence. The
   entry's approved field says "chief's decision, 2026-11-15".
+- Q9, a file whose read fails only before its last 64 KiB (D1's rest): (a), a known limitation; the round still fixes
+  the tail half. The user's pick 2026-11-15 (about 01:37 PST, through chief), "Known limitation (Recommended)", shown
+  that it leaves a wrong result the rules call always worth fixing and that "Fixes round (Recommended)" (2026-11-14)
+  had put the fix in the round. Revisit when one file's UNREADABLE alert repeats at full comparisons and `history`
+  shows a new version each time.
+- Q13, a name CIFS or sshfs lists but cannot look up, in a batch's scopes (D13's scope half): (a), a known limitation,
+  with the watcher's half and the whole-tree walk built. The user's pick 2026-11-15 (through chief), "Known limitation
+  (Recommended)", shown that "Fixes round (Recommended)" had it in the round. Revisit when a job monitors a CIFS or
+  sshfs mount.
+- Q14, two restores at once into one NFS folder (P17's one case left): (a), a known limitation with one README line.
+  The user's pick 2026-11-15 (through chief), "Known limitation (Recommended)". Revisit when restores into an NFS
+  folder are run side by side.
 - `mv q a; rm a` (the round 13 spec, left "for the user"): Not an issue, the user's pick 2026-11-14, "Not an issue
   (Recommended)": the check after every batch removes the old file; the test comment says so.
 - P9, one pass over the watches per folder move by an index of paths: not an agreed part (the user's pick 2026-11-10,
