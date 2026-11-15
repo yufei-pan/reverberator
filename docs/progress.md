@@ -54,6 +54,9 @@ The user's rulings on how the project is worked, as opposed to what gets built. 
 - A cold measurement comes from the live backups after a deploy, not from flushing the host's page cache: "Use the live
   backups (Recommended)" (2026-11-03).
 
+Decisions of the session that coordinates the user's other sessions ("chief") on how this session uses shared usage
+limits are kept outside this public repo, in the agent's private notes beside its memory; read them with this file.
+
 ## Open parts
 
 **P1. The deferred entries of `docs/limitations.md`.** Source: the 17 entries whose kind is deferred. State: round
