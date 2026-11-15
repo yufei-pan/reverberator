@@ -100,17 +100,29 @@ writes after release. State: measuring. To measure on the current release: write
 the spec's 24 to 36 MiB a cycle and 0.6 to 0.85 GiB a day, f2fs GC's share, prune times, idle CPU, peak memory.
 First readings, 2026-11-14 23:01 PST, 0.55.5 at 21 hours. Answered: between backups every vault disk writes 0.0 MiB a
 minute (0.54.1: 16); prunes take 0.32 s at the median and 1.90 s at most (0.54.1: 14.3 and 26 s); memory is 19 MB
-resident, 87 MB in swap, peak 158 MB. Open: since the host's boot 6.1 days earlier, the busiest job's vault disk took
-59.5 GiB (9.7 GiB a day), 81% of it moved by f2fs's background GC, mostly node blocks; the other three vault disks 0.28
-to 0.48 GiB a day. What wrote it is not known yet: other programs write to the same disks; the busiest job's batches
-grew to 5,000 to 31,000 entries as worktrees came and went in its tree; and that job now backs up about once a day
-(the measuring agent's reading: its minimum interval never sees an hour of quiet; not verified). Idle CPU was 0.46% of
-a core with agents busy in the tree (0.54.1: 0.03%), so not a quiet reading. Next: readings around the busiest job's
-next cycle (2026-11-15 about 01:30 PST) and 24 hours after the first (2026-11-15 23:01 PST), both scheduled as
-read-only background scripts writing to the session's scratch folder (`p7/snap-a1.txt`, `snap-a2.txt`, `snap-d.txt`;
-`delta.py` subtracts two snapshots); then find what the GC moved, and whether the daemon's own share is over the
-target. The vault disks are mounted with f2fs `mode=lfs` and `background_gc=on`; whether that drives the GC share is
-not checked. A change to those mount options is an fstab change: the user's OK, through chief.
+resident, 87 MB in swap, peak 158 MB. Idle CPU was 0.46% of a core with agents busy in the tree (0.54.1: 0.03%), so
+not a quiet reading. Since the host's boot 6.1 days earlier, by the filesystem's own counters, the busiest job's vault
+disk took 60 GiB (9.9 GiB a day): f2fs's background GC moved 48 GiB of it (7.9 GiB a day), collecting sections still
+about 93% valid, three in four of its blocks node blocks; every program together wrote 9.4 GiB (1.5 GiB a day); the
+checkpoints' own areas 1.9 GiB. The other three vault disks took 0.28 to 0.48 GiB a day. The disk is a member of a
+storage pool that other programs write to, and the job's manifest lives on it.
+Reading A, 2026-11-15 01:28 to 01:55 PST, around the busiest job's daily batch (01:36: a full comparison, 23,002
+entries: 28,347 creates, 14,048 deletes, 1,117 modifies, 2,176 attribute changes; the oldest version pruned): the disk
+took 5.17 GiB, the daemon's own data writes were 5.28 GiB, so the daemon was nearly its only writer; the GC moved 88
+MiB (2%) in the window. The files the batch copied are 4.63 GiB at their current sizes (2.3 GiB in one project's agent
+folder, 1.0 GiB of release evidence, 0.7 GiB in three archives), which leaves about 0.46 GiB for the rest: inodes,
+links, the manifest, the deletes. That split is an estimate: a moved file recorded by a hard link would move bytes from
+the first figure to the second. Daemon CPU: 32 s for the batch. Against the targets: the spec's 0.6 to 0.85 GiB a day
+was 24 hourly batches of 212 to 1,353 entries at 24 to 36 MiB each; the job now makes one batch a day (Q16), whose
+overhead of about 0.46 GiB is under the day target, and whose copied bytes are what the tree changed that day.
+Why one batch a day: the minimum interval is a quiet time (a batch starts once the tree has gone that long without an
+event, or at the maximum interval; the watcher's rule since the first release), and since 2026-11-12 the tree has had
+one hour of quiet: the job's versions came at 11:27 on 11-12 (that quiet hour), 11:27 on 11-13 and 01:36 on 11-15 (the
+24-hour maximum), and at the restart on 11-14; until 2026-11-09 it made about 24 a day. Next: the GC's tail after the
+batch (hourly read-only snapshots to 08:00 PST) and the 24-hour reading (23:01 PST), both in the session's scratch
+folder (`p7/`; `delta.py` subtracts two snapshots); then whether the GC's share returns after a batch, and whether the
+daemon's own share is over the target. The vault disks are mounted with f2fs `mode=lfs` and `background_gc=on`; a
+change to those mount options is an fstab change: the user's OK, through chief.
 Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
 when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
@@ -195,6 +207,15 @@ is written on the recommended options and marks the tasks an answer would change
   - (b) Widen "A folder whose extended attributes alone fail to copy keeps the wrong ones" (this one overrides the
     ladder).
 
+- **Q16. The busiest job makes one version a day** (P7, reading A). The operator sees: the job's newest version is up
+  to a day old, and Keep 5 holds five days, where it used to make about 24 versions a day (five hours at Keep 5).
+  Why: its minimum interval (an hour) is a quiet time, and agents now write to its tree around the clock, so each
+  batch comes at the maximum interval (a day). One batch a day also keeps the daemon's writes near the bytes that
+  changed. The user's words: none on this; the job's rule is the user's own (minimum an hour, maximum a day, Keep 5).
+  - (a) Keep the rule as it is (Recommended): a version a day, five days of history.
+  - (b) Lower the job's maximum interval in its rule (say 6 hours: four versions a day, 30 hours of history at Keep 5;
+    a change to the live rule file, the user's OK).
+  - (c) Raise Keep N with (b), for more versions and the same history; more versions kept means more vault space.
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
   yet, keep it open".
