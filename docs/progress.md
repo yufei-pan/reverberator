@@ -9,7 +9,7 @@ specs, plans and commit messages, not here.
 First written on 2026-11-14, with 0.55.5 live (main 720e518), from every spec and plan in `docs/superpowers/`: each
 part's state was taken from the code and the commits, not from notes. An audit against the user's own messages
 (2026-11-14) added P16, Q8 (closed the same day) and three candidates, moved P9 to the candidates, and corrected P7, P8,
-Q5 and the closed list.
+Q5 and the closed list. On 2026-11-14 the user picked the fixes round as the next work: round 0.55.6, branch `r0556`.
 
 ## The goal, in the user's words
 
@@ -56,9 +56,10 @@ The user's rulings on how the project is worked, as opposed to what gets built. 
 
 ## Open parts
 
-**P1. The deferred entries of `docs/limitations.md`.** Source: the 17 entries whose kind is deferred. State: not
-started; each waits for its "Revisit when", most of them the round after 0.55.5. Next: that round takes the entries
-that name it. Behind it: a deferral is planned work.
+**P1. The deferred entries of `docs/limitations.md`.** Source: the 17 entries whose kind is deferred. State: round
+0.55.6 (branch `r0556`) takes the entries whose "Revisit when" names the round after 0.55.5; its spec is being written.
+The others wait for their own "Revisit when". Behind it: a deferral is planned work; the user's pick 2026-11-14,
+"Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
 8, 9 ("the 0.54 parts go in a later release") and 12 step 3; `plans/2026-11-05-round20.md`; commit 9ab7949 ("stays for
@@ -77,8 +78,8 @@ with "the no-copy move into a new folder gets its own design round after".
 
 **P4. Remove the backuper's dead branch** at `reverberator.py` ~4988-4995. **P5. Remove the lost-manifest branch of
 `drop_untracked_deletes(newest_path=)`.** **P6. Remove `remove_pending_file()`.** Source: round 0.55.5's final review
-and its second opinions (parts that can go; not in a spec). State: not started. Next: the round after 0.55.5. Behind
-them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own housekeeping, with no
+and its second opinions (parts that can go; not in a spec). State: in round 0.55.6 (branch `r0556`), spec being
+written. Behind them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own housekeeping, with no
 pick of the user's.
 
 **P7. The live measurement after design R.** Source: `plans/2026-11-05-round20.md`, Rollout; the round 19 spec's real
@@ -100,8 +101,8 @@ user's pick "Trim, shrink, 2 arenas (Recommended)" (2026-11-13).
 
 **P10 to P13. Four parts of round 22's first watcher design that the step back never took up.** Source:
 `specs/2026-11-08-round22-watcher-design.md`. Its top says it was not built; the step back replaced its watcher work
-and says nothing of these. State: not started. Next: the round after 0.55.5. Behind them: the user's pick
-2026-11-14, "Carry all four (Recommended)".
+and says nothing of these. State: in round 0.55.6 (branch `r0556`), spec being written. Behind them: the user's
+picks 2026-11-14, "Carry all four (Recommended)" and "Fixes round (Recommended)".
 - **P10. A tree walk without recursion** (its 2.3): `iter_tree_entries()` recurses by `yield from` (:3783). A tree
   deeper than about 1,000 levels leaves its deepest folders unwatched, and the comparison, restore and vault walks
   through the same function stop at the same depth.
@@ -117,48 +118,46 @@ keep is hard-linked, not exchanged), 3 (the staging rule, the lost-manifest row)
 filesystem with no exchange is treated as a pool, not only mergerfs), 6 (the estimate changed) and 13 (line numbers),
 where the round 20 plan's proposed spec edits were applied only in part; the 0.55.5 spec's L4 summary table (three and
 four mount-table reads, not two and three) and its 5.9 (L10 decides "gone" by listing the parent, not by an lstat).
-State: open. Next: one docs commit. Behind it: the main session's own housekeeping, with no pick of the user's.
+State: in round 0.55.6 (branch `r0556`), as one docs commit. Behind it: the main session's own housekeeping, with no
+pick of the user's.
 
 **P15. Every test module carries its layer marker.** Source: `specs/2026-08-12-full-test-suite-design.md`, Goals and
 "1 Pytest config". State: partly done. Eight modules carry none (`test_crash_power_loss`, `test_r_batch`,
 `test_r_readers`, `test_r_scan`, `test_r_sizes`, `test_sysctl_limits`, `test_tree_writes`, `test_version_walk`: 226
 tests), so `pytest -m unit` leaves out most of design R's unit tests; `test_crash_safety.py` and
 `test_backup_replay_ordering.py` are still `unittest` classes, which the spec said to move "when touching them". Next:
-the next round that touches the tests. Behind it: that spec's goals; no pick of the user's is on record for it.
+round 0.55.6 (branch `r0556`), which touches the tests. Behind it: that spec's goals; no pick of the user's is on record for it.
 
 **P16. Check whether a folder whose own metadata copy failed heals in later versions.** Source: the user's pick
 2026-11-03, "Not an issue, check healing (Recommended)", on a folder that keeps the setgid or default ACL it inherited
 when its own metadata copy fails (an ERROR line, and the folder listed as unsynced). State: not started; no spec, plan
 or commit has a result. Round 18 (0.54) and design R changed how folder metadata is copied since, so the check runs on
 the current release. The entry "A folder whose extended attributes alone fail to copy keeps the wrong ones" covers
-only the xattr case. Next: the round after 0.55.5: force such a failure in a test, then see what the next versions
-hold. Behind it: that pick.
+only the xattr case. State: in round 0.55.6 (branch `r0556`), spec being written: force such a failure in a test,
+then see what the next versions hold. Behind it: that pick, and "Fixes round (Recommended)" (2026-11-14).
+
+**P17. Four notes the names-chains spec (2026-10-21, "Left as they are") never wrote down** (was Q3): the commands
+redirect stdout and stderr process-wide while they load the rules (~14814); `get_path_fs_info` logs through the
+backuper's logger in the commands (~11106); folders that cannot be locked (NFS) are not kept apart, and a microsecond
+window between an in-place mkdir and its lock can leave an extra empty moved-aside folder (~16190); a `cp` that outlives
+the stop timeout may write a partial file after the lock is released. State: in round 0.55.6 (branch `r0556`): each
+goes down the ladder there; one left as a known limitation comes back to the user as its own question. Behind it: the
+main session's call (2026-11-14), told to the user with the round's question.
+
+**P18. Lines for the shared lessons file** (was Q4), which the 0.55.5 spec (section 11) and plan (Task 13) said to
+propose and never did: sharpen "What a restart rescans follows from what could change while it was down, not from the
+job it resumes." with "; when it rescans everything, drop the saved work it would resume"; add "A record describes an
+object, not a name: move it with the object, and only once the object has moved."; add "When a guarantee moves
+upstream, remove the downstream check that stood in for it."; and design R's lesson (its section 15), which is in
+`docs/lessons.md` only. State: in round 0.55.6 (branch `r0556`): written as the agent rules say (APIs: a lesson that
+would change a design in an unrelated repo gets one line in the shared file), listed in its Calls to confirm. Behind
+it: the main session's call (2026-11-14).
 
 ## Questions waiting for the user
 
-- **Q3.** Four notes the names-chains spec (2026-10-21, "Left as they are") never wrote down: the commands redirect
-  stdout and stderr process-wide while they load the rules (~14814); `get_path_fs_info` logs through the backuper's
-  logger in the commands (~11106); folders that cannot be locked (NFS) are not kept apart, and a microsecond window
-  between an in-place mkdir and its lock can leave an extra empty moved-aside folder (~16190); a `cp` that outlives the
-  stop timeout may write a partial file after the lock is released. Known limitations to write down, or fixes?
-- **Q4.** Lines for the shared lessons file that the 0.55.5 spec (section 11) and plan (Task 13) said to propose, never
-  asked: sharpen "What a restart rescans follows from what could change while it was down, not from the job it
-  resumes." with "; when it rescans everything, drop the saved work it would resume"; add "A record describes an
-  object, not a name: move it with the object, and only once the object has moved."; add "When a guarantee moves
-  upstream, remove the downstream check that stood in for it." Design R's lesson (its section 15) is in
-  `docs/lessons.md` but not in the shared file either.
-- **Q5.** Three of round 22's costs above 0.55.1, accepted by the main session (the step back's item 20) without a pick
-  of the user's: move-outs +7 to 8%, a folder moved out for good 0.3 to 0.7 ms, the move-out peak 11.77 MiB against
-  0.89. The question of 2026-11-10 said "Every other move and rename benchmarks the same as live". The others were
-  picked: a move out of a new folder about 1 ms and moves into new folders about 5% slower ("Keep the full check
-  (Recommended)", 2026-11-10).
-- **Q6.** 0.55.5's calls to confirm at its rollout, not yet answered: RF2-1 ruled Not an issue (a millisecond race, as
-  in 0.55.4); the behaviour changes with no pick of their own (the waits for an fstab disk at the job vault or under a
-  pool disk, the job vault folder made before the first scan, a too-long link copy left out, a first version locks
-  first, pruning a batch earlier under an inode limit, no UNREADABLE for a folder gone mid-walk, restores handle each
-  file by its filesystem); docs text beyond the approved wording.
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
-  drafted, for the user to send from their own address; whether it went is not known.
+  drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
+  yet, keep it open".
 
 ## Candidates, never agreed
 
@@ -190,6 +189,11 @@ Kept so they are not lost; none is planned until the user picks it.
   "Keep the full check (Recommended)"); moved to the candidates on 2026-11-14.
 - Q8, rule columns 14 and 15 (Chain Length, Copy threads), asked for on 2026-10-27 and 2026-11-04 and inert since
   0.55: kept accepted and ignored, as the README says, the user's pick 2026-11-14, "Keep them ignored (Recommended)".
+- Q5, three of round 22's costs above 0.55.1 (move-outs +7 to 8%, a folder moved out for good 0.3 to 0.7 ms, the
+  move-out peak 11.77 MiB against 0.89): accepted, the user's pick 2026-11-14, "Accept them (Recommended)".
+- Q6, 0.55.5's calls to confirm (RF2-1 Not an issue; the behaviour changes with no pick of their own; docs text beyond
+  the approved wording): kept as built, the user's pick 2026-11-14, "Keep them all (Recommended)".
+- Q3 and Q4 became rows P17 and P18 (2026-11-14): work for round 0.55.6, not questions for the user.
 
 Releases, newest first (the spec and plan of each are in `docs/superpowers/`):
 - 0.55.5, 2026-11-14 (9fcbcfa; main 720e518): four deferred fixes and the lightness round.
