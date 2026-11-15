@@ -57,8 +57,8 @@ The user's rulings on how the project is worked, as opposed to what gets built. 
 ## Open parts
 
 **P1. The deferred entries of `docs/limitations.md`.** Source: the 17 entries whose kind is deferred. State: round
-0.55.6 (branch `r0556`) takes the entries whose "Revisit when" names the round after 0.55.5; its spec is being written.
-The others wait for their own "Revisit when". Behind it: a deferral is planned work; the user's pick 2026-11-14,
+0.55.6 (branch `r0556`) takes the entries whose "Revisit when" names the round after 0.55.5 (15 of the 17); its spec
+(`specs/2026-11-14-r0556-design.md`, 0c13d04) is in its spec check. The other two wait for upstream fixes. Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -78,9 +78,9 @@ with "the no-copy move into a new folder gets its own design round after".
 
 **P4. Remove the backuper's dead branch** at `reverberator.py` ~4988-4995. **P5. Remove the lost-manifest branch of
 `drop_untracked_deletes(newest_path=)`.** **P6. Remove `remove_pending_file()`.** Source: round 0.55.5's final review
-and its second opinions (parts that can go; not in a spec). State: in round 0.55.6 (branch `r0556`), spec being
-written. Behind them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own housekeeping, with no
-pick of the user's.
+and its second opinions (parts that can go; not in a spec). State: in round 0.55.6 (branch `r0556`), spec in its
+check. Behind them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own
+housekeeping, with no pick of the user's.
 
 **P7. The live measurement after design R.** Source: `plans/2026-11-05-round20.md`, Rollout; the round 19 spec's real
 writes after release. State: measuring. To measure on the current release: writes per backup of the busiest job and per day (the vault disks' lifetime write counters) against
@@ -110,7 +110,7 @@ user's pick "Trim, shrink, 2 arenas (Recommended)" (2026-11-13).
 
 **P10 to P13. Four parts of round 22's first watcher design that the step back never took up.** Source:
 `specs/2026-11-08-round22-watcher-design.md`. Its top says it was not built; the step back replaced its watcher work
-and says nothing of these. State: in round 0.55.6 (branch `r0556`), spec being written. Behind them: the user's
+and says nothing of these. State: in round 0.55.6 (branch `r0556`), spec in its check. Behind them: the user's
 picks 2026-11-14, "Carry all four (Recommended)" and "Fixes round (Recommended)".
 - **P10. A tree walk without recursion** (its 2.3): `iter_tree_entries()` recurses by `yield from` (:3783). A tree
   deeper than about 1,000 levels leaves its deepest folders unwatched, and the comparison, restore and vault walks
@@ -142,7 +142,7 @@ round 0.55.6 (branch `r0556`), which touches the tests. Behind it: that spec's g
 when its own metadata copy fails (an ERROR line, and the folder listed as unsynced). State: not started; no spec, plan
 or commit has a result. Round 18 (0.54) and design R changed how folder metadata is copied since, so the check runs on
 the current release. The entry "A folder whose extended attributes alone fail to copy keeps the wrong ones" covers
-only the xattr case. State: in round 0.55.6 (branch `r0556`), spec being written: force such a failure in a test,
+only the xattr case. State: in round 0.55.6 (branch `r0556`), spec in its check: force such a failure in a test,
 then see what the next versions hold. Behind it: that pick, and "Fixes round (Recommended)" (2026-11-14).
 
 **P17. Four notes the names-chains spec (2026-10-21, "Left as they are") never wrote down** (was Q3): the commands
