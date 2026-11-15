@@ -64,13 +64,16 @@ limits are kept outside this public repo, in the agent's private notes beside it
 (`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
 (2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports
 are in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
-corrected, 4 rejected with reasons in its commits). Its questions are Q9 to Q15 below. The plan is written
+corrected, 4 rejected with reasons in its commits). Its questions were Q9 to Q15: Q10 to Q12 are closed by chief's
+decisions, the rest are below. The plan is written
 (`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a table at its top and a [Q<n>] mark on each
 task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (the healing test) runs second so Q15
 can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
-stays as written). Next: building, by subagent-driven development, once Q9 to Q14 are answered and P7's readings are
-in (2026-11-15 23:01 PST), by chief's order of 2026-11-15: the worktree sits in the busiest job's tree, so building
-during the 24-hour reading would add to the writes it measures. Behind it: a deferral is planned work; the user's pick 2026-11-14,
+stays as written). Next: building, by subagent-driven development, on the recommended options: chief said to build
+meanwhile while it asks the user Q9, Q13 and Q14 (2026-11-15). Whether that lifts chief's earlier order of the same day
+(the spec, its questions and that night's P7 readings before any building) is asked of chief: until it answers, building
+waits for P7's 24-hour reading (2026-11-15 23:01 PST), because the worktree sits in the busiest job's tree and a build
+there adds to the writes it measures. Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -180,7 +183,8 @@ it: the main session's call (2026-11-14).
 ## Questions waiting for the user
 
 Round 0.55.6's questions, from its spec (`specs/2026-11-14-r0556-design.md` section 26, 1e96eeb, where each is written
-out at length). Q9 to Q14 are asked before the build; Q15 waits for the healing test's results. What waits on each: its
+out at length). Q9, Q13 and Q14 are with the user: chief asks them and sends the answers (2026-11-15); chief decided
+Q10 to Q12 (Closed). Q15 waits for the healing test's results. What waits on each: its
 `docs/limitations.md` entry and, for an option other than the recommended one, the part it adds to the plan. The plan
 is written on the recommended options and marks the tasks an answer would change. Each recommended known limitation
 here leaves a wrong result, which the ladder calls always worth fixing: picking it overrides the ladder.
@@ -196,41 +200,13 @@ here leaves a wrong result, which the ladder calls always worth fixing: picking 
   - (a) A known limitation (Recommended).
   - (b) The whole-file read at the check.
   - (c) Keep it deferred: the take-back designed in a round of its own.
-- **Q10. D3 on a pool.** The operator sees: on a vault on a mergerfs pool, after a cut batch and with the database lost,
-  a file the cut batch had just copied in new, whose source cannot be read at the retry, keeps the cut copy as its
-  backed-up copy (wrong bytes if the cut damaged it), with only its UNREADABLE line, until the file changes. Why not
-  fix: over a lost manifest on a pool the repair cannot tell a removed entry from a new one (the approved "A manifest
-  lost in the same cut as a split on a pool"). No vault here is on a pool. Revisit when: a vault goes on a pool. The
-  user's words: "Support pools with a limitation" (2026-11-04); "Fixes round (Recommended)" (2026-11-14) put the entry
-  in the round.
-  - (a) Widen "A manifest lost in the same cut as a split on a pool" to this case (Recommended).
-  - (b) Keep it deferred, to design with the pool's split repair.
-- **Q11. What the length rule leaves out** (D4). The operator sees: an entry whose path in the vault would pass 4,095
-  bytes (a tree some 4,000 bytes deep) is in no version (a file, a link, or a folder with all under it), with a NOT
-  BACKED UP alert per batch, and the rest is backed up; today such an entry fails every backup of its job. With the
-  copy's temporary name as it is, files in folders whose vault path is 4,041 to 4,095 bytes are left out too; a 20-byte
-  name would let those up to about 4,075 in, at the cost of reading both name forms from then on. Revisit when: a NOT
-  BACKED UP alert names a path too long for the vault. Widens: "Accept: leave it out, warn (Recommended)" (2026-11-09)
-  approved this for a symlink only. Drops: the deferred entry's planned fix, in the round by "Fixes round
-  (Recommended)", named the shorter name. No option can keep such entries.
-  - (a) Widen the approved symlink entry to every entry kind, and keep the temporary name (Recommended).
-  - (b) Widen it, and shorten the temporary name, both forms read.
-- **Q12. An xattr change made while down, in a folder renamed during the start's walk** (D12). The operator sees: that
-  change is missing from the versions until the entry changes again, with no line. Why not fix: each fix is for a
-  three-way coincidence: a second whole-tree walk whenever a folder vanishes during a full comparison (three such lines
-  in a week of the live journal), or a part with its own state carrying the gone folders to the rename's batch. Revisit
-  when: a restore is found missing such a change. The user's words: "Fixes round (Recommended)" (2026-11-14) put the
-  entry in the round; on another rare case (2026-10-26): "if unable to do this cleanly I think it also make sense to put
-  as limitations".
-  - (a) A known limitation (Recommended).
-  - (b) A second full comparison after one that met a folder gone mid-walk.
-  - (c) The gone folders and the comparison's bound carried to the rename's batch.
 - **Q13. A name a network filesystem lists but cannot look up, in a batch's scopes** (D13's scope half). The operator
   sees: on CIFS or sshfs with such name trouble, a batch whose events name that very path takes it as deleted: the new
   version lacks it and all under it, with no line; older versions keep it. The watcher's half and the whole-tree walk
   are fixed in the round. Why not fix: the fix lists the parent of every path a batch finds gone, on every delete's path
   (about 8 ms a batch in a folder of 100,000 names, about 0.1 ms in one of 1,000). Revisit when: a job monitors a CIFS
-  or sshfs mount. The user's words: as in Q12.
+  or sshfs mount. The user's words: "Fixes round (Recommended)" (2026-11-14) put the entry in the round; on another
+  rare case (2026-10-26): "if unable to do this cleanly I think it also make sense to put as limitations".
   - (a) A known limitation, the watcher's half built (Recommended).
   - (b) The parent-listing rule in the scope walks.
 - **Q14. A restore target that cannot be locked (NFS)** (P17's one case left). The operator sees: two restores run at
@@ -278,6 +254,18 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Q10, D3 on a pool: (a), widen "A manifest lost in the same cut as a split on a pool" to the cut copy kept over a lost
+  manifest on a pool. Chief's decision, 2026-11-15, on the user's words "Support pools with a limitation" (2026-11-04);
+  no vault is on a pool. The entry's approved field says "chief's decision, 2026-11-15".
+- Q11, what the length rule leaves out: (a), widen "A symlink the vault's filesystem can't hold is left out" to every
+  entry kind, and keep the temporary name. Chief's decision, 2026-11-15, on the user's pick "Accept: leave it out, warn
+  (Recommended)" (2026-11-09) for the same case in a symlink; no option keeps such entries, and (b) bought about 34 bytes
+  of path for a second name form read for good. The entry says it drops the shorter name that "Fixes round
+  (Recommended)" (2026-11-14) had planned; its approved field says "chief's decision, 2026-11-15".
+- Q12, an xattr change made while down in a folder renamed during the start's walk: (a), a known limitation. Chief's
+  decision, 2026-11-15, on the user's words on a rare case, "if unable to do this cleanly I think it also make sense to
+  put as limitations" (2026-10-26): both fixes add a walk, or a part with its own state, for a three-way coincidence. The
+  entry's approved field says "chief's decision, 2026-11-15".
 - `mv q a; rm a` (the round 13 spec, left "for the user"): Not an issue, the user's pick 2026-11-14, "Not an issue
   (Recommended)": the check after every batch removes the old file; the test comment says so.
 - P9, one pass over the watches per folder move by an index of paths: not an agreed part (the user's pick 2026-11-10,
