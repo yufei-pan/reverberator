@@ -58,7 +58,11 @@ The user's rulings on how the project is worked, as opposed to what gets built. 
 
 **P1. The deferred entries of `docs/limitations.md`.** Source: the 17 entries whose kind is deferred. State: round
 0.55.6 (branch `r0556`) takes the entries whose "Revisit when" names the round after 0.55.5 (15 of the 17); its spec
-(`specs/2026-11-14-r0556-design.md`, 0c13d04) is in its spec check. The other two wait for upstream fixes. Behind it: a deferral is planned work; the user's pick 2026-11-14,
+(`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
+(2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports
+are in the session's scratch folder, `r0556/`); a fresh agent is revising the spec from them, committing as it goes.
+Next: the revised spec's questions go into this file's questions section in full (chief reads them there), then the
+plan; no building before the questions and P7's readings, by chief's order of 2026-11-15. Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -93,8 +97,11 @@ to 0.48 GiB a day. What wrote it is not known yet: other programs write to the s
 grew to 5,000 to 31,000 entries as worktrees came and went in its tree; and that job now backs up about once a day
 (the measuring agent's reading: its minimum interval never sees an hour of quiet; not verified). Idle CPU was 0.46% of
 a core with agents busy in the tree (0.54.1: 0.03%), so not a quiet reading. Next: readings around the busiest job's
-next cycle (2026-11-15 about 01:30 PST) and 24 hours after the first (2026-11-15 23:01 PST); then find what the GC
-moved, and whether the daemon's own share is over the target.
+next cycle (2026-11-15 about 01:30 PST) and 24 hours after the first (2026-11-15 23:01 PST), both scheduled as
+read-only background scripts writing to the session's scratch folder (`p7/snap-a1.txt`, `snap-a2.txt`, `snap-d.txt`;
+`delta.py` subtracts two snapshots); then find what the GC moved, and whether the daemon's own share is over the
+target. The vault disks are mounted with f2fs `mode=lfs` and `background_gc=on`; whether that drives the GC share is
+not checked. A change to those mount options is an fstab change: the user's OK, through chief.
 Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
 when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
