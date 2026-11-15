@@ -60,9 +60,9 @@ The user's rulings on how the project is worked, as opposed to what gets built. 
 0.55.6 (branch `r0556`) takes the entries whose "Revisit when" names the round after 0.55.5 (15 of the 17); its spec
 (`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
 (2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports
-are in the session's scratch folder, `r0556/`); a fresh agent is revising the spec from them, committing as it goes.
-Next: the revised spec's questions go into this file's questions section in full (chief reads them there), then the
-plan; no building before the questions and P7's readings, by chief's order of 2026-11-15. Behind it: a deferral is planned work; the user's pick 2026-11-14,
+are in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
+corrected, 4 rejected with reasons in its commits). Its questions are Q9 to Q15 below. Next: the plan, on the
+recommended options; no building before the questions and P7's readings, by chief's order of 2026-11-15. Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -170,6 +170,77 @@ would change a design in an unrelated repo gets one line in the shared file), li
 it: the main session's call (2026-11-14).
 
 ## Questions waiting for the user
+
+Round 0.55.6's questions, from its spec (`specs/2026-11-14-r0556-design.md` section 26, 1e96eeb, where each is written
+out at length). Q9 to Q14 are asked before the build; Q15 waits for the healing test's results. What waits on each: its
+`docs/limitations.md` entry and, for an option other than the recommended one, the part it adds to the plan. The plan
+is written on the recommended options and marks the tasks an answer would change. Each recommended known limitation
+here leaves a wrong result, which the ladder calls always worth fixing: picking it overrides the ladder.
+
+- **Q9. A file whose read fails only before its last 64 KiB** (D1's rest). The operator sees: when it is the only
+  change of a batch or a full comparison, one version that changes nothing at each full comparison and each batch of its
+  events, with its UNREADABLE alert; under Keep N each pushes the oldest real version out. The round fixes the rest of
+  the entry (a file whose tail fails). Why not fix: a whole-file read at the check (a second read of the first file of
+  every batch, uncached for a large one), or a take-back at the commit path, the rollback path the user declined on
+  2026-11-13: "Accept the race (Recommended)", over "undoing the version after the copy instead of checking before,
+  which adds a rollback path". Revisit when: one file's UNREADABLE alert repeats at full comparisons and `history`
+  shows a new version each time. Drops: "Fixes round (Recommended)" (2026-11-14) put this entry's fix in the round.
+  - (a) A known limitation (Recommended).
+  - (b) The whole-file read at the check.
+  - (c) Keep it deferred: the take-back designed in a round of its own.
+- **Q10. D3 on a pool.** The operator sees: on a vault on a mergerfs pool, after a cut batch and with the database lost,
+  a file the cut batch had just copied in new, whose source cannot be read at the retry, keeps the cut copy as its
+  backed-up copy (wrong bytes if the cut damaged it), with only its UNREADABLE line, until the file changes. Why not
+  fix: over a lost manifest on a pool the repair cannot tell a removed entry from a new one (the approved "A manifest
+  lost in the same cut as a split on a pool"). No vault here is on a pool. Revisit when: a vault goes on a pool. The
+  user's words: "Support pools with a limitation" (2026-11-04); "Fixes round (Recommended)" (2026-11-14) put the entry
+  in the round.
+  - (a) Widen "A manifest lost in the same cut as a split on a pool" to this case (Recommended).
+  - (b) Keep it deferred, to design with the pool's split repair.
+- **Q11. What the length rule leaves out** (D4). The operator sees: an entry whose path in the vault would pass 4,095
+  bytes (a tree some 4,000 bytes deep) is in no version (a file, a link, or a folder with all under it), with a NOT
+  BACKED UP alert per batch, and the rest is backed up; today such an entry fails every backup of its job. With the
+  copy's temporary name as it is, files in folders whose vault path is 4,041 to 4,095 bytes are left out too; a 20-byte
+  name would let those up to about 4,075 in, at the cost of reading both name forms from then on. Revisit when: a NOT
+  BACKED UP alert names a path too long for the vault. Widens: "Accept: leave it out, warn (Recommended)" (2026-11-09)
+  approved this for a symlink only. Drops: the deferred entry's planned fix, in the round by "Fixes round
+  (Recommended)", named the shorter name. No option can keep such entries.
+  - (a) Widen the approved symlink entry to every entry kind, and keep the temporary name (Recommended).
+  - (b) Widen it, and shorten the temporary name, both forms read.
+- **Q12. An xattr change made while down, in a folder renamed during the start's walk** (D12). The operator sees: that
+  change is missing from the versions until the entry changes again, with no line. Why not fix: each fix is for a
+  three-way coincidence: a second whole-tree walk whenever a folder vanishes during a full comparison (three such lines
+  in a week of the live journal), or a part with its own state carrying the gone folders to the rename's batch. Revisit
+  when: a restore is found missing such a change. The user's words: "Fixes round (Recommended)" (2026-11-14) put the
+  entry in the round; on another rare case (2026-10-26): "if unable to do this cleanly I think it also make sense to put
+  as limitations".
+  - (a) A known limitation (Recommended).
+  - (b) A second full comparison after one that met a folder gone mid-walk.
+  - (c) The gone folders and the comparison's bound carried to the rename's batch.
+- **Q13. A name a network filesystem lists but cannot look up, in a batch's scopes** (D13's scope half). The operator
+  sees: on CIFS or sshfs with such name trouble, a batch whose events name that very path takes it as deleted: the new
+  version lacks it and all under it, with no line; older versions keep it. The watcher's half and the whole-tree walk
+  are fixed in the round. Why not fix: the fix lists the parent of every path a batch finds gone, on every delete's path
+  (about 8 ms a batch in a folder of 100,000 names, about 0.1 ms in one of 1,000). Revisit when: a job monitors a CIFS
+  or sshfs mount. The user's words: as in Q12.
+  - (a) A known limitation, the watcher's half built (Recommended).
+  - (b) The parent-listing rule in the scope walks.
+- **Q14. A restore target that cannot be locked (NFS)** (P17's one case left). The operator sees: two restores run at
+  once into one NFS folder both run, where on a local disk the second is refused; two different versions restored there
+  leave files of both, each saying done. Why not fix: it needs a second kind of lock (a POSIX lock on a lock file in the
+  target) for two runs into one NFS folder at once. Revisit when: restores into an NFS folder are run side by side. The
+  user's words: the round's option (2026-11-14), "I'd also check the four names-chains notes myself and come back only
+  for any I'd leave as limitations"; this is the one.
+  - (a) A known limitation, with one README line (Recommended).
+  - (b) A POSIX lock on a lock file in the target where flock fails.
+- **Q15. A folder metadata copy that fails once and does not heal** (P16 step 2; asked only with the healing test's
+  results, for each case it finds not healing; reasoned: the source's own extended attributes). The operator sees: the
+  folder keeps wrong extended attributes in every later version until its metadata is copied again for another reason.
+  The user's words: "Not an issue, check healing (Recommended)" (2026-11-03): they ruled the case Not an issue and asked
+  only for the check, so a fix goes beyond it.
+  - (a) Build step 2 for the cases that did not heal: a mark in the failed folder's row and one retry (Recommended).
+  - (b) Widen "A folder whose extended attributes alone fail to copy keeps the wrong ones" (this one overrides the
+    ladder).
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
