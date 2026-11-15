@@ -83,9 +83,18 @@ written. Behind them: "simpler and smarter is better"; ruled "can go, next round
 pick of the user's.
 
 **P7. The live measurement after design R.** Source: `plans/2026-11-05-round20.md`, Rollout; the round 19 spec's real
-writes after release. State: open; no result is recorded since 0.55 went live on 2026-11-06. Next: measure on the
-current release: writes per backup of the busiest job and per day (the vault disks' lifetime write counters) against
+writes after release. State: measuring. To measure on the current release: writes per backup of the busiest job and per day (the vault disks' lifetime write counters) against
 the spec's 24 to 36 MiB a cycle and 0.6 to 0.85 GiB a day, f2fs GC's share, prune times, idle CPU, peak memory.
+First readings, 2026-11-14 23:01 PST, 0.55.5 at 21 hours. Answered: between backups every vault disk writes 0.0 MiB a
+minute (0.54.1: 16); prunes take 0.32 s at the median and 1.90 s at most (0.54.1: 14.3 and 26 s); memory is 19 MB
+resident, 87 MB in swap, peak 158 MB. Open: since the host's boot 6.1 days earlier, the busiest job's vault disk took
+59.5 GiB (9.7 GiB a day), 81% of it moved by f2fs's background GC, mostly node blocks; the other three vault disks 0.28
+to 0.48 GiB a day. What wrote it is not known yet: other programs write to the same disks; the busiest job's batches
+grew to 5,000 to 31,000 entries as worktrees came and went in its tree; and that job now backs up about once a day
+(the measuring agent's reading: its minimum interval never sees an hour of quiet; not verified). Idle CPU was 0.46% of
+a core with agents busy in the tree (0.54.1: 0.03%), so not a quiet reading. Next: readings around the busiest job's
+next cycle (2026-11-15 about 01:30 PST) and 24 hours after the first (2026-11-15 23:01 PST); then find what the GC
+moved, and whether the daemon's own share is over the target.
 Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
 when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
