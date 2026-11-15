@@ -64,9 +64,13 @@ limits are kept outside this public repo, in the agent's private notes beside it
 (`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
 (2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports
 are in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
-corrected, 4 rejected with reasons in its commits). Its questions are Q9 to Q15 below. Now: a fresh agent writes the plan
-(`plans/2026-11-15-r0556.md`, committed as it goes) on the recommended options, marking the tasks an answer would change.
-No building before the questions and P7's readings, by chief's order of 2026-11-15. Behind it: a deferral is planned work; the user's pick 2026-11-14,
+corrected, 4 rejected with reasons in its commits). Its questions are Q9 to Q15 below. The plan is written
+(`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a table at its top and a [Q<n>] mark on each
+task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (the healing test) runs second so Q15
+can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
+stays as written). Next: building, by subagent-driven development, once Q9 to Q14 are answered and P7's readings are
+in (2026-11-15 23:01 PST), by chief's order of 2026-11-15: the worktree sits in the busiest job's tree, so building
+during the 24-hour reading would add to the writes it measures. Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
