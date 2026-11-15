@@ -118,11 +118,21 @@ overhead of about 0.46 GiB is under the day target, and whose copied bytes are w
 Why one batch a day: the minimum interval is a quiet time (a batch starts once the tree has gone that long without an
 event, or at the maximum interval; the watcher's rule since the first release), and since 2026-11-12 the tree has had
 one hour of quiet: the job's versions came at 11:27 on 11-12 (that quiet hour), 11:27 on 11-13 and 01:36 on 11-15 (the
-24-hour maximum), and at the restart on 11-14; until 2026-11-09 it made about 24 a day. Next: the GC's tail after the
-batch (hourly read-only snapshots to 08:00 PST) and the 24-hour reading (23:01 PST), both in the session's scratch
-folder (`p7/`; `delta.py` subtracts two snapshots); then whether the GC's share returns after a batch, and whether the
-daemon's own share is over the target. The vault disks are mounted with f2fs `mode=lfs` and `background_gc=on`; a
-change to those mount options is an fstab change: the user's OK, through chief.
+24-hour maximum), and at the restart on 11-14; until 2026-11-09 it made about 24 a day.
+Reading B, 2026-11-15 01:56 to 08:00 PST, hourly: after the batch the GC ran about five hours, one call a minute (its 60
+s sleep), each moving one 16 MiB section (8 segments) about 94% valid: 4.09 GiB moved, 93% of the disk's 4.38 GiB of
+writes in that time (the rest not attributed); from 07:00 it found nothing to move. With the 88 MiB during the batch,
+the GC's tail was about 4.2 GiB against the batch's 5.17 GiB, and it gained 67 free segments (134 MiB) on a disk 6%
+full: a section holding a few blocks the batch or the prune invalidated is rewritten whole, and `mode=lfs` reuses space
+only through the GC. So `background_gc=on` drives it, not a lack of space; f2fs's valid-ratio threshold for the
+background GC is set to 80, yet the GC took sections 94% valid (the threshold is for zoned disks; these are not). More
+batches a day would likely mean more such tails (not measured), which bears on Q16. The other three vault disks took 0.3
+to 0.7 GiB each from 04:00 to 05:00 PST, 57 to 93% of it GC, while another job backed up a database dump (the daemon
+wrote 192 MiB; the rest is not attributed, and the dump's own folder is on the same pool). Next: the 24-hour reading
+(23:01 PST) in the session's scratch folder (`p7/`; `delta.py` subtracts two snapshots); then whether the daemon's own
+share is over the target, and a question on the GC for the user. The vault disks are members of the storage pool, whose
+members are all mounted `mode=lfs` with `background_gc=on`; a change to those mount options is an fstab change: the
+user's OK, through chief.
 Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
 when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
