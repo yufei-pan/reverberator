@@ -108,8 +108,8 @@ checkpoints' own areas 1.9 GiB. The other three vault disks took 0.28 to 0.48 Gi
 storage pool that other programs write to, and the job's manifest lives on it.
 Reading A, 2026-11-15 01:28 to 01:55 PST, around the busiest job's daily batch (01:36: a full comparison, 23,002
 entries: 28,347 creates, 14,048 deletes, 1,117 modifies, 2,176 attribute changes; the oldest version pruned): the disk
-took 5.17 GiB, the daemon's own data writes were 5.28 GiB, so the daemon was nearly its only writer; the GC moved 88
-MiB (2%) in the window. The files the batch copied are 4.63 GiB at their current sizes (2.3 GiB in one project's agent
+took 5.17 GiB, the daemon's own data writes were 5.28 GiB, so the daemon was nearly its only writer; the GC moved 88 MiB
+(2%) in the window. The files the batch copied are 4.63 GiB at their current sizes (2.3 GiB in one project's agent
 folder, 1.0 GiB of release evidence, 0.7 GiB in three archives), which leaves about 0.46 GiB for the rest: inodes,
 links, the manifest, the deletes. That split is an estimate: a moved file recorded by a hard link would move bytes from
 the first figure to the second. Daemon CPU: 32 s for the batch. Against the targets: the spec's 0.6 to 0.85 GiB a day
@@ -126,13 +126,13 @@ the GC's tail was about 4.2 GiB against the batch's 5.17 GiB, and it gained 67 f
 full: a section holding a few blocks the batch or the prune invalidated is rewritten whole, and `mode=lfs` reuses space
 only through the GC. So `background_gc=on` drives it, not a lack of space; f2fs's valid-ratio threshold for the
 background GC is set to 80, yet the GC took sections 94% valid (the threshold is for zoned disks; these are not). More
-batches a day would likely mean more such tails (not measured), which bore on Q16 (closed: the user kept the rule). The other three vault disks took 0.3
-to 0.7 GiB each from 04:00 to 05:00 PST, 57 to 93% of it GC, while another job backed up a database dump (the daemon
-wrote 192 MiB; the rest is not attributed, and the dump's own folder is on the same pool). Next: the 24-hour reading
-(23:01 PST) in the session's scratch folder (`p7/`; `delta.py` subtracts two snapshots); then whether the daemon's own
-share is over the target, and a question on the GC for the user. The vault disks are members of the storage pool, whose
-members are all mounted `mode=lfs` with `background_gc=on`; a change to those mount options is an fstab change: the
-user's OK, through chief.
+batches a day would likely mean more such tails (not measured), which bore on Q16 (closed: the user kept the rule). The
+other three vault disks took 0.3 to 0.7 GiB each from 04:00 to 05:00 PST, 57 to 93% of it GC, while another job backed
+up a database dump (the daemon wrote 192 MiB; the rest is not attributed, and the dump's own folder is on the same
+pool). Next: the 24-hour reading (23:01 PST) in the session's scratch folder (`p7/`; `delta.py` subtracts two
+snapshots); then whether the daemon's own share is over the target, and a question on the GC for the user. The vault
+disks are members of the storage pool, whose members are all mounted `mode=lfs` with `background_gc=on`; a change to
+those mount options is an fstab change: the user's OK, through chief.
 Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
 when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
