@@ -113,7 +113,7 @@ MiB (2%) in the window. The files the batch copied are 4.63 GiB at their current
 folder, 1.0 GiB of release evidence, 0.7 GiB in three archives), which leaves about 0.46 GiB for the rest: inodes,
 links, the manifest, the deletes. That split is an estimate: a moved file recorded by a hard link would move bytes from
 the first figure to the second. Daemon CPU: 32 s for the batch. Against the targets: the spec's 0.6 to 0.85 GiB a day
-was 24 hourly batches of 212 to 1,353 entries at 24 to 36 MiB each; the job now makes one batch a day (Q16), whose
+was 24 hourly batches of 212 to 1,353 entries at 24 to 36 MiB each; the job now makes one batch a day (Q16, kept), whose
 overhead of about 0.46 GiB is under the day target, and whose copied bytes are what the tree changed that day.
 Why one batch a day: the minimum interval is a quiet time (a batch starts once the tree has gone that long without an
 event, or at the maximum interval; the watcher's rule since the first release), and since 2026-11-12 the tree has had
@@ -126,7 +126,7 @@ the GC's tail was about 4.2 GiB against the batch's 5.17 GiB, and it gained 67 f
 full: a section holding a few blocks the batch or the prune invalidated is rewritten whole, and `mode=lfs` reuses space
 only through the GC. So `background_gc=on` drives it, not a lack of space; f2fs's valid-ratio threshold for the
 background GC is set to 80, yet the GC took sections 94% valid (the threshold is for zoned disks; these are not). More
-batches a day would likely mean more such tails (not measured), which bears on Q16. The other three vault disks took 0.3
+batches a day would likely mean more such tails (not measured), which bore on Q16 (closed: the user kept the rule). The other three vault disks took 0.3
 to 0.7 GiB each from 04:00 to 05:00 PST, 57 to 93% of it GC, while another job backed up a database dump (the daemon
 wrote 192 MiB; the rest is not attributed, and the dump's own folder is on the same pool). Next: the 24-hour reading
 (23:01 PST) in the session's scratch folder (`p7/`; `delta.py` subtracts two snapshots); then whether the daemon's own
@@ -217,15 +217,6 @@ is written on the recommended options and marks the tasks an answer would change
   - (b) Widen "A folder whose extended attributes alone fail to copy keeps the wrong ones" (this one overrides the
     ladder).
 
-- **Q16. The busiest job makes one version a day** (P7, reading A). The operator sees: the job's newest version is up
-  to a day old, and Keep 5 holds five days, where it used to make about 24 versions a day (five hours at Keep 5).
-  Why: its minimum interval (an hour) is a quiet time, and agents now write to its tree around the clock, so each
-  batch comes at the maximum interval (a day). One batch a day also keeps the daemon's writes near the bytes that
-  changed. The user's words: none on this; the job's rule is the user's own (minimum an hour, maximum a day, Keep 5).
-  - (a) Keep the rule as it is (Recommended): a version a day, five days of history.
-  - (b) Lower the job's maximum interval in its rule (say 6 hours: four versions a day, 30 hours of history at Keep 5;
-    a change to the live rule file, the user's OK).
-  - (c) Raise Keep N with (b), for more versions and the same history; more versions kept means more vault space.
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
   yet, keep it open".
@@ -254,6 +245,10 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Q16, the busiest job makes one version a day (P7, reading A: its minimum interval is a quiet time and its tree is
+  never quiet for an hour now, so each batch comes at the one-day maximum): (a), keep the rule, one version a day and
+  five days of history at Keep 5, no change to the live rule file. The user's pick 2026-11-15 (about 19:12 PST, through
+  chief), "Keep the rule (Recommended)".
 - Q10, D3 on a pool: (a), widen "A manifest lost in the same cut as a split on a pool" to the cut copy kept over a lost
   manifest on a pool. Chief's decision, 2026-11-15, on the user's words "Support pools with a limitation" (2026-11-04);
   no vault is on a pool. The entry's approved field says "chief's decision, 2026-11-15".
