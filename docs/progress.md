@@ -133,6 +133,8 @@ pool). Next: the 24-hour reading (23:01 PST) in the session's scratch folder (`p
 snapshots); then whether the daemon's own share is over the target, and a question on the GC for the user. The vault
 disks are members of the storage pool, whose members are all mounted `mode=lfs` with `background_gc=on`; a change to
 those mount options is an fstab change: the user's OK, through chief.
+Paused for shared usage limits from 2026-11-15 21:01 PST, as those decisions say: the 24-hour reading's snapshot is
+taken by its script at 23:01 PST and recorded here when the pause ends.
 Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
 when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
