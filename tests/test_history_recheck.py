@@ -21,7 +21,7 @@ from tests.crash_batches import batch3_of, prepare, restore
 from tests.crash_child import KillPoints, in_child, kill_run, run_do_backup
 from tests.vault_oracle import entry_view
 
-pytestmark = pytest.mark.skipif(os.geteuid() != 0, reason='the root record is a trusted.* attribute, and a file is chowned')
+pytestmark = [pytest.mark.unit, pytest.mark.skipif(os.geteuid() != 0, reason='the root record is a trusted.* attribute, and a file is chowned')]
 
 DEFAULT_STARTS = 30
 # how long a read of the pipe may wait for the batch: past it, the child is stuck

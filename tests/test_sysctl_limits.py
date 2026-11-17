@@ -1,5 +1,8 @@
 import os
+import pytest
 import reverberator as rv
+
+pytestmark = pytest.mark.unit
 
 
 class SysctlTask:

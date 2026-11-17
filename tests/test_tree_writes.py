@@ -6,8 +6,11 @@ so a new write fails here on the day it is written, in code no test runs too.
 import ast
 import os
 
+import pytest
 import reverberator as rv
 from tests.harness import copy_now
+
+pytestmark = pytest.mark.unit
 
 # what writes the filesystem directly
 WRITE_CALLS = {'os.rename', 'os.replace', 'os.remove', 'os.unlink', 'os.mkdir', 'os.makedirs', 'os.rmdir', 'os.symlink', 'os.link',

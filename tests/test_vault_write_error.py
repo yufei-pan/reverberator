@@ -22,7 +22,7 @@ from tests.harness import committed_versions, create_job
 from tests.scratch_images import extents_of, FailingDisk, needs_dm, SCRATCH
 from tests.test_vault_units import at_the_commit_flush, base, disk_of, KEPT, lists_of, manifest_version, modify_big, tree_of, vault_write_errors
 
-pytestmark = needs_dm
+pytestmark = [pytest.mark.privileged, needs_dm]
 
 # the image: a job's few small versions; sparse, so what the disk holds is all it takes of REVERB_SCRATCH
 DISK_MIB = 64

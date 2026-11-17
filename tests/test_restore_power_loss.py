@@ -20,7 +20,7 @@ from tests.conftest import REAL_LIBC_SYNCFS
 from tests.harness import create_job, run_backup, seed_monitor, write_rule
 from tests.scratch_images import flush_scratch, LoopImage, needs_f2fs, SCRATCH, shut_down_scratch
 
-pytestmark = needs_f2fs
+pytestmark = [pytest.mark.privileged, needs_f2fs]
 
 # the loop image: a sparse file, so what the restore writes is all it takes
 IMAGE_MIB = 256

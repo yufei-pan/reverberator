@@ -115,11 +115,13 @@ def sweep(vault, fault=None, default=DEFAULT_KILL_POINTS):
 
 # --- no RENAME_EXCHANGE ---
 
+@pytest.mark.unit
 def test_a_filesystem_without_exchange_uses_two_renames(crash_vault):
 	wrong = sweep(crash_vault, no_exchange)
 	assert not wrong, f'{len(wrong)} kill points wrong: {wrong[:4]}'
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('code', [errno.EINVAL, errno.ENOSYS, errno.ENOTSUP])
 def test_each_answer_of_no_exchange_turns_to_two_renames(tmp_path, monkeypatch, code):
 	job_vault, newest = a_vault(str(tmp_path), {'d/f': 'x', 'g': 'y'})
@@ -132,6 +134,7 @@ def test_each_answer_of_no_exchange_turns_to_two_renames(tmp_path, monkeypatch, 
 	assert read_view(job_vault, V1) == before
 
 
+@pytest.mark.unit
 def test_another_error_of_the_exchange_stops_the_hand_over(tmp_path, monkeypatch):
 	job_vault, newest = a_vault(str(tmp_path), {'f': 'x'})
 	monkeypatch.setattr(rv, 'rename_exchange', lambda a, b: no_exchange(rv, errno.EIO) or rv.rename_exchange(a, b))
@@ -141,6 +144,7 @@ def test_another_error_of_the_exchange_stops_the_hand_over(tmp_path, monkeypatch
 	assert os.path.isfile(os.path.join(newest, 'f'))
 
 
+@pytest.mark.unit
 def test_a_roll_forward_finds_out_at_its_first_exchange(plain_vault):
 	# it makes no hand-over to find out by, so its writer starts on exchanges, and the first record of a folder turns it to two renames
 	job = plain_vault.job
@@ -156,6 +160,7 @@ def conversion_steps(job, fault):
 	return outcome
 
 
+@pytest.mark.unit
 def test_a_conversion_without_exchange_uses_two_renames(tmp_path, tmp_path_factory, v054):
 	job = create_job(str(tmp_path / 'job'))
 	v054.build(job, SMALL, keep_n_versions=9)
@@ -198,6 +203,7 @@ def test_a_conversion_without_exchange_uses_two_renames(tmp_path, tmp_path_facto
 	assert between == 2
 
 
+@pytest.mark.unit
 def test_a_one_version_vault_cut_between_the_two_renames_resumes(tmp_path, v054):
 	# every version folder gone between them: the vault reads as started over, had the repair not come first
 	job = create_job(str(tmp_path / 'job'))
@@ -225,6 +231,7 @@ def steps(monkeypatch):
 	return seen
 
 
+@pytest.mark.unit
 def test_hand_over_flushes_between_its_renames(tmp_path, fake_pool, steps):
 	job_vault, newest = a_vault(str(tmp_path), {'d/f': 'x', 'g': 'y'})
 	fake_pool.add(job_vault, ['a', 'b'])
@@ -238,6 +245,7 @@ def test_hand_over_flushes_between_its_renames(tmp_path, fake_pool, steps):
 	assert os.readlink(os.path.join(newest, 'g')) == rv.forward_text('g', V2)
 
 
+@pytest.mark.unit
 def test_a_hand_over_keeps_its_folders_times_and_record_across_the_renames(tmp_path, fake_pool, monkeypatch):
 	job_vault, newest = a_vault(str(tmp_path), {'f': 'x'})
 	fake_pool.add(job_vault, ['a', 'b'])
@@ -254,6 +262,7 @@ def test_a_hand_over_keeps_its_folders_times_and_record_across_the_renames(tmp_p
 	assert os.getxattr(newest, rv.ROOT_META_XATTR) == record
 
 
+@pytest.mark.unit
 def test_a_hand_over_on_a_pool_refuses_a_taken_name_with_nothing_changed(tmp_path, fake_pool):
 	job_vault, newest = a_vault(str(tmp_path), {'f': 'x'})
 	fake_pool.add(job_vault, ['a', 'b'])
@@ -263,6 +272,7 @@ def test_a_hand_over_on_a_pool_refuses_a_taken_name_with_nothing_changed(tmp_pat
 	assert os.path.isfile(os.path.join(newest, 'f'))
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('failing_flush', [1, 2, 3, 4])
 def test_a_failed_flush_in_the_hand_over_is_a_cut_the_scan_finishes(plain_vault, fake_pool, failing_flush):
 	job = plain_vault.job
@@ -279,6 +289,7 @@ def test_a_failed_flush_in_the_hand_over_is_a_cut_the_scan_finishes(plain_vault,
 	assert wrong_after_retry(plain_vault) == []
 
 
+@pytest.mark.unit
 def test_the_tree_keeps_every_entry_until_its_apply_phase(plain_vault, fake_pool, monkeypatch):
 	job = plain_vault.job
 	fake_pool.add(job.vault, ['a', 'b'])
@@ -313,6 +324,7 @@ def pool_writer(tmp_path, fake_pool, entries):
 	return rv.hand_over(job_vault, newest, os.path.join(job_vault, V2)), job_vault, newest
 
 
+@pytest.mark.unit
 def test_inline_records_are_noops_after_the_pass(tmp_path, fake_pool, steps):
 	writer, job_vault, newest = pool_writer(tmp_path, fake_pool, {'d/f': 'x', 'd/e/g': 'y', 'h': 'z', 'keep/i': 'k'})
 	del steps[:]
@@ -335,6 +347,7 @@ def test_inline_records_are_noops_after_the_pass(tmp_path, fake_pool, steps):
 	assert snapshot_tree(newest) == before
 
 
+@pytest.mark.unit
 def test_a_pass_with_nothing_to_record_flushes_nothing(tmp_path, fake_pool, steps):
 	writer, _, _ = pool_writer(tmp_path, fake_pool, {'f': 'x'})
 	del steps[:]
@@ -343,6 +356,7 @@ def test_a_pass_with_nothing_to_record_flushes_nothing(tmp_path, fake_pool, step
 	assert steps == []
 
 
+@pytest.mark.unit
 def test_an_inline_record_after_a_change_flushes_first(tmp_path, fake_pool, monkeypatch):
 	writer, job_vault, newest = pool_writer(tmp_path, fake_pool, {'d/f': 'x', 'g': 'y'})
 	seen = []
@@ -358,6 +372,7 @@ def test_an_inline_record_after_a_change_flushes_first(tmp_path, fake_pool, monk
 		assert f.read() == 'y'
 
 
+@pytest.mark.unit
 def test_each_verb_flushes_a_record_before_its_change(tmp_path, fake_pool, monkeypatch):
 	writer, job_vault, newest = pool_writer(tmp_path, fake_pool, {'a/f': '1', 'b/f': '2', 'c/f': '3', 'd/f': '4', 'e/f': '5'})
 	flushes = []
@@ -377,6 +392,7 @@ def test_each_verb_flushes_a_record_before_its_change(tmp_path, fake_pool, monke
 	assert not writer.needs_flush
 
 
+@pytest.mark.unit
 def test_a_record_on_a_pool_leaves_the_tree_as_it_was(tmp_path, fake_pool):
 	writer, job_vault, newest = pool_writer(tmp_path, fake_pool, {'d/e/f': 'x', 'g': 'y'})
 	tree = snapshot_tree(writer.tree)
@@ -389,6 +405,7 @@ def test_a_record_on_a_pool_leaves_the_tree_as_it_was(tmp_path, fake_pool):
 	assert os.lstat(os.path.join(newest, 'g')).st_ino == os.lstat(writer.path('g')).st_ino
 
 
+@pytest.mark.unit
 def test_a_batch_with_nothing_copied_flushes_on_a_pool_before_it_commits(tmp_path, fake_pool, monkeypatch):
 	job = create_job(str(tmp_path))
 	write_rule(job)
@@ -413,6 +430,7 @@ def test_a_batch_with_nothing_copied_flushes_on_a_pool_before_it_commits(tmp_pat
 	assert seen[-3:] == ['commit flush', 'flush', 'commit']
 
 
+@pytest.mark.unit
 def test_a_batch_on_a_pool_flushes_by_the_phase_not_by_the_entry(tmp_path, fake_pool, monkeypatch):
 	# each flush is a checkpoint on every disk: the replay's records go in one pass and the settling's in one, whatever the batch's size
 	job = create_job(str(tmp_path))
@@ -432,6 +450,7 @@ def test_a_batch_on_a_pool_flushes_by_the_phase_not_by_the_entry(tmp_path, fake_
 	assert 0 < len(flushes) <= 7
 
 
+@pytest.mark.unit
 def test_entries_the_sweep_removes_in_many_folders_are_recorded_in_one_pass(tmp_path, fake_pool, monkeypatch):
 	# a verification's sweep removes what no row tracks, from folders the batch had no event in: the settling's pass records them all and flushes
 	# once. taken out, each removal records inline, with a flush before it: one per folder (Review 3's surviving mutant of the pass)
@@ -457,6 +476,7 @@ def test_entries_the_sweep_removes_in_many_folders_are_recorded_in_one_pass(tmp_
 	assert 0 < len(flushes) <= 7, len(flushes)
 
 
+@pytest.mark.unit
 def test_a_cut_between_a_records_renames_gets_its_link_back(plain_vault, fake_pool):
 	job = plain_vault.job
 	fake_pool.add(job.vault, ['a', 'b'])
@@ -496,6 +516,7 @@ def job(tmp_path):
 	return create_job(str(tmp_path))
 
 
+@pytest.mark.unit
 def test_a_prune_flushes_after_its_rename(job, fake_pool, monkeypatch):
 	info = two_versions(job)
 	fake_pool.add(job.vault, ['a', 'b'])
@@ -512,12 +533,14 @@ def test_a_prune_flushes_after_its_rename(job, fake_pool, monkeypatch):
 	assert not os.path.lexists(staged) and not lists_of(job, v0)
 
 
+@pytest.mark.unit
 def test_a_prune_off_a_pool_flushes_nothing(job, monkeypatch):
 	info = two_versions(job)
 	monkeypatch.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: pytest.fail('a flush off a pool'))
 	assert rv.prune_oldest(info, 'job', job.monitor, on_tree=True) != (0, 0)
 
 
+@pytest.mark.unit
 def test_a_prune_whose_flush_fails_removes_nothing_more(job, fake_pool, monkeypatch):
 	info = two_versions(job)
 	fake_pool.add(job.vault, ['a', 'b'])
@@ -530,6 +553,7 @@ def test_a_prune_whose_flush_fails_removes_nothing_more(job, fake_pool, monkeypa
 	assert list(info) == [0, 1]
 
 
+@pytest.mark.unit
 def test_a_disk_mounted_again_during_a_prune_keeps_the_oldest_version(job, fake_pool):
 	info = two_versions(job)
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
@@ -543,6 +567,7 @@ def test_a_disk_mounted_again_during_a_prune_keeps_the_oldest_version(job, fake_
 	assert os.path.isdir(info[0].path) and lists_of(job, info[0]) and list(info) == [0, 1]
 
 
+@pytest.mark.unit
 def test_a_prune_never_finishes_an_oldest_version_a_missing_disk_hides_on_r(job, fake_pool, tmp_path):
 	# V0's folder lived on disk a alone: with it out, the rename would find nothing
 	info = two_versions(job)
@@ -561,6 +586,7 @@ def test_a_prune_never_finishes_an_oldest_version_a_missing_disk_hides_on_r(job,
 	assert not os.path.lexists(v0.path) and not lists_of(job, v0)
 
 
+@pytest.mark.unit
 def test_a_disk_dropping_during_the_removal_keeps_the_oldest_versions_lists_on_r(job, fake_pool, tmp_path, monkeypatch):
 	# the part of V0 on disk a goes out of sight while rm -rf runs, and is back with the disk
 	info = two_versions(job)
@@ -626,6 +652,7 @@ def waits_seen(monkeypatch):
 	return waiting
 
 
+@pytest.mark.unit
 def test_history_waits_through_the_hand_over_window(job, monkeypatch, capsys):
 	stacked(job)
 	waiting = waits_seen(monkeypatch)
@@ -647,6 +674,7 @@ def restore_thread(job, out, result):
 	return threading.Thread(target=lambda: result.append(rv.run_command(['restore', os.path.join(job.monitor, 'd/x'), str(out), '--version', '1', '--rule', job.rule_path])))
 
 
+@pytest.mark.unit
 def test_a_restore_waits_on_the_lock(job, tmp_path, monkeypatch):
 	# come while the batch holds its locks, before the first rename: it reads what it picks, and waits there through the window
 	stacked(job)
@@ -673,6 +701,7 @@ def test_a_restore_waits_on_the_lock(job, tmp_path, monkeypatch):
 		assert f.read() == 'x1'
 
 
+@pytest.mark.unit
 def test_a_restore_coming_in_the_window_waits_for_the_batch(job, tmp_path, monkeypatch):
 	stacked(job)
 	waiting = waits_seen(monkeypatch)
@@ -692,6 +721,7 @@ def test_a_restore_coming_in_the_window_waits_for_the_batch(job, tmp_path, monke
 		assert f.read() == 'x1'
 
 
+@pytest.mark.unit
 def test_a_prunes_list_with_no_folder_makes_no_reader_wait(job, monkeypatch):
 	# the oldest went at its rename, and its list goes after the removal: no reader waits on that
 	info = two_versions(job)
@@ -725,6 +755,7 @@ def real_pool(size_mib=256):
 		shutil.rmtree(root)
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 @pytest.mark.parametrize('only_sync_attributes', [False, True], ids=['attributes_copied', 'only_sync_attributes'])
 def test_every_kill_point_on_a_pool(only_sync_attributes):
@@ -735,6 +766,7 @@ def test_every_kill_point_on_a_pool(only_sync_attributes):
 		assert not wrong, f'{len(wrong)} kill points wrong: {wrong[:4]}'
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 def test_a_conversion_on_a_pool_reads_the_same(v054):
 	with real_pool() as root:
@@ -747,6 +779,7 @@ def test_a_conversion_on_a_pool_reads_the_same(v054):
 		assert not any(plain_links(job).values())
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 def test_hard_links_on_a_pool_read_as_one_inode_and_their_count_as_it_is():
 	with real_pool() as root:
@@ -763,6 +796,7 @@ def test_hard_links_on_a_pool_read_as_one_inode_and_their_count_as_it_is():
 		assert rv.links_now(second) == 1
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 def test_sizes_on_a_vault_read_as_no_pool_whose_attributes_lag_match_the_oracle(monkeypatch):
 	# the shape of any FUSE filesystem with no exchange that keeps a name's attributes for a second and is not read as a pool: the records
@@ -793,6 +827,7 @@ def test_sizes_on_a_vault_read_as_no_pool_whose_attributes_lag_match_the_oracle(
 			one.close()
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 @needs_mount
 def test_a_job_vault_on_a_real_mount_of_its_own_on_a_branch_commits_and_is_synced_through_it(monkeypatch):

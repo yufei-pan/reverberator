@@ -20,6 +20,8 @@ from tests.harness import create_job
 from tests.vault_oracle import forward_text, landing, version_number
 from tests.vaults import FORWARD, Link, forward_chain, record_layout, version_name, write_version
 
+pytestmark = pytest.mark.unit
+
 
 @pytest.fixture
 def vault(tmp_path):

@@ -77,6 +77,7 @@ def state_after(job_vault, old_list_of_2):
 	return 'list of 3 placed, previous list under its old name' if placed_old_name else 'list of 3 placed, previous list renamed'
 
 
+@pytest.mark.unit
 def test_the_helper_refuses_all_but_a_loop_image_of_this_test(tmp_path, monkeypatch):
 	ran = []
 	real_run = subprocess.run
@@ -107,6 +108,7 @@ def test_the_helper_refuses_all_but_a_loop_image_of_this_test(tmp_path, monkeypa
 	assert set(ran) == {'findmnt'}
 
 
+@pytest.mark.unit
 def test_the_helper_refuses_a_loop_device_of_someone_else(monkeypatch, tmp_path):
 	# as findmnt answers for a path under the scratch folder: a loop device this test never attached, and one holding another image
 	scratch = tmp_path / 'scratch'
@@ -130,6 +132,7 @@ def test_the_helper_refuses_a_loop_device_of_someone_else(monkeypatch, tmp_path)
 	assert 'sync' not in ran
 
 
+@pytest.mark.unit
 def test_a_loop_device_taken_by_another_run_between_find_and_set_up_is_tried_again(monkeypatch, tmp_path):
 	# losetup -f finds a free device and then sets it up: two runs at once can both find the same one, and the second exits 1. nothing has been
 	# done to the vault then, so it is not a run gone wrong
@@ -152,6 +155,7 @@ def test_a_loop_device_taken_by_another_run_between_find_and_set_up_is_tried_aga
 		image.attach()
 
 
+@pytest.mark.unit
 def test_no_test_calls_f2fs_io_or_syncfs_but_through_the_helper():
 	# the shutdown is the kernel's ioctl now (FS_IOC_SHUTDOWN on f2fs and ext4, XFS_IOC_GOINGDOWN on XFS, one number: 0x8004587D), issued from
 	# Python by scratch_images.py alone, so the guard names the ioctl as well as f2fs_io, which no test runs any more
@@ -164,6 +168,7 @@ def test_no_test_calls_f2fs_io_or_syncfs_but_through_the_helper():
 		assert not re.search(r"""['"]f2fs_io['"]|['"]sync['"],\s*['"]-f['"]|FS_IOC_SHUTDOWN|0x8004587[dD]|GOINGDOWN""", text), name
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_the_helper_refuses_a_loop_image_it_did_not_attach():
 	# mounted as the other tests mount it, by mount -o loop: not attached here
@@ -177,6 +182,7 @@ def test_the_helper_refuses_a_loop_image_it_did_not_attach():
 			f.write('alive')
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_the_helper_takes_only_while_attached():
 	with LoopImage(os.path.join(SCRATCH, 'attached'), 64) as image:
@@ -240,11 +246,13 @@ def sweep(only_sync, tmp_name, flush_step=None, filesystem='f2fs'):
 		assert not wrong, f'{len(wrong)} of {len(points)} steps wrong: {wrong[:4]}'
 
 
+@pytest.mark.privileged
 @pytest.mark.parametrize('filesystem', FILESYSTEMS)
 def test_every_step_survives_a_power_loss(only_sync, filesystem):
 	sweep(only_sync, 'power-loss', filesystem=filesystem)
 
 
+@pytest.mark.privileged
 @pytest.mark.parametrize('filesystem', FILESYSTEMS)
 @pytest.mark.parametrize('flush_step', [lambda step: max(1, step // 2), lambda step: max(1, step - 1)], ids=['midway', 'just_before'])
 def test_every_step_survives_a_power_loss_after_a_checkpoint(only_sync, flush_step, filesystem):
@@ -265,6 +273,7 @@ def keeping_the_placement_and_losing_the_rename(job_vault):
 	return fault
 
 
+@pytest.mark.privileged
 @pytest.mark.parametrize('filesystem', FILESYSTEMS)
 def test_a_power_loss_that_keeps_the_placement_and_loses_the_rename_is_finished(filesystem):
 	# a kernel may keep them in either order, as nothing syncs between them: this f2fs never showed this one by itself
@@ -293,6 +302,7 @@ def test_a_power_loss_that_keeps_the_placement_and_loses_the_rename_is_finished(
 		assert check_vault(job.job_vault, vault.expected, set()) == [] and view_truth.wrong_lists(job.job_vault) == []
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_a_committed_copy_survives_a_power_cut():
 	# a plain batch, no outside checkpoint: a folder's fsync in the commit is a checkpoint, which keeps a new file's size and not its data
@@ -324,6 +334,7 @@ def test_a_committed_copy_survives_a_power_cut():
 		assert check_vault(job.job_vault, {1: base[1], 2: base[2], 3: wanted}, set()) == []
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_a_cut_after_the_change_list_is_written_keeps_every_copy_right():
 	# the list's fsync is a checkpoint, which keeps a new file's size and not its data: the copies must be flushed before it. a chmod
@@ -388,6 +399,7 @@ def power_goes_before_the_flush(job_vault, mount, rel):
 	return fault
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_a_power_cut_after_a_checkpoint_before_the_commit_flush_copies_an_attribute_changes_copy_again():
 	# tests 7 and 8 of the flush round under a real power loss. A chmod with Only Sync Attributes off copies a file whose row does
@@ -430,6 +442,7 @@ def newest_bytes(job_vault, rel):
 		return f.read()
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_a_power_cut_before_the_flush_under_a_paused_mount_keeps_version_ns_bytes(monkeypatch):
 	# F1 under a real power loss. The file is on a folder the fake mount table calls an inner mount; a chmod with Only Sync Attributes

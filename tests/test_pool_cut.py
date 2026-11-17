@@ -208,6 +208,7 @@ def link_on_disk(disk: str, rel: str) -> str:
 	return path
 
 
+@pytest.mark.unit
 def test_a_name_both_link_and_real_loses_its_link(split_vault):
 	job_vault, newest, a, b = split_vault
 	file_link, folder_link, deep_link, alone = (link_on_disk(a, rel) for rel in ('g', 'd', 'e/f', 'h'))
@@ -221,6 +222,7 @@ def test_a_name_both_link_and_real_loses_its_link(split_vault):
 	assert os.path.islink(alone)
 
 
+@pytest.mark.unit
 def test_a_vault_off_a_pool_has_no_links_to_look_for(tmp_path, monkeypatch):
 	job_vault, newest = a_vault(str(tmp_path), {'g': 'y'})
 	monkeypatch.setattr(rv, 'entries_on_disks', lambda disks, folder: pytest.fail('a walk off a pool'))
@@ -228,6 +230,7 @@ def test_a_vault_off_a_pool_has_no_links_to_look_for(tmp_path, monkeypatch):
 	rv.remove_mixed_names(newest, newest, rv.PoolGuard([job_vault]))
 
 
+@pytest.mark.unit
 def test_a_missing_row_under_a_real_folder_gets_its_link_back(tmp_path, fake_pool):
 	job = create_job(str(tmp_path))
 	write_rule(job)
@@ -258,6 +261,7 @@ def test_a_missing_row_under_a_real_folder_gets_its_link_back(tmp_path, fake_poo
 	assert read_view(job.job_vault, newest.name) == before
 
 
+@pytest.mark.unit
 def test_a_name_of_two_kinds_in_the_tree_goes_on_every_disk(split_vault):
 	job_vault, newest, a, b = split_vault
 	tree = os.path.join(job_vault, V2)
@@ -274,6 +278,7 @@ def test_a_name_of_two_kinds_in_the_tree_goes_on_every_disk(split_vault):
 	assert not os.path.lexists(os.path.join(a, V2, 'same/deep')) and not os.path.lexists(os.path.join(b, V2, 'same/deep'))
 
 
+@pytest.mark.unit
 def test_a_name_the_previous_version_forwards_to_is_left_alone(tmp_path, fake_pool):
 	# it never changed in this batch, so what it holds is the only copy of it: whatever a disk shows, nothing goes on inference
 	job_vault, newest = a_vault(str(tmp_path), {'d/f': 'x'})
@@ -294,6 +299,7 @@ def flushes(monkeypatch):
 	return seen
 
 
+@pytest.mark.unit
 def test_a_skeleton_in_staging_is_finished(tmp_path, fake_pool, flushes):
 	job_vault, newest = a_vault(str(tmp_path), {'d/f': 'x', 'g': 'y'})
 	fake_pool.add(job_vault, ['a', 'b'])
@@ -316,6 +322,7 @@ def test_a_skeleton_in_staging_is_finished(tmp_path, fake_pool, flushes):
 		manifest.close()
 
 
+@pytest.mark.unit
 def test_a_tree_renamed_on_one_disk_only_gets_its_name_on_the_other(split_vault, flushes):
 	job_vault, newest, a, b = split_vault
 	os.mkdir(os.path.join(job_vault, V2))
@@ -332,6 +339,7 @@ def test_a_tree_renamed_on_one_disk_only_gets_its_name_on_the_other(split_vault,
 	assert flushes
 
 
+@pytest.mark.unit
 def test_a_disk_gone_before_a_tree_is_renamed_fails_the_repair_and_renames_nothing(split_vault, fake_pool, flushes):
 	# the repair judges by a listing through the pool (a new version with no change list, which a disk that is gone makes true of the list it
 	# holds) and renames on each disk directly: the scan's guard is checked before each rename. Disk a goes after the guard is made and before the
@@ -353,6 +361,7 @@ def test_a_disk_gone_before_a_tree_is_renamed_fails_the_repair_and_renames_nothi
 	assert not flushes
 
 
+@pytest.mark.unit
 def test_a_skeleton_on_its_way_in_is_no_tree(split_vault, flushes):
 	# past the flush between the renames every disk has the tree under its new name: a disk's folder under the old one is the skeleton's
 	job_vault, newest, a, b = split_vault
@@ -363,6 +372,7 @@ def test_a_skeleton_on_its_way_in_is_no_tree(split_vault, flushes):
 	assert os.path.islink(link)
 
 
+@pytest.mark.unit
 def test_no_new_folder_means_no_tree_to_rename(split_vault):
 	job_vault, newest, a, b = split_vault
 	on_disk(b, f'{V1}/there/x')
@@ -370,6 +380,7 @@ def test_no_new_folder_means_no_tree_to_rename(split_vault):
 	assert os.path.isfile(os.path.join(b, V1, 'there/x'))
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('second', ['full', 'empty', 'none'])
 def test_a_skeleton_left_beside_a_committed_version_is_no_tree_to_rename(tmp_path, fake_pool, flushes, second):
 	# the rm of a hand-over's skeleton failed, and V2 committed since: its list is there. disk b's folder of V1 holds the only copy of what V1
@@ -413,6 +424,7 @@ def a_cut_conversion(tmp_path, fake_pool):
 	return job_vault, newest, a, b, manifest
 
 
+@pytest.mark.unit
 def test_a_cut_migration_is_renamed_into_place(tmp_path, flushes):
 	# a filesystem with no RENAME_EXCHANGE, the job vault its one disk: the version gone, its tree ready
 	job_vault, newest = a_vault(str(tmp_path), {'g': 'y'})
@@ -431,6 +443,7 @@ def test_a_cut_migration_is_renamed_into_place(tmp_path, flushes):
 	assert flushes == [1]
 
 
+@pytest.mark.unit
 def test_a_ready_tree_goes_in_on_each_disk(tmp_path, fake_pool, flushes):
 	# in on one disk and on its way on the other: the version's folder shows, and the half still in staging joins it
 	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
@@ -446,6 +459,7 @@ def test_a_ready_tree_goes_in_on_each_disk(tmp_path, fake_pool, flushes):
 	assert os.path.isfile(os.path.join(b, rv.STAGING_NAME, rv.REPLACED_NAME, 'old'))
 
 
+@pytest.mark.unit
 def test_a_disk_gone_before_a_conversion_is_renamed_fails_the_repair_and_renames_nothing(tmp_path, fake_pool, flushes):
 	# a conversion's renames are judged by what staging shows through the pool, then made on each disk: the guard is checked before the first.
 	# Fails when the check comes after the renames (b's ready tree is in)
@@ -465,6 +479,7 @@ def test_a_disk_gone_before_a_conversion_is_renamed_fails_the_repair_and_renames
 	assert not flushes
 
 
+@pytest.mark.unit
 def test_an_old_tree_out_on_one_disk_only_comes_back(tmp_path, fake_pool, flushes):
 	# the tree built is still under its first name, so no flush said the old one is out of every disk: the version is converted again
 	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
@@ -480,6 +495,7 @@ def test_an_old_tree_out_on_one_disk_only_comes_back(tmp_path, fake_pool, flushe
 	assert not os.path.lexists(os.path.join(b, V1, 'built'))
 
 
+@pytest.mark.unit
 def test_a_conversion_whose_tree_is_in_leaves_the_old_one_to_staging(tmp_path, fake_pool, flushes):
 	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
 	try:
@@ -492,6 +508,7 @@ def test_a_conversion_whose_tree_is_in_leaves_the_old_one_to_staging(tmp_path, f
 	assert os.path.isfile(os.path.join(b, rv.STAGING_NAME, rv.REPLACED_NAME, 'old'))
 
 
+@pytest.mark.unit
 def test_a_conversion_on_two_renames_flushes_before_the_version_moves(tmp_path, fake_pool, monkeypatch):
 	# the tree built in staging must be on every disk before the version goes to old: then old on a disk means m or n shows somewhere,
 	# and old with the version showing means the tree is in. without the flush a disk may come back with old and the other with no m
@@ -515,6 +532,7 @@ def test_a_conversion_on_two_renames_flushes_before_the_version_moves(tmp_path, 
 		assert steps[steps.index(move) + 1] == ('flush',)
 
 
+@pytest.mark.unit
 def test_a_conversion_on_one_swap_has_no_flush_of_its_own(tmp_path, flushes):
 	# a swap in one call (RENAME_EXCHANGE) is one step on one disk
 	job_vault, newest = a_vault(str(tmp_path), {'d/f': 'x', 'g': 'y'})
@@ -523,6 +541,7 @@ def test_a_conversion_on_one_swap_has_no_flush_of_its_own(tmp_path, flushes):
 	assert flushes == []
 
 
+@pytest.mark.unit
 def test_a_conversion_split_in_the_middle_goes_back(tmp_path, fake_pool, flushes):
 	# m on one disk, n on the other, old on both: the middle rename reached one disk only, and the version is converted again
 	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
@@ -539,6 +558,7 @@ def test_a_conversion_split_in_the_middle_goes_back(tmp_path, fake_pool, flushes
 	assert flushes
 
 
+@pytest.mark.unit
 def test_a_lone_ready_tree_beside_the_version_is_a_leftover(tmp_path, fake_pool, flushes):
 	# a repair put old back and the removal of staging stopped after m: n is half of a tree already given up, and the version shows
 	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
@@ -555,6 +575,7 @@ def test_a_lone_ready_tree_beside_the_version_is_a_leftover(tmp_path, fake_pool,
 	assert flushes == []
 
 
+@pytest.mark.unit
 def test_a_lone_ready_tree_with_the_version_gone_goes_in(tmp_path, fake_pool, flushes):
 	job_vault, newest, a, b, manifest = a_cut_conversion(tmp_path, fake_pool)
 	try:
@@ -570,6 +591,7 @@ def test_a_lone_ready_tree_with_the_version_gone_goes_in(tmp_path, fake_pool, fl
 	assert flushes == [1]
 
 
+@pytest.mark.unit
 def test_the_version_being_converted_is_the_newest_not_done(tmp_path):
 	job_vault, newest = a_vault(str(tmp_path), {'g': 'y'})
 	manifest = rv.VaultManifest(job_vault)
@@ -586,6 +608,7 @@ def test_the_version_being_converted_is_the_newest_not_done(tmp_path):
 		manifest.close()
 
 
+@pytest.mark.unit
 def test_a_walk_does_not_read_a_folder_an_rm_is_removing(tmp_path, fake_pool, monkeypatch):
 	# through mergerfs a lstat of a folder an rm -rf is at can answer EBADF, and the attempt would fail on it
 	job_vault, newest = a_vault(str(tmp_path), {'d/e/f': 'x', 'd/g': 'y'})
@@ -599,6 +622,7 @@ def test_a_walk_does_not_read_a_folder_an_rm_is_removing(tmp_path, fake_pool, mo
 	writer.record('d', False)
 
 
+@pytest.mark.unit
 def test_a_folder_queued_for_removal_is_known_to_the_writer(tmp_path, fake_pool):
 	job_vault, newest = a_vault(str(tmp_path), {'d/e/f': 'x', 'g': 'y'})
 	fake_pool.add(job_vault, ['a', 'b'])
@@ -613,6 +637,7 @@ def test_a_folder_queued_for_removal_is_known_to_the_writer(tmp_path, fake_pool)
 	assert len(removals) == 2
 
 
+@pytest.mark.unit
 def test_the_plan_of_a_batch():
 	# flushes at 2 and 5, the change list at 4: an interval is cut before its next flush
 	trace = [['mkdir', 'x'], ['flush'], ['rename', 'V1--a', 'V2--a'], ['mkdir', f'{rv.CHANGE_LIST_FOLDER_PREFIX}x'], ['flush'], ['commit'], ['end']]
@@ -1035,6 +1060,7 @@ def refuse_under_xdist(environ=os.environ) -> None:
 			'Run it alone: pytest -p no:cacheprovider tests/test_pool_cut.py', pytrace=False)
 
 
+@pytest.mark.unit
 def test_the_gate_fails_under_xdist_and_runs_alone_otherwise(monkeypatch):
 	monkeypatch.setenv('PYTEST_XDIST_WORKER', 'gw0')
 	with pytest.raises(pytest.fail.Exception, match='must run without -n'):
@@ -1056,6 +1082,7 @@ def steps_of(shape: Shape, cut_fault=None) -> tuple:
 	return in_worker_result(lambda: run_uncut(shape, os.path.join(shape.base, 'work', f'{shape.name}-uncut'), cut_fault))
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 @pytest.mark.parametrize('name', list(SHAPES))
 def test_a_cut_at_any_step_of_each_disk_leaves_every_version_exact(name, request):
@@ -1124,6 +1151,7 @@ def caught(name: str, request, plan, tag: str, cut_fault=None, retry_fault=None)
 	return bool(wrong_runs(name, request, plan, tag, cut_fault, retry_fault))
 
 
+@pytest.mark.unit
 def test_the_pre_record_fault_takes_away_the_flush_and_nothing_else(tmp_path, fake_pool, monkeypatch):
 	# flush() also gives a real folder its times back: without that, a folder a pool made on a disk keeps the time of the record in a run with no cut at all (Review 3b's N6)
 	writer, job_vault, newest = pool_writer(tmp_path, fake_pool, {'d/f': 'x', 'd/e/g': 'y'})
@@ -1146,6 +1174,7 @@ def test_the_pre_record_fault_takes_away_the_flush_and_nothing_else(tmp_path, fa
 	assert os.lstat(os.path.join(newest, 'd')).st_mtime_ns == wanted
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 def test_a_skipped_pre_record_flush_is_caught(request):
 	assert caught('mixed-2', request, control_runs, '-control-pre-record', cut_fault=no_pre_record_flush)
@@ -1156,6 +1185,7 @@ def last_disk_unsynced(trace: list, disks: int) -> list:
 	return sorted({(kill, *cuts[:-1], 0) for kill, *cuts in control_runs(trace, disks)})
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 def test_the_flush_reaches_every_disk(request):
 	# the real helper, no fault: in runs where the last disk comes back from its template, a flush that skipped it leaves a version wrong (the plan puts a disk's own sync
@@ -1181,6 +1211,7 @@ def skipping(name: str):
 # that cannot be read and keeps its last copy, is still in the new version, where 0.55.4 lost it, and every version reads exact (the oracle, the
 # rows, the commands); 0 of 275 runs wrong in 12 templates. The repair itself is pinned by the tests of it above, which fail with it taken out, and the
 # test after this one pins what is left to the scan without it.
+@pytest.mark.privileged
 @needs_mergerfs
 @pytest.mark.parametrize('name, repair', [('mixed-2', 'remove_shadowed_links'), ('mixed-2', 'put_back_forward_links'), ('mixed-2', 'remove_mixed_names'),
 	('conversion-2', 'finish_conversion_renames')])
@@ -1211,6 +1242,7 @@ def skipping_the_tree_rename_and_noting_it(folder: str):
 	return fault
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 def test_a_skipped_tree_rename_repair_leaves_every_version_exact(request):
 	# the opposite of the controls above, on the state finish_tree_rename() is for: a hand-over's tree renamed on one disk only, the other disk still
@@ -1294,6 +1326,7 @@ def a_start_losing_a_disk(shape: Shape, work: str, kill: int, when: str) -> dict
 	return found
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 @pytest.mark.parametrize('when', ['begins', 'ends'])
 def test_a_disk_lost_during_the_starts_repair_fails_the_start_and_leaves_every_version_exact(when, request):
@@ -1370,6 +1403,7 @@ def one_forced_try(shape: Shape, rename: int, flushed: int) -> dict:
 	return found
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 def test_a_conversion_cut_after_the_version_moved_keeps_every_name(request):
 	# old on one disk and the version's other part in place on the other must never read as "the tree is in": that depends on where the pool put
@@ -1455,6 +1489,7 @@ def double_runs(trace: list, disks: int) -> list:
 	return runs
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 @pytest.mark.parametrize('name', ['conversion-2', 'conversion-3'])
 def test_a_second_cut_in_the_retry_leaves_every_version_exact(name, request):
@@ -1471,6 +1506,7 @@ def test_a_second_cut_in_the_retry_leaves_every_version_exact(name, request):
 	assert not wrong, f'{len(wrong)} of {len(runs)} runs wrong: {wrong[:3]}'
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 @pytest.mark.parametrize('name, runner, plan', [('mixed-2', one_run, planned_runs), ('conversion-2', double_run, double_runs)], ids=['single', 'double'])
 def test_a_vault_the_oracle_cannot_read_is_a_wrong_run_and_no_failure_of_the_rig(name, runner, plan, request):
@@ -1484,6 +1520,7 @@ def test_a_vault_the_oracle_cannot_read_is_a_wrong_run_and_no_failure_of_the_rig
 	assert len(wrong) == 2 and all('FileNotFoundError' in row['wrong'][0] and 'y.txt' in row['wrong'][0] for row in wrong), wrong
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 def test_a_failure_to_mount_or_make_an_image_stays_a_rig_row_that_says_what_failed(request):
 	shape = built_shape('mixed-2', request)

@@ -21,6 +21,8 @@ from tests.test_r_batch import ITEMS, each_item, take_wrong
 from tests.test_tree_writer import V2, deep_vault, source_file
 from tests.vault_oracle import check_vault, sizes_by_newest_holder, snapshot_tree, version_number
 
+pytestmark = pytest.mark.unit
+
 ONE_MIB = 1 << 20
 
 

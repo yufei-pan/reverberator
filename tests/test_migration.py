@@ -156,6 +156,7 @@ def plain_links(job):
 	return {name: daemon_links(job.job_vault, name) for name in folders_of(job).values()}
 
 
+@pytest.mark.unit
 def test_the_054_module_cannot_flush_the_disks(tmp_path, v054, monkeypatch):
 	# a real syncfs would flush the live filesystem under /tmp: the stub on rv does not reach a second module
 	module = v054.module
@@ -178,6 +179,7 @@ def test_the_054_module_cannot_flush_the_disks(tmp_path, v054, monkeypatch):
 	assert set(flushed) <= {job.job_vault}
 
 
+@pytest.mark.unit
 def test_a_built_vault_is_a_real_054_vault(small):
 	names = folders_of(small)
 	assert sorted(names) == [0, 1, 2]
@@ -187,6 +189,7 @@ def test_a_built_vault_is_a_real_054_vault(small):
 	assert not os.path.lexists(rv.staging_path(small.job_vault))
 
 
+@pytest.mark.unit
 def test_every_version_reads_the_same_after_conversion(every_item):
 	before = expected(every_item)
 	versions = folders_of(every_item)
@@ -204,6 +207,7 @@ def test_every_version_reads_the_same_after_conversion(every_item):
 	assert layout_of(every_item) == 'r'
 
 
+@pytest.mark.unit
 def test_a_converted_version_holds_no_chain_link(every_item):
 	assert any(plain_links(every_item).values())
 	assert migrate(every_item) is True
@@ -213,6 +217,7 @@ def test_a_converted_version_holds_no_chain_link(every_item):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_the_files_of_a_converted_version_are_the_same_inodes(small):
 	before, after = {}, {}
 	for number, name in folders_of(small).items():
@@ -225,6 +230,7 @@ def test_the_files_of_a_converted_version_are_the_same_inodes(small):
 	assert after == before
 
 
+@pytest.mark.unit
 def test_the_oldest_whole_version_is_left_alone(every_item):
 	oldest = os.path.join(every_item.job_vault, next(iter(folders_of(every_item).values())))
 	assert daemon_links(every_item.job_vault, os.path.basename(oldest)) == []
@@ -235,6 +241,7 @@ def test_the_oldest_whole_version_is_left_alone(every_item):
 	assert {rel: os.lstat(os.path.join(oldest, rel)).st_ino for rel in inner} == inner
 
 
+@pytest.mark.unit
 def test_a_version_left_whole_gets_its_line_too(small):
 	lines = []
 	real = rv.backuperTeeLogToTl
@@ -246,6 +253,7 @@ def test_a_version_left_whole_gets_its_line_too(small):
 	assert [line for line in lines if line.startswith('Converting ')] == ['Converting job vault: V2 (1 of 3)', 'Converting job vault: V1 (2 of 3)', 'Converting job vault: V0 (3 of 3)']
 
 
+@pytest.mark.unit
 def test_each_conversion_line_reaches_the_journal(small):
 	# the Rollout says to watch the journal, which gets stdout: only a line sent the ok way is teed to it
 	seen = []
@@ -259,6 +267,7 @@ def test_each_conversion_line_reaches_the_journal(small):
 	assert len(lines) == 3 and all(kwargs.get('ok') is True for _, kwargs in lines)
 
 
+@pytest.mark.unit
 def test_a_dangling_chain_stays_the_link(small):
 	names = folders_of(small)
 	# the end of a's chain, gone by hand
@@ -279,6 +288,7 @@ def test_a_dangling_chain_stays_the_link(small):
 	assert rv.walk_version(small.job_vault, 2, 'a.txt', False).kind == 'symlink'
 
 
+@pytest.mark.unit
 def test_a_dangling_chain_is_logged_once_and_a_users_own_link_is_not(small):
 	names = folders_of(small)
 	os.remove(os.path.join(small.job_vault, names[0], 'a.txt'))
@@ -339,6 +349,7 @@ def rel_with_a_link_that_fits(room, limit):
 			return rel
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('spare', [1, 12, 22])
 def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	# the tree is built in staging, whose own name must not be longer than the version's: a path that fits in a version converts
@@ -375,6 +386,7 @@ def test_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	assert cli_differences(job.job_vault, before) == []
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('spare', [1, 12, 22])
 def test_a_new_file_at_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	# on every filesystem, XFS included: a file new in the last batch is copied, not linked to an older version, so the path can be as long as a path
@@ -408,6 +420,7 @@ def test_a_new_file_at_a_path_near_the_limit_converts(tmp_path, v054, spare):
 	assert cli_differences(job.job_vault, before) == []
 
 
+@pytest.mark.unit
 def test_a_version_counts_as_done_only_after_a_flush_of_its_folder_time(small, monkeypatch):
 	# including one that needs no plain tree (V0, or one a repair finished): its folder's time is set, and a second cut must not lose it
 	# for a version the manifest calls done
@@ -426,6 +439,7 @@ def test_a_version_counts_as_done_only_after_a_flush_of_its_folder_time(small, m
 		assert events[number - 1] == 'flush' and events[number - 2] == ('utime', events[number][1])
 
 
+@pytest.mark.unit
 def test_folders_moved_aside_and_put_back_still_read_as_converting(small, tmp_path):
 	# a conversion begun, the version folders moved away for a look, a start, and the folders put back: the layout stays unset, so
 	# the conversion goes on and reads them as 0.54 trees (a scan that set 'r' while they were away would read their links as R's)
@@ -458,6 +472,7 @@ def test_folders_moved_aside_and_put_back_still_read_as_converting(small, tmp_pa
 	assert expected(small) == before
 
 
+@pytest.mark.unit
 def test_a_prune_temp_is_left_out(small):
 	names = folders_of(small)
 	top = os.path.join(small.job_vault, names[2])
@@ -475,6 +490,7 @@ def test_a_prune_temp_is_left_out(small):
 	assert expected(small) == before
 
 
+@pytest.mark.unit
 def test_a_prune_temp_beside_a_copy_makes_a_version_with_no_chain_link_go_through(small):
 	# what a cut on a pool leaves: the copy in the link's place, the temp on another disk
 	names = folders_of(small)
@@ -488,6 +504,7 @@ def test_a_prune_temp_beside_a_copy_makes_a_version_with_no_chain_link_go_throug
 	assert expected(small) == before
 
 
+@pytest.mark.unit
 def test_a_users_link_with_chain_text_is_judged_by_text(small):
 	# the accepted limitation: a user's link whose text is exactly a chain link's, naming a file, becomes that file
 	names = folders_of(small)
@@ -506,6 +523,7 @@ def test_a_users_link_with_chain_text_is_judged_by_text(small):
 	assert os.readlink(os.path.join(top, 'mine_nothing')) == to_nothing
 
 
+@pytest.mark.unit
 def test_a_file_at_its_hard_link_limit_is_copied(small, monkeypatch):
 	before = expected(small)
 	names = folders_of(small)
@@ -524,6 +542,7 @@ def test_a_file_at_its_hard_link_limit_is_copied(small, monkeypatch):
 	assert len(inodes) == 3
 
 
+@pytest.mark.unit
 def test_a_link_that_fails_leaves_the_version_as_it_was(small, monkeypatch):
 	before = expected(small)
 	def failing(*args, **kwargs):
@@ -537,6 +556,7 @@ def test_a_link_that_fails_leaves_the_version_as_it_was(small, monkeypatch):
 	assert expected(small) == before
 
 
+@pytest.mark.unit
 def test_a_copy_that_fails_leaves_the_version_as_it_was(small, monkeypatch):
 	before = expected(small)
 	def refused(*args, **kwargs):
@@ -548,6 +568,7 @@ def test_a_copy_that_fails_leaves_the_version_as_it_was(small, monkeypatch):
 	assert expected(small) == before
 
 
+@pytest.mark.unit
 def test_a_folder_whose_metadata_cannot_be_kept_stops_the_version(small, monkeypatch):
 	before = expected(small)
 	def losing(source, dest, st, failed):
@@ -560,6 +581,7 @@ def test_a_folder_whose_metadata_cannot_be_kept_stops_the_version(small, monkeyp
 	assert any(plain_links(small).values())
 
 
+@pytest.mark.unit
 def test_folders_keep_their_metadata_and_the_root_its_record(small):
 	names = folders_of(small)
 	newest = os.path.join(small.job_vault, names[2])
@@ -580,6 +602,7 @@ def rows_of(job):
 		conn.close()
 
 
+@pytest.mark.unit
 def test_the_rows_still_describe_the_newest(small):
 	rows = rows_of(small)
 	names = folders_of(small)
@@ -613,6 +636,7 @@ def lists_of(job):
 	return sorted(name for name in os.listdir(job.job_vault) if name.endswith(rv.CONTENT_FILE_EXTENSION_NAME))
 
 
+@pytest.mark.unit
 def test_sizes_pass_equals_newest_holder(every_item):
 	assert migrate(every_item) is True
 	assert wrong_lists(every_item.job_vault) == []
@@ -624,6 +648,7 @@ def test_sizes_pass_equals_newest_holder(every_item):
 		assert entries[number].size == pytest.approx(size, rel=0.01)
 
 
+@pytest.mark.unit
 def test_sizes_pass_on_hand_made_sharing_counts_each_inode_in_the_newest_holder(small):
 	assert migrate(small) is True
 	names = folders_of(small)
@@ -639,6 +664,7 @@ def test_sizes_pass_on_hand_made_sharing_counts_each_inode_in_the_newest_holder(
 	assert wrong_lists(small.job_vault) == []
 
 
+@pytest.mark.unit
 def test_sizes_pass_twice_changes_nothing(small, monkeypatch):
 	assert migrate(small) is True
 	lists = lists_of(small)
@@ -654,6 +680,7 @@ def test_sizes_pass_twice_changes_nothing(small, monkeypatch):
 	assert {name: os.lstat(os.path.join(small.job_vault, name)).st_mtime_ns for name in lists} == times
 
 
+@pytest.mark.unit
 def test_the_salt_and_the_marker_go_after_the_layout(small):
 	job_vault = small.job_vault
 	for name in (SALT, MARKER):
@@ -673,6 +700,7 @@ def test_the_salt_and_the_marker_go_after_the_layout(small):
 	assert [name for name in (SALT, MARKER) if os.path.lexists(os.path.join(job_vault, name))] == []
 
 
+@pytest.mark.unit
 def test_a_cut_after_the_layout_leaves_the_salt_to_the_next_scan(small):
 	job_vault = small.job_vault
 	assert migrate(small) is True
@@ -756,6 +784,7 @@ def after_the_resume(job, before, times, point):
 	return [f'kill at {point}, resumed: {line}' for line in wrong]
 
 
+@pytest.mark.unit
 def test_the_kill_sweep_covers_every_kind_of_step(tmp_path_factory, v054):
 	job, _ = prepared_vault(tmp_path_factory, v054)
 	counts = steps_of(job).counts
@@ -763,6 +792,7 @@ def test_the_kill_sweep_covers_every_kind_of_step(tmp_path_factory, v054):
 		assert counts.get(kind), f'no {kind} step in {counts}'
 
 
+@pytest.mark.unit
 def test_a_kill_at_every_step_resumes_exact(tmp_path_factory, v054):
 	job, before = prepared_vault(tmp_path_factory, v054)
 	total = in_child(job, None, lambda: migrate(job), moving_the_mtime).steps
@@ -781,6 +811,7 @@ def test_a_kill_at_every_step_resumes_exact(tmp_path_factory, v054):
 	assert wrong == []
 
 
+@pytest.mark.unit
 def test_a_kill_during_the_resume_is_safe(tmp_path_factory, v054):
 	job, before = prepared_vault(tmp_path_factory, v054)
 	total = steps_of(job).steps
@@ -826,6 +857,7 @@ def a_batch_is_refused(job):
 	return True
 
 
+@pytest.mark.unit
 def test_no_backup_or_prune_before_the_sizes_pass_ends(small, monkeypatch):
 	# a stop between two versions: the newest is plain, the older still of links
 	names = folders_of(small)
@@ -845,6 +877,7 @@ def test_no_backup_or_prune_before_the_sizes_pass_ends(small, monkeypatch):
 	assert wrong_lists(small.job_vault) == []
 
 
+@pytest.mark.unit
 def test_the_conversion_runs_no_batch_of_its_own(small, monkeypatch):
 	def refused(*args, **kwargs):
 		raise AssertionError('a backup or a prune during the conversion')
@@ -853,6 +886,7 @@ def test_the_conversion_runs_no_batch_of_its_own(small, monkeypatch):
 	assert migrate(small) is True
 
 
+@pytest.mark.unit
 def test_a_vault_with_a_lost_manifest_is_no_conversion_to_refuse(tmp_path):
 	# only a vault whose manifest says a conversion began waits for it: the scan and the roll-forward read one whose manifest is lost
 	job = create_job(str(tmp_path))
@@ -872,6 +906,7 @@ def run_options(keep):
 	return dict(only_sync_attributes=False, keep_n_versions=keep, backup_size_limit='0')
 
 
+@pytest.mark.unit
 def test_the_first_prune_after_conversion_keeps_the_others_exact(every_item):
 	assert migrate(every_item) is True
 	before = expected(every_item)
@@ -887,6 +922,7 @@ def test_the_first_prune_after_conversion_keeps_the_others_exact(every_item):
 	assert wrong_lists(every_item.job_vault) == []
 
 
+@pytest.mark.unit
 def test_the_first_batch_after_conversion_is_exact(every_item):
 	assert migrate(every_item) is True
 	before = expected(every_item)
@@ -910,6 +946,7 @@ def test_the_first_batch_after_conversion_is_exact(every_item):
 	assert cli_differences(every_item.job_vault, before) == []
 
 
+@pytest.mark.unit
 def test_a_stop_during_conversion_goes_on_at_the_next_start(small):
 	before = expected(small)
 	polls = []
@@ -925,6 +962,7 @@ def test_a_stop_during_conversion_goes_on_at_the_next_start(small):
 	assert not any(plain_links(small).values())
 
 
+@pytest.mark.unit
 def test_a_stop_at_the_start_changes_no_version(small):
 	before = expected(small)
 	assert migrate(small, lambda: True) is False
@@ -933,6 +971,7 @@ def test_a_stop_at_the_start_changes_no_version(small):
 	assert migrate(small) is True
 
 
+@pytest.mark.unit
 def test_a_resume_passes_over_a_version_already_done(small, monkeypatch):
 	polls = []
 	real = rv.materialize_version
@@ -950,6 +989,7 @@ def test_a_resume_passes_over_a_version_already_done(small, monkeypatch):
 	assert first not in done
 
 
+@pytest.mark.unit
 def test_the_staging_folder_is_on_the_disk_first(small, monkeypatch):
 	# a vault that has staging never gets the 0.54 rules again, so staging comes before the first change of a version
 	real = rv.fsync_vault_folder
@@ -961,6 +1001,7 @@ def test_the_staging_folder_is_on_the_disk_first(small, monkeypatch):
 	assert ('fsync', True) in order[:order.index('build')]
 
 
+@pytest.mark.unit
 def test_each_version_is_flushed_before_it_counts_as_done(small, monkeypatch):
 	# a power cut must not keep the manifest's word that a version is plain and lose its exchange: that version would never be converted
 	order = []
@@ -975,6 +1016,7 @@ def test_each_version_is_flushed_before_it_counts_as_done(small, monkeypatch):
 			assert order.index(('exchange', name)) < order.index('flush', order.index(('exchange', name))) < order.index(('done', name))
 
 
+@pytest.mark.unit
 def test_a_flush_that_fails_stops_the_conversion(small, monkeypatch):
 	monkeypatch.setattr(rv, 'sync_vault_filesystems', lambda job_vault, job_name: {'/dev/fake': OSError(errno.EIO, 'input/output error')})
 	with pytest.raises(rv.JobFailure):
@@ -982,6 +1024,7 @@ def test_a_flush_that_fails_stops_the_conversion(small, monkeypatch):
 	assert layout_of(small) is None
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_a_conversion_on_f2fs_uses_exchange_and_keeps_times(v054, monkeypatch):
 	exchanges = []
@@ -1023,6 +1066,7 @@ def flushing_for_real(module):
 	module.LIBC_SYNCFS = lambda fd: flush_scratch(os.readlink(f'/proc/self/fd/{fd}')) or 0
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_a_power_loss_during_conversion_resumes_exact(v054):
 	# at each step the filesystem stops with no checkpoint; every other point has one from half way, so that state is what comes back

@@ -18,6 +18,8 @@ from tests.harness import create_job, event_entry, run_backup
 from tests.test_migration import long_rel, put_long
 from tests.vault_oracle import check_vault, forward_text, linked_place, read_view, snapshot_tree, version_number
 
+pytestmark = pytest.mark.unit
+
 # every version stays to be read; tests/test_r_sizes.py runs each item through a real keep-N
 KEPT = dict(keep_n_versions=0)
 

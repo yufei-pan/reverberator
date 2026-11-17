@@ -31,7 +31,7 @@ from tests.crash_child import failing_copy_command, in_child, kill_run, retry, r
 from tests.harness import create_job
 from tests.vault_oracle import check_vault, compared, entry_view, forward_text, read_view, rows_match_vault, sizes_by_newest_holder, snapshot_tree, version_number
 
-pytestmark = pytest.mark.skipif(os.geteuid() != 0, reason='the root record is a trusted.* attribute, and a file is chowned')
+pytestmark = [pytest.mark.unit, pytest.mark.skipif(os.geteuid() != 0, reason='the root record is a trusted.* attribute, and a file is chowned')]
 
 # a default run's kill points
 DEFAULT_KILL_POINTS = 110

@@ -19,6 +19,8 @@ from tests.crash_batches import backup_events, build_base, put_text
 from tests.harness import create_job, run_backup, write_committed_version, write_incomplete_version
 from tests.vault_oracle import check_vault, compared, read_view, snapshot_tree, version_number
 
+pytestmark = pytest.mark.unit
+
 STAMP = '2030-01-01_00-00-00_+0000'
 MANIFEST = rv.MANIFEST_FILE_NAME
 KEPT = {'keep_n_versions': 0}

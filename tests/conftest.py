@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import pytest
+from _pytest.doctest import DoctestItem
 import reverberator as rv
 from tests import harness
 from tests.harness import FakePool, create_job, reverberator_script
@@ -25,6 +26,11 @@ STILL_054 = {
 # syncfs only ever on a scratch image's own mount (tests/scratch_images.py)
 REAL_SYNC_VAULT_FILESYSTEMS = rv.sync_vault_filesystems
 REAL_LIBC_SYNCFS = rv.LIBC_SYNCFS
+
+# the layers of the full-test-suite spec (docs/superpowers/specs/2026-08-12-full-test-suite-design.md), by what a test does:
+# unit in-process (also one that needs root only for a trusted.* attribute or a chown), inotify a real watch, process the
+# daemon's CLI started, privileged a mount (a loop image, tmpfs, mergerfs, dm). every collected test carries one
+LAYERS = ('unit', 'inotify', 'process', 'privileged')
 
 
 def syncfs_stand_in(fd:int) -> int:
@@ -235,7 +241,23 @@ def pytest_configure(config):
 		resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 
 
+def unmarked_tests(items) -> list:
+	'''The node id of each collected test that carries none of the layer markers; a doctest needs none.'''
+	return [item.nodeid for item in items
+		if not isinstance(item, DoctestItem) and not any(item.get_closest_marker(name) is not None for name in LAYERS)]
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
+	# a test made without its layer fails the collection, naming it: twenty modules once missed theirs, and `pytest -m unit`
+	# left most of design R's unit tests out. first, so no -m has deselected it yet. a collection error of its module, which an
+	# xdist worker hands on as any other: a UsageError there ends in an INTERNALERROR naming none of them, and no test run
+	by_module = {}
+	for nodeid in unmarked_tests(items):
+		by_module.setdefault(nodeid.split('::')[0], []).append(nodeid)
+	for module, names in by_module.items():
+		config.hook.pytest_collectreport(report=pytest.CollectReport(module, 'failed',
+			f'tests with no layer marker ({", ".join(LAYERS)}): ' + ', '.join(names), []))
 	if sys.platform == 'linux':
 		return
 	skip = pytest.mark.skip(reason='inotify/process tests require Linux')

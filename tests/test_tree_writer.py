@@ -203,6 +203,7 @@ def apply_random_change(rng, writer, shadow, tmp, log):
 		assert os.lstat(path).st_mtime_ns == st.st_mtime_ns
 
 
+@pytest.mark.unit
 def test_a_random_sequence_of_tree_changes_keeps_version_n_exact(tmp_path):
 	for seed in range(200):
 		rng = random.Random(seed)
@@ -233,6 +234,7 @@ def test_a_random_sequence_of_tree_changes_keeps_version_n_exact(tmp_path):
 
 # --- the texts and the hand-over ---
 
+@pytest.mark.unit
 def test_the_forward_text_is_exact():
 	assert rv.forward_text('a', 'V2--x') == '../V2--x/a'
 	assert rv.forward_text('a/b/c', 'V2--x') == '../../../V2--x/a/b/c'
@@ -243,6 +245,7 @@ def test_the_forward_text_is_exact():
 	assert os.fsencode(rv.forward_text('bad\udcff', 'V2--x')) == b'../V2--x/bad\xff'
 
 
+@pytest.mark.unit
 def test_hand_over_leaves_no_moment_without_the_tree(tmp_path):
 	def attempt(kill_at, number):
 		job_vault, newest = a_vault(str(tmp_path / str(number)), {'x': 'the contents', 'y': 'y', 'd/z': 'z'})
@@ -262,6 +265,7 @@ def test_hand_over_leaves_no_moment_without_the_tree(tmp_path):
 	assert not attempt(uncut.steps + 1, 'past').killed
 
 
+@pytest.mark.unit
 def test_the_skeleton_names_itself_until_its_exchange(tmp_path, monkeypatch):
 	job_vault, newest = a_vault(str(tmp_path), {'x': 'x', 'd/y': 'y', 'bad\udcff': 'b'})
 	new = os.path.join(job_vault, V2)
@@ -282,6 +286,7 @@ def test_the_skeleton_names_itself_until_its_exchange(tmp_path, monkeypatch):
 		assert f.read() == 'x'
 
 
+@pytest.mark.unit
 def test_hand_over_fails_on_a_folder_already_there_and_changes_nothing(tmp_path):
 	job_vault, newest = a_vault(str(tmp_path), {'x': 'x'})
 	os.mkdir(os.path.join(job_vault, V2))
@@ -290,6 +295,7 @@ def test_hand_over_fails_on_a_folder_already_there_and_changes_nothing(tmp_path)
 	assert os.listdir(os.path.join(job_vault, V2)) == [] and not os.path.islink(os.path.join(newest, 'x'))
 
 
+@pytest.mark.unit
 def test_hand_over_makes_staging_before_the_exchange(tmp_path, monkeypatch):
 	# a vault whose manifest is lost reads as design R by its staging: the 0.54 rules would remove a cut batch's tree
 	job_vault, newest = a_vault(str(tmp_path), {'x': 'x'})
@@ -302,6 +308,7 @@ def test_hand_over_makes_staging_before_the_exchange(tmp_path, monkeypatch):
 	assert rv.staging_path(job_vault) == os.path.join(job_vault, '.reverberator_staging')
 
 
+@pytest.mark.unit
 def test_hand_over_copies_the_root_record_and_times(tmp_path):
 	job_vault, newest = a_vault(str(tmp_path), {'x': 'x'})
 	write_root_record(newest, 77)
@@ -316,6 +323,7 @@ def test_hand_over_copies_the_root_record_and_times(tmp_path):
 	assert not os.path.islink(os.path.join(newest, 'x'))
 
 
+@pytest.mark.unit
 def test_a_vault_with_no_root_record_hands_over(tmp_path):
 	job_vault, newest = a_vault(str(tmp_path), {'x': 'x'})
 	os.removexattr(newest, ROOT_RECORD)
@@ -323,6 +331,7 @@ def test_a_vault_with_no_root_record_hands_over(tmp_path):
 	assert ROOT_RECORD not in os.listxattr(newest)
 
 
+@pytest.mark.unit
 def test_rename_exchange_raises_oserror(tmp_path):
 	with pytest.raises(FileNotFoundError):
 		rv.rename_exchange(str(tmp_path / 'gone'), str(tmp_path / 'gone2'))
@@ -334,6 +343,7 @@ def test_rename_exchange_raises_oserror(tmp_path):
 
 # --- the records ---
 
+@pytest.mark.unit
 def test_a_file_replacing_a_folder_keeps_the_folder_until_placed(tmp_path, monkeypatch):
 	entries = {'d/x': 'old x', 'd/sub/y': 'old y', 'keep': 'k'}
 	writer, job_vault, before = handed_over(str(tmp_path), entries)
@@ -353,6 +363,7 @@ def test_a_file_replacing_a_folder_keeps_the_folder_until_placed(tmp_path, monke
 	assert staging_of(job_vault) == []
 
 
+@pytest.mark.unit
 def test_a_folder_copied_over_itself_records_per_entry(tmp_path, monkeypatch):
 	entries = {'d/copied': 'old copied', 'd/unreadable': 'old unreadable', 'd/sub/deep': 'old deep', 'd/sub/deep2': 'old deep2', 'other': 'o'}
 	writer, job_vault, before = handed_over(str(tmp_path), entries)
@@ -379,6 +390,7 @@ def test_a_folder_copied_over_itself_records_per_entry(tmp_path, monkeypatch):
 	assert os.path.islink(os.path.join(previous, 'd', 'sub', 'deep2')) and os.path.islink(os.path.join(previous, 'other'))
 
 
+@pytest.mark.unit
 def test_a_move_records_by_hard_link(tmp_path):
 	writer, job_vault, before = handed_over(str(tmp_path), {'d/x': 'old x', 'd/sub/y': 'old y'})
 	tree, previous = writer.tree, writer.previous
@@ -394,6 +406,7 @@ def test_a_move_records_by_hard_link(tmp_path):
 	assert not os.path.lexists(os.path.join(previous, 'e'))
 
 
+@pytest.mark.unit
 def test_a_rename_with_nothing_to_rename_changes_nothing(tmp_path):
 	writer, job_vault, before = handed_over(str(tmp_path), {'f': 'f', 'to': 'to', 'd/x': 'x'})
 	assert writer.rename('gone', 'to') is False
@@ -405,6 +418,7 @@ def test_a_rename_with_nothing_to_rename_changes_nothing(tmp_path):
 	assert read_view(job_vault, V1) == before
 
 
+@pytest.mark.unit
 def test_emlink_records_a_copy(tmp_path, monkeypatch):
 	entries = {'keep': 'kept', 'moved': 'moved', 'd/x': 'in d', 'd/sub/y': 'in sub'}
 	writer, job_vault, before = handed_over(str(tmp_path), entries)
@@ -425,6 +439,7 @@ def test_emlink_records_a_copy(tmp_path, monkeypatch):
 	assert staging_of(job_vault) == []
 
 
+@pytest.mark.unit
 def test_another_link_error_fails_the_record_and_keeps_version_n(tmp_path, monkeypatch):
 	writer, job_vault, before = handed_over(str(tmp_path), {'x': 'x'})
 	def full(*args, **kwargs):
@@ -436,6 +451,7 @@ def test_another_link_error_fails_the_record_and_keeps_version_n(tmp_path, monke
 	assert read_view(job_vault, V1) == before
 
 
+@pytest.mark.unit
 def test_a_folder_an_rm_is_removing_needs_no_record(tmp_path, monkeypatch):
 	# deletes run deepest first and their rm runs beside the replay: the record of a folder above can look at one the rm then takes
 	writer, job_vault, before = handed_over(str(tmp_path), {'d/sub/x': 'x', 'd/y': 'y'})
@@ -451,6 +467,7 @@ def test_a_folder_an_rm_is_removing_needs_no_record(tmp_path, monkeypatch):
 	assert read_view(job_vault, V1) == before
 
 
+@pytest.mark.unit
 def test_a_metadata_copy_that_fails_fails_the_unfold_before_the_exchange(tmp_path, monkeypatch):
 	writer, job_vault, before = handed_over(str(tmp_path), {'d/x': 'x'})
 	def no_meta(source, dest, failed=None):
@@ -463,6 +480,7 @@ def test_a_metadata_copy_that_fails_fails_the_unfold_before_the_exchange(tmp_pat
 	assert read_view(job_vault, V1) == before
 
 
+@pytest.mark.unit
 def test_a_forwarded_entry_missing_from_the_tree_fails_the_attempt_on_a_pool(tmp_path, monkeypatch):
 	# a pool's disk gone: copying over it would make version 1 read the new copy, and it may come back
 	writer, job_vault, _ = handed_over(str(tmp_path), {'x': 'x', 'd/y': 'y'})
@@ -478,6 +496,7 @@ def test_a_forwarded_entry_missing_from_the_tree_fails_the_attempt_on_a_pool(tmp
 	assert os.path.islink(os.path.join(writer.previous, 'x')) and os.path.islink(os.path.join(writer.previous, 'd'))
 
 
+@pytest.mark.unit
 def test_a_forwarded_entry_missing_from_the_tree_goes_with_a_warning_on_one_filesystem(tmp_path, capsys):
 	# only a hand can have removed it, and the version already reads as missing there
 	writer, job_vault, before = handed_over(str(tmp_path), {'x': 'x', 'd/y': 'y', 'e/f/z': 'z', 'kept': 'k'})
@@ -518,6 +537,7 @@ def deep_vault(tmp, levels):
 	return job_vault, os.path.join(job_vault, V1)
 
 
+@pytest.mark.unit
 def test_a_forward_text_too_long_is_recorded_real(tmp_path):
 	levels = 1500
 	job_vault, newest = deep_vault(str(tmp_path), levels)
@@ -570,6 +590,7 @@ def p_state(previous):
 	return state
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('do', [
 	lambda writer: writer.record('file', True),
 	lambda writer: writer.record('file', False),
@@ -598,6 +619,7 @@ def test_records_are_idempotent(tmp_path, do):
 	assert staging_of(job_vault) == []
 
 
+@pytest.mark.unit
 def test_a_merge_records_what_still_forwards_and_nothing_else(tmp_path):
 	writer, job_vault, before = handed_over(str(tmp_path), {'d/old': 'old', 'd/kept': 'kept', 'd/sub/x': 'x'})
 	# P/d is real, one entry recorded: the removal of the folder records the others one by one
@@ -610,6 +632,7 @@ def test_a_merge_records_what_still_forwards_and_nothing_else(tmp_path):
 	assert not os.path.islink(os.path.join(writer.previous, 'd', 'sub'))
 
 
+@pytest.mark.unit
 def test_pass_through_writes_only_the_tree(tmp_path):
 	# previous None: V0 and the 0.54 layout. no record, no staging
 	tree = tmp_path / 'tree'
@@ -627,6 +650,7 @@ def test_pass_through_writes_only_the_tree(tmp_path):
 
 # --- on the filesystem of the live vaults ---
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_unfold_gives_times_back_on_f2fs():
 	with f2fs_mount(SCRATCH, 128) as mount_point:

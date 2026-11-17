@@ -27,6 +27,7 @@ def read_job(tmp_path):
 	return lambda name: _read(tmp_path / 'state' / f'job-{name}.json')
 
 
+@pytest.mark.unit
 def test_status_board_writes_the_daemon_record(tmp_path):
 	rv.StatusBoard(str(tmp_path / 's'), '/etc/r.tsv')
 	with open(tmp_path / 's' / 'daemon.json') as f:
@@ -35,12 +36,14 @@ def test_status_board_writes_the_daemon_record(tmp_path):
 	assert record['version'] == rv.__version__ and record['rule_path'] == '/etc/r.tsv'
 
 
+@pytest.mark.unit
 def test_status_board_never_raises(tmp_path):
 	(tmp_path / 'file').write_text('x')
 	board = rv.StatusBoard(str(tmp_path / 'file'), '/r.tsv')
 	board.write_job('j', {'state': 'running'})
 
 
+@pytest.mark.unit
 def test_state_dir_path_prefers_override_then_environment(monkeypatch):
 	monkeypatch.setenv('REVERB_STATE_DIR', '/env')
 	assert rv.state_dir_path('/x') == '/x' and rv.state_dir_path() == '/env'
@@ -48,10 +51,12 @@ def test_state_dir_path_prefers_override_then_environment(monkeypatch):
 	assert rv.state_dir_path() == rv.DEFAULT_STATE_DIR
 
 
+@pytest.mark.unit
 def test_process_start_ticks_is_none_for_a_missing_process():
 	assert rv.process_start_ticks(2 ** 22 + 12345) is None
 
 
+@pytest.mark.unit
 def test_waits_publish_waiting_until_the_last_ends(board, read_job):
 	job = rv.JobControl('j')
 	job.start_attempt()
@@ -65,6 +70,7 @@ def test_waits_publish_waiting_until_the_last_ends(board, read_job):
 	assert read_job('j')['state'] == 'running'
 
 
+@pytest.mark.unit
 def test_wait_for_path_reports_waiting(tmp_path, board, read_job, poll_fast):
 	flag = threading.Event()
 	flag.set()
@@ -82,6 +88,7 @@ def test_wait_for_path_reports_waiting(tmp_path, board, read_job, poll_fast):
 	assert result == [True] and read_job('j')['state'] == 'running'
 
 
+@pytest.mark.unit
 def test_run_job_publishes_retrying_then_stopped(board, read_job, monkeypatch, poll_fast):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.3)
 	start_attempt, _ = _attempts([('fail', 'disk gone'), ('fail', 'bad pattern', True)])
@@ -101,6 +108,7 @@ def test_run_job_publishes_retrying_then_stopped(board, read_job, monkeypatch, p
 	assert stopped['state'] == 'stopped' and stopped['detail'] == 'bad pattern'
 
 
+@pytest.mark.unit
 def test_a_monitor_gate_wait_shows_what_it_waits_for_now(tmp_path, board, read_job, monkeypatch, poll_fast):
 	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 60)
 	monkeypatch.setattr(rv, 'get_fs_signatures', lambda path: [])
@@ -125,6 +133,7 @@ def test_a_monitor_gate_wait_shows_what_it_waits_for_now(tmp_path, board, read_j
 	assert result == [False] and read_job('j')['state'] == 'starting'
 
 
+@pytest.mark.unit
 def test_a_stalled_status_write_holds_up_no_other_job_thread(board, read_job):
 	job = rv.JobControl('j')
 	job.start_attempt()
@@ -156,6 +165,7 @@ def test_a_stalled_status_write_holds_up_no_other_job_thread(board, read_job):
 	assert read_job('j')['state'] == 'stopped'
 
 
+@pytest.mark.unit
 def test_status_board_logs_one_error_for_writes_failing_together(tmp_path, capsys):
 	main = threading.current_thread()
 	class RacingBoard(rv.StatusBoard):
@@ -183,6 +193,7 @@ def test_status_board_logs_one_error_for_writes_failing_together(tmp_path, capsy
 	assert capsys.readouterr().out.count('Cannot write status files') == 1
 
 
+@pytest.mark.unit
 def test_a_failed_status_write_leaves_no_temp_file_and_logs_once(tmp_path, capsys):
 	state = tmp_path / 'state'
 	board = rv.StatusBoard(str(state), '/r.tsv')
@@ -196,6 +207,7 @@ def test_a_failed_status_write_leaves_no_temp_file_and_logs_once(tmp_path, capsy
 	assert capsys.readouterr().out.count('Cannot write status files') == 1
 
 
+@pytest.mark.unit
 def test_mark_committed_records_last_success(board, read_job):
 	job = rv.JobControl('j')
 	job.set_state('running')

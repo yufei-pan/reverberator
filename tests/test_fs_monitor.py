@@ -34,6 +34,7 @@ def manual_monitor(tmp_path, monkeypatch):
 	return monitor, mountinfo
 
 
+@pytest.mark.unit
 def test_shared_pair_is_checked_once_with_independent_flags(manual_monitor, counted_signatures, tmp_path):
 	monitor, _ = manual_monitor
 	calls, _ = counted_signatures
@@ -52,6 +53,7 @@ def test_shared_pair_is_checked_once_with_independent_flags(manual_monitor, coun
 	assert len(calls) == 1
 
 
+@pytest.mark.unit
 def test_only_containing_mount_changes_trigger_recheck(manual_monitor, counted_signatures, tmp_path):
 	monitor, mountinfo = manual_monitor
 	calls, result = counted_signatures
@@ -70,6 +72,7 @@ def test_only_containing_mount_changes_trigger_recheck(manual_monitor, counted_s
 	assert not flag.is_set()
 
 
+@pytest.mark.unit
 def test_unsigned_pair_sets_flag_without_running_commands(monkeypatch, poll_fast, tmp_path):
 	def fail(path):
 		raise AssertionError('unsigned pairs must not run df / lsblk')

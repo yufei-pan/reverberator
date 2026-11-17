@@ -25,6 +25,8 @@ from tests.harness import create_job, event_entry, run_backup, seed_monitor, wri
 from tests.vault_oracle import entry_view, read_view, snapshot_tree
 from tests.vaults import FORWARD, Link, forward_chain, record_layout, version_name, write_version
 
+pytestmark = pytest.mark.unit
+
 T0 = '2021-01-01_00-00-00_-0800'
 T1 = '2021-01-02_00-00-00_-0800'
 T2 = '2021-01-03_00-00-00_-0800'

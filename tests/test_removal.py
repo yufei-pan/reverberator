@@ -41,23 +41,28 @@ def module_names() -> set:
 	return names
 
 
+@pytest.mark.unit
 def test_the_removed_names_are_gone():
 	assert sorted(REMOVED & module_names()) == []
 
 
+@pytest.mark.unit
 def test_the_kept_names_are_there():
 	assert sorted(KEPT - module_names()) == []
 
 
+@pytest.mark.unit
 def test_the_scan_no_longer_measures_with_du():
 	assert 'recalculate' not in inspect.signature(rv.get_vault_info).parameters
 
 
+@pytest.mark.unit
 def test_nothing_of_a_batch_takes_a_chain_length_or_copy_threads():
 	for function in (rv.backuper, rv.do_backup):
 		assert not {'chain_length', 'copy_threads'} & set(inspect.signature(function).parameters)
 
 
+@pytest.mark.unit
 def test_columns_14_and_15_stay_in_the_rule_file():
 	assert rv.REVERB_RULE_TSV_HEADER[13:15] == ['Chain Length', 'Copy threads']
 	assert rv.REVERB_RULE_HEADER[-2:] == ['chain_length', 'copy_threads']
