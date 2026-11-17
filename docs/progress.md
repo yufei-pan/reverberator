@@ -70,8 +70,7 @@ chief's decisions), Q15 is below. The plan is written
 task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (the healing test) runs second so Q15
 can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
 stays as written). Next: building, by subagent-driven development, on the recommended options, which Q9 to Q14's
-answers all took, once P7's 24-hour reading is in (2026-11-15 23:01 PST) (chief's decision,
-2026-11-15). Behind it: a deferral is planned work; the user's pick 2026-11-14,
+answers all took, once shared usage limits allow (chief's decision of 2026-11-16); P7's 24-hour reading is in. Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -129,12 +128,16 @@ background GC is set to 80, yet the GC took sections 94% valid (the threshold is
 batches a day would likely mean more such tails (not measured), which bore on Q16 (closed: the user kept the rule). The
 other three vault disks took 0.3 to 0.7 GiB each from 04:00 to 05:00 PST, 57 to 93% of it GC, while another job backed
 up a database dump (the daemon wrote 192 MiB; the rest is not attributed, and the dump's own folder is on the same
-pool). Next: the 24-hour reading (23:01 PST) in the session's scratch folder (`p7/`; `delta.py` subtracts two
-snapshots); then whether the daemon's own share is over the target, and a question on the GC for the user. The vault
-disks are members of the storage pool, whose members are all mounted `mode=lfs` with `background_gc=on`; a change to
-those mount options is an fstab change: the user's OK, through chief.
-Paused for shared usage limits from 2026-11-15 21:01 PST, as those decisions say: the 24-hour reading's snapshot is
-taken by its script at 23:01 PST and recorded here when the pause ends.
+pool).
+Reading D, the 24 hours from 2026-11-14 23:01 PST: the busiest job's vault disk took 13.1 GiB, 4.5 GiB of it GC (35%);
+the other three vault disks took 0.5 to 1.1 GiB each, 67 to 84% of it GC. The day held two of the job's batches: 01:36
+PST (23,002 entries, reading A) and 22:41 PST (19,731 entries, 21 hours after the first, so started by an hour of quiet,
+not the one-day maximum), whose GC tail falls after the reading. The daemon wrote 9.1 GiB in all and used 163 s of CPU
+(0.19% of a core); in the last 15 hours, the second batch included, 28 s (0.05%; 0.54.1 idle: 0.03%). So the daemon's
+own share is under the target: about 0.46 GiB a batch beyond the bytes that changed (reading A), and those bytes are the
+tree's own changes, 3.5 to 5 GiB a batch now, which the spec's 24 to 36 MiB a cycle (hourly batches of a quieter tree)
+did not foresee. P7 has measured all it set out to: writes, the GC share, prunes, idle CPU, memory. Next: Q17, the GC on
+the vault disks; the row closes with its answer.
 Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
 when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
@@ -144,8 +147,8 @@ swap, peak 158 MB; at 14 hours (15:20), anonymous 91.2 MB (18.5 MB in memory, 72
 158 MB. Next: read again at two days' uptime, about 2026-11-16, against 0.55.4's 163 MB anonymous (18 MB in memory,
 145 MB swapped) and 150 MB peak. The README (line 90) says idle memory stays near 35 MB, which the tests measured: live,
 only the resident part is near it, as swap holds the rest. If the anonymous total stays far above it, find what holds
-the memory and correct the line. housekeepd takes
-the reading (case 572, from 2026-11-16, the user's pick "Leave housekeepd a note (Recommended)"). Behind it: the
+the memory and correct the line. A reading at 45 hours (2026-11-15 23:01 PST, 20 minutes after a 19,731-entry batch, so not idle): resident 86 MB
+(74 MB of it anonymous), 39 MB in swap, peak 158 MB. housekeepd takes the reading (case 572, from 2026-11-16, the user's pick "Leave housekeepd a note (Recommended)"). Behind it: the
 user's pick "Trim, shrink, 2 arenas (Recommended)" (2026-11-13).
 
 **P10 to P13. Four parts of round 22's first watcher design that the step back never took up.** Source:
@@ -219,6 +222,20 @@ is written on the recommended options and marks the tasks an answer would change
   - (b) Widen "A folder whose extended attributes alone fail to copy keeps the wrong ones" (this one overrides the
     ladder).
 
+- **Q17. f2fs's background GC on the vault disks** (P7, readings B and D). The operator sees: after each large batch the
+  busiest job's vault disk keeps writing for about five hours, as f2fs's background GC rewrites 16 MiB sections still
+  about 94% valid: about 4.2 GiB after a 5.17 GiB batch, to gain 134 MiB of free space on a disk 6% full; over 24 hours,
+  4.5 of that disk's 13.1 GiB of writes. The cause is the mount options every pool member shares (`background_gc=on`
+  with `mode=lfs`, sections of 8 segments), not the daemon; the members are 0 to 31% full. With background GC off, a
+  section whose blocks are all deleted is still freed without GC, and f2fs still collects in the foreground when free
+  sections run low, picking the emptiest; on these disks that point is months away, and the writes that meet it then
+  wait for the collection. The user's words: "every little bit will sum up to a lot over days month years" (2026-11-03);
+  none on the mount options; `mode=lfs` is the pool's own choice, its reason not on record. What waits on it: nothing in
+  round 0.55.6; a change is an fstab change and a remount, the user's OK.
+  - (a) Turn background GC off on the four vault disks only (`background_gc=off` in their fstab lines, then a
+    remount); the other pool members keep it (Recommended).
+  - (b) Leave the mount options as they are: about 0.8 times each large batch's bytes again in GC writes.
+  - (c) Turn it off on every pool member.
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
   yet, keep it open".
