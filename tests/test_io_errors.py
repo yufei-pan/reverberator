@@ -1,6 +1,7 @@
 import errno
 import os
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -8,6 +9,7 @@ from collections import OrderedDict
 import pytest
 import reverberator as rv
 from tests.harness import seed_monitor, committed_versions
+from tests.vault_oracle import landing, version_number
 
 pytestmark = pytest.mark.unit
 
@@ -1110,3 +1112,229 @@ def test_an_unreadable_file_under_a_folder_over_a_lost_manifest_still_makes_no_v
 	manifest.close()
 	assert committed is True and committed_versions(job) == before
 	assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
+# the folder-metadata healing check (spec section 16, step 1; the user's pick 2026-11-03, "Not an issue, check healing
+# (Recommended)"): a folder's own metadata copy fails once, and later versions are read for whether they heal it
+
+# the kernel's POSIX ACL as an extended attribute: version 2, then (tag, permissions, id) per entry. A minimal default ACL,
+# user::rwx group::r-x other::r-x, which a folder made in its folder inherits as its own default ACL (and no access ACL)
+ACL_DEFAULT = 'system.posix_acl_default'
+DEFAULT_ACL = (2).to_bytes(4, 'little') + b''.join(tag.to_bytes(2, 'little') + perm.to_bytes(2, 'little') + (0xFFFFFFFF).to_bytes(4, 'little')
+	for tag, perm in ((0x01, 7), (0x04, 5), (0x20, 5)))
+# copy_file_meta()'s steps after the owner, in its order: drop_xattrs_missing_from(), then copystat()'s times, extended attributes and
+# mode (Python 3.13's order). A step named here is the one the stand-in fails at: everything before it is done
+FOLDER_COPY_STEPS = ('drop_missing', 'copy_xattrs', 'before_chmod')
+
+
+def fail_folder_copy_once(monkeypatch, vault_rel:str, step:str) -> list:
+	'''
+	rv.copy_new_folder_meta() and rv.copy_file_meta() replaced so that the first copy onto any version's folder at vault_rel
+	(<job vault>/V<n>--<time>/<vault_rel>; never one into staging, on its way into the previous version) runs the real
+	copy_file_meta() with its steps after the owner done for real up to step, one of FOLDER_COPY_STEPS, where an EIO stops it:
+	copy_file_meta()'s own except then writes its ERROR line and traceback, appends the source to failed and returns False.
+	Every later call is the real one. Both are replaced, as copy_new_folder_meta()'s fast path falls back to copy_file_meta(),
+	which would mend a single failed request at once. Returns the list of the destination it failed, empty until then.
+	'''
+	assert step in FOLDER_COPY_STEPS
+	parts = vault_rel.strip('/').split('/')
+	real_new_folder_meta, real_file_meta, real_drop, real_copystat = rv.copy_new_folder_meta, rv.copy_file_meta, rv.drop_xattrs_missing_from, rv.copystat
+	failed_at = []
+
+	def first_at_place(dest:str) -> bool:
+		held = os.path.normpath(dest).split(os.sep)
+		if failed_at or len(held) <= len(parts) or held[-len(parts):] != parts or version_number(held[-len(parts) - 1]) is None:
+			return False
+		failed_at.append(dest)
+		return True
+
+	def fail_at(here:str, path:str):
+		if here == step:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+
+	def drop(source:str, dest:str):
+		fail_at('drop_missing', dest)
+		real_drop(source, dest)
+
+	def copystat(src:str, dst:str):
+		# shutil.copystat() of 3.13 on a folder, step by step, as copy_file_meta() calls it
+		st = os.stat(src)
+		os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+		fail_at('copy_xattrs', dst)
+		shutil._copyxattr(src, dst)
+		fail_at('before_chmod', dst)
+		os.chmod(dst, stat.S_IMODE(st.st_mode))
+
+	def failing_copy(source:str, dest:str, failed:list):
+		rv.drop_xattrs_missing_from, rv.copystat = drop, copystat
+		try:
+			return real_file_meta(source, dest, failed)
+		finally:
+			rv.drop_xattrs_missing_from, rv.copystat = real_drop, real_copystat
+
+	def copy_new_folder_meta(source_folder, backup_folder_path, st, failed=None):
+		if first_at_place(backup_folder_path):
+			return failing_copy(source_folder, backup_folder_path, failed)
+		return real_new_folder_meta(source_folder, backup_folder_path, st, failed)
+
+	def copy_file_meta(source_file, backup_file_path, failed=None):
+		if first_at_place(backup_file_path):
+			return failing_copy(source_file, backup_file_path, failed)
+		return real_file_meta(source_file, backup_file_path, failed)
+
+	monkeypatch.setattr(rv, 'copy_new_folder_meta', copy_new_folder_meta)
+	monkeypatch.setattr(rv, 'copy_file_meta', copy_file_meta)
+	return failed_at
+
+
+def _give(path:str, case:str):
+	'''The monitored folder at path gets what case names: setgid, the default ACL, or user.note. Skips where the filesystem keeps no such attribute.'''
+	try:
+		if case == 'setgid':
+			os.chmod(path, stat.S_IMODE(os.lstat(path).st_mode) | stat.S_ISGID)
+		elif case == 'default_acl':
+			os.setxattr(path, ACL_DEFAULT, DEFAULT_ACL)
+		else:
+			os.setxattr(path, 'user.note', b'x')
+	except OSError as e:
+		if e.errno != errno.ENOTSUP:
+			raise
+		pytest.skip(f'the basetemp\'s filesystem keeps no {ACL_DEFAULT if case == "default_acl" else "user.*"} attribute: {e}')
+
+
+def _case_reading(path:str, case:str):
+	'''What case reads of the folder at path: whether it has setgid, its default ACL, or its user.note (None for none).'''
+	if case == 'setgid':
+		return bool(os.lstat(path).st_mode & stat.S_ISGID)
+	try:
+		return os.getxattr(path, ACL_DEFAULT if case == 'default_acl' else 'user.note', follow_symlinks=False)
+	except OSError as e:
+		if e.errno != errno.ENODATA:
+			raise
+		return None
+
+
+def healed_at(job, versions:list, case:str, monitored:str, rel:str):
+	'''
+	The index in versions (the failing version first) of the first whose folder at rel, read through its daemon links, reads as
+	the monitored folder does what case reads: 0 when the failing version already does (its failure left nothing to heal), None
+	when none does. Also returns each version's reading.
+	'''
+	want = _case_reading(monitored, case)
+	reads = [_case_reading(os.path.join(job.job_vault, *landing(job.job_vault, os.path.basename(version), rel)), case) for version in versions]
+	return next((i for i, read in enumerate(reads) if read == want), None), reads
+
+
+CASES = {
+	# P setgid, C without (uid 65534 sets both on its own folders); the copy fails before its chmod: C keeps the inherited bit
+	'setgid': 'before_chmod',
+	# P with a default ACL (system.posix_acl_default, an ACL blob written by os.setxattr), C without; the removal step fails
+	'default_acl': 'drop_missing',
+	# C with user.note = b'x'; copystat()'s attribute step fails, after the times
+	'own_xattr': 'copy_xattrs',
+}
+# step 1's three places: V0's walk and settle() of a folder a batch made (mkdir C), where C is new and inherits from P what the case names; and
+# a batch's attrib of C, where C is right in the vault and the batch gives the monitored C what the case names (chmod g+s, a default ACL,
+# user.note), which settle() copies too
+PLACES = ['first_version', 'settle', 'attrib']
+# the full comparison's attribute check reaches an entry whose ctime is not before the matched time less VERIFY_CTIME_MARGIN_SECONDS
+# (full_comparison_since(), ctime_bound()). right_after: it comes within seconds of the batch that touched C, as the test's steps do,
+# so it still reaches C, whose ctime that batch moved. later: the margin is 0 for it, which stands for the time a later full comparison
+# comes after (one after a batch committed more than the margin after C's last change, as one at the next start or interval mostly
+# is): C's ctime is before its bound, and only C's record (mode, owner, group, mtime) can show it differs
+FULL_COMPARISONS = ['right_after', 'later']
+# (case, place, full comparison): the index of the first version that holds C as the monitored C is (1, after a batch that does not
+# touch C; 2, after a batch that touches C; 3, after the full comparison), 0 when the failing version already does, None when none does
+HEALS = {
+	# main 0.55.5: nothing to heal: V0's walk makes every folder before it copies any folder's metadata, so C inherits nothing from P
+	('setgid', 'first_version', 'right_after'): 0,
+	('setgid', 'first_version', 'later'): 0,
+	# main 0.55.5: heals at the full comparison, by C's mode against its record
+	('setgid', 'settle', 'right_after'): 3,
+	('setgid', 'settle', 'later'): 3,
+	# main 0.55.5: heals at the full comparison, by C's mode against its record
+	('setgid', 'attrib', 'right_after'): 3,
+	('setgid', 'attrib', 'later'): 3,
+	# main 0.55.5: nothing to heal, as for setgid
+	('default_acl', 'first_version', 'right_after'): 0,
+	('default_acl', 'first_version', 'later'): 0,
+	# main 0.55.5: heals at the full comparison, by its attribute check
+	('default_acl', 'settle', 'right_after'): 3,
+	# main 0.55.5: does not heal: the batch that writes into C gives it its times and records them, so C's record no longer differs
+	('default_acl', 'settle', 'later'): None,
+	# main 0.55.5: heals at the full comparison, by its attribute check
+	('default_acl', 'attrib', 'right_after'): 3,
+	# main 0.55.5: does not heal: C's record never differed (an attribute moves no mtime)
+	('default_acl', 'attrib', 'later'): None,
+	# main 0.55.5: heals at the full comparison, by its attribute check
+	('own_xattr', 'first_version', 'right_after'): 3,
+	# main 0.55.5: does not heal: C's record matches the monitored C
+	('own_xattr', 'first_version', 'later'): None,
+	# main 0.55.5: heals at the full comparison, by its attribute check
+	('own_xattr', 'settle', 'right_after'): 3,
+	# main 0.55.5: does not heal: C's record matches the monitored C
+	('own_xattr', 'settle', 'later'): None,
+	# main 0.55.5: heals at the full comparison, by its attribute check
+	('own_xattr', 'attrib', 'right_after'): 3,
+	# main 0.55.5: does not heal: C's record matches the monitored C
+	('own_xattr', 'attrib', 'later'): None,
+}
+
+
+@pytest.mark.parametrize('case', CASES)
+@pytest.mark.parametrize('place', PLACES)
+@pytest.mark.parametrize('full_comparison', FULL_COMPARISONS)
+def test_a_folder_metadata_copy_that_failed_once(job, poll_fast, monkeypatch, capsys, case, place, full_comparison):
+	# pin: main's answer to the healing check (spec section 16, step 1), which the user is asked about (the spec's Q7). The failing
+	# version, then a batch that does not touch C (a file elsewhere), a batch that touches C (a file in it), and a full comparison
+	# (with a file changed elsewhere, so it commits a version whatever it finds of C): C's setgid bit, its system.posix_acl_default,
+	# or its user.note, read in each version through its daemon links
+	parent, folder = os.path.join(job.monitor, 'P'), os.path.join(job.monitor, 'P', 'C')
+	seed_monitor(job, {'a.txt': 'a'})
+	os.mkdir(parent)
+	if case != 'own_xattr':
+		_give(parent, case)
+
+	def make_folder():
+		# made in P, so it inherits what P has; then without it, as the case's C is
+		os.mkdir(folder)
+		if case == 'setgid':
+			os.chmod(folder, stat.S_IMODE(os.lstat(folder).st_mode) & ~stat.S_ISGID)
+		elif case == 'default_acl':
+			os.removexattr(folder, ACL_DEFAULT)
+		assert _case_reading(folder, case) in (False, None)
+		if case == 'own_xattr' and place != 'attrib':
+			_give(folder, case)
+
+	if place == 'first_version':
+		make_folder()
+		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case])
+		assert _full(job) is True
+	elif place == 'settle':
+		assert _full(job) is True
+		make_folder()
+		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case])
+		_events(job, [(True, 'create', 'P/C', None)])
+	else:
+		make_folder()
+		assert _full(job) is True
+		_give(folder, case)
+		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case])
+		_events(job, [(True, 'attrib', 'P/C', None)])
+	failing = len(committed_versions(job)) - 1
+	# the stand-in failed C's copy in the failing version
+	assert [os.path.dirname(os.path.dirname(os.path.normpath(dest))) for dest in failed_at] == [committed_versions(job)[failing]]
+	seed_monitor(job, {'elsewhere.txt': 'e'})
+	_events(job, [(False, 'create', 'elsewhere.txt', None)])
+	seed_monitor(job, {'P/C/f.txt': 'f'})
+	_events(job, [(False, 'create', 'P/C/f.txt', None)])
+	seed_monitor(job, {'a.txt': 'a, changed'})
+	if full_comparison == 'later':
+		monkeypatch.setattr(rv, 'VERIFY_CTIME_MARGIN_SECONDS', 0)
+	assert _full(job) is True
+	versions = committed_versions(job)[failing:]
+	assert len(versions) == 4
+	out = capsys.readouterr()
+	assert (out.out + out.err).count('Failed to copy metadata ') == 1
+	heals, reads = healed_at(job, versions, case, folder, 'P/C')
+	assert heals == HEALS[(case, place, full_comparison)], f'{case} at {place}, the full comparison {full_comparison}: heals at {heals}; the versions read {reads}, the monitored C {_case_reading(folder, case)!r}'
