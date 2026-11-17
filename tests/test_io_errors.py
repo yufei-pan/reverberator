@@ -8,7 +8,7 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, committed_versions
+from tests.harness import on_folder_open, seed_monitor, committed_versions
 from tests.vault_oracle import landing, version_number
 
 pytestmark = pytest.mark.unit
@@ -19,13 +19,11 @@ def _backup(job, entries=None):
 		vault_path=job.vault, only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0')
 
 
-def _fail_scandir(monkeypatch, failing_path, err):
-	original = os.scandir
-	def scandir(path='.'):
-		if os.path.abspath(path).rstrip('/') == os.path.abspath(failing_path).rstrip('/'):
-			raise OSError(err, os.strerror(err), path)
-		return original(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
+def _fail_open(monkeypatch, failing_path, err):
+	'''Every open of the folder at failing_path for a listing fails with err (on_folder_open()).'''
+	def fail():
+		raise OSError(err, os.strerror(err), failing_path)
+	on_folder_open(monkeypatch, failing_path, fail)
 
 
 def _fail_lstat(monkeypatch, failing_path, err):
@@ -41,7 +39,7 @@ def test_unreadable_folder_keeps_entries_and_logs_once(job, poll_fast, monkeypat
 	seed_monitor(job, {'a.txt': 'a', **{f'big/f{i}.txt': str(i) for i in range(500)}})
 	_backup(job)[1].close()
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
-	_fail_scandir(monkeypatch, os.path.join(job.monitor, 'big'), errno.EIO)
+	_fail_open(monkeypatch, os.path.join(job.monitor, 'big'), errno.EIO)
 	capsys.readouterr()
 	_backup(job)[1].close()
 	v1 = committed_versions(job)[1]
@@ -53,7 +51,7 @@ def test_unreadable_folder_keeps_entries_and_logs_once(job, poll_fast, monkeypat
 def test_unreadable_root_fails_the_job_without_deletions(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	_backup(job)[1].close()
-	_fail_scandir(monkeypatch, job.monitor, errno.ENOTCONN)
+	_fail_open(monkeypatch, job.monitor, errno.ENOTCONN)
 	with pytest.raises(rv.JobFailure):
 		_backup(job)
 	assert len(committed_versions(job)) == 1
@@ -61,7 +59,7 @@ def test_unreadable_root_fails_the_job_without_deletions(job, poll_fast, monkeyp
 
 def test_unreadable_folder_in_first_backup_is_reported(job, poll_fast, monkeypatch, capsys):
 	seed_monitor(job, {'a.txt': 'a', 'locked/b.txt': 'b'})
-	_fail_scandir(monkeypatch, os.path.join(job.monitor, 'locked'), errno.EACCES)
+	_fail_open(monkeypatch, os.path.join(job.monitor, 'locked'), errno.EACCES)
 	_backup(job)[1].close()
 	out = capsys.readouterr()
 	assert 'UNREADABLE: ' + os.path.join(job.monitor, 'locked') in out.out + out.err
@@ -71,7 +69,7 @@ def test_new_unreadable_folder_is_logged_once(job, poll_fast, monkeypatch, capsy
 	seed_monitor(job, {'a.txt': 'a'})
 	_backup(job)[1].close()
 	seed_monitor(job, {'new/x': 'x'})
-	_fail_scandir(monkeypatch, os.path.join(job.monitor, 'new'), errno.EIO)
+	_fail_open(monkeypatch, os.path.join(job.monitor, 'new'), errno.EIO)
 	capsys.readouterr()
 	_backup(job)[1].close()
 	out = capsys.readouterr()
@@ -823,13 +821,11 @@ def test_a_batch_of_only_a_fifo_or_a_socket_commits_it(job, poll_fast, monkeypat
 # ---- L10: a folder gone when a walk reaches it is no error
 
 def _removed_at_its_listing(monkeypatch, folder):
-	'''folder is removed when a listing of it is opened, just before the kernel's open: a folder made and removed while a walk passed.'''
-	real = os.scandir
-	def scandir(path='.'):
-		if isinstance(path, str) and os.path.abspath(path).rstrip('/') == folder and os.path.isdir(folder):
+	'''folder is removed when it is opened for a listing, just before the kernel's open: a folder made and removed while a walk passed.'''
+	def remove():
+		if os.path.isdir(folder):
 			shutil.rmtree(folder)
-		return real(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
+	on_folder_open(monkeypatch, folder, remove)
 
 
 def _walk_lines(monkeypatch):
@@ -904,7 +900,7 @@ def test_a_mode_000_folder_still_logs_its_error_and_unreadable_lines(job, poll_f
 	seed_monitor(job, {'a.txt': 'a', 'locked/b.txt': 'b'})
 	_settled(job)
 	folder = os.path.join(job.monitor, 'locked')
-	_fail_scandir(monkeypatch, folder, errno.EACCES)
+	_fail_open(monkeypatch, folder, errno.EACCES)
 	lines = _walk_lines(monkeypatch)
 	capsys.readouterr()
 	_full(job)
@@ -922,7 +918,7 @@ def test_a_folder_listed_but_never_opened_keeps_its_error_and_unreadable_lines(j
 	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
 	_settled(job)
 	folder = os.path.join(job.monitor, 'd')
-	_fail_scandir(monkeypatch, folder, errno.ENOENT)
+	_fail_open(monkeypatch, folder, errno.ENOENT)
 	if lookup == 'lstat_fails_too':
 		_fail_lstat(monkeypatch, folder, errno.ENOENT)
 	for _ in range(2):
@@ -942,6 +938,127 @@ def test_a_monitored_root_gone_at_the_walk_still_fails_the_attempt(job, poll_fas
 	with pytest.raises(rv.JobFailure):
 		_backup(job)
 	assert committed_versions(job) == before
+
+
+# ---- P11: a folder is opened without following a link at its name (spec section 2, items 2 and 6)
+
+def _outside(tmp_path):
+	'''A folder beside the monitored tree, holding secret.txt and a subfolder: what a link swapped in for a folder points to.'''
+	outside = tmp_path / 'outside'
+	os.makedirs(outside / 'sub')
+	(outside / 'secret.txt').write_text('not in the tree')
+	(outside / 'sub' / 'deeper.txt').write_text('not in the tree either')
+	return str(outside)
+
+
+def _swap(folder, aside, replaced_by, target=None):
+	'''What mv folder aside; ln -s target folder does (or puts a file at folder's place), once: an action for on_folder_open().'''
+	def swap():
+		if os.path.isdir(folder) and not os.path.islink(folder):
+			os.rename(folder, aside)
+			if replaced_by == 'link':
+				os.symlink(target, folder)
+			else:
+				with open(folder, 'w') as f:
+					f.write('a file now')
+	return swap
+
+
+def _holding(job, name):
+	'''The paths in every committed version of job that end with name (links not followed).'''
+	return [os.path.join(base, found) for version in committed_versions(job) for base, dirs, files in os.walk(version)
+		for found in dirs + files if found == name]
+
+
+@pytest.mark.parametrize('replaced_by', ['link', 'file'])
+def test_a_folder_replaced_at_its_open_is_gone_with_one_info_line(tmp_path, monkeypatch, replaced_by):
+	# spec section 2, test 4: d, listed by its parent, is replaced before the walk opens it by a link to a folder outside the tree
+	# (mv d d.old; ln -s /srv/other d) or by a file: no entry of the outside folder, one INFO line, no ERROR line, a FolderGone.
+	# Fails on 8b411a5: the walk lists the outside folder through the link; for the file, "Error scanning" at ERROR
+	from tests.harness import write_tree
+	root = str(tmp_path / 'm')
+	write_tree(root, {'a.txt': 'a', 'd/x.txt': 'x', 'e/y.txt': 'y'})
+	folder = os.path.join(root, 'd')
+	on_folder_open(monkeypatch, folder, _swap(folder, str(tmp_path / 'd.old'), replaced_by, _outside(tmp_path)))
+	lines = _walk_lines(monkeypatch)
+	errors = []
+	walked = sorted((rel, is_dir) for _, rel, is_dir in rv.iter_tree_entries(root, errors=errors))
+	assert walked == [('a.txt', False), ('d/', True), ('e/', True), ('e/y.txt', False)]
+	assert [(rel, type(error)) for rel, error in errors] == [('d/', rv.FolderGone)]
+	assert len(_gone_lines(lines, folder)) == 1 and _scan_errors(lines) == []
+
+
+def test_a_full_comparison_meeting_a_link_swapped_in_mid_walk_commits_nothing_from_outside(job, tmp_path, poll_fast, monkeypatch):
+	# spec section 2, test 4: the same swap while a full comparison walks the tree. Fails on 8b411a5: the walk lists the outside
+	# folder through the link, and the version holds its files under d, with their rows
+	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
+	_settled(job)
+	folder = os.path.join(job.monitor, 'd')
+	on_folder_open(monkeypatch, folder, _swap(folder, str(tmp_path / 'd.old'), 'link', _outside(tmp_path)))
+	_full(job)
+	assert os.path.islink(folder)
+	assert _holding(job, 'secret.txt') == [] and _holding(job, 'deeper.txt') == []
+	assert _row(job, 'd/secret.txt') is None and _row(job, 'd/sub/') is None
+
+
+def test_a_new_folder_replaced_by_a_link_before_its_copy_walk_is_not_followed(job, tmp_path, poll_fast, monkeypatch):
+	# review focus 2 (beyond the spec): a batch's create of a folder copies it with a walk from that folder, which is not a
+	# configured path: n is replaced by a link to a folder outside the tree before that walk opens it, and nothing of the outside
+	# folder is copied. Fails on 8b411a5: the copy walk opens its root following the link, and the version holds the outside
+	# folder's files under n
+	from tests.harness import event_entry, run_backup
+	seed_monitor(job, {'a.txt': 'a'})
+	_settled(job)
+	seed_monitor(job, {'n/inner.txt': 'i'})
+	folder = os.path.join(job.monitor, 'n')
+	on_folder_open(monkeypatch, folder, _swap(folder, str(tmp_path / 'n.old'), 'link', _outside(tmp_path)))
+	run_backup(job, OrderedDict([event_entry(job, 'n/', 'create')]))
+	assert os.path.islink(folder)
+	assert _holding(job, 'secret.txt') == [] and _holding(job, 'deeper.txt') == []
+	assert _row(job, 'n/secret.txt') is None
+
+
+def test_a_root_with_a_trailing_slash_yields_the_same_paths(tmp_path):
+	# review focus 3, a pin: a listing of a handle names its entries only, so the walk joins each path itself, where DirEntry.path
+	# joined it. A root given with a trailing / (a rule path may end with one) yields the same paths as without, none with //, and
+	# the walk of / itself yields paths with one / at their start (only its own names kept, the walk stopped early)
+	import itertools
+	from tests.harness import write_tree
+	root = str(tmp_path / 'm')
+	write_tree(root, {'a.txt': 'a', 'd/e/f.txt': 'f', 'd/g.txt': 'g', 'h/': None})
+	plain = list(rv.iter_tree_entries(root))
+	assert list(rv.iter_tree_entries(root + '/')) == plain
+	assert sorted(rel for _, rel, _ in plain) == ['a.txt', 'd/', 'd/e/', 'd/e/f.txt', 'd/g.txt', 'h/']
+	assert all(path == os.path.join(root, rel) and '//' not in path for path, rel, _ in plain)
+	walk = rv.iter_tree_entries('/', skip=lambda rel: '/' in rel.rstrip('/'))
+	first = list(itertools.islice(walk, 5))
+	walk.close()
+	assert first and all(path == '/' + rel and not path.startswith('//') for path, rel, _ in first)
+
+
+def test_a_folder_whose_path_passes_4095_bytes_keeps_its_error_and_unreadable_lines(job, poll_fast, monkeypatch, capsys):
+	# pin (spec section 2, test 9): the kernel refuses a path of 4,096 bytes and more (ENAMETOOLONG), which no swap explains: the
+	# folder whose path passes it keeps its ERROR line and its UNREADABLE alert. The monitored folder is itself deep, so its
+	# files' places in the vault, which is not, stay short
+	# 3,900 bytes of the monitored folder's path, made of names of 200 bytes and one shorter
+	monitor = os.path.join(job.root, 'm')
+	while len(os.fsencode(monitor)) < 3690:
+		monitor = os.path.join(monitor, 'x' * 200)
+	monitor = os.path.join(monitor, 'y' * (3900 - len(os.fsencode(monitor)) - 1))
+	job = job._replace(monitor=monitor)
+	seed_monitor(job, {'a.txt': 'a'})
+	_settled(job)
+	name = 'f' * 200
+	folder = os.path.join(monitor, name)
+	assert len(os.fsencode(folder)) >= 4096 > len(os.fsencode(monitor)) + len('/a.txt')
+	monkeypatch.chdir(monitor)
+	os.mkdir(name)
+	lines = _walk_lines(monkeypatch)
+	capsys.readouterr()
+	_full(job)
+	assert [message for message in _scan_errors(lines) if message.startswith(f'Error scanning {folder}: [Errno {errno.ENAMETOOLONG}]')] == _scan_errors(lines)
+	assert len(_scan_errors(lines)) >= 1 and _gone_lines(lines, folder) == []
+	assert _lines(capsys, 'UNREADABLE', folder) == 1
 
 
 # ---- F4's check meets two cases the copy answers otherwise (the final review's measurement, F-fix): a file another process

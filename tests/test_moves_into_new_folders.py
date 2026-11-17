@@ -18,7 +18,7 @@ import time
 import pytest
 
 import reverberator as rv
-from tests.harness import get_path_size, committed_versions, latest_version, run_backup, seed_monitor, wait_until
+from tests.harness import get_path_size, committed_versions, latest_version, on_folder_open, run_backup, seed_monitor, wait_until
 from tests.vault_oracle import read_view, snapshot_tree
 
 pytestmark = pytest.mark.inotify
@@ -822,12 +822,10 @@ def test_a_folder_found_moved_in_takes_its_unwatched_subfolder_off_the_old_path(
 	# and watched, it is not unwatched at the old path any more
 	state = {'fail': True}
 	bad = os.path.join(job.monitor, 'big', 'sub')
-	real = os.scandir
-	def scandir(path='.'):
-		if state['fail'] and os.path.abspath(path) == bad and threading.current_thread() is not threading.main_thread():
-			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
-		return real(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
+	def fail():
+		if state['fail'] and threading.current_thread() is not threading.main_thread():
+			raise OSError(errno.EIO, os.strerror(errno.EIO), bad)
+	on_folder_open(monkeypatch, bad, fail)
 	one = session()
 	state['fail'] = False
 	with one.unread():

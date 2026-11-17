@@ -136,6 +136,33 @@ def deep_tree(root: str, depth: int, leaf: str = 'f') -> str:
 	return root.rstrip('/') + '/d' * depth
 
 
+def on_folder_open(monkeypatch, path: str, action) -> None:
+	'''
+	Run action() before each open of the folder at path for a listing, then the real call: action may change the tree (a removal, a
+	link or a file swapped in), or raise what that open is to answer. An open for a listing is os.open() with O_DIRECTORY in its flags
+	(a walk opens each folder so, by its path, and lists the handle) or os.scandir() given a path, not a handle (a listing by path,
+	as folder_gone() takes one, and as the walks did before round 0.55.6, so a test of the walk's open fails there for its own
+	reason). The name is compared as os.path.abspath(name).rstrip('/'), path likewise.
+	'''
+	target = os.path.abspath(path).rstrip('/')
+	real_open, real_scandir = os.open, os.scandir
+	def opening(name, flags, *args, **kwargs):
+		if flags & os.O_DIRECTORY and kwargs.get('dir_fd') is None and os.path.abspath(os.fsdecode(name)).rstrip('/') == target:
+			action()
+		return real_open(name, flags, *args, **kwargs)
+	def scandir(name='.'):
+		if not isinstance(name, int) and os.path.abspath(os.fsdecode(name)).rstrip('/') == target:
+			action()
+		return real_scandir(name)
+	monkeypatch.setattr(os, 'open', opening)
+	monkeypatch.setattr(os, 'scandir', scandir)
+
+
+def listed_folder(name) -> str:
+	'''The folder an os.scandir(name) call lists, given by its path or by a handle of it: the real path, as /proc/self/fd names a handle's.'''
+	return os.readlink(f'/proc/self/fd/{name}') if isinstance(name, int) else os.path.realpath(name)
+
+
 def copy_now(writer, source: str, rel: str):
 	"""A copy of source to rel of the writer's tree, made and put in place now, as the replay queues and ends it: cp's exit code, or False when nothing is copied."""
 	writer.record(rel, True)
@@ -405,18 +432,16 @@ def run_backup(job: JobPaths, entries=None, **kwargs) -> list:
 
 def commit_with_a_subfolder_unlisted(job: JobPaths, monkeypatch, folder: str, subfolder: str) -> list:
 	'''
-	One committed batch that creates folder (a path ending with /) while the copy walk's scandir of subfolder (below it) fails with EIO,
+	One committed batch that creates folder (a path ending with /) while the copy walk's open of subfolder (below it) fails with EIO,
 	as a disk with a bad sector does: the version then holds subfolder, with a row, and the folders in it are in no version and have
-	no rows, whatever the monitored tree holds there (what a later batch meets). The scandir answers again afterwards.
+	no rows, whatever the monitored tree holds there (what a later batch meets). The open answers again afterwards.
 	'''
 	failing = os.path.abspath(os.path.join(job.monitor, subfolder)).rstrip('/')
 	broken = [True]
-	scandir = os.scandir
-	def failing_scandir(path='.'):
-		if broken[0] and os.path.abspath(path).rstrip('/') == failing:
-			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
-		return scandir(path)
-	monkeypatch.setattr(os, 'scandir', failing_scandir)
+	def fail():
+		if broken[0]:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), failing)
+	on_folder_open(monkeypatch, failing, fail)
 	try:
 		return run_backup(job, OrderedDict([event_entry(job, folder, 'create')]))
 	finally:

@@ -13,7 +13,7 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import create_job, daemon, seed_monitor, run_backup, event_entry, write_committed_version, write_incomplete_version
+from tests.harness import create_job, daemon, listed_folder, seed_monitor, run_backup, event_entry, write_committed_version, write_incomplete_version
 from tests.test_log_text import alerting_lines
 
 pytestmark = pytest.mark.unit
@@ -100,7 +100,7 @@ def listing(monkeypatch, job, fail=None, first=None, scandir_code=None):
 	'''
 	real_scandir = os.scandir
 	def scandir(path='.'):
-		if os.path.abspath(os.fspath(path)) != job.job_vault:
+		if listed_folder(path) != os.path.realpath(job.job_vault):
 			return real_scandir(path)
 		if scandir_code is not None:
 			raise OSError(scandir_code, os.strerror(scandir_code), path)
@@ -420,7 +420,7 @@ def test_a_failed_scan_logs_a_failed_marker_and_the_next_attempt_backs_up(tmp_pa
 	failing = [True]
 	real_scandir = os.scandir
 	def scandir(path='.'):
-		if failing[0] and os.path.abspath(os.fspath(path)) == job.job_vault:
+		if failing[0] and listed_folder(path) == os.path.realpath(job.job_vault):
 			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
 		return real_scandir(path)
 	monkeypatch.setattr(rv.os, 'scandir', scandir)
@@ -492,7 +492,7 @@ def test_a_listing_that_leaves_out_a_middle_versions_list_removes_nothing(tmp_pa
 	before = vault_names(job)
 	real_scandir = os.scandir
 	def scandir(path='.'):
-		if os.path.abspath(os.fspath(path)) != job.job_vault:
+		if listed_folder(path) != os.path.realpath(job.job_vault):
 			return real_scandir(path)
 		return iter([entry for entry in real_scandir(path) if entry.name != os.path.basename(v1.change_list)])
 	monkeypatch.setattr(rv.os, 'scandir', scandir)
@@ -757,7 +757,7 @@ def test_a_vault_that_shows_no_version_after_its_versions_were_seen_fails_the_sc
 	else:
 		real_scandir = os.scandir
 		def scandir(path='.'):
-			if os.path.abspath(os.fspath(path)) != job.job_vault:
+			if listed_folder(path) != os.path.realpath(job.job_vault):
 				return real_scandir(path)
 			return iter([entry for entry in real_scandir(path) if not entry.name.startswith('V')])
 		monkeypatch.setattr(rv.os, 'scandir', scandir)
@@ -789,7 +789,7 @@ def hide(monkeypatch, job, hidden):
 	branch dropping out shows it, each change list on one branch while each version folder spans several.'''
 	real_scandir = os.scandir
 	def scandir(path='.'):
-		if os.path.abspath(os.fspath(path)) != job.job_vault:
+		if listed_folder(path) != os.path.realpath(job.job_vault):
 			return real_scandir(path)
 		return iter([entry for entry in real_scandir(path) if not hidden(entry.name)])
 	monkeypatch.setattr(rv.os, 'scandir', scandir)

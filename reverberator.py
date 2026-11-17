@@ -3187,7 +3187,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 			if not at_or_under(place, walked):
 				walked.add(place)
 				# into newDirWDs: the batch holds a create that copies it (this one, or the one whose walk noted it)
-				initializeFolderWatchers(inotify_obj,place,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found)
+				initializeFolderWatchers(inotify_obj,place,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found,follow_root=False)
 			if copy and not at_or_under(place, copied):
 				copied.add(place)
 				watcherTeeLogToTl(monitor_path,f'Copying {place}: its changes came at another path until the event queue ran empty')
@@ -3403,7 +3403,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					if isDir and not skipped and event.mask & (flags.CREATE | flags.MOVED_TO):
 						# the recursive copy holds this folder, but it still needs watches for later changes. a watch the walk
 						# finds held at another path stays where the events put it until they bring it, or settle() does
-						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found)
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found,follow_root=False)
 						# a take since this read: its copy may have passed this folder before the watch above, so the next batch compares it
 						with to_process_lock:
 							if to_process.takes != seen_takes:
@@ -3426,7 +3426,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						watcherTeeLogToTl(monitor_path,f'Create event detected for {eventPath}')
 					queue_pending_move_from_at(eventPath,monTime)
 					if isDir:
-						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found)
+						initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found,follow_root=False)
 					append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.DELETE:
 					if DEBUG:
@@ -3508,14 +3508,14 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 								# (mkdir d; mv d e), while the walk was inside it, or with a subfolder whose create is handled at
 								# the old path. this walk watches the rest; a watch it finds held at another path stays there
 								# until the events bring it, or settle() does
-								initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found,new_folders=newDirWDs)
+								initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found,new_folders=newDirWDs,follow_root=False)
 					else:
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Cookie not found for {event.cookie}')
 							watcherTeeLogToTl(monitor_path,f'Treating move as create event for {eventPath}')
 						queue_pending_move_from_at(eventPath,monTime)
 						if isDir:
-							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found)
+							initializeFolderWatchers(inotify_obj,eventPath,wdDic,irm,watch_flags,newDirWDs,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=notes.found,follow_root=False)
 						append_change_event(to_process, to_process_lock, ChangeEvent(monTime,isDir,'create',eventPath,None))
 				elif event.mask & flags.MODIFY:
 					if DEBUG:
@@ -3549,7 +3549,7 @@ def watcherTeeLogToTl(monitor_path:str,message:str,error=False,ok=False):
 	else:
 		tl.info(message,callerStackDepth=4)
 
-def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None,found:dict = None,new_folders:set = None):
+def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,newDirWds = None,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None,found:dict = None,new_folders:set = None,follow_root:bool = True):
 	'''
 	Watch monitor_path and every folder under it that the skip list keeps; returns monitor_path's watch, or -1 without one.
 	Each folder's watch is added as the walk reaches it, before the walk reads the folder: a folder made in it afterwards
@@ -3565,6 +3565,11 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	walk, the walk puts each watch it finds where it finds it.
 	newDirWds gets every watch the walk holds at its path, monitor_path's too: the walk's folders are new. new_folders (the
 	watcher's newDirWDs, for a walk not given it as newDirWds) gets each watch the walk adds in a folder whose watch is in it.
+	Each folder below monitor_path is watched at its path without the trailing /, with IN_ONLYDIR and IN_DONT_FOLLOW, and
+	opened by the walk without following a link ( iter_tree_entries() ): a link that took a folder's place is never watched
+	or listed through (its watch fails with ENOTDIR, a folder gone). monitor_path is watched and opened following a link
+	when follow_root, as a configured path may be given through one, and like the others when not: a folder the tree just
+	made, or an inner mount.
 	'''
 	if not os.path.exists(monitor_path):
 		return -1
@@ -3573,13 +3578,15 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	added = set()
 	# the walk goes into inner mounts too, so what it drops there it adds back if it still fails
 	forget_unwatched_under(unwatched,root_norm)
-	def watch(folder:str, parent_wd:int = None):
+	no_link_flags = watch_flags | inotify_simple.flags.ONLYDIR | inotify_simple.flags.DONT_FOLLOW
+	def watch(folder:str, parent_wd:int = None, follow:bool = False):
 		irm.increaseUserWatches()
 		try:
-			wd = inotify_obj.add_watch(folder, watch_flags)
+			# a path with a trailing / makes the kernel follow a link there whatever the flags
+			wd = inotify_obj.add_watch(folder, watch_flags) if follow else inotify_obj.add_watch(folder.rstrip('/') or '/', no_link_flags)
 		except Exception as e:
-			# a folder made and removed before its watch was added ( ENOENT, or ENOTDIR for one a file replaced ) is a
-			# normal race that misses nothing, as the folder is gone: an info line. any other failure leaves it unwatched
+			# a folder made and removed before its watch was added ( ENOENT, or ENOTDIR for one a file or a link replaced )
+			# is a normal race that misses nothing, as the folder is gone: an info line. any other failure leaves it unwatched
 			gone = getattr(e,'errno',None) in (errno.ENOENT, errno.ENOTDIR)
 			watcherTeeLogToTl(monitor_path,f'Failed to add watch for {folder}: {e}',error=not gone)
 			# counted above but never taken: an inner mount that keeps failing would add up over a long run
@@ -3605,13 +3612,13 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 		wdDic[wd] = folder
 		return wd
 	watcherTeeLogToTl(monitor_path,f'Adding watch for {monitor_path}')
-	parentWatchDescriptor = watch(monitor_path)
+	parentWatchDescriptor = watch(monitor_path, follow=follow_root)
 	if parentWatchDescriptor is None:
 		return -1
 	rel_base = '' if skip_list is None else skip_list.folder_rel(monitor_path)
 	errors = []
 	watched = {}
-	for folder, _, is_dir in iter_tree_entries(monitor_path, rel_base, skip=None if skip_list is None else skip_list.skips, errors=errors):
+	for folder, _, is_dir in iter_tree_entries(monitor_path, rel_base, skip=None if skip_list is None else skip_list.skips, errors=errors, follow_root=follow_root):
 		if is_dir:
 			parent_wd = None
 			if new_folders is not None:
@@ -3730,7 +3737,7 @@ def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,moun
 		watcherTeeLogToTl(monitor_path,f'Inner mount {mount_point} {change}, watching what is there now and comparing it with the vault')
 		remove_watches_under(inotify_obj,wdDic,irm,mount_point,forget)
 		# not into newDirWDs: the scan compares what is there already, and later events in it are recorded as they come
-		initializeFolderWatchers(inotify_obj,mount_point,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=found)
+		initializeFolderWatchers(inotify_obj,mount_point,wdDic,irm,watch_flags,skip_list=skip_list,job_name=job_name,unwatched=unwatched,found=found,follow_root=False)
 		if fingerprint is None:
 			del inner_mounts[mount_point]
 		else:
@@ -3748,24 +3755,30 @@ def remove_newly_skipped_watches(inotify_obj:inotify_simple.INotify,folder_path:
 	return remove_watches(inotify_obj,wdDic,irm,[wd for wd, wd_path in wdDic.items() if wd_path.startswith(prefix)
 		and wd_path.rstrip('/') != folder_norm and skips_folder_or_parent(skip_list.skips,skip_list.folder_rel(wd_path))],forget)
 
-def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = False, skip = None, errors:list = None):
+def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = False, skip = None, errors:list = None, follow_root:bool = True):
 	'''
 	Walk path depth first, yielding (entry_path, rel_path, is_dir) with each folder right before its contents.
 	Folder paths end with /. Symlinks to folders are not followed and come out as files.
 	Nothing is listed up front, so walking a tree of 500k entries holds only the open folders of one branch: a stack of
 	them, not a call a level, so Python's limit of 1,000 frames sets no depth. A folder is opened when the caller asks
 	for what comes after it, so a watch added for it at its yield comes before its listing.
+	Each folder is opened by its path without following a link at its name (O_NOFOLLOW) and listed through that handle, so
+	one replaced by a link after its parent listed it (mv d d.old; ln -s /srv/other d) is never listed through the link. The
+	walk root is opened following a link when follow_root, as a configured path may be given through one, and like the
+	others when not: a walk from a folder the tree just made, or a scope whose lstat just found a folder.
 	With list_folders_first, each folder is read in full before its entries are yielded, so the caller can replace
 	entries as it goes: renaming into a folder still being read can make the listing skip an entry (through mergerfs
 	the entry can move to another branch).
 	skip(rel_path) -> bool leaves an entry out; a skipped folder is not descended into.
 	A folder that cannot be read is logged, and (its rel_prefix, error) is appended to errors when given: its entries
 	are missing from the walk, which is not the same as being deleted. The walk root reports rel_prefix as given. A
-	folder gone when the walk reaches it (made and removed while the walk passed, as git or a build does) is a race its
-	delete event or the next full comparison covers: its own listing fails to open with ENOENT or ENOTDIR and its parent
-	no longer lists it (folder_gone()), so it gets one info line, at every level, the walk root's too, and is appended as
-	a FolderGone. Any other error, one its parent's listing does not confirm (a folder listed that cannot be opened or
-	looked up, as a FUSE mount's name trouble gives every time), or one met while listing, keeps its error line.
+	folder gone when the walk reaches it (made and removed while the walk passed, as git or a build does, or replaced by a
+	link or a file) is a race its delete event or the next full comparison covers, so it gets one info line, at every
+	level, the walk root's too, and is appended as a FolderGone. Its open tells it: ENOTDIR or ELOOP from an open that does
+	not follow a link (a link or a file took its place; its parent is not asked), or ENOENT (or ENOTDIR at a root opened
+	following a link) with its parent no longer listing it (folder_gone()). Any other error, one its parent's listing does
+	not confirm (a folder listed that cannot be opened or looked up, as a FUSE mount's name trouble gives every time), or
+	one met while listing, keeps its error line.
 	A walk the caller stops early (a break, close(), an exception) closes every listing it holds.
 
 	Examples:
@@ -3780,38 +3793,59 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 		[True, True, True, True]
 		>>> sorted(rel_path for _, rel_path, _ in iter_tree_entries(root, skip=lambda rel: rel == 'd/e/'))
 		['d/', 'link']
+		>>> sorted(rel_path for _, rel_path, _ in iter_tree_entries(os.path.join(root, 'link') + '/'))
+		['e/', 'e/f']
 		>>> import shutil; shutil.rmtree(root)
 	'''
-	# the folders the walk is in, the deepest last, each [its path, its rel, its listing, the entries left of it]: the listing
-	# is None until the folder is opened, which is when the caller asks for what comes after its yield
-	stack = [[path, rel_prefix, None, None]]
+	# the folders the walk is in, the deepest last, each [its path, its rel, its listing, the entries left of it, its handle]:
+	# the listing is None until the folder is opened, which is when the caller asks for what comes after its yield. the handle
+	# stays open until the listing is closed, as each entry stats through it (DirEntry.is_dir() where the filesystem gives no type)
+	root = [path, rel_prefix, None, None, None]
+	stack = [root]
+	# a name with a trailing / makes the kernel follow a link there whatever the flags: the root's is opened without it
+	root_name = path.rstrip('/') or path[:1]
+	no_link = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+	root_flags = no_link & ~os.O_NOFOLLOW if follow_root else no_link
+	def close(frame):
+		listing, fd = frame[2], frame[4]
+		frame[2] = frame[4] = None
+		if listing is not None:
+			listing.close()
+		if fd is not None:
+			os.close(fd)
 	try:
 		while stack:
 			frame = stack[-1]
-			folder_path, rel, listing, entries = frame
+			folder_path, rel, listing, entries, fd = frame
 			try:
-				if listing is None:
-					listing = frame[2] = os.scandir(folder_path)
+				if fd is None:
+					fd = frame[4] = os.open(folder_path, no_link) if frame is not root else os.open(root_name, root_flags)
+					listing = frame[2] = os.scandir(fd)
 					entries = frame[3] = iter(list(listing) if list_folders_first else listing)
+				# a listing of a handle names its entries only: each path is the folder's joined with the name, as os.path.join()
+				# joins them
+				prefix = folder_path if folder_path.endswith('/') else folder_path + '/'
 				for entry in entries:
 					rel_path = rel + entry.name
 					if entry.is_dir(follow_symlinks=False):
 						if skip is not None and skip(rel_path + '/'):
 							continue
-						yield entry.path + '/', rel_path + '/', True
-						stack.append([entry.path, rel_path + '/', None, None])
+						entry_path = prefix + entry.name
+						yield entry_path + '/', rel_path + '/', True
+						stack.append([entry_path, rel_path + '/', None, None, None])
 						break
 					if skip is not None and skip(rel_path):
 						continue
-					yield entry.path, rel_path, False
+					yield prefix + entry.name, rel_path, False
 				else:
-					listing.close()
+					close(frame)
 					stack.pop()
 			except Exception as e:
 				stack.pop()
-				if listing is not None:
-					listing.close()
-				elif isinstance(e, OSError) and e.errno in (errno.ENOENT, errno.ENOTDIR) and folder_gone(folder_path):
+				opened = frame[4] is not None
+				close(frame)
+				if not opened and isinstance(e, OSError) and ((e.errno in (errno.ENOTDIR, errno.ELOOP) and (frame is not root or not follow_root))
+						or (e.errno in (errno.ENOENT, errno.ENOTDIR) and folder_gone(folder_path))):
 					if errors is not None:
 						errors.append((rel, FolderGone(e.errno, e.strerror, folder_path)))
 					watcherTeeLogToTl(folder_path,f'{folder_path} was gone when the walk reached it: {e}')
@@ -3821,8 +3855,7 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 				watcherTeeLogToTl(folder_path,f'Error scanning {folder_path}: {e}',error=True)
 	finally:
 		for frame in stack:
-			if frame[2] is not None:
-				frame[2].close()
+			close(frame)
 
 class FolderGone(OSError):
 	'''A walk's error for a folder gone when the walk reached it (iter_tree_entries()): no UNREADABLE line and no unwatched folder.'''
@@ -10486,7 +10519,8 @@ def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list
 	'''
 	Walk the folder scope_rel (ending with /) of monitor_path as iter_tree_entries walks the whole tree, the folder itself
 	first, as the walk of its parent would list it. Nothing is yielded when it is gone; when it cannot be looked at,
-	(scope_rel, error) is appended to errors like a folder that cannot be read.
+	(scope_rel, error) is appended to errors like a folder that cannot be read. Its lstat found a folder, so the walk opens
+	it as any folder below a root, without following a link that took its place since.
 	'''
 	path = os.path.join(monitor_path, scope_rel.rstrip('/'))
 	try:
@@ -10504,7 +10538,7 @@ def iter_scope_entries(monitor_path:str, scope_rel:str, skip = None, errors:list
 			yield path, scope_rel[:-1], False
 		return
 	yield path + '/', scope_rel, True
-	yield from iter_tree_entries(path, scope_rel, skip=skip, errors=errors)
+	yield from iter_tree_entries(path, scope_rel, skip=skip, errors=errors, follow_root=False)
 
 # what a comparison covers: subtrees are folder rels ending with /, each compared with everything under it ('' for the
 # whole tree), and paths are file rels or folder rels ending with /, each compared alone. changed_since, when not None,
@@ -13862,7 +13896,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 			rel_base = as_folder_entry(source_relative_path)
 			# a folder that could not be made: nothing is copied under it
 			unmade = None
-			for subRealPath, subRelativePath, subIsDir in iter_tree_entries(source_real_path,rel_base,skip=walk_skip,errors=walk_errors):
+			# from a folder made in the tree, not a configured path: a link that took its place since is not followed
+			for subRealPath, subRelativePath, subIsDir in iter_tree_entries(source_real_path,rel_base,skip=walk_skip,errors=walk_errors,follow_root=False):
 				# a folder's create queues a copy of everything below it
 				poll_pools()
 				if unmade is not None and subRelativePath.startswith(unmade):
@@ -14005,7 +14040,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 		wait_for_async_commands(mcae)
 		copied = None
 		walk_errors = []
-		for sub_real_path,sub_rel,sub_is_dir in iter_tree_entries(os.path.join(monitor_path,folder_rel),folder_rel,skip=skip_list.skips,errors=walk_errors):
+		for sub_real_path,sub_rel,sub_is_dir in iter_tree_entries(os.path.join(monitor_path,folder_rel),folder_rel,skip=skip_list.skips,errors=walk_errors,follow_root=False):
 			if copied is not None and sub_rel.startswith(copied):
 				continue
 			if manifest.lookup(sub_rel) is None:

@@ -8,7 +8,7 @@ import pytest
 import reverberator as rv
 from collections import deque
 from tests.harness import (reads_the_file_before, scripted_watch, seed_monitor, run_backup, event_entry, latest_version, wait_until,
-	wait_for_committed_count, header_counter, committed_versions)
+	wait_for_committed_count, header_counter, committed_versions, on_folder_open)
 from tests.test_inner_mounts import _fake_mounts
 from tests.test_moves_then_changes import user_xattrs_or_skip
 from tests.test_verify_replay import start_backuper, stop_backuper
@@ -155,12 +155,9 @@ def test_an_attempt_that_met_an_unreadable_folder_carries_the_time_forward(job, 
 	seed_monitor(job, {'a.txt': 'a', 'bad/x': 'x'})
 	run_backup(job, matched_since=100)
 	bad = os.path.join(job.monitor, 'bad')
-	original = os.scandir
-	def scandir(path='.'):
-		if os.path.abspath(path).rstrip('/') == bad:
-			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
-		return original(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
+	def fail():
+		raise OSError(errno.EIO, os.strerror(errno.EIO), bad)
+	on_folder_open(monkeypatch, bad, fail)
 	v0 = rv.list_versions(job.job_vault)[-1].path
 	run_backup(job, matched_since=200)                      # a full comparison that could not read bad/
 	assert matched(job) == (name(v0), 100)
@@ -171,12 +168,9 @@ def test_a_folder_left_unwatched_stops_the_watcher_publishing_read_times(job, po
 	seed_monitor(job, {'a.txt': 'a', 'bad/x': 'x'})
 	v0 = run_backup(job, matched_since=100)[-1]
 	bad = os.path.join(job.monitor, 'bad')
-	original = os.scandir
-	def scandir(path='.'):
-		if os.path.abspath(path).rstrip('/') == bad:
-			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
-		return original(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
+	def fail():
+		raise OSError(errno.EIO, os.strerror(errno.EIO), bad)
+	on_folder_open(monkeypatch, bad, fail)
 	calls = record_matched_since(monkeypatch)
 	compared = threading.Event()
 	recording = rv.do_backup

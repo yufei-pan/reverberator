@@ -5,7 +5,7 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import committed_versions, seed_monitor, tracked_manifest, wait_until
+from tests.harness import committed_versions, on_folder_open, seed_monitor, tracked_manifest, wait_until
 
 def _privileged():
 	return os.geteuid() == 0 or os.environ.get('REVERB_PRIVILEGED') == '1'
@@ -85,12 +85,9 @@ def test_a_walk_of_the_root_tells_again_what_is_unwatched_in_an_inner_mount(tmp_
 	try:
 		u = os.path.join(inner, 'u')
 		os.makedirs(os.path.join(u, 'v'))
-		real = os.scandir
-		def scandir(path='.'):
-			if isinstance(path, str) and os.path.abspath(path) == u:
-				raise OSError(errno.EIO, os.strerror(errno.EIO), path)
-			return real(path)
-		monkeypatch.setattr(os, 'scandir', scandir)
+		def fail():
+			raise OSError(errno.EIO, os.strerror(errno.EIO), u)
+		on_folder_open(monkeypatch, u, fail)
 		irm = rv.inotify_resource_manager()
 		wdDic, unwatched = {}, set()
 		with rv.inotify_simple.INotify() as inotify_obj:
@@ -667,12 +664,9 @@ def test_an_unreadable_folder_in_a_scanned_disk_is_reported_once(job, poll_fast,
 	_fake_mounts(monkeypatch, job, [])
 	_backup(job)[1].close()
 	bad = os.path.join(job.monitor, 'disk', 'bad')
-	original = os.scandir
-	def scandir(path='.'):
-		if os.path.abspath(path).rstrip('/') == bad:
-			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
-		return original(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
+	def fail():
+		raise OSError(errno.EIO, os.strerror(errno.EIO), bad)
+	on_folder_open(monkeypatch, bad, fail)
 	lines = []
 	monkeypatch.setattr(rv, 'job_log', lambda job_name, text: lines.append(text) or text)
 	queue, lock, to_process_flag = rv.ChangeEventQueue(job.monitor), threading.Lock(), threading.Event()

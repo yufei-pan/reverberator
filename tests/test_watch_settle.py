@@ -68,12 +68,18 @@ def captured_notes(monkeypatch) -> list:
 	return notes
 
 
+def probing() -> bool:
+	'''Whether the add_watch() stand-in calling this is called by settle()'s probe_at(): the walk's watches below its root carry the
+	probe's flags too (IN_ONLYDIR and IN_DONT_FOLLOW), so only the caller tells a probe.'''
+	return sys._getframe(2).f_code.co_name == 'probe_at'
+
+
 def blinded_probes(monkeypatch) -> set:
-	'''The paths whose probe (an add_watch with IN_ONLYDIR, as settle() makes them) fails with EIO while in the set.'''
+	'''The paths whose probe (settle()'s probe_at()) fails with EIO while in the set.'''
 	blind = set()
 	real_add = rv.inotify_simple.INotify.add_watch
 	def add_watch(inotify, path, mask):
-		if mask & rv.inotify_simple.flags.ONLYDIR and path.rstrip('/') in blind:
+		if probing() and path.rstrip('/') in blind:
 			raise OSError(errno.EIO, 'a probe that cannot look')
 		return real_add(inotify, path, mask)
 	monkeypatch.setattr(rv.inotify_simple.INotify, 'add_watch', add_watch)
@@ -699,12 +705,11 @@ def test_a_folder_made_during_the_first_walk_whose_subfolder_leaves(session, job
 	outside = tmp_path / 'outside'
 	outside.mkdir()
 	m = job.monitor
-	flags = rv.inotify_simple.flags
 	real_add, real_read = rv.inotify_simple.INotify.add_watch, rv.inotify_simple.INotify.read
 	state = {'made': False, 'moved': False}
 	def add_watch(inotify, path, mask):
 		wd = real_add(inotify, path, mask)
-		if not state['made'] and path.rstrip('/') == f'{m}/a' and not mask & flags.ONLYDIR:
+		if not state['made'] and path.rstrip('/') == f'{m}/a' and not probing():
 			# a is watched and not listed yet
 			state['made'] = True
 			os.makedirs(f'{m}/a/n/w')

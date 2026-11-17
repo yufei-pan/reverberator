@@ -6,7 +6,7 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import deep_tree, run_backup, seed_monitor, wait_until
+from tests.harness import deep_tree, listed_folder, on_folder_open, run_backup, seed_monitor, wait_until
 
 pytestmark = pytest.mark.inotify
 
@@ -540,7 +540,7 @@ def test_a_folder_made_while_the_walk_reads_its_parent_is_watched(job, poll_fast
 				os.mkdir(b)
 	def scandir(path='.'):
 		entries = real(path)
-		return Listing(entries) if os.path.abspath(path) == a else entries
+		return Listing(entries) if listed_folder(path) == os.path.realpath(a) else entries
 	monkeypatch.setattr(os, 'scandir', scandir)
 	to_process = rv.ChangeEventQueue(job.monitor)
 	flag = threading.Event()
@@ -563,13 +563,14 @@ def _kernel_watches(inotify_obj):
 		return sum(line.startswith('inotify wd:') for line in f)
 
 
-def _fail_scandir(monkeypatch, folder, code=errno.EIO):
-	real = os.scandir
-	def scandir(path='.'):
-		if os.path.abspath(path) == folder:
-			raise OSError(code, os.strerror(code), path)
-		return real(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
+def _fail_open(monkeypatch, folder, code=errno.EIO):
+	'''Every open of folder for a listing fails with code (on_folder_open()) until the stop() returned is called.'''
+	failing = {'on': True}
+	def fail():
+		if failing['on']:
+			raise OSError(code, os.strerror(code), folder)
+	on_folder_open(monkeypatch, folder, fail)
+	return lambda: failing.update(on=False)
 
 
 WATCH_FLAGS = rv.inotify_simple.flags.CREATE | rv.inotify_simple.flags.MODIFY
@@ -579,7 +580,7 @@ def test_an_unreadable_folder_gives_its_watch_back_and_is_left_unwatched(tmp_pat
 	for rel in ('k/s', 'u/v'):
 		os.makedirs(tmp_path / rel)
 	root, k, u = str(tmp_path), str(tmp_path / 'k'), str(tmp_path / 'u')
-	_fail_scandir(monkeypatch, u)
+	_fail_open(monkeypatch, u)
 	irm = rv.inotify_resource_manager()
 	wdDic, unwatched = {}, set()
 	with rv.inotify_simple.INotify() as inotify_obj:
@@ -591,13 +592,11 @@ def test_an_unreadable_folder_gives_its_watch_back_and_is_left_unwatched(tmp_pat
 
 
 def _removed_at_its_listing(monkeypatch, folder):
-	'''folder is removed when a listing of it is opened, just before the kernel's open: a folder made and removed while a walk passed.'''
-	real = os.scandir
-	def scandir(path='.'):
-		if isinstance(path, str) and os.path.abspath(path) == folder and os.path.isdir(folder):
+	'''folder is removed when it is opened for a listing, just before the kernel's open: a folder made and removed while a walk passed.'''
+	def remove():
+		if os.path.isdir(folder):
 			shutil.rmtree(folder)
-		return real(path)
-	monkeypatch.setattr(os, 'scandir', scandir)
+	on_folder_open(monkeypatch, folder, remove)
 
 
 def _watcher_lines(monkeypatch):
@@ -641,6 +640,95 @@ def test_a_new_folder_gone_before_its_walk_opens_it_is_one_info_line(tmp_path, m
 	assert unwatched == set()
 	assert [message for message, error in lines if error] == []
 	assert len([message for message, _ in lines if message.startswith(f'{new} was gone when the walk reached it: ')]) == 1
+
+
+def _outside_and_swap(tmp_path, folder):
+	'''
+	A folder beside the tree, with a subfolder, and the swap of folder for a link to it, as mv folder folder.old; ln -s /srv/other
+	folder does it (once): (outside, its subfolder, the swap).
+	'''
+	outside = str(tmp_path / 'outside')
+	os.makedirs(os.path.join(outside, 'sub'))
+	open(os.path.join(outside, 'secret.txt'), 'w').write('not in the tree')
+	def swap():
+		if not os.path.islink(folder):
+			os.rename(folder, str(tmp_path / 'aside'))
+			os.symlink(outside, folder)
+	return outside, os.path.join(outside, 'sub'), swap
+
+
+@pytest.mark.parametrize('swap', ['before_its_watch', 'between_its_watch_and_its_open'])
+def test_a_folder_replaced_by_a_link_is_never_watched_through_it(tmp_path, monkeypatch, swap):
+	# spec section 2, test 5: d, listed by the walk, is replaced by a link to a folder outside the tree before its watch is added,
+	# or after its watch and before the walk opens it: no watch on the outside folder or the one in it, nothing watched through
+	# the link, and no ERROR line. Fails on 8b411a5: add_watch follows the link at d's path (given with its /), and the walk
+	# lists the outside folder through it, watching its subfolder
+	from tests.harness import on_folder_open
+	root = str(tmp_path / 'm')
+	d = os.path.join(root, 'd')
+	os.makedirs(os.path.join(d, 'x'))
+	outside, sub, swap_d = _outside_and_swap(tmp_path, d)
+	real_add = rv.inotify_simple.INotify.add_watch
+	if swap == 'before_its_watch':
+		def add_watch(self, path, mask):
+			if os.path.abspath(path).rstrip('/') == d:
+				swap_d()
+			return real_add(self, path, mask)
+		monkeypatch.setattr(rv.inotify_simple.INotify, 'add_watch', add_watch)
+	else:
+		on_folder_open(monkeypatch, d, swap_d)
+	lines = _watcher_lines(monkeypatch)
+	irm = rv.inotify_resource_manager()
+	wdDic, unwatched = {}, set()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		assert rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched) != -1
+		assert os.path.islink(d)
+		assert sorted(path.rstrip('/') for path in wdDic.values()) == [root]
+		assert irm.current_user_watches == len(wdDic) == _kernel_watches(inotify_obj)
+		# the watch each outside folder has, held already or added by this look
+		assert [wd for wd in (real_add(inotify_obj, folder, WATCH_FLAGS) for folder in (outside, sub)) if wd in wdDic] == []
+	assert unwatched == set()
+	assert [message for message, error in lines if error] == []
+
+
+def test_a_new_folder_replaced_by_a_link_before_its_walk_is_not_followed(job, tmp_path, poll_fast, monkeypatch):
+	# review focus 2 (beyond the spec): the watcher walks a folder made in the tree from that folder, which is not a configured
+	# path; n, made, is replaced by a link to a folder outside the tree before that walk watches it: nothing of the outside folder
+	# is watched (the copy walk's half is in test_io_errors.py). Fails on 8b411a5: the walk's root is watched and listed following
+	# the link, so the outside folder and the one in it are watched
+	n = os.path.join(job.monitor, 'n')
+	outside, sub, swap_n = _outside_and_swap(tmp_path, n)
+	outside_ids = {(st.st_dev, st.st_ino) for st in (os.stat(outside), os.stat(sub))}
+	# the folder each watch the watcher was given is on, as the kernel took it
+	watched = {}
+	# for each walk of n, the paths the watch map held right after it whose watch is on an outside folder: n's move-out, read
+	# later, takes away what was watched at n
+	after_n = []
+	real_init = rv.initializeFolderWatchers
+	def init(inotify_obj, path, wdDic, *args, **kwargs):
+		wd = real_init(inotify_obj, path, wdDic, *args, **kwargs)
+		if path.rstrip('/') == n:
+			after_n.append([held for held_wd, held in wdDic.items() if watched.get(held_wd) in outside_ids])
+		return wd
+	monkeypatch.setattr(rv, 'initializeFolderWatchers', init)
+	real_add = rv.inotify_simple.INotify.add_watch
+	def add_watch(self, path, mask):
+		if os.path.abspath(path).rstrip('/') == n:
+			swap_n()
+		wd = real_add(self, path, mask)
+		try:
+			st = os.stat(path)
+		except OSError:
+			return wd
+		watched[wd] = (st.st_dev, st.st_ino)
+		return wd
+	monkeypatch.setattr(rv.inotify_simple.INotify, 'add_watch', add_watch)
+	with _ready_watch(job) as (to_process, lock, flag):
+		os.mkdir(n)
+		# its create, read before a later probe's, is handled with its walk
+		_wait_watch_ready(job, to_process, lock)
+		assert os.path.islink(n)
+		assert after_n and [held for held in after_n if held] == []
 
 
 @pytest.mark.parametrize('code, left_unwatched', [(errno.EACCES, True), (errno.ENOSPC, True), (errno.ENOENT, False), (errno.ENOTDIR, False)],
@@ -702,8 +790,7 @@ def test_a_walk_tells_again_what_under_its_folder_is_unwatched(tmp_path, monkeyp
 	for rel in ('u/v', 'u/w', 'k'):
 		os.makedirs(tmp_path / rel)
 	root, u, k = str(tmp_path), str(tmp_path / 'u'), str(tmp_path / 'k')
-	real = os.scandir
-	_fail_scandir(monkeypatch, u)
+	stop = _fail_open(monkeypatch, u)
 	irm = rv.inotify_resource_manager()
 	wdDic, unwatched = {}, set()
 	with rv.inotify_simple.INotify() as inotify_obj:
@@ -711,11 +798,11 @@ def test_a_walk_tells_again_what_under_its_folder_is_unwatched(tmp_path, monkeyp
 		assert unwatched == {u}
 		# u readable again, w not: a walk of u drops what it had and adds back what still fails; k is not walked
 		unwatched.add(k)
-		monkeypatch.setattr(os, 'scandir', real)
-		_fail_scandir(monkeypatch, os.path.join(u, 'w'))
+		stop()
+		stop = _fail_open(monkeypatch, os.path.join(u, 'w'))
 		rv.initializeFolderWatchers(inotify_obj, u, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
 		assert unwatched == {os.path.join(u, 'w'), k}
-		monkeypatch.setattr(os, 'scandir', real)
+		stop()
 		rv.initializeFolderWatchers(inotify_obj, u, wdDic, irm, WATCH_FLAGS, unwatched=unwatched)
 		assert unwatched == {k}
 
@@ -723,8 +810,7 @@ def test_a_walk_tells_again_what_under_its_folder_is_unwatched(tmp_path, monkeyp
 def test_read_times_publish_again_once_an_unreadable_folder_is_made_again_and_walked(job, poll_fast, monkeypatch):
 	bad = os.path.join(job.monitor, 'bad')
 	os.makedirs(os.path.join(bad, 'sub'))
-	real = os.scandir
-	_fail_scandir(monkeypatch, bad)
+	stop = _fail_open(monkeypatch, bad)
 	to_process = rv.ChangeEventQueue(job.monitor)
 	flag = threading.Event()
 	thread, lock = _start_watch(job, to_process, flag, min_snapshot_delay_seconds=0.2)
@@ -732,7 +818,7 @@ def test_read_times_publish_again_once_an_unreadable_folder_is_made_again_and_wa
 		_wait_watch_ready(job, to_process, lock)
 		with lock:
 			assert to_process.read_wall_ns is None
-		monkeypatch.setattr(os, 'scandir', real)
+		stop()
 		shutil.rmtree(bad)
 		os.makedirs(os.path.join(bad, 'sub'))
 		wait_until(lambda: _has_create(to_process, lock, bad), message='no create of bad')
@@ -860,9 +946,10 @@ def test_a_folder_renamed_while_the_walk_is_inside_it_is_watched_in_full(job, po
 		os.makedirs(os.path.join(F, child, 'deep'))
 	real = os.scandir
 	renamed = []
+	inside = os.path.realpath(F) + '/'
 	def scandir(path='.'):
 		entries = real(path)
-		if not renamed and isinstance(path, str) and os.path.abspath(path).startswith(F + '/'):
+		if not renamed and listed_folder(path).startswith(inside):
 			# mv F G while the walk reads one of F's subfolders: the ones it has not read yet are gone at their old path
 			os.rename(F, G)
 			renamed.append(path)
@@ -889,11 +976,10 @@ def test_read_times_publish_again_once_an_unwatched_folder_is_gone(job, tmp_path
 	P = os.path.join(job.monitor, 'P')
 	bad = os.path.join(P, 'bad')
 	os.makedirs(os.path.join(bad, 'sub'))
-	real = os.scandir
-	_fail_scandir(monkeypatch, bad)
+	stop = _fail_open(monkeypatch, bad)
 	with _ready_watch(job, skip_list=rv.SkipList(job.monitor, ['old_*/'])) as (to_process, lock, flag):
 		assert not _published(to_process, lock)
-		monkeypatch.setattr(os, 'scandir', real)
+		stop()
 		if gone == 'deleted':
 			shutil.rmtree(bad)
 		elif gone == 'moved out':
@@ -910,14 +996,13 @@ def test_read_times_publish_again_once_an_unwatched_folder_is_gone(job, tmp_path
 def test_read_times_publish_again_once_an_unwatched_folder_in_a_new_folder_is_gone(job, tmp_path, poll_fast, monkeypatch, gone):
 	N = os.path.join(job.monitor, 'N')
 	bad = os.path.join(N, 'bad')
-	real = os.scandir
 	with _ready_watch(job) as (to_process, lock, flag):
 		# N is made after the first take, so its events are not recorded until the next take: bad's delete or move-out too
-		_fail_scandir(monkeypatch, bad)
+		stop = _fail_open(monkeypatch, bad)
 		os.makedirs(os.path.join(bad, 'sub'))
 		wait_until(lambda: _has_create(to_process, lock, N), message='no create of N')
 		wait_until(lambda: not _published(to_process, lock), message='bad is not unwatched')
-		monkeypatch.setattr(os, 'scandir', real)
+		stop()
 		if gone == 'deleted':
 			shutil.rmtree(bad)
 		else:
@@ -929,21 +1014,19 @@ def test_a_rewalk_that_cannot_read_a_held_folder_keeps_its_watch(job, poll_fast,
 	P, Q = os.path.join(job.monitor, 'P'), os.path.join(job.monitor, 'Q')
 	S = os.path.join(Q, 'S')
 	os.makedirs(os.path.join(P, 'S'))
-	real = os.scandir
-	failed = []
-	def scandir(path='.'):
-		if os.path.abspath(path) == S:
+	failed, failing = [], {'on': True}
+	def fail():
+		if failing['on']:
 			# S renamed in Q after the re-walk listed Q: reading it fails, and its own rename event handles it
-			failed.append(path)
-			raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), path)
-		return real(path)
+			failed.append(S)
+			raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), S)
 	with _ready_watch(job) as (to_process, lock, flag):
-		monkeypatch.setattr(os, 'scandir', scandir)
+		on_folder_open(monkeypatch, S, fail)
 		# mv P Q walks Q again; S's watch is held from before the walk, so the walk's error on S leaves it in place
 		os.rename(P, Q)
 		wait_until(lambda: failed, message='the re-walk did not reach S')
 		wait_until(lambda: _moved_to(to_process, lock, Q), message='no move')
-		monkeypatch.setattr(os, 'scandir', real)
+		failing['on'] = False
 		_consume_batch(to_process, lock, flag)
 		late = os.path.join(S, 'late.txt')
 		open(late, 'w').write('a later change in the held folder')

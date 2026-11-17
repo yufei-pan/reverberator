@@ -3,7 +3,7 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import latest_version, run_backup, seed_monitor, wait_until
+from tests.harness import latest_version, listed_folder, run_backup, seed_monitor, wait_until
 
 pytestmark = pytest.mark.inotify
 
@@ -545,7 +545,7 @@ def test_a_folder_made_while_a_moved_folders_walk_reads_its_parent_is_watched(jo
 				os.mkdir(sub)
 	def scandir(path='.'):
 		entries = real(path)
-		return Listing(entries) if isinstance(path, str) and os.path.abspath(path) == build else entries
+		return Listing(entries) if listed_folder(path) == os.path.realpath(build) else entries
 	monkeypatch.setattr(os, 'scandir', scandir)
 	flag = threading.Event()
 	thread, to_process, lock = _start(job, ['projects/*/build/'], flag)
