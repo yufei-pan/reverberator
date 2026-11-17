@@ -622,18 +622,21 @@ def test_backuper_passes_what_each_batch_touched(job, monkeypatch):
 		passed.append(kwargs.get('touched'))
 		return real(*args, **kwargs)
 	monkeypatch.setattr(rv, 'do_backup', recording)
-	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
 	queue = rv.ChangeEventQueue(job.monitor)
 	lock = threading.Lock()
 	flag = threading.Event()
-	# the batch queued at startup
-	queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
 	control = rv.JobControl(job.job_name)
 	control.start_attempt()
 	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag),
 		kwargs=dict(job=control), daemon=True)
 	thread.start()
 	try:
+		# the start's full comparison, then a batch of a file changed
+		assert control.committed.wait(10)
+		open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
+		with lock:
+			queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+		flag.set()
 		wait_for_committed_count(job, 2)
 		# then a folder created, and a full comparison
 		seed_monitor(job, {'N/c.txt': 'c'})
@@ -652,8 +655,8 @@ def test_backuper_passes_what_each_batch_touched(job, monkeypatch):
 		rv.GREEN_LIGHT.set()
 	# with the time of each batch's first event, from which the verification reads the extended attributes of what changed,
 	# on both clocks: the queue's wall clock stamp, and the event's monotonic time
-	assert all(isinstance(scopes.changed_since_wall, int) for scopes in passed[:2])
-	assert [without_wall(scopes) for scopes in passed] == [rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0), rv.TouchedScopes(['N/'], ['N'], 2.0), None]
+	assert all(isinstance(scopes.changed_since_wall, int) for scopes in passed[1:3])
+	assert [without_wall(scopes) for scopes in passed] == [None, rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0), rv.TouchedScopes(['N/'], ['N'], 2.0), None]
 
 
 def test_the_sweep_never_follows_links(job):
@@ -849,36 +852,23 @@ def queued_full_scan(queue, lock):
 		return queue.full_scan_requested
 
 
-def record_backups(monkeypatch):
-	'''(entries, touched) of each do_backup() call; a full comparison is (0, None).'''
-	calls = []
-	real = rv.do_backup
-
-	def recording(entries, *args, **kwargs):
-		calls.append((len(entries), kwargs.get('touched')))
-		return real(entries, *args, **kwargs)
-	monkeypatch.setattr(rv, 'do_backup', recording)
-	return calls
-
-
-def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job, monkeypatch):
-	from tests.harness import wait_for_committed_count
+def test_an_ordinary_batch_is_not_followed_by_a_full_comparison(job):
 	import time
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
-	with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
-		f.write('changed')
-	queue = rv.ChangeEventQueue(job.monitor)
-	queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
-	calls = record_backups(monkeypatch)
-	thread, lock, flag = start_backuper(job, queue)
+	backuper = RunningBackuper(job)
 	try:
-		wait_for_committed_count(job, 2)
+		with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
+			f.write('changed')
+		backuper.back_up([rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None)])
 		time.sleep(0.5)
-		assert [(count, without_wall(scopes)) for count, scopes in calls] == [(1, rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0))]
-		assert not queued_full_scan(queue, lock)
+		# the start's full comparison, then the batch, and nothing after it
+		assert [(count, without_wall(scopes), committed) for count, scopes, committed in backuper.calls] == [
+			(0, None, True), (1, rv.TouchedScopes(['a.txt/'], ['a.txt'], 1.0), True)]
+		assert not queued_full_scan(backuper.queue, backuper.lock)
 	finally:
-		stop_backuper(thread)
+		backuper.stop()
+	assert len(rv.list_versions(job.job_vault)) == 2
 
 
 class RunningBackuper:

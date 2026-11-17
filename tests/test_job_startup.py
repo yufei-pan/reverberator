@@ -1,4 +1,3 @@
-import errno
 import os
 import shutil
 import threading
@@ -190,26 +189,25 @@ def test_a_stop_before_the_watches_are_in_place_saves_nothing_and_makes_no_versi
 
 def test_the_vault_scan_runs_while_the_job_waits_for_its_monitored_path(job, poll_fast):
 	# a job restarted with its monitored path missing still has what a killed batch left taken away, by the scan, before
-	# the path comes back; a pending file an older release left goes then too
+	# the path comes back
 	seed_monitor(job, {'a.txt': 'a'})
 	_v0(job)
 	orphan = write_scan_leftover(job)
-	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None)])
 	shutil.rmtree(job.monitor)
 	startup = rv.JobStartup(job.job_name, job.monitor)
 	startup.watching.set()
 	thread = _run_backuper(job, startup)
 	try:
-		wait_until(lambda: not os.path.lexists(orphan) and not os.path.lexists(pending))
+		wait_until(lambda: not os.path.lexists(orphan))
 		assert thread.is_alive() and not startup.loaded.is_set()
 		assert len(committed_versions(job)) == 1
 	finally:
 		_stop(thread)
 
 
-# ---- F3: every start is one full comparison, and the pending file goes. A stop saves nothing and a start resumes nothing:
-# each start runs the one full comparison it ran anyway and makes one version. A pending file an older release left is
-# removed at the start. The tree's mtimes are set back after each change (_age()), so 0.55.4's resume check passes and it
+# ---- F3: every start is one full comparison. A stop saves nothing and a start resumes nothing: each start runs the one full
+# comparison it ran anyway and makes one version. A pending file an older release left stays, unread (0.55.5 removed it; P6
+# of round 0.55.6). The tree's mtimes are set back after each change (_age()), so 0.55.4's resume check passes and it
 # replays what it saved.
 
 class IdleFlag(threading.Event):
@@ -316,8 +314,9 @@ def test_a_stop_saves_nothing_and_the_start_makes_one_version(job, poll_fast):
 		manifest.close()
 
 
-def test_a_leftover_pending_file_is_removed_and_the_start_makes_one_version(job, poll_fast, monkeypatch):
-	# fails on main: it replays the file as a version of its own, then compares the whole tree into a second one
+def test_a_leftover_pending_file_is_left_unread_and_the_start_makes_one_version(job, poll_fast, monkeypatch):
+	# fails on main: its start removes the file, with an INFO line. From 0.55.6 nothing reads or removes a pending file a stop of
+	# 0.55.4 left (spec section 12, P6): it stays as it was, and the start's full comparison makes the one version
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
 	_age(job)
 	_v0(job)
@@ -328,20 +327,64 @@ def test_a_leftover_pending_file_is_removed_and_the_start_makes_one_version(job,
 	# as 0.55.4 writes it at a stop, newer than every change of the tree
 	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
 	os.utime(pending, (2000, 2000))
+	with open(pending, 'rb') as f:
+		written = f.read()
 	lines = _logged(monkeypatch)
 	_start_until_idle(job)
-	assert [message for message, _ in lines if pending in message] == [f'Removed {pending}, a pending file of an older release: every start compares the whole tree']
-	assert not os.path.lexists(pending)
+	assert os.path.lexists(pending), 'the start removed the pending file'
+	with open(pending, 'rb') as f:
+		assert f.read() == written
+	assert os.lstat(pending).st_mtime == 2000
+	assert [message for message, _ in lines if pending in message] == []
 	versions = committed_versions(job)
 	assert len(versions) == 2
 	assert _read(os.path.join(versions[-1], 'a.txt')) == 'a changed before the stop' and _read(os.path.join(versions[-1], 'b.txt')) == 'b changed while down'
 
 
+def test_a_backuper_started_with_a_filled_queue_and_no_startup_compares_the_whole_tree(job, poll_fast, monkeypatch):
+	# fails on main: with no JobStartup its first take converts what was queued ("Converted events queued at startup"), and a
+	# file changed with no event is in no version. From 0.55.6 every attempt's first batch is the whole tree's comparison, as the
+	# daemon's always was (spec section 12, P4): b.txt, made with no event, is in the first version, and the take that emptied
+	# the queue counts, so the watcher learns of it
+	seed_monitor(job, {'c.txt': 'c'})
+	_v0(job)
+	a, b = os.path.join(job.monitor, 'a.txt'), os.path.join(job.monitor, 'b.txt')
+	open(a, 'w').write('a')
+	open(b, 'w').write('b')
+	queue, lock = rv.ChangeEventQueue(job.monitor), threading.Lock()
+	with lock:
+		queue.append(rv.ChangeEvent(time.monotonic(), False, 'create', a, None))
+	takes = queue.takes
+	real = rv.do_backup
+	batches = []
+	def do_backup(backup_entries, **kwargs):
+		with lock:
+			batches.append((queue.takes - takes, len(queue), len(backup_entries), kwargs.get('touched')))
+		return real(backup_entries, **kwargs)
+	monkeypatch.setattr(rv, 'do_backup', do_backup)
+	lines = _logged(monkeypatch)
+	ready = threading.Event()
+	ready.set()
+	flag = IdleFlag()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag, ready), daemon=True)
+	thread.start()
+	try:
+		wait_until(flag.idle.is_set, message='the backuper never went idle')
+	finally:
+		_stop(thread)
+	assert [message for message, _ in lines if 'queued at startup' in message] == []
+	# the first batch: the queue taken once and empty, no entries and no touched scopes, as a full comparison
+	assert batches[0] == (1, 0, 0, None)
+	versions = committed_versions(job)
+	assert len(versions) == 2
+	assert sorted(os.listdir(versions[1])) == ['a.txt', 'b.txt', 'c.txt']
+
+
 def test_a_failed_attempt_is_followed_by_one_full_comparison(job, poll_fast, monkeypatch):
 	# pin: a failed attempt leaves an event queued (the watcher queued it while its batch ran, so that batch did not take it) and
 	# a file changes with no event (during the retry delay, nothing watches): the next attempt compares the whole tree once and
-	# makes one version holding both. Without the start's full scan (the append in backuper()) the queued event alone would
-	# decide, and the file changed with no event would be missed
+	# makes one version holding both. Without the start's full comparison (backuper()'s first batch) the queued event alone
+	# would decide, and the file changed with no event would be missed
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b', 'c.txt': 'c'})
 	_age(job)
 	_v0(job)
@@ -424,32 +467,3 @@ def test_a_rewrite_keeping_size_mtime_and_tail_before_a_stop_is_not_in_the_start
 	_age(job)
 	_start_until_idle(job)
 	assert _read(os.path.join(committed_versions(job)[-1], 'big.txt'))[:1024] == 'h' * 1024
-
-
-def test_a_leftover_pending_file_that_cannot_be_removed_stops_nothing(job, poll_fast, monkeypatch):
-	# review focus 5: one warning naming it, and the start's one full comparison and one version
-	seed_monitor(job, {'a.txt': 'a'})
-	_age(job)
-	_v0(job)
-	a = os.path.join(job.monitor, 'a.txt')
-	open(a, 'w').write('changed while down')
-	_age(job)
-	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
-	os.utime(pending, (2000, 2000))
-	real_remove = os.remove
-	def remove(path, *args, **kwargs):
-		if os.path.basename(os.fspath(path)) == rv.PENDING_TRANSACTIONS_FILE_NAME:
-			raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
-		return real_remove(path, *args, **kwargs)
-	monkeypatch.setattr(os, 'remove', remove)
-	lines = _logged(monkeypatch)
-	flag = IdleFlag()
-	thread, _, _ = _start(job, flag)
-	try:
-		wait_until(flag.idle.is_set, message='the start never went idle')
-		assert thread.is_alive()
-	finally:
-		_stop(thread)
-	assert [level for message, level in lines if pending in message] == ['warning']
-	versions = committed_versions(job)
-	assert len(versions) == 2 and _read(os.path.join(versions[-1], 'a.txt')) == 'changed while down'

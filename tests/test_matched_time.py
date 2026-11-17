@@ -265,27 +265,32 @@ def test_the_backuper_passes_each_batch_its_matched_time(job, monkeypatch):
 	run_backup(job)
 	calls = record_matched_since(monkeypatch)
 	queue = rv.ChangeEventQueue(job.monitor)
-	queue.read_wall_ns = 111
-	open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
-	queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+	started = time.time_ns()
 	thread, lock, flag = start_backuper(job, queue)
 	try:
+		# the start's full comparison, which records its matched time once it ends
+		wait_until(lambda: matched(job) is not None, message='no full comparison at the start')
+		open(os.path.join(job.monitor, 'a.txt'), 'w').write('changed')
+		with lock:
+			queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+			queue.read_wall_ns = 111
+		flag.set()
 		wait_for_committed_count(job, 2)
 		open(os.path.join(job.monitor, 'b.txt'), 'w').write('changed')
 		with lock:
 			queue.append(rv.ChangeEvent(2.0, False, 'modify', os.path.join(job.monitor, 'b.txt'), None))
 			queue.read_wall_ns = 222
 		flag.set()
-		wait_until(lambda: len(calls) == 2, message='no second batch')
+		wait_until(lambda: len(calls) == 3, message='no third batch')
 		# a full comparison's is its own start
 		before = time.time_ns()
 		with lock:
 			queue.append(rv.ChangeEvent(3.0, False, 'full_scan', job.monitor, None))
 		flag.set()
-		wait_until(lambda: len(calls) == 3, message='no full comparison')
+		wait_until(lambda: len(calls) == 4, message='no full comparison')
 	finally:
 		stop_backuper(thread)
-	assert calls[:2] == [111, 222] and before <= calls[2] <= time.time_ns()
+	assert started <= calls[0] <= before and calls[1:3] == [111, 222] and before <= calls[3] <= time.time_ns()
 
 
 @pytest.mark.unit

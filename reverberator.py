@@ -104,6 +104,7 @@ VAULT_TIMESTAMP_FORMAT = '%Y-%m-%d_%H-%M-%S_%z'
 MANIFEST_RECORD_HEADER = ['kind','size','mtime_ns','mode','uid','gid','hash','link','unchecked']
 
 CONTENT_FILE_EXTENSION_NAME = '.modified_contents.nsv'
+# a stop of 0.55.4 or older wrote it in the job vault; nothing reads, writes or removes it since 0.55.6 (the tests name it)
 PENDING_TRANSACTIONS_FILE_NAME = '.reverberator_pending_transactions.nsv'
 MANIFEST_FILE_NAME = '.reverberator_manifest.sqlite'
 
@@ -4539,27 +4540,15 @@ def scan_scopes(monitor_path:str, folders) -> list:
 			scopes.append(rel)
 	return scopes
 
-def drop_untracked_deletes(backup_entries:dict, manifest:'VaultManifest', monitor_path:str, newest_path:str = None) -> int:
+def drop_untracked_deletes(backup_entries:dict, manifest:'VaultManifest', monitor_path:str) -> int:
 	'''
 	Drop the delete entries of paths the manifest does not track ( no row at the path, at the path with /, or under it ),
 	which have nothing in the vault to delete; returns how many went. Every other entry and the order stay.
 	A move-out carried over a phantom is deleted at the pair timeout, after the phantom's removal took its path from the vault.
-	With newest_path, the newest version's folder, for a manifest that does not describe it (a lost one, before the batch
-	lists the version again), a delete drops when an lstat finds nothing at its path there: the newest version is the real
-	tree. An lstat that fails otherwise keeps the delete.
+	The manifest describes the newest version: a batch with entries comes after its attempt's first batch, the whole tree's
+	comparison, a roll-forward or a first version, each of which leaves it so.
 	'''
-	def untracked(path):
-		rel = os.path.relpath(path, monitor_path)
-		if newest_path is None:
-			return not manifest.tracks(rel)
-		try:
-			os.lstat(os.path.join(newest_path, rel.rstrip('/')))
-		except (FileNotFoundError, NotADirectoryError):
-			return True
-		except OSError:
-			return False
-		return False
-	untracked = [path for path, values in backup_entries.items() if values.event == 'delete' and untracked(path)]
+	untracked = [path for path, values in backup_entries.items() if values.event == 'delete' and not manifest.tracks(os.path.relpath(path, monitor_path))]
 	for path in untracked:
 		del backup_entries[path]
 	return len(untracked)
@@ -4868,22 +4857,6 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 		raise
 	return vaultInfo, manifest, False
 
-def remove_pending_file(job_name:str, job_vault:str) -> None:
-	'''
-	Remove the pending transactions file (PENDING_TRANSACTIONS_FILE_NAME) a stop of 0.55.4 or older left in job_vault: from
-	0.55.5 on no release reads it, as every start compares the whole tree (0.55.4 replayed it). One unlink, which finds nothing after the first start; a
-	removal says so on one line, and one that fails is a warning, and the start goes on.
-	'''
-	path = os.path.join(job_vault, PENDING_TRANSACTIONS_FILE_NAME)
-	try:
-		os.remove(path)
-	except FileNotFoundError:
-		return
-	except OSError as e:
-		backuperTeeLogToTl(job_name, f'Could not remove {path}, a pending file of an older release, which nothing reads: {e}', warning=True)
-		return
-	backuperTeeLogToTl(job_name, f'Removed {path}, a pending file of an older release: every start compares the whole tree')
-
 def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.Lock,monitor_path:str,vault_path:str,vault_path_signature:str,
 			 to_process_flag:threading.Event,monitor_fs_flag:threading.Event=None,
 			 only_sync_attributes:bool = DEFAULT_ONLY_SYNC_ATTRIBUTES, keep_n_versions:int = DEFAULT_KEEP_N_VERSIONS, 
@@ -4955,7 +4928,6 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				locks.release()
 		# the waits made the job vault, or the job is stopping
 		scanned = scan() if running() else None
-		remove_pending_file(job_name, job_vault)
 		wait_for_path(job, monitor_fs_flag, monitor_path, 'monitored filesystem not ready')
 		# batches are compared with the vault only while the monitored path shows the filesystem it shows now
 		root_mount = mount_fingerprint(current_mount_table(),os.path.realpath(monitor_path))
@@ -4975,24 +4947,13 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			# come as an event: it waits for the watches
 			while running() and not startup.watching.is_set():
 				startup.watching.wait(POLL_WAIT_SECONDS)
-			if not running():
-				return
-			with to_process_lock:
-				# every start compares the whole tree: a full scan absorbs whatever the watcher queued meanwhile, and what a
-				# failed attempt left queued
-				to_process.append(ChangeEvent(time.monotonic(),False,'full_scan',monitor_path,None))
 		if not running():
 			return
+		# every attempt's first batch compares the whole tree, which absorbs whatever the watcher queued meanwhile and what a
+		# failed attempt left queued: the take empties the queue, and the watcher learns of it by its count, as of any take
 		with to_process_lock:
-			to_process_temp = to_process.take()
-		if to_process_temp:
-			if to_process_temp.full_scan_requested:
-				full_comparison = True
-			else:
-				backupEntries = change_events_to_backup_entries(to_process_temp,monitor_path)
-				scan_folders = [event.path for event in to_process_temp if event.event == 'scan']
-				touched = batch_scopes(to_process_temp)
-				backuperTeeLogToTl(job_name, f'Converted events queued at startup into {len(backupEntries)} backup entries and {len(scan_folders)} folders to compare')
+			to_process.take()
+		full_comparison = True
 		# the start's scan: the first batch does not scan again
 		vaultInfo = scanned
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
@@ -5931,10 +5892,8 @@ def do_backup(backup_entries:dict,
 							backuperTeeLogToTl(job_name,'No backup entries left outside unmounted inner mounts',ok=True)
 				# a delete of what the vault holds no path of would make a version with no change. dropping it is safe: deletes
 				# replay first, onto a version that holds only the tracked rows, so such a delete would remove nothing. after
-				# the paused drop, as a move into a paused folder deletes its source, which may be untracked. a manifest that
-				# does not describe the newest version is not asked: the newest version is
-				describes = manifest.describes(latest_version_info.path)
-				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path,None if describes else latest_version_info.path)
+				# the paused drop, as a move into a paused folder deletes its source, which may be untracked
+				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path)
 				if dropped:
 					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
 				all_drop_out()

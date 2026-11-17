@@ -137,9 +137,10 @@ def test_uncommitted_backup_while_green_light_set_clears_green_light_and_requeue
 		threading.Event(),
 		monitor_fs_flag,
 	)
-	# the backuper took the batch and ran it: an error before do_backup() would leave the same three states
-	assert len(calls) == 1
-	# the batch is not handed back: the next start compares the whole tree
+	# the backuper took the queue and ran its first batch, the whole tree's comparison (no entries): an error before do_backup()
+	# would leave the same three states
+	assert len(calls) == 1 and not calls[0][0]
+	# the queued event is not handed back: the next start compares the whole tree
 	assert len(to_process) == 0
 	assert not os.path.lexists(os.path.join(tmp, 'vault', 'job', rv.PENDING_TRANSACTIONS_FILE_NAME))
 	assert not rv.GREEN_LIGHT.is_set()

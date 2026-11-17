@@ -640,24 +640,30 @@ def test_a_scanned_folder_meeting_only_an_unreadable_file_makes_no_version_and_o
 	from tests.harness import wait_until
 	seed_monitor(job, {'a.txt': 'a', 'disk/b.txt': 'b'})
 	before = _settled(job)
-	path = os.path.join(job.monitor, 'disk', 'b.txt')
-	open(path, 'w').write('b, longer')
-	os.chmod(path, 0)
 	compared = []
 	real = rv.compare_scopes
 	def compare_scopes(found, manifest, version_path, monitor_path, scopes, *args, **kwargs):
 		compared.append((list(scopes.subtrees), list(scopes.paths)))
 		return real(found, manifest, version_path, monitor_path, scopes, *args, **kwargs)
 	monkeypatch.setattr(rv, 'compare_scopes', compare_scopes)
-	queue, lock = rv.ChangeEventQueue(job.monitor), threading.Lock()
-	queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+	queue, lock, flag = rv.ChangeEventQueue(job.monitor), threading.Lock(), threading.Event()
 	control = rv.JobControl(job.job_name)
 	control.start_attempt()
-	capsys.readouterr()
-	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', threading.Event()),
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag),
 		kwargs=dict(job=control), daemon=True)
 	thread.start()
 	try:
+		# the start's full comparison first, then the change and its batch, the scan of disk/
+		wait_until(lambda: control.committed.is_set(), message='the start did not end')
+		path = os.path.join(job.monitor, 'disk', 'b.txt')
+		open(path, 'w').write('b, longer')
+		os.chmod(path, 0)
+		del compared[:]
+		capsys.readouterr()
+		control.committed.clear()
+		with lock:
+			queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+		flag.set()
 		wait_until(lambda: control.committed.is_set(), message='the batch did not end')
 	finally:
 		rv.GREEN_LIGHT.clear()
@@ -693,34 +699,6 @@ def test_a_create_of_a_folder_removed_before_the_check_makes_no_version(job, pol
 	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'made-and-gone/', 'create')]))
 	manifest.close()
 	assert committed is True and committed_versions(job) == before
-
-
-def test_an_untracked_delete_over_a_lost_manifest_makes_no_version(job, poll_fast):
-	# fails on main: the drop of deletes the vault does not track needs a manifest that describes the newest version, and the
-	# batch commits a version that changes nothing
-	from tests.harness import event_entry
-	from tests.test_vault_units import lose_the_manifest
-	seed_monitor(job, {'a.txt': 'a'})
-	before = _settled(job)
-	lose_the_manifest(job)
-	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'never-backed-up.txt', 'delete')]))
-	manifest.close()
-	assert committed is True and committed_versions(job) == before
-
-
-def test_a_tracked_delete_over_a_lost_manifest_is_still_removed(job, poll_fast):
-	# pin: with the manifest lost the drop of deletes asks the newest version, which holds the file, so the delete is a change
-	from tests.harness import event_entry
-	from tests.test_vault_units import lose_the_manifest
-	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
-	before = _settled(job)
-	lose_the_manifest(job)
-	os.remove(os.path.join(job.monitor, 'b.txt'))
-	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'b.txt', 'delete')]))
-	manifest.close()
-	versions = committed_versions(job)
-	assert committed is True and len(versions) == len(before) + 1
-	assert not os.path.lexists(os.path.join(versions[-1], 'b.txt')) and os.path.lexists(os.path.join(before[-1], 'b.txt'))
 
 
 def test_a_file_gone_between_the_check_and_its_open_is_gone_not_unreadable(job, poll_fast, monkeypatch, capsys):

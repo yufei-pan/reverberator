@@ -357,19 +357,23 @@ def test_backuper_handles_scan_events(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
 	_fake_mounts(monkeypatch, job, ['disk/'])
 	_backup(job)[1].close()
-	open(os.path.join(job.monitor, 'a.txt'), 'w').write('outside')
-	open(os.path.join(job.monitor, 'disk', 'f.txt'), 'w').write('inside')
-	queue = rv.ChangeEventQueue(job.monitor)
-	queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
-	queue.append(rv.ChangeEvent(2.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+	queue, lock, to_process_flag = rv.ChangeEventQueue(job.monitor), threading.Lock(), threading.Event()
 	control = rv.JobControl(job.job_name)
 	control.start_attempt()
 	flag = threading.Event()
 	flag.set()
-	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, threading.Lock(), job.monitor, job.vault, 'N/A',
-		threading.Event(), flag), kwargs=dict(job=control), daemon=True)
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A',
+		to_process_flag, flag), kwargs=dict(job=control), daemon=True)
 	thread.start()
 	try:
+		# the start's full comparison first, then the changes and their batch: f.txt, with no event of its own, comes by the scan
+		assert control.committed.wait(5)
+		open(os.path.join(job.monitor, 'a.txt'), 'w').write('outside')
+		open(os.path.join(job.monitor, 'disk', 'f.txt'), 'w').write('inside')
+		with lock:
+			queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+			queue.append(rv.ChangeEvent(2.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+		to_process_flag.set()
 		v1 = wait_for_committed_count(job, 2)[1]
 		assert open(os.path.join(v1, 'a.txt')).read() == 'outside'
 		assert open(os.path.join(v1, 'disk', 'f.txt')).read() == 'inside'
@@ -482,13 +486,19 @@ def test_scan_of_a_paused_mount_runs_no_backup(job, poll_fast, monkeypatch):
 	monkeypatch.setattr(rv, 'delta_generate_backup_entries', recording_delta)
 	queue = rv.ChangeEventQueue(job.monitor)
 	lock = threading.Lock()
-	queue.append(rv.ChangeEvent(1.0, False, 'delete', os.path.join(job.monitor, 'disk', 'f.txt'), None))
-	queue.append(rv.ChangeEvent(2.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
 	control = rv.JobControl(job.job_name)
 	control.start_attempt()
 	to_process_flag = threading.Event()
 	thread = _run_backuper(job, queue, control, to_process_flag, lock)
 	try:
+		# the start's full comparison, which keeps the paused disk's files, then what the disk saw before it went
+		assert control.committed.wait(5)
+		del scopes[:]
+		control.committed.clear()
+		with lock:
+			queue.append(rv.ChangeEvent(1.0, False, 'delete', os.path.join(job.monitor, 'disk', 'f.txt'), None))
+			queue.append(rv.ChangeEvent(2.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+		to_process_flag.set()
 		wait_until(lambda: not queue, timeout=5, message='batch not taken')
 		# a batch that needs no new version still counts as a clean backup
 		assert control.committed.wait(5)
@@ -656,9 +666,6 @@ def test_an_unreadable_folder_in_a_scanned_disk_is_reported_once(job, poll_fast,
 	seed_monitor(job, {'a.txt': 'a', 'disk/': None})
 	_fake_mounts(monkeypatch, job, [])
 	_backup(job)[1].close()
-	# a disk is mounted on the folder, holding a folder that cannot be read
-	seed_monitor(job, {'disk/new.txt': 'n', 'disk/bad/x': 'x'})
-	_fake_mounts(monkeypatch, job, ['disk/'])
 	bad = os.path.join(job.monitor, 'disk', 'bad')
 	original = os.scandir
 	def scandir(path='.'):
@@ -668,12 +675,19 @@ def test_an_unreadable_folder_in_a_scanned_disk_is_reported_once(job, poll_fast,
 	monkeypatch.setattr(os, 'scandir', scandir)
 	lines = []
 	monkeypatch.setattr(rv, 'job_log', lambda job_name, text: lines.append(text) or text)
-	queue = rv.ChangeEventQueue(job.monitor)
-	queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+	queue, lock, to_process_flag = rv.ChangeEventQueue(job.monitor), threading.Lock(), threading.Event()
 	control = rv.JobControl(job.job_name)
 	control.start_attempt()
-	thread = _run_backuper(job, queue, control, threading.Event())
+	thread = _run_backuper(job, queue, control, to_process_flag, lock)
 	try:
+		# the start's full comparison first; then a disk is mounted on the folder, holding a folder that cannot be read, and
+		# its scan comes
+		assert control.committed.wait(5)
+		seed_monitor(job, {'disk/new.txt': 'n', 'disk/bad/x': 'x'})
+		_fake_mounts(monkeypatch, job, ['disk/'])
+		with lock:
+			queue.append(rv.ChangeEvent(1.0, True, 'scan', os.path.join(job.monitor, 'disk'), None))
+		to_process_flag.set()
 		v1 = wait_for_committed_count(job, 2)[1]
 		assert open(os.path.join(v1, 'disk', 'new.txt')).read() == 'n'
 		assert sum(line.startswith(f'UNREADABLE: {bad}:') for line in lines) == 1
