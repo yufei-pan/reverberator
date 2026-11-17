@@ -7,7 +7,6 @@ import sys
 import tempfile
 import threading
 import pytest
-from _pytest.doctest import DoctestItem
 import reverberator as rv
 from tests import harness
 from tests.harness import FakePool, create_job, reverberator_script
@@ -28,8 +27,10 @@ REAL_SYNC_VAULT_FILESYSTEMS = rv.sync_vault_filesystems
 REAL_LIBC_SYNCFS = rv.LIBC_SYNCFS
 
 # the layers of the full-test-suite spec (docs/superpowers/specs/2026-08-12-full-test-suite-design.md), by what a test does:
-# unit in-process (also one that needs root only for a trusted.* attribute or a chown), inotify a real watch, process the
-# daemon's CLI started, privileged a mount (a loop image, tmpfs, mergerfs, dm). every collected test carries one
+# unit in-process (it may spawn a helper such as cp, or a child that only runs library code; it may need root only for a
+# trusted.* attribute or a chown), inotify a real watch (an instance made by watchFolder() or by the test), process the daemon
+# or its CLI started as a process (run_reverberator, reverberator_script()), privileged a mount (a loop image, tmpfs, mergerfs,
+# dm). every collected test carries exactly one: the hook below fails the collection of a module that holds a test with none or two
 LAYERS = ('unit', 'inotify', 'process', 'privileged')
 
 
@@ -244,20 +245,34 @@ def pytest_configure(config):
 def unmarked_tests(items) -> list:
 	'''The node id of each collected test that carries none of the layer markers; a doctest needs none.'''
 	return [item.nodeid for item in items
-		if not isinstance(item, DoctestItem) and not any(item.get_closest_marker(name) is not None for name in LAYERS)]
+		if not isinstance(item, pytest.DoctestItem) and not any(item.get_closest_marker(name) is not None for name in LAYERS)]
+
+
+def multi_layer_tests(items) -> list:
+	'''The node id of each collected test that carries more than one of the layer markers, each name counted once, a module's
+	mark and the test's own alike: `-m` would select it by both layers, so it would not go by what the test does.'''
+	return [item.nodeid for item in items if len({mark.name for mark in item.iter_markers() if mark.name in LAYERS}) > 1]
+
+
+def report_layer_errors(config, nodeids:list, what:str):
+	'''One failed collection report per module that holds a node id of the list, naming its tests.'''
+	by_module = {}
+	for nodeid in nodeids:
+		by_module.setdefault(nodeid.split('::')[0], []).append(nodeid)
+	for module, names in by_module.items():
+		config.hook.pytest_collectreport(report=pytest.CollectReport(module, 'failed',
+			f'tests with {what} ({", ".join(LAYERS)}): ' + ', '.join(names), []))
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-	# a test made without its layer fails the collection, naming it: twenty modules once missed theirs, and `pytest -m unit`
-	# left most of design R's unit tests out. first, so no -m has deselected it yet. a collection error of its module, which an
-	# xdist worker hands on as any other: a UsageError there ends in an INTERNALERROR naming none of them, and no test run
-	by_module = {}
-	for nodeid in unmarked_tests(items):
-		by_module.setdefault(nodeid.split('::')[0], []).append(nodeid)
-	for module, names in by_module.items():
-		config.hook.pytest_collectreport(report=pytest.CollectReport(module, 'failed',
-			f'tests with no layer marker ({", ".join(LAYERS)}): ' + ', '.join(names), []))
+	# a test made without its layer, or with two, is a collection error of its module, naming its tests: twenty modules once
+	# missed theirs, and `pytest -m unit` left most of design R's unit tests out. first, so no -m has deselected it yet. a
+	# collection error and not a UsageError, because an xdist worker hands it on as any other, where a UsageError ends the
+	# controller in an INTERNALERROR that names one test (xdist's crashed item) and loses the reason. Without xdist the error
+	# interrupts the run (exit 2, no test runs); under xdist the ERROR line shows, the run exits 1, and the other tests still run
+	report_layer_errors(config, unmarked_tests(items), 'no layer marker')
+	report_layer_errors(config, multi_layer_tests(items), 'more than one layer marker')
 	if sys.platform == 'linux':
 		return
 	skip = pytest.mark.skip(reason='inotify/process tests require Linux')

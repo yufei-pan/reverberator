@@ -41,7 +41,7 @@ The daemon stays a single module. Tests are a layered pytest suite.
 
 | Marker | Meaning | Default `pytest` |
 |--------|---------|------------------|
-| `unit` | In-process, temp dirs, no kernel watch, no subprocess | run |
+| `unit` | In-process, temp dirs, no kernel watch, no daemon or CLI process (a helper such as `cp` may run, and root may be needed for a `trusted.*` attribute or a chown): this follows the rule of round 0.55.6's Task 1 | run |
 | `inotify` | Real `inotify_simple` on a temp tree | run |
 | `process` | Spawn `reverberator.py` CLI | run |
 | `privileged` | Real bind-mount / unmount | collect, **skip** unless `os.geteuid() == 0` or env `REVERB_PRIVILEGED=1` |

@@ -35,8 +35,8 @@ filterwarnings = ["ignore:This process .* is multi-threaded, use of fork:Depreca
 norecursedirs = [".venv", "dist", ".git"]
 pythonpath = ["."]
 markers = [
-	"unit: fast in-process tests",
-	"inotify: live kernel inotify",
-	"process: spawn reverberator CLI",
-	"privileged: requires root or REVERB_PRIVILEGED=1",
+	"unit: in-process; may spawn helper commands such as cp, never the daemon or its CLI; may need root for a trusted.* attribute or a chown",
+	"inotify: a real inotify watch (an instance made by the watcher, or by the test)",
+	"process: spawns the daemon or its CLI (reverberator.py) as a process",
+	"privileged: mounts a filesystem (a loop image, tmpfs, mergerfs, dm)",
 ]
