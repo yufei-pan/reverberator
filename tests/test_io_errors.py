@@ -1018,6 +1018,29 @@ def test_a_new_folder_replaced_by_a_link_before_its_copy_walk_is_not_followed(jo
 	assert _row(job, 'n/secret.txt') is None
 
 
+@pytest.mark.parametrize('skip', ['no_skip_list', 'skip_list'])
+def test_the_size_estimate_of_a_new_folder_replaced_by_a_link_charges_nothing_of_the_links_target(job, tmp_path, monkeypatch, skip):
+	# review of Task 6, I1: the size estimate walks each folder entry of a batch from that folder, which is not a configured path: n
+	# is replaced by a link to a folder outside the tree after the estimate's lstat found it and before its walk opens it. The
+	# copy walk copies none of the outside folder, so the estimate must charge none of it either (a limit would otherwise prune the
+	# oldest versions for good to make room for bytes never written). Fails on 2cdd763: the walk opens n following the link and
+	# charges the outside folder's file and subfolder
+	seed_monitor(job, {'n/inner.txt': 'i' * 5000})
+	folder = os.path.join(job.monitor, 'n')
+	os.makedirs(job.job_vault, exist_ok=True)
+	outside = _outside(tmp_path)
+	with open(os.path.join(outside, 'big.bin'), 'wb') as f:
+		f.write(b'o' * (1 << 20))
+	# n itself, which the lstat found before the swap
+	own_blocks = os.lstat(folder).st_blocks * 512
+	on_folder_open(monkeypatch, folder, _swap(folder, str(tmp_path / 'n.old'), 'link', outside))
+	entries = OrderedDict([(folder + '/', rv.BackupEntryValues('t', 'create', None))])
+	skip_list = rv.SkipList(job.monitor, ['*.tmp']) if skip == 'skip_list' else None
+	size, inodes = rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, skip_list)
+	assert os.path.islink(folder)
+	assert (size, inodes) == (own_blocks, 1)
+
+
 def test_a_root_with_a_trailing_slash_yields_the_same_paths(tmp_path):
 	# review focus 3, a pin: a listing of a handle names its entries only, so the walk joins each path itself, where DirEntry.path
 	# joined it. A root given with a trailing / (a rule path may end with one) yields the same paths as without, none with //, and

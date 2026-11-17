@@ -691,11 +691,14 @@ def test_a_folder_replaced_by_a_link_is_never_watched_through_it(tmp_path, monke
 	assert [message for message, error in lines if error] == []
 
 
-def test_a_new_folder_replaced_by_a_link_before_its_walk_is_not_followed(job, tmp_path, poll_fast, monkeypatch):
+@pytest.mark.parametrize('swap', ['before_its_watch', 'between_its_watch_and_its_open'])
+def test_a_new_folder_replaced_by_a_link_before_its_walk_is_not_followed(job, tmp_path, poll_fast, monkeypatch, swap):
 	# review focus 2 (beyond the spec): the watcher walks a folder made in the tree from that folder, which is not a configured
-	# path; n, made, is replaced by a link to a folder outside the tree before that walk watches it: nothing of the outside folder
+	# path; n, made, is replaced by a link to a folder outside the tree before its watch is added (the watch is refused, and the walk
+	# never starts), or after its watch and before the walk opens it (the walk's own open of its root): nothing of the outside folder
 	# is watched (the copy walk's half is in test_io_errors.py). Fails on 8b411a5: the walk's root is watched and listed following
-	# the link, so the outside folder and the one in it are watched
+	# the link, so the outside folder and the one in it are watched; the second case fails with the walk's root opened following a
+	# link (follow_root=True), which the first never reaches
 	n = os.path.join(job.monitor, 'n')
 	outside, sub, swap_n = _outside_and_swap(tmp_path, n)
 	outside_ids = {(st.st_dev, st.st_ino) for st in (os.stat(outside), os.stat(sub))}
@@ -704,6 +707,8 @@ def test_a_new_folder_replaced_by_a_link_before_its_walk_is_not_followed(job, tm
 	# for each walk of n, the paths the watch map held right after it whose watch is on an outside folder: n's move-out, read
 	# later, takes away what was watched at n
 	after_n = []
+	# whether n was still a folder, not yet a link, when each watch at n was added, the first one first
+	folder_at_its_watch = []
 	real_init = rv.initializeFolderWatchers
 	def init(inotify_obj, path, wdDic, *args, **kwargs):
 		wd = real_init(inotify_obj, path, wdDic, *args, **kwargs)
@@ -714,7 +719,9 @@ def test_a_new_folder_replaced_by_a_link_before_its_walk_is_not_followed(job, tm
 	real_add = rv.inotify_simple.INotify.add_watch
 	def add_watch(self, path, mask):
 		if os.path.abspath(path).rstrip('/') == n:
-			swap_n()
+			if swap == 'before_its_watch':
+				swap_n()
+			folder_at_its_watch.append(not os.path.islink(n))
 		wd = real_add(self, path, mask)
 		try:
 			st = os.stat(path)
@@ -723,12 +730,17 @@ def test_a_new_folder_replaced_by_a_link_before_its_walk_is_not_followed(job, tm
 		watched[wd] = (st.st_dev, st.st_ino)
 		return wd
 	monkeypatch.setattr(rv.inotify_simple.INotify, 'add_watch', add_watch)
+	if swap == 'between_its_watch_and_its_open':
+		on_folder_open(monkeypatch, n, swap_n)
 	with _ready_watch(job) as (to_process, lock, flag):
 		os.mkdir(n)
 		# its create, read before a later probe's, is handled with its walk
 		_wait_watch_ready(job, to_process, lock)
 		assert os.path.islink(n)
 		assert after_n and [held for held in after_n if held] == []
+		# the swap came where the test says: the first watch at n was added while n was a folder (the walk's open is what met the link),
+		# or while it was a link already (the watch was refused); later looks at the link are refused too
+		assert folder_at_its_watch and folder_at_its_watch[0] == (swap == 'between_its_watch_and_its_open')
 
 
 @pytest.mark.parametrize('code, left_unwatched', [(errno.EACCES, True), (errno.ENOSPC, True), (errno.ENOENT, False), (errno.ENOTDIR, False)],

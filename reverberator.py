@@ -11043,7 +11043,9 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int) -> tupl
 	size, inodes = vault_charge(st, block), 1
 	if not path.endswith('/'):
 		return size, inodes
-	walk = iter_tree_entries(path, skip_list.folder_rel(path), skip=skip_list.skips) if skip_list else iter_tree_entries(path)
+	# a folder of the batch, which is not a configured path: one replaced by a link since the batch was taken is not walked through it,
+	# as the copy walk does not copy it
+	walk = iter_tree_entries(path, skip_list.folder_rel(path), skip=skip_list.skips, follow_root=False) if skip_list else iter_tree_entries(path, follow_root=False)
 	for entry_path, _, _ in walk:
 		try:
 			st = os.lstat(entry_path)

@@ -105,9 +105,12 @@ def open_fds() -> int:
 @pytest.mark.unit
 @pytest.mark.parametrize('walk', ['iter_tree_entries', 'iter_folder_entries'])
 def test_a_walk_stopped_early_closes_every_listing(tmp_path, walk):
-	# review focus 1: a consumer stops a walk early (a JobFailure from the pool guard, a PoolNotReady in a comparison, a break), and
-	# the daemon, which runs for months, keeps no listing of it. pin: a with block a level closes them today
+	# pin: review focus 1: a consumer stops a walk early (a JobFailure from the pool guard, a PoolNotReady in a comparison, a break),
+	# and the daemon, which runs for months, keeps no listing of it. A with block a level closes them today
 	depth = 50
+	# iter_tree_entries() keeps a folder's handle open beside its listing (R12: a DirEntry of a listing by handle stats through it),
+	# and the listing holds a duplicate of it: two descriptors a level. iter_folder_entries() lists by path: one
+	per_level = 2 if walk == 'iter_tree_entries' else 1
 	if walk == 'iter_tree_entries':
 		root = str(tmp_path / 't')
 		deep_tree(root, depth)
@@ -122,7 +125,7 @@ def test_a_walk_stopped_early_closes_every_listing(tmp_path, walk):
 		if rel_of(entry) != bottom:
 			return False
 		# a listing a level is open, the walk root's too
-		assert open_fds() >= before + depth + 1
+		assert open_fds() >= before + per_level * (depth + 1)
 		return True
 	for entry in start():
 		if at_the_bottom(entry):

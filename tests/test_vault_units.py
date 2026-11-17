@@ -21,7 +21,7 @@ import pytest
 import reverberator as rv
 from tests.crash_batches import backup_events, put_text
 from tests.errseq import open_folders
-from tests.harness import committed_versions, create_job, mark_unchecked_by_hand, run_backup, vault_unit, wait_for_committed_count, wait_until, write_fstab, write_rule
+from tests.harness import committed_versions, create_job, mark_unchecked_by_hand, on_folder_open, run_backup, vault_unit, wait_for_committed_count, wait_until, write_fstab, write_rule
 from tests.scratch_images import needs_mount, ScratchTmpfs
 from tests import version_view_ground_truth as view_truth
 from tests.vault_oracle import check_vault, rows_match_vault, snapshot_tree, version_number
@@ -1150,24 +1150,27 @@ def an_attribute_copy_cut(job, monkeypatch, tmp_path):
 
 def unreadable_below(monkeypatch, folder):
 	'''
-	Every look into folder fails with EACCES (its listing, and an lstat of anything in it), as a folder of mode 000 does for a user
-	other than root, while the folder itself can still be looked at. A real mode 000 would not do: root reads it, and a daemon run as
-	uid 65534 gives its own copy of the folder that mode and then cannot measure its own version.
+	Every look into folder fails with EACCES (its open for a listing, and an lstat of anything in it), as a folder of mode 000 does for
+	a user other than root, while the folder itself can still be looked at. A real mode 000 would not do: root reads it, and a daemon
+	run as uid 65534 gives its own copy of the folder that mode and then cannot measure its own version. The walk opens a folder with
+	os.open() before it lists it, which is where a folder of mode 000 refuses a user other than root. The list returned holds the
+	folder once for each open of it refused, which a test asserts, as a stand-in the walk no longer meets would deny nothing.
 	'''
-	real_scandir, real_lstat = os.scandir, os.lstat
+	real_lstat = os.lstat
 	inside = folder + os.sep
+	opens_refused = []
 	def denied(path):
 		raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
-	def scandir(path='.'):
-		if isinstance(path, str) and (path.rstrip(os.sep) == folder or path.startswith(inside)):
-			denied(path)
-		return real_scandir(path)
+	def refuse_open():
+		opens_refused.append(folder)
+		denied(folder)
+	on_folder_open(monkeypatch, folder, refuse_open)
 	def lstat(path, *args, **kwargs):
 		if isinstance(path, str) and path.startswith(inside):
 			denied(path)
 		return real_lstat(path, *args, **kwargs)
-	monkeypatch.setattr(rv.os, 'scandir', scandir)
 	monkeypatch.setattr(rv.os, 'lstat', lstat)
+	return opens_refused
 
 
 @pytest.mark.unit
@@ -1192,8 +1195,9 @@ def test_a_cut_batchs_file_the_roll_forward_cannot_copy_again_holds_version_ns_e
 		monkeypatch.setattr(rv, 'roll_forward_entries', walked)
 	if mount == 'unreadable_folder':
 		with monkeypatch.context() as denied:
-			unreadable_below(denied, disk.folder)
+			refused = unreadable_below(denied, disk.folder)
 			roll_forward(r_job, only_sync_attributes=False)
+		assert refused, 'the roll-forward\'s walk never opened the unreadable folder'
 	else:
 		roll_forward(r_job, only_sync_attributes=False)
 	held = os.path.join(committed_versions(r_job)[-1], 'disk', 'file.bin')
@@ -1740,11 +1744,13 @@ def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkey
 		if unreadable == 'file':
 			os.chmod(os.path.join(r_job.monitor, 'd/x.bin'), 0)
 		else:
-			unreadable_below(denied, os.path.join(r_job.monitor, 'd/sub'))
+			refused = unreadable_below(denied, os.path.join(r_job.monitor, 'd/sub'))
 		try:
 			roll_forward(r_job)
 		finally:
 			os.chmod(os.path.join(r_job.monitor, 'd/x.bin'), 0o644)
+	if unreadable == 'folder':
+		assert refused, 'the roll-forward\'s walk never opened the unreadable folder'
 	held = contents_of(committed_versions(r_job)[-1])
 	assert {rel: held.get(rel) for rel in held_before} == held_before
 	# the version before keeps nothing at d: the link the cut left in staging goes with staging, and over a lost manifest no row

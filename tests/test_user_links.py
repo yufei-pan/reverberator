@@ -794,8 +794,9 @@ def test_a_next_version_that_cannot_be_looked_at_keeps_the_oldest(tmp_path, monk
 	real_scandir, real_lstat = os.scandir, os.lstat
 	failing = os.path.join(v1.path, 'sub')
 	def scandir(path, *args, **kwargs):
-		if inside[0] and fails == 'listing' and os.fspath(path) == failing:
-			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		# the walk lists a folder by the handle it opened: the folder a listing is of, by a path or a handle
+		if inside[0] and fails == 'listing' and harness.listed_folder(path) == os.path.realpath(failing):
+			raise OSError(errno.EIO, os.strerror(errno.EIO), failing)
 		return real_scandir(path, *args, **kwargs)
 	def lstat(path, *args, **kwargs):
 		if inside[0] and fails == 'lstat' and os.fspath(path) == os.path.join(failing, 'f1'):
@@ -806,7 +807,11 @@ def test_a_next_version_that_cannot_be_looked_at_keeps_the_oldest(tmp_path, monk
 	before = snapshot(job, [v1], {})
 	capsys.readouterr()
 	bump(job, 1, keep_n_versions=2)
-	assert len([line for line in alerting_lines(capsys.readouterr().out) if 'cannot remove' in line]) == 1
+	out = capsys.readouterr().out
+	assert len([line for line in alerting_lines(out) if 'cannot remove' in line]) == 1
+	if fails == 'listing':
+		# it is V1's sub that could not be listed, as the stand-in says, not another folder or another error
+		assert f'Error scanning {failing}: [Errno {errno.EIO}]' in out
 	monkeypatch.undo()
 	versions = rv.list_versions(job.job_vault)
 	assert [version.number for version in versions] == [0, 1, 2] and os.path.isdir(v0.path)
