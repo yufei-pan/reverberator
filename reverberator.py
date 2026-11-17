@@ -2614,6 +2614,20 @@ def slugify(value, allow_unicode=False):
 	return re.sub(r'[-\s]+', '-', value).strip('-_')
 
 #%% ---- IRM ----
+def raise_open_file_limit() -> int:
+	'''
+	The soft limit of open files raised to the hard one, which needs no privilege: a walk holds a listing a level of the tree
+	(iter_tree_entries(), iter_folder_entries()), and a login shell starts a process with 1,024. Returns the hard limit, 0 when
+	the limit cannot be read or raised. The daemon calls it at start (inotify_resource_manager), and history and restore at theirs.
+	'''
+	try:
+		soft , hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+		if soft < hard:
+			resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+		return hard
+	except Exception as _:
+		return 0
+
 class inotify_resource_manager:
 	def __init__(self):
 		global DEBUG
@@ -2629,13 +2643,7 @@ class inotify_resource_manager:
 		self.max_user_instances = self.getSysctlValues('fs.inotify.max_user_instances')
 		self.max_user_watches = self.getSysctlValues('fs.inotify.max_user_watches')
 		self.max_no_files = self.getSysctlValues('fs.file-max')
-		try:
-			soft , hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-			if soft < hard:
-				resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-			self.max_no_files_user = hard
-		except Exception as _:
-			self.max_no_files_user = 0
+		self.max_no_files_user = raise_open_file_limit()
 
 	def __iter__(self):
 		for key in self.__dict__.keys():
@@ -3744,7 +3752,9 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 	'''
 	Walk path depth first, yielding (entry_path, rel_path, is_dir) with each folder right before its contents.
 	Folder paths end with /. Symlinks to folders are not followed and come out as files.
-	Nothing is listed up front, so walking a tree of 500k entries holds only the open folders of one branch.
+	Nothing is listed up front, so walking a tree of 500k entries holds only the open folders of one branch: a stack of
+	them, not a call a level, so Python's limit of 1,000 frames sets no depth. A folder is opened when the caller asks
+	for what comes after it, so a watch added for it at its yield comes before its listing.
 	With list_folders_first, each folder is read in full before its entries are yielded, so the caller can replace
 	entries as it goes: renaming into a folder still being read can make the listing skip an entry (through mergerfs
 	the entry can move to another branch).
@@ -3756,6 +3766,7 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 	no longer lists it (folder_gone()), so it gets one info line, at every level, the walk root's too, and is appended as
 	a FolderGone. Any other error, one its parent's listing does not confirm (a folder listed that cannot be opened or
 	looked up, as a FUSE mount's name trouble gives every time), or one met while listing, keeps its error line.
+	A walk the caller stops early (a break, close(), an exception) closes every listing it holds.
 
 	Examples:
 		>>> import tempfile
@@ -3771,33 +3782,47 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 		['d/', 'link']
 		>>> import shutil; shutil.rmtree(root)
 	'''
-	# None until the folder's own listing is open
-	listing = None
+	# the folders the walk is in, the deepest last, each [its path, its rel, its listing, the entries left of it]: the listing
+	# is None until the folder is opened, which is when the caller asks for what comes after its yield
+	stack = [[path, rel_prefix, None, None]]
 	try:
-		listing = os.scandir(path)
-		with listing as entries:
-			if list_folders_first:
-				entries = list(entries)
-			for entry in entries:
-				rel_path = rel_prefix + entry.name
-				if entry.is_dir(follow_symlinks=False):
-					if skip is not None and skip(rel_path + '/'):
-						continue
-					yield entry.path + '/', rel_path + '/', True
-					yield from iter_tree_entries(entry.path, rel_path + '/', list_folders_first, skip, errors)
-				else:
+		while stack:
+			frame = stack[-1]
+			folder_path, rel, listing, entries = frame
+			try:
+				if listing is None:
+					listing = frame[2] = os.scandir(folder_path)
+					entries = frame[3] = iter(list(listing) if list_folders_first else listing)
+				for entry in entries:
+					rel_path = rel + entry.name
+					if entry.is_dir(follow_symlinks=False):
+						if skip is not None and skip(rel_path + '/'):
+							continue
+						yield entry.path + '/', rel_path + '/', True
+						stack.append([entry.path, rel_path + '/', None, None])
+						break
 					if skip is not None and skip(rel_path):
 						continue
 					yield entry.path, rel_path, False
-	except Exception as e:
-		if listing is None and isinstance(e, OSError) and e.errno in (errno.ENOENT, errno.ENOTDIR) and folder_gone(path):
-			if errors is not None:
-				errors.append((rel_prefix, FolderGone(e.errno, e.strerror, path)))
-			watcherTeeLogToTl(path,f'{path} was gone when the walk reached it: {e}')
-			return
-		if errors is not None:
-			errors.append((rel_prefix, e))
-		watcherTeeLogToTl(path,f'Error scanning {path}: {e}',error=True)
+				else:
+					listing.close()
+					stack.pop()
+			except Exception as e:
+				stack.pop()
+				if listing is not None:
+					listing.close()
+				elif isinstance(e, OSError) and e.errno in (errno.ENOENT, errno.ENOTDIR) and folder_gone(folder_path):
+					if errors is not None:
+						errors.append((rel, FolderGone(e.errno, e.strerror, folder_path)))
+					watcherTeeLogToTl(folder_path,f'{folder_path} was gone when the walk reached it: {e}')
+					continue
+				if errors is not None:
+					errors.append((rel, e))
+				watcherTeeLogToTl(folder_path,f'Error scanning {folder_path}: {e}',error=True)
+	finally:
+		for frame in stack:
+			if frame[2] is not None:
+				frame[2].close()
 
 class FolderGone(OSError):
 	'''A walk's error for a folder gone when the walk reached it (iter_tree_entries()): no UNREADABLE line and no unwatched folder.'''
@@ -12519,9 +12544,14 @@ class WrittenFolders:
 			writer = TreeWriter(version_path)
 		real = {'': True}
 		def is_real(rel:str) -> bool:
+			# up the rel to the first folder known, then down from it, one lstat a folder not known yet, none below one that is not real
+			unknown = []
 			known = real.get(rel)
-			if known is None:
-				known = is_real(rel.rpartition('/')[0])
+			while known is None:
+				unknown.append(rel)
+				rel = rel.rpartition('/')[0]
+				known = real.get(rel)
+			for rel in reversed(unknown):
 				if known:
 					try:
 						known = stat.S_ISDIR(os.lstat(os.path.join(version_path, rel)).st_mode)
@@ -14598,19 +14628,43 @@ def read_walked(job_vault:str, number:int, rel:str, reading:VaultReading) -> Wal
 			return walked
 
 def iter_folder_entries(job_vault:str, folder:Walked, rel:str, backward:bool, refused, errors:list):
-	'''iter_version_entries() below rel, the folder walked as folder: each entry is walked from the version folder landed in, as the links on the way there are behind it.'''
-	name = os.path.relpath(folder.path, job_vault).partition('/')[0]
+	'''
+	iter_version_entries() below rel, the folder walked as folder: each entry is walked from the version folder landed in, as the
+	links on the way there are behind it. The folders it is in are kept on a stack, not a call a level, so Python's limit of
+	1,000 frames sets no depth; a walk the caller stops early closes every listing it holds.
+	'''
+	# the folders the walk is in, the deepest last, each [its rel, the version folder its walk landed in, its path there, its
+	# listing, the entries left of it]: the listing is None until the folder is opened, which is when the caller asks for what
+	# comes after its yield
+	stack = [[rel, os.path.relpath(folder.path, job_vault).partition('/')[0], folder.path, None, None]]
 	try:
-		with os.scandir(folder.path) as entries:
-			for entry in entries:
-				entry_rel = os.path.join(rel, entry.name)
-				walked = walk_folder(job_vault, name, entry_rel, backward)
-				yield entry_rel, walked
-				if walked.kind == 'folder' and entry_rel not in refused:
-					yield from iter_folder_entries(job_vault, walked, entry_rel, backward, refused, errors)
-	except Exception as e:
-		if errors is not None:
-			errors.append((rel, e))
+		while stack:
+			frame = stack[-1]
+			folder_rel, name, path, listing, entries = frame
+			try:
+				if listing is None:
+					listing = frame[3] = os.scandir(path)
+					entries = frame[4] = iter(listing)
+				for entry in entries:
+					entry_rel = os.path.join(folder_rel, entry.name)
+					walked = walk_folder(job_vault, name, entry_rel, backward)
+					yield entry_rel, walked
+					if walked.kind == 'folder' and entry_rel not in refused:
+						stack.append([entry_rel, os.path.relpath(walked.path, job_vault).partition('/')[0], walked.path, None, None])
+						break
+				else:
+					listing.close()
+					stack.pop()
+			except Exception as e:
+				stack.pop()
+				if listing is not None:
+					listing.close()
+				if errors is not None:
+					errors.append((folder_rel, e))
+	finally:
+		for frame in stack:
+			if frame[3] is not None:
+				frame[3].close()
 
 def iter_version_entries(job_vault:str, number:int, rel:str, backward:bool, refused = (), errors:list = None):
 	'''
@@ -15416,6 +15470,8 @@ def vault_pool_warning(job_vault:str) -> bool:
 
 def history_command(args) -> int:
 	'''Print the versions in which a file or folder changed, newest first. Exits 0 once shown, a path never backed up too, 1 when a disk of the vault's pool is missing (warned on stderr).'''
+	# as the daemon and restore do, whose walks hold a listing a level: a history reads each version by lstat (read_walked())
+	raise_open_file_limit()
 	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
 	rule, rel = find_job(load_command_rules(rule_path), args.path, args.job)
 	job_vault = job_vault_path(rule)
@@ -17013,6 +17069,8 @@ def restore_command(args) -> int:
 	with --accept. One run of a restore into a target at a time. Exits 0 once everything was restored (or kept),
 	EXIT_COMMAND_FAILED when anything was not (each named) or a disk of the vault's pool is missing (warned), EXIT_USAGE when it cannot start.
 	'''
+	# a folder's restore walks the version, a listing open a level of it
+	raise_open_file_limit()
 	if args.in_place and args.dest is not None:
 		raise CommandError('Give a destination folder or --in-place, not both')
 	if not args.in_place and args.dest is None:

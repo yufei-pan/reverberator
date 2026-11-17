@@ -6,7 +6,7 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import run_backup, seed_monitor, wait_until
+from tests.harness import deep_tree, run_backup, seed_monitor, wait_until
 
 pytestmark = pytest.mark.inotify
 
@@ -533,6 +533,8 @@ def test_a_folder_made_while_the_walk_reads_its_parent_is_watched(job, poll_fast
 		def __iter__(self):
 			return iter(self.entries)
 		def __exit__(self, *exc_info):
+			self.close()
+		def close(self):
 			self.entries.close()
 			if not os.path.exists(b):
 				os.mkdir(b)
@@ -663,6 +665,26 @@ def test_a_folder_whose_watch_fails_is_left_unwatched_unless_it_is_gone(tmp_path
 		assert f not in {path.rstrip('/') for path in wdDic.values()}
 		assert irm.current_user_watches == len(wdDic) == _kernel_watches(inotify_obj)
 	assert unwatched == ({f} if left_unwatched else set())
+
+
+def test_a_tree_1200_levels_deep_is_watched_to_its_bottom(tmp_path, monkeypatch):
+	# past Python's 1,000 frames the walk keeps a stack, not a call a level (spec section 2, P10): every folder is watched, and a
+	# file made at the bottom raises its create. Fails on 1a4eeae: the walk stops some 990 levels down at the recursion limit, taken
+	# for an unreadable folder ("Error scanning ...: maximum recursion depth exceeded"), and the folders below are left unwatched
+	root = str(tmp_path / 'm')
+	bottom = deep_tree(root, 1200)
+	lines = _watcher_lines(monkeypatch)
+	irm = rv.inotify_resource_manager()
+	wdDic, unwatched = {}, set()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		assert rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched) != -1
+		assert len(wdDic) == 1201
+		assert [message for message, error in lines if error] == []
+		assert unwatched == set()
+		bottom_wd = next(wd for wd, path in wdDic.items() if path.rstrip('/') == bottom)
+		open(os.path.join(bottom, 'new'), 'w').close()
+		creates = [(event.wd, event.name) for event in inotify_obj.read(timeout=5000) if event.mask & rv.inotify_simple.flags.CREATE]
+		assert creates == [(bottom_wd, 'new')]
 
 
 def test_a_folder_watched_twice_is_counted_once(tmp_path):

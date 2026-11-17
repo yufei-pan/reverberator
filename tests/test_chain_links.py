@@ -2,14 +2,12 @@
 The links of a 0.54 vault as the code a 0.54 vault still needs reads them: vault_chain_hop() and the prune tell a chain link from a user's
 link. tests/legacy054.py writes the vaults, as the product's writer is gone.
 '''
-import contextlib
 import errno
 import os
-import sys
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import seed_monitor, write_tree, write_committed_version, run_backup, latest_version, event_entry, link_text_limit
+from tests.harness import seed_monitor, write_tree, write_committed_version, run_backup, latest_version, event_entry, link_text_limit, stack_for_half_the_folders
 
 pytestmark = pytest.mark.unit
 
@@ -109,23 +107,6 @@ def folders_deep(prefix, *folders):
 	# does not starve it
 	assert depth // 2 >= 2 * DAEMON_FRAMES, depth
 	return depth
-
-
-@contextlib.contextmanager
-def stack_for_half_the_folders(depth):
-	'''
-	A limit on the stack that gives the code under it half as many frames as the link has folders: a check that went down a folder at a time,
-	a frame for each, would fail on it, whatever depth its filesystem lets a link be.
-	'''
-	limit = sys.getrecursionlimit()
-	frames, frame = 0, sys._getframe()
-	while frame is not None:
-		frames, frame = frames + 1, frame.f_back
-	sys.setrecursionlimit(frames + depth // 2)
-	try:
-		yield
-	finally:
-		sys.setrecursionlimit(limit)
 
 
 @pytest.mark.parametrize('absolute', [False, True])

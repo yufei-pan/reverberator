@@ -538,6 +538,8 @@ def test_a_folder_made_while_a_moved_folders_walk_reads_its_parent_is_watched(jo
 		def __iter__(self):
 			return iter(self.entries)
 		def __exit__(self, *exc_info):
+			self.close()
+		def close(self):
 			self.entries.close()
 			if not os.path.exists(sub):
 				os.mkdir(sub)

@@ -1,5 +1,4 @@
 import os
-import resource
 import shutil
 import signal
 import subprocess
@@ -189,7 +188,7 @@ def run_reverberator(tmp_path, process_env):
 		except Exception:
 			pass
 
-	def _run(rule_path, extra_args=()):
+	def _run(rule_path, extra_args=(), preexec_fn=None):
 		p = subprocess.Popen(
 			[sys.executable, reverberator_script(), '--no_log', '-ld', log_dir, *list(extra_args), str(rule_path)],
 			env=process_env,
@@ -198,6 +197,7 @@ def run_reverberator(tmp_path, process_env):
 			text=True,
 			# a byte that is not UTF-8 must show in the capture, not end the reading of it
 			errors='surrogateescape',
+			preexec_fn=preexec_fn,
 		)
 		p._out_buf = []
 		p._err_buf = []
@@ -235,11 +235,9 @@ def pytest_configure(config):
 	config.addinivalue_line('markers', 'on_054: this test is of a vault on 0.54: run_backup() and the vaults it writes are the 0.54 daemon\'s (tests/legacy054.py)')
 	# every process of the suite runs with the open file limit the daemon gives itself at start (soft raised to hard), so no
 	# test depends on whether an earlier one in its worker built the daemon's limits: a 1,500 folder deep tree's rmtree
-	# holds an fd per level, over the 1,024 a login shell starts with (2026-11-09, VM gate, EMFILE). The commands (status,
-	# history, restore) raise no limit of their own: out of the suite they run with the one they are started with
-	soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-	if soft < hard:
-		resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+	# holds an fd per level, over the 1,024 a login shell starts with (2026-11-09, VM gate, EMFILE). The daemon, history and
+	# restore raise their own the same way: tests/test_deep_trees.py starts them at 1,024
+	rv.raise_open_file_limit()
 
 
 def unmarked_tests(items) -> list:

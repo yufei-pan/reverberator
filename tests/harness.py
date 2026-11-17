@@ -1,6 +1,8 @@
+import contextlib
 import errno
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections import namedtuple, OrderedDict
@@ -97,6 +99,41 @@ def link_text_taking_a_block(folder: str):
 		else:
 			low = middle + 1
 	return low
+
+
+@contextlib.contextmanager
+def stack_for_half_the_folders(depth):
+	'''
+	A limit on the stack that gives the code under it half as many frames as the tree or the link has folders (depth): a walk or a check that
+	went down a folder at a time, a frame for each, would fail on it, whatever depth its filesystem lets a link be.
+	'''
+	limit = sys.getrecursionlimit()
+	frames, frame = 0, sys._getframe()
+	while frame is not None:
+		frames, frame = frames + 1, frame.f_back
+	sys.setrecursionlimit(frames + depth // 2)
+	try:
+		yield
+	finally:
+		sys.setrecursionlimit(limit)
+
+
+def deep_tree(root: str, depth: int, leaf: str = 'f') -> str:
+	'''
+	depth one-letter folders, d in d, under root, and an empty file leaf at the bottom; the bottom folder's path. Made a level at a time
+	with os.mkdir() and os.chdir(), as os.makedirs() itself recurses a level at a time; the working folder is the old one again after.
+	'''
+	os.makedirs(root, exist_ok=True)
+	cwd = os.getcwd()
+	os.chdir(root)
+	try:
+		for _ in range(depth):
+			os.mkdir('d')
+			os.chdir('d')
+		open(leaf, 'w').close()
+	finally:
+		os.chdir(cwd)
+	return root.rstrip('/') + '/d' * depth
 
 
 def copy_now(writer, source: str, rel: str):

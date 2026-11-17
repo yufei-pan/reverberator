@@ -26,12 +26,15 @@ def test_get_vault_info_indexes_committed_only(job):
 
 
 class Listing(list):
-	'''What os.scandir() hands back, in an order the test sets: the daemon iterates it bare and in a with.'''
+	'''What os.scandir() hands back, in an order the test sets: the daemon iterates it bare and in a with, and a walk closes it.'''
 	def __enter__(self):
 		return self
 
 	def __exit__(self, *_):
 		return False
+
+	def close(self):
+		pass
 
 
 def test_get_vault_info_keeps_committed_when_content_file_listed_first(job, monkeypatch):
