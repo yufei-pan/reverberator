@@ -69,10 +69,11 @@ chief's decisions), Q15 is below. The plan is written
 (`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a table at its top and a [Q<n>] mark on each
 task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (the healing test) runs second so Q15
 can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
-stays as written). Next: building, by subagent-driven development, on the recommended options, which Q9 to Q14's
-answers all took, from 2026-11-16 22:15 PST (chief's decision of that time); P7's
-24-hour reading is in. Behind it: a deferral is planned work; the user's pick 2026-11-14,
-"Fixes round (Recommended)".
+stays as written). Building since 2026-11-16 22:15 PST (chief's decision of that time), by subagent-driven development, on the recommended options, which Q9 to Q14's answers all took; the build's
+ledger (task by task, rulings, deferred minors) is the git-ignored `.superpowers/sdd/2026-11-15-r0556/progress.md` in the
+worktree. Where it stands (2026-11-17 02:50 PST): Task 1 (P15) done and reviewed (c18fc76..5212daf); Task 2 (P16's
+healing check) built and fixed once (85e8e5d, 9f3b707), its re-review next, then Q15 is rewritten from its table;
+Tasks 3 to 22 not started. It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
 8, 9 ("the 0.54 parts go in a later release") and 12 step 3; `plans/2026-11-05-round20.md`; commit 9ab7949 ("stays for
