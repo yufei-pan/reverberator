@@ -1227,17 +1227,27 @@ def healed_at(job, versions:list, steps:list, case:str, monitored:str, rel:str):
 
 
 CASES = {
-	# P setgid, C without (uid 65534 sets both on its own folders); the copy fails before its chmod: C keeps the inherited bit
+	# P setgid, C without (uid 65534 sets both on its own folders); the copy fails before its chmod. At settle C keeps the bit it
+	# inherited from the vault's P (at first_version it inherits none, and at attrib the bit is the one the batch gave the monitored C,
+	# which the vault's C lacks). Kept only when two attempts fail: a folder with no extended attributes on either side is copied
+	# first by copy_new_folder_meta()'s fast path (a request each for the owner, mode and times), and one failed request there falls
+	# back to copy_file_meta(), which mends it in the same batch with no ERROR line. fail_folder_copy_once() fails both on purpose, as
+	# a chmod that keeps failing does. (V0's walk copies each folder with copy_file_meta() itself: no fast path at first_version)
 	'setgid': 'before_chmod',
 	# P with a default ACL (system.posix_acl_default, an ACL blob written by os.setxattr), C without; the removal step fails. The
+	# single-failure case: at settle the vault's C holds the inherited ACL and at attrib the monitored C has one, so
+	# copy_new_folder_meta() sends the copy straight to copy_file_meta(), which has no fallback (V0's walk calls it itself). The
 	# removal is real only at settle: at first_version and attrib the vault's C has no extended attributes at that step, so the real
-	# drop_xattrs_missing_from() returns before any syscall, and the stand-in fails a removal the real copy cannot make there. The
-	# pins stand: the state left (no times, no extended attributes, no mode copied) is what a real failure at the next step, the
-	# first of copystat(), leaves
+	# drop_xattrs_missing_from() lists the destination's attributes (xattr_names(dest), a listxattr) and returns before any removal.
+	# The stand-in fails before that listing. An EIO from the listing is a real failure at this step at first_version and attrib, and
+	# leaves the state the stand-in does (the pins stand with more reason): no times, no extended attributes and no mode copied, as a
+	# real failure at the next step, the first of copystat(), leaves it too
 	'default_acl': 'drop_missing',
-	# C with user.note = b'x'; copystat()'s attribute step fails, after the times. Its chmod is not done either, so a C that is new
-	# keeps the mode mkdir gave it in the vault (0755 under umask 022), and its row records that mode: the monitored C, made under
-	# the same umask, has the same one, which the test asserts
+	# C with user.note = b'x'; copystat()'s attribute step fails, after the times. The single-failure case: the monitored C has an
+	# attribute, so copy_new_folder_meta() sends the copy straight to copy_file_meta(), which has no fallback (V0's walk calls it
+	# itself). Its chmod is not done either, so a C that is new keeps the mode mkdir gave it in the vault (0755 under umask 022, which
+	# umask_022 sets), and its row records that mode: the monitored C, made under the same umask, has the same one, which the test
+	# asserts
 	'own_xattr': 'copy_xattrs',
 	# the same with the monitored C at mode 0775, which differs from the vault's new C and from its row: the next full comparison
 	# finds that by the mode, wherever it comes. At attrib, V0 copied the mode (C was right), so this case is as own_xattr there
@@ -1251,23 +1261,34 @@ CASES = {
 PLACES = ['first_version', 'settle', 'attrib']
 # What comes between the failing version and the full comparison, and whether the full comparison's attribute check reaches C. That
 # check compares the extended attributes of the entries whose ctime is not before the matched time less VERIFY_CTIME_MARGIN_SECONDS
-# (full_comparison_since(), ctime_bound()). The matched time is the read time of the newest batch committed with every copy synced,
-# or the start of the newest full comparison; a batch that left an unsynced entry (C's failed copy) carries the older time over; and
-# with none recorded (the first version failed) the bound starts at the newest version's folder time, which holds whole seconds. So
-# the commits between decide, never how late the full comparison itself runs.
-# no_batch: the full comparison is the commit right after the failing version, which no batch comes between. Its bound starts from the
-# time matched before it: at settle and attrib the start of V0's full comparison, which C's last change (the batch's) came after, so
-# the bound reaches C however late the full comparison runs; at the first version nothing is matched (it failed), and the bound
-# starts from its folder time, which here is seconds after C's last change
-# no_batch_old_folder: the same at the first version, with C's last change more than the margin before the version's folder time (a
-# folder that was there long before the first backup). The margin is -1 for the full comparison, which puts the bound after C's ctime
-# (0 would leave a C made in the same whole second as the folder's name after it). Not at settle or attrib: C changed after the
-# matched time there, so no time passing puts it before the bound
-# next_commit: a batch elsewhere, then a batch that writes into C (the file moves C's ctime and mtime), then the full comparison as the
-# next commit: the matched time is that batch's read time, seconds after C's last change, so C's attributes are compared
-# after_another_batch: the same, and another batch committed more than the margin after C's last change comes before the full
-# comparison, so the matched time is past C's ctime plus the margin. The margin is 0 for the full comparison, which puts the bound after
-# C's ctime as that does (checked once with a real 11 s wait and a batch after it, which gave the same cells)
+# (10 s: full_comparison_since(), ctime_bound()). A commit records a matched time when no inner mount was paused, nothing was logged
+# unreadable and every metadata copy synced (so the failing version never does): the read time of a batch, or the start of a full
+# comparison. Any other commit leaves the older time, and with none recorded the bound starts at a version's folder time, which holds
+# whole seconds. So the commits between decide, never how late the full comparison itself runs. The test differs from the daemon in
+# where a matched time comes from: its _full() and _backup() pass no matched_since, so a full comparison records none (record_matched()
+# writes nothing with no time and none to carry over), and a batch of backup_events() is stamped with the time of the call
+# no_batch: the full comparison is the commit right after the failing version, which no batch comes between. Nothing is matched in
+# the test, so its bound comes from full_comparison_since()'s fallback, V0's folder time: V0's start in whole seconds, the same instant
+# as the daemon's matched time (the start of V0's full comparison) to within a second. At settle and attrib C's last change came
+# after V0's start, so the bound reaches C however late the full comparison runs; at the first version V0 is the failing version, and
+# its folder time is within a second of C's last change (it can fall just before it)
+# no_batch_old_folder: the same at the first version, with C's last change more than the margin before V0's folder time (a folder that
+# was there long before the first backup). The margin is -1 for the full comparison, which puts the bound after C's ctime (0 would
+# leave a C made in the same whole second as the folder's name after it). Not at settle or attrib: C changed after V0's start there,
+# so no time passing puts it before the bound
+# next_commit: a batch elsewhere, then a batch that writes into C (the file moves C's ctime and mtime), then the full comparison as
+# the next commit. backup_events() stamps the batch into C with the time of the call, milliseconds after C's last change, so the
+# bound reaches C. In the daemon a batch's matched time is its watcher read time, and next_commit holds only where that is within the
+# margin of C's last change: a minimum interval under about 10 s (blank or none is 0), or a take at the maximum interval of a tree
+# never quiet that long. At the sample rule's 60 s (auto is 60 too) it does not occur: the watcher signals a batch after the
+# minimum interval of quiet (or at the maximum interval) and restamps its read time at every empty read, so the batch into C carries
+# a read time about 57 s or more after C's last change (the interval less the watcher's read wait, 3 s by default), and the bound
+# misses C: the next_commit cells are then after_another_batch's. From about 13 s up (the margin and the read wait) the minimum
+# interval alone cannot produce next_commit
+# after_another_batch: next_commit's sequence with the margin 0 for the full comparison, which puts the bound at the matched time of
+# the batch into C, past C's ctime. The margin 0 stands for a batch committed more than the margin after C's last change: in the
+# daemon at 60 s any batch taken after the minimum interval's quiet, the batch into C included (see next_commit). A real 11 s wait and
+# one more batch after the one into C, with the margin left at 10, gave the same cells
 TIMINGS = {'no_batch': (False, None), 'no_batch_old_folder': (False, -1), 'next_commit': (True, None), 'after_another_batch': (True, 0)}
 PLACE_TIMINGS = [(place, timing) for place in PLACES for timing in ('no_batch', 'next_commit', 'after_another_batch')] + [('first_version', 'no_batch_old_folder')]
 # (case, place, timing): the step of the first version that holds C as the monitored C is, from which every later one does:
@@ -1313,18 +1334,20 @@ HEALS = {
 	('own_xattr', 'first_version', 'no_batch'): 'full',
 	('own_xattr', 'first_version', 'next_commit'): 'full',
 	# main 0.55.5: does not heal where the attribute check does not reach C (C last changed more than the margin before the first
-	# version's folder time, or another batch committed after the one into C): C's record matches the monitored C's, as the times were
-	# copied before the failing step and the mode is the 0755 mkdir gave both (at another mode it heals, by the mode: own_xattr_0775)
+	# version's folder time, or the matched time of a batch is more than the margin after C's last change: the margin 0): C's record
+	# matches the monitored C's, as the times were copied before the failing step and the mode is the 0755 mkdir gave both (at another
+	# mode it heals, by the mode: own_xattr_0775)
 	('own_xattr', 'first_version', 'no_batch_old_folder'): None,
 	('own_xattr', 'first_version', 'after_another_batch'): None,
-	# main 0.55.5: heals at the full comparison by the attribute check, which reaches C: C changed after the time matched before the
-	# failing version, and the batch that wrote into C moves its ctime again. The mode condition is as at the first version
+	# main 0.55.5: heals at the full comparison by the attribute check, which reaches C: C changed after V0's start, where the bound of
+	# no_batch starts, and the matched time of the batch that wrote into C (next_commit) is within the margin of its ctime. The mode
+	# condition is as at the first version
 	('own_xattr', 'settle', 'no_batch'): 'full',
 	('own_xattr', 'settle', 'next_commit'): 'full',
 	# main 0.55.5: does not heal after another batch: C's record matches the monitored C's, as at the first version
 	('own_xattr', 'settle', 'after_another_batch'): None,
-	# main 0.55.5: heals at the full comparison by the attribute check, which reaches C (the monitored C's attribute changed after the
-	# time matched before the failing version)
+	# main 0.55.5: heals at the full comparison by the attribute check, which reaches C (the monitored C's attribute changed after V0's
+	# start, where the bound of no_batch starts; for next_commit, the matched time of the batch into C is within the margin of C's ctime)
 	('own_xattr', 'attrib', 'no_batch'): 'full',
 	('own_xattr', 'attrib', 'next_commit'): 'full',
 	# main 0.55.5: does not heal after another batch: C's record matches the monitored C's (V0 copied the mode and the times)
@@ -1345,9 +1368,22 @@ HEALS = {
 }
 
 
+@pytest.fixture
+def umask_022():
+	'''
+	The process's umask 022 for the test, the old one back after it. Listed before job, so it holds when anything is made: the
+	monitored C and the daemon's vault C (made in this process, by do_backup) then get the same mode from mkdir whoever runs the test.
+	'''
+	old = os.umask(0o022)
+	try:
+		yield
+	finally:
+		os.umask(old)
+
+
 @pytest.mark.parametrize('case', CASES)
 @pytest.mark.parametrize('place, timing', PLACE_TIMINGS)
-def test_a_folder_metadata_copy_that_failed_once(job, poll_fast, monkeypatch, capsys, case, place, timing):
+def test_a_folder_metadata_copy_that_failed_once(umask_022, job, poll_fast, monkeypatch, capsys, case, place, timing):
 	# pin: main's answer to the healing check (spec section 16, step 1), which the user is asked about (the spec's Q7). The failing
 	# version, then (by timing) a batch that does not touch C (a file elsewhere) and a batch that touches C (a file in it), and a full
 	# comparison (with a file changed elsewhere, so it commits a version whatever it finds of C): C's setgid bit, its
@@ -1375,7 +1411,7 @@ def test_a_folder_metadata_copy_that_failed_once(job, poll_fast, monkeypatch, ca
 			os.chmod(folder, 0o775)
 		assert _case_reading(folder, case) in (False, None)
 		if own:
-			# the mode mkdir gives a folder under the test's umask (022), the same in the vault, unless the case sets another
+			# the mode mkdir gives a folder under the umask the fixture sets (022), the same in the vault, unless the case sets another
 			assert stat.S_IMODE(os.lstat(folder).st_mode) == (0o775 if case == 'own_xattr_0775' else 0o755)
 			if place != 'attrib':
 				_give(folder, case)
