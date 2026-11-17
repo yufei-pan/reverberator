@@ -71,9 +71,9 @@ task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (
 can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
 stays as written). Building since 2026-11-16 22:15 PST (chief's decision of that time), by subagent-driven development, on the recommended options, which Q9 to Q14's answers all took; the build's
 ledger (task by task, rulings, deferred minors) is the git-ignored `.superpowers/sdd/2026-11-15-r0556/progress.md` in the
-worktree. Where it stands (2026-11-17 04:00 PST): Task 1 (P15) done and reviewed (c18fc76..5212daf); Task 2 (P16's
-healing check) done and reviewed after two fix rounds (85e8e5d..2dfb89d), its results asked as Q15; Task 3 next;
-Tasks 4 to 22 not started (Task 18 waits on Q15). It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
+worktree. Where it stands (2026-11-17 05:40 PST): Task 1 (P15) done and reviewed (c18fc76..5212daf); Task 2 (P16's
+healing check) done and reviewed after two fix rounds (85e8e5d..2dfb89d), its results asked as Q15; Task 3 (P4 to
+P6) done and reviewed (6b77746); Task 4 building; Tasks 5 to 22 not started (Task 18 waits on Q15). It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
 8, 9 ("the 0.54 parts go in a later release") and 12 step 3; `plans/2026-11-05-round20.md`; commit 9ab7949 ("stays for
@@ -92,8 +92,10 @@ with "the no-copy move into a new folder gets its own design round after".
 
 **P4. Remove the backuper's dead branch** at `reverberator.py` ~4988-4995. **P5. Remove the lost-manifest branch of
 `drop_untracked_deletes(newest_path=)`.** **P6. Remove `remove_pending_file()`.** Source: round 0.55.5's final review
-and its second opinions (parts that can go; not in a spec). State: in round 0.55.6 (branch `r0556`), spec in its
-check. Behind them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own
+and its second opinions (parts that can go; not in a spec). State: built on branch `r0556` (Task 3, 6b77746, reviewed;
+41 lines fewer). The review found one more unreachable part of the same kind, the rebuild before `hand_over()` in
+`do_backup()`, with tests that reach it by hand: it goes in the round's cleanup before the final review (the main
+session's call, as these were). Done with the round's merge. Behind them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own
 housekeeping, with no pick of the user's.
 
 **P7. The live measurement after design R.** Source: `plans/2026-11-05-round20.md`, Rollout; the round 19 spec's real
