@@ -6,7 +6,7 @@ import threading
 
 import reverberator as rv
 import pytest
-from tests.harness import create_job, get_path_size, path_inodes, run_backup, seed_monitor, tracked_manifest
+from tests.harness import committed_versions, create_job, get_path_size, path_inodes, run_backup, seed_monitor, tracked_manifest
 
 pytestmark = pytest.mark.unit
 
@@ -118,7 +118,11 @@ def test_uncommitted_backup_while_green_light_set_clears_green_light_and_requeue
 	tmp = str(tmp_path)
 	rv.GREEN_LIGHT.set()
 	os.makedirs(os.path.join(tmp, 'monitor'))
-	monkeypatch.setattr(rv, 'do_backup', lambda *a, **k: (None, None, False))
+	calls = []
+	def uncommitted(*args, **kwargs):
+		calls.append(args)
+		return None, None, False
+	monkeypatch.setattr(rv, 'do_backup', uncommitted)
 	to_process = rv.ChangeEventQueue(os.path.join(tmp, 'monitor'))
 	to_process.append(rv.ChangeEvent(1, False, 'modify', os.path.join(tmp, 'monitor', 'f.txt'), None))
 	monitor_fs_flag = threading.Event()
@@ -133,6 +137,8 @@ def test_uncommitted_backup_while_green_light_set_clears_green_light_and_requeue
 		threading.Event(),
 		monitor_fs_flag,
 	)
+	# the backuper took the batch and ran it: an error before do_backup() would leave the same three states
+	assert len(calls) == 1
 	# the batch is not handed back: the next start compares the whole tree
 	assert len(to_process) == 0
 	assert not os.path.lexists(os.path.join(tmp, 'vault', 'job', rv.PENDING_TRANSACTIONS_FILE_NAME))
@@ -141,34 +147,40 @@ def test_uncommitted_backup_while_green_light_set_clears_green_light_and_requeue
 
 # --- do_backup() commits nothing once the green light is cleared ---
 
-def test_cleared_green_light_skips_content_file_and_current_version(tmp_path):
-	monitor_path = os.path.join(tmp_path, 'monitor')
-	vault_path = os.path.join(tmp_path, 'vault')
-	job_name = 'job'
-	os.makedirs(monitor_path)
-	os.makedirs(vault_path)
-	with open(os.path.join(monitor_path, 'f.txt'), 'w') as f:
-		f.write('x')
-	rv.GREEN_LIGHT.clear()
+def test_cleared_green_light_skips_content_file_and_current_version(tmp_path, monkeypatch):
+	# with no committed version behind it, do_backup() returns at its lock take, before any copy and before the commit gate: so V0 is
+	# committed first, a change is backed up as V1, and the stop comes after the copies, as a stop signal does mid-batch
+	paths = create_job(str(tmp_path))
+	seed_monitor(paths, {'f.txt': 'x'})
+	v0 = run_backup(paths)[0]
+	seed_monitor(paths, {'g.txt': 'y'})
+	current = os.path.join(paths.job_vault, 'current_version')
+	assert os.readlink(current) == os.path.basename(v0)
+	copied = []
+	real_copy = rv.do_reverb_backup
+	def copy_then_stop(*args, **kwargs):
+		real_copy(*args, **kwargs)
+		copied.append(rv.GREEN_LIGHT.is_set())
+		rv.GREEN_LIGHT.clear()
+	monkeypatch.setattr(rv, 'do_reverb_backup', copy_then_stop)
 	try:
-		_, _, committed = rv.do_backup(
+		_, manifest, committed = rv.do_backup(
 			{},
-			job_name=job_name,
-			monitor_path=monitor_path,
-			vault_path=vault_path,
+			job_name=paths.job_name,
+			monitor_path=paths.monitor,
+			vault_path=paths.vault,
 			only_sync_attributes=True,
 			keep_n_versions=0,
 			backup_size_limit='0',
 		)
 	finally:
 		rv.GREEN_LIGHT.set()
-	job_vault = os.path.join(vault_path, job_name)
+	manifest.close()
+	# the batch's copies ran with the light on, and it was off at the gate: the stop is the gate's
+	assert copied == [True]
 	assert not committed
-	assert not os.path.lexists(os.path.join(job_vault, 'current_version'))
-	assert not any(
-		name.endswith(rv.CONTENT_FILE_EXTENSION_NAME)
-		for name in os.listdir(job_vault)
-	)
+	assert committed_versions(paths) == [v0]
+	assert os.readlink(current) == os.path.basename(v0)
 
 
 # --- an empty batch makes no version ---
@@ -220,10 +232,14 @@ def test_symlink_dest_resolving_like_source_is_replaced(tmp_path):
 	os.symlink('python3', dst)
 	assert os.path.realpath(src) == os.path.realpath(dst)
 	assert rv.is_subpath(dst, src)  # documents the false-positive
+	old = os.stat(dst, follow_symlinks=False).st_ino
 	ok = rv.cp_af_copy_path(src, dst)
-	assert ok == 0  # return_code_only: 0 means success
+	# return_code_only: 0 means success, and a refusal returns False, which equals 0
+	assert ok is not False and ok == 0
 	assert os.path.islink(dst)
 	assert os.readlink(dst) == 'python3'
+	# replaced, not left as it was: the copy was made beside it, so the old link's inode was still taken while the new one's was made
+	assert os.stat(dst, follow_symlinks=False).st_ino != old
 
 
 # --- a folder's delete updates the tracking sets ---

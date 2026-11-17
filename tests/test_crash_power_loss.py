@@ -80,10 +80,11 @@ def state_after(job_vault, old_list_of_2):
 @pytest.mark.unit
 def test_the_helper_refuses_all_but_a_loop_image_of_this_test(tmp_path, monkeypatch):
 	ran = []
-	real_run = subprocess.run
+	# what findmnt answers for a path under the scratch folder, as the helper reads it: no host's mount table is asked
+	found = ['']
 	def recording(command, *args, **kwargs):
 		ran.append(command[0])
-		return real_run(command, *args, **kwargs)
+		return subprocess.CompletedProcess(command, 0, found[0], '')
 	monkeypatch.setattr(scratch_images.subprocess, 'run', recording)
 	monkeypatch.delenv('REVERB_SCRATCH', raising=False)
 	for call in (flush_scratch, shut_down_scratch):
@@ -101,11 +102,13 @@ def test_the_helper_refuses_all_but_a_loop_image_of_this_test(tmp_path, monkeypa
 			with pytest.raises(NotOurLoopImage):
 				call(path)
 	assert ran == []
-	# under it, on the filesystem under tmp_path, which is no loop device: only findmnt runs
-	for call in (flush_scratch, shut_down_scratch):
-		with pytest.raises(NotOurLoopImage):
-			call(str(scratch))
-	assert set(ran) == {'findmnt'}
+	# under it, on a filesystem that is no loop device (findmnt names none, or a disk): only findmnt runs
+	for answer in ('', f'/dev/nvme0n1 {scratch}\n'):
+		found[0] = answer
+		for call in (flush_scratch, shut_down_scratch):
+			with pytest.raises(NotOurLoopImage):
+				call(str(scratch))
+	assert ran == ['findmnt'] * 4
 
 
 @pytest.mark.unit
