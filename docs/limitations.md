@@ -974,3 +974,21 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** a growth gate needs a burst of changes and a bound for what memory may keep after it, and that bound is not
   measured yet.
 - **Revisit when:** the round after 0.55.5: a gate after a burst of changes, once its bound is measured.
+
+### A change to the monitored folder's own metadata alone makes no version
+
+- **Kind:** deferred.
+- **What the operator sees:** a chmod, chown, touch or extended-attribute change of the monitored folder itself (the
+  job's top folder), with nothing else in the tree changing, reaches no version and writes no line. The next version
+  that something else in the tree causes records the top folder's metadata as of then; until it, a whole-job restore of
+  the newest version gives the top folder its owner, mode, times and extended attributes from before the change. The
+  top folder of a disk mounted inside the tree waits the same way, for the next full comparison (each start; the Full
+  Comparison Interval). Found by round 0.55.6's review, from the code and an inotify probe; the inner disk's case is
+  reasoned, not run.
+- **Why:** older than 0.55.6. The change raises only a nameless event on the folder's own watch (its parent is not
+  watched, or for an inner disk's top folder is not told), which the watcher drops; a full comparison compares the top
+  folder only as the whole tree, so with no other difference it makes no version; and the top folder's metadata is
+  recorded on a version's folder only when a version is written.
+- **Revisit when:** the round after 0.55.6: queue that nameless attribute event as a change of the folder, and commit a
+  batch holding only it when the top folder's metadata differs from its record (or record it at a full comparison that
+  finds no other difference).
