@@ -71,10 +71,10 @@ task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (
 can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
 stays as written). Building since 2026-11-16 22:15 PST (chief's decision of that time), by subagent-driven development, on the recommended options, which Q9 to Q14's answers all took; the build's
 ledger (task by task, rulings, deferred minors) is the git-ignored `.superpowers/sdd/2026-11-15-r0556/progress.md` in the
-worktree. Where it stands (2026-11-17 06:15 PST): Task 1 (P15) done and reviewed (c18fc76..5212daf); Task 2 (P16's
+worktree. Where it stands (2026-11-17 08:20 PST): Task 1 (P15) done and reviewed (c18fc76..5212daf); Task 2 (P16's
 healing check) done and reviewed after two fix rounds (85e8e5d..2dfb89d), its results asked as Q15; Task 3 (P4 to
-P6) done and reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 next; Tasks 6 to 22 not started
-(Task 18 waits on Q15). It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
+P6) done and reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d);
+Task 6 (P11) building; Tasks 7 to 22 not started (Task 18 waits on Q15). It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
 8, 9 ("the 0.54 parts go in a later release") and 12 step 3; `plans/2026-11-05-round20.md`; commit 9ab7949 ("stays for
@@ -175,9 +175,11 @@ user's pick "Trim, shrink, 2 arenas (Recommended)" (2026-11-13).
 `specs/2026-11-08-round22-watcher-design.md`. Its top says it was not built; the step back replaced its watcher work
 and says nothing of these. State: in round 0.55.6 (branch `r0556`), spec in its check. Behind them: the user's
 picks 2026-11-14, "Carry all four (Recommended)" and "Fixes round (Recommended)".
-- **P10. A tree walk without recursion** (its 2.3): `iter_tree_entries()` recurses by `yield from` (:3783). A tree
-  deeper than about 1,000 levels leaves its deepest folders unwatched, and the comparison, restore and vault walks
-  through the same function stop at the same depth.
+- **P10. A tree walk without recursion** (its 2.3): `iter_tree_entries()` recursed by `yield from`, so a tree
+  deeper than about 1,000 levels left its deepest folders unwatched, and the comparison, restore and vault walks
+  through the same function stopped at the same depth. Built on branch `r0556` (Task 5, aa5834d, reviewed): both walks
+  and `settle()`'s `is_real()` keep a stack, with the same yields in the same order; a tree 1,200 levels deep is
+  watched, backed up, listed and restored. Done with the round's merge.
 - **P11. The walk follows no link that replaced a folder while it ran** (2.5, item 7): the tree's watches are added
   without `IN_DONT_FOLLOW` (`watch_flags` :2945, `add_watch` :3567), and the listing follows such a link.
 - **P12. The walk catches `OSError`, not every `Exception`** (section 7): :3788. The broad catch hides
