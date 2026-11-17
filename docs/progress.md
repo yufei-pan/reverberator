@@ -137,8 +137,23 @@ not the one-day maximum), whose GC tail falls after the reading. The daemon wrot
 (0.19% of a core); in the last 15 hours, the second batch included, 28 s (0.05%; 0.54.1 idle: 0.03%). So the daemon's
 own share is under the target: about 0.46 GiB a batch beyond the bytes that changed (reading A), and those bytes are the
 tree's own changes, 3.5 to 5 GiB a batch now, which the spec's 24 to 36 MiB a cycle (hourly batches of a quieter tree)
-did not foresee. P7 has measured all it set out to: writes, the GC share, prunes, idle CPU, memory. Next: Q17, the GC on
-the vault disks; the row closes with its answer.
+did not foresee. P7 has measured all it set out to: writes, the GC share, prunes, idle CPU, memory. Q17's answer (the
+user, 2026-11-17): background GC off on the four vault disks.
+Carrying it out (a host change, the user's to run): one root script outside the repo, run by the user. It shows the daemon's state, each vault disk's options,
+GC thread and counters; backs /etc/fstab up with a date; changes `background_gc=on,gc_merge` to
+`background_gc=off,nogc_merge` in the four vault disks' lines only (checked before it writes); remounts each with
+`mount -o remount,background_gc=off,nogc_merge <dir>`; then checks /proc/mounts shows both, the disk's `f2fs_gc-<dev>`
+thread is gone, and no f2fs kernel line or daemon ERROR came since, and prints the undo. `nogc_merge` is needed too: in
+kernel v7.0's f2fs, with `gc_merge` set the GC thread runs whatever `background_gc` says (`__f2fs_remount()` stops it only
+when `bggc_mode == BGGC_MODE_OFF && !test_opt(sbi, GC_MERGE)`; `gc_thread_func()` has no check of the mode). No unmount
+and no stop of the daemon: a read-write remount applies only the options given (`f2fs_apply_options()` masks by what was
+specified), syncs only when going read-only, and changes nothing the daemon's disk checks key on (a mount's id, device,
+root, source and type; the disk's ids); it can run mid-batch, waiting at most for the section the GC is moving. Next
+reading, after the next large batch and over the 24 hours after: each vault disk's background GC calls and moved blocks
+stay flat; the busiest disk stops writing within minutes of a batch's commit (no five-hour tail), and takes about the
+batches' own bytes a day (reading D's 13.1 GiB less its 4.5 GiB of GC); the other three take 0.1 to 0.3 GiB a day; dirty
+segments grow and free segments shrink by what partly emptied sections hold, with no foreground GC until free sections
+run low (months on disks 6% to 31% full). The row closes with that reading.
 Behind it: the goal (light), the spec's targets, and the user's words 2026-11-04, "ok, let me know the write numbers
 when it's done", with their pick 2026-11-06, "Accept them (Recommended)", on two rehearsal numbers over the plan's lines.
 
@@ -223,20 +238,6 @@ is written on the recommended options and marks the tasks an answer would change
   - (b) Widen "A folder whose extended attributes alone fail to copy keeps the wrong ones" (this one overrides the
     ladder).
 
-- **Q17. f2fs's background GC on the vault disks** (P7, readings B and D). The operator sees: after each large batch the
-  busiest job's vault disk keeps writing for about five hours, as f2fs's background GC rewrites 16 MiB sections still
-  about 94% valid: about 4.2 GiB after a 5.17 GiB batch, to gain 134 MiB of free space on a disk 6% full; over 24 hours,
-  4.5 of that disk's 13.1 GiB of writes. The cause is the mount options every pool member shares (`background_gc=on`
-  with `mode=lfs`, sections of 8 segments), not the daemon; the members are 0 to 31% full. With background GC off, a
-  section whose blocks are all deleted is still freed without GC, and f2fs still collects in the foreground when free
-  sections run low, picking the emptiest; on these disks that point is months away, and the writes that meet it then
-  wait for the collection. The user's words: "every little bit will sum up to a lot over days month years" (2026-11-03);
-  none on the mount options; `mode=lfs` is the pool's own choice, its reason not on record. What waits on it: nothing in
-  round 0.55.6; a change is an fstab change and a remount, the user's OK.
-  - (a) Turn background GC off on the four vault disks only (`background_gc=off` in their fstab lines, then a
-    remount); the other pool members keep it (Recommended).
-  - (b) Leave the mount options as they are: about 0.8 times each large batch's bytes again in GC writes.
-  - (c) Turn it off on every pool member.
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
   yet, keep it open".
@@ -265,6 +266,11 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Q17, f2fs's background GC on the vault disks (P7, readings B and D: after each large batch the busiest vault disk kept
+  writing about five hours, the GC rewriting sections still about 94% valid, 4.5 of its 13.1 GiB a day): (a), turn it
+  off on the four vault disks only, by fstab and a remount; the other pool members keep it. The user's answer
+  2026-11-17 (about 00:05 PST, through chief), "Off on vault disks (Recommended)". P7 says how it is carried out (with
+  `nogc_merge`, which kernel v7.0 needs for it to take) and what its next reading should show.
 - Q16, the busiest job makes one version a day (P7, reading A: its minimum interval is a quiet time and its tree is
   never quiet for an hour now, so each batch comes at the one-day maximum): (a), keep the rule, one version a day and
   five days of history at Keep 5, no change to the live rule file. The user's pick 2026-11-15 (about 19:12 PST, through
