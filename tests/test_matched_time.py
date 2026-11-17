@@ -13,9 +13,8 @@ from tests.test_inner_mounts import _fake_mounts
 from tests.test_moves_then_changes import user_xattrs_or_skip
 from tests.test_verify_replay import start_backuper, stop_backuper
 
-pytestmark = pytest.mark.unit
 
-
+@pytest.mark.unit
 def test_take_carries_the_read_time_and_keeps_it():
 	queue = rv.ChangeEventQueue('/m')
 	assert queue.read_wall_ns is None
@@ -37,6 +36,7 @@ class RecordingFlag(threading.Event):
 		super().set()
 
 
+@pytest.mark.unit
 def test_a_max_delay_hand_over_carries_the_previous_reads_time(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	flag = RecordingFlag()
@@ -60,6 +60,7 @@ class RecordingQueue(rv.ChangeEventQueue):
 		super().append(event)
 
 
+@pytest.mark.unit
 def test_no_read_time_is_visible_before_all_its_events_are_queued(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	reads = [[(flags.CREATE, 'a', 0), (flags.CREATE, 'b', 0)], [(flags.CREATE, 'c', 0), (flags.CREATE, 'd', 0)]]
@@ -71,6 +72,7 @@ def test_no_read_time_is_visible_before_all_its_events_are_queued(job, monkeypat
 	assert seen['c'] is not None and seen['c'] <= returned[0] and seen['d'] <= returned[0]
 
 
+@pytest.mark.unit
 def test_a_scripted_folder_create_does_not_re_root_later_events(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	reads = [[(flags.CREATE | flags.ISDIR, 'd', 0)], [(flags.CREATE, 'x', 0)]]
@@ -108,6 +110,7 @@ def record_matched_since(monkeypatch):
 	return calls
 
 
+@pytest.mark.unit
 def test_full_comparison_since_uses_a_key_naming_the_newest_version():
 	infos = OrderedDict([(4, rv.VaultEntry(4, '/v/V4--a', 100.0, 0, 0)), (5, rv.VaultEntry(5, '/v/V5--b', 200.0, 0, 0))])
 	assert rv.full_comparison_since(infos, ('V5--b', 150 * 10 ** 9)) == 150 * 10 ** 9
@@ -115,6 +118,7 @@ def test_full_comparison_since_uses_a_key_naming_the_newest_version():
 	assert rv.full_comparison_since(infos, None) == 100 * 10 ** 9
 
 
+@pytest.mark.unit
 def test_each_final_commit_advances_or_carries_the_key(job):
 	seed_monitor(job, {'a.txt': 'a'})
 	v0 = run_backup(job, matched_since=100)[-1]
@@ -127,6 +131,7 @@ def test_each_final_commit_advances_or_carries_the_key(job):
 	assert matched(job) == (name(v2), 300)
 
 
+@pytest.mark.unit
 def test_no_key_is_carried_from_a_vault_without_one(job):
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
@@ -134,6 +139,7 @@ def test_no_key_is_carried_from_a_vault_without_one(job):
 	assert matched(job) is None
 
 
+@pytest.mark.unit
 def test_a_paused_inner_mount_carries_the_time_forward(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f'})
 	_fake_mounts(monkeypatch, job, ['disk/'])
@@ -144,6 +150,7 @@ def test_a_paused_inner_mount_carries_the_time_forward(job, monkeypatch):
 	assert matched(job) == (name(v1), 100)
 
 
+@pytest.mark.unit
 def test_an_attempt_that_met_an_unreadable_folder_carries_the_time_forward(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a', 'bad/x': 'x'})
 	run_backup(job, matched_since=100)
@@ -203,6 +210,7 @@ def test_a_folder_left_unwatched_stops_the_watcher_publishing_read_times(job, po
 	assert matched(job) == (name(v1), 100) and v1 != v0
 
 
+@pytest.mark.unit
 def test_a_failed_metadata_copy_carries_the_time_forward(job, monkeypatch):
 	user_xattrs_or_skip(job.monitor)
 	seed_monitor(job, {'a.txt': 'a'})
@@ -223,6 +231,7 @@ def test_a_failed_metadata_copy_carries_the_time_forward(job, monkeypatch):
 	assert v2 != v1 and os.getxattr(os.path.join(v2, 'a.txt'), 'user.x') == b'1'
 
 
+@pytest.mark.unit
 def test_delta_generation_writes_no_key(job):
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
@@ -230,6 +239,7 @@ def test_delta_generation_writes_no_key(job):
 	assert matched(job) is None
 
 
+@pytest.mark.unit
 def test_a_full_comparison_reads_xattrs_only_of_entries_changed_since_the_matched_time(job, monkeypatch):
 	monkeypatch.setattr(rv, 'VERIFY_CTIME_MARGIN_SECONDS', 0)
 	files = [os.path.join(job.monitor, f'f{i}.txt') for i in range(5)]
@@ -249,6 +259,7 @@ def test_a_full_comparison_reads_xattrs_only_of_entries_changed_since_the_matche
 	assert [path for path in calls if path.startswith(job.monitor)] == [files[2]]
 
 
+@pytest.mark.unit
 def test_the_backuper_passes_each_batch_its_matched_time(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
 	run_backup(job)
@@ -277,6 +288,7 @@ def test_the_backuper_passes_each_batch_its_matched_time(job, monkeypatch):
 	assert calls[:2] == [111, 222] and before <= calls[2] <= time.time_ns()
 
 
+@pytest.mark.unit
 def test_a_restarts_full_comparison_records_a_key(job, poll_fast):
 	seed_monitor(job, {'a.txt': 'a'})
 	v0 = run_backup(job)[-1]
@@ -294,6 +306,7 @@ def test_a_restarts_full_comparison_records_a_key(job, poll_fast):
 	assert matched(job)[0] == name(v0) and before <= matched(job)[1] <= time.time_ns()
 
 
+@pytest.mark.unit
 def test_an_xattr_set_while_down_reaches_the_starts_version(job, poll_fast):
 	user_xattrs_or_skip(job.monitor)
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
@@ -319,6 +332,7 @@ def test_an_xattr_set_while_down_reaches_the_starts_version(job, poll_fast):
 	assert open(os.path.join(v1, 'a.txt')).read() == 'changed'
 
 
+@pytest.mark.unit
 def test_a_move_out_pending_at_a_max_delay_hand_over_still_pairs(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	reads = [[(flags.CREATE, 'f', 0)], [(flags.MOVED_FROM, 'a', 7)], [(flags.MOVED_TO, 'b', 7)]]
@@ -328,6 +342,7 @@ def test_a_move_out_pending_at_a_max_delay_hand_over_still_pairs(job, monkeypatc
 	assert [(e.event, e.path, e.moved_from) for e in queue] == [('create', f'{m}/f', None), ('move', f'{m}/b', f'{m}/a')]
 
 
+@pytest.mark.unit
 def test_a_move_out_held_for_a_whole_read_goes_with_a_batch_taken_after_it(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
@@ -367,6 +382,7 @@ def take_before_first(monkeypatch, kind, batches):
 	monkeypatch.setattr(rv.ChangeEventQueue, 'append', wrapped)
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('split', ['mid-read', 'across reads'])
 def test_a_rename_split_by_a_take_stays_a_move_in_the_next_batch(job, monkeypatch, split):
 	seed_monitor(job, {'D/sub/x': 'x' * 1000, 'D/y': 'y', 'keep.txt': 'k', 'f': 'f'})
@@ -398,6 +414,7 @@ def test_a_rename_split_by_a_take_stays_a_move_in_the_next_batch(job, monkeypatc
 	assert not first.pending_move_outs
 
 
+@pytest.mark.unit
 def test_a_move_out_no_longer_held_is_not_carried(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
@@ -409,6 +426,7 @@ def test_a_move_out_no_longer_held_is_not_carried(job, monkeypatch):
 	assert queue.take().pending_move_outs == set()
 
 
+@pytest.mark.unit
 def test_a_batch_compares_the_paths_whose_move_out_is_held(job):
 	seed_monitor(job, {'a.txt': 'a', 'D/sub/x': 'x', 'b.txt': 'b', 'keep.txt': 'k'})
 	run_backup(job, matched_since=100)
@@ -436,6 +454,7 @@ def take_then(events):
 	return read
 
 
+@pytest.mark.unit
 def test_an_event_in_a_new_folder_after_an_unsignalled_take_is_queued(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
@@ -446,6 +465,7 @@ def test_an_event_in_a_new_folder_after_an_unsignalled_take_is_queued(job, monke
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/d/x')]
 
 
+@pytest.mark.unit
 def test_an_event_in_a_new_folder_before_any_take_is_discarded(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
@@ -455,6 +475,7 @@ def test_an_event_in_a_new_folder_before_any_take_is_discarded(job, monkeypatch)
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/d')]
 
 
+@pytest.mark.unit
 def test_a_new_folders_event_read_before_the_take_is_discarded_and_one_after_kept(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
@@ -464,6 +485,7 @@ def test_a_new_folders_event_read_before_the_take_is_discarded_and_one_after_kep
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/d/y')]
 
 
+@pytest.mark.unit
 def test_a_folder_renamed_before_its_create_is_handled_is_watched_at_its_new_name(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
@@ -477,6 +499,7 @@ def test_a_folder_renamed_before_its_create_is_handled_is_watched_at_its_new_nam
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/e/x')]
 
 
+@pytest.mark.unit
 def test_a_chain_of_renames_before_the_watcher_catches_up_ends_watched_at_its_last_name(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
@@ -489,6 +512,7 @@ def test_a_chain_of_renames_before_the_watcher_catches_up_ends_watched_at_its_la
 	assert [(e.event, e.path) for e in queue] == [('create', f'{m}/f/x')]
 
 
+@pytest.mark.unit
 def test_a_moved_folder_keeps_the_watches_it_had(job, monkeypatch):
 	flags = rv.inotify_simple.flags
 	m = job.monitor
@@ -534,6 +558,7 @@ def collapsed(job, *events, touching=()):
 	return run_backup(job, entries, touched=scopes, matched_since=time.time_ns())
 
 
+@pytest.mark.unit
 def test_a_collapsed_batch_with_no_difference_commits_nothing(job):
 	# fails on main: a file made and removed, its batch backed up with its touched scopes and no entries
 	all_checked(job)
@@ -548,6 +573,7 @@ def test_a_collapsed_batch_with_no_difference_commits_nothing(job):
 	assert matched(job) == matched_before and len(committed_versions(job)) == versions_before
 
 
+@pytest.mark.unit
 def test_a_full_comparison_with_no_difference_moves_the_counter_once(job, monkeypatch):
 	# fails on main (two): the comparison's commit rewrites the version row, then the no-differences commit writes the rest
 	all_checked(job)
@@ -563,6 +589,7 @@ def test_a_full_comparison_with_no_difference_moves_the_counter_once(job, monkey
 	assert sum(moved) == 1 and matched(job)[1] == since
 
 
+@pytest.mark.unit
 def test_a_collapsed_batch_reading_a_copy_back_commits_its_record(job):
 	# pin: a row set unchecked by hand in the touched scope: the comparison reads the copy back, and its record commits
 	all_checked(job)
@@ -582,6 +609,7 @@ def test_a_collapsed_batch_reading_a_copy_back_commits_its_record(job):
 		manifest.close()
 
 
+@pytest.mark.unit
 def test_a_skip_list_change_commits_its_fingerprint_with_no_difference(job):
 	# pin
 	all_checked(job)
@@ -594,6 +622,7 @@ def test_a_skip_list_change_commits_its_fingerprint_with_no_difference(job):
 		manifest.close()
 
 
+@pytest.mark.unit
 def test_a_starts_full_comparison_with_no_difference_moves_the_matched_time(job, poll_fast):
 	# pin: the start's own full comparison is a full comparison, so its matched time moves though nothing differs
 	all_checked(job)

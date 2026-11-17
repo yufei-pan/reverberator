@@ -271,7 +271,6 @@ def test_a_big_move_out_is_unwatched_in_parts_that_fit_the_queue(session, job, t
 QUEUE_LIMIT = '/proc/sys/fs/inotify/max_queued_events'
 
 
-@pytest.mark.privileged
 @pytest.mark.skipif(os.geteuid() != 0 or 'PYTEST_XDIST_WORKER' in os.environ,
 	reason='sets the host-wide fs.inotify.max_queued_events: as root, alone (no xdist), in the test VM')
 def test_a_big_move_out_fits_a_real_queue_of_64(session, job, tmp_path, monkeypatch):

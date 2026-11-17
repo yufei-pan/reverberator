@@ -9,8 +9,6 @@ import reverberator as rv
 from tests.harness import (write_scan_leftover, committed_versions, latest_version, seed_monitor, wait_for_committed_count, wait_until,
 	write_fstab, write_incomplete_version)
 
-pytestmark = pytest.mark.unit
-
 
 @pytest.fixture
 def grace(monkeypatch, poll_fast):
@@ -88,6 +86,7 @@ def _goes_on(path):
 	return f'reverberator job job goes on: {path} is ready again after 0 min'
 
 
+@pytest.mark.unit
 def test_a_missing_vault_disk_pauses_the_job_with_the_waiting_marker(job, fake_pool, grace, board, output, tmp_path):
 	seed_monitor(job, {'a.txt': 'a'})
 	_v0(job)
@@ -113,6 +112,7 @@ def test_a_missing_vault_disk_pauses_the_job_with_the_waiting_marker(job, fake_p
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_a_missing_monitored_disk_pauses_the_backup_but_not_the_vault_scan(job, fake_pool, grace, output):
 	seed_monitor(job, {'a.txt': 'a'})
 	_v0(job)
@@ -134,6 +134,7 @@ def test_a_missing_monitored_disk_pauses_the_backup_but_not_the_vault_scan(job, 
 		_stop(control, thread)
 
 
+@pytest.mark.inotify
 def test_the_watcher_keeps_queuing_while_the_vault_pool_is_out(job, fake_pool, grace, output, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
@@ -174,6 +175,7 @@ def test_the_watcher_keeps_queuing_while_the_vault_pool_is_out(job, fake_pool, g
 		_stop(control, watcher, backuper)
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('side', ['vault', 'monitor'])
 def test_a_disk_dropped_between_batches_pauses_the_next_one(job, fake_pool, grace, output, side):
 	seed_monitor(job, {'a.txt': 'a'})
@@ -201,6 +203,7 @@ def test_a_disk_dropped_between_batches_pauses_the_next_one(job, fake_pool, grac
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('side', ['vault', 'monitor'])
 def test_an_idle_job_reports_a_missing_pool_disk(job, fake_pool, grace, output, side):
 	# a job with nothing to back up waits for its next batch: a disk of its pool that drops meanwhile is reported
@@ -239,6 +242,7 @@ def _wait_in_thread(control, flag, path, results):
 	return thread
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('phase', [0, 1 / 3, 2 / 3])
 def test_a_lost_root_alerts_once_with_a_batch_pending(tmp_path, grace, output, phase):
 	# the watcher's lost-root wait and the batch loop's monitored wait, half a poll apart, both past the grace when the
@@ -271,6 +275,7 @@ def test_a_lost_root_alerts_once_with_a_batch_pending(tmp_path, grace, output, p
 		_stop(control, *(thread for thread in (first, second) if thread is not None))
 
 
+@pytest.mark.unit
 def test_a_job_off_the_pool_runs_while_the_pool_is_out(job, tmp_path, fake_pool, grace, output):
 	seed_monitor(job, {'a.txt': 'a'})
 	other = str(tmp_path / 'other_pool')
@@ -287,6 +292,7 @@ def test_a_job_off_the_pool_runs_while_the_pool_is_out(job, tmp_path, fake_pool,
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_a_wait_that_never_alerted_ends_silently(job, fake_pool, poll_fast, monkeypatch, output):
 	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 30)
 	a, _ = fake_pool.add(job.vault, ['a', 'b'])
@@ -311,6 +317,7 @@ def _not_mounted(mount_point):
 	return f'{mount_point} is not mounted ({rv.FSTAB_PATH} names it)'
 
 
+@pytest.mark.unit
 def test_a_vault_wait_waits_for_its_fstab_mount_with_the_marker(job, fake_pool, grace, output):
 	write_fstab(job.vault)
 	control = _control(job)
@@ -330,6 +337,7 @@ def test_a_vault_wait_waits_for_its_fstab_mount_with_the_marker(job, fake_pool, 
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_a_monitored_path_wait_waits_for_its_fstab_mount_with_the_marker(job, fake_pool, grace, output):
 	# 0.47 and the first 0.48 build pinned the opposite: a monitored wait read no fstab
 	write_fstab(job.monitor)
@@ -350,6 +358,7 @@ def test_a_monitored_path_wait_waits_for_its_fstab_mount_with_the_marker(job, fa
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_a_file_at_the_waited_path_is_named_in_the_marker(job, fake_pool, grace, output):
 	path = os.path.join(job.root, 'a_file')
 	open(path, 'w').write('x')
@@ -365,6 +374,7 @@ def test_a_file_at_the_waited_path_is_named_in_the_marker(job, fake_pool, grace,
 	assert open(path).read() == 'x'
 
 
+@pytest.mark.unit
 def test_a_monitored_path_under_an_unmounted_fstab_mount_commits_nothing_until_mounted(job, fake_pool, grace, output):
 	# the unmounted disk's bare folder is empty: backing it up would commit every file deleted
 	write_fstab(job.monitor)
@@ -382,6 +392,7 @@ def test_a_monitored_path_under_an_unmounted_fstab_mount_commits_nothing_until_m
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_a_bare_vault_folder_hidden_by_its_mount_is_replaced_by_one_made_on_the_disk(job, tmp_path, fake_pool, grace, output):
 	# a 0.47 leftover (or mkdir -p before mounting) shows the vault path, while the disk mounted over it has no such folder
 	vaults = str(tmp_path / 'vaults')
@@ -403,6 +414,7 @@ def test_a_bare_vault_folder_hidden_by_its_mount_is_replaced_by_one_made_on_the_
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_the_start_makes_a_missing_vault_path_once_its_fstab_mount_is_mounted(job, tmp_path, fake_pool, grace, output, monkeypatch):
 	vaults = str(tmp_path / 'vaults')
 	os.makedirs(vaults)
@@ -424,6 +436,7 @@ def test_the_start_makes_a_missing_vault_path_once_its_fstab_mount_is_mounted(jo
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_a_bare_vault_folder_under_an_unmounted_fstab_mount_is_never_backed_up_into(job, fake_pool, grace, output):
 	# 0.47 left such folders on the root disk
 	write_fstab(job.vault)
@@ -440,6 +453,7 @@ def test_a_bare_vault_folder_under_an_unmounted_fstab_mount_is_never_backed_up_i
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_a_vault_disk_unmounted_mid_run_holds_the_next_batch(job, fake_pool, grace, output):
 	write_fstab(job.vault)
 	fake_pool.add_mount(job.vault)
@@ -463,6 +477,7 @@ def test_a_vault_disk_unmounted_mid_run_holds_the_next_batch(job, fake_pool, gra
 		_stop(control, thread)
 
 
+@pytest.mark.unit
 def test_a_vault_path_that_cannot_be_made_fails_the_attempt(job, fake_pool, poll_fast):
 	blocker = os.path.join(job.root, 'blocker')
 	open(blocker, 'w').write('x')
@@ -473,6 +488,7 @@ def test_a_vault_path_that_cannot_be_made_fails_the_attempt(job, fake_pool, poll
 	assert not thread.is_alive() and 'does not exist and cannot be created' in control.failure.reason
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('spelled', ['//', '/', '/./'])
 def test_the_guard_of_a_batch_answers_for_the_job_folder_however_the_vault_path_is_spelled(job, fake_pool, poll_fast, monkeypatch, spelled):
 	# the rule's vault path is not normalised: the guard is built on the job's folder as spelled and asked with the normal spelling (the prune), or the other way

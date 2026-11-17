@@ -22,8 +22,6 @@ import reverberator as rv
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
 from tests.harness import create_job, daemon, event_entry, run_backup, seed_monitor, vault_unit
 
-pytestmark = pytest.mark.unit
-
 V = ['V0--2021-01-01_00-00-00_-0800', 'V1--2021-01-02_00-00-00_-0800', 'V2--2021-01-03_00-00-00_-0800']
 
 
@@ -81,6 +79,7 @@ def prune(job):
 
 # --- the marker ---
 
+@pytest.mark.unit
 def test_the_marker_is_one_json_line_written_in_place(tmp_path):
 	job_vault = str(tmp_path)
 	assert rv.read_prune_marker(job_vault) is None
@@ -94,6 +93,7 @@ def test_the_marker_is_one_json_line_written_in_place(tmp_path):
 	assert os.stat(path).st_ino == inode
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('content', [b'', b'{"walking": "V0--x"}\n{"walk', b'{"walking": 3}\n', b'[]\n', b'\xff\n'],
 	ids=['empty', 'torn', 'not_a_name', 'not_an_object', 'not_utf8'])
 def test_a_marker_that_holds_anything_else_cannot_be_read(tmp_path, content):
@@ -103,6 +103,7 @@ def test_a_marker_that_holds_anything_else_cannot_be_read(tmp_path, content):
 		rv.read_prune_marker(str(tmp_path))
 
 
+@pytest.mark.unit
 def test_a_marker_made_whose_folder_cannot_be_flushed_is_removed_again(tmp_path, monkeypatch):
 	def fail(path):
 		raise OSError(errno.EIO, 'EIO', path)
@@ -114,6 +115,7 @@ def test_a_marker_made_whose_folder_cannot_be_flushed_is_removed_again(tmp_path,
 
 # --- the prune's order on a pool, and none of it on a single filesystem ---
 
+@pytest.mark.unit
 def test_a_prune_on_a_single_filesystem_makes_no_marker_and_no_flush(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	flushes = []
@@ -123,6 +125,7 @@ def test_a_prune_on_a_single_filesystem_makes_no_marker_and_no_flush(tmp_path, m
 	assert not os.path.lexists(marker_path(job))
 
 
+@pytest.mark.unit
 def test_a_prune_on_a_pool_names_its_walk_flushes_twice_and_clears_the_marker(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	events = []
@@ -148,6 +151,7 @@ def test_a_prune_on_a_pool_names_its_walk_flushes_twice_and_clears_the_marker(tm
 	assert len(pruned) == 1 and ', disks flushed in ' in pruned[0]
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('when', ['first', 'second'])
 def test_a_disk_that_fails_its_flush_keeps_the_oldest_version(tmp_path, monkeypatch, when):
 	job = three_versions(tmp_path)
@@ -173,6 +177,7 @@ def test_a_disk_that_fails_its_flush_keeps_the_oldest_version(tmp_path, monkeypa
 		assert list(info2) == [1, 2]
 
 
+@pytest.mark.unit
 def test_a_marker_that_cannot_be_written_keeps_the_oldest_version(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -208,6 +213,7 @@ def cut_after_the_removal(job, monkeypatch):
 	return before
 
 
+@pytest.mark.unit
 def test_the_already_gone_path_flushes_before_the_lists_go(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	before = cut_after_the_removal(job, monkeypatch)
@@ -219,6 +225,7 @@ def test_the_already_gone_path_flushes_before_the_lists_go(tmp_path, monkeypatch
 
 # --- after a cut before the first flush ---
 
+@pytest.mark.unit
 def test_a_prune_after_a_cut_links_back_what_the_next_version_lost(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -239,6 +246,7 @@ def test_a_prune_after_a_cut_links_back_what_the_next_version_lost(tmp_path, mon
 	assert marker(job) == '{"walking": null}\n'
 
 
+@pytest.mark.unit
 def test_an_unreadable_marker_is_taken_for_a_cut(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -250,6 +258,7 @@ def test_an_unreadable_marker_is_taken_for_a_cut(tmp_path, monkeypatch):
 	assert open(os.path.join(v1, 'a')).read() == 'a'
 
 
+@pytest.mark.unit
 def test_a_marker_naming_another_version_is_no_cut(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -261,6 +270,7 @@ def test_a_marker_naming_another_version_is_no_cut(tmp_path, monkeypatch):
 	assert not os.path.lexists(os.path.join(v1, 'a'))
 
 
+@pytest.mark.unit
 def test_unusable_rows_link_back_at_the_files_own_path_with_an_error_line(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -274,6 +284,7 @@ def test_unusable_rows_link_back_at_the_files_own_path_with_an_error_line(tmp_pa
 	assert any(kwargs.get('error') and 'cannot be used (a row outside /elsewhere)' in message for message, kwargs in lines)
 
 
+@pytest.mark.unit
 def test_a_stray_temp_beside_its_copy_goes_after_a_cut(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -293,6 +304,7 @@ def test_a_stray_temp_beside_its_copy_goes_after_a_cut(tmp_path, monkeypatch):
 	assert not os.path.lexists(temp) and open(link).read() == 'a'
 
 
+@pytest.mark.unit
 def test_a_temp_whose_rename_does_nothing_is_removed_after_a_cut(tmp_path, monkeypatch):
 	# on a pool, the link's name can show as the link while the disk the rename lands on holds the copy there already:
 	# rename(temp, name) of one inode does nothing. stood in for by a rename that leaves the temp
@@ -314,6 +326,7 @@ def test_a_temp_whose_rename_does_nothing_is_removed_after_a_cut(tmp_path, monke
 	assert sorted(os.listdir(os.path.join(v1, 'D'))) == ['b']
 
 
+@pytest.mark.unit
 def test_no_temp_is_looked_at_beside_a_copy_without_a_cut(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -329,6 +342,7 @@ def test_no_temp_is_looked_at_beside_a_copy_without_a_cut(tmp_path, monkeypatch)
 
 # --- the backup finishes a cut prune first; the scan flushes before deleting a stale list ---
 
+@pytest.mark.unit
 def test_a_backup_leaves_the_oldest_version_when_the_marker_names_none(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	as_pool(monkeypatch)
@@ -337,6 +351,7 @@ def test_a_backup_leaves_the_oldest_version_when_the_marker_names_none(tmp_path,
 	assert [version.number for version in rv.list_versions(job.job_vault)] == [0, 1, 2]
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('flush', ['ok', 'failing'])
 def test_the_scan_flushes_a_pool_before_it_deletes_a_stale_list(tmp_path, monkeypatch, flush):
 	job = three_versions(tmp_path)
@@ -355,6 +370,7 @@ def test_the_scan_flushes_a_pool_before_it_deletes_a_stale_list(tmp_path, monkey
 	assert not os.path.exists(os.path.join(job.job_vault, stale[0]))
 
 
+@pytest.mark.unit
 def test_the_scan_of_a_single_filesystem_flushes_nothing(tmp_path, monkeypatch):
 	job = three_versions(tmp_path)
 	v0 = cut_after_the_removal(job, monkeypatch)[0]
@@ -365,6 +381,7 @@ def test_the_scan_of_a_single_filesystem_flushes_nothing(tmp_path, monkeypatch):
 	assert flushes == [] and not [name for name in os.listdir(job.job_vault) if name.startswith(os.path.basename(v0.path))]
 
 
+@pytest.mark.unit
 def test_the_filesystems_of_a_vault_sync_side_by_side(tmp_path, fake_pool, errseq, monkeypatch, other_filesystem):
 	# each filesystem once, through its one handle, on threads of their own: two folders of one filesystem share it
 	import threading
@@ -476,6 +493,7 @@ def two_versions_of_tricky_batches(base):
 	return job_vault, v0, v1, mon
 
 
+@pytest.mark.unit
 def test_after_the_worst_cut_every_lost_copy_is_linked_back_and_nothing_else(tmp_path, monkeypatch):
 	job_vault, v0, v1, mon = two_versions_of_tricky_batches(str(tmp_path))
 	as_pool(monkeypatch)
@@ -551,6 +569,7 @@ def worst_cut_prune(job, monkeypatch):
 	return held, links, after
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('order', ['g_first', 'h_first'])
 def test_a_move_over_a_file_then_a_folder_move_links_back_the_moved_file_whatever_the_walk_order(tmp_path, monkeypatch, order):
 	# mv d/g d/h (over d/h); mv d e: V0's d/h and d/g both place at e/h, and only d/g's copy belongs there
@@ -576,6 +595,7 @@ def test_a_move_over_a_file_then_a_folder_move_links_back_the_moved_file_whateve
 	assert after == links and open(os.path.join(v1, 'e/h')).read() == 'G' * 50
 
 
+@pytest.mark.unit
 def test_the_moves_of_a_version_tell_a_file_moved_over_from_one_moved_on():
 	moves = rv.VersionMoves.applied([('d/g', 'd/h', False), ('d/', 'e/', True), ('c', 'e/h', False), ('e/k', 'k', False)])
 	# d/h is overwritten by the first move; d/g is moved on to e/h, which c's move then overwrites; c is the one left there;
@@ -584,6 +604,7 @@ def test_the_moves_of_a_version_tell_a_file_moved_over_from_one_moved_on():
 		(None, True), (None, True), ('e/h', True), ('k', True), (None, True), ('a', False)]
 
 
+@pytest.mark.unit
 def test_a_new_file_at_a_moved_folders_old_path_that_is_gone_before_the_verification_loses_no_copy(tmp_path, monkeypatch):
 	# mv D E; mkdir D; echo > D/x; D/x removed between the replay and its verification, whose delete row of D/x names the new
 	# file, not V0's D/x that went to E/x
@@ -604,6 +625,7 @@ def test_a_new_file_at_a_moved_folders_old_path_that_is_gone_before_the_verifica
 	assert sorted(set(links) - set(after)) == [] and sorted(set(after) - held) == []
 
 
+@pytest.mark.unit
 def test_a_delete_before_a_folder_move_still_drops_what_it_names(tmp_path, monkeypatch):
 	# rm D/x; mv D E: the delete runs before the move and names V0's D/x, so its copy is not linked back
 	job = create_job(str(tmp_path))
@@ -618,6 +640,7 @@ def test_a_delete_before_a_folder_move_still_drops_what_it_names(tmp_path, monke
 	assert sorted(links) == ['E/z', 'keep'] and sorted(after) == ['E/z', 'keep']
 
 
+@pytest.mark.unit
 def test_a_place_in_a_users_symlinked_folder_is_not_linked_into_after_a_cut(tmp_path, monkeypatch):
 	# V1 holds a user's symlink in the place of V0's folder d; rows that cannot be used link back at the file's own path,
 	# which must not follow that symlink out of the vault
@@ -635,6 +658,7 @@ def test_a_place_in_a_users_symlinked_folder_is_not_linked_into_after_a_cut(tmp_
 	assert os.listdir(outside) == []
 
 
+@pytest.mark.unit
 def test_a_temp_whose_link_was_unlinked_on_one_disk_and_not_renamed_on_the_other_goes_with_the_relink(tmp_path, monkeypatch):
 	# the copy's disk has the temp's link but not its rename, the link's disk has the link's unlink: link_back() links the
 	# copy in the link's place, and the temp is the one name left of it
@@ -737,6 +761,7 @@ def survey(job, pool, expect):
 	return lost, hidden, strays
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 @pytest.mark.chain_ground_truth_allows('blind_spot', reason='the branches are put back by cp -a, which makes every chain link anew, so no frame recorded them and the plugin takes them for user links')
 def test_every_cut_state_on_a_pool_loses_nothing_after_the_rerun(monkeypatch):

@@ -22,8 +22,6 @@ from tests.harness import create_job, seed_monitor, run_backup, write_rule
 from tests.scratch_images import needs_mount, ScratchTmpfs
 from tests.test_pool_writer import needs_mergerfs, real_pool
 
-pytestmark = pytest.mark.unit
-
 
 @pytest.fixture(autouse=True)
 def _fast(poll_fast):
@@ -106,6 +104,7 @@ def claimed(monkeypatch):
 	return fds
 
 
+@pytest.mark.unit
 def test_a_folder_restore_syncs_before_the_hand_over_and_again_after(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -120,6 +119,7 @@ def test_a_folder_restore_syncs_before_the_hand_over_and_again_after(job, tmp_pa
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
 
 
+@pytest.mark.unit
 def test_both_syncs_go_through_the_fd_the_target_was_claimed_by(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -133,6 +133,7 @@ def test_both_syncs_go_through_the_fd_the_target_was_claimed_by(job, tmp_path, c
 	assert len(fds) == 1 and synced == fds * 2
 
 
+@pytest.mark.unit
 def test_a_file_restore_syncs_through_its_folder_opened_before_the_copy(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -161,6 +162,7 @@ def test_a_file_restore_syncs_through_its_folder_opened_before_the_copy(job, tmp
 	assert [event for event in events if event[0] == 'sync'] == [events[-1]]
 
 
+@pytest.mark.unit
 def test_accept_syncs_before_the_hand_over_and_again_after(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	target = unfinished(job, tmp_path, capsys, monkeypatch)
@@ -184,6 +186,7 @@ def marker_of(target):
 		return json.load(f)
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('accept', [False, True], ids=['restore', 'accept'])
 def test_a_failed_sync_before_the_hand_over_keeps_the_marker_and_records_it(job, tmp_path, capsys, monkeypatch, accept):
 	backed_up(job)
@@ -210,6 +213,7 @@ def test_a_failed_sync_before_the_hand_over_keeps_the_marker_and_records_it(job,
 	assert 'retry them' not in stdout and 'as not everything was restored' not in stdout
 
 
+@pytest.mark.unit
 def test_a_run_again_after_a_failed_sync_copies_everything_again(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -229,6 +233,7 @@ def test_a_run_again_after_a_failed_sync_copies_everything_again(job, tmp_path, 
 		assert f.read() == 'a' * 5000
 
 
+@pytest.mark.unit
 def test_accept_over_a_failed_sync_is_refused(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -244,6 +249,7 @@ def test_accept_over_a_failed_sync_is_refused(job, tmp_path, capsys, monkeypatch
 	assert handed == [] and marker_of(target).get('recopy') == 'sync failed'
 
 
+@pytest.mark.unit
 def test_a_marker_without_the_record_reads_as_before(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	target = unfinished(job, tmp_path, capsys, monkeypatch)
@@ -256,6 +262,7 @@ def test_a_marker_without_the_record_reads_as_before(job, tmp_path, capsys, monk
 	assert [os.path.basename(source) for source in made] == ['b.txt']
 
 
+@pytest.mark.unit
 def test_a_failed_sync_after_the_hand_over_fails_the_restore(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -272,6 +279,7 @@ def test_a_failed_sync_after_the_hand_over_fails_the_restore(job, tmp_path, caps
 	assert 'run the same restore again' not in stdout + err
 
 
+@pytest.mark.unit
 def test_accept_whose_sync_after_the_hand_over_fails_does_not_say_all_went_well(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	target = unfinished(job, tmp_path, capsys, monkeypatch)
@@ -288,6 +296,7 @@ def test_accept_whose_sync_after_the_hand_over_fails_does_not_say_all_went_well(
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
 
 
+@pytest.mark.unit
 def test_a_failed_sync_of_a_file_target_fails_the_restore(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -337,6 +346,7 @@ def opened_branches(monkeypatch, branches, events):
 	monkeypatch.setattr(rv, 'copy_command', lambda source, dest: events.append('copy') or copy_command(source, dest))
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('kind', ['folder', 'file'])
 def test_a_pools_disks_are_opened_before_the_first_copy_and_every_sync_goes_through_them(job, tmp_path, capsys, monkeypatch, fake_pool, kind, other_filesystem):
 	backed_up(job)
@@ -357,6 +367,7 @@ def test_a_pools_disks_are_opened_before_the_first_copy_and_every_sync_goes_thro
 	assert sorted(synced) == sorted([fd for _, _, fd in opened] * (2 if kind == 'folder' else 1))
 
 
+@pytest.mark.unit
 def test_a_copy_landing_on_a_disk_without_the_target_at_the_claim_is_synced(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
@@ -410,6 +421,7 @@ def joined_line(disk):
 	return f'FAILED proj: the disk {disk} joined the pool while the restore ran: what was restored onto it is not known to be on disk'
 
 
+@pytest.mark.unit
 def test_a_disk_that_joined_the_pool_after_the_claim_fails_the_restore_and_a_run_again_finishes(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
@@ -438,6 +450,7 @@ def test_a_disk_that_joined_the_pool_after_the_claim_fails_the_restore_and_a_run
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and whole(target)
 
 
+@pytest.mark.unit
 def test_a_disk_mounted_onto_a_listed_branchs_folder_after_the_claim_fails_the_restore(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	# two branches that are folders of the root filesystem at the claim, which names one disk for both
@@ -467,6 +480,7 @@ def test_a_disk_mounted_onto_a_listed_branchs_folder_after_the_claim_fails_the_r
 	assert marker_of(os.path.join(str(out), 'proj')).get('recopy') == 'sync failed'
 
 
+@pytest.mark.unit
 def test_a_disk_that_joined_the_pool_without_the_restores_folder_is_passed_over(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
@@ -480,6 +494,7 @@ def test_a_disk_that_joined_the_pool_without_the_restores_folder_is_passed_over(
 	assert synced == [os.lstat(branches['one']).st_ino] * 2
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('sync', ['accept', 'stop'])
 def test_a_disk_that_joined_the_pool_fails_the_sync_of_accept_and_of_a_stop_too(job, tmp_path, capsys, monkeypatch, fake_pool, sync, other_filesystem):
 	backed_up(job)
@@ -520,6 +535,7 @@ def test_a_disk_that_joined_the_pool_fails_the_sync_of_accept_and_of_a_stop_too(
 	assert whole(target) and not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
 
 
+@pytest.mark.unit
 def test_a_branch_that_failed_to_open_at_the_claim_is_not_called_a_write_error(job, tmp_path, capsys, monkeypatch, fake_pool):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']})
@@ -543,6 +559,7 @@ def test_a_branch_that_failed_to_open_at_the_claim_is_not_called_a_write_error(j
 	assert marker_of(target).get('recopy') == 'sync failed'
 
 
+@pytest.mark.unit
 def test_a_stop_on_a_pool_syncs_through_the_handles_opened_at_the_claim(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
@@ -564,6 +581,7 @@ def test_a_stop_on_a_pool_syncs_through_the_handles_opened_at_the_claim(job, tmp
 	assert 'unsynced' not in marker_of(target) and 'recopy' not in marker_of(target)
 
 
+@pytest.mark.unit
 def test_a_failed_second_listing_of_the_pool_says_the_look_for_a_joined_disk_failed(job, tmp_path, capsys, monkeypatch, fake_pool):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
@@ -601,6 +619,7 @@ def deny(monkeypatch, paths):
 	monkeypatch.setattr(os, 'open', opening)
 
 
+@pytest.mark.unit
 def test_a_disk_none_of_whose_branches_the_user_can_open_is_a_warning_once(job, tmp_path, capsys, monkeypatch, fake_pool, other_filesystem):
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one-a', 'one-b'], 'two': ['two']}, other_filesystem)
@@ -621,6 +640,7 @@ def test_a_disk_none_of_whose_branches_the_user_can_open_is_a_warning_once(job, 
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
 
 
+@pytest.mark.unit
 def test_a_folder_shut_to_its_owner_by_the_hand_over_is_synced_on_a_pool(job, tmp_path, capsys, monkeypatch, fake_pool):
 	# the hand-over gives the target its own mode, here without the owner's read: the second sync goes through the disk's
 	# handle of the claim, the restore folder's place on its branch (held), never through the folder opened again
@@ -676,6 +696,7 @@ def write_error_line(disk):
 	return f'FAILED proj: the disk {disk} reported a write error as the restore was written out to it ('
 
 
+@pytest.mark.unit
 def test_a_restore_onto_a_nested_mount_of_a_branch_reports_its_write_error(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
 	# fails on main (says done): its one handle is the branch root's, on another filesystem than the folder's place
 	backed_up(job)
@@ -690,6 +711,7 @@ def test_a_restore_onto_a_nested_mount_of_a_branch_reports_its_write_error(job, 
 	assert marker_of(os.path.join(out, 'proj')).get('recopy') == 'sync failed'
 
 
+@pytest.mark.unit
 def test_a_restore_syncs_both_filesystems_of_branches_of_one_disk(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
 	# fails on main: one handle per disk name, the first branch's that opens, so the second filesystem is never synced
 	backed_up(job)
@@ -704,6 +726,7 @@ def test_a_restore_syncs_both_filesystems_of_branches_of_one_disk(job, tmp_path,
 	assert {event[3] for event in errseq.events if event[0] == 'syncfs'} == {os.stat(branches['one-a']).st_dev, os.stat(nested).st_dev}
 
 
+@pytest.mark.unit
 def test_a_mount_made_at_the_restore_folders_place_during_the_restore_fails_it(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
 	# fails on main (says done): its check for a joined disk goes by disk name, which a mount at a listed branch's folder keeps
 	backed_up(job)
@@ -719,6 +742,7 @@ def test_a_mount_made_at_the_restore_folders_place_during_the_restore_fails_it(j
 	assert marker_of(target).get('recopy') == 'sync failed'
 
 
+@pytest.mark.unit
 @pytest.mark.skipif(os.geteuid() == 0, reason='root opens any folder')
 def test_a_place_the_user_can_go_through_but_not_read_is_synced_through_its_branch(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
 	# fails at 15b3108: the open of the place raises EACCES, the restore warns, hears no write error there and says done (0.55.4
@@ -745,6 +769,7 @@ def test_a_place_the_user_can_go_through_but_not_read_is_synced_through_its_bran
 	assert len(failed) == 1 and failed[0].startswith(write_error_line(os.path.realpath(os.path.dirname(branches['two']))))
 
 
+@pytest.mark.unit
 def test_disks_that_cannot_be_listed_are_not_called_a_write_error(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -767,6 +792,7 @@ def test_disks_that_cannot_be_listed_are_not_called_a_write_error(job, tmp_path,
 	assert f'What {target} holds is not known to be on disk: run the same restore again, which copies everything again' in stdout
 
 
+@pytest.mark.unit
 def test_a_run_stopped_in_the_hand_over_after_a_recopy_is_finished_by_accept(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -798,6 +824,7 @@ def test_a_run_stopped_in_the_hand_over_after_a_recopy_is_finished_by_accept(job
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
 
 
+@pytest.mark.unit
 def test_a_recopy_whose_sync_fails_beside_a_fixable_failure_offers_no_accept(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -820,6 +847,7 @@ def test_a_recopy_whose_sync_fails_beside_a_fixable_failure_offers_no_accept(job
 	assert marker_of(target).get('recopy') == 'sync failed'
 
 
+@pytest.mark.unit
 def test_a_fixable_failure_with_a_good_sync_is_picked_up_and_can_be_accepted(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	target = unfinished(job, tmp_path, capsys, monkeypatch)
@@ -854,6 +882,7 @@ def recopy_line(target):
 	return f'Interrupted: what {target} holds is not known to be on disk: run the same restore again, which copies everything again. {rv.unfinished_note(target)}'
 
 
+@pytest.mark.unit
 def test_a_run_stopped_before_its_sync_syncs_on_its_way_out_and_a_run_again_keeps_it(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -876,6 +905,7 @@ def test_a_run_stopped_before_its_sync_syncs_on_its_way_out_and_a_run_again_keep
 	assert len(made) == 1 and 'keeping 1 already there' in stdout and whole(target)
 
 
+@pytest.mark.unit
 def test_a_stopped_run_whose_sync_fails_records_a_recopy(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -897,6 +927,7 @@ def test_a_stopped_run_whose_sync_fails_records_a_recopy(job, tmp_path, capsys, 
 	assert 'keeping' not in stdout and whole(target)
 
 
+@pytest.mark.unit
 def test_a_stop_right_after_its_own_sync_offers_a_run_again_or_accept(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -919,6 +950,7 @@ def test_a_stop_right_after_its_own_sync_offers_a_run_again_or_accept(job, tmp_p
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and whole(target)
 
 
+@pytest.mark.unit
 def test_a_stop_whose_record_cannot_be_cleared_after_its_sync_says_a_run_again_copies_everything_again(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -943,6 +975,7 @@ def test_a_stop_whose_record_cannot_be_cleared_after_its_sync_says_a_run_again_c
 	assert sorted(os.path.basename(source) for source in made) == ['a.txt', 'b.txt']
 
 
+@pytest.mark.unit
 def test_accept_whose_record_cannot_be_written_does_not_offer_a_run_again(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	target = unfinished(job, tmp_path, capsys, monkeypatch)
@@ -960,6 +993,7 @@ def test_accept_whose_record_cannot_be_written_does_not_offer_a_run_again(job, t
 	assert 'run the same restore again' not in stdout
 
 
+@pytest.mark.unit
 def test_the_marker_is_on_disk_before_the_first_copy(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -1007,6 +1041,7 @@ def whole(target):
 		return f.read() == 'a' * 5000
 
 
+@pytest.mark.unit
 def test_a_recopy_stopped_at_its_first_copy_keeps_the_record(job, tmp_path, capsys, monkeypatch):
 	target = a_failed_sync_then_a_nul_file(job, tmp_path, capsys, monkeypatch)
 	copy_command = rv.copy_command
@@ -1028,6 +1063,7 @@ def test_a_recopy_stopped_at_its_first_copy_keeps_the_record(job, tmp_path, caps
 	assert whole(target)
 
 
+@pytest.mark.unit
 def test_a_recopy_with_a_failed_copy_keeps_the_record_past_a_good_sync(job, tmp_path, capsys, monkeypatch):
 	target = a_failed_sync_then_a_nul_file(job, tmp_path, capsys, monkeypatch)
 	copy_command = rv.copy_command
@@ -1063,6 +1099,7 @@ def killed_at_its_sync(job, tmp_path, capsys, monkeypatch):
 
 
 # "unsynced" as the restore writes it, and whatever else a marker holds there: it reads as unsynced all the same
+@pytest.mark.unit
 @pytest.mark.parametrize('unsynced', [True, 'any text', None], ids=['as_written', 'a_string', 'null'])
 def test_a_run_again_after_a_kill_copies_everything_again_and_accept_is_refused(job, tmp_path, capsys, monkeypatch, unsynced):
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
@@ -1086,6 +1123,7 @@ def test_a_run_again_after_a_kill_copies_everything_again_and_accept_is_refused(
 	assert 'keeping' not in stdout and whole(target) and not os.path.lexists(marker)
 
 
+@pytest.mark.unit
 def test_a_write_error_copies_everything_again(job, tmp_path, capsys, monkeypatch):
 	target = a_failed_sync_then_a_nul_file(job, tmp_path, capsys, monkeypatch)
 	made = copies(monkeypatch)
@@ -1094,6 +1132,7 @@ def test_a_write_error_copies_everything_again(job, tmp_path, capsys, monkeypatc
 	assert sorted(os.path.basename(source) for source in made) == ['a.txt', 'b.txt'] and whole(target)
 
 
+@pytest.mark.unit
 def test_a_file_targets_folder_that_cannot_be_opened_is_a_warning(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -1115,6 +1154,7 @@ def test_a_file_targets_folder_that_cannot_be_opened_is_a_warning(job, tmp_path,
 
 
 
+@pytest.mark.unit
 def test_a_failed_sync_whose_record_cannot_be_written_leaves_the_claims_record(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -1205,6 +1245,7 @@ def a_final_failure(kind, job, monkeypatch):
 	return 'proj/sub/b.txt', re.escape(str(refused)), ['a.txt']
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('kind', FIRST_RUN_KINDS)
 def test_a_failure_no_run_again_fixes_does_not_hold_a_restore(job, tmp_path, capsys, monkeypatch, kind):
 	backed_up(job)
@@ -1224,6 +1265,7 @@ def test_a_failure_no_run_again_fixes_does_not_hold_a_restore(job, tmp_path, cap
 	assert 'run the same restore again' not in stdout + err and '--accept' not in stdout + err
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('kind', FINAL_KINDS)
 def test_a_run_again_after_a_kill_finishes_over_a_failure_no_run_again_fixes(job, tmp_path, capsys, monkeypatch, kind):
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
@@ -1241,6 +1283,7 @@ def test_a_run_again_after_a_kill_finishes_over_a_failure_no_run_again_fixes(job
 	assert 'run the same restore again' not in stdout + err
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('kind', STOPPED_KINDS)
 def test_a_run_again_after_a_kill_over_such_a_failure_that_stops_in_its_hand_over_is_finished_by_accept(job, tmp_path, capsys, monkeypatch, kind):
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
@@ -1261,6 +1304,7 @@ def test_a_run_again_after_a_kill_over_such_a_failure_that_stops_in_its_hand_ove
 	assert not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME)) and whole(target)
 
 
+@pytest.mark.unit
 def test_a_recopy_of_a_vault_missing_a_disk_keeps_its_recopy_and_the_target_private(job, tmp_path, capsys, monkeypatch):
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
 	# a leftover of the killed run, whose bytes were lost
@@ -1293,6 +1337,7 @@ def test_a_recopy_of_a_vault_missing_a_disk_keeps_its_recopy_and_the_target_priv
 	assert whole(target) and not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
 
 
+@pytest.mark.unit
 def test_a_first_restore_of_a_vault_missing_a_disk_is_not_held_for_it(job, tmp_path, capsys, monkeypatch):
 	# nothing was left by an earlier run: what the walk does not meet is not there, and the exit code says why
 	backed_up(job)
@@ -1309,6 +1354,7 @@ def way_out(target, made):
 	return f'If that keeps failing, fix the cause and run it again, or {fresh}.'
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('reason', ['cut', 'sync failed'])
 def test_a_recopy_that_keeps_failing_names_the_way_out_for_a_target_a_restore_made(job, tmp_path, capsys, monkeypatch, reason):
 	if reason == 'cut':
@@ -1343,6 +1389,7 @@ def a_whole_job_root_killed_at_its_sync(job, tmp_path, capsys, monkeypatch):
 	return job.monitor
 
 
+@pytest.mark.unit
 def test_a_recopy_that_keeps_failing_never_says_to_remove_a_target_no_restore_made(job, tmp_path, capsys, monkeypatch):
 	root = a_whole_job_root_killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
 	code, stdout, err = restore(tmp_path, capsys, root, '--in-place', '--version', '0', '--accept')
@@ -1356,6 +1403,7 @@ def test_a_recopy_that_keeps_failing_never_says_to_remove_a_target_no_restore_ma
 	assert 'remove' not in stdout and 'made' not in marker_of(root)
 
 
+@pytest.mark.unit
 def test_a_marker_without_made_never_says_to_remove_the_target(job, tmp_path, capsys, monkeypatch):
 	# a marker of 0.55.1 (or one made by hand) says nothing of who made the target
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
@@ -1368,6 +1416,7 @@ def test_a_marker_without_made_never_says_to_remove_the_target(job, tmp_path, ca
 	assert code == rv.EXIT_USAGE and err.endswith(f'{way_out(target, False)}\n')
 
 
+@pytest.mark.unit
 def test_a_dangling_chain_on_a_vault_missing_a_disk_is_not_final(job, tmp_path, capsys, monkeypatch):
 	backed_up(job)
 	out = destination(tmp_path)
@@ -1393,6 +1442,7 @@ def recopy_summary(target, made=True, missing=False):
 	return f'{line} {rv.unfinished_note(target)}'
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('first', [False, True], ids=['recopy', 'first_run'])
 def test_a_failed_sync_on_a_vault_missing_a_disk_keeps_its_own_line_and_the_way_out(job, tmp_path, capsys, monkeypatch, first):
 	if first:
@@ -1411,6 +1461,7 @@ def test_a_failed_sync_on_a_vault_missing_a_disk_keeps_its_own_line_and_the_way_
 	assert stdout.splitlines()[-1] == recopy_summary(target, missing=True)
 
 
+@pytest.mark.unit
 def test_a_stopped_recopy_on_a_vault_missing_a_disk_keeps_its_own_line(job, tmp_path, capsys, monkeypatch):
 	target = killed_at_its_sync(job, tmp_path, capsys, monkeypatch)
 	copy_command = rv.copy_command
@@ -1426,6 +1477,7 @@ def test_a_stopped_recopy_on_a_vault_missing_a_disk_keeps_its_own_line(job, tmp_
 	assert err == recopy_line(target) + '\n'
 
 
+@pytest.mark.privileged
 @needs_mergerfs
 @needs_mount
 def test_a_restore_onto_a_real_mount_of_its_own_on_a_branch_is_synced_through_it(job, tmp_path, capsys, monkeypatch):

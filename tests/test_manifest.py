@@ -12,8 +12,6 @@ from tests.scratch_images import LoopImage, needs_f2fs, SCRATCH
 from tests.harness import create_job, mark_unchecked_by_hand, seed_monitor, tracked_manifest, run_backup, latest_version, event_entry, reads_the_file_before, vault_unit
 from tests.test_names import contents, database, schema, schema_1_job
 
-pytestmark = pytest.mark.unit
-
 
 @pytest.fixture(autouse=True)
 def _fast(poll_fast):
@@ -31,6 +29,7 @@ def count_vault_reads(monkeypatch):
 	return reads
 
 
+@pytest.mark.unit
 def test_backup_records_what_the_new_version_holds(job):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	v0 = run_backup(job)[0]
@@ -45,6 +44,7 @@ def test_backup_records_what_the_new_version_holds(job):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_a_start_reads_each_copy_an_older_release_left_unchecked_back_once_then_only_the_monitored_side(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	run_backup(job)
@@ -57,6 +57,7 @@ def test_a_start_reads_each_copy_an_older_release_left_unchecked_back_once_then_
 	assert reads == []
 
 
+@pytest.mark.unit
 def test_mark_vouched_keeps_the_record_until_an_add(job):
 	seed_monitor(job, {'a.txt': 'hello', 'd/b.txt': 'b'})
 	run_backup(job)
@@ -105,6 +106,7 @@ def unchecked_flags(job):
 		manifest.close()
 
 
+@pytest.mark.unit
 def test_a_comparison_makes_no_sync_however_many_copies_it_checks(job, monkeypatch):
 	# every copy a version commits was flushed before its commit through the batch's own handles: a copy read back is recorded
 	# checked with no sync of the comparison's
@@ -121,6 +123,7 @@ def test_a_comparison_makes_no_sync_however_many_copies_it_checks(job, monkeypat
 	assert set(unchecked_flags(job).values()) == {0}
 
 
+@pytest.mark.unit
 def test_a_comparison_storing_no_checked_file_record_makes_no_sync(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
@@ -136,6 +139,7 @@ def test_a_comparison_storing_no_checked_file_record_makes_no_sync(job, monkeypa
 	assert unchecked_flags(job)['b.txt'] == 0
 
 
+@pytest.mark.privileged
 @needs_f2fs
 def test_the_real_sync_succeeds_on_the_test_filesystem(monkeypatch):
 	# the real binding, on a scratch image's own mount: nothing else lives there
@@ -152,6 +156,7 @@ def test_the_real_sync_succeeds_on_the_test_filesystem(monkeypatch):
 				REAL_SYNC_VAULT_FILESYSTEMS(gone, 'job')
 
 
+@pytest.mark.unit
 def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
 	# a crash mid copy can leave the size and mtime in place over space whose bytes never reached the disk: a row an older release
 	# marked unchecked is read back, and its copy is copied again
@@ -167,6 +172,7 @@ def test_unchecked_copy_missing_its_bytes_is_copied_again(job):
 	assert open(os.path.join(versions[1], 'a.txt')).read() == 'hello'
 
 
+@pytest.mark.unit
 def test_content_rewritten_keeping_size_and_mtime_is_modify_without_reading_the_vault(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
@@ -182,6 +188,7 @@ def test_content_rewritten_keeping_size_and_mtime_is_modify_without_reading_the_
 	assert reads == []
 
 
+@pytest.mark.unit
 def test_relative_symlink_is_not_copied_again_at_each_start(job):
 	seed_monitor(job, {'lib/x.txt': 'x'})
 	os.symlink('lib', os.path.join(job.monitor, 'lib64'))
@@ -189,6 +196,7 @@ def test_relative_symlink_is_not_copied_again_at_each_start(job):
 	assert len(run_backup(job)) == 1
 
 
+@pytest.mark.unit
 def test_attribute_change_is_attrib(job):
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
@@ -199,6 +207,7 @@ def test_attribute_change_is_attrib(job):
 	assert entries == OrderedDict([(source, entries[source])]) and entries[source].event == 'attrib'
 
 
+@pytest.mark.unit
 def test_moved_folder_is_read_from_the_vault_again(job, monkeypatch):
 	seed_monitor(job, {'sub/x.txt': 'x'})
 	run_backup(job)
@@ -212,6 +221,7 @@ def test_moved_folder_is_read_from_the_vault_again(job, monkeypatch):
 	assert sorted(reads) == ['moved/']
 
 
+@pytest.mark.unit
 def test_folder_moved_to_another_depth_needs_no_copy(job):
 	# a folder moved to another depth keeps its files, whatever the depth, as the older version gets them by hard links
 	seed_monitor(job, {'sub/x.txt': 'x', 'deep/er/p.txt': 'p'})
@@ -225,6 +235,7 @@ def test_folder_moved_to_another_depth_needs_no_copy(job):
 	assert reads_the_file_before(latest_version(job).path, 'deep/er/sub/x.txt', 'sub/x.txt') and open(copy).read() == 'x'
 
 
+@pytest.mark.unit
 def test_manifest_for_another_version_is_listed_again_from_the_vault(job):
 	# a version whose content file was never written is removed at startup, but the manifest committed before it
 	seed_monitor(job, {'a.txt': 'hello', 'new.txt': 'n'})
@@ -239,6 +250,7 @@ def test_manifest_for_another_version_is_listed_again_from_the_vault(job):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_interrupted_backup_leaves_the_manifest_on_the_previous_version(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
 	v0 = run_backup(job)[0]
@@ -261,6 +273,7 @@ def test_interrupted_backup_leaves_the_manifest_on_the_previous_version(job, mon
 	reopened.close()
 
 
+@pytest.mark.unit
 def test_unreadable_manifest_is_started_over(job):
 	os.makedirs(job.job_vault)
 	with open(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME), 'wb') as f:
@@ -270,6 +283,7 @@ def test_unreadable_manifest_is_started_over(job):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_a_malformed_manifest_is_started_over(job):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	run_backup(job)
@@ -284,6 +298,7 @@ def test_a_malformed_manifest_is_started_over(job):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_a_lock_held_past_the_timeout_keeps_the_manifest(job, monkeypatch):
 	# the manifest of a cut batch holds the only copy of version n's folder times: a lock, a failing disk or a full table of
 	# file handles says nothing of the file, and it stays as it is
@@ -305,6 +320,7 @@ def test_a_lock_held_past_the_timeout_keeps_the_manifest(job, monkeypatch):
 	reopened.close()
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('message', ['disk I/O error', 'unable to open database file', 'database or disk is full'])
 def test_an_error_of_the_operation_keeps_the_manifest(job, monkeypatch, message):
 	seed_monitor(job, {'a.txt': 'hello'})
@@ -326,6 +342,7 @@ def test_an_error_of_the_operation_keeps_the_manifest(job, monkeypatch, message)
 	reopened.close()
 
 
+@pytest.mark.unit
 def test_a_vault_whose_manifest_cannot_be_opened_says_so_first_and_what_fixes_it(job, monkeypatch):
 	# every open fails: the scan stops at the layout, before any open of the manifest of the backup itself, so the reason is the scan's
 	seed_monitor(job, {'a.txt': 'hello'})
@@ -349,6 +366,7 @@ def test_a_vault_whose_manifest_cannot_be_opened_says_so_first_and_what_fixes_it
 	assert os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME) in reason and 'if it stays, remove' in reason
 
 
+@pytest.mark.unit
 def test_an_attempt_that_cannot_open_the_manifest_fails_and_the_next_one_commits(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
@@ -384,6 +402,7 @@ def without_schema(meta):
 	return [pair for pair in meta if pair[0] != 'schema']
 
 
+@pytest.mark.unit
 def test_schema_2_upgrades_in_place_keeping_rows(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world', 'sub/c/d.txt': 'deep'})
 	run_backup(job)
@@ -407,6 +426,7 @@ def test_schema_2_upgrades_in_place_keeping_rows(job, monkeypatch):
 	assert entries == OrderedDict() and reads == []
 
 
+@pytest.mark.unit
 def test_schema_1_upgrades_to_3(job):
 	schema_1_job(job)
 	rows, meta = contents(job)
@@ -418,6 +438,7 @@ def test_schema_1_upgrades_to_3(job):
 	assert dict(after_meta)['skip_fingerprint'] == 'abc' and dict(after_meta)['version'] == dict(meta)['version']
 
 
+@pytest.mark.unit
 def test_schema_2_without_its_entries_table_upgrades(job):
 	# _open commits a new database's schema and its entries table one after the other: a crash between them left this
 	os.makedirs(job.job_vault)
@@ -431,6 +452,7 @@ def test_schema_2_without_its_entries_table_upgrades(job):
 	assert schema(job) == '3'
 
 
+@pytest.mark.unit
 def test_a_schema_2_the_upgrade_cannot_write_stays_for_the_next_attempt(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
@@ -449,6 +471,7 @@ def test_a_schema_2_the_upgrade_cannot_write_stays_for_the_next_attempt(job, mon
 	assert contents(job)[0] == before[0] and schema(job) == '3'
 
 
+@pytest.mark.unit
 def test_the_journal_name_is_flushed_before_an_upgrade_writes(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello'})
 	run_backup(job)
@@ -473,6 +496,7 @@ def test_the_journal_name_is_flushed_before_an_upgrade_writes(job, monkeypatch):
 	assert calls[:2] == [('flush', True), ('begin',)]
 
 
+@pytest.mark.unit
 def test_the_new_keys_roll_back_with_the_transaction(job):
 	os.makedirs(job.job_vault)
 	manifest = rv.VaultManifest(job.job_vault)
@@ -525,6 +549,7 @@ FOLDER_ROW = rv.ManifestRecord('d', None, 1, 0o40755, 0, 0, None, None, 0)
 FOLDER_BYTES = 4096
 
 
+@pytest.mark.unit
 def test_totals_counts_files_and_folders(job):
 	manifest = manifest_of_rows(job, {'a.txt': file_row(5), 'd/': FOLDER_ROW, 'd/b.txt': file_row(7), 'd/l': LINK_ROW, 'd/e/': FOLDER_ROW})
 	# a link has no bytes and one inode, as sizes_by_newest_holder counts it
@@ -538,6 +563,7 @@ def test_totals_counts_files_and_folders(job):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_totals_of_no_rows_is_zero_and_an_unverified_row_is_an_inode_of_no_bytes(job):
 	manifest = manifest_of_rows(job, {})
 	assert manifest.totals() == (0, 0)
@@ -549,6 +575,7 @@ def test_totals_of_no_rows_is_zero_and_an_unverified_row_is_an_inode_of_no_bytes
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_size_under_counts_only_below_the_folder(job):
 	escape = rv.NAME_ESCAPE
 	manifest = manifest_of_rows(job, {
@@ -564,12 +591,14 @@ def test_size_under_counts_only_below_the_folder(job):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_size_under_finds_a_name_that_is_not_utf8(job):
 	manifest = manifest_of_rows(job, {'b\udcff/': FOLDER_ROW, 'b\udcff/x': file_row(6)})
 	assert manifest.size_under('b\udcff/') == (6, 1)
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_synchronous_stays_full(job):
 	# the manifest's commit is the commit point of a version
 	os.makedirs(job.job_vault)
@@ -578,6 +607,7 @@ def test_synchronous_stays_full(job):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_a_read_only_open_of_schema_2_reads_no_layout(job, v054):
 	v054.build(job, [lambda monitor: seed_monitor(job, {'a.txt': 'hello'})])
 	before = contents(job)

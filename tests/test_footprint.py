@@ -14,8 +14,6 @@ import pytest
 import reverberator as rv
 from tests.harness import create_job, wait_until, write_rule
 
-pytestmark = pytest.mark.unit
-
 # the footprint report's gate (section 6): one job of 3,000 folders and 19,843 files, a restart, then idle. Plain 0.55.4: [heap]
 # 34.0 MB and RssAnon + VmSwap 57 to 60 MB; trimmed: 5.8 and 25 to 29 MB, 10.3 MB of [heap] with MALLOC_ARENA_MAX=2. The bounds
 # sit 11 MB above the highest fixed figure and 17 below the lowest plain one
@@ -74,11 +72,13 @@ def anon_kb(pid):
 	return int(fields['RssAnon'][0]) + int(fields['VmSwap'][0])
 
 
+@pytest.mark.unit
 def test_the_trim_is_there():
 	# the gate below would pass on a libc without malloc_trim for the wrong reason
 	assert rv.LIBC_MALLOC_TRIM is not None
 
 
+@pytest.mark.process
 def test_an_idle_daemon_gives_back_what_its_start_and_its_backup_freed(tmp_path, run_reverberator, process_env):
 	# fails on 2c47969 ([heap] about 34 MB): nothing gave back the compile's garbage or the comparison's
 	job = create_job(str(tmp_path))

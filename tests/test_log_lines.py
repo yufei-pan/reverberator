@@ -35,7 +35,6 @@ for thread in threads:
 '''
 
 
-@pytest.mark.process
 def test_markers_logged_at_once_from_many_threads_each_start_a_line():
 	child = subprocess.run([sys.executable, '-c', SCRIPT], env=dict(os.environ, PYTHONUNBUFFERED='1'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=ROOT, timeout=60)
 	out = child.stdout.decode('utf-8', 'replace')

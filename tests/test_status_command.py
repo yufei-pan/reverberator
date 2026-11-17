@@ -9,8 +9,6 @@ import pytest
 import reverberator as rv
 from tests.harness import create_job, rule_row, write_rule, write_committed_version, reverberator_script
 
-pytestmark = pytest.mark.unit
-
 
 def state_dir(tmp_path):
 	return str(tmp_path / 'state')
@@ -47,6 +45,7 @@ def status(tmp_path, capsys, *extra):
 	return code, captured.out, captured.err
 
 
+@pytest.mark.unit
 def test_main_dispatches_commands_and_keeps_the_daemon_argv(monkeypatch):
 	calls = []
 	monkeypatch.setattr(rv, 'run_command', lambda argv: calls.append(('cmd', argv)) or 0)
@@ -60,6 +59,7 @@ def test_main_dispatches_commands_and_keeps_the_daemon_argv(monkeypatch):
 	assert calls == [('cmd', ['status']), ('install',), ('daemon',)]
 
 
+@pytest.mark.unit
 def test_command_args_define_all_three_commands():
 	args = rv.get_command_args(['restore', 'p', 'd', '--job', 'j', '--version', '3', '--at', 'x', '--in-place', '--threads', '2', '--yes', '--rule', 'r', '--state_dir', 's'])
 	assert (args.command, args.path, args.dest, args.job, args.version, args.at, args.in_place, args.threads, args.yes, args.rule, args.state_dir) == ('restore', 'p', 'd', 'j', 3, 'x', True, 2, True, 'r', 's')
@@ -67,6 +67,7 @@ def test_command_args_define_all_three_commands():
 	assert rv.get_command_args(['status']).rule is None
 
 
+@pytest.mark.unit
 def test_restore_runs_four_copies_at_once_by_default(capsys):
 	# however many processors there are, so a restore does not keep the vault disk busy with more by default
 	assert rv.get_command_args(['restore', 'p']).threads == 4
@@ -75,6 +76,7 @@ def test_restore_runs_four_copies_at_once_by_default(capsys):
 	assert 'Copies to run at once (default 4)' in ' '.join(capsys.readouterr().out.split())
 
 
+@pytest.mark.unit
 def test_status_with_a_live_daemon(job, tmp_path, capsys):
 	two_versions(job, keep='5')
 	write_state(tmp_path, 'daemon.json', daemon_record(job))
@@ -89,6 +91,7 @@ def test_status_with_a_live_daemon(job, tmp_path, capsys):
 	assert 'no limit' in out and 'inodes' in out
 
 
+@pytest.mark.unit
 def test_status_after_the_daemon_died(job, tmp_path, capsys):
 	two_versions(job)
 	proc = subprocess.Popen([sys.executable, '-c', 'pass'])
@@ -103,6 +106,7 @@ def test_status_after_the_daemon_died(job, tmp_path, capsys):
 	assert 'last known: running' in out
 
 
+@pytest.mark.unit
 def test_status_with_a_reused_pid(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job, ticks_shift=1))
@@ -111,6 +115,7 @@ def test_status_with_a_reused_pid(job, tmp_path, capsys):
 	assert code == 0 and 'is not running' in out and 'last known: running' in out
 
 
+@pytest.mark.unit
 def test_status_marks_a_record_from_an_earlier_run_as_last_known(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job, started_at=time.time() - 10))
@@ -119,6 +124,7 @@ def test_status_marks_a_record_from_an_earlier_run_as_last_known(job, tmp_path, 
 	assert 'running since' in out and 'last known: running' in out
 
 
+@pytest.mark.unit
 def test_status_state_phrases(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job))
@@ -135,6 +141,7 @@ def test_status_state_phrases(job, tmp_path, capsys):
 		assert code == 0 and phrase in out and 'last known' not in out
 
 
+@pytest.mark.unit
 def test_status_vault_not_mounted(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job))
@@ -144,6 +151,7 @@ def test_status_vault_not_mounted(job, tmp_path, capsys):
 	assert code == 0 and f'vault not mounted: {job.vault}' in out and 'no versions yet' in out
 
 
+@pytest.mark.unit
 def test_status_shows_a_detail_with_control_characters_escaped(job, tmp_path, capsys):
 	# a job's detail can quote a monitored path, which anyone writing there names
 	two_versions(job)
@@ -155,6 +163,7 @@ def test_status_shows_a_detail_with_control_characters_escaped(job, tmp_path, ca
 	assert '\x1b' not in out
 
 
+@pytest.mark.unit
 def test_status_numbers_match_the_vault(job, tmp_path):
 	two_versions(job, keep='4')
 	rules = rv.parse_rules(job.rule_path, read_only=True)
@@ -166,17 +175,20 @@ def test_status_numbers_match_the_vault(job, tmp_path):
 	assert (numbers.size_limit, numbers.inode_limit) == rv.get_backup_limits_from_str('5%,i5%', *rv.get_path_fs_info(job.vault))
 
 
+@pytest.mark.unit
 def test_status_needs_a_rule_without_a_record(tmp_path, capsys):
 	code, out, err = status(tmp_path, capsys)
 	assert code == rv.EXIT_USAGE and '--rule' in err and out == ''
 
 
+@pytest.mark.unit
 def test_status_takes_the_rule_from_a_stale_record(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job, ticks_shift=1))
 	assert status(tmp_path, capsys)[0] == 0
 
 
+@pytest.mark.unit
 def test_status_ignores_malformed_files(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'job-garbage.json', '{not json')
@@ -189,6 +201,7 @@ def test_status_ignores_malformed_files(job, tmp_path, capsys):
 	assert code == 0 and 'unknown' in out
 
 
+@pytest.mark.unit
 def test_status_names_an_unreadable_rule_file(tmp_path, capsys):
 	code, out, err = status(tmp_path, capsys, '--rule', str(tmp_path))
 	assert code != 0 and str(tmp_path) in err and 'Traceback' not in err
@@ -198,6 +211,7 @@ def test_status_names_an_unreadable_rule_file(tmp_path, capsys):
 	assert code != 0 and 'no jobs' in err
 
 
+@pytest.mark.unit
 def test_status_keeps_the_header_mismatch_dump_off_the_output(job, tmp_path, capsys):
 	two_versions(job)
 	with open(job.rule_path) as f:
@@ -208,6 +222,7 @@ def test_status_keeps_the_header_mismatch_dump_off_the_output(job, tmp_path, cap
 	assert code == 0 and 'mismatch' not in (out + err).lower()
 
 
+@pytest.mark.unit
 def test_status_writes_nothing(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job))
@@ -232,6 +247,7 @@ def test_status_runs_as_a_subprocess(job, tmp_path, process_env):
 	assert done.returncode == 0 and job.job_name in done.stdout
 
 
+@pytest.mark.unit
 def test_status_shows_an_unreadable_vault_and_the_other_jobs(job, tmp_path, capsys, monkeypatch):
 	two_versions(job)
 	other = create_job(str(tmp_path / 'other'), 'second')
@@ -249,6 +265,7 @@ def test_status_shows_an_unreadable_vault_and_the_other_jobs(job, tmp_path, caps
 	assert 'last backup' in out and out.index('second') > out.index('vault not readable')
 
 
+@pytest.mark.unit
 def test_show_size_and_count_below_a_thousand_are_plain():
 	assert [rv.show_size(n) for n in (0, 5, 1023)] == ['0 B', '5 B', '1023 B']
 	assert rv.show_size(1536) == '1.50 KiB' and rv.show_size(0, 0) == 'no limit'
@@ -256,6 +273,7 @@ def test_show_size_and_count_below_a_thousand_are_plain():
 	assert rv.show_count(1000) == '1.00 K' and rv.show_count(5, 0) == 'no limit'
 
 
+@pytest.mark.unit
 def test_status_vault_line_formats(job, tmp_path, capsys):
 	two_versions(job)
 	code, out, err = status(tmp_path, capsys, '--rule', job.rule_path)
@@ -265,6 +283,7 @@ def test_status_vault_line_formats(job, tmp_path, capsys):
 	assert 'limit no limit' not in out and ' 4.00 inodes' not in line
 
 
+@pytest.mark.unit
 def test_status_lists_each_vault_once(job, tmp_path, capsys, monkeypatch):
 	two_versions(job)
 	listed = []
@@ -279,6 +298,7 @@ def status_json(tmp_path, capsys, *extra):
 	return code, json.loads(out) if out else None, err
 
 
+@pytest.mark.unit
 def test_status_json_with_a_live_daemon(job, tmp_path, capsys):
 	two_versions(job, keep='5')
 	record = daemon_record(job)
@@ -296,12 +316,14 @@ def test_status_json_with_a_live_daemon(job, tmp_path, capsys):
 			'inodes': numbers.inodes, 'inode_limit': numbers.inode_limit}}]
 
 
+@pytest.mark.unit
 def test_status_json_prints_one_line(job, tmp_path, capsys):
 	two_versions(job)
 	code, out, err = status(tmp_path, capsys, '--json', '--rule', job.rule_path)
 	assert code == 0 and out.count('\n') == 1 and out.endswith('}\n')
 
 
+@pytest.mark.unit
 def test_status_json_and_text_say_the_same(job, tmp_path, capsys):
 	# both are made from status_view(): each phrase and number the text shows is in the JSON
 	two_versions(job, keep='5')
@@ -322,6 +344,7 @@ def test_status_json_and_text_say_the_same(job, tmp_path, capsys):
 	assert found['phrase'] == 'starting'
 
 
+@pytest.mark.unit
 def test_status_json_after_the_daemon_died(job, tmp_path, capsys):
 	two_versions(job)
 	proc = subprocess.Popen([sys.executable, '-c', 'pass'])
@@ -337,6 +360,7 @@ def test_status_json_after_the_daemon_died(job, tmp_path, capsys):
 	assert view['jobs'][0]['phrase'] == 'last known: running'
 
 
+@pytest.mark.unit
 def test_status_json_without_a_daemon_record(job, tmp_path, capsys):
 	two_versions(job)
 	code, view, err = status_json(tmp_path, capsys, '--rule', job.rule_path)
@@ -346,6 +370,7 @@ def test_status_json_without_a_daemon_record(job, tmp_path, capsys):
 	assert view['jobs'][0]['last_version'] == 1
 
 
+@pytest.mark.unit
 def test_status_json_lists_jobs_in_rule_file_order(job, tmp_path, capsys):
 	other = create_job(str(tmp_path / 'other'), 'aaa_first_by_name')
 	write_committed_version(other, 0, {'a': 'x'})
@@ -361,6 +386,7 @@ def test_status_json_lists_jobs_in_rule_file_order(job, tmp_path, capsys):
 	assert nameless['phrase'] == f'stopped: {nameless["detail"]}' and 'rename it in' in nameless['detail']
 
 
+@pytest.mark.unit
 def test_status_json_vault_not_mounted(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job))
@@ -371,6 +397,7 @@ def test_status_json_vault_not_mounted(job, tmp_path, capsys):
 	assert view['jobs'][0]['versions'] == 0 and view['jobs'][0]['last_backup'] is None
 
 
+@pytest.mark.unit
 def test_status_json_shows_an_unreadable_vault_and_the_other_jobs(job, tmp_path, capsys, monkeypatch):
 	two_versions(job)
 	other = create_job(str(tmp_path / 'other'), 'second')
@@ -390,6 +417,7 @@ def test_status_json_shows_an_unreadable_vault_and_the_other_jobs(job, tmp_path,
 	assert second['vault']['error'] is None and second['last_version'] == 0
 
 
+@pytest.mark.unit
 def test_status_json_escapes_control_characters(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job))
@@ -400,11 +428,13 @@ def test_status_json_escapes_control_characters(job, tmp_path, capsys):
 	assert found['detail'] == 'cannot read /m/\\x1b[2Jx\\x0anext \\xff' and found['phrase'] == f'stopped: {found["detail"]}'
 
 
+@pytest.mark.unit
 def test_status_json_needs_a_rule_without_a_record(tmp_path, capsys):
 	code, out, err = status(tmp_path, capsys, '--json')
 	assert code == rv.EXIT_USAGE and '--rule' in err and out == ''
 
 
+@pytest.mark.unit
 def test_status_json_writes_nothing(job, tmp_path, capsys):
 	two_versions(job)
 	write_state(tmp_path, 'daemon.json', daemon_record(job))

@@ -311,7 +311,6 @@ for thread in threads:
 '''
 
 
-@pytest.mark.process
 def test_split_prints_from_threads_never_put_a_marker_mid_line():
 	child = subprocess.run([sys.executable, '-c', SCRIPT], env=dict(os.environ, PYTHONUNBUFFERED='1'), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=ROOT, timeout=60)
 	out = child.stdout.decode('utf-8', 'replace')

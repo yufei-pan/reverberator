@@ -11,8 +11,6 @@ import signal
 from tests.harness import seed_monitor, wait_until, committed_versions, create_job, rule_row, run_backup, write_rule, wait_for_committed_count, write_fstab
 from tests.test_log_text import alerting_lines
 
-pytestmark = pytest.mark.unit
-
 
 def _run_backuper(paths, job, startup=None, to_process=None):
 	to_process = rv.ChangeEventQueue(paths.monitor) if to_process is None else to_process
@@ -24,6 +22,7 @@ def _run_backuper(paths, job, startup=None, to_process=None):
 	return thread, to_process
 
 
+@pytest.mark.unit
 def test_job_control_first_failure_wins():
 	job = rv.JobControl('j')
 	job.start_attempt()
@@ -35,11 +34,13 @@ def test_job_control_first_failure_wins():
 	assert job.should_run() and job.failure is None
 
 
+@pytest.mark.unit
 def test_marker_helpers_exact_text(capsys):
 	assert rv.job_log('j', 'STOPPED: bad pattern') == 'reverberator job j STOPPED: bad pattern'
 	assert rv.daemon_error_log('every job is stopped') == 'reverberator EXITING with error: every job is stopped'
 
 
+@pytest.mark.unit
 def test_backuper_failure_stops_only_its_job_and_saves_nothing(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	def broken(*args, **kwargs):
@@ -58,6 +59,7 @@ def test_backuper_failure_stops_only_its_job_and_saves_nothing(job, poll_fast, m
 	assert not os.path.exists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
 
 
+@pytest.mark.unit
 def test_watcher_failure_stops_only_its_job(job, poll_fast, monkeypatch):
 	monkeypatch.setattr(rv, 'watchFolder', lambda *a, **k: rv.WATCH_RESULT_INIT_FAILED)
 	control = rv.JobControl(job.job_name)
@@ -69,6 +71,7 @@ def test_watcher_failure_stops_only_its_job(job, poll_fast, monkeypatch):
 	assert rv.GREEN_LIGHT.is_set() and control.failure is not None
 
 
+@pytest.mark.unit
 def test_startup_failures_classified(job):
 	missing = rv.JobStartup(job.job_name, job.monitor, os.path.join(job.root, 'missing'))
 	assert missing.load(None) is False and missing.permanent is False
@@ -80,6 +83,7 @@ def test_startup_failures_classified(job):
 	assert refused.load('recorded') is False and refused.permanent is True
 
 
+@pytest.mark.unit
 def test_backuper_reports_permanent_startup_failure(job, poll_fast):
 	bad = os.path.join(job.root, 'bad')
 	open(bad, 'w').write('[z-a]\n')
@@ -90,6 +94,7 @@ def test_backuper_reports_permanent_startup_failure(job, poll_fast):
 	assert control.failure.permanent and rv.GREEN_LIGHT.is_set()
 
 
+@pytest.mark.unit
 def test_backuper_marks_committed_and_stops_with_its_job(job, poll_fast):
 	seed_monitor(job, {'a.txt': 'a'})
 	control = rv.JobControl(job.job_name)
@@ -101,6 +106,7 @@ def test_backuper_marks_committed_and_stops_with_its_job(job, poll_fast):
 	assert not thread.is_alive() and rv.GREEN_LIGHT.is_set() and len(committed_versions(job)) == 1
 
 
+@pytest.mark.unit
 def test_watch_folder_stops_with_its_job(monkeypatch, poll_fast):
 	class FakeINotify:
 		def __enter__(self):
@@ -139,6 +145,7 @@ def _attempts(script):
 	return start_attempt, calls
 
 
+@pytest.mark.unit
 def test_run_job_retries_with_backoff_then_stops(monkeypatch, poll_fast, capsys):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.01)
 	start_attempt, calls = _attempts([('fail', 'disk gone'), ('fail', 'disk gone'), ('fail', 'bad pattern', True)])
@@ -150,6 +157,7 @@ def test_run_job_retries_with_backoff_then_stops(monkeypatch, poll_fast, capsys)
 	assert 'reverberator job j STOPPED: bad pattern' in text
 
 
+@pytest.mark.unit
 def test_run_job_logs_recovered(monkeypatch, poll_fast, capsys):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.01)
 	start_attempt, _ = _attempts([('fail', 'disk gone'), ('commit_then_fail', 'x', True)])
@@ -158,6 +166,7 @@ def test_run_job_logs_recovered(monkeypatch, poll_fast, capsys):
 	assert 'reverberator job j RECOVERED after 1 failed attempts' in out.out + out.err
 
 
+@pytest.mark.unit
 def test_run_job_backoff_resets_only_after_a_clean_hour(monkeypatch, poll_fast):
 	now = [0.0]
 	delays = []
@@ -174,6 +183,7 @@ def test_run_job_backoff_resets_only_after_a_clean_hour(monkeypatch, poll_fast):
 	assert delays == [1, 2, 1, 2]
 
 
+@pytest.mark.unit
 def test_run_job_delay_is_interruptible(monkeypatch, poll_fast):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 3600)
 	started = threading.Event()
@@ -191,6 +201,7 @@ def test_run_job_delay_is_interruptible(monkeypatch, poll_fast):
 	assert result == ['exit']
 
 
+@pytest.mark.unit
 def test_run_job_counts_a_thread_that_ends_on_its_own_as_a_failure(monkeypatch, poll_fast, capsys):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.01)
 	def start_attempt(job, attempt):
@@ -205,6 +216,7 @@ def test_run_job_counts_a_thread_that_ends_on_its_own_as_a_failure(monkeypatch, 
 	assert 'reverberator job j FAILED: j watcher exited unexpectedly; retrying in' in out.out + out.err
 
 
+@pytest.mark.unit
 def test_run_job_starts_an_attempt_only_after_the_last_one_ended(monkeypatch, poll_fast):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.01)
 	threads = []
@@ -233,6 +245,7 @@ def _run_job_in_thread(control, start_attempt):
 	return thread, result
 
 
+@pytest.mark.unit
 def test_run_job_stopped_in_its_retry_delay_exits_and_saves_nothing(job, monkeypatch, poll_fast):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 3600)
 	failed = threading.Event()
@@ -250,6 +263,7 @@ def test_run_job_stopped_in_its_retry_delay_exits_and_saves_nothing(job, monkeyp
 	assert not os.path.exists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
 
 
+@pytest.mark.unit
 def test_apply_job_timing_from_env(monkeypatch):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', rv.JOB_RETRY_FIRST_SECONDS)
 	monkeypatch.setattr(rv, 'JOB_RETRY_MAX_SECONDS', rv.JOB_RETRY_MAX_SECONDS)
@@ -266,11 +280,13 @@ def test_apply_job_timing_from_env(monkeypatch):
 		monkeypatch.setenv('REVERB_JOB_RETRY_MAX_SECONDS', '2')
 
 
+@pytest.mark.unit
 def test_job_retry_delay_survives_months_of_failures(monkeypatch):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.5)
 	assert rv.job_retry_delay(5000) == rv.JOB_RETRY_MAX_SECONDS
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('ending', ['job stops', 'root watch fails', 'read raises'])
 def test_watch_folder_gives_back_its_inotify_counts(tmp_path, monkeypatch, poll_fast, ending):
 	monitor = str(tmp_path / 'monitor')
@@ -313,6 +329,7 @@ def test_watch_folder_gives_back_its_inotify_counts(tmp_path, monkeypatch, poll_
 	assert (irm.current_user_instances, irm.current_user_watches) == (3, 10)
 
 
+@pytest.mark.unit
 def test_do_backup_closes_a_manifest_it_opened_when_it_raises(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
 	opened = []
@@ -338,6 +355,7 @@ def test_do_backup_closes_a_manifest_it_opened_when_it_raises(job, monkeypatch):
 	given.close()
 
 
+@pytest.mark.unit
 def test_main_exits_1_with_a_marker_when_the_daemon_fails(monkeypatch, capsys):
 	order = []
 	def broken():
@@ -354,6 +372,7 @@ def test_main_exits_1_with_a_marker_when_the_daemon_fails(monkeypatch, capsys):
 	assert 'reverberator EXITING with error: OSError: [Errno 5] Input/output error' in out.out + out.err
 
 
+@pytest.mark.unit
 def test_wait_for_path_alerts_after_grace_then_hourly(tmp_path, poll_fast, monkeypatch, capsys):
 	now = [0.0]
 	flag = threading.Event()
@@ -387,6 +406,7 @@ def _run_watcher_until(control, path, seconds, monkeypatch):
 	assert not thread.is_alive()
 
 
+@pytest.mark.unit
 def test_the_watcher_and_the_backuper_alert_once_for_the_startup_wait(tmp_path, poll_fast, monkeypatch, capsys):
 	# the backuper waits for the same monitored filesystem at startup: only one of the two waits alerts
 	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 0.1)
@@ -405,6 +425,7 @@ def test_the_watcher_and_the_backuper_alert_once_for_the_startup_wait(tmp_path, 
 	assert (out.out + out.err).count('reverberator job j FAILED: waiting') == 1
 
 
+@pytest.mark.unit
 def test_watcher_alerts_while_waiting_for_a_lost_root(tmp_path, poll_fast, monkeypatch, capsys):
 	# a watcher alone waiting for its lost root is the oldest wait for it, so it alerts itself
 	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 0.1)
@@ -421,6 +442,7 @@ def test_watcher_alerts_while_waiting_for_a_lost_root(tmp_path, poll_fast, monke
 	assert f'reverberator job j FAILED: waiting 0 min for {root}: monitored filesystem not ready' in out.out + out.err
 
 
+@pytest.mark.unit
 def test_wait_for_path_stops_with_the_job(tmp_path, poll_fast):
 	control = rv.JobControl('j')
 	control.start_attempt()
@@ -429,6 +451,7 @@ def test_wait_for_path_stops_with_the_job(tmp_path, poll_fast):
 	assert rv.wait_for_path(control, flag, str(tmp_path), 'x') is False
 
 
+@pytest.mark.unit
 def test_fs_monitor_rechecks_failed_pairs_without_a_mount_change(tmp_path, monkeypatch, poll_fast):
 	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.1)
 	state = {'ok': False}
@@ -440,6 +463,7 @@ def test_fs_monitor_rechecks_failed_pairs_without_a_mount_change(tmp_path, monke
 	wait_until(flag.is_set, timeout=3, message='not rechecked')
 
 
+@pytest.mark.unit
 def test_fs_monitor_rechecks_failed_pairs_through_mount_churn(tmp_path, monkeypatch, poll_fast):
 	# docker starting containers changes the mount table every few seconds, which must not keep putting the re-check off
 	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.3)
@@ -470,6 +494,7 @@ def test_fs_monitor_rechecks_failed_pairs_through_mount_churn(tmp_path, monkeypa
 	assert len(calls) >= 3
 
 
+@pytest.mark.unit
 def test_fs_monitor_invalidate_clears_the_flag_and_rechecks(tmp_path, monkeypatch, poll_fast):
 	state = {'ok': True}
 	monkeypatch.setattr(rv, 'check_fs_signature', lambda path, signature: state['ok'])
@@ -485,6 +510,7 @@ def test_fs_monitor_invalidate_clears_the_flag_and_rechecks(tmp_path, monkeypatc
 	assert not flag.is_set()
 
 
+@pytest.mark.unit
 def test_fs_monitor_invalidate_sets_the_flag_again_when_the_check_passes(tmp_path, monkeypatch, poll_fast):
 	# the check is held while the test looks: a fast pass would set the flag again first
 	checks = threading.Event()
@@ -501,6 +527,7 @@ def test_fs_monitor_invalidate_sets_the_flag_again_when_the_check_passes(tmp_pat
 	wait_until(flag.is_set, timeout=3, message='set again')
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('check_result', [False, True])
 def test_monitor_gate_registers_the_resolved_signature_before_the_job_starts(tmp_path, monkeypatch, poll_fast, check_result):
 	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.1)
@@ -537,6 +564,7 @@ def test_monitor_gate_registers_the_resolved_signature_before_the_job_starts(tmp
 	rv.FS_SIGNATURE_MONITOR.unregister(path, 'UUID-A', flag)
 
 
+@pytest.mark.unit
 def test_monitor_gate_looks_up_an_unknown_signature_once_per_recheck(tmp_path, monkeypatch, poll_fast):
 	# each lookup runs df and lsblk: a gate that cannot tell the signature yet must not spin on them
 	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.4)
@@ -556,6 +584,7 @@ def test_monitor_gate_looks_up_an_unknown_signature_once_per_recheck(tmp_path, m
 	assert 2 <= len(calls) <= 4
 
 
+@pytest.mark.unit
 def test_monitor_gate_looks_up_a_path_as_soon_as_it_appears(tmp_path, monkeypatch, poll_fast):
 	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 60)
 	path = str(tmp_path / 'late')
@@ -577,6 +606,7 @@ def test_monitor_gate_looks_up_a_path_as_soon_as_it_appears(tmp_path, monkeypatc
 		rv.FS_SIGNATURE_MONITOR.unregister(path, gate.signature, gate.flag)
 
 
+@pytest.mark.unit
 def test_monitor_gate_looks_up_no_signature_from_a_bare_folder_under_an_unmounted_fstab_mount(tmp_path, fake_pool, monkeypatch, poll_fast):
 	# an app writes into the bare mount point while the disk is out: that folder's signature is the root disk's
 	monkeypatch.setattr(rv, 'FS_RECHECK_SECONDS', 0.1)
@@ -610,6 +640,7 @@ def test_monitor_gate_looks_up_no_signature_from_a_bare_folder_under_an_unmounte
 			rv.FS_SIGNATURE_MONITOR.unregister(path, gate.signature, gate.flag)
 
 
+@pytest.mark.unit
 def test_invalidate_during_a_running_check_keeps_the_flag_clear(tmp_path, monkeypatch):
 	monitor = rv.fs_signature_monitor(mountinfo_path=str(tmp_path / 'mountinfo'))
 	key = (str(tmp_path), 'UUID-X')
@@ -623,6 +654,7 @@ def test_invalidate_during_a_running_check_keeps_the_flag_clear(tmp_path, monkey
 	assert not flag.is_set() and monitor.states.get(key) is not True
 
 
+@pytest.mark.unit
 def test_watcher_invalidates_its_signature_on_self_destruct_for_an_ordinary_job(tmp_path, monkeypatch, poll_fast):
 	path = str(tmp_path)
 	calls = []
@@ -643,6 +675,7 @@ def test_watcher_invalidates_its_signature_on_self_destruct_for_an_ordinary_job(
 	assert calls == [(path, 'UUID-RULE')]
 
 
+@pytest.mark.unit
 def test_job_attempt_starter_passes_the_backuper_keywords(monkeypatch):
 	got = []
 	monkeypatch.setattr(rv, 'watcher', lambda *a, **k: None)
@@ -656,6 +689,7 @@ def test_job_attempt_starter_passes_the_backuper_keywords(monkeypatch):
 	assert got == [dict(full_comparison_interval=3600.0)]
 
 
+@pytest.mark.unit
 def test_ignored_and_unknown_watch_events_log_quietly(monkeypatch, poll_fast):
 	flags = rv.inotify_simple.flags
 	class FakeEvent:
@@ -711,6 +745,7 @@ def _fake_inotify_with(events_first, monkeypatch):
 	return flags
 
 
+@pytest.mark.unit
 def test_delete_self_for_an_unmapped_watch_does_not_decrement(monkeypatch, poll_fast):
 	class FakeEvent:
 		def __init__(self, wd, mask):
@@ -727,6 +762,7 @@ def test_delete_self_for_an_unmapped_watch_does_not_decrement(monkeypatch, poll_
 	assert 1 not in decreased
 
 
+@pytest.mark.unit
 def test_file_bind_mount_is_not_an_inner_mount(tmp_path):
 	monitor = tmp_path / 'm'
 	monitor.mkdir()
@@ -745,6 +781,7 @@ def test_file_bind_mount_is_not_an_inner_mount(tmp_path):
 	assert inner == {} and len(queue) == 0
 
 
+@pytest.mark.unit
 def test_run_job_counts_an_exception_from_start_attempt_as_a_failure(monkeypatch, poll_fast, capsys):
 	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.01)
 	def permanent(job, attempt):
@@ -763,6 +800,7 @@ def test_run_job_counts_an_exception_from_start_attempt_as_a_failure(monkeypatch
 	assert 'reverberator job j FAILED: ' in out.out + out.err and 'boom' in out.out + out.err and calls == [1, 2]
 
 
+@pytest.mark.unit
 def test_supervise_job_records_a_crash_and_stops_the_others(monkeypatch):
 	def crashing(*args, **kwargs):
 		raise RuntimeError('supervisor bug')
@@ -783,6 +821,7 @@ def _firewatcher_matches(message, identifier='python[8776]'):
 
 
 # Tee_Logger colors an error line before 6.42 and on a terminal, and names its level otherwise
+@pytest.mark.unit
 @pytest.mark.parametrize('prefix, suffix', [('', ''), ('\x1b[93m', '\x1b[0m'), ('[ERROR] ', '')])
 @pytest.mark.parametrize('identifier', ['python[8776]', 'reverberator[3875501]'])
 def test_firewatcher_patterns_match_every_alerting_marker_and_not_recovered(prefix, suffix, identifier):
@@ -800,6 +839,7 @@ def test_firewatcher_patterns_match_every_alerting_marker_and_not_recovered(pref
 	assert not _firewatcher_matches(prefix + rv.job_log('j', 'RECOVERED after 2 failed attempts') + suffix, identifier)
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('prefix', ['', '\x1b[0m', '[INFO] ', '\x1b[93m', '[ERROR] '])
 def test_firewatcher_patterns_ignore_markers_in_file_names(prefix):
 	# a monitored file named like a marker shows up inside other lines, and must not raise an alert
@@ -812,6 +852,7 @@ def test_firewatcher_patterns_ignore_markers_in_file_names(prefix):
 		assert not _firewatcher_matches(prefix + message), message
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('debug', [False, True])
 def test_unmount_of_an_already_removed_watch_logs_only_in_debug(monkeypatch, poll_fast, debug):
 	# follow_inner_mounts removed the unmounted disk's watches before their IN_UNMOUNT events were read: one per folder
@@ -884,6 +925,7 @@ def test_the_only_job_having_no_name_exits_3(job, run_reverberator):
 	assert os.listdir(job.vault) == []
 
 
+@pytest.mark.unit
 def test_find_job_ignores_nameless_rules():
 	blank = rv.NamelessJobName('!!!')
 	rules = [rv.ReverbRule(blank, '/m', *['']*10), rv.ReverbRule('sub', '/m/sub', *['']*10)]
@@ -894,6 +936,7 @@ def test_find_job_ignores_nameless_rules():
 		rv.find_job(rules, 'x', job_name='')
 
 
+@pytest.mark.unit
 def test_each_nameless_row_quotes_its_own_name():
 	empty = rv.ReverbRule(*[''] * len(rv.REVERB_RULE_HEADER))
 	rules = [empty._replace(job_name=rv.NamelessJobName('!!!')), empty._replace(job_name=rv.NamelessJobName('???'))]
@@ -906,6 +949,7 @@ def test_each_nameless_row_quotes_its_own_name():
 	assert jobs[0].failure.permanent and jobs[1].failure.permanent
 
 
+@pytest.mark.unit
 def test_status_shows_a_nameless_job_as_stopped(tmp_path):
 	rules = [rv.ReverbRule(rv.NamelessJobName('!!!'), '/m', str(tmp_path), *['']*9)]
 	status = rv.DaemonStatus(None, False, {})
@@ -1015,6 +1059,7 @@ def a_changed_file(job, rel='a.txt'):
 	return rv.ChangeEvent(time.monotonic(), False, 'modify', path, None)
 
 
+@pytest.mark.unit
 def test_a_one_file_batch_reads_the_mount_table_three_times(job, poll_fast, monkeypatch):
 	# fails on main: off a pool, through backuper(): one read for both waits, the guard and do_backup(); one after the
 	# verification's walk, for its check of the monitored mount and its paused set; one at the commit, after the copies,
@@ -1027,6 +1072,7 @@ def test_a_one_file_batch_reads_the_mount_table_three_times(job, poll_fast, monk
 	assert counts['reads'] == 3
 
 
+@pytest.mark.unit
 def test_a_batch_with_a_scanned_folder_reads_the_mount_table_four_times(job, poll_fast, monkeypatch):
 	# fails on main: the three reads above and one more, after the scanned folders' walk, for do_backup() (main: eight, and
 	# two in the fsyncs)
@@ -1056,6 +1102,7 @@ def covered_with_a_handle_per_filesystem(job, seen, branches):
 	assert seen['unit'] == (os.path.realpath(job.vault), len({os.stat(branch).st_dev for branch in branches}))
 
 
+@pytest.mark.unit
 def test_a_pool_mounted_while_the_vault_wait_polls_is_covered_by_the_batch(job, fake_pool, monkeypatch, poll_fast):
 	# pin (passes on main; fails with a table read before the waits): the vault's pool is unmounted when the batch's loop
 	# begins (its fstab line names it, so the wait polls) and mounted while the vault's wait polls
@@ -1079,6 +1126,7 @@ def test_a_pool_mounted_while_the_vault_wait_polls_is_covered_by_the_batch(job, 
 	covered_with_a_handle_per_filesystem(job, seen, branches)
 
 
+@pytest.mark.unit
 def test_a_failed_mount_table_read_is_not_kept_for_the_batch(job, fake_pool, monkeypatch, poll_fast):
 	# review focus 4: the read at the vault wait's first poll fails, once: the wait polls again, and the batch's guard sees
 	# the pool from a good read

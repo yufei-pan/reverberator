@@ -8,8 +8,6 @@ import pytest
 import reverberator as rv
 from tests.harness import seed_monitor, run_backup, latest_version, event_entry, write_rule, write_committed_version, create_job, reverberator_script
 
-pytestmark = pytest.mark.unit
-
 # the vault database as 0.39 and earlier created it
 SCHEMA_1_ENTRIES = ('CREATE TABLE entries(path TEXT PRIMARY KEY, kind TEXT, size INTEGER, mtime_ns INTEGER, mode INTEGER, uid INTEGER, '
 	'gid INTEGER, hash TEXT, link TEXT, unchecked INTEGER, dirty INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID')
@@ -83,6 +81,7 @@ def unverified():
 	return rv.ManifestRecord(*[None] * len(rv.MANIFEST_RECORD_HEADER))
 
 
+@pytest.mark.unit
 def test_manifest_round_trips_bad_names(job):
 	folder, nested, other, name = 'd\udcff/', 'd\udcff/x\udc80', 'd\udcff/y.txt', 'bad\udcfe.txt'
 	version_path = os.path.join(job.job_vault, VERSION)
@@ -126,6 +125,7 @@ def test_manifest_round_trips_bad_names(job):
 	reopened.close()
 
 
+@pytest.mark.unit
 def test_manifest_round_trips_escape_lookalikes(job):
 	escape = rv.NAME_ESCAPE
 	# names holding the escape character or the code points it uses, next to the bad names they look like
@@ -163,6 +163,7 @@ def test_manifest_round_trips_escape_lookalikes(job):
 	reopened.close()
 
 
+@pytest.mark.unit
 def test_schema_1_upgrades_in_place(job):
 	escape = rv.NAME_ESCAPE
 	schema_1_job(job)
@@ -182,6 +183,7 @@ def test_schema_1_upgrades_in_place(job):
 	fresh.close()
 
 
+@pytest.mark.unit
 def test_failed_upgrade_leaves_schema_1(job, monkeypatch):
 	schema_1_job(job)
 	before = contents(job)
@@ -203,6 +205,7 @@ def test_failed_upgrade_leaves_schema_1(job, monkeypatch):
 	assert schema(job) == rv.VaultManifest.SCHEMA
 
 
+@pytest.mark.unit
 def test_schema_1_without_its_entries_table_upgrades(job):
 	# 0.39 created a new database's meta and its entries table in separate commits: a crash between them left this
 	os.makedirs(job.job_vault)
@@ -217,6 +220,7 @@ def test_schema_1_without_its_entries_table_upgrades(job):
 	assert schema(job) == rv.VaultManifest.SCHEMA and columns(job)[-1] == 'copy_version'
 
 
+@pytest.mark.unit
 def test_unknown_schema_is_started_over(job):
 	schema_1_job(job)
 	conn = database(job)
@@ -228,6 +232,7 @@ def test_unknown_schema_is_started_over(job):
 	assert schema(job) == rv.VaultManifest.SCHEMA
 
 
+@pytest.mark.unit
 def test_upgraded_database_reads_nothing_from_the_vault(job, monkeypatch):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	# V0 records each row checked at its commit (nothing reads a copy back, L9): a second backup would change no row and no meta pair
@@ -310,6 +315,7 @@ def written(path):
 	return [[rv.unescape_change_list_field(field.decode('utf-8')) for field in row] for row in raw_rows(path)]
 
 
+@pytest.mark.unit
 def test_first_full_backup_of_a_bad_name(job):
 	put(job.monitor, b'bad\xff.txt', 'bad')
 	put(job.monitor, b'd\xff/x\xfe', 'nested')
@@ -322,6 +328,7 @@ def test_first_full_backup_of_a_bad_name(job):
 	manifest.close()
 
 
+@pytest.mark.unit
 def test_events_on_bad_names(job, poll_fast):
 	put(job.monitor, b'keep', 'k')
 	os.makedirs(os.fsencode(job.monitor) + b'/d\xfe/sub')
@@ -357,6 +364,7 @@ def test_events_on_bad_names(job, poll_fast):
 	assert backup(job)[-1] == v4
 
 
+@pytest.mark.unit
 def test_delta_generation_with_bad_names(job, poll_fast):
 	seed_monitor(job, {'a.txt': 'hello', 'sub/b.txt': 'world'})
 	run_backup(job)
@@ -396,6 +404,7 @@ def test_delta_generation_with_bad_names(job, poll_fast):
 	assert {path: values.event for path, values in entries.items()} == {os.path.join(job.monitor, 'd\udcff/y\udcfd'): 'modify'}
 
 
+@pytest.mark.unit
 def test_change_list_round_trips_bad_names(job, poll_fast):
 	escape = rv.NAME_ESCAPE
 	put(job.monitor, b'keep', 'k')
@@ -423,6 +432,7 @@ def test_change_list_round_trips_bad_names(job, poll_fast):
 	assert change_rows(version)[-1] == (path('old\udcfa'), 'create', None)
 
 
+@pytest.mark.unit
 def test_retention_with_bad_names(job, poll_fast):
 	put(job.monitor, b'bad\xff.txt', 'old')
 	put(job.monitor, b'd\xff/x\xfe', 'nested')
@@ -442,6 +452,7 @@ def test_retention_with_bad_names(job, poll_fast):
 	assert len(backup(job)) == 2
 
 
+@pytest.mark.unit
 def test_nested_bad_names_survive_a_move_and_restore(job, tmp_path, capsys, poll_fast):
 	put(job.monitor, b'keep', 'k')
 	put(job.monitor, b'd\xff/x\xfe', 'nested')
@@ -495,6 +506,7 @@ def test_nested_bad_names_survive_a_move_and_restore(job, tmp_path, capsys, poll
 	assert (code, err) == (0, '') and listing(str(file_out)) == {b'x\xfe': 'nested'}
 
 
+@pytest.mark.process
 def test_commands_take_bad_paths(job, tmp_path, capsys, process_env, poll_fast):
 	put(job.monitor, b'keep', 'k')
 	run_backup(job)
@@ -536,6 +548,7 @@ def test_commands_take_bad_paths(job, tmp_path, capsys, process_env, poll_fast):
 	assert code == rv.EXIT_USAGE and captured.err.startswith('/elsewhere/bad\\xff is not under')
 
 
+@pytest.mark.unit
 def test_status_and_marker_json_keep_bad_names(job, tmp_path):
 	state = str(tmp_path / 'state')
 	board = rv.StatusBoard(state, job.rule_path)

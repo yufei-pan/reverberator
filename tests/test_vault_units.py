@@ -26,8 +26,6 @@ from tests.scratch_images import needs_mount, ScratchTmpfs
 from tests import version_view_ground_truth as view_truth
 from tests.vault_oracle import check_vault, rows_match_vault, snapshot_tree, version_number
 
-pytestmark = pytest.mark.unit
-
 KEPT = {'keep_n_versions': 0}
 # past f2fs's inline size and past the 64 KiB tail a comparison reads back: a loss before the tail is what no read-back sees
 BIG = 256 * 1024
@@ -106,6 +104,7 @@ def vault_write_errors(out):
 
 # ---- 1. the commit flush hears an error another program's sync saw first
 
+@pytest.mark.unit
 def test_the_commit_flush_hears_a_write_error_another_sync_saw_first(r_job, errseq, monkeypatch, capsys):
 	base(r_job)
 	before, lists = committed_versions(r_job), lists_of(r_job)
@@ -129,6 +128,7 @@ def test_the_commit_flush_hears_a_write_error_another_sync_saw_first(r_job, errs
 
 # ---- 2. the comparison no longer syncs
 
+@pytest.mark.unit
 def test_a_comparison_that_reads_copies_back_makes_no_sync(r_job, errseq):
 	base(r_job)
 	# copies an older release left unchecked
@@ -142,6 +142,7 @@ def test_a_comparison_that_reads_copies_back_makes_no_sync(r_job, errseq):
 	assert errseq.synced() == []
 
 
+@pytest.mark.unit
 def test_a_batch_that_placed_a_copy_flushes_even_after_a_read_back_after_its_last_copy(r_job, errseq, monkeypatch):
 	for rel in ('a/x.txt', 'a/sub/m.txt', 'a/sub/deep/k.txt'):
 		put_text(r_job.monitor, rel, rel)
@@ -171,6 +172,7 @@ def rows(job):
 
 # ---- 3. whoever saw the error first, the unit hears it itself
 
+@pytest.mark.unit
 def test_a_write_error_a_restores_sync_saw_first_is_heard_by_the_batch(r_job, errseq, monkeypatch, capsys, tmp_path):
 	base(r_job)
 	before = committed_versions(r_job)
@@ -201,6 +203,7 @@ def test_a_write_error_a_restores_sync_saw_first_is_heard_by_the_batch(r_job, er
 	assert 'for the daemon' not in out
 
 
+@pytest.mark.unit
 def test_a_write_error_another_jobs_batch_saw_first_is_heard_by_each(r_job, errseq, monkeypatch, capsys, tmp_path):
 	base(r_job)
 	other = create_job(str(tmp_path / 'other'), 'other')
@@ -266,6 +269,7 @@ def no_exchange(monkeypatch):
 	monkeypatch.setattr(rv, 'rename_exchange', refused)
 
 
+@pytest.mark.unit
 def test_the_hand_over_on_a_vault_with_no_exchange_hears_it(r_job, heard_at_the_first_sync, monkeypatch, capsys):
 	base(r_job)
 	before = committed_versions(r_job)
@@ -280,6 +284,7 @@ def test_the_hand_over_on_a_vault_with_no_exchange_hears_it(r_job, heard_at_the_
 	assert committed_versions(r_job) == before
 
 
+@pytest.mark.unit
 def test_the_scans_repair_of_a_cut_between_two_renames_hears_it(r_job, errseq, monkeypatch, capsys):
 	base(r_job)
 	no_exchange(monkeypatch)
@@ -309,6 +314,7 @@ def test_the_scans_repair_of_a_cut_between_two_renames_hears_it(r_job, errseq, m
 	assert len(vault_write_errors(capsys.readouterr().out)) == 1
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('exchange', [False, True], ids=['materialize_with_no_exchange', 'per_version_flush'])
 def test_the_conversion_hears_it(tmp_path, v054, heard_at_the_first_sync, monkeypatch, capsys, exchange):
 	from tests.test_migration import SMALL
@@ -344,6 +350,7 @@ def pool_vault(job, fake_pool, names=('a', 'b')):
 	return branches
 
 
+@pytest.mark.unit
 def test_a_prunes_flush_on_a_pool_hears_it(r_job, fake_pool, heard_at_the_first_sync, capsys):
 	base(r_job)
 	put_text(r_job.monitor, 'small.txt', 's1')
@@ -361,6 +368,7 @@ def test_a_prunes_flush_on_a_pool_hears_it(r_job, fake_pool, heard_at_the_first_
 	assert committed_versions(r_job) == before[1:]
 
 
+@pytest.mark.unit
 def test_the_scans_removal_of_a_stale_list_on_a_pool_hears_it_and_keeps_the_list(r_job, fake_pool, heard_at_the_first_sync, capsys):
 	base(r_job)
 	put_text(r_job.monitor, 'small.txt', 's1')
@@ -380,6 +388,7 @@ def test_the_scans_removal_of_a_stale_list_on_a_pool_hears_it_and_keeps_the_list
 	assert all(os.path.lexists(os.path.join(r_job.job_vault, name)) for name in stale) and stale
 
 
+@pytest.mark.unit
 def test_a_054_prunes_flush_on_a_pool_hears_it(tmp_path, v054, fake_pool, heard_at_the_first_sync, capsys):
 	from tests.test_migration import SMALL
 	job = create_job(str(tmp_path))
@@ -402,6 +411,7 @@ def test_a_054_prunes_flush_on_a_pool_hears_it(tmp_path, v054, fake_pool, heard_
 
 # ---- 5. a disk that joins a pool
 
+@pytest.mark.unit
 def test_a_disk_that_joins_the_pool_holding_the_job_vault_fails_the_sync(r_job, fake_pool, errseq, monkeypatch, capsys, other_filesystem, tmp_path):
 	pool_vault(r_job, fake_pool)
 	base(r_job)
@@ -472,6 +482,7 @@ def own_filesystem_on_a_branch(job, fake_pool, other_filesystem):
 	return own
 
 
+@pytest.mark.unit
 def test_a_job_vault_on_a_filesystem_of_its_own_on_a_branch_commits(r_job, fake_pool, errseq, other_filesystem):
 	# fails on main: every sync raises "is not on a filesystem this step opened", as the handle is the branch root's
 	own = own_filesystem_on_a_branch(r_job, fake_pool, other_filesystem)
@@ -489,6 +500,7 @@ def test_a_job_vault_on_a_filesystem_of_its_own_on_a_branch_commits(r_job, fake_
 	assert open_folders(own) == []
 
 
+@pytest.mark.unit
 def test_a_write_error_on_a_branchs_own_filesystem_fails_the_batch(r_job, fake_pool, errseq, monkeypatch, capsys, other_filesystem):
 	# fails on main: its sync raises "is not on a filesystem this step opened" (no write error is heard, no alert)
 	own = own_filesystem_on_a_branch(r_job, fake_pool, other_filesystem)
@@ -520,6 +532,7 @@ def mount_nested_disk(fake_pool, own, place):
 	fake_pool.mount(own)
 
 
+@pytest.mark.unit
 def test_a_batch_on_a_nested_vault_disk_fstab_names_that_is_not_mounted_fails_with_the_disk_named(r_job, fake_pool, errseq, other_filesystem):
 	# pin: the guard of a scan and a batch, for a disk that drops while a batch runs; it held before the waits below. What a batch
 	# writes into the bare mount point is hidden when the disk is mounted again, so the guard fails it whatever the waits did
@@ -569,6 +582,7 @@ def waits_for_the_job_vault(control, job, reason):
 	return [wait[1:3] for wait in control._waits] == [[job.job_vault, reason]]
 
 
+@pytest.mark.unit
 def test_an_attempt_waits_for_a_nested_vault_disk_fstab_names_that_is_not_mounted(r_job, fake_pool, errseq, other_filesystem, capsys):
 	# fails at 5bfa874: the waits ask about the rule's Vault Path, whose place on each branch lies above the disk's mount point, so
 	# none holds the job: the start's scan raises PoolNotReady, the attempt fails, and run_job() retries after its delay (60 s,
@@ -607,6 +621,7 @@ def test_an_attempt_waits_for_a_nested_vault_disk_fstab_names_that_is_not_mounte
 	assert not thread.is_alive()
 
 
+@pytest.mark.unit
 def test_a_batch_waits_for_a_nested_vault_disk_fstab_names_that_goes_out_while_the_job_idles(r_job, fake_pool, errseq, other_filesystem, capsys):
 	# fails at 5bfa874: the batch's waits, which share one read of the mount table, ask about the Vault Path alone, so the batch
 	# begins, and its guard, which sees the disk, fails the attempt with PoolNotReady instead of the batch waiting
@@ -649,6 +664,7 @@ def test_a_batch_waits_for_a_nested_vault_disk_fstab_names_that_goes_out_while_t
 	assert not thread.is_alive()
 
 
+@pytest.mark.unit
 def test_a_nested_disk_fstab_names_says_so_beside_a_branch_that_is_out(r_job, fake_pool):
 	# the nested disk's text carries "(/etc/fstab names it)", as the reason of a disk off a pool does; a branch that is out has none
 	a, b = fake_pool.add(r_job.vault, ['a', 'b'])
@@ -661,6 +677,7 @@ def test_a_nested_disk_fstab_names_says_so_beside_a_branch_that_is_out(r_job, fa
 	assert rv.vault_disk_problem(r_job.job_vault) == f'disk {a} of pool {pool} is not mounted; disk {place} of pool {pool} is not mounted ({rv.FSTAB_PATH} names it)'
 
 
+@pytest.mark.unit
 def test_a_job_vault_made_later_under_a_nested_mount_is_synced_through_its_parents_handle(tmp_path, fake_pool, errseq, monkeypatch, other_filesystem):
 	# fails on main: its handle is the branch root's, on another filesystem, so the sync raises "is not on a filesystem this step
 	# opened"
@@ -688,6 +705,7 @@ def test_a_job_vault_made_later_under_a_nested_mount_is_synced_through_its_paren
 	assert os.path.join(branches[0], 'mnt') in synced_through(errseq.events)
 
 
+@pytest.mark.unit
 def test_the_nearest_existing_folder_stops_at_the_branch(tmp_path):
 	branch = str(tmp_path / 'branch')
 	os.makedirs(os.path.join(branch, 'x'))
@@ -720,6 +738,7 @@ def swapped_sync_fails(job, disk, folder, capsys):
 	assert vault_write_errors(capsys.readouterr().out) == []
 
 
+@pytest.mark.privileged
 @needs_mount
 def test_a_disk_swapped_at_the_vaults_mount_point_fails_the_sync(tmp_path, errseq, capsys):
 	with ScratchTmpfs(str(tmp_path / 'disk')) as disk:
@@ -728,6 +747,7 @@ def test_a_disk_swapped_at_the_vaults_mount_point_fails_the_sync(tmp_path, errse
 		swapped_sync_fails(job, disk, job.job_vault, capsys)
 
 
+@pytest.mark.privileged
 @needs_mount
 def test_a_disk_swapped_at_a_branchs_mount_point_fails_the_sync(r_job, fake_pool, errseq, capsys):
 	branches = fake_pool.add(r_job.vault, ['a', 'b'])
@@ -739,6 +759,7 @@ def test_a_disk_swapped_at_a_branchs_mount_point_fails_the_sync(r_job, fake_pool
 
 # ---- 6. a one-file batch off a pool
 
+@pytest.mark.unit
 def test_a_one_file_batch_opens_one_handle_before_its_copy_and_syncs_once(r_job, errseq, monkeypatch):
 	base(r_job)
 	stacks = []
@@ -867,6 +888,7 @@ def read_bytes(path):
 		return f.read()
 
 
+@pytest.mark.unit
 def test_the_roll_forward_copies_again_what_the_cut_batch_wrote_over(r_job, monkeypatch):
 	base(r_job)
 	cut_before_the_commit(r_job, modify_big(r_job), monkeypatch)
@@ -879,6 +901,7 @@ def test_the_roll_forward_copies_again_what_the_cut_batch_wrote_over(r_job, monk
 	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'big.txt')) == read_bytes(os.path.join(r_job.monitor, 'big.txt'))
 
 
+@pytest.mark.unit
 def test_the_roll_forward_copies_again_a_file_an_attribute_change_copied(r_job, monkeypatch):
 	# Only Sync Attributes off: a chmod copies the file, which the cut batch records before its copy
 	data = b''.join(f'z{i:07d}\n'.encode() for i in range(8192)) + bytes(128 * 1024)
@@ -897,6 +920,7 @@ def test_the_roll_forward_copies_again_a_file_an_attribute_change_copied(r_job, 
 	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'zeros.bin')) == data
 
 
+@pytest.mark.unit
 def test_the_roll_forward_over_a_rebuilt_manifest_copies_again_what_the_cut_batch_made(r_job, monkeypatch):
 	base(r_job)
 	put_text(r_job.monitor, 'new.txt', big_text('n1'))
@@ -987,6 +1011,7 @@ def contents_of(root):
 	return found
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('manifest', ['standing', 'lost'])
 @pytest.mark.parametrize('shape', sorted(KIND_SHAPES))
 def test_the_roll_forward_copies_again_a_file_that_took_the_place_of_another_kind(r_job, monkeypatch, shape, manifest):
@@ -1016,6 +1041,7 @@ def test_the_roll_forward_copies_again_a_file_that_took_the_place_of_another_kin
 # link stood where a recorded real folder was (a: ELOOP, for a link naming its own place), and the roll-forward took each recorded
 # name under a link of the monitored tree for a regular file of that tree and replayed it as a modify (b: d/inner.txt copied).
 
+@pytest.mark.unit
 @pytest.mark.parametrize('manifest', ['standing', 'lost'])
 def test_the_roll_forward_commits_over_the_link_a_cut_exchange_left_in_a_folders_place(r_job, monkeypatch, manifest):
 	# a folder deleted is recorded by swapping it with the previous version's forward link, which is then unlinked: a cut between leaves
@@ -1042,6 +1068,7 @@ def test_the_roll_forward_commits_over_the_link_a_cut_exchange_left_in_a_folders
 	assert 'd' not in contents_of(committed_versions(r_job)[-1])
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('manifest', ['standing', 'lost'])
 def test_the_roll_forward_copies_nothing_a_link_of_the_monitored_tree_leads_to(r_job, monkeypatch, manifest, tmp_path, capsys):
 	# a folder moved out and an absolute link put in its place: the monitored d/inner.txt is a regular file through the link, and is
@@ -1143,6 +1170,7 @@ def unreadable_below(monkeypatch, folder):
 	monkeypatch.setattr(rv.os, 'lstat', lstat)
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('mount', ['stays', 'paused_at_the_retry', 'goes_during_the_walk', 'unreadable_folder'])
 def test_a_cut_batchs_file_the_roll_forward_cannot_copy_again_holds_version_ns_entry(r_job, monkeypatch, tmp_path, mount):
 	# At the retry the roll-forward cannot copy the cut batch's file again: its inner mount is not mounted yet, it goes during the
@@ -1195,6 +1223,7 @@ OTHER_KINDS = {
 }
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('shape', sorted(OTHER_KINDS))
 def test_a_paused_mounts_name_of_another_kind_gets_version_ns_entry_back(r_job, monkeypatch, tmp_path, shape):
 	# the cut batch changed a name's kind on the inner disk, which is not mounted at the retry: the roll-forward passes over it, and
@@ -1228,6 +1257,7 @@ def test_a_paused_mounts_name_of_another_kind_gets_version_ns_entry_back(r_job, 
 	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
 
 
+@pytest.mark.unit
 def test_a_folder_moved_under_a_paused_mount_and_cut_comes_back_where_it_was(r_job, monkeypatch, tmp_path):
 	# the design review's probe B: mv disk/a disk/b on the inner disk, the batch cut before its commit, retried with the disk not
 	# mounted. The newest version holds disk/a as version n held it and no disk/b, under rows that name disk/a, and every list
@@ -1250,6 +1280,7 @@ def test_a_folder_moved_under_a_paused_mount_and_cut_comes_back_where_it_was(r_j
 	assert view_truth.wrong_lists(r_job.job_vault) == []
 
 
+@pytest.mark.unit
 def test_a_cut_create_unreadable_at_the_retry_is_left_out_with_its_line(r_job, monkeypatch, capsys):
 	# the design re-check's run N4, the manifest standing: a file the cut batch made, its copy's middle lost (a stand-in writes it
 	# damaged), and its source mode 000 at the retry (uid 65534 only, as root reads it; the VM gate deselects it by name). The scan
@@ -1276,6 +1307,7 @@ def test_a_cut_create_unreadable_at_the_retry_is_left_out_with_its_line(r_job, m
 	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'new.bin')) == read_bytes(path)
 
 
+@pytest.mark.unit
 def test_a_put_back_where_hard_links_are_refused_copies_and_flushes_once(r_job, monkeypatch, tmp_path):
 	# a vault that refuses hard links at the retry (EMLINK; a FUSE or network filesystem, or a pool answering EXDEV between its disks):
 	# the put-back copies version n's entry, and the scan flushes the vault's disks once, through its own unit, before the attempt
@@ -1299,6 +1331,7 @@ def test_a_put_back_where_hard_links_are_refused_copies_and_flushes_once(r_job, 
 	assert read_bytes(held) == data
 
 
+@pytest.mark.unit
 def test_a_pool_cut_after_the_put_back_links_every_recorded_entry_again(r_job, fake_pool, monkeypatch):
 	# on a pool there is no same-inode shortcut: mergerfs makes up the inode number it shows, and after a cut each disk comes back at
 	# its own point. A scan cut after its put-back (nothing after it ran) leaves the tree as version n's; the next scan unlinks and
@@ -1335,6 +1368,7 @@ def test_a_pool_cut_after_the_put_back_links_every_recorded_entry_again(r_job, f
 	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
 
 
+@pytest.mark.unit
 def test_a_pool_branch_gone_while_the_put_back_lists_a_folder_fails_the_scan_and_removes_nothing(r_job, fake_pool, monkeypatch):
 	# on a pool a branch that goes after the scan read the vault and before the put-back lists a recorded folder of version n hides what that
 	# branch holds: here the forward link of an unchanged name, whose entry in the tree is the only copy (R45). The listing then lacks the
@@ -1367,6 +1401,7 @@ def test_a_pool_branch_gone_while_the_put_back_lists_a_folder_fails_the_scan_and
 	assert read_bytes(held) == b'o0'
 
 
+@pytest.mark.unit
 def test_a_pool_branch_gone_while_a_mixed_name_is_checked_fails_the_scan_and_removes_no_copy(r_job, fake_pool, monkeypatch):
 	# a name of the tree that is a folder on one disk and a file on another goes on every disk (remove_mixed_names()), unless version n forwards to
 	# it, which it reads through the pool: a branch that is gone takes the forward link it holds away, and that read answers "no such name", which
@@ -1411,6 +1446,7 @@ def test_a_pool_branch_gone_while_a_mixed_name_is_checked_fails_the_scan_and_rem
 	assert read_bytes(on_a) == b'o0' and read_bytes(os.path.join(on_b, 'in')) == b'in'
 
 
+@pytest.mark.unit
 def test_a_pool_branch_gone_as_the_orphan_is_judged_fails_the_scan_and_removes_nothing(r_job, fake_pool, monkeypatch):
 	# the scan takes an orphan for a skeleton when no real entry shows in it, an absence, on a view taken after its whole read. Branch c
 	# holds all the cut batch's tree holds and goes as the orphan is judged: through the pool the folder is empty, the scan returned
@@ -1451,6 +1487,7 @@ def test_a_pool_branch_gone_as_the_orphan_is_judged_fails_the_scan_and_removes_n
 	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'd', 'inner.txt')) == b'i1'
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('back', [True, False], ids=['mounted-again', 'still-gone'])
 def test_a_pool_branch_gone_while_the_put_back_looks_for_a_link_to_write_fails_the_scan_with_no_link_written(r_job, fake_pool, monkeypatch, back):
 	# RR-C2-1: version n's own copy of a recorded name is real on branch c, and c goes as put_back_forward_links() looks at the name: through
@@ -1521,6 +1558,7 @@ def skeleton_beside_v0(job):
 	return skeleton, name
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('when', ['give_back_folder_times', 'remove_orphan'])
 def test_a_pool_branch_gone_while_a_skeleton_is_removed_fails_the_scan_that_a_batch_would_reuse(r_job, fake_pool, monkeypatch, when):
 	# RR-C3-1: a disk of the pool goes after the scan took an orphan for a skeleton and before its removal is over (while the previous version's
@@ -1564,6 +1602,7 @@ def test_a_pool_branch_gone_while_a_skeleton_is_removed_fails_the_scan_that_a_ba
 	rv.get_vault_info(r_job.job_vault)
 
 
+@pytest.mark.unit
 def test_a_pool_branch_gone_while_a_skeleton_is_walked_keeps_the_folder_times_version_n_is_given_back(r_job, fake_pool, monkeypatch):
 	# RR-C3-1's other harm: version n's folder d, moved by the cut batch's renames, lives on branch c, which goes as the walk that gives the
 	# folders their times back starts. The walk does not see d, and the skeleton, which holds nothing on c, goes with no check: no later scan has
@@ -1596,6 +1635,7 @@ def test_a_pool_branch_gone_while_a_skeleton_is_walked_keeps_the_folder_times_ve
 	assert os.lstat(os.path.join(v0, 'd')).st_mtime_ns == right
 
 
+@pytest.mark.unit
 def test_a_pool_branch_gone_as_a_skeleton_in_staging_is_judged_fails_the_scan_and_renames_nothing(r_job, fake_pool, monkeypatch):
 	# a hand-over cut between its second and third renames leaves the tree under the new name and the skeleton in staging, which the scan renames
 	# into the version's place when nothing shows there: an absence through the pool, and the rename an act on it. A disk that goes as the scan looks
@@ -1637,6 +1677,7 @@ def test_a_pool_branch_gone_as_a_skeleton_in_staging_is_judged_fails_the_scan_an
 	assert read_bytes(os.path.join(versions[-1], 'd', 'inner.txt')) == b'i1'
 
 
+@pytest.mark.unit
 def test_a_pool_branch_gone_before_the_put_back_acts_fails_the_scan_with_the_tree_as_the_batch_left_it(r_job, fake_pool, monkeypatch):
 	# pin: pass 1 of the put-back replaces what the tree holds at each recorded name with version n's entry, on the view the walk that listed the names
 	# (give_back_folder_times()) took. A disk gone since is checked before the first act, so that scan's claim, that each act that trusts a listing is
@@ -1668,6 +1709,7 @@ def test_a_pool_branch_gone_before_the_put_back_acts_fails_the_scan_with_the_tre
 	assert read_bytes(os.path.join(versions[-1], 'd', 'inner.txt')) == b'i1'
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('unreadable', ['file', 'folder'])
 def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkeypatch, unreadable):
 	# pin, the design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
@@ -1713,6 +1755,7 @@ def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkey
 	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost]
 
 
+@pytest.mark.unit
 def test_a_recorded_folders_failed_metadata_copy_fails_the_attempt(r_job, monkeypatch):
 	# the put-back gives each recorded folder of the tree its metadata in version n; a copy of it that fails fails the scan, and
 	# with it the attempt, and the next attempt puts back again and commits right. Fails on 82732dd: no put-back, nothing fails
@@ -1735,6 +1778,7 @@ def test_a_recorded_folders_failed_metadata_copy_fails_the_attempt(r_job, monkey
 
 # ---- 9. no markers
 
+@pytest.mark.unit
 def test_neither_the_daemon_nor_a_restore_writes_a_marker(r_job, errseq, monkeypatch, capsys, tmp_path):
 	base(r_job)
 	write_rule(r_job)
@@ -1803,6 +1847,7 @@ def first_version_and_a_one_file_batch(job, seen):
 	return found
 
 
+@pytest.mark.unit
 def test_an_off_pool_batch_makes_no_folder_fsync_after_its_commit(r_job, monkeypatch):
 	# fails on main: both the first version and a one-file batch fsync the job vault twice after the commit, after
 	# swap_current_version() and in place_change_list(), each reading the mount table
@@ -1810,6 +1855,7 @@ def test_an_off_pool_batch_makes_no_folder_fsync_after_its_commit(r_job, monkeyp
 	assert first_version_and_a_one_file_batch(r_job, seen) == [([], 0), ([], 0)]
 
 
+@pytest.mark.unit
 def test_a_pool_batch_fsyncs_both_after_its_commit(r_job, fake_pool, monkeypatch):
 	# pin: on a pool each disk keeps its own order, so both fsyncs stay, a first version's included
 	pool_vault(r_job, fake_pool)
@@ -1821,6 +1867,7 @@ class Cut(Exception):
 	pass
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize('pooled', [False, True], ids=['off_pool', 'pool'])
 def test_finishing_a_cut_commit_fsyncs_both_off_a_pool_too(r_job, fake_pool, monkeypatch, pooled):
 	# pin: the scan's finish of a commit cut before its list was placed, which runs once after a crash, fsyncs the job vault
