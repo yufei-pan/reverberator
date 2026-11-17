@@ -190,11 +190,11 @@ State: in round 0.55.6 (branch `r0556`), as one docs commit. Behind it: the main
 pick of the user's.
 
 **P15. Every test module carries its layer marker.** Source: `specs/2026-08-12-full-test-suite-design.md`, Goals and
-"1 Pytest config". State: partly done. Eight modules carry none (`test_crash_power_loss`, `test_r_batch`,
-`test_r_readers`, `test_r_scan`, `test_r_sizes`, `test_sysctl_limits`, `test_tree_writes`, `test_version_walk`: 226
-tests), so `pytest -m unit` leaves out most of design R's unit tests; `test_crash_safety.py` and
-`test_backup_replay_ordering.py` are still `unittest` classes, which the spec said to move "when touching them". Next:
-round 0.55.6 (branch `r0556`), which touches the tests. Behind it: that spec's goals; no pick of the user's is on record for it.
+"1 Pytest config". State: built on branch `r0556` (Task 1, c18fc76..5212daf, reviewed): every test carries exactly
+one layer by what it does (twenty modules had tests with none, not the eight first counted; about twenty tests had a
+wrong or a second layer), the collection fails a module with an unmarked or a two-layer test, and the two `unittest`
+modules are pytest functions. A few wording points and one more test's layer wait for the round's cleanup. Done with
+the round's merge. Behind it: that spec's goals; no pick of the user's is on record for it.
 
 **P16. Check whether a folder whose own metadata copy failed heals in later versions.** Source: the user's pick
 2026-11-03, "Not an issue, check healing (Recommended)", on a folder that keeps the setgid or default ACL it inherited
