@@ -62,19 +62,21 @@ limits are kept outside this public repo, in the agent's private notes beside it
 **P1. The deferred entries of `docs/limitations.md`.** Source: the 17 entries whose kind is deferred. State: round
 0.55.6 (branch `r0556`) takes the entries whose "Revisit when" names the round after 0.55.5 (15 of the 17); its spec
 (`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
-(2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports
-are in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
+(2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports are
+in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
 corrected, 4 rejected with reasons in its commits). Its questions were Q9 to Q15, all closed (the user's picks and
 chief's decisions). The plan is written (`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a
-table at its top and a [Q<n>] mark on each task say what another answer changes, Task 18 runs only on Q15 (a), and
-Task 2 (the healing test) runs second so Q15 can be asked while the round builds. The plan corrects the spec in
-places (listed in its Calls to confirm; the spec stays as written). Building since 2026-11-16 22:15 PST (chief's decision of that time), by subagent-driven development, on the recommended options, which Q9 to Q15's answers all took; the build's
-ledger (task by task, rulings, deferred minors) is the git-ignored `.superpowers/sdd/2026-11-15-r0556/progress.md` in the
-worktree. Where it stands (2026-11-17 11:20 PST): Task 1 (P15) done and reviewed (c18fc76..5212daf); Task 2 (P16's
-healing check) done and reviewed after two fix rounds (85e8e5d..2dfb89d), its results asked as Q15 (answered (a)
-2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d);
-Task 6 (P11) done and reviewed after one fix round (2cdd763..8c50ca9); Tasks 7 to 22 not started (Task 7's dispatch
-is written). Paused for shared usage limits since 11:20 PST, as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
+table at its top and a [Q<n>] mark on each task say what another answer changes, Task 18 runs only on Q15 (a), and Task
+2 (the healing test) runs second so Q15 can be asked while the round builds. The plan corrects the spec in places
+(listed in its Calls to confirm; the spec stays as written). Building since 2026-11-16 22:15 PST (chief's decision of
+that time), by subagent-driven development, on the recommended options, which Q9 to
+Q15's answers all took; the build's ledger (task by task, rulings, deferred minors) is the git-ignored
+`.superpowers/sdd/2026-11-15-r0556/progress.md` in the worktree. Where it stands (2026-11-17 11:20 PST): Task 1 (P15)
+done and reviewed (c18fc76..5212daf); Task 2 (P16's healing check) done and reviewed after two fix rounds
+(85e8e5d..2dfb89d), its results asked as Q15 (answered (a) 2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and
+reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d); Task 6 (P11)
+done and reviewed after one fix round (2cdd763..8c50ca9); Tasks 7 to 22 not started (Task 7's dispatch is written).
+Paused for shared usage limits since 11:20 PST, as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
 8, 9 ("the 0.54 parts go in a later release") and 12 step 3; `plans/2026-11-05-round20.md`; commit 9ab7949 ("stays for
