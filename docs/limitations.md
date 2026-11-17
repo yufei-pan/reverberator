@@ -344,10 +344,10 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   back, changed only before its last 64 KiB, is missed at the restart and kept wrong until it changes again. So is such
   a rewrite made while the daemon ran whose event a stop dropped before it was backed up, as every stop drops the queued
   changes: the start's full comparison has the same blind spot. A kill drops it the same way, and so does a failed
-  backup, whose next attempt compares the whole tree with that blind spot (both as in 0.55.4). On the upgrade, the first
-  0.55.5 start removes the pending-transactions file a 0.55.4 stop left in the job vault
-  (`.reverberator_pending_transactions.nsv`, with one INFO line) without replaying it, so the changes it held get that
-  full comparison, once. So is such a rewrite of a file under an inner mount, made while a batch that copied it was cut
+  backup, whose next attempt compares the whole tree with that blind spot (both as in 0.55.4). On the upgrade, a
+  pending-transactions file a 0.55.4 stop left in the job vault (`.reverberator_pending_transactions.nsv`) is not
+  replayed (0.55.5 removed it at its first start; from 0.55.6 it stays, unread), so the changes it held get that full
+  comparison, once. So is such a rewrite of a file under an inner mount, made while a batch that copied it was cut
   (a kill or a power loss), with that mount unmounted at the next start: the newest version keeps the bytes of the
   version before until the file changes again, with no line. So is one made while the watcher watches the tree afresh
   after an event queue overflow (about 8 µs a folder, some 0.15 s at 17,200 folders): the full comparison that follows
