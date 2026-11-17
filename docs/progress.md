@@ -64,18 +64,17 @@ limits are kept outside this public repo, in the agent's private notes beside it
 (`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
 (2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports
 are in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
-corrected, 4 rejected with reasons in its commits). Its questions were Q9 to Q15: Q9 to Q14 are closed (the user's picks and
-chief's decisions), Q15 is below. The plan is written
-(`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a table at its top and a [Q<n>] mark on each
-task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (the healing test) runs second so Q15
-can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
-stays as written). Building since 2026-11-16 22:15 PST (chief's decision of that time), by subagent-driven development, on the recommended options, which Q9 to Q14's answers all took; the build's
+corrected, 4 rejected with reasons in its commits). Its questions were Q9 to Q15, all closed (the user's picks and
+chief's decisions). The plan is written (`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a
+table at its top and a [Q<n>] mark on each task say what another answer changes, Task 18 runs only on Q15 (a), and
+Task 2 (the healing test) runs second so Q15 can be asked while the round builds. The plan corrects the spec in
+places (listed in its Calls to confirm; the spec stays as written). Building since 2026-11-16 22:15 PST (chief's decision of that time), by subagent-driven development, on the recommended options, which Q9 to Q15's answers all took; the build's
 ledger (task by task, rulings, deferred minors) is the git-ignored `.superpowers/sdd/2026-11-15-r0556/progress.md` in the
 worktree. Where it stands (2026-11-17 11:20 PST): Task 1 (P15) done and reviewed (c18fc76..5212daf); Task 2 (P16's
-healing check) done and reviewed after two fix rounds (85e8e5d..2dfb89d), its results asked as Q15; Task 3 (P4 to
-P6) done and reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d);
-Task 6 (P11) done and reviewed after one fix round (2cdd763..8c50ca9); Tasks 7 to 22 not started (Task 18 waits on
-Q15; Task 7's dispatch is written). Paused for shared usage limits since 11:20 PST, as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
+healing check) done and reviewed after two fix rounds (85e8e5d..2dfb89d), its results asked as Q15 (answered (a)
+2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d);
+Task 6 (P11) done and reviewed after one fix round (2cdd763..8c50ca9); Tasks 7 to 22 not started (Task 7's dispatch
+is written). Paused for shared usage limits since 11:20 PST, as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
 8, 9 ("the 0.54 parts go in a later release") and 12 step 3; `plans/2026-11-05-round20.md`; commit 9ab7949 ("stays for
@@ -217,9 +216,11 @@ when its own metadata copy fails (an ERROR line, and the folder listed as unsync
 or commit has a result. Round 18 (0.54) and design R changed how folder metadata is copied since, so the check runs on
 the current release. The entry "A folder whose extended attributes alone fail to copy keeps the wrong ones" covers
 only the xattr case. State: in round 0.55.6 (branch `r0556`). Step 1, the check, is built and reviewed (Task 2,
-85e8e5d..2dfb89d, tests/test_io_errors.py: 40 results, the same on 0.55.5's code). Its results are Q15. Step 2 (plan
-Task 18) waits on Q15's answer. Spec section 16's reasoned list ("reasoned, not run") is superseded by those results.
-Behind it: that pick, and "Fixes round (Recommended)" (2026-11-14).
+85e8e5d..2dfb89d, tests/test_io_errors.py: 40 results, the same on 0.55.5's code). Its results were Q15, which the
+user answered (a) on 2026-11-17: step 2 is plan Task 18 (the failed folder's row is marked, so the next comparison that
+meets the folder copies its metadata again, once), not started. Spec section 16's reasoned list ("reasoned, not run")
+is superseded by those results. Behind it: that pick, "Fixes round (Recommended)" (2026-11-14), and Q15's answer,
+"Build the retry (Recommended)" (2026-11-17).
 
 **P17. Four notes the names-chains spec (2026-10-21, "Left as they are") never wrote down** (was Q3): the commands
 redirect stdout and stderr process-wide while they load the rules (~14814); `get_path_fs_info` logs through the
@@ -241,46 +242,7 @@ it: the main session's call (2026-11-14).
 ## Questions waiting for the user
 
 Round 0.55.6's questions, from its spec (`specs/2026-11-14-r0556-design.md` section 26, 1e96eeb, where each is written
-out at length). Q9 to Q14 are closed: the user answered Q9, Q13 and Q14, and chief decided Q10 to Q12 (2026-11-15).
-Q15 is asked with the healing check's results (2026-11-17). What waits on it: plan Task 18, and the
-`docs/limitations.md` entry (Task 20). The plan is written on the recommended options and marks the tasks an answer
-would change.
-
-- **Q15. A folder whose own metadata copy failed: what later versions hold** (P16, step 2). The healing check (Task 2,
-  tests/test_io_errors.py) gives 40 results, the same on 0.55.5's code and the branch. It makes one folder's own
-  metadata copy fail, then reads the versions after it. Below is what the daemon does with the usual rule: a batch
-  starts after a quiet minute, and a full comparison runs once a day.
-  - **setgid** inherited from the parent folder. It is mended at the next full comparison, wherever the copy failed,
-    because the folder's mode differs from its record. It is kept at all only when both of the copy's tries fail: one
-    failed request is retried at once, in the same batch. At the first backup there is nothing to mend, because no
-    folder there inherits anything.
-  - **A default ACL** inherited from the parent, which leaves the vault's copy with an ACL the original lacks. At the
-    first backup there is nothing to mend. When the copy fails later, the next full comparison mends it if no batch
-    recorded a matched time in between. For a folder new in the failing batch, it also mends it when the folder's mode
-    is not 0755 (probed, not pinned). Otherwise the ACL stays.
-  - **The folder's own extended attributes**, missing from the vault's copy. The next full comparison mends them in two
-    cases. The first is when no batch recorded a matched time in between; for a failure at the first backup, the folder
-    must also have changed in the 10 s before that backup began. The second is when the folder's mode is not 0755 (a
-    failure at the first backup or as a new folder). Otherwise they stay.
-  - **"Stays" means until the folder's own metadata changes**: a chmod, a touch, or a change of its attributes on the
-    folder itself. The batch for that change copies all of it again (probed on every case that had something to mend).
-    A file written into the folder does not mend it.
-    - Why: a full comparison reads a folder's extended attributes only when the folder changed after the last fully
-      synced batch's read time, less 10 s.
-    - A batch is read a quiet minute after its last change, so any synced batch after the failing one moves that window
-      past the folder's change. Rarely it does not: a batch taken at the maximum interval, or one a busy backuper takes late, can be read within
-      10 s of the change, and the folder is then mended at the next full comparison.
-    - In a tree where some batch commits most days before the daily comparison, the usual outcome: setgid is mended the
-      next day; the ACL and the folder's own attributes stay wrong until the folder's metadata changes.
-  - The operator sees one ERROR line for the folder, and the folder listed as unsynced. Its copy in later versions then
-    holds the parent's default ACL, or lacks its own extended attributes.
-  - The user's words: "Not an issue, check healing (Recommended)" (2026-11-03). They ruled the case Not an issue and
-    asked only for the check, so a fix goes beyond it.
-  - (a) Build Task 18: the failed folder's row gets a mark, so the next comparison that meets the folder copies its
-    metadata again, once. A copy that fails every time is tried once more, then left. (Recommended: a version holds a
-    wrong result that one retry would mend.)
-  - (b) Widen "A folder whose extended attributes alone fail to copy keeps the wrong ones" to a copy that failed once,
-    and to the default ACL. This option overrides the ladder.
+out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chief decided Q10 to Q12 (2026-11-15).
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
@@ -310,6 +272,12 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Q15, a folder whose own metadata copy failed (P16, step 2; the healing check's 40 results, Task 2, asked in 90e1003):
+  setgid is mended at the next full comparison, but a default ACL the folder inherited and its own extended attributes
+  usually stay wrong until the folder's own metadata changes. (a), build plan Task 18: the failed folder's row is
+  marked, so the next comparison that meets it copies its metadata again, once. The user's answer 2026-11-17 (dialog of
+  13:40 to 13:53 PST, through chief), "Build the retry (Recommended)", shown their 2026-11-03 ruling "Not an issue,
+  check healing (Recommended)" and that the retry goes beyond it on the check's evidence.
 - Q17, f2fs's background GC on the vault disks (P7, readings B and D: after each large batch the busiest vault disk kept
   writing about five hours, the GC rewriting sections still about 94% valid, 4.5 of its 13.1 GiB a day): (a), turn it
   off on the four vault disks only, by fstab and a remount; the other pool members keep it. The user's answer
