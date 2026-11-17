@@ -3362,7 +3362,10 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 						if DEBUG:
 							watcherTeeLogToTl(monitor_path,f'Watch {event.wd} ignored by the kernel')
 						continue
-					watcherTeeLogToTl(monitor_path,'Event name not found, ignoring event')
+					# a chmod or touch of a watched folder comes to its own watch with no name (and, with its name, to its
+					# parent's watch when the parent is watched): one line per folder, so a chmod -R of thousands writes thousands
+					if DEBUG:
+						watcherTeeLogToTl(monitor_path,'Event name not found, ignoring event')
 					continue
 				if event.wd not in wdDic:
 					watcherTeeLogToTl(monitor_path,f'Watch descriptor {event.wd} not found, ignoring event')

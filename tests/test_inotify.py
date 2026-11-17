@@ -956,3 +956,29 @@ def test_a_watch_failing_for_a_folder_that_is_gone_logs_info(tmp_path, monkeypat
 	assert failed == [(f'Failed to add watch for {gone}/: [Errno {error}] {os.strerror(error)}', logged_as_error)] or \
 		failed == [(f'Failed to add watch for {gone}: [Errno {error}] {os.strerror(error)}', logged_as_error)], lines
 	assert unwatched == ({gone} if logged_as_error else set())
+
+
+def _lines_after_chmod_of_a_watched_folder(job, monkeypatch):
+	'''The watcher's lines once it has read a chmod of d, a folder it watches from its start.'''
+	d = os.path.join(job.monitor, 'd')
+	os.mkdir(d)
+	lines = _watcher_lines(monkeypatch)
+	with _ready_watch(job) as (to_process, lock, flag):
+		os.chmod(d, 0o750)
+		wait_until(lambda: any(e.event == 'attrib' and e.path.rstrip('/') == d for e in _events(to_process, lock)), message='no attrib')
+		# d's own watch reports the chmod with no name, after its parent's report with the name: a create made since is read after both
+		_wait_watch_ready(job, to_process, lock)
+	return [message for message, _ in lines]
+
+
+def test_a_chmod_of_a_watched_folder_logs_no_event_name_line(job, poll_fast, monkeypatch):
+	# a chmod or touch of a watched folder also comes to its own watch, with no name: that event is ignored, and says so only
+	# under DEBUG, as a chmod -R of 5,000 folders wrote 5,000 INFO lines (spec section 13).
+	# Fails on fc0fdb1: the line is logged once
+	assert 'Event name not found, ignoring event' not in _lines_after_chmod_of_a_watched_folder(job, monkeypatch)
+
+
+def test_with_debug_the_event_name_line_is_logged(job, poll_fast, monkeypatch):
+	# pin: with DEBUG, the same chmod logs it once
+	monkeypatch.setattr(rv, 'DEBUG', True)
+	assert _lines_after_chmod_of_a_watched_folder(job, monkeypatch).count('Event name not found, ignoring event') == 1
