@@ -70,7 +70,8 @@ chief's decisions), Q15 is below. The plan is written
 task say what another answer changes, Task 18 runs only on Q15 (a), and Task 2 (the healing test) runs second so Q15
 can be asked while the round builds. The plan corrects the spec in places (listed in its Calls to confirm; the spec
 stays as written). Next: building, by subagent-driven development, on the recommended options, which Q9 to Q14's
-answers all took, once shared usage limits allow (chief's decision of 2026-11-16); P7's 24-hour reading is in. Behind it: a deferral is planned work; the user's pick 2026-11-14,
+answers all took, from 2026-11-16 22:15 PST (chief's decision of that time); P7's
+24-hour reading is in. Behind it: a deferral is planned work; the user's pick 2026-11-14,
 "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
