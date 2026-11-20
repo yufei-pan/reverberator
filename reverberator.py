@@ -3556,9 +3556,10 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 	raises its create, and one made before is in the walk, so cp -r or tar x racing the walk leaves nothing unwatched.
 	A folder the walk cannot read gets no watch from it: nothing can be told about what is in it. One whose watch was held
 	before the walk keeps it ( a subfolder renamed after the walk listed its parent ): its own rename or delete event handles it.
-	Each folder left unwatched that is still there (unreadable, or its watch failed other than by being gone) is added to
-	unwatched when given: no event reports a change in it. The walk tells again what under monitor_path is unwatched, so
-	what unwatched held there before goes first ( a folder made again, or a disk mounted again, is watched in full ).
+	Each folder left unwatched that is still there (unreadable: any error of the walk's but a folder gone, a FolderGone; or
+	its watch failed other than by being gone) is added to unwatched when given: no event reports a change in it. The walk
+	tells again what under monitor_path is unwatched, so what unwatched held there before goes first ( a folder made again,
+	or a disk mounted again, is watched in full ).
 	With found (a dict), a watch held at another path than the one the walk finds its folder at stays where the events put
 	it, and found gets that path: the walk sees the tree ahead of the events still queued, which may bring it there yet.
 	The watcher settles it once the kernel holds no event ( watchFolder()'s settle() ). Without found, as at the first
@@ -3629,7 +3630,9 @@ def initializeFolderWatchers(inotify_obj:inotify_simple.INotify,monitor_path:str
 				watched[folder.rstrip('/')] = wd
 	for rel, error in errors:
 		folder = unreadable_path(monitor_path, rel[len(rel_base):])
-		if unwatched is not None and getattr(error,'errno',None) not in (errno.ENOENT, errno.ENOTDIR):
+		if unwatched is not None and not isinstance(error, FolderGone):
+			# no event reports a change in it: one its parent lists and the kernel cannot open (ENOENT every time, as a FUSE, CIFS
+			# or sshfs mount's name trouble gives) too, which only its parent's listing tells from a folder gone
 			unwatched.add(folder)
 		if folder == root_norm:
 			# keeps its watch, for the events of what is in it
@@ -3776,9 +3779,14 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 	link or a file) is a race its delete event or the next full comparison covers, so it gets one info line, at every
 	level, the walk root's too, and is appended as a FolderGone. Its open tells it: ENOTDIR or ELOOP from an open that does
 	not follow a link (a link or a file took its place; its parent is not asked), or ENOENT (or ENOTDIR at a root opened
-	following a link) with its parent no longer listing it (folder_gone()). Any other error, one its parent's listing does
-	not confirm (a folder listed that cannot be opened or looked up, as a FUSE mount's name trouble gives every time), or
-	one met while listing, keeps its error line.
+	following a link) with its parent no longer listing it (folder_gone() for the walk root). Below the root the parent's
+	names are listed once, when the open of a folder in it first answers ENOENT, and kept: a name they lack is gone at once,
+	so a mass deletion of siblings while the walk passes lists their parent once, not once a folder; a name they hold is
+	asked again, by a new listing, as one made before that folder's open cannot tell. Any other error, one its parent's
+	listing does not confirm (a folder listed that cannot be opened or looked up, as a FUSE mount's name trouble gives every
+	time), or one met while listing, keeps its error line.
+	Only an OSError of the walk's own reads is caught: a folder's open and listing, an entry's type. Anything else, an error
+	of skip() included, is raised to the caller with its traceback, so a bug is never taken for an unreadable folder.
 	A walk the caller stops early (a break, close(), an exception) closes every listing it holds.
 
 	Examples:
@@ -3797,10 +3805,11 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 		['e/', 'e/f']
 		>>> import shutil; shutil.rmtree(root)
 	'''
-	# the folders the walk is in, the deepest last, each [its path, its rel, its listing, the entries left of it, its handle]:
-	# the listing is None until the folder is opened, which is when the caller asks for what comes after its yield. the handle
-	# stays open until the listing is closed, as each entry stats through it (DirEntry.is_dir() where the filesystem gives no type)
-	root = [path, rel_prefix, None, None, None]
+	# the folders the walk is in, the deepest last, each [its path, its rel, its listing, the entries left of it, its handle, its
+	# names]: the listing is None until the folder is opened, which is when the caller asks for what comes after its yield. the
+	# handle stays open until the listing is closed, as each entry stats through it (DirEntry.is_dir() where the filesystem gives
+	# no type). its names are None until the open of a folder in it answers ENOENT ( child_gone() )
+	root = [path, rel_prefix, None, None, None, None]
 	stack = [root]
 	# a name with a trailing / makes the kernel follow a link there whatever the flags: the root's is opened without it
 	root_name = path.rstrip('/') or path[:1]
@@ -3813,46 +3822,74 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 			listing.close()
 		if fd is not None:
 			os.close(fd)
+	def child_gone(frame, name:str) -> bool:
+		# whether the folder name in frame's folder is gone, as that folder's listing says (folder_gone()'s rule): at once when
+		# the names kept from a listing made after an earlier open in it failed lack it, else by a listing made now, by path,
+		# which is kept. a name the kept names hold is asked again: they were listed before this folder's open failed
+		names = frame[5]
+		if names is not None and name not in names:
+			return True
+		try:
+			with os.scandir(frame[0]) as listing:
+				names = frame[5] = {entry.name for entry in listing}
+		except OSError as e:
+			return e.errno in (errno.ENOENT, errno.ENOTDIR)
+		return name not in names
 	try:
 		while stack:
 			frame = stack[-1]
-			folder_path, rel, listing, entries, fd = frame
-			try:
-				if fd is None:
+			folder_path, rel, listing, entries, fd, _ = frame
+			# only the reads are in a try: what skip() or the caller raises goes on up with its traceback
+			error = None
+			if entries is None:
+				try:
 					fd = frame[4] = os.open(folder_path, no_link) if frame is not root else os.open(root_name, root_flags)
 					listing = frame[2] = os.scandir(fd)
 					entries = frame[3] = iter(list(listing) if list_folders_first else listing)
+				except OSError as e:
+					error = e
+			if error is None:
 				# a listing of a handle names its entries only: each path is the folder's joined with the name, as os.path.join()
 				# joins them
 				prefix = folder_path if folder_path.endswith('/') else folder_path + '/'
-				for entry in entries:
+				while True:
+					try:
+						entry = next(entries, None)
+						is_dir = entry is not None and entry.is_dir(follow_symlinks=False)
+					except OSError as e:
+						error = e
+						break
+					if entry is None:
+						break
 					rel_path = rel + entry.name
-					if entry.is_dir(follow_symlinks=False):
+					if is_dir:
 						if skip is not None and skip(rel_path + '/'):
 							continue
 						entry_path = prefix + entry.name
 						yield entry_path + '/', rel_path + '/', True
-						stack.append([entry_path, rel_path + '/', None, None, None])
+						stack.append([entry_path, rel_path + '/', None, None, None, None])
 						break
 					if skip is not None and skip(rel_path):
 						continue
 					yield prefix + entry.name, rel_path, False
-				else:
-					close(frame)
-					stack.pop()
-			except Exception as e:
-				stack.pop()
-				opened = frame[4] is not None
-				close(frame)
-				if not opened and isinstance(e, OSError) and ((e.errno in (errno.ENOTDIR, errno.ELOOP) and (frame is not root or not follow_root))
-						or (e.errno in (errno.ENOENT, errno.ENOTDIR) and folder_gone(folder_path))):
-					if errors is not None:
-						errors.append((rel, FolderGone(e.errno, e.strerror, folder_path)))
-					watcherTeeLogToTl(folder_path,f'{folder_path} was gone when the walk reached it: {e}')
+				if stack[-1] is not frame:
+					# into the folder just yielded; this one's listing goes on after it
 					continue
+			stack.pop()
+			opened = frame[4] is not None
+			close(frame)
+			if error is None:
+				continue
+			if not opened and ((error.errno in (errno.ENOTDIR, errno.ELOOP) and (frame is not root or not follow_root))
+					or (error.errno in (errno.ENOENT, errno.ENOTDIR)
+						and (folder_gone(folder_path) if frame is root else child_gone(stack[-1], os.path.basename(folder_path))))):
 				if errors is not None:
-					errors.append((rel, e))
-				watcherTeeLogToTl(folder_path,f'Error scanning {folder_path}: {e}',error=True)
+					errors.append((rel, FolderGone(error.errno, error.strerror, folder_path)))
+				watcherTeeLogToTl(folder_path,f'{folder_path} was gone when the walk reached it: {error}')
+				continue
+			if errors is not None:
+				errors.append((rel, error))
+			watcherTeeLogToTl(folder_path,f'Error scanning {folder_path}: {error}',error=True)
 	finally:
 		for frame in stack:
 			close(frame)
@@ -3865,7 +3902,8 @@ def folder_gone(path:str) -> bool:
 	Whether path is gone, as its parent says: the parent's listing no longer names it, or fails with ENOENT or ENOTDIR (the parent is
 	gone, or no longer a folder). A name the parent still lists is not gone, whatever an open or an lstat of it answers: a FUSE, CIFS or
 	NTFS mount can list a name it cannot look up, and fails an lstat of it with ENOENT too, every time. False when the parent cannot
-	be listed for another reason. One listing of the parent, on the error path only.
+	be listed for another reason. One listing of the parent, on the error path only: iter_tree_entries() asks it of its root, and
+	below that keeps each parent's names by the same rule.
 	'''
 	parent, name = os.path.split(os.path.abspath(path))
 	try:

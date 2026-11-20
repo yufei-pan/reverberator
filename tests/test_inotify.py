@@ -1045,6 +1045,76 @@ def test_a_rewalk_that_cannot_read_a_held_folder_keeps_its_watch(job, poll_fast,
 		wait_until(lambda: _has_create(to_process, lock, late), timeout=3, message='the re-walk dropped a watch it did not add')
 
 
+def test_a_folder_its_parent_lists_and_its_open_cannot_find_is_counted_unwatched(job, poll_fast, monkeypatch):
+	# spec section 2, test 7 (D13, the watcher's half): d, which its parent lists, cannot be opened, ENOENT every time (name trouble
+	# on a FUSE, CIFS or sshfs mount): it gets no watch and no event reports a change in it, so the watcher counts it unwatched and
+	# publishes no read time for a batch to claim; and the next full comparison, which cannot read it either, keeps the matched
+	# time. Fails on c4c5553: its error is an ENOENT, which the watcher took for a folder gone, so it was not counted unwatched
+	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
+	v0 = run_backup(job, matched_since=100)[-1]
+	d = os.path.join(job.monitor, 'd')
+	_fail_open(monkeypatch, d, errno.ENOENT)
+	irm = rv.inotify_resource_manager()
+	wdDic, unwatched = {}, set()
+	with rv.inotify_simple.INotify() as inotify_obj:
+		assert rv.initializeFolderWatchers(inotify_obj, job.monitor, wdDic, irm, WATCH_FLAGS, unwatched=unwatched) != -1
+		assert sorted(path.rstrip('/') for path in wdDic.values()) == [job.monitor.rstrip('/')]
+	assert unwatched == {d}
+	with _ready_watch(job) as (to_process, lock, flag):
+		assert not _published(to_process, lock)
+	# the watcher's probes made a file: a version, which keeps V0's matched time
+	newest = run_backup(job, matched_since=200)[-1]
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		assert manifest.matched == (os.path.basename(newest), 100) and newest != v0
+	finally:
+		manifest.close()
+
+
+def test_a_watcher_whose_walk_raises_fails_its_job_with_the_traceback(job, poll_fast, monkeypatch, capsys):
+	# spec section 2, test 8 (P12), the watcher's half: the job's skip list raises a ValueError at the first folder (a bug in it)
+	# while the watcher walks the tree to watch it. The watcher's thread ends with it, its traceback is logged
+	# (log_thread_exception()), and run_job() fails the job, so the next attempt starts a watcher again rather than leave the job
+	# with none. Fails on c4c5553: the walk swallows the error as an unreadable folder, the one whose listing called the skip (here
+	# the monitored folder, which keeps its watch), and the watcher runs on; the job fails only at the backuper's comparison, for
+	# "cannot read" the monitored folder
+	os.makedirs(os.path.join(job.monitor, 'd'))
+	monkeypatch.setattr(rv, 'JOB_RETRY_FIRST_SECONDS', 0.01)
+	monkeypatch.setattr(threading, 'excepthook', rv.log_thread_exception)
+	real = rv.SkipList.skips
+	def skips(self, rel):
+		if rel == 'd/':
+			raise ValueError('a bug in the skip list')
+		return real(self, rel)
+	monkeypatch.setattr(rv.SkipList, 'skips', skips)
+	m = job.monitor
+	to_process, lock, flag, ready = rv.ChangeEventQueue(m), threading.Lock(), threading.Event(), threading.Event()
+	ready.set()
+	# the job's two threads as the daemon starts them (watcher(), backuper()), through run_job()
+	starter = rv.job_attempt_starter(job.job_name, (job.job_name, m), (ready, m, to_process, lock, flag, rv.inotify_resource_manager(), 0.2, 60),
+		(job.job_name, to_process, lock, m, job.vault, 'N/A', flag, ready, True, 0, '0', False))
+	attempts = []
+	def start_attempt(control, attempt):
+		attempts.append(attempt)
+		return starter(control, attempt)
+	control = rv.JobControl(job.job_name)
+	supervisor = threading.Thread(target=lambda: rv.run_job(control, start_attempt), daemon=True)
+	supervisor.start()
+	try:
+		wait_until(lambda: len(attempts) >= 2, message='no second attempt')
+	finally:
+		rv.GREEN_LIGHT.clear()
+		supervisor.join(timeout=10)
+		rv.GREEN_LIGHT.set()
+	assert not supervisor.is_alive()
+	out = capsys.readouterr()
+	text = out.out + out.err
+	assert f'reverberator job {job.job_name} FAILED: {job.job_name} watcher exited unexpectedly; retrying in' in text
+	# the traceback, whole: from the thread's name to the error, through the walk's call of the skip
+	traceback = text[text.index(f'Uncaught exception in thread {job.job_name} watcher:'):]
+	assert 'in iter_tree_entries' in traceback and 'ValueError: a bug in the skip list' in traceback
+
+
 @pytest.mark.parametrize('error, logged_as_error', [(errno.ENOENT, False), (errno.ENOTDIR, False), (errno.EACCES, True)])
 def test_a_watch_failing_for_a_folder_that_is_gone_logs_info(tmp_path, monkeypatch, error, logged_as_error):
 	# a folder made and removed before its watch is added (pytest-cache-files-* folders) is a normal race that misses

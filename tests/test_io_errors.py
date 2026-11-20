@@ -1084,6 +1084,103 @@ def test_a_folder_whose_path_passes_4095_bytes_keeps_its_error_and_unreadable_li
 	assert _lines(capsys, 'UNREADABLE', folder) == 1
 
 
+# ---- D14 and P12: a listing kept per parent, and only the reads' OSError caught (spec section 2, items 4 and 5)
+
+def test_a_mass_deletion_while_the_walk_passes_lists_the_parent_at_most_twice(tmp_path, monkeypatch):
+	# spec section 2, test 6 (D14): 200 sibling folders, all removed as the walk opens the first of them (an rm -rf of a build's
+	# output while a full comparison passes): one listing of their parent, kept, tells the rest gone, rather than a listing a
+	# folder. Each is still a FolderGone with its INFO line. Fails on c4c5553: the parent is listed 201 times (its own listing,
+	# then once for each folder gone)
+	root = str(tmp_path / 'm')
+	parent = os.path.join(root, 'p')
+	names = [f'd{i:03}' for i in range(200)]
+	for name in names:
+		os.makedirs(os.path.join(parent, name, 'sub'))
+	# the first the walk opens: an unchanged folder is listed in the same order every time
+	with os.scandir(parent) as listing:
+		first = next(entry.name for entry in listing)
+	def remove_all():
+		for name in names:
+			shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
+	on_folder_open(monkeypatch, os.path.join(parent, first), remove_all)
+	parent_id = (os.stat(parent).st_dev, os.stat(parent).st_ino)
+	listings = []
+	real_scandir = os.scandir
+	def scandir(name='.'):
+		# the parent, by its path or by a handle of it
+		if isinstance(name, int):
+			st = os.fstat(name)
+			if (st.st_dev, st.st_ino) == parent_id:
+				listings.append(name)
+		elif os.path.abspath(os.fsdecode(name)).rstrip('/') == parent:
+			listings.append(name)
+		return real_scandir(name)
+	monkeypatch.setattr(os, 'scandir', scandir)
+	lines = _walk_lines(monkeypatch)
+	errors = []
+	walked = [rel for _, rel, _ in rv.iter_tree_entries(root, errors=errors)]
+	assert walked[0] == 'p/' and sorted(walked[1:]) == [f'p/{name}/' for name in names]
+	assert len(listings) <= 2, listings
+	assert sorted((rel, type(error)) for rel, error in errors) == [(f'p/{name}/', rv.FolderGone) for name in names]
+	assert all(len(_gone_lines(lines, os.path.join(parent, name))) == 1 for name in names) and _scan_errors(lines) == []
+
+
+def test_a_walk_raises_what_its_skip_raises(tmp_path):
+	# spec section 2, test 8 (P12): a bug in what the walk calls between its reads (here its skip, at the bottom of a deep tree) is
+	# raised to the caller with its traceback, not taken for an unreadable folder. And with that exception and its traceback still
+	# held, every listing the walk had open is closed: the traceback keeps the walk's frame, so only the walk's own finally closes
+	# them (a walk stopped early by a break or a close() is freed with its listings anyway). Fails on c4c5553: the ValueError is
+	# swallowed as an unreadable folder (the one whose listing called the skip), with an "Error scanning" line, and the walk goes on
+	from tests.harness import deep_tree
+	from tests.test_deep_trees import open_fds
+	root = str(tmp_path / 't')
+	depth = 20
+	deep_tree(root, depth)
+	bottom = 'd/' * depth
+	def skip(rel):
+		if rel == bottom:
+			raise ValueError(f'a bug at {rel}')
+		return False
+	before = open_fds()
+	with pytest.raises(ValueError) as excinfo:
+		list(rv.iter_tree_entries(root, skip=skip))
+	assert open_fds() == before
+	assert str(excinfo.value) == f'a bug at {bottom}' and excinfo.traceback[-1].name == 'skip'
+
+
+def test_a_full_comparison_whose_skip_raises_fails_the_attempt(job, poll_fast, monkeypatch):
+	# spec section 2, test 8 (P12), the backuper's half: the job's skip list raises a ValueError at d/ (a bug in it), and the
+	# start's full comparison raises it: the attempt fails with it, and nothing is committed. Fails on c4c5553: the walk swallows it
+	# as an unreadable folder, the one whose listing called the skip (here the monitored folder), so the attempt fails as "cannot
+	# read <the monitored folder>: a bug in the skip list", and with the skip at a deeper folder it would commit V0 without that one
+	from tests.harness import wait_until
+	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
+	real = rv.SkipList.skips
+	def skips(self, rel):
+		if rel == 'd/':
+			raise ValueError('a bug in the skip list')
+		return real(self, rel)
+	monkeypatch.setattr(rv.SkipList, 'skips', skips)
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	# the backuper as a start runs it, its watches in place
+	startup = rv.JobStartup(job.job_name, job.monitor)
+	startup.watching.set()
+	queue, lock, flag, ready = rv.ChangeEventQueue(job.monitor), threading.Lock(), threading.Event(), threading.Event()
+	ready.set()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag, ready),
+		kwargs=dict(startup=startup, job=control), daemon=True)
+	thread.start()
+	try:
+		wait_until(lambda: control.failure is not None or bool(committed_versions(job)), message='the attempt neither failed nor committed')
+	finally:
+		rv.GREEN_LIGHT.clear()
+		thread.join(timeout=5)
+		rv.GREEN_LIGHT.set()
+	assert committed_versions(job) == []
+	assert control.failure is not None and control.failure.reason == 'ValueError: a bug in the skip list'
+
+
 # ---- F4's check meets two cases the copy answers otherwise (the final review's measurement, F-fix): a file another process
 # holds a write lease on, and an entry under a folder the version has no row of
 
