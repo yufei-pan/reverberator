@@ -76,7 +76,7 @@ done and reviewed (c18fc76..5212daf); Task 2 (P16's healing check) done and revi
 (85e8e5d..2dfb89d), its results asked as Q15 (answered (a) 2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and
 reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d); Task 6 (P11)
 done and reviewed after one fix round (2cdd763..8c50ca9); Tasks 7 to 22 not started (Task 7's dispatch is written).
-Paused for shared usage limits since 11:20 PST, as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
+It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
 8, 9 ("the 0.54 parts go in a later release") and 12 step 3; `plans/2026-11-05-round20.md`; commit 9ab7949 ("stays for
