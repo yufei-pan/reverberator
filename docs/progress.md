@@ -75,7 +75,10 @@ Q15's answers all took; the build's ledger (task by task, rulings, deferred mino
 done and reviewed (c18fc76..5212daf); Task 2 (P16's healing check) done and reviewed after two fix rounds
 (85e8e5d..2dfb89d), its results asked as Q15 (answered (a) 2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and
 reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d); Task 6 (P11)
-done and reviewed after one fix round (2cdd763..8c50ca9); Tasks 7 to 22 not started (Task 7's dispatch is written).
+done and reviewed after one fix round (2cdd763..8c50ca9); Task 7 (P12, D14, D13's watcher half) built (094394b), not
+reviewed: its measurement found the walk alone slower than main's beyond the spread (main 0.087 s, the branch 0.102 to
+0.123 s; the full comparison within it), so the main session rules on the walk's shape (the builder's probe of a for
+loop with an inner try measures at Task 6's figure), then the whole suite and the review; Tasks 8 to 22 not started.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
