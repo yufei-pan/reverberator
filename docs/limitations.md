@@ -939,10 +939,10 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **What the operator sees:** on a monitored filesystem that can list a name it cannot look up (name trouble on a CIFS
   or sshfs mount, say, whose lstat of the name answers ENOENT every time), a batch whose comparison walks such a name as
   a scope it touched (a folder or a path of the batch's events) takes it as gone: its rows are deleted, so the
-  new version lacks it and everything under it, with no line; older versions keep it. The whole-tree walk tells it apart:
-  a folder its parent still lists is not gone, and keeps its ERROR and UNREADABLE lines at every walk; the watcher
-  counts such a folder unwatched, so it holds the matched time ("A paused inner mount or an unwatched folder holds the
-  matched time"). 0.55.4 does the same.
+  new version lacks it and everything under it, with no line; older versions keep it (0.55.4 does the same). The
+  whole-tree walk tells it apart: a folder its parent still lists is not gone, and keeps its ERROR and UNREADABLE lines
+  at every walk; the watcher counts such a folder unwatched, so it holds the matched time ("A paused inner mount or an
+  unwatched folder holds the matched time").
 - **Why:** older than 0.55.5. The scope walks (`iter_scope_entries()`, `scope_path_entry()`) take an lstat's ENOENT as
   gone, which is the normal answer for every folder and file a batch deleted or moved away; asking the parent's listing
   each time, as the whole-tree walk does on its error path, would list a parent once per deleted entry, about 8 ms for
