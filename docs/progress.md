@@ -77,8 +77,9 @@ done and reviewed (c18fc76..5212daf); Task 2 (P16's healing check) done and revi
 reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d); Task 6 (P11)
 done and reviewed after one fix round (2cdd763..8c50ca9); Task 7 (P12, D14, D13's watcher half) built (094394b), not
 reviewed: its measurement found the walk alone slower than main's beyond the spread (main 0.087 s, the branch 0.102 to
-0.123 s; the full comparison within it), so the main session rules on the walk's shape (the builder's probe of a for
-loop with an inner try measures at Task 6's figure), then the whole suite and the review; Tasks 8 to 22 not started.
+0.123 s; the full comparison within it), so the walk's loop takes the builder's faster probe shape (a for loop with an
+inner try, at Task 6's figure; the main session's ruling, 2026-11-21), being built with the whole suite, then the
+review; Tasks 8 to 22 not started.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
