@@ -940,29 +940,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   or sshfs mount, say, whose lstat of the name answers ENOENT every time), a batch whose comparison walks such a name as
   a scope it touched (a folder or a path of the batch's events) takes it as gone: its rows are deleted, so the
   new version lacks it and everything under it, with no line; older versions keep it. The whole-tree walk tells it apart:
-  a folder its parent still lists is not gone, and keeps its ERROR and UNREADABLE lines at every walk. The watcher has
-  the same blind spot: such a folder gets no watch, and as its error is an ENOENT it is not counted unwatched, so it does
-  not hold the matched time as an unwatched folder does ("A paused inner mount or an unwatched folder holds the matched
-  time"). An xattr-only change made in it while it cannot be looked up can then be missed by the next full comparison
-  once it reads again, until the entry next changes. 0.55.4 does the same.
+  a folder its parent still lists is not gone, and keeps its ERROR and UNREADABLE lines at every walk; the watcher
+  counts such a folder unwatched, so it holds the matched time ("A paused inner mount or an unwatched folder holds the
+  matched time"). 0.55.4 does the same.
 - **Why:** older than 0.55.5. The scope walks (`iter_scope_entries()`, `scope_path_entry()`) take an lstat's ENOENT as
   gone, which is the normal answer for every folder and file a batch deleted or moved away; asking the parent's listing
   each time, as the whole-tree walk does on its error path, would list a parent once per deleted entry, about 8 ms for
-  a parent of 100,000 names. The watcher's walk (`initializeFolderWatchers()`) counts a folder unwatched by its error's
-  errno, and ENOENT is a folder gone's.
+  a parent of 100,000 names.
 - **Revisit when:** the round after 0.55.5: the same parent-listing rule in the scope walks, with one listing per parent
-  kept for the comparison, and in the watcher's walk (a folder is unwatched unless its error is a `FolderGone`).
-
-### A walk lists a parent once per folder gone under it
-
-- **Kind:** deferred.
-- **What the operator sees:** nothing but cost: a walk tells a folder that vanished as it reached it by listing its
-  parent once (on the error path only), so a mass deletion of many sibling folders while a walk passes lists that
-  parent once per folder: about 8 ms a listing for a parent of 100,000 names, so the time grows with the square of the
-  folders deleted. A rare case: a mass deletion during a full comparison.
-- **Why:** each listing answers for one folder, which keeps the rule to one call on the error path.
-- **Revisit when:** the round after 0.55.5: one listing per parent per walk, listed again only when the kept listing
-  still names the folder.
+  kept for the comparison.
 
 ### The footprint gate does not catch a missing trim after a commit
 
