@@ -1326,6 +1326,230 @@ def test_a_file_under_another_processs_write_lease_is_backed_up_as_on_main(job, 
 	assert _lines(capsys, 'UNREADABLE', path) == 0
 
 
+# ---- spec section 3 (D2, D1): a comparison waits for a leased file as cp does, and the check reads the last 64 KiB of the file it
+# opens, so a file whose tail cannot be read drops out there
+
+def _matched(job):
+	'''The vault's matched time (VaultManifest.matched).'''
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return manifest.matched
+	finally:
+		manifest.close()
+
+
+def test_a_full_comparison_waits_for_a_leased_file_and_finds_it_unchanged(job, poll_fast, capsys):
+	# fails on main ("Error comparing <path>: [Errno 11] Resource temporarily unavailable, treating as modify", and a version that
+	# changes nothing): b.txt matches its record by size and mtime, and the helper holds a write lease on it through a full
+	# comparison, letting go 1.5 s after the break begins. The comparison's tail read waits for that, as cp's open does
+	import subprocess
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	holder = subprocess.Popen([sys.executable, '-c', LEASE_HOLDER, path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+	try:
+		said = holder.stdout.readline().strip()
+		if said.startswith('refused'):
+			pytest.skip(f'this filesystem takes no write lease ({said})')
+		assert said == 'held', f'the lease helper said {said!r} and exited {holder.poll()}'
+		capsys.readouterr()
+		began = time.monotonic()
+		assert _full(job) is True
+		took = time.monotonic() - began
+	finally:
+		holder.stdin.close()
+		holder.wait(timeout=30)
+	out = capsys.readouterr()
+	assert 'Error comparing' not in out.out + out.err
+	assert committed_versions(job) == before
+	assert took >= 1
+
+
+def test_a_fifo_swapped_in_after_the_ewouldblock_does_not_hold_the_comparison(tmp_path, monkeypatch):
+	# fails on main at once, never by blocking: main raises the EWOULDBLOCK itself. A stand-in on os.open answers the non-blocking
+	# open of f with EWOULDBLOCK, as a lease does, after putting a FIFO with no writer at f's place, so the reopen meets the FIFO:
+	# its O_PATH handle cannot block, and its fstat refuses it as "Not a regular file", where a blocking open would wait for ever
+	path = str(tmp_path / 'f')
+	with open(path, 'w') as f:
+		f.write('f')
+	real_open = os.open
+	swapped = []
+	def opening(target, flags, *args, **kwargs):
+		if not swapped and os.fspath(target) == path and flags & os.O_NONBLOCK:
+			swapped.append(True)
+			os.remove(path)
+			os.mkfifo(path)
+			raise BlockingIOError(errno.EWOULDBLOCK, os.strerror(errno.EWOULDBLOCK), target)
+		return real_open(target, flags, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', opening)
+	outcome = []
+	def hash_it():
+		try:
+			outcome.append(rv.hash_file(path, 1))
+		except OSError as e:
+			outcome.append(e)
+	worker = threading.Thread(target=hash_it, daemon=True)
+	worker.start()
+	worker.join(timeout=5)
+	if worker.is_alive():
+		# a writer's open lets a blocked reader's open return, so the thread does not outlive the test
+		os.close(real_open(path, os.O_WRONLY | os.O_NONBLOCK))
+	assert not worker.is_alive(), 'hash_file blocked on the FIFO'
+	assert swapped and isinstance(outcome[0], OSError)
+	assert (outcome[0].errno, outcome[0].strerror) == (errno.EINVAL, 'Not a regular file'), outcome[0]
+
+
+@pytest.mark.parametrize('changed', [True, False], ids=['changed', 'unchanged'])
+def test_a_file_whose_tail_cannot_be_read_makes_no_version(job, poll_fast, monkeypatch, capsys, changed):
+	# fails on main (a version that changes nothing): b.txt opens and its read fails with EIO (a bad sector under its tail), at the
+	# check's read (os.pread of a handle of its inode). Changed, it was rewritten and its modify is a batch's only entry; unchanged, a
+	# full comparison meets it, its tail failing there too (rv.hash_file), which logs "Error comparing ..., treating as modify". The
+	# check drops it with one UNREADABLE line, and the matched time stays
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	if changed:
+		with open(path, 'w') as f:
+			f.write('b, longer')
+	st = os.lstat(path)
+	real_pread = os.pread
+	def pread(fd, length, offset):
+		held = os.fstat(fd)
+		if (held.st_dev, held.st_ino) == (st.st_dev, st.st_ino):
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		return real_pread(fd, length, offset)
+	monkeypatch.setattr(os, 'pread', pread)
+	if not changed:
+		real_hash = rv.hash_file
+		def hash_file(target, *args, **kwargs):
+			if os.path.abspath(target) == path:
+				raise OSError(errno.EIO, os.strerror(errno.EIO), target)
+			return real_hash(target, *args, **kwargs)
+		monkeypatch.setattr(rv, 'hash_file', hash_file)
+	matched = _matched(job)
+	capsys.readouterr()
+	if changed:
+		_events(job, [(False, 'modify', 'b.txt', None)])
+	else:
+		assert _full(job) is True
+	out = capsys.readouterr()
+	assert committed_versions(job) == before
+	assert (out.out + out.err).count(f'UNREADABLE: {path}: ') == 1
+	assert changed or f'Error comparing {path}: ' in out.out + out.err
+	assert _matched(job) == matched
+
+
+def test_a_fifo_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll_fast, monkeypatch, capsys):
+	# pin (review focus 4): the check's lstat sees a regular file f, then a FIFO is put at f's place, which its open takes without
+	# blocking (O_NONBLOCK). An entry of another kind changes the version, as the lstat pass counts one, and the tail read of a FIFO,
+	# which fails (ESPIPE), must not make it an unreadable file
+	from tests.harness import event_entry
+	seed_monitor(job, {'a.txt': 'a', 'f': 'f'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'f')
+	real_lstat = os.lstat
+	swapped = []
+	def lstat(target, *args, **kwargs):
+		got = real_lstat(target, *args, **kwargs)
+		if not swapped and os.fspath(target) == path:
+			swapped.append(True)
+			os.remove(path)
+			os.mkfifo(path)
+		return got
+	capsys.readouterr()
+	with monkeypatch.context() as patch:
+		patch.setattr(os, 'lstat', lstat)
+		dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set())
+	assert swapped and dropped is False
+	assert _lines(capsys, 'UNREADABLE', path) == 0
+
+
+def test_an_unchanged_readable_file_compares_as_unchanged(job, poll_fast, capsys):
+	# pin: a full comparison reads each file's tail through its non-blocking open, which a file no lease is on takes at once
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b' * (rv.HASH_SIZE + 10)})
+	before = _settled(job)
+	capsys.readouterr()
+	assert _full(job) is True
+	out = capsys.readouterr()
+	assert committed_versions(job) == before
+	assert 'Error comparing' not in out.out + out.err and 'UNREADABLE' not in out.out + out.err
+
+
+@pytest.mark.parametrize('where', ['comparison', 'check'])
+def test_a_file_deleted_between_its_lstat_and_its_tail_read_is_handled_as_on_main(job, poll_fast, monkeypatch, capsys, where):
+	# pin: b.txt goes after its lstat. At a full comparison it goes at the tail read's open: the comparison's error line, then the
+	# check's lstat finds it gone ("Not tracking"), and no version. At the check of a batch, it goes just after the check's open, and
+	# its tail is read through the handle: a change, as main's open counted it, and the version drops it. Neither is unreadable
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	if where == 'check':
+		with open(path, 'w') as f:
+			f.write('b, longer')
+	real_open = os.open
+	gone = []
+	def opening(target, flags, *args, **kwargs):
+		if gone or os.fspath(target) != path or not flags & os.O_NONBLOCK:
+			return real_open(target, flags, *args, **kwargs)
+		gone.append(True)
+		if where == 'comparison':
+			os.remove(path)
+			return real_open(target, flags, *args, **kwargs)
+		fd = real_open(target, flags, *args, **kwargs)
+		os.remove(path)
+		return fd
+	monkeypatch.setattr(os, 'open', opening)
+	capsys.readouterr()
+	if where == 'comparison':
+		assert _full(job) is True
+	else:
+		_events(job, [(False, 'modify', 'b.txt', None)])
+	out = capsys.readouterr()
+	text = out.out + out.err
+	assert gone and 'UNREADABLE' not in text
+	versions = committed_versions(job)
+	if where == 'comparison':
+		assert f'Error comparing {path}: [Errno {errno.ENOENT}] ' in text and text.count('Not tracking b.txt: source no longer exists') == 1
+		assert versions == before
+	else:
+		assert len(versions) == len(before) + 1 and not os.path.lexists(os.path.join(versions[-1], 'b.txt'))
+
+
+def test_a_readable_change_beside_a_file_whose_tail_cannot_be_read_commits(job, poll_fast, monkeypatch, capsys):
+	# pin: the check's read of b.txt fails (EIO at os.pread), and it goes on to a.txt, a readable change, so the batch commits; b.txt's
+	# copy fails as cp fails on a read error, and it keeps its last copy with its UNREADABLE line, once
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'b.txt')
+	with open(path, 'w') as f:
+		f.write('b, longer')
+	with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
+		f.write('a changed')
+	st = os.lstat(path)
+	real_pread = os.pread
+	def pread(fd, length, offset):
+		held = os.fstat(fd)
+		if (held.st_dev, held.st_ino) == (st.st_dev, st.st_ino):
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		return real_pread(fd, length, offset)
+	monkeypatch.setattr(os, 'pread', pread)
+	real_command = rv.copy_command
+	def copy_command(source_path, dest_path):
+		if source_path == path:
+			return ['sh', '-c', 'printf "%s\\n" "$1" >&2; exit 1', 'sh', f"cp: error reading '{source_path}': Input/output error", dest_path]
+		return real_command(source_path, dest_path)
+	monkeypatch.setattr(rv, 'copy_command', copy_command)
+	capsys.readouterr()
+	_events(job, [(False, 'modify', 'b.txt', None), (False, 'modify', 'a.txt', None)])
+	versions = committed_versions(job)
+	assert len(versions) == len(before) + 1
+	with open(os.path.join(versions[-1], 'a.txt')) as f:
+		assert f.read() == 'a changed'
+	with open(os.path.join(versions[-1], 'b.txt')) as f:
+		assert f.read() == 'b'
+	assert _lines(capsys, 'UNREADABLE', path) == 1
+
+
 def _a_version_lacking_the_folder_with_the_files(job, monkeypatch):
 	'''
 	The state a folder with no row comes from: a batch's copy walk of p/ could not list p/s (EIO), so the newest version holds p/s

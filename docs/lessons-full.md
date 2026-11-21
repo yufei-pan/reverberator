@@ -154,3 +154,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: since 0.55 every committed copy is flushed through handles opened before it was written, so the read-back could find nothing, and it cost a 64 KiB read and a row write per copied file.
 - Original design was wrong because: the mark stood in for a flush the commit did not make yet; once the flush came, the mark stayed.
 - Lesson: when a guarantee moves upstream, remove the downstream check that stood in for it, or every write pays twice.
+
+## 2026-11-14 reverberator 0.55.6: a comparison reopens a leased file blocking, through a handle that cannot block
+- Changed: a comparison's tail read that its non-blocking open refuses with EWOULDBLOCK opens the file again through an O_PATH handle, and, once that handle says it is a regular file, reads it through a blocking open of that handle, which waits for the lease to break as cp does.
+- Why we had to change: a file under another process's write lease (an NFS write delegation, Samba's oplocks) failed the comparison with an error line and was copied again, committing a version that changed nothing.
+- Original design was wrong because: the non-blocking open was there for a FIFO put at a file's place, and it refuses a leased regular file the same way: one flag answered two questions.
+- Lesson: when a flag guards against one hazard, check what else it refuses; tell the cases apart by a handle that cannot block before taking the one that can.

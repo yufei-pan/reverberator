@@ -5,7 +5,8 @@ agreed behaviour here. For the full story of a line, find the entry with the sam
 `lessons-full.md`.
 
 When one has to change, add the full entry to `lessons-full.md` and one line here, newest last, in the
-same commit as the change. Keep this file under 20 KB: at the cap, merge lines before adding.
+same commit as the change. Never merge lines to save space; before this file passes 80 KB (what one
+Claude Code read returns, measured 2026-11-15), ask the user.
 
 - **2026-10-23 reverberator: a vault link is told by the version's moves, not its text**: when a format holds both your own records and users' data of the same shape, mark yours with something only you write, from the first version.
 - **2026-10-23 reverberator: pruning hard-links instead of moving, and keeps its books itself**: make the old state whole until the new state is complete, and keep counts you can compute yourself instead of reading them back from the filesystem.
@@ -30,3 +31,4 @@ same commit as the change. Keep this file under 20 KB: at the cap, merge lines b
 - **2026-11-12 reverberator 0.55.5: a record follows its inode through a rename**: a record describes an object, not a name: move it with the object, and only once the object has moved.
 - **2026-11-13 reverberator 0.55.5: every start compares the whole tree, and the pending file goes**: when a restart redoes the work in full anyway, drop the saved state that would resume it: a second path to the same result costs a format, its checks and its bugs, for the little only it does.
 - **2026-11-12 reverberator 0.55.5: a copy flushed before its commit is recorded checked**: when a guarantee moves upstream, remove the downstream check that stood in for it, or every write pays twice.
+- **2026-11-14 reverberator 0.55.6: a comparison reopens a leased file blocking, through a handle that cannot block**: when a flag guards against one hazard, check what else it refuses; tell the cases apart by a handle that cannot block before taking the one that can.

@@ -7961,8 +7961,11 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	cheapest first, stopping at the first entry that would change the version (False):
 	1. a delete or a move changes it, with no syscall (an untracked delete has gone already, drop_untracked_deletes());
 	2. every other entry (a create, a modify or an attrib, of a folder too) has its monitored path looked at, one lstat: a
-	   folder changes it, as does a regular file that opens (as source_readable() opens it) and an entry of another kind (a
-	   FIFO, a socket, a device, which cp -a copies as itself). A regular file that does not open drops out, as its copy keeps
+	   folder changes it, as does a regular file that opens and reads, and an entry of another kind (a FIFO, a socket, a
+	   device, which cp -a copies as itself). A regular file is opened once, non-blocking, and read through that handle: its
+	   last HASH_SIZE bytes (64 KiB), the tail the comparison reads ( hash_file() ), which the copy then reads from the page
+	   cache; one its handle shows of another kind (put there since the lstat) changes it unread. A regular file that does not
+	   open, or whose read fails (a bad sector under its tail, an EIO of a network filesystem), drops out, as its copy keeps
 	   the last copy (an attrib too, under Only Sync Attributes: its record cannot vouch, as its tail cannot be read, so the
 	   replay copies it); so does a path that cannot be looked at, and a path gone, which the replay passes over. Two things
 	   keep an entry in the batch though its file does not open, or before its link is probed: an open that fails at once with
@@ -7983,7 +7986,8 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   refuses.
 	When none would (True), each entry has been logged as the copy or the replay would log it: UNREADABLE and NOT BACKED UP
 	once per batch through reported, and the replay's own line for a path gone. A file that turns unreadable or goes between
-	this check and its copy still makes a version that changes nothing (a known limitation), and so does a link whose copy's
+	this check and its copy still makes a version that changes nothing (a known limitation), as does one whose read fails
+	only before its last 64 KiB, which the check does not read (a known limitation), and so does a link whose copy's
 	temporary name passes the vault's path limit, as the probe sits in staging, at a shorter path.
 	'''
 	if any(values.event in ('delete', 'move') for values in backup_entries.values()):
@@ -8029,7 +8033,7 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 		if not stat.S_ISREG(mode):
 			return False
 		try:
-			os.close(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+			fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
 		except (FileNotFoundError, NotADirectoryError):
 			# gone between the lstat and the open
 			lines.append(('gone', path, None))
@@ -8042,6 +8046,20 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 				return False
 			lines.append(('unreadable', path, e))
 			continue
+		try:
+			st = os.fstat(fd)
+			if not stat.S_ISREG(st.st_mode):
+				# another kind put there since the lstat (a FIFO, whose read would fail): a change, as the lstat pass counts one
+				return False
+			# the bytes the comparison's tail check reads ( hash_file() ), which the copy then reads from the page cache
+			os.pread(fd, HASH_SIZE, max(st.st_size - HASH_SIZE, 0))
+		except OSError as e:
+			if under_untracked_folder(path):
+				return False
+			lines.append(('unreadable', path, e))
+			continue
+		finally:
+			os.close(fd)
 		return False
 	for path in links:
 		rel = os.path.relpath(path, monitor_path)
@@ -11008,7 +11026,8 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 
 def hash_file(path,size = ...,full_hash=False):
 	'''
-	Hash file contents with xxhash (last HASH_SIZE bytes unless full_hash is True).
+	Hash file contents with xxhash (last HASH_SIZE bytes unless full_hash is True). The open never blocks on what is not a
+	regular file (OSError, "Not a regular file"), and waits for another process's write lease to break, as cp's open does.
 
 	Examples:
 		>>> digest = hash_file(__file__, full_hash=True)
@@ -11030,8 +11049,22 @@ def hash_file(path,size = ...,full_hash=False):
 			backuperTeeLogToTl(path='hash_file',error=True,message=f'Error getting size for {path}')
 			return ''
 	hasher = xxhash.xxh64()
-	# a file swapped for a FIFO after its lstat would block a plain open forever with no writer
-	with open(path, 'rb', opener=lambda file, flags: os.open(file, flags | os.O_NONBLOCK | os.O_NOCTTY)) as f:
+	def opener(file, flags):
+		# a file swapped for a FIFO after its lstat would block a plain open forever with no writer
+		try:
+			return os.open(file, flags | os.O_NONBLOCK | os.O_NOCTTY)
+		except BlockingIOError:
+			# another process's write lease (an NFS write delegation, Samba's oplocks) answers that open so too: the file is
+			# opened again through a handle that cannot block, and only a regular file is then opened blocking, through that
+			# handle's inode, which waits for the lease to break as cp's open does
+			handle = os.open(file, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+			try:
+				if not stat.S_ISREG(os.fstat(handle).st_mode):
+					raise OSError(errno.EINVAL, 'Not a regular file', file)
+				return os.open(f'/proc/self/fd/{handle}', flags)
+			finally:
+				os.close(handle)
+	with open(path, 'rb', opener=opener) as f:
 		if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
 			raise OSError(errno.EINVAL, 'Not a regular file', path)
 		# regular files ignore O_NONBLOCK, but drop it in case a filesystem passes it on
