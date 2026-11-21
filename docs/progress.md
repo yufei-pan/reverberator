@@ -75,11 +75,8 @@ Q15's answers all took; the build's ledger (task by task, rulings, deferred mino
 done and reviewed (c18fc76..5212daf); Task 2 (P16's healing check) done and reviewed after two fix rounds
 (85e8e5d..2dfb89d), its results asked as Q15 (answered (a) 2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and
 reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d); Task 6 (P11)
-done and reviewed after one fix round (2cdd763..8c50ca9); Task 7 (P12, D14, D13's watcher half) built (094394b), not
-reviewed: its measurement found the walk alone slower than main's beyond the spread (main 0.087 s, the branch 0.102 to
-0.123 s; the full comparison within it), so the walk's loop takes the builder's faster probe shape (a for loop with an
-inner try, at Task 6's figure; the main session's ruling, 2026-11-21), being built with the whole suite, then the
-review; Tasks 8 to 22 not started.
+done and reviewed after one fix round (2cdd763..8c50ca9); Task 7 (P12, D14, D13's watcher half) done and reviewed (094394b..91c80b4; the walk's loop in the faster shape the main
+session ruled on, 7e7feff, at Task 6's figure); Task 8 building; Tasks 9 to 22 not started.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -194,8 +191,11 @@ picks 2026-11-14, "Carry all four (Recommended)" and "Fixes round (Recommended)"
   raised, a folder *above* replaced by a link after the walk entered it, the spec rules Not an issue; one of them adds a
   file protected only by an ancestor folder's mode, which the final review weighs (the build's ledger). Done with the
   round's merge.
-- **P12. The walk catches `OSError`, not every `Exception`** (section 7): :3788. The broad catch hides
-  `tests/test_inner_mounts.py:91`, which uses `errno` without importing it (a root-only test that passes only through it).
+- **P12. The walk catches `OSError`, not every `Exception`** (section 7): the broad catch hid
+  `tests/test_inner_mounts.py:91`, which used `errno` without importing it. Built on branch `r0556` (Task 7, 094394b and
+  7e7feff, reviewed): the walk catches only its reads' OSError, so a bug in what it calls fails the backup attempt or
+  the watcher's job with its traceback; it lists a parent once when many of its folders vanish (D14), and the watcher
+  counts a folder it cannot open unwatched (D13's watcher half). Done with the round's merge.
 - **P13. "Event name not found, ignoring event" as a DEBUG line** (item 9): built on branch `r0556` (Task 4, 8b3f23d,
   reviewed): no log-file line for every chmod or touch of a watched folder any more, unless DEBUG. Its review found that
   a change to the monitored folder's own metadata alone makes no version (older than this round): a deferred entry in
