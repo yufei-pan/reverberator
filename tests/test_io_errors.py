@@ -1148,6 +1148,98 @@ def test_a_walk_raises_what_its_skip_raises(tmp_path):
 	assert str(excinfo.value) == f'a bug at {bottom}' and excinfo.traceback[-1].name == 'skip'
 
 
+@pytest.mark.parametrize('raised_by', ['skip', 'consumer'])
+def test_a_walk_raises_an_oserror_of_its_skip_or_its_consumer_as_it_is(tmp_path, monkeypatch, raised_by):
+	# ruling R17 (the walk's loop shape), a pin of P12 for what is an OSError: the walk catches an OSError of its own reads only, so
+	# one that the skip raises (a bug in it that reads a file, say) or one thrown into the walk at a yield (the caller's own) is no
+	# unreadable folder either: it leaves the walk as it is, with no ERROR line and no errors entry, and, with it and its traceback
+	# held, every listing the walk had open is closed. Fails on a walk whose catch cannot tell its reads from its body: the OSError
+	# is taken as the folder's error (an ERROR line, an errors entry) and the walk goes on
+	from tests.harness import deep_tree
+	from tests.test_deep_trees import open_fds
+	root = str(tmp_path / 't')
+	depth = 20
+	deep_tree(root, depth)
+	bottom = 'd/' * depth
+	def skip(rel):
+		if raised_by == 'skip' and rel == bottom:
+			raise OSError(errno.EIO, 'a bug in the skip', rel)
+		return False
+	lines = _walk_lines(monkeypatch)
+	errors = []
+	before = open_fds()
+	with pytest.raises(OSError) as excinfo:
+		walk = rv.iter_tree_entries(root, skip=skip, errors=errors)
+		for _, rel, _ in walk:
+			if raised_by == 'consumer' and rel == bottom:
+				walk.throw(OSError(errno.EIO, 'thrown in by the caller', rel))
+	assert open_fds() == before
+	assert excinfo.value.errno == errno.EIO and excinfo.value.strerror == ('a bug in the skip' if raised_by == 'skip' else 'thrown in by the caller')
+	assert errors == [] and _scan_errors(lines) == []
+
+
+class _FailingListing:
+	'''
+	A listing of a folder by handle, as os.scandir(fd) gives one, whose entries come sorted by name and which fails with EIO as a folder
+	on a dying disk does: its next entry after `served` entries (fail_at 'next'), or the is_dir() of the entry with the name `name`
+	(fail_at 'is_dir', the way a DirEntry whose type the filesystem does not give stats through the handle).
+	'''
+	def __init__(self, listing, fail_at, served=1, name=None):
+		self._listing, self._fail_at, self._name = listing, fail_at, name
+		self._entries = iter(sorted(listing, key=lambda entry: entry.name))
+		self._served = served
+
+	def __iter__(self):
+		return self
+
+	def __next__(self):
+		if self._fail_at == 'next' and not self._served:
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		self._served -= 1
+		entry = next(self._entries)
+		return _FailingEntry(entry) if self._fail_at == 'is_dir' and entry.name == self._name else entry
+
+	def close(self):
+		self._listing.close()
+
+
+class _FailingEntry:
+	def __init__(self, entry):
+		self.name = entry.name
+
+	def is_dir(self, *, follow_symlinks=True):
+		raise OSError(errno.EIO, os.strerror(errno.EIO), self.name)
+
+
+@pytest.mark.parametrize('fail_at', ['next', 'is_dir'])
+def test_an_oserror_of_a_listings_next_entry_or_an_entrys_type_is_the_folders_error(tmp_path, monkeypatch, fail_at):
+	# ruling R17, a pin of the reads the walk catches (P12): d is listed and its entries x then y come, the next entry after x, or the
+	# type of y, failing with EIO. That is d's error and no other's: the entry before it is yielded, d gets its ERROR line and its
+	# errors entry (no FolderGone), and the walk goes on with the next folder and its files. Fails on a walk with no catch of its
+	# reads: the OSError leaves the walk
+	from tests.harness import listed_folder, write_tree
+	from tests.test_deep_trees import open_fds
+	root = str(tmp_path / 'm')
+	write_tree(root, {'a.txt': 'a', 'd/x.txt': 'x', 'd/y.txt': 'y', 'e/z.txt': 'z'})
+	folder = os.path.join(root, 'd')
+	real_scandir = os.scandir
+	def scandir(name='.'):
+		listing = real_scandir(name)
+		if isinstance(name, int) and listed_folder(name) == folder:
+			return _FailingListing(listing, fail_at, name='y.txt')
+		return listing
+	monkeypatch.setattr(os, 'scandir', scandir)
+	lines = _walk_lines(monkeypatch)
+	errors = []
+	before = open_fds()
+	walked = [rel for _, rel, _ in rv.iter_tree_entries(root, errors=errors)]
+	assert open_fds() == before
+	assert sorted(walked) == ['a.txt', 'd/', 'd/x.txt', 'e/', 'e/z.txt']
+	assert [(rel, type(error), error.errno) for rel, error in errors] == [('d/', OSError, errno.EIO)]
+	scan_errors = _scan_errors(lines)
+	assert len(scan_errors) == 1 and scan_errors[0].startswith(f'Error scanning {folder}: [Errno {errno.EIO}] ')
+
+
 def test_a_full_comparison_whose_skip_raises_fails_the_attempt(job, poll_fast, monkeypatch):
 	# spec section 2, test 8 (P12), the backuper's half: the job's skip list raises a ValueError at d/ (a bug in it), and the
 	# start's full comparison raises it: the attempt fails with it, and nothing is committed. Fails on c4c5553: the walk swallows it

@@ -3786,7 +3786,8 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 	listing does not confirm (a folder listed that cannot be opened or looked up, as a FUSE mount's name trouble gives every
 	time), or one met while listing, keeps its error line.
 	Only an OSError of the walk's own reads is caught: a folder's open and listing, an entry's type. Anything else, an error
-	of skip() included, is raised to the caller with its traceback, so a bug is never taken for an unreadable folder.
+	of skip() included, an OSError too, is raised to the caller with its traceback, so a bug is never taken for an unreadable
+	folder; an error the caller throws in at a yield is not a read's either.
 	A walk the caller stops early (a break, close(), an exception) closes every listing it holds.
 
 	Examples:
@@ -3852,26 +3853,32 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 				# a listing of a handle names its entries only: each path is the folder's joined with the name, as os.path.join()
 				# joins them
 				prefix = folder_path if folder_path.endswith('/') else folder_path + '/'
-				while True:
-					try:
-						entry = next(entries, None)
-						is_dir = entry is not None and entry.is_dir(follow_symlinks=False)
-					except OSError as e:
-						error = e
-						break
-					if entry is None:
-						break
-					rel_path = rel + entry.name
-					if is_dir:
-						if skip is not None and skip(rel_path + '/'):
-							continue
-						entry_path = prefix + entry.name
-						yield entry_path + '/', rel_path + '/', True
-						stack.append([entry_path, rel_path + '/', None, None, None, None])
-						break
-					if skip is not None and skip(rel_path):
-						continue
-					yield prefix + entry.name, rel_path, False
+				# a try costs nothing until it catches (CPython 3.11+), so the loop keeps its for, and the reads (the listing's next
+				# entry, an entry's type) are caught where they happen, by the try around it, while the body's errors (skip(), the
+				# yields: the caller's own) are marked by the inner one and let go on up with their traceback, an OSError too
+				in_body = False
+				try:
+					for entry in entries:
+						is_dir = entry.is_dir(follow_symlinks=False)
+						try:
+							rel_path = rel + entry.name
+							if is_dir:
+								if skip is not None and skip(rel_path + '/'):
+									continue
+								entry_path = prefix + entry.name
+								yield entry_path + '/', rel_path + '/', True
+								stack.append([entry_path, rel_path + '/', None, None, None, None])
+								break
+							if skip is not None and skip(rel_path):
+								continue
+							yield prefix + entry.name, rel_path, False
+						except BaseException:
+							in_body = True
+							raise
+				except OSError as e:
+					if in_body:
+						raise
+					error = e
 				if stack[-1] is not frame:
 					# into the folder just yielded; this one's listing goes on after it
 					continue
