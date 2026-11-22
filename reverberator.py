@@ -3919,7 +3919,8 @@ def iter_tree_entries(path:str, rel_prefix:str = '', list_folders_first:bool = F
 		while stack:
 			frame = stack[-1]
 			folder_path, rel, listing, entries, fd, _ = frame
-			# only the reads are in a try: what skip() or the caller raises goes on up with its traceback
+			# the folder's open and listing are in a try of their own; the entries' reads below are in another, which marks the body
+			# (skip(), the yields) so that what it raises goes on up with its traceback
 			error = None
 			if entries is None:
 				try:
