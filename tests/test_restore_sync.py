@@ -933,6 +933,62 @@ def test_a_branch_the_user_could_not_open_that_leaves_the_pool_fails_the_restore
 	assert [line for line in stdout.splitlines() if line.startswith('WARNING')][0].startswith(f'WARNING proj: could not sync {held}: ')
 
 
+def unmounted_line(branch):
+	return f'FAILED proj: the disk {branch} was unmounted, or another mounted in its place, while the restore ran: what was restored onto it is not known to be on disk'
+
+
+@pytest.mark.unit
+def test_two_branches_unmounted_lazily_while_listed_each_fail_the_restore_by_their_branch(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails before the fix wave's FW9 (the final review's s19 (2), s20 (3)): a claimed branch whose disk was unmounted lazily while the pool
+	# still lists it was named by the disk holding its folder's place now, the filesystem under its mount point ('/' on a host; /proc's
+	# here, the lazy unmount's stand-in), and the lines were keyed by that name, so the second such branch got none. Each is named by its
+	# branch now, as the pool listed it at the claim, as a branch that left the pool is
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two'], 'three': ['three']}, other_filesystem)
+	unmounts = []
+	for name in ('two', 'three'):
+		os.makedirs(os.path.join(branches[name], 'out', 'proj'))
+		unmounts.append(unmounted_lazily(os.path.dirname(branches[name]), branches[name], False))
+	ran = at_the_first_copy(monkeypatch, lambda: [unmount() for unmount in unmounts])
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert sorted(line for line in stdout.splitlines() if line.startswith('FAILED')) == sorted(unmounted_line(branches[name]) for name in ('two', 'three'))
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(os.geteuid() == 0, reason='root opens any folder')
+def test_a_branch_the_user_could_not_open_unmounted_lazily_while_listed_fails_the_restore(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails before the fix wave's FW9 (the final review's s20 (4); says done, exit 0, with the claim's warning alone): the claim could not
+	# open branch two's place (warned of), and the look for a disk unmounted or replaced since passed it over with the branches whose
+	# handle failed, against sync_restore()'s rule. It is looked at now, by the filesystem its place was on at the claim, which it no longer is
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
+	held = os.path.join(branches['two'], 'out', 'proj')
+	os.makedirs(held)
+	deny(monkeypatch, {held, branches['two']})
+	ran = at_the_first_copy(monkeypatch, unmounted_lazily(os.path.dirname(branches['two']), branches['two'], False))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [unmounted_line(branches['two'])]
+	assert [line for line in stdout.splitlines() if line.startswith('WARNING')][0].startswith(f'WARNING proj: could not sync {held}: ')
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(os.geteuid() == 0, reason='root opens any folder')
+def test_a_branch_the_user_could_not_open_still_on_its_disk_is_a_warning_alone(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# pin: the same branch, its disk still there at the sync (the copies may have made folders on it since the claim, on the same
+	# filesystem): the claim's warning alone, and the restore is done
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
+	held = os.path.join(branches['two'], 'out', 'proj')
+	deny(monkeypatch, {branches['two']})
+	ran = at_the_first_copy(monkeypatch, lambda: os.makedirs(held))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == 0, stdout
+	assert 'FAILED' not in stdout
+	assert [line for line in stdout.splitlines() if line.startswith('WARNING')][0].startswith(f'WARNING proj: could not sync {branches["two"]}: ')
+
+
 def syncing_once_then(monkeypatch, then):
 	'''then() runs once, as the restore's first sync of a handle starts; the list returned holds True once it ran.'''
 	ran = []

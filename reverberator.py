@@ -17170,9 +17170,10 @@ def claim_restore_target(target:str, check = None) -> int:
 # folder's place on each branch left out at the claim, which sync_restore()'s look for a joined disk passes over; dev, the
 # st_dev of the restore's folder as the run opened it, the filesystem each sync checks it is still on; held, (the branch as the
 # pool listed it, the folder's place on it) of each branch the pool listed at the claim, whether the folder was there or not, for
-# sync_restore() to look at each one the pool no longer lists; empty off a pool; denied, the places in passed that were left out
-# because the restoring user could not open them (warned of), not because their handle failed (a sync fails with that), which the
-# look for a disk the pool no longer lists does not pass over
+# sync_restore() to look at each one the pool no longer lists; empty off a pool; denied, {place: the st_dev of the nearest existing
+# folder at it as the claim found it, None when it could not be looked at} of the places in passed that were left out because the
+# restoring user could not open them (warned of), not because their handle failed (a sync fails with that), which the looks for a
+# disk the pool no longer lists, and for one unmounted or replaced since, do not pass over (the latter by that filesystem)
 RestoreDisks = namedtuple('RestoreDisks', ['handles', 'devs', 'passed', 'dev', 'held', 'denied'])
 
 def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> RestoreDisks:
@@ -17208,9 +17209,9 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 	try:
 		pooled, disks = vault_disks(folder, roots=True)
 	except OSError as e:
-		return RestoreDisks(e, None, frozenset(), folder_dev, frozenset(), frozenset())
+		return RestoreDisks(e, None, frozenset(), folder_dev, frozenset(), {})
 	if not pooled:
-		return RestoreDisks([(disks[0][0], fd)], None, frozenset(), folder_dev, frozenset(), frozenset())
+		return RestoreDisks([(disks[0][0], fd)], None, frozenset(), folder_dev, frozenset(), {})
 	handles, devs, passed, denied, there = [], set(), set(), [], set()
 	for disk, held, branch in disks:
 		there.add((branch, held))
@@ -17240,15 +17241,17 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 		else:
 			devs.add(dev)
 			handles.append((disk, opened))
+	denied_devs = {}
 	for held, place, error in denied:
 		passed.add(held)
 		try:
-			if os.stat(place).st_dev in devs:
-				continue
+			denied_devs[held] = os.stat(place).st_dev
 		except OSError:
-			pass
+			denied_devs[held] = None
+		if denied_devs[held] in devs:
+			continue
 		report.cannot_sync(rel, place, error)
-	return RestoreDisks(handles, frozenset(devs), frozenset(passed), folder_dev, frozenset(there), frozenset(held for held, _, _ in denied))
+	return RestoreDisks(handles, frozenset(devs), frozenset(passed), folder_dev, frozenset(there), denied_devs)
 
 def close_restore_disks(disks, fd:int) -> None:
 	'''Close the fds open_restore_disks() opened for disks (None when it never ran): every one but fd, the folder it was given.'''
@@ -17276,7 +17279,12 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 	mount point, with no such folder, on the filesystem under it) or replaced by another, found by the filesystem of the nearest
 	existing folder at its place not being one a handle is of (a place that cannot be looked at counts), where a plain ENOENT
 	at the folder passes a branch over. A branch left out at the claim because the user could not open its place is not passed
-	over by that look (disks.denied), as it was warned of, not failed. Before the syncs, and again once they ran, on a pool and
+	over by that look (disks.denied), as it was warned of, not failed: as no handle is of its filesystem, it is found unmounted or
+	replaced by the nearest existing folder at its place being on another filesystem than the claim found it on, and one whose
+	place the claim could not look at cannot be told so, and stays the warning it was. An unmounted or replaced branch is named
+	by the branch as the pool listed it at the claim (the folder at its place is on the filesystem under its mount point now,
+	whose name says nothing), a disk that joined by the disk holding the folder on it; each once. Before the syncs, and again once
+	they ran, on a pool and
 	off one, folder must still be on the
 	filesystem the run opened it on (disks.dev): a filesystem unmounted under it (a lazy unmount), or another mounted over
 	it or above it, puts what was restored since on a filesystem none of the handles is of, which fails it, the syncs
@@ -17337,34 +17345,48 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 		# the branch each place the claim listed was the folder's place on
 		claimed = {held: branch for branch, held in disks.held}
 		def replaced(held):
-			# whether the filesystem at the place of a branch the pool listed at the claim is no longer one a handle is of: its disk was
-			# unmounted (lazily, so that its mount point shows the folder under it) or another mounted in its place, and the copies that
-			# landed on it are out of reach. A place that cannot be looked at counts too
+			# whether the filesystem at the place of a branch the pool listed at the claim is no longer one a handle is of (for a branch
+			# the user could not open, no longer the one the claim found there): its disk was unmounted (lazily, so that its mount point
+			# shows the folder under it) or another mounted in its place, and the copies that landed on it are out of reach. A place that
+			# cannot be looked at counts too, now or at the claim
 			try:
-				return os.stat(nearest_existing_folder(claimed[held], os.path.relpath(held, claimed[held]))).st_dev not in disks.devs
+				dev = os.stat(nearest_existing_folder(claimed[held], os.path.relpath(held, claimed[held]))).st_dev
 			except OSError:
 				return True
+			return dev != disks.denied[held] if held in disks.denied else dev not in disks.devs
+		# the names already failed: a disk that joined by the disk holding the folder on it (two branches of it are one line), a
+		# branch unmounted or replaced by the branch itself
 		joined = set()
 		for disk, held in now if pooled else ():
-			if held in disks.passed or disk in joined:
-				continue
 			unmounted = False
-			try:
-				if os.stat(held).st_dev in disks.devs:
-					continue
-			except (FileNotFoundError, NotADirectoryError):
-				# nothing can have landed there, unless it is a disk of the claim's that was replaced
-				if held not in claimed or not replaced(held):
+			if held in disks.denied:
+				# warned of at the claim, with no handle of its own: only a disk unmounted or replaced at its place since counts, which
+				# a place the claim could not look at cannot tell
+				if disks.denied[held] is None or not replaced(held):
 					continue
 				unmounted = True
-			except OSError:
-				# whether it holds the folder cannot be told: counted as holding it
-				pass
-			joined.add(disk)
-			if unmounted:
-				report.fail(rel, f'the disk {disk} was unmounted, or another mounted in its place, while the restore ran: what was restored onto it is not known to be on disk', rerun=False)
+			elif held in disks.passed:
+				continue
 			else:
-				report.fail(rel, f'the disk {disk} joined the pool while the restore ran: what was restored onto it is not known to be on disk', rerun=False)
+				try:
+					if os.stat(held).st_dev in disks.devs:
+						continue
+				except (FileNotFoundError, NotADirectoryError):
+					# nothing can have landed there, unless it is a disk of the claim's that was replaced
+					if held not in claimed or not replaced(held):
+						continue
+					unmounted = True
+				except OSError:
+					# whether it holds the folder cannot be told: counted as holding it
+					pass
+			name = claimed[held] if unmounted else disk
+			if name in joined:
+				continue
+			joined.add(name)
+			if unmounted:
+				report.fail(rel, f'the disk {name} was unmounted, or another mounted in its place, while the restore ran: what was restored onto it is not known to be on disk', rerun=False)
+			else:
+				report.fail(rel, f'the disk {name} joined the pool while the restore ran: what was restored onto it is not known to be on disk', rerun=False)
 			synced = False
 		# a folder on no pool now is on another filesystem than the pool's, failed above: its disks are not called gone as well
 		if pooled:
