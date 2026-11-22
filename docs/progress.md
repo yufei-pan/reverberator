@@ -94,7 +94,9 @@ container suite on the version commit; version 0.55.6 at e166baa. Waiting for th
 the build's rulings): `docs/progress/r0556.md`. Next while Q19 waits: the round after 0.55.6 (0.55.7, its fourteen
 deferred entries): its spec (`specs/2026-11-22-r0557-design.md`, 2026-11-22) is written, checked by fresh agents four
 times and revised after each (a step back redesigned two parts that drew findings in every round), with questions Q20
-to Q23 below; its plan comes next; no build on top of the unreleased round before Q19's answer.
+to Q23 below; its plan is written (`plans/2026-11-22-r0557.md`, 20 tasks, on each question's recommended option: a
+table at its top and a [Q<n>] mark on each task say what another answer changes). It is built on its own branch after
+Q19's answer (no build on top of the unreleased round), and its marked tasks wait for Q20 to Q23.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
