@@ -81,7 +81,8 @@ round (4a60607..21345ea); Task 10 (D8, D7) done and reviewed (582ee3a, 310a19c);
 (bce95b0: a one-file batch reads /etc/fstab once, 18 times on a pool before); Task 12 (D10) done and reviewed (79d42c5); Task 13 (D5, D6) done and reviewed after one fix
 round (5aba4ed..1f774a3); Task 14 (D3 item 1) done and reviewed (79220a8); Task 15 (D3 items 2, 3) done and reviewed after two fix rounds and
 a design check's rework (d00537b..b9bbde4: a link a cut left in staging stays there until the scan after the commit);
-Task 16 building; Tasks 17 to 22 not started.
+Task 16 (D15) done and reviewed after one fix round (2159b07, 80398bd: a gate after a burst and a pin counting the
+trim at each commit); Task 17 building; Tasks 18 to 22 not started.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
