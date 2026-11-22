@@ -261,8 +261,13 @@ def _attempt_that_loses_a_disk(job, fake_pool, monkeypatch, pool):
 	control = _control(job)
 	thread = _run_backuper(job, control)
 	thread.join(timeout=10)
-	assert left and not thread.is_alive()
-	assert control.failure.reason == f'disk {b} left pool {pool} during this step'
+	try:
+		assert left and not thread.is_alive()
+		assert control.failure.reason == f'disk {b} left pool {pool} during this step'
+	except BaseException:
+		# a regression must not leave a backuper thread running behind the failed test
+		_stop(control, thread)
+		raise
 	return control, b
 
 
@@ -282,7 +287,8 @@ def test_the_attempt_after_a_disk_was_taken_out_of_the_pool_waits_for_it_to_be_l
 	try:
 		reason = _left_reason(pool, b)
 		wait_until(lambda: _marker(pool, reason) in output(), timeout=5, message='no waiting marker')
-		assert (os.path.lexists(orphan) if side == 'vault' else not os.path.lexists(orphan)), 'the vault was scanned while a disk of its pool is out'
+		scanned = 'the vault was scanned while a disk of its pool is out' if side == 'vault' else 'the vault was not scanned, though only the monitored path\'s pool lost a disk'
+		assert (os.path.lexists(orphan) if side == 'vault' else not os.path.lexists(orphan)), scanned
 		assert len(committed_versions(job)) == 1
 		assert _state(tmp_path)['state'] == 'waiting' and _state(tmp_path)['detail'] == f'{pool}: {reason}'
 		fake_pool.come_back(pool, b)
@@ -295,6 +301,31 @@ def test_the_attempt_after_a_disk_was_taken_out_of_the_pool_waits_for_it_to_be_l
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize('unreadable', ['the branch list', 'the mount table'])
+def test_a_wait_for_a_disk_that_left_the_pool_goes_on_while_the_pool_cannot_be_read(job, tmp_path, fake_pool, monkeypatch, unreadable):
+	# review of Task 13 (Haiku c1 (3)), fails on 1f774a3 (the wait ends: left_reason() answered None): the pool's branch list, or the mount
+	# table, cannot be read at the moment the wait looks for the disk the failed attempt saw leave. It is the wait's reason, as the pool's
+	# own is (pool_state()), not an end to the wait with the disk possibly still out
+	_, b = fake_pool.add(job.vault, ['a', 'b'])
+	pool = os.path.realpath(job.vault)
+	control = rv.JobControl('job')
+	control.left.add((pool, b))
+	fake_pool.leave(job.vault, b)
+	assert control.left_reason(job.vault) == _left_reason(pool, b)
+	if unreadable == 'the branch list':
+		fake_pool.unreadable(job.vault, errno.ENOTCONN)
+		assert control.left_reason(job.vault) == f'the disks of pool {pool} cannot be listed: {os.strerror(errno.ENOTCONN)}'
+		fake_pool.unreadable_pools.pop(pool)
+	else:
+		with monkeypatch.context() as unread:
+			unread.setattr(rv, 'MOUNTINFO_PATH', str(tmp_path / 'no-mountinfo'))
+			assert control.left_reason(job.vault).startswith('the mount table cannot be read: ')
+	# nothing is forgotten by it: listed again, the wait ends
+	fake_pool.come_back(job.vault, b)
+	assert control.left_reason(job.vault) is None and not control.left
+
+
+@pytest.mark.unit
 def test_the_attempt_after_a_disk_taken_out_and_listed_again_goes_on_at_once(job, fake_pool, grace, board, output, monkeypatch):
 	# pin: the disk is listed again before the retry looks, so nothing waits and the memory of it is gone
 	control, b = _attempt_that_loses_a_disk(job, fake_pool, monkeypatch, job.vault)
@@ -304,6 +335,7 @@ def test_the_attempt_after_a_disk_taken_out_and_listed_again_goes_on_at_once(job
 	try:
 		wait_for_committed_count(job, 2)
 		assert 'FAILED: waiting' not in output()
+		assert not control.left
 	finally:
 		_stop(control, thread)
 

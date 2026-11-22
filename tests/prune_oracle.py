@@ -160,10 +160,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	def require_pools() -> None:
 		# the reference vault kept, and the attempt failed: its retry scans the vault again, so the caller's sums need not
 		# be right
-		problem = guard.problem()
+		left = []
+		problem = guard.problem(left)
 		if problem:
 			keep_oldest(problem)
-			raise PoolNotReady(problem)
+			raise PoolNotReady(problem, left)
 	folder_name = os.path.basename(referenceVaultPath)
 	own_folder = os.path.join(job_vault, folder_name)
 	def own_paths() -> tuple:

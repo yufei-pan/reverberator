@@ -411,6 +411,22 @@ def test_the_change_list_is_not_placed_when_a_disk_drops_after_the_commit_check(
 	assert committed_versions(job) == [v0, v1]
 
 
+def test_the_guard_collects_the_disks_that_left_every_pool_it_holds(job, fake_pool):
+	# review of Task 13 (Opus M3, Haiku c1 (1)), fails on 1f774a3 (a disk of the second pool is not remembered): the vault and the monitored
+	# path on two pools, a disk of each taken out of its list in the same check. The problem is the first path's text, and left holds both,
+	# as the job waits for each of them. Without a left list the check stops at the first problem
+	vault_pool, monitor_pool = job.vault, job.monitor
+	_, vault_b = fake_pool.add(vault_pool, ['a', 'b'])
+	_, monitor_b = fake_pool.add(monitor_pool, ['c', 'd'])
+	guard = rv.PoolGuard([job.job_vault, job.monitor])
+	fake_pool.leave(vault_pool, vault_b)
+	fake_pool.leave(monitor_pool, monitor_b)
+	left = []
+	assert guard.problem(left) == f'disk {vault_b} left pool {os.path.realpath(vault_pool)} during this step'
+	assert sorted(left) == sorted([(os.path.realpath(vault_pool), vault_b), (os.path.realpath(monitor_pool), monitor_b)])
+	assert guard.problem() == f'disk {vault_b} left pool {os.path.realpath(vault_pool)} during this step'
+
+
 def test_a_disk_dropped_from_the_pools_list_during_a_batch_fails_it(job, fake_pool, monkeypatch):
 	# fails on main (commits): a disk taken out of the pool's branch list (mergerfs's control file), still mounted, after the batch's
 	# copies and before its flush: the flush syncs only the disks the pool lists by then, so what the batch wrote there is not known

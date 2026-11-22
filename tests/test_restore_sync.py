@@ -868,8 +868,135 @@ def test_a_disk_that_leaves_the_pool_without_the_folder_is_passed_over(job, tmp_
 	assert 'FAILED' not in stdout
 
 
+def unmounted_lazily(mount, branch, at_the_mount):
+	'''
+	What runs to unmount the disk of a branch lazily: the folder at the branch's mount point is the empty one under the mount, a
+	folder of another filesystem than the disks' (a symlink to /proc stands in for it, as os.stat() follows it to another st_dev).
+	With at_the_mount the branch is the mount point itself, so it exists and is empty; else it is a folder in the mount, which is
+	no longer there.
+	'''
+	def unmount():
+		if at_the_mount:
+			os.rename(branch, branch + '.gone')
+			os.symlink('/proc', branch)
+		else:
+			os.rename(mount, mount + '.gone')
+			os.symlink('/proc', mount)
+	return unmount
+
+
 @pytest.mark.unit
-def test_a_branch_that_leaves_the_pool_is_named_by_its_branch_not_by_its_disk(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+@pytest.mark.parametrize('listed', [False, True], ids=['taken_out', 'still_listed'])
+@pytest.mark.parametrize('at_the_mount', [False, True], ids=['branch_below_the_mount', 'branch_is_the_mount'])
+def test_a_branch_whose_disk_was_unmounted_lazily_fails_the_restore(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem, listed, at_the_mount):
+	# fails on 873cd90 (says done): the disk of branch two held the restore's folder at the claim, a copy landed on it, and then it was
+	# unmounted lazily (the pool still lists it, or it was taken out first): its branch folder reads ENOENT, or is the empty mount
+	# point under the mount, and the folder at its place ENOENT, which both loops took for "nothing of the restore can be there". The
+	# filesystem of the nearest existing folder at its place is no longer one a handle is of
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
+	target = os.path.join(out, 'proj')
+	held = os.path.join(branches['two'], 'out', 'proj')
+	os.makedirs(held)
+	mount = os.path.dirname(branches['two'])
+	unmount = unmounted_lazily(mount, branches['two'], at_the_mount)
+	def then():
+		if not listed:
+			fake_pool.leave(str(tmp_path / 'pool'), branches['two'])
+		unmount()
+	ran = at_the_first_copy(monkeypatch, then)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	failed = [line for line in stdout.splitlines() if line.startswith('FAILED')]
+	if listed:
+		assert len(failed) == 1 and failed[0].startswith('FAILED proj: the disk ') and failed[0].endswith(' was unmounted, or another mounted in its place, while the restore ran: what was restored onto it is not known to be on disk'), failed
+	else:
+		assert failed == [left_line(branches['two'])]
+	assert marker_of(target).get('recopy') == 'sync failed'
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(os.geteuid() == 0, reason='root opens any folder')
+def test_a_branch_the_user_could_not_open_that_leaves_the_pool_fails_the_restore(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails on 873cd90 (a warning, exit 0): the claim could not open branch two's place (a mode that shuts the user out, as deny() does),
+	# which was warned of and left out of what the look for a joined disk passes over; the left loop passed it over too, so the disk taken
+	# out of the pool with the restore's folder on it did not fail the restore
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
+	held = os.path.join(branches['two'], 'out', 'proj')
+	os.makedirs(held)
+	deny(monkeypatch, {held, branches['two']})
+	ran = at_the_first_copy(monkeypatch, lambda: fake_pool.leave(str(tmp_path / 'pool'), branches['two']))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [left_line(branches['two'])]
+	assert [line for line in stdout.splitlines() if line.startswith('WARNING')][0].startswith(f'WARNING proj: could not sync {held}: ')
+
+
+def syncing_once_then(monkeypatch, then):
+	'''then() runs once, as the restore's first sync of a handle starts; the list returned holds True once it ran.'''
+	ran = []
+	real = rv.syncfs_fd
+	def syncing(fd, path=None):
+		if not ran:
+			ran.append(True)
+			then()
+		return real(fd, path)
+	monkeypatch.setattr(rv, 'syncfs_fd', syncing)
+	return ran
+
+
+@pytest.mark.unit
+def test_a_restore_whose_folder_changes_filesystem_while_it_syncs_fails(job, tmp_path, capsys, monkeypatch, errseq, other_filesystem):
+	# fails on 873cd90 (says done, the marker and the folders' metadata written onto the other filesystem): the folder was on the
+	# claim's filesystem at the check before the syncs, and another is mounted over it as the first sync runs. The folder is looked at
+	# again once the syncs ran
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	ran = syncing_once_then(monkeypatch, mounted_over(target, other_filesystem))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [filesystem_line(target)]
+	assert 'recopy' not in marker_of(other_filesystem) and marker_of(target + '.under').get('unsynced') is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('when', ['before the first sync', 'while it syncs'])
+def test_accept_on_a_folder_that_changed_filesystem_fails_and_changes_nothing(job, tmp_path, capsys, monkeypatch, errseq, other_filesystem, when):
+	# pin for 'before the first sync', fails on 873cd90 for 'while it syncs': --accept finds the restore's folder on another filesystem
+	# than its claim's (a lazy unmount, or another mounted over it): it fails with that line and hands nothing over; nothing is written
+	# onto the other filesystem, and the marker on the claim's stays as it was, with no record of the failed sync (README, restore)
+	backed_up(job)
+	target = unfinished(job, tmp_path, capsys, monkeypatch)
+	marker = os.path.join(target, rv.RESTORE_MARKER_NAME)
+	with open(marker, 'rb') as f:
+		before = f.read()
+	handed = []
+	hand_over_folders = rv.hand_over_folders
+	monkeypatch.setattr(rv, 'hand_over_folders', lambda *args, **kwargs: handed.append(args) or hand_over_folders(*args, **kwargs))
+	if when == 'while it syncs':
+		ran = syncing_once_then(monkeypatch, mounted_over(target, other_filesystem))
+	else:
+		ran = []
+		iter_version_entries = rv.iter_version_entries
+		def walking(*args, **kwargs):
+			if not ran:
+				ran.append(True)
+				mounted_over(target, other_filesystem)()
+			return iter_version_entries(*args, **kwargs)
+		monkeypatch.setattr(rv, 'iter_version_entries', walking)
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout + err
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [filesystem_line(target)]
+	assert handed == []
+	with open(os.path.join(target + '.under', rv.RESTORE_MARKER_NAME), 'rb') as f:
+		assert f.read() == before
+	assert 'recopy' not in marker_of(other_filesystem)
+
+
+@pytest.mark.unit
+def test_a_branch_that_leaves_the_pool_is_named_by_its_branch_not_by_its_disk(job, tmp_path, capsys, monkeypatch, fake_pool, errseq):
 	# two branches of one disk, and only one is taken out of the pool: the failure names that branch, as the pool listed it, not the
 	# mount point of the disk, which the other branch (still listed) is on as well
 	backed_up(job)

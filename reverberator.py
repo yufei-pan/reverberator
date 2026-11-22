@@ -664,20 +664,25 @@ class JobControl:
 		'''
 		Why a wait for path goes on for the disks a failed attempt saw leave the pool holding path (left): None when none of them is
 		out still, else the text of the wait. Each is out while the pool does not list it (its branch list read now, with no mount
-		table read when nothing is remembered); one listed again is forgotten. Nothing is said while the pool cannot be listed (its own
-		problem is the wait's reason then) or path is on no pool now. mount_table, when given, is the one the wait looked at.
+		table read when nothing is remembered); one listed again is forgotten. A mount table or a branch list that cannot be read now
+		is the wait's reason, as it is the pool's own (pool_state()): the wait goes on, not ends with a disk possibly still out. None
+		too when path is on no pool now. mount_table, when given, is the one the wait looked at.
 		'''
 		with self._lock:
 			remembered = set(self.left)
 		if not remembered:
 			return None
 		try:
-			pool = mergerfs_mount(read_mount_table() if mount_table is None else mount_table, path)
-			if pool is None:
-				return None
-			listed = {os.path.realpath(branch) for branch in read_pool_branches(pool)}
-		except OSError:
+			table = read_mount_table() if mount_table is None else mount_table
+		except OSError as e:
+			return mount_table_unreadable(e)
+		pool = mergerfs_mount(table, path)
+		if pool is None:
 			return None
+		try:
+			listed = {os.path.realpath(branch) for branch in read_pool_branches(pool)}
+		except OSError as e:
+			return f'the disks of pool {pool} cannot be listed: {e.strerror or e}'
 		back = {(held, branch) for held, branch in remembered if held == pool and branch in listed}
 		if back:
 			with self._lock:
@@ -4621,12 +4626,17 @@ class PoolGuard:
 		self.lock = threading.Lock()
 
 	def problem(self, left:list = None) -> 'str | None':
-		'''The first path's problem (pool_problem()); left, a list, gets (the pool, the branch) of each disk that left that path's pool.'''
+		'''
+		The first path's problem (pool_problem()). left, a list, gets (the pool, the branch) of each disk that left the pool of any
+		path, the paths after the first with a problem included, as the job waits for each of them: with none, the check stops there.
+		'''
+		first = None
 		for path, since in self.states:
 			problem = pool_problem(path, since, fstab=self.fstab, left=left)
-			if problem:
-				return problem
-		return None
+			first = first or problem
+			if first and left is None:
+				break
+		return first
 
 	def require(self) -> None:
 		left = []
@@ -17108,8 +17118,10 @@ def claim_restore_target(target:str, check = None) -> int:
 # folder's place on each branch left out at the claim, which sync_restore()'s look for a joined disk passes over; dev, the
 # st_dev of the restore's folder as the run opened it, the filesystem each sync checks it is still on; held, (the branch as the
 # pool listed it, the folder's place on it) of each branch the pool listed at the claim, whether the folder was there or not, for
-# sync_restore() to look at each one the pool no longer lists; empty off a pool
-RestoreDisks = namedtuple('RestoreDisks', ['handles', 'devs', 'passed', 'dev', 'held'])
+# sync_restore() to look at each one the pool no longer lists; empty off a pool; denied, the places in passed that were left out
+# because the restoring user could not open them (warned of), not because their handle failed (a sync fails with that), which the
+# look for a disk the pool no longer lists does not pass over
+RestoreDisks = namedtuple('RestoreDisks', ['handles', 'devs', 'passed', 'dev', 'held', 'denied'])
 
 def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> RestoreDisks:
 	'''
@@ -17133,7 +17145,7 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 	are of, which sync_restore() checks the pool against later: a filesystem that holds folder on a branch then and no
 	handle is of (a disk that joined, or one mounted at a folder on the way) has no handle, and one opened now would miss
 	an error another sync of it has seen. .passed is the folder's place on each branch left out (that check passes them
-	over, as they are failed or warned of already). .dev is fd's st_dev, on a pool and off one: sync_restore() checks that
+	over, as they are failed or warned of already; .denied the ones among them that were warned of, not failed). .dev is fd's st_dev, on a pool and off one: sync_restore() checks that
 	folder is still on that filesystem, which a lazy unmount, or another filesystem mounted over it, ends. .held is (the
 	branch as the pool lists it, the folder's place on it) of every branch the pool lists now, with no look at the place: a
 	copy may land on a branch where the folder is not yet (mergerfs's create policies that keep no paths put it where the
@@ -17144,9 +17156,9 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 	try:
 		pooled, disks = vault_disks(folder, roots=True)
 	except OSError as e:
-		return RestoreDisks(e, None, frozenset(), folder_dev, frozenset())
+		return RestoreDisks(e, None, frozenset(), folder_dev, frozenset(), frozenset())
 	if not pooled:
-		return RestoreDisks([(disks[0][0], fd)], None, frozenset(), folder_dev, frozenset())
+		return RestoreDisks([(disks[0][0], fd)], None, frozenset(), folder_dev, frozenset(), frozenset())
 	handles, devs, passed, denied, there = [], set(), set(), [], set()
 	for disk, held, branch in disks:
 		there.add((branch, held))
@@ -17184,7 +17196,7 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 		except OSError:
 			pass
 		report.cannot_sync(rel, place, error)
-	return RestoreDisks(handles, frozenset(devs), frozenset(passed), folder_dev, frozenset(there))
+	return RestoreDisks(handles, frozenset(devs), frozenset(passed), folder_dev, frozenset(there), frozenset(held for held, _, _ in denied))
 
 def close_restore_disks(disks, fd:int) -> None:
 	'''Close the fds open_restore_disks() opened for disks (None when it never ran): every one but fd, the folder it was given.'''
@@ -17208,26 +17220,35 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 	and so is a branch left out at the claim (disks.passed). A branch the pool listed at the claim (disks.held) and lists
 	no more, taken out through mergerfs's control file, fails it too, naming the branch, when the folder is on it now (os.stat()
 	finds it, or cannot tell): a copy may have landed there, even where the folder was not at the claim, and is in the
-	pool's view no more. Before the syncs, on a pool and off one, folder must still be on the
+	pool's view no more. So does a branch of the claim's, listed or not, whose disk was unmounted since (a lazy unmount leaves its
+	mount point, with no such folder, on the filesystem under it) or replaced by another, found by the filesystem of the nearest
+	existing folder at its place not being one a handle is of (a place that cannot be looked at counts), where a plain ENOENT
+	at the folder passes a branch over. A branch left out at the claim because the user could not open its place is not passed
+	over by that look (disks.denied), as it was warned of, not failed. Before the syncs, and again once they ran, on a pool and
+	off one, folder must still be on the
 	filesystem the run opened it on (disks.dev): a filesystem unmounted under it (a lazy unmount), or another mounted over
 	it or above it, puts what was restored since on a filesystem none of the handles is of, which fails it, the syncs
 	still run, and report.moved is set: no marker is written by the folder's path after that, as it would be written onto
 	that other filesystem (the claim's marker, on the filesystem it was made on, already says a run again copies everything
-	again). A handle whose sync failed, or that could not be opened, a disk that joined or left, a folder on another
+	again; for --accept see accept_restore()). A handle whose sync failed, or that could not be opened, a disk that joined or left, a folder on another
 	filesystem, or disks that could not be listed, is a failure of rel that no run again fixes as it is, as a run again
 	opens that disk at its own claim; False then, once every handle was tried. after_hand_over is the sync once the files
 	were synced and the folders handed over, so what it failed to write is their folders' owners, modes and times and the
 	marker's removal, which its failure says.
 	'''
 	synced = True
-	try:
-		moved = os.stat(folder).st_dev != disks.dev
-	except OSError:
-		# not there, or not to be looked at: not known to be the filesystem the restore began on
-		moved = True
-	if moved:
+	def moved_now():
+		try:
+			return os.stat(folder).st_dev != disks.dev
+		except OSError:
+			# not there, or not to be looked at: not known to be the filesystem the restore began on
+			return True
+	def say_moved():
 		report.fail(rel, f'the filesystem holding {folder} changed while the restore ran (unmounted, or another mounted over it): what was restored since is not on the disk it began on', rerun=False)
 		report.moved = True
+	moved = moved_now()
+	if moved:
+		say_moved()
 		synced = False
 	if isinstance(disks.handles, OSError):
 		report.fail(rel, f'the disks holding {folder} could not be listed to write the restore out to them: {disks.handles}', rerun=False)
@@ -17249,6 +17270,11 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 		if message is not None:
 			report.fail(rel, message, rerun=False)
 			synced = False
+	# the folder looked at again: a filesystem mounted over it while the syncs ran puts the marker, its removal and the folder's metadata,
+	# written by its path, onto that one
+	if not moved and moved_now():
+		say_moved()
+		synced = False
 	if disks.devs is not None:
 		try:
 			pooled, now = vault_disks(folder)
@@ -17256,33 +17282,51 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 			# the handles were synced: what could not be done is the look for a disk that joined
 			report.fail(rel, f'the disks holding {folder} could not be listed again to check for a disk that joined the pool while the restore ran: {e}', rerun=False)
 			return False
+		# the branch each place the claim listed was the folder's place on
+		claimed = {held: branch for branch, held in disks.held}
+		def replaced(held):
+			# whether the filesystem at the place of a branch the pool listed at the claim is no longer one a handle is of: its disk was
+			# unmounted (lazily, so that its mount point shows the folder under it) or another mounted in its place, and the copies that
+			# landed on it are out of reach. A place that cannot be looked at counts too
+			try:
+				return os.stat(nearest_existing_folder(claimed[held], os.path.relpath(held, claimed[held]))).st_dev not in disks.devs
+			except OSError:
+				return True
 		joined = set()
 		for disk, held in now if pooled else ():
 			if held in disks.passed or disk in joined:
 				continue
+			unmounted = False
 			try:
 				if os.stat(held).st_dev in disks.devs:
 					continue
 			except (FileNotFoundError, NotADirectoryError):
-				# nothing can have landed there
-				continue
+				# nothing can have landed there, unless it is a disk of the claim's that was replaced
+				if held not in claimed or not replaced(held):
+					continue
+				unmounted = True
 			except OSError:
 				# whether it holds the folder cannot be told: counted as holding it
 				pass
 			joined.add(disk)
-			report.fail(rel, f'the disk {disk} joined the pool while the restore ran: what was restored onto it is not known to be on disk', rerun=False)
+			if unmounted:
+				report.fail(rel, f'the disk {disk} was unmounted, or another mounted in its place, while the restore ran: what was restored onto it is not known to be on disk', rerun=False)
+			else:
+				report.fail(rel, f'the disk {disk} joined the pool while the restore ran: what was restored onto it is not known to be on disk', rerun=False)
 			synced = False
 		# a folder on no pool now is on another filesystem than the pool's, failed above: its disks are not called gone as well
 		if pooled:
 			listed = {held for _, held in now}
 			for branch, held in sorted(disks.held):
-				if held in listed or held in disks.passed:
+				if held in listed or (held in disks.passed and held not in disks.denied):
 					continue
 				try:
 					os.stat(held)
 				except (FileNotFoundError, NotADirectoryError):
-					# nothing of the restore can be there
-					continue
+					# nothing of the restore can be there, unless the disk was replaced since the claim (a lazy unmount leaves its mount
+					# point, with no such folder, on the filesystem under it)
+					if not replaced(held):
+						continue
 				except OSError:
 					# whether it holds the folder cannot be told: counted as holding it
 					pass
@@ -17642,7 +17686,12 @@ def accept_restore(job_vault:str, version:KeptVersion, monitor_path:str, rel:str
 	a folder already its vault folder's owner's, which a run stopped while handing them over left with all under it
 	handed over too. Partial files a killed run left are removed. A marker whose copies are not known to be on disk, or
 	must be copied again, is refused (refuse_accept_unsynced()); a sync that fails records recopy 'sync failed' in it.
-	Both syncs go through the handles open_restore_disks() opened at the claim.
+	Both syncs go through the handles open_restore_disks() opened at the claim. A folder found on another filesystem than the
+	claim's (sync_restore(): a lazy unmount, or another filesystem mounted over it) ends it with that failure and changes nothing:
+	nothing is written onto that filesystem, and the marker, on the claim's, stays as it was, with no record of the failed sync, which
+	cannot be written there (a restore's own claim marker says "unsynced", this run has none of its own): a later --accept, once
+	the folder is that filesystem's again, syncs before it hands over as this one did, and what was restored before holds, as its own
+	sync was seen to succeed before the marker lost its record.
 	'''
 	report.version, report.rel, report.target, report.accepted = version, rel, target, True
 	report.marker = os.path.join(target, RESTORE_MARKER_NAME)
