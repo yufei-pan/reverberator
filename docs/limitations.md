@@ -991,7 +991,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   whole-job restore of the top folder) holds the inner disks' mount points too; when both do not fit in one extended
   attribute of the version's folder (about 100 inner mounts, or about 4 KiB of the top folder's own extended
   attributes), the record keeps the mount points and drops the top folder's own extended attributes, with one line
-  saying so: a whole-job restore of that version gives the top folder none of its extended attributes. When the write
+  saying so: a whole-job restore of that version gives the top folder none of its extended attributes. At about 100
+  inner mounts the mount points alone do not fit: the record drops them too, with a line saying so, and keeps the owner,
+  mode and times, so over a lost database no inner disk is paused then. When the write
   of that record fails (an I/O error, or no room even for the owner, mode and times), with its ERROR line, the version
   keeps the record of the version before, whose mount points may be older: if the vault's database is then lost before
   a later version's record is written, an inner disk mounted since that older record and unmounted at that moment reads
