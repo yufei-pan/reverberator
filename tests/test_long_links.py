@@ -325,12 +325,12 @@ def test_real_a_full_comparison_meeting_only_a_link_the_vault_refuses_makes_no_v
 	assert warned(out.out + out.err, link) == 1
 
 
-def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_still_commits_one_version(job, capsys, monkeypatch):
+def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_makes_no_version(job, capsys, monkeypatch):
 	# fails before the fix of TreeWriter.discard_temp() (on main too): the removal of the link's partial copy raises ENAMETOOLONG,
-	# which fails every batch. Now the narrowed limitation: the probe sits in staging, at a short path, and passes; the copy,
-	# written under its temporary name (54 bytes after its slash), passes Linux's 4,096-byte path limit in a folder whose path
-	# in the vault reaches 4,041 bytes, and the link is left out with its line. Such a folder holds no regular file, as one
-	# would fail every backup
+	# which fails every batch; and before round 0.55.6's length rule (spec section 5) each comparison committed a version that
+	# changed nothing, the link left out by its copy, as the probe sits in staging, at a short path, and passes. Now the check takes
+	# the rule first, with no syscall: the copy's temporary name (54 bytes after its slash) passes Linux's 4,095 bytes in a folder
+	# whose path in the vault reaches 4,041 bytes, so the link drops out with its line, unprobed, and no version is made
 	seed_monitor(job, {'a': 'a'})
 	versions = run_backup(job)
 	# the version folder's name keeps its length from V0 to V9
@@ -357,13 +357,10 @@ def test_a_full_comparison_meeting_a_link_in_a_4041_byte_folder_still_commits_on
 	monkeypatch.setattr(os, 'symlink', symlink)
 	capsys.readouterr()
 	for _ in range(2):
-		before = len(versions)
-		versions = run_backup(job)
-		assert len(versions) == before + 1 and not os.path.lexists(os.path.join(versions[-1], os.path.relpath(link, job.monitor)))
+		assert run_backup(job) == versions and not os.path.lexists(os.path.join(versions[-1], os.path.relpath(link, job.monitor)))
 		out = capsys.readouterr()
 		assert warned(out.out + out.err, link) == 1
-	# each check made its probe, which the vault took, and unlinked it: nothing is left in staging
-	assert probes == ['short'] * 2
+	assert probes == []
 	assert not [name for name in os.listdir(rv.staging_path(job.job_vault)) if name.startswith('.link-probe-')]
 
 

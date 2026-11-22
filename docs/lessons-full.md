@@ -160,3 +160,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: a file under another process's write lease (an NFS write delegation, Samba's oplocks) failed the comparison with an error line and was copied again, committing a version that changed nothing.
 - Original design was wrong because: the non-blocking open was there for a FIFO put at a file's place, and it refuses a leased regular file the same way: one flag answered two questions.
 - Lesson: when a flag guards against one hazard, check what else it refuses; tell the cases apart by a handle that cannot block before taking the one that can.
+
+## 2026-11-14 reverberator 0.55.6: an entry whose path the vault refuses is left out, not a failed job
+- Changed: an entry whose path in the vault, or its copy's temporary path, would pass Linux's 4,095 bytes is left out of the version before anything is written, with its NOT BACKED UP line; before, it failed every attempt of its job.
+- Why we had to change: one deep entry stopped every backup of the job, a first version included, for as long as it stayed in the monitored tree.
+- Original design was wrong because: a limit no retry can lift was handled as a failure a retry might fix.
+- Lesson: a limit of the target that no retry lifts is met per entry, by a rule that decides before writing; the entry is reported, and the rest goes on.

@@ -830,6 +830,8 @@ def test_firewatcher_patterns_match_every_alerting_marker_and_not_recovered(pref
 		rv.job_log('my_job-2', 'FAILED: waiting 15 min for /mnt/x: vault filesystem not ready'),
 		rv.job_log('j', 'UNREADABLE: /m/a: [Errno 5] Input/output error; keeping its last backed-up copy'),
 		rv.job_log('j', "NOT BACKED UP: /m/l: a symlink whose text or path is longer than the vault's filesystem takes; left out of this version"),
+		rv.job_log('j', 'NOT BACKED UP: /m/d/f: its path in the vault would be longer than Linux takes (4,095 bytes); left out of this version'),
+		rv.job_log('j', 'NOT BACKED UP: /m/d/f: its path in the vault would be longer than Linux takes (4,095 bytes); this version keeps it'),
 		rv.job_log('j', 'STOPPED: bad pattern'),
 		rv.job_log('j', 'VAULT WRITE ERROR: disk /mnt/vaults_data/a58 failed a sync ([Errno 5] Input/output error): nothing is committed past it, and the next attempt copies again what this one changed'),
 		rv.daemon_error_log('every job is stopped'),
