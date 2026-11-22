@@ -99,6 +99,23 @@ def kept_in_staging(text: str, folder_name: str) -> bool:
 	return match is not None and forward_text(match[1], folder_name) == text and not any(part in ('', '.', '..') for part in match[1].split('/'))
 
 
+def kept_staging_link(path: str, folder_name: str) -> bool:
+	'''
+	Whether path, in staging, is a link the scan keeps while the version folder folder_name is a cut batch's tree: one that
+	kept_in_staging() accepts by its text, or one whose text cannot be read, which the daemon keeps too (empty_staging(): any
+	readlink error but EINVAL, an f2fs link whose text missed the checkpoint answers ENOENT) while an orphan stands, and removes at
+	the first scan with none. The check cannot tell which of the two states it reads, so it passes such a link over, as it does one
+	whose text is the forward form.
+	'''
+	if not os.path.islink(path):
+		return False
+	try:
+		text = os.readlink(path)
+	except OSError:
+		return True
+	return kept_in_staging(text, folder_name)
+
+
 def landing(job_vault: str, folder_name: str, rel: str, backward: bool = None):
 	'''
 	(version folder name, path in it) that holds rel of folder_name once every daemon link on the way is followed, one
@@ -276,7 +293,8 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 	daemon makes both, and a version's root is recorded in its attribute instead). On design R the newest version is the real
 	tree and holds no daemon link, of 0.54's kind or any, except a user's own link whose text has that form, which the
 	monitored tree holds with that text (expected for the newest version). Staging holds nothing but links a cut left there naming the
-	newest version folder (kept_in_staging()). That is accepted whatever the state: the folder is a cut tree until its commit, which the scan keeps the
+	newest version folder (kept_in_staging()), and a link whose text cannot be read, which the daemon keeps while an orphan stands
+	(kept_staging_link()). That is accepted whatever the state: the folder is a cut tree until its commit, which the scan keeps the
 	link for, and the newest version after it, where the scan after the commit removes the link, which this check cannot say it did.
 	'''
 	problems = []
@@ -301,8 +319,7 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 			problems.append(f'left over in the job vault: {name}')
 	if folders:
 		staging = os.path.join(job_vault, STAGING)
-		staged = [name for name in staged
-			if not (os.path.islink(os.path.join(staging, name)) and kept_in_staging(os.readlink(os.path.join(staging, name)), folders[max(folders)]))]
+		staged = [name for name in staged if not kept_staging_link(os.path.join(staging, name), folders[max(folders)])]
 	if staged:
 		problems.append(f'left in staging: {sorted(staged)}')
 	for folder_name, names in lists.items():

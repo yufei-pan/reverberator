@@ -2133,6 +2133,29 @@ def test_the_vault_oracle_takes_only_a_link_naming_the_newest_folder_in_staging(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize('answer', [errno.EIO, errno.ENOENT], ids=['EIO', 'ENOENT'])
+def test_the_vault_oracle_passes_over_a_link_in_staging_it_cannot_read(r_job, monkeypatch, answer):
+	# fails before the residual round's O2 (the fix wave's re-review): check_vault() readlink()ed every link in staging with no try, and
+	# the daemon keeps a link whose text it cannot read (empty_staging(): any readlink error but EINVAL, an f2fs link whose text missed
+	# the checkpoint answers ENOENT) while an orphan stands, so a power-loss run could raise there. It is passed over, as a link whose text
+	# is the forward form is; one that reads and is not, and a folder, are still left in staging (the control)
+	base(r_job)
+	staging = rv.staging_path(r_job.job_vault)
+	os.makedirs(staging, exist_ok=True)
+	newest = os.path.basename(committed_versions(r_job)[-1])
+	os.symlink(rv.forward_text('d', newest), os.path.join(staging, 'unreadable'))
+	os.symlink('/elsewhere', os.path.join(staging, 'elsewhere'))
+	real = os.readlink
+	def readlink(path, *args, **kwargs):
+		if os.path.basename(os.fspath(path)) == 'unreadable':
+			raise OSError(answer, os.strerror(answer), os.fspath(path))
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(os, 'readlink', readlink)
+	left = [line for line in check_vault(r_job.job_vault, {0: snapshot_tree(r_job.monitor)}, set()) if line.startswith('left in staging')]
+	assert left == ["left in staging: ['elsewhere']"]
+
+
+@pytest.mark.unit
 def test_a_name_in_staging_that_is_taken_is_never_given_out_again(tmp_path, monkeypatch):
 	# a link a cut left in staging stays there until the scan after the tree's commit (empty_staging()), the entry's only record over a lost
 	# manifest, and the 6 hex characters TreeWriter.staged() draws at random can be its name: the rename that comes to that name replaces a link.
