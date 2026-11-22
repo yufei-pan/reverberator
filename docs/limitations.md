@@ -663,7 +663,9 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
     the pool has it, not as a link into the pool spells it (reasoned from how mergerfs writes a path, not run on a real
     pool). An entry a version already holds past the limit (a version number's growth, V99 to V100, or a folder renamed
     to a longer name can put one there) stays as it is; its delete leaves it in the newest version, with its line ending
-    `this version keeps it`, and makes no version of its own.
+    `this version keeps it`, and makes no version of its own; but a change in its folder, or a rename of a folder above
+    it, fails every backup of the job until it is gone (deferred: "An entry past the path limit inside a version fails the
+    job's backups when its folder changes").
 - **Why:** a version holds a link as itself, so a vault that cannot hold its text cannot keep it browsable; keeping it
   another way (its text in a file with a marker) would add code, and browsing would show a file where the link was.
   Linux refuses a path past 4,095 bytes on every filesystem, so no version can hold such an entry by its path. A shorter
@@ -887,3 +889,144 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   restart is also how an operator lets a disk taken out for good go.
 - **Revisit when:** the round after 0.55.6: keep those disks in the job's state across a restart, with another way to
   let a disk taken out for good go.
+
+### An entry past the path limit inside a version fails the job's backups when its folder changes
+
+- **Kind:** deferred.
+- **What the operator sees:** an entry a version already holds past Linux's 4,095-byte path limit (it fit when it was
+  written and passed the limit later: the version number gained a digit, V9's 4,095 bytes being V10's 4,096, or a folder
+  above it was renamed to a longer name) makes every backup of the job fail, retried with the growing delay, once a
+  change reaches its folder (a file beside it made, changed or removed while the version before still shares the folder
+  with the newest) or a folder above it is renamed: each attempt fails with `recording ... failed: [Errno 36] File name
+  too long`, until the entry is removed from the monitored tree or a folder above it is renamed shorter. Its own delete
+  is handled (the newest version keeps it, with its NOT BACKED UP line). Only a monitored tree some 4,000 bytes deep can
+  reach it. Found by round 0.55.6's final review and run in a test container; older than 0.55.6, which failed at such an
+  entry's own create.
+- **Why:** the writer of a version reaches its entries by their full paths, which Linux refuses past 4,095 bytes; the
+  length rule refuses an entry before anything is written for it, not one that grows past the limit afterwards.
+- **Revisit when:** the round after 0.55.6: the writer works on a version's entries through a handle of the folder that
+  holds them (dir_fd), so no path it passes is longer than one name.
+
+### An inner disk under one disk of a pool is not paused when another disk shows its folder
+
+- **Kind:** deferred.
+- **What the operator sees:** on a monitored path on a mergerfs pool, a disk mounted inside the tree under one of the
+  pool's disks (an inner disk) is paused while it is unmounted, keeping its files in each new version, only while its
+  folder reads empty through the pool. When another disk of the pool holds an entry in a folder of the same name (any
+  create policy can put one there), the folder is not empty through the pool: the inner disk is not paused, with no
+  `Inner mounts not mounted` line, its files leave each new version (older versions keep them), the job forgets the
+  mount, and once it stays away past Keep N Versions the versions that held its files are pruned, and the vault loses
+  them. No live job has such a disk. Found by round 0.55.6's final review, reasoned from the code, not run.
+- **Why:** the pause looks at the folder through the pool, the union of every disk's folder of that name, as it looks
+  at a disk inside the tree off a pool.
+- **Revisit when:** the round after 0.55.6: record the disk of the pool each inner mount sits under, and look at that
+  disk's folder.
+
+### A disk taken out of a pool's list while the job is idle is not waited for
+
+- **Kind:** deferred.
+- **What the operator sees:** a disk taken out of a mergerfs pool's list (through mergerfs's control file) between a
+  job's backups, still mounted, is never seen leaving: no wait and no line. The next backup works on the pool as it is:
+  a full comparison (each start, an inotify overflow, the Full Comparison Interval) records that disk's files of the
+  monitored path deleted in the version it commits (older versions keep them), a prune removes only what the pool still
+  shows of the oldest version and leaves its part on that disk behind, and a forward link to an entry on that disk fails
+  the backup. A disk taken out during a backup fails it and is waited for. Found by round 0.55.6's final review,
+  reasoned from the code, not run.
+- **Why:** a disk that left is found by comparing the pool's list with the one a backup took when it began; between
+  backups no list is kept.
+- **Revisit when:** the round after 0.55.6: keep each pool's last list per job between backups (with the state of
+  "A daemon restarted while a disk that left its pool is still out forgets to wait for it"), so a disk gone from it is
+  waited for.
+
+### A disk that joins a pool and leaves it within one restore is not seen
+
+- **Kind:** deferred.
+- **What the operator sees:** a restore into a folder on a mergerfs pool fails, when it syncs, for a disk that joined
+  the pool since it began and for one that left; a disk that joins and leaves again between the restore's start and its
+  last sync is seen by neither: copies that landed on it are not synced and are no longer in the pool's view, and the
+  restore says done. Found by round 0.55.6's final review, reasoned from the code, not run.
+- **Why:** the look for a disk that joined reads the pool's list at the sync, and the look for one that left compares
+  it with the list at the restore's start; nothing reads it between.
+- **Revisit when:** the round after 0.55.6: read the pool's list once per batch of copies (one extended-attribute read),
+  keeping every disk seen.
+
+### A folder restore keeps copying after its target moved to another filesystem
+
+- **Kind:** deferred.
+- **What the operator sees:** when the target folder of a restore moves to another filesystem while the restore runs
+  (its disk unmounted lazily, or another filesystem mounted over it), the restore goes on copying by path into what is
+  there now (after a lazy unmount, the folder under the mount point, on the disk below it) until its walk ends, which
+  can fill that filesystem; it fails, naming the change of filesystem, only at its sync after the walk. `--accept`'s
+  walk does the same. Found by round 0.55.6's final review, reasoned from the code, not run.
+- **Why:** the restore looks at its target's filesystem once per sync, as round 0.55.6 chose (one stat a sync).
+- **Revisit when:** the round after 0.55.6: look at it once per batch of copies, and stop there.
+
+### A disk mounted and unmounted inside the tree within one backup is taken for emptied
+
+- **Kind:** deferred.
+- **What the operator sees:** a disk mounted inside the monitored tree after a backup began and unmounted again before
+  that backup commits is in neither mount table the backup reads (after its locks, and at its commit), so the job does
+  not remember it: the version may hold its files (a walk or copy met them while it was mounted), and the next backup
+  takes its empty folder for emptied: the next version lacks those files (older versions keep them), with no `Inner
+  mounts not mounted` line. Found by round 0.55.6's review, reasoned from the code, not run.
+- **Why:** the inner mounts a backup remembers come from the mount tables it reads; none is read between them.
+- **Revisit when:** the round after 0.55.6: remember a mount the backup's walks or copies met too.
+
+### A link given back after a cut can lose its text to a power cut on f2fs
+
+- **Kind:** deferred.
+- **What the operator sees:** after a backup cut between the two renames that record a folder (on a mergerfs pool, or
+  a vault whose filesystem has no exchange), the next start gives the version before its link back. A power cut between
+  that link's write and the flush right after it can leave, on f2fs, a link with no text (see "f2fs can keep a symlink
+  with no text"), which the start after reads as given back and never writes again: that version then holds a broken
+  link where its entry was. Found by round 0.55.6's review, reasoned from the code, not run.
+- **Why:** the flush after the put-back narrows the window to the write itself; the start's judgement takes a link that
+  is there as given back, whatever its text.
+- **Revisit when:** the round after 0.55.6: the judgement reads the link's text, and writes it again when it cannot.
+
+### A top folder with many inner disks loses its own extended attributes from its record
+
+- **Kind:** deferred.
+- **What the operator sees:** the record of the monitored folder's own metadata that each version's folder keeps (for a
+  whole-job restore of the top folder) holds the inner disks' mount points too; when both do not fit in one extended
+  attribute of the version's folder (about 100 inner mounts, or about 4 KiB of the top folder's own extended
+  attributes), the record keeps the mount points and drops the top folder's own extended attributes, with one line
+  saying so: a whole-job restore of that version gives the top folder none of its extended attributes.
+- **Why:** the record is one attribute, so 0.55.5 reads it as it always did and it is one write; the mount points and
+  the top folder's attributes share its room.
+- **Revisit when:** the round after 0.55.6: the mount points in an attribute of their own.
+
+### An I/O or permission error reads as "not there" in parts of a backup's replay
+
+- **Kind:** deferred.
+- **What the operator sees:** where a backup's replay cannot look at a folder above an entry in the version, or at the
+  monitored entry (an lstat that fails with EIO or EACCES), some of its steps take it for missing: a delete drops the
+  entry's row and leaves the entry in the version, with no line; a finished copy's row is dropped and its partial file
+  left in the version, with a false `a folder above it in the version is not a real folder` line; a copy whose source
+  cannot be looked at is passed over with `source no longer exists`; a folder may be left unmade the same way. A later
+  comparison, once the error is gone, puts each right. Found by round 0.55.6's review, reasoned from the code, not run;
+  older than 0.55.6, whose new places read such an error as the error it is.
+- **Why:** those steps ask a look that answers "no" for any error (real_folders_to() without strict, os.path.lexists()).
+- **Revisit when:** the round after 0.55.6: the strict look, which raises an error rather than answering "no", at each
+  step that acts on "not there".
+
+### History names a change a version left out
+
+- **Kind:** deferred.
+- **What the operator sees:** a version's change list, which `history` reads, is written from every entry of its
+  backup, those the replay left out too (an entry whose path the vault cannot hold, a source gone by its copy): history
+  can say an entry was modified, or moved to a place, in a version that kept its old copy or never got the target.
+  Found by round 0.55.6's review, reasoned from the code, not run.
+- **Why:** the list is written from the backup's entries, not from what the replay applied.
+- **Revisit when:** the round after 0.55.6: write the list from what the replay applied.
+
+### A deletion running in a folder a walk is inside slows the walk
+
+- **Kind:** deferred.
+- **What the operator sees:** when a walk of the tree (the watcher's, a comparison's or a folder copy's) is inside a
+  folder while another program deletes the folders in it, the walk lists that folder again for each folder it finds
+  gone, where it should once for each such wave: about the square of their number in names read (tens of seconds for
+  10,000 folders), during which the watcher reads no events (they wait in the kernel's queue, which can overflow into a
+  full comparison). Found by round 0.55.6's final review, reasoned from the code, not run.
+- **Why:** the walk asks the folder's listing again for each name it kept that fails to open (child_gone()).
+- **Revisit when:** the round after 0.55.6: list the folder again once for each wave of names that fail to open.
