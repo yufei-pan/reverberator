@@ -77,7 +77,8 @@ done and reviewed (c18fc76..5212daf); Task 2 (P16's healing check) done and revi
 reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d); Task 6 (P11)
 done and reviewed after one fix round (2cdd763..8c50ca9); Task 7 (P12, D14, D13's watcher half) done and reviewed (094394b..91c80b4; the walk's loop in the faster shape the main
 session ruled on, 7e7feff, at Task 6's figure); Task 8 (D2, D1) done and reviewed (1144d8a); Task 9 (D4) done and reviewed after one fix
-round (4a60607..21345ea); Task 10 building; Tasks 11 to 22 not started.
+round (4a60607..21345ea); Task 10 (D8, D7) done and reviewed (582ee3a, 310a19c); Task 11 building; Tasks 12 to 22
+not started.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
