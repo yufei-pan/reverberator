@@ -13502,7 +13502,9 @@ def record_root_meta(monitor_path:str, version_path:str, inner_mounts:list = Non
 			# record that loses its inner mount points after one that lost the root's attributes alone says so
 			if trimmed.inner_mounts is None and inner_mounts is not None:
 				state = 'trimmed mounts'
-				tell(state, f'The extended attributes and the inner mount points of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes, and a vault database lost meanwhile does not say which inner disks were unmounted')
+				# what was left out: a root with no attributes of its own has only the set to lose
+				gone, restore_says = ('The extended attributes and the inner mount points', 'a whole-job restore gives the top folder none of its extended attributes, and ') if xattrs else ('The inner mount points', '')
+				tell(state, f'{gone} of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so {restore_says}a vault database lost meanwhile does not say which inner disks were unmounted')
 			else:
 				state = 'trimmed'
 				tell(state, f'The extended attributes of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes')

@@ -1566,13 +1566,19 @@ def test_a_record_that_loses_its_set_after_losing_the_roots_attributes_says_so(j
 
 
 def test_a_set_too_big_for_a_root_with_no_attributes_is_left_out_the_same(job, monkeypatch):
-	# the root has no attributes of its own: the only thing to leave out is the set
+	# the root has no attributes of its own: the only thing to leave out is the set. The line says only that: it fails before the residual
+	# round's W1 (the fix wave's second-opinion finding), which said the extended attributes did not fit too, and that a whole-job restore
+	# gives the top folder none of them, for a root that had none
 	store, writes = root_meta_store(monkeypatch, limit=3500)
+	lines = logged(monkeypatch)
 	seed_monitor(job, {'a.txt': 'a'})
 	mounts = [f'mount{i:04}/' for i in range(300)]
 	version = a_version_folder(job)
 	assert rv.record_root_meta(job.monitor, version, mounts)
 	assert rv.load_root_meta(version).inner_mounts is None
+	said = trimmed_lines(lines)
+	assert len(said) == 1 and said[0]['message'].startswith(f'The inner mount points of {job.monitor} do not fit') and 'extended attributes' not in said[0]['message']
+	assert 'a vault database lost meanwhile does not say which inner disks were unmounted' in said[0]['message']
 
 
 def test_a_record_that_does_not_fit_with_nothing_left_out_is_an_error(job, monkeypatch):
