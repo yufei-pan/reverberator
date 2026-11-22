@@ -17300,9 +17300,9 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 	mount point, with no such folder, on the filesystem under it) or replaced by another, found by the filesystem of the nearest
 	existing folder at its place not being one a handle is of (a place that cannot be looked at counts), where a plain ENOENT
 	at the folder passes a branch over. A branch left out at the claim because the user could not open its place is not passed
-	over by that look (disks.denied), as it was warned of, not failed: as no handle is of its filesystem, it is found unmounted or
-	replaced by the nearest existing folder at its place being on another filesystem than the claim found it on, and one whose
-	place the claim could not look at cannot be told so, and stays the warning it was. An unmounted or replaced branch (one the
+	over by that look (disks.denied), as it was not failed (warned of, or synced by another branch's handle of its filesystem):
+	it is found unmounted or replaced by the nearest existing folder at its place being on another filesystem than the claim
+	found it on, and one whose place the claim could not look at cannot be told so, and stays the warning it was. An unmounted or replaced branch (one the
 	claim listed whose place is on a filesystem no handle is of now, the folder there or not, and that the disk holding the
 	folder does not hold by a mount of its own at the branch or below it) is named by the branch as the pool listed it at the
 	claim (the folder at its place is on the filesystem under its mount point now, whose name says nothing), a disk that joined
