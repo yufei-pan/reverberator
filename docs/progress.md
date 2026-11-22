@@ -87,11 +87,10 @@ trim at each commit); Task 17 (P14) done and reviewed after one docs fix round (
 recommended answer); the round's cleanup done in three passes (c752e08..21a5f98) and Task 20's docs (f7e7562; the shared
 lessons file's lines committed, not pushed); the flaky watcher test fixed in the test (4c17b53: it wrote before the
 watcher's settle had removed the moved folder's watches; 22 of 240 runs under load failed before, none after); the final
-review done (2026-11-22: with fixes; its one Important, an entry already past 4,095 bytes inside a version failing
-every backup when a sibling changes or a folder above is renamed, is deferred to the round after 0.55.6 with ten more
-narrow cases, each a deferred entry; thirteen small fixes in one fix wave, running); the VM gate's whole suite passed
-on 4c17b53 but for one new pool test's teardown check (a fix-wave item), its extra runs (alone, XFS, the full crash
-runs) running; then the fix wave's re-review, the gate again on the final commit, and the version (Task 21).
+review done (2026-11-22: with fixes), its fix wave, re-review and residual pass done, every finding fixed or
+bucketed (fourteen deferred entries for the round after 0.55.6); the VM gate passed on the last code commit and the
+container suite on the version commit; version 0.55.6 at 99ce063. Waiting for the user's pick to merge and roll out
+(Q19). The round's record (measurements, Calls to confirm, the build's rulings): `docs/progress/r0556.md`.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -265,6 +264,17 @@ it: the main session's call (2026-11-14).
 
 Round 0.55.6's questions, from its spec (`specs/2026-11-14-r0556-design.md` section 26, 1e96eeb, where each is written
 out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chief decided Q10 to Q12 (2026-11-15).
+
+- **Q19. Roll out 0.55.6** (P1; branch `r0556` at 99ce063, gated: the container suite fails only main's 265 root-needing
+  tests, and the test VM's whole suite, crash and power-loss runs pass). The round's Calls to confirm are in
+  `docs/progress/r0556.md`: the final review's one Important finding and the pool pause rule deferred, not asked; the
+  folder-above-a-link case Not an issue; a few behaviour and wording changes.
+  - (a) Roll out now by the runbook (Recommended): merge into main, the rule-file backup, the restart, the health check;
+    then the scrub of the new commits and the push after a healthy restart (chief's OK for the push).
+  - (b) Hold: the branch stays as it is until the user picks a time.
+  - What waits on it: the merge, the push, and the round after 0.55.6 (its fourteen deferred entries). The user's
+    words behind it: "Fixes round (Recommended)" (2026-11-14); each release rolls out on the user's pick for it
+    (standing decisions).
 
 - **Q18. A folder whose metadata copy fails every time, beyond its extended attributes** (P16 step 2, Task 18). Q15
   (a), which the user picked on 2026-11-17, said: "A copy that fails every time is tried once more, then left." Built,
