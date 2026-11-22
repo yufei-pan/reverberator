@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import shutil
@@ -642,7 +643,6 @@ def test_a_full_comparison_with_it_unmounted_keeps_its_rows(job, tmp_path, fake_
 	assert _recorded(job) == ((os.path.basename(v1), since), ['sub/'])
 
 
-
 @pytest.mark.unit
 def test_its_files_deleted_while_it_is_mounted_are_deleted(job, tmp_path, fake_pool, poll_fast):
 	# pin: the disk mounted and emptied is not paused, as the batch's pool is passed to every look at it: the backuper's comparison of
@@ -660,6 +660,7 @@ def test_its_files_deleted_while_it_is_mounted_are_deleted(job, tmp_path, fake_p
 	assert not full and entries[os.path.join(monitor, 'sub', 'f.txt')].event == 'delete'
 	run_backup(job)
 	assert not os.path.lexists(os.path.join(committed_versions(job)[1], 'sub', 'f.txt'))
+
 
 @pytest.mark.unit
 def test_its_fingerprint_is_the_disks_own(tmp_path, fake_pool):
@@ -684,14 +685,58 @@ def test_the_watcher_compares_it_when_it_is_mounted_again(tmp_path, fake_pool):
 		def add_watch(self, path, mask):
 			return 1
 	inner = {}
+	seen = [None]
 	def follow():
-		return rv.follow_inner_mounts(FakeINotify(), monitor, rv.read_mount_table(), inner, {}, rv.inotify_resource_manager(), 0, queue, threading.Lock())
+		return rv.follow_inner_mounts(FakeINotify(), monitor, rv.read_mount_table(), inner, seen, {}, rv.inotify_resource_manager(), 0, queue, threading.Lock())
 	assert follow() == 1
 	fake_pool.drop(disk)
 	assert follow() == 1 and inner == {}
 	fake_pool.mount(disk)
 	assert follow() == 1 and list(inner) == [os.path.join(monitor, 'sub')]
 	assert [(event.event, event.path) for event in queue] == [('scan', os.path.join(monitor, 'sub'))] * 3
+
+
+@pytest.mark.unit
+def test_the_watcher_reads_the_branch_list_alone_and_keeps_the_last_one_when_a_read_fails(tmp_path, fake_pool, monkeypatch):
+	# review of Task 12, M2 (fails on 829bb9f, which read the whole pool_state() at each table: fstab, a statx of the pool and each branch, so its
+	# read of the branch list failing gave no disks, the disk under the branch read as unmounted, its watches went and a scan was queued, and
+	# the next table mounted it again: a large inner disk compared twice for a read that failed). The watcher takes the pool's mount point and
+	# the branch list from the control file alone, and keeps the last list when a read fails
+	monitor, disk = _a_pool_with_a_disk_under_its_branch(tmp_path, fake_pool)
+	pool = os.path.dirname(monitor)
+	queue = rv.ChangeEventQueue(monitor)
+	class FakeINotify:
+		def rm_watch(self, wd):
+			pass
+		def add_watch(self, path, mask):
+			return 1
+	reads = []
+	for name in ('fstab_mount_points', 'statx_mount'):
+		real = getattr(rv, name)
+		monkeypatch.setattr(rv, name, lambda *args, _real=real, _name=name, **kwargs: reads.append(_name) or _real(*args, **kwargs))
+	inner = {}
+	seen = [rv.watched_pool(monitor, rv.read_mount_table(), None)]
+	assert [branch for branch, _ in seen[0].ids] == [os.path.realpath(os.path.join(tmp_path, 'disks', 'disk1'))]
+	def follow():
+		return rv.follow_inner_mounts(FakeINotify(), monitor, rv.read_mount_table(), inner, seen, {}, rv.inotify_resource_manager(), 0, queue, threading.Lock())
+	assert follow() == 1 and list(inner) == [os.path.join(monitor, 'sub')]
+	assert reads == []
+	fake_pool.unreadable(pool, errno.ENOTCONN)
+	# the read fails: the last list stays, the disk is still the pool's inner mount, nothing is queued
+	assert follow() == 0 and list(inner) == [os.path.join(monitor, 'sub')]
+	assert len(list(queue)) == 1 and reads == []
+
+
+@pytest.mark.unit
+def test_a_pool_the_watcher_never_read_has_no_disks_until_a_table_reads_them(tmp_path, fake_pool):
+	# a start whose branch list cannot be read has no list to keep: no inner mount under a branch is followed until a read answers
+	monitor, disk = _a_pool_with_a_disk_under_its_branch(tmp_path, fake_pool)
+	fake_pool.unreadable(os.path.dirname(monitor), errno.ENOTCONN)
+	table = rv.read_mount_table()
+	first = rv.watched_pool(monitor, table, None)
+	assert first.pool == os.path.dirname(monitor) and first.ids == () and rv.watched_inner_mounts(table, monitor, pool=first) == {}
+	fake_pool.unreadable_pools.pop(os.path.dirname(monitor))
+	assert list(rv.watched_inner_mounts(table, monitor, pool=rv.watched_pool(monitor, table, first))) == [os.path.join(monitor, 'sub')]
 
 
 @pytest.mark.unit
@@ -706,6 +751,6 @@ def test_off_a_pool_inner_mounts_are_as_today(tmp_path):
 	table = [('/', (b'1', b'8:1', b'/', b'/dev/sda1', b'ext4')), (os.path.join(monitor, 'disk'), disk),
 		(os.path.join(root, 'disk1'), (b'3', b'8:33', b'/', b'/dev/sdc1', b'xfs')), (os.path.join(root, 'disk1', 'm', 'sub'), (b'4', b'8:49', b'/', b'/dev/sdd1', b'xfs'))]
 	assert rv.pool_state(monitor, table) is None
-	assert rv.inner_mount_rels(table, monitor) == {'disk/'}
-	assert rv.watched_inner_mounts(table, monitor) == {os.path.join(monitor, 'disk'): disk}
-	assert rv.paused_inner_mounts(monitor, ['disk/', 'gone/'], table) == set()
+	assert rv.inner_mount_rels(table, monitor, pool=None) == {'disk/'}
+	assert rv.watched_inner_mounts(table, monitor, pool=None) == {os.path.join(monitor, 'disk'): disk}
+	assert rv.paused_inner_mounts(monitor, ['disk/', 'gone/'], table, pool=None) == set()

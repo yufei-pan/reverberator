@@ -140,9 +140,9 @@ def test_inner_mount_points_resolve_the_monitored_path(tmp_path):
 	link.symlink_to(real)
 	table = [('/', ('1',)), (str(real), ('2',)), (str(real / 'disk'), ('3',)), (str(real / 'disk'), ('4',)),
 		(str(tmp_path / 'realx'), ('5',))]
-	assert rv.inner_mount_points(table, str(link)) == [str(real / 'disk')]
+	assert rv.inner_mount_points(table, str(link), pool=None) == [str(real / 'disk')]
 	# the watcher works with paths under the monitored path as given, and sees the topmost of stacked mounts
-	assert rv.watched_inner_mounts(table, str(link)) == {str(link / 'disk'): ('4',)}
+	assert rv.watched_inner_mounts(table, str(link), pool=None) == {str(link / 'disk'): ('4',)}
 
 
 @pytest.mark.unit
@@ -150,7 +150,7 @@ def test_watched_inner_mounts_leave_out_skipped_folders(tmp_path):
 	monitor = str(tmp_path / 'm')
 	table = [('/', ('1',)), (monitor + '/disk', ('2',)), (monitor + '/cache/disk', ('3',)), (monitor + '/keep', ('4',))]
 	skip_list = rv.SkipList(monitor, ['disk/', 'cache/', '!cache/disk/'])
-	assert rv.watched_inner_mounts(table, monitor, skip_list) == {monitor + '/keep': ('4',)}
+	assert rv.watched_inner_mounts(table, monitor, skip_list, pool=None) == {monitor + '/keep': ('4',)}
 
 
 @pytest.mark.unit
@@ -346,7 +346,7 @@ def test_scoped_delta_compares_only_the_scope(job, poll_fast, monkeypatch):
 	open(os.path.join(job.monitor, 'a.txt'), 'w').write('outside change')
 	open(os.path.join(job.monitor, 'disk', 'f.txt'), 'w').write('inside change')
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/')
+	rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/', paused=frozenset())
 	manifest.close()
 	assert list(entries) == [os.path.join(job.monitor, 'disk', 'f.txt')]
 
@@ -416,7 +416,7 @@ def test_paused_inner_mounts_need_an_empty_unmounted_folder(tmp_path):
 	table = [('/', ('1',)), (os.path.join(monitor, 'mounted'), ('2',))]
 	remembered = ['empty/', 'full/', 'mounted/', 'gone/', 'file/', 'link/', 'outer/', 'outer/inner/']
 	# outer/inner/ is gone with its outer disk, which keeps it
-	assert rv.paused_inner_mounts(monitor, remembered, table) == {'empty/', 'outer/'}
+	assert rv.paused_inner_mounts(monitor, remembered, table, pool=None) == {'empty/', 'outer/'}
 
 
 @pytest.mark.unit
@@ -574,11 +574,11 @@ def test_scoped_delta_keeps_a_folder_it_cannot_look_at_and_drops_one_that_is_gon
 			return real_lstat(path, *args, **kwargs)
 		monkeypatch.setattr(rv.os, 'lstat', failing_lstat)
 		entries = OrderedDict()
-		rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/')
+		rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/', paused=frozenset())
 		monkeypatch.setattr(rv.os, 'lstat', real_lstat)
 		assert entries == {}
 		shutil.rmtree(disk)
-		rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/')
+		rv.delta_generate_backup_entries(entries, latest, job.monitor, manifest=manifest, scope_rel='disk/', paused=frozenset())
 		assert {path: values.event for path, values in entries.items()} == {disk + '/': 'delete', disk + '/f.txt': 'delete'}
 	finally:
 		manifest.close()
@@ -629,7 +629,7 @@ def test_a_remembered_folder_that_cannot_be_inspected_stays_paused(job, poll_fas
 		return real_lstat(path, *args, **kwargs)
 	monkeypatch.setattr(rv.os, 'lstat', failing_lstat)
 	try:
-		assert rv.paused_inner_mounts(job.monitor, ['disk/'], rv.current_mount_table()) == {'disk/'}
+		assert rv.paused_inner_mounts(job.monitor, ['disk/'], rv.current_mount_table(), pool=None) == {'disk/'}
 		_, manifest, _ = _backup(job)
 	finally:
 		monkeypatch.setattr(rv.os, 'lstat', real_lstat)
@@ -650,7 +650,7 @@ def test_a_skipped_inner_mount_is_neither_paused_nor_remembered(job, poll_fast, 
 	_fake_mounts(monkeypatch, job, ['cache/usb/'])
 	# the disk's folder is added to the skip list while it is unmounted, and a disk is mounted in a skipped folder
 	skip_list = rv.SkipList(job.monitor, ['disk/', 'cache/'])
-	assert rv.paused_inner_mounts(job.monitor, ['disk/'], rv.current_mount_table(), skip_list.skips) == set()
+	assert rv.paused_inner_mounts(job.monitor, ['disk/'], rv.current_mount_table(), skip_list.skips, pool=None) == set()
 	_, manifest, _ = rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault,
 		only_sync_attributes=True, keep_n_versions=0, backup_size_limit='0', skip_list=skip_list)
 	try:

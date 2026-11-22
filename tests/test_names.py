@@ -244,7 +244,7 @@ def test_upgraded_database_reads_nothing_from_the_vault(job, monkeypatch):
 	read = rv.read_vault_record
 	monkeypatch.setattr(rv, 'read_vault_record', lambda *args: reads.append(args) or read(*args))
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor, paused=frozenset()).close()
 	assert entries == OrderedDict() and reads == []
 	assert schema(job) == rv.VaultManifest.SCHEMA
 
@@ -377,7 +377,7 @@ def test_delta_generation_with_bad_names(job, poll_fast):
 	put(job.monitor, b'sub/x\xfe', 'nested')
 	put(job.monitor, b'd\xff/y\xfd', 'deeper')
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor, paused=frozenset()).close()
 	assert schema(job) == rv.VaultManifest.SCHEMA
 	assert {path: values.event for path, values in entries.items()} == {os.path.join(job.monitor, 'bad\udcff.txt'): 'create',
 		os.path.join(job.monitor, 'sub/x\udcfe'): 'create', os.path.join(job.monitor, 'd\udcff/'): 'create', os.path.join(job.monitor, 'd\udcff/y\udcfd'): 'create',
@@ -396,11 +396,11 @@ def test_delta_generation_with_bad_names(job, poll_fast):
 	assert os.fsencode(job.monitor) + b'/bad' + STORED_FF + b'.txt' in [row[0] for row in journal]
 	# a full comparison after the backup finds nothing to do, and finds a change made to such a name
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor, paused=frozenset()).close()
 	assert entries == OrderedDict()
 	put(job.monitor, b'd\xff/y\xfd', 'changed')
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor, paused=frozenset()).close()
 	assert {path: values.event for path, values in entries.items()} == {os.path.join(job.monitor, 'd\udcff/y\udcfd'): 'modify'}
 
 

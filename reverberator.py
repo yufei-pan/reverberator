@@ -3288,9 +3288,11 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 	move_pair_timeout = max(min_snapshot_delay_seconds, MOVE_PAIR_TIMEOUT_SECONDS)
 	# the inner mounts followed (path -> fingerprint), from a table read before any watch is added: every mount change
 	# after it shows in a table the monitor hands over later. on a mergerfs pool, the mounts under its disks below the
-	# monitored path's place too, its disks read with that table ( pool_state(), which reads none off a pool )
+	# monitored path's place too, its disks read with that table ( watched_pool(), which reads none off a pool ), and kept for the next
+	# table's read to fall back on
 	start_table = current_mount_table()
-	inner_mounts = watched_inner_mounts(start_table, monitor_path, skip_list, pool_state(monitor_path, start_table))
+	pool_seen = [watched_pool(monitor_path, start_table, None)]
+	inner_mounts = watched_inner_mounts(start_table, monitor_path, skip_list, pool=pool_seen[0])
 	# the newest mount table from the monitor, until the loop takes it
 	latest_mount_table = [None]
 	mount_table_lock = threading.Lock()
@@ -3340,7 +3342,7 @@ def watchFolder(monitor_path:str,to_process:ChangeEventQueue,to_process_lock:thr
 					clock[0] = lastProcessTime
 			with mount_table_lock:
 				mount_table, latest_mount_table[0] = latest_mount_table[0], None
-			if mount_table is not None and follow_inner_mounts(inotify_obj,monitor_path,mount_table,inner_mounts,wdDic,irm,watch_flags,to_process,to_process_lock,skip_list,job_name,unwatched,found=notes.found,forget=notes.forget):
+			if mount_table is not None and follow_inner_mounts(inotify_obj,monitor_path,mount_table,inner_mounts,pool_seen,wdDic,irm,watch_flags,to_process,to_process_lock,skip_list,job_name,unwatched,found=notes.found,forget=notes.forget):
 				# like an event, so the backuper waits for the tree to settle before comparing the folders
 				lastReadTime = time.monotonic()
 			now = time.monotonic()
@@ -3780,7 +3782,7 @@ def forget_unwatched_under(unwatched:set,folder_path:str) -> None:
 		prefix = folder_norm.rstrip('/') + '/'
 		unwatched.difference_update([folder for folder in unwatched if folder == folder_norm or folder.startswith(prefix)])
 
-def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None,found:dict = None,forget = None) -> int:
+def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,mount_table:list,inner_mounts:dict,pool_seen:list,wdDic:dict,irm:inotify_resource_manager,watch_flags:int,to_process:ChangeEventQueue,to_process_lock:threading.Lock,skip_list:'SkipList' = None,job_name:str = None,unwatched:set = None,found:dict = None,forget = None) -> int:
 	'''
 	Bring the watches in line with a new mount table. Each inner mount mounted, unmounted or replaced since inner_mounts
 	(path -> fingerprint, updated here) is watched again from what is there now, and gets a 'scan' event so the backuper
@@ -3790,10 +3792,11 @@ def follow_inner_mounts(inotify_obj:inotify_simple.INotify,monitor_path:str,moun
 	An unmounted disk's watches go with its IN_UNMOUNT events, or here if those come later (a lazy unmount sends none
 	while the disk is still in use); the mount point folder it uncovers is watched in their place.
 	On a mergerfs pool, a disk mounted under one of its disks below the monitored path's place is followed at the path the
-	pool shows it at (watched_inner_mounts()); the pool's disks are read with each table (pool_state(), which reads none
-	when the monitored path is on no pool).
+	pool shows it at (watched_inner_mounts()); the pool's disks are read with each table, alone (watched_pool()), and pool_seen,
+	a one-item list that holds what the table before gave, keeps its list when a read fails.
 	'''
-	current = watched_inner_mounts(mount_table, monitor_path, skip_list, pool_state(monitor_path, mount_table))
+	pool_seen[0] = watched_pool(monitor_path, mount_table, pool_seen[0])
+	current = watched_inner_mounts(mount_table, monitor_path, skip_list, pool=pool_seen[0])
 	queued = 0
 	for mount_point in sorted(current.keys() | inner_mounts.keys()):
 		fingerprint = current.get(mount_point)
@@ -4147,7 +4150,7 @@ def mount_holding(mount_table:list, path:str):
 	# the mount id makes a fingerprint the one of a single mount
 	return next(point for point, mount in mount_table if mount == fingerprint), os.fsdecode(fingerprint[3])
 
-def inner_mount_points(mount_table:list, monitor_path:str, pool:'PoolState' = None) -> list:
+def inner_mount_points(mount_table:list, monitor_path:str, *, pool:'PoolState | None') -> list:
 	'''
 	The mount points in mount_table (as parse_mount_table gives it) strictly under monitor_path once resolved, sorted. With
 	pool, the pool_state() of the mergerfs pool holding monitor_path, also each mount under a disk of the pool below the
@@ -4156,54 +4159,65 @@ def inner_mount_points(mount_table:list, monitor_path:str, pool:'PoolState' = No
 	Examples:
 		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m', ('2',)), ('/tmp/reverb_doctest/m/disk', ('3',)),
 		...     ('/tmp/reverb_doctest/m/a b', ('4',)), ('/tmp/reverb_doctest/m/disk', ('5',)), ('/tmp/reverb_doctest/mx', ('6',))]
-		>>> inner_mount_points(table, '/tmp/reverb_doctest/m/')
+		>>> inner_mount_points(table, '/tmp/reverb_doctest/m/', pool=None)
 		['/tmp/reverb_doctest/m/a b', '/tmp/reverb_doctest/m/disk']
-		>>> inner_mount_points(table, '/')[:2]
+		>>> inner_mount_points(table, '/', pool=None)[:2]
 		['/tmp/reverb_doctest/m', '/tmp/reverb_doctest/m/a b']
-		>>> inner_mount_points([], '/tmp/reverb_doctest/m')
+		>>> inner_mount_points([], '/tmp/reverb_doctest/m', pool=None)
 		[]
 		>>> pool = PoolState('/tmp/reverb_doctest/pool', (('/tmp/reverb_doctest/d1', '7'),), None, '8')
-		>>> inner_mount_points([('/', ('1',)), ('/tmp/reverb_doctest/d1/m/sub', ('9',))], '/tmp/reverb_doctest/pool/m', pool)
+		>>> inner_mount_points([('/', ('1',)), ('/tmp/reverb_doctest/d1/m/sub', ('9',))], '/tmp/reverb_doctest/pool/m', pool=pool)
 		['/tmp/reverb_doctest/pool/m/sub']
 	'''
 	root = os.path.realpath(monitor_path)
 	prefix = root.rstrip('/') + '/'
 	points = {mount_point for mount_point, _ in mount_table if mount_point != root and mount_point.startswith(prefix)}
 	if pool is not None:
-		points.update(pool_inner_mounts(mount_table, monitor_path, pool))
+		points.update(pool_inner_mounts(mount_table, root, pool))
 	return sorted(points)
 
-def pool_inner_mounts(mount_table:list, monitor_path:str, pool:'PoolState') -> dict:
+def pool_inner_mounts(mount_table:list, root:str, pool:'PoolState') -> dict:
 	'''
-	The mounts under the disks of a mergerfs pool (pool, the pool_state() of the pool holding monitor_path) strictly below
-	monitor_path's place on each, which the pool shows inside monitor_path while they are mounted: {the path the pool shows
-	one at, under monitor_path resolved: its mount point under the disk}. A disk's place is the disk's path joined with
-	monitor_path's below the pool's mount point, as mergerfs maps it. A mount at the place itself is the fstab wait's
-	(pool_state()), not an inner mount: the monitored root cannot be one. Where two disks have one at the same place,
-	the first disk's, in the pool's order, is the one named. Nothing when the pool's disks are not known.
+	The mounts under the disks of a mergerfs pool (pool, as pool_state() or watched_pool() gives it, of the pool holding root)
+	strictly below root's place on each, which the pool shows inside root while they are mounted: {the path the pool shows
+	one at, under root: its mount point under the disk}. root is the monitored path resolved (os.path.realpath()). A disk's place
+	is the disk's path joined with root's below the pool's mount point, as mergerfs maps it. A mount at the place itself is the
+	fstab wait's (pool_state()), not an inner mount: the monitored root cannot be one (for a branch of /, with root the pool's own
+	mount point, the place is / and the mount of / is that). Where two disks have one at the same place, the first disk's, in the pool's order, is the one named.
+	Nothing when the pool's disks are not known. One pass over the table, whatever the number of disks.
 
 	Examples:
 		>>> pool = PoolState('/srv/pool', (('/mnt/disk1', '7'), ('/mnt/disk2', '8')), None, '9')
 		>>> table = [('/', ('1',)), ('/mnt/disk1', ('7',)), ('/mnt/disk1/data', ('2',)), ('/mnt/disk1/data/sub', ('3',)),
 		...     ('/mnt/disk2', ('8',)), ('/mnt/disk2/data/a/usb', ('4',)), ('/mnt/disk2/database', ('5',)), ('/srv/pool', ('9',))]
-		>>> pool_inner_mounts(table, '/srv/pool/data/', pool)
+		>>> pool_inner_mounts(table, '/srv/pool/data', pool)
 		{'/srv/pool/data/sub': '/mnt/disk1/data/sub', '/srv/pool/data/a/usb': '/mnt/disk2/data/a/usb'}
 		>>> pool_inner_mounts(table, '/srv/pool', pool)['/srv/pool/data/sub']
 		'/mnt/disk1/data/sub'
 		>>> pool_inner_mounts(table, '/srv/pool/data', PoolState(None, (), 'the mount table cannot be read', None))
 		{}
+		>>> # two disks with a mount at the same place: the first disk's in the pool's order, whatever the table's order
+		>>> pool_inner_mounts([('/mnt/disk2/data/sub', ('4',)), ('/mnt/disk1/data/sub', ('3',))], '/srv/pool/data', pool)
+		{'/srv/pool/data/sub': '/mnt/disk1/data/sub'}
+		>>> # a branch of / has the mount of / itself, which is no mount under its place
+		>>> pool_inner_mounts([('/', ('1',)), ('/data', ('2',))], '/srv/pool', PoolState('/srv/pool', (('/', '1'),), None, '9'))
+		{'/srv/pool/data': '/data'}
 	'''
 	mounts = {}
 	if not pool.ids:
 		return mounts
-	root = os.path.realpath(monitor_path)
 	rel = os.path.relpath(root, pool.pool)
-	for branch, _ in pool.ids:
-		place = os.path.normpath(os.path.join(branch, rel))
-		prefix = place.rstrip('/') + '/'
-		for mount_point, _ in mount_table:
-			if mount_point.startswith(prefix):
-				mounts.setdefault(os.path.join(root, os.path.relpath(mount_point, place)), mount_point)
+	places = [os.path.normpath(os.path.join(branch, rel)) for branch, _ in pool.ids]
+	prefixes = tuple(place.rstrip('/') + '/' for place in places)
+	# (the disk's place in the pool's order, the path shown, the mount point) of each, the table's order within a disk
+	found = []
+	for mount_point, _ in mount_table:
+		if mount_point.startswith(prefixes):
+			for index, place in enumerate(places):
+				if mount_point != place and mount_point.startswith(prefixes[index]):
+					found.append((index, os.path.join(root, os.path.relpath(mount_point, place)), mount_point))
+	for _, shown, mount_point in sorted(found, key=lambda hit: hit[0]):
+		mounts.setdefault(shown, mount_point)
 	return mounts
 
 def read_mount_table() -> list:
@@ -4638,7 +4652,30 @@ class PoolGuard:
 			self.next_check = now + POOL_CHECK_SECONDS
 		self.require()
 
-def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList' = None, pool:'PoolState' = None) -> dict:
+def watched_pool(monitor_path:str, mount_table:list, last:'PoolState | None') -> 'PoolState | None':
+	'''
+	The mergerfs pool holding monitor_path as a watcher needs it, to follow the mounts under its disks (pool_inner_mounts()): its
+	mount point and its branches (as pool_state() resolves them), read from the pool's control file alone. It leaves out what
+	pool_state() checks for a step (fstab, a statx of each disk, an f2fs's checkpoint), which the monitor's own call and the steps'
+	guards make, and which a watcher given each table would repeat for nothing. None when monitor_path is on no mergerfs mount. When the
+	branch list cannot be read, last's stays, when it was this pool's: with none, a disk mounted under a branch would read as
+	unmounted, its watches go and its folder is compared twice, for a read that failed. A pool never read has no disks until a table
+	reads them.
+
+	Examples:
+		>>> watched_pool('/tmp/reverb_doctest/m', [('/', ('1',))], None) is None
+		True
+	'''
+	pool = mergerfs_mount(mount_table, monitor_path)
+	if pool is None:
+		return None
+	try:
+		branches = read_pool_branches(pool)
+	except OSError:
+		return last if last is not None and last.pool == pool else PoolState(pool, (), None, None)
+	return PoolState(pool, tuple((os.path.realpath(branch), None) for branch in branches), None, None)
+
+def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList' = None, *, pool:'PoolState | None') -> dict:
 	'''
 	The inner mounts a watcher of monitor_path follows: each mount point strictly under it, as a path under monitor_path
 	as given, mapped to the fingerprint of what is mounted there (the topmost of stacked mounts). A mount point the skip
@@ -4649,9 +4686,9 @@ def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList
 	Examples:
 		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m/disk', ('2',)), ('/tmp/reverb_doctest/m/disk', ('3',)),
 		...     ('/tmp/reverb_doctest/m/cache/usb', ('4',))]
-		>>> watched_inner_mounts(table, '/tmp/reverb_doctest/m/')
+		>>> watched_inner_mounts(table, '/tmp/reverb_doctest/m/', pool=None)
 		{'/tmp/reverb_doctest/m/cache/usb': ('4',), '/tmp/reverb_doctest/m/disk': ('3',)}
-		>>> watched_inner_mounts(table, '/tmp/reverb_doctest/m', SkipList('/tmp/reverb_doctest/m', ['cache/']))
+		>>> watched_inner_mounts(table, '/tmp/reverb_doctest/m', SkipList('/tmp/reverb_doctest/m', ['cache/']), pool=None)
 		{'/tmp/reverb_doctest/m/disk': ('3',)}
 		>>> pool = PoolState('/tmp/reverb_doctest/pool', (('/tmp/reverb_doctest/d1', ('7',)),), None, ('8',))
 		>>> watched_inner_mounts([('/', ('1',)), ('/tmp/reverb_doctest/pool', ('8',)), ('/tmp/reverb_doctest/d1', ('7',)),
@@ -4660,8 +4697,8 @@ def watched_inner_mounts(mount_table:list, monitor_path:str, skip_list:'SkipList
 	'''
 	real_root = os.path.realpath(monitor_path)
 	# where each is looked at: a mount under a disk of the pool at its mount point there, unless one is mounted at the path itself
-	places = {} if pool is None else pool_inner_mounts(mount_table, monitor_path, pool)
-	places.update((mount_point, mount_point) for mount_point in inner_mount_points(mount_table, monitor_path))
+	places = {} if pool is None else pool_inner_mounts(mount_table, real_root, pool)
+	places.update((mount_point, mount_point) for mount_point in inner_mount_points(mount_table, monitor_path, pool=None))
 	mounts = {}
 	for shown, mount_point in sorted(places.items()):
 		rel = os.path.relpath(shown, real_root)
@@ -4695,23 +4732,23 @@ def skips_folder_or_parent(skip, rel:str) -> bool:
 	parts = rel.rstrip('/').split('/')
 	return any(skip('/'.join(parts[:depth]) + '/') for depth in range(1, len(parts) + 1))
 
-def inner_mount_rels(mount_table:list, monitor_path:str, skip = None, pool:'PoolState' = None) -> set:
+def inner_mount_rels(mount_table:list, monitor_path:str, skip = None, *, pool:'PoolState | None') -> set:
 	'''
 	The inner mount points in mount_table, as folder rels of monitor_path, but those skip leaves out or that are in a
 	folder it leaves out. With pool, those under a disk of the pool too (inner_mount_points()).
 
 	Examples:
 		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m/disk', ('2',)), ('/tmp/reverb_doctest/m/a/usb', ('3',))]
-		>>> sorted(inner_mount_rels(table, '/tmp/reverb_doctest/m'))
+		>>> sorted(inner_mount_rels(table, '/tmp/reverb_doctest/m', pool=None))
 		['a/usb/', 'disk/']
-		>>> sorted(inner_mount_rels(table, '/tmp/reverb_doctest/m', lambda rel: rel == 'a/'))
+		>>> sorted(inner_mount_rels(table, '/tmp/reverb_doctest/m', lambda rel: rel == 'a/', pool=None))
 		['disk/']
 	'''
 	real_root = os.path.realpath(monitor_path)
-	rels = {os.path.relpath(mount_point, real_root) + '/' for mount_point in inner_mount_points(mount_table, monitor_path, pool)}
+	rels = {os.path.relpath(mount_point, real_root) + '/' for mount_point in inner_mount_points(mount_table, monitor_path, pool=pool)}
 	return {rel for rel in rels if not skips_folder_or_parent(skip, rel)}
 
-def paused_inner_mounts(monitor_path:str, remembered:list, mount_table:list, skip = None, pool:'PoolState' = None) -> set:
+def paused_inner_mounts(monitor_path:str, remembered:list, mount_table:list, skip = None, *, pool:'PoolState | None') -> set:
 	'''
 	The remembered inner mount points (folder rels of monitor_path) that are paused: not mounted in mount_table, with
 	their folder there and empty, as an unmounted disk leaves it, or a folder that cannot be looked at. Walks leave a
@@ -4740,7 +4777,7 @@ def paused_inner_mounts(monitor_path:str, remembered:list, mount_table:list, ski
 			paused.add(rel)
 	return paused
 
-def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mount_tables, skip = None, pool:'PoolState' = None) -> list:
+def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mount_tables, skip = None, pool:'PoolState | None') -> list:
 	'''
 	The inner mount points a backup records with its committed state: those mounted in any of mount_tables, the paused
 	ones, and the remembered ones inside a paused folder, which went away with its disk. Nothing is forgotten when no
@@ -4749,11 +4786,11 @@ def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mou
 
 	Examples:
 		>>> table = [('/', ('1',)), ('/tmp/reverb_doctest/m/new', ('2',))]
-		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['old/', 'old/inner/', 'retired/'], {'old/'}, table, [])
+		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['old/', 'old/inner/', 'retired/'], {'old/'}, table, [], pool=None)
 		['new/', 'old/', 'old/inner/']
-		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['retired/'], set(), [])
+		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['retired/'], set(), [], pool=None)
 		['retired/']
-		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['old/', 'old/inner/'], {'old/'}, table, skip=lambda rel: rel in ('new/', 'old/inner/'))
+		>>> inner_mounts_to_remember('/tmp/reverb_doctest/m', ['old/', 'old/inner/'], {'old/'}, table, skip=lambda rel: rel in ('new/', 'old/inner/'), pool=None)
 		['old/']
 	'''
 	tables = [table for table in mount_tables if table]
@@ -4761,7 +4798,7 @@ def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mou
 		return sorted(rel for rel in remembered if not skips_folder_or_parent(skip, rel))
 	kept = set(paused)
 	for table in tables:
-		kept |= inner_mount_rels(table, monitor_path, skip, pool)
+		kept |= inner_mount_rels(table, monitor_path, skip, pool=pool)
 	kept.update(rel for rel in remembered if any(rel.startswith(folder) for folder in paused))
 	return sorted(rel for rel in kept if not skips_folder_or_parent(skip, rel))
 
@@ -5149,7 +5186,7 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 		latest_version_info = vaultInfo.vault_info_dict[next(reversed(vaultInfo.vault_info_dict))]
 		# the batch's guard holds the pool of the monitored path, whose disks' mounts below its place are inner mounts too
 		paused = paused_inner_mounts(monitor_path,remembered_inner_mounts(manifest,latest_version_info.path),mount_table,None if skip_list is None else skip_list.skips,
-			None if pool_guard is None else pool_guard.state_of(monitor_path))
+			pool=None if pool_guard is None else pool_guard.state_of(monitor_path))
 		backuperTeeLogToTl(job_name,f'Comparing {", ".join(scopes)} with the vault')
 		drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in scopes])
 		if reported is None:
@@ -5972,7 +6009,7 @@ def log_events_to_journal(backup_entries:dict,journal_path:str):
 	lines = [entry_row(path,entry) for path,entry in backup_entries.items()]
 	TSVZ.appendLinesTabularFile(journal_path,lines,header = BACKUP_JOURNAL_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl)
 
-def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str, first_version:bool = False, pool:'PoolState' = None) -> tuple:
+def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str, first_version:bool = False, *, pool:'PoolState | None') -> tuple:
 	'''
 	After a walk of the monitored tree, or the wait for the job's locks that follows a comparison (named by walk in the
 	log): a disk unmounted meanwhile was walked as the empty folder it left, or is gone now, so what the batch found under
@@ -5986,8 +6023,8 @@ def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, 
 	'''
 	walked_table = current_mount_table()
 	check_monitored_mount(monitor_path,walked_table,root_mount)
-	seen_mounts = sorted(set(remembered_mounts) | inner_mount_rels(mount_table,monitor_path,skip,pool))
-	unmounted = paused_inner_mounts(monitor_path,seen_mounts,walked_table,skip,pool) - paused
+	seen_mounts = sorted(set(remembered_mounts) | inner_mount_rels(mount_table,monitor_path,skip,pool=pool))
+	unmounted = paused_inner_mounts(monitor_path,seen_mounts,walked_table,skip,pool=pool) - paused
 	if unmounted:
 		dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in unmounted])
 		if first_version:
@@ -6099,7 +6136,7 @@ def do_backup(backup_entries:dict,
 		# a manifest with none of its own takes those of the newest version's record
 		newest = next(reversed(vaultInfo.vault_info_dict), None)
 		remembered_mounts = remembered_inner_mounts(manifest,None if newest is None else vaultInfo.vault_info_dict[newest].path)
-		paused = paused_inner_mounts(monitor_path,remembered_mounts,mount_table,skip,pool)
+		paused = paused_inner_mounts(monitor_path,remembered_mounts,mount_table,skip,pool=pool)
 		if paused:
 			backuperTeeLogToTl(job_name,f'Inner mounts not mounted, keeping their last backed-up contents: {", ".join(sorted(paused))}')
 		walk_skip = skip_paused(skip,paused)
@@ -11522,7 +11559,7 @@ def full_comparison_since(vault_info_dict:OrderedDict, matched:tuple = None) -> 
 		timestamp = datetime.datetime.strptime(timestamp, VAULT_TIMESTAMP_FORMAT).timestamp()
 	return int(timestamp * 10 ** 9)
 
-def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel = '',paused:set = None,
+def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEntry,monitor_path:str,manifest:VaultManifest = None,skip_list:'SkipList' = None,job_name:str = '',reported:set = None,scope_rel = '',*,paused:set,
 		pool_guard:'PoolGuard' = None,changed_since_wall:int = None) -> VaultManifest:
 	'''
 	Add to backupEntries what changed in monitor_path since the latest version, comparing against its manifest
@@ -11540,9 +11577,8 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	of the entries changed since then compared, by their ctime (ctime_bound()); a TouchedScopes keeps its own times.
 	The whole tree, or scope_rel, has its folders' mtimes compared too, as their events may have been missed; a
 	TouchedScopes, a batch's, does not (compare_monitor_entry()).
-	The paused inner mounts (paused_inner_mounts, from the remembered ones, the mount table now and pool_guard's state of
-	the pool holding monitor_path when not given) are not walked and keep their tracked rows; a scope that is skipped or
-	inside a paused folder compares nothing.
+	The paused inner mounts (paused, as paused_inner_mounts() finds them: the caller's look at the remembered ones and the mount
+	table) are not walked and keep their tracked rows; a scope that is skipped or inside a paused folder compares nothing.
 	With pool_guard, nothing is recorded unless the pools it holds stayed whole: what was read of the vault while a
 	disk of it was out, as a listing of the version that misses that disk's files, is rolled back, and PoolNotReady
 	raised.
@@ -11551,8 +11587,6 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	if manifest is None:
 		manifest = VaultManifest(os.path.dirname(os.path.abspath(latest_version_info.path)))
 	skips = None if skip_list is None else skip_list.skips
-	if paused is None:
-		paused = paused_inner_mounts(monitor_path, remembered_inner_mounts(manifest, latest_version_info.path), current_mount_table(), skips, None if pool_guard is None else pool_guard.state_of(monitor_path))
 	scopes = scope_rel if isinstance(scope_rel, TouchedScopes) else TouchedScopes([scope_rel], [], None, changed_since_wall)
 	if scope_rel:
 		# checked before the transaction, as a scope compared nothing in leaves the manifest as it is. compare_scopes()

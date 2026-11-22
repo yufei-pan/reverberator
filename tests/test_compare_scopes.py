@@ -202,11 +202,11 @@ def test_delta_generation_is_unchanged(job):
 	# a whole scope's comparison compares folders' mtimes too: D/, whose entries were made and removed, is an attrib
 	expected['D/'] = 'attrib'
 	scoped = OrderedDict()
-	assert rv.delta_generate_backup_entries(scoped, latest_version(job), job.monitor, manifest=manifest, scope_rel='D/') is manifest
+	assert rv.delta_generate_backup_entries(scoped, latest_version(job), job.monitor, manifest=manifest, scope_rel='D/', paused=frozenset()) is manifest
 	assert events(job, scoped) == {rel: event for rel, event in expected.items() if rel.startswith('D/')}
 	assert not manifest.conn.in_transaction
 	whole = OrderedDict()
-	rv.delta_generate_backup_entries(whole, latest_version(job), job.monitor, manifest=manifest)
+	rv.delta_generate_backup_entries(whole, latest_version(job), job.monitor, manifest=manifest, paused=frozenset())
 	assert events(job, whole) == expected
 	assert not manifest.conn.in_transaction and manifest.describes(v0)
 	manifest.close()
@@ -323,6 +323,6 @@ def test_a_root_gone_during_the_pass_raises_before_any_deletion(job, monkeypatch
 	monkeypatch.setattr(rv, 'iter_scope_entries', vanishing)
 	before = rows(manifest)
 	with pytest.raises(rv.JobFailure):
-		rv.delta_generate_backup_entries(OrderedDict(), latest_version(job), job.monitor, manifest=manifest, scope_rel='B/')
+		rv.delta_generate_backup_entries(OrderedDict(), latest_version(job), job.monitor, manifest=manifest, scope_rel='B/', paused=frozenset())
 	assert not manifest.conn.in_transaction and rows(manifest) == before
 	manifest.close()

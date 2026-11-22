@@ -229,7 +229,7 @@ def test_a_failed_metadata_copy_carries_the_time_forward(job, monkeypatch):
 def test_delta_generation_writes_no_key(job):
 	seed_monitor(job, {'a.txt': 'a'})
 	run_backup(job)
-	rv.delta_generate_backup_entries(OrderedDict(), latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(OrderedDict(), latest_version(job), job.monitor, paused=frozenset()).close()
 	assert matched(job) is None
 
 

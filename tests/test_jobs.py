@@ -798,7 +798,7 @@ def test_file_bind_mount_is_not_an_inner_mount(tmp_path):
 	(monitor / 'file.cfg').write_text('x')
 	(monitor / 'dir').mkdir()
 	table = [('/', ('1',)), (str(monitor / 'file.cfg'), ('2',)), (str(monitor / 'dir'), ('3',))]
-	assert rv.watched_inner_mounts(table, str(monitor)) == {str(monitor / 'dir'): ('3',)}
+	assert rv.watched_inner_mounts(table, str(monitor), pool=None) == {str(monitor / 'dir'): ('3',)}
 	inner = {}
 	queue = rv.ChangeEventQueue(str(monitor))
 	class FakeINotify:
@@ -806,7 +806,7 @@ def test_file_bind_mount_is_not_an_inner_mount(tmp_path):
 			pass
 		def add_watch(self, path, mask):
 			return 1
-	rv.follow_inner_mounts(FakeINotify(), str(monitor), table[:2], inner, {}, rv.inotify_resource_manager(), 0, queue, threading.Lock())
+	rv.follow_inner_mounts(FakeINotify(), str(monitor), table[:2], inner, [None], {}, rv.inotify_resource_manager(), 0, queue, threading.Lock())
 	assert inner == {} and len(queue) == 0
 
 

@@ -738,7 +738,8 @@ def test_a_prunes_list_with_no_folder_makes_no_reader_wait(job, monkeypatch):
 def real_pool(size_mib=256):
 	"""
 	A folder under REVERB_SCRATCH to make a job in, its vault a mergerfs over two new f2fs images, with the options the pool tests run with. The
-	monitored tree stays off the pool: a pool moves the mtime of folders above a new entry, and no event says so.
+	monitored tree stays off the pool unless a test puts it on (create_job()'s own folder is beside the vault): a pool moves the mtime of folders
+	above a new entry, and no event says so. test_a_tmpfs_under_a_real_branch_is_paused_when_unmounted() monitors a folder of the pool.
 	"""
 	os.makedirs(SCRATCH, exist_ok=True)
 	root = tempfile.mkdtemp(prefix='pool-writer-', dir=SCRATCH)
@@ -863,7 +864,7 @@ def test_a_tmpfs_under_a_real_branch_is_paused_when_unmounted(monkeypatch):
 	# a tmpfs (bound from one kept aside, so it comes back with what it held) mounted under the first branch at the monitored path's
 	# place; a first version; the tmpfs unmounted and a.txt changed, a full comparison: the version keeps the tmpfs's files, "Inner
 	# mounts not mounted" logged; mounted again, the next full comparison copies nothing under it
-	from tests.test_inner_mounts import _lines, _read
+	from tests.test_inner_mounts import _lines, _read, _recorded
 	with real_pool() as root:
 		pool = os.path.join(root, 'vault')
 		job = create_job(os.path.join(root, 'job'))._replace(monitor=os.path.join(pool, 'data'))
@@ -899,6 +900,8 @@ def test_a_tmpfs_under_a_real_branch_is_paused_when_unmounted(monkeypatch):
 			run_backup(job, matched_since=time.time_ns())
 			assert [path for path in copied if path.startswith(os.path.join(job.monitor, 'sub') + '/')] == []
 			assert _read(os.path.join(committed_versions(job)[-1], 'sub', 'g', 'h.txt')) == 'h'
+			# the batch that found nothing to change still records the mount it met, so the next one pauses it again when it goes
+			assert _recorded(job)[1] == ['sub/']
 		finally:
 			subprocess.call(['umount', place], stderr=subprocess.DEVNULL)
 			subprocess.call(['umount', store])

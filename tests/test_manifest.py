@@ -183,7 +183,7 @@ def test_content_rewritten_keeping_size_and_mtime_is_modify_without_reading_the_
 	os.utime(source, ns=(st.st_atime_ns, st.st_mtime_ns))
 	reads = count_vault_reads(monkeypatch)
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor, paused=frozenset()).close()
 	assert entries[source].event == 'modify'
 	assert reads == []
 
@@ -203,7 +203,7 @@ def test_attribute_change_is_attrib(job):
 	source = os.path.join(job.monitor, 'a.txt')
 	os.chmod(source, 0o600)
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor, paused=frozenset()).close()
 	assert entries == OrderedDict([(source, entries[source])]) and entries[source].event == 'attrib'
 
 
@@ -229,7 +229,7 @@ def test_folder_moved_to_another_depth_needs_no_copy(job):
 	os.rename(os.path.join(job.monitor, 'sub'), os.path.join(job.monitor, 'deep', 'er', 'sub'))
 	run_backup(job, OrderedDict([event_entry(job, 'deep/er/sub/', 'move', 'sub/')]))
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor, paused=frozenset()).close()
 	assert entries == {}
 	copy = os.path.join(latest_version(job).path, 'deep', 'er', 'sub', 'x.txt')
 	assert reads_the_file_before(latest_version(job).path, 'deep/er/sub/x.txt', 'sub/x.txt') and open(copy).read() == 'x'
@@ -244,7 +244,7 @@ def test_manifest_for_another_version_is_listed_again_from_the_vault(job):
 	rv.cp_af_copy_path(os.path.join(job.monitor, 'a.txt'), os.path.join(v0, 'a.txt'))
 	tracked_manifest(job.job_vault, os.path.join(job.job_vault, 'V1--2021-01-02_00-00-00_-0800'), ['gone.txt']).close()
 	entries = OrderedDict()
-	manifest = rv.delta_generate_backup_entries(entries, rv.VaultEntry(0, v0, 0, 1, 1), job.monitor)
+	manifest = rv.delta_generate_backup_entries(entries, rv.VaultEntry(0, v0, 0, 1, 1), job.monitor, paused=frozenset())
 	assert {path: values.event for path, values in entries.items()} == {os.path.join(job.monitor, 'new.txt'): 'create'}
 	assert manifest.describes(v0) and manifest.lookup('a.txt').kind == 'f'
 	manifest.close()
@@ -422,7 +422,7 @@ def test_schema_2_upgrades_in_place_keeping_rows(job, monkeypatch):
 	read = rv.read_vault_record
 	monkeypatch.setattr(rv, 'read_vault_record', lambda *args: reads.append(args) or read(*args))
 	entries = OrderedDict()
-	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor).close()
+	rv.delta_generate_backup_entries(entries, latest_version(job), job.monitor, paused=frozenset()).close()
 	assert entries == OrderedDict() and reads == []
 
 
