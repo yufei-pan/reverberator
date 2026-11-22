@@ -466,13 +466,23 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 ### A folder whose extended attributes alone fail to copy keeps the wrong ones
 
 - **Kind:** known limitation.
-- **What the operator sees:** when copying a folder's metadata into a version fails, the copy is tried again at the end
-  of the batch, and a folder that still fails has its record marked so the next comparison copies its owner and mode
-  again. A failure that only ever hits its extended attributes (ACLs among them) is logged with a traceback each time,
-  and the version keeps the folder's xattrs as they were, so a restore gives them back that way.
-- **Why:** records hold no xattrs, so no comparison can see that they differ; recording them would cost every entry.
+- **What the operator sees:** when copying a folder's metadata into a version fails (an ERROR line with a traceback),
+  the commit marks the folder's row, so the next comparison that meets the folder (a full comparison, or a batch that
+  compares it) copies all of its metadata again, its extended attributes (ACLs among them) included, once. A failure
+  that hits every time is tried that once more, which makes one version that changes nothing, and is then left: where
+  only the folder's extended attributes fail (an inherited default ACL not removed, or the source's own attributes not
+  copied), the versions keep its xattrs as they were, so a restore gives them back that way, and the traceback is
+  logged at each copy. A failed copy that also leaves the folder's mode, owner or mtime unlike the monitored folder's
+  (an attribute write failing with a full disk or an I/O error before the mode is set, or a change of owner the vault's
+  filesystem refuses) is copied again at every comparison that meets the folder (when only its mtime differs, at every
+  full comparison), each time making a version that changes nothing, with its ERROR line, as 0.55.5 does; under Keep N
+  Versions each such version pushes the oldest one out.
+- **Why:** records hold no xattrs, so no comparison can see that they differ; recording them would cost every entry. The
+  mark gives a failure that would work if tried its one more try for the price of one value in the row; a give-up mark
+  for a failure that leaves the mode, owner or mtime different would be a second mark with rules of its own.
 - **Revisit when:** such failures are seen in the log.
-- **Approved:** 2026-11-04, the user's choice "All three (Recommended)".
+- **Approved:** 2026-11-04, the user's choice "All three (Recommended)"; 2026-11-17, the mark and its one retry built,
+  the user's answer (through chief) "Build the retry (Recommended)".
 
 ### On a mergerfs pool, a folder cloned to another disk can lose setgid
 
@@ -562,16 +572,23 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** something reads that time.
 - **Approved:** 2026-11-06, "Accept (Recommended)".
 
-### A manifest lost in the same cut as a split on a pool
+### A manifest lost after a cut, on a pool
 
 - **Kind:** known limitation.
 - **What the operator sees:** on a pool, if the manifest is lost in the same power cut that left a folder record or a
   conversion's rename on one disk and not on another, the repair cannot tell a removed entry from a new one. An older
   version can lose an entry, or part of a version being converted can go with staging, with no error. Two faults at
-  once. Reasoned by reading the code, not run.
-- **Why:** a fix would need staged links that carry their path, a new format for a layout no vault here uses.
+  once. Reasoned by reading the code, not run. And when the database is lost after a backup was cut (a kill or a power
+  loss), a file that backup had just copied in new, whose source cannot be read at the retry, keeps the cut copy as its
+  backed-up copy, wrong bytes if the cut damaged it, until the file changes again; its UNREADABLE line ends "keeping the
+  copy a cut backup made of it, which may be damaged". Run on a stand-in pool. Off a pool the start removes such a copy
+  whatever the database, and the file is left out of the version with its line.
+- **Why:** a fix would need staged links that carry their path, a new format for a layout no vault here uses. Over a lost
+  database on a pool the start cannot tell what the cut backup made from an entry of a version whose record is on
+  another disk (the split above), so it removes neither, and a copy it keeps is copied again only when its source reads.
 - **Revisit when:** a vault goes back on a pool.
-- **Approved:** 2026-11-06, "Accept (Recommended)".
+- **Approved:** 2026-11-06, "Accept (Recommended)"; widened to the cut copy kept over a lost database on a pool:
+  chief's decision, 2026-11-15, on the user's words "Support pools with a limitation" (2026-11-04).
 
 ### A monitored tree on a pool: a clone's folder time comes with no event
 
@@ -623,25 +640,42 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Why:** the proper fix is in the kernel; a report is drafted for the f2fs list.
 - **Revisit when:** a kernel carries the fix: then that tolerance in `is_skeleton()` can go.
 
-### A symlink the vault's filesystem can't hold is left out
+### A symlink or a path the vault can't hold is left out
 
 - **Kind:** known limitation.
-- **What the operator sees:** a symlink in the monitored tree whose text or path is longer than the vault's filesystem
-  takes is in no version: on an XFS vault, a link text of 1,024 bytes and up (ext4 and f2fs take up to 4,095). Each
-  backup that meets it logs `reverberator job <name> NOT BACKED UP: <path>: a symlink whose text or path is longer than
-  the vault's filesystem takes; left out of this version`, which alerts, and the rest of the batch is backed up. A path
-  too long is left out this way when the temporary name the copy is first written under passes the limit (in a folder
-  whose path in the vault reaches 4,041 bytes); a link whose own path in the vault passes 4,095 bytes is not left out
-  but fails every backup (deferred: "An entry whose path in the vault passes 4,095 bytes fails every backup"). A
-  version that held a link of that name before keeps it; the new version shows none. A restore that meets such a link
-  (from a vault on another filesystem to a target on XFS) restores everything else, names the link
-  (`FAILED <rel>: not restored: the target's filesystem cannot hold a link that long (its text or its path)`), finishes,
-  and exits 1.
-- **Why:** a version holds a link as itself, so a vault that cannot hold its text cannot keep it browsable. Before 0.55.2
-  the failed copy stopped every backup of the job until the link was gone. Keeping it another way (its text in a file
-  with a marker) would add code, and browsing would show a file where the link was.
-- **Revisit when:** someone needs such links kept on an XFS vault.
-- **Approved:** 2026-11-09, "Accept: leave it out, warn (Recommended)".
+- **What the operator sees:** two kinds of entry in the monitored tree are in no version. Each backup that meets one logs
+  its NOT BACKED UP line once, which alerts, and the rest of the batch is backed up; a batch or full comparison that
+  meets only such entries makes no version.
+  - A symlink whose text is longer than the vault's filesystem takes: on an XFS vault, a link text of 1,024 bytes and up
+    (ext4 and f2fs take up to 4,095), with `reverberator job <name> NOT BACKED UP: <path>: a symlink whose text or path
+    is longer than the vault's filesystem takes; left out of this version`. A version that held a link of that name
+    before keeps it; the new version shows none. A restore that meets such a link (from a vault on another filesystem to
+    a target on XFS) restores everything else, names the link (`FAILED <rel>: not restored: the target's filesystem
+    cannot hold a link that long (its text or its path)`), finishes, and exits 1.
+  - Any entry whose path in the vault would pass Linux's 4,095 bytes (4,096 with its terminating NUL), whatever the
+    filesystem: a file, a link or an entry of another kind, or a folder with everything under it, with `reverberator job
+    <name> NOT BACKED UP: <path>: its path in the vault would be longer than Linux takes (4,095 bytes); left out of this
+    version`. A path in the vault is the Vault Path, the job name, the version folder's name (about 30 bytes) and the
+    path below the monitored root, so only a monitored tree some 4,000 bytes deep meets it. An entry that is copied
+    (anything but a folder) is first written under a temporary name 54 bytes long in its folder, so every such entry in
+    a folder whose path in the vault reaches 4,041 bytes is left out, whatever its own name. On a mergerfs pool the path
+    is counted as mergerfs writes it: the longest disk's path in place of the pool's mount point, and the vault's path as
+    the pool has it, not as a link into the pool spells it (reasoned from how mergerfs writes a path, not run on a real
+    pool). An entry a version already holds past the limit (a version number's growth, V99 to V100, or a folder renamed
+    to a longer name can put one there) stays as it is; its delete leaves it in the newest version, with its line ending
+    `this version keeps it`, and makes no version of its own.
+- **Why:** a version holds a link as itself, so a vault that cannot hold its text cannot keep it browsable; keeping it
+  another way (its text in a file with a marker) would add code, and browsing would show a file where the link was.
+  Linux refuses a path past 4,095 bytes on every filesystem, so no version can hold such an entry by its path. A shorter
+  temporary name (about 20 bytes) would let entries into folders of 4,041 to about 4,075 bytes, at the price of a second
+  name form that the restore's clean-up of its leftovers and the 0.54 prune reader would read from then on. Before 0.55.2
+  such a link stopped every backup of the job until it was gone, and before 0.55.6 such a path did.
+- **Revisit when:** someone needs such links kept on an XFS vault, or a NOT BACKED UP alert names a path too long for the
+  vault.
+- **Approved:** 2026-11-09, "Accept: leave it out, warn (Recommended)", for a symlink; widened to every entry whose path
+  in the vault passes 4,095 bytes, the copy's temporary name kept as it is (which drops the shorter name the deferred fix
+  had planned, which "Fixes round (Recommended)", 2026-11-14, had put in this round): chief's decision, 2026-11-15, on the
+  user's pick of 2026-11-09 for the same case in a symlink.
 
 ### A killed restore copies everything again
 
@@ -692,47 +726,47 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 
 - **Kind:** known limitation.
 - **What the operator sees:** a batch, or a full comparison such as the one at each start, whose only differences are
-  entries it leaves out (an unreadable file, a symlink the vault's filesystem can't hold) commits no version, but for
-  three cases, each of which commits one version that changes nothing; with Keep N Versions, that version pushes the
-  oldest one out:
-  - a symlink in a folder whose full path in the vault reaches 4,041 bytes, in a folder that holds no regular file (one
-    would fail every backup), with the link's NOT BACKED UP line. Its copy is written under a temporary name (a dot, 32
-    hex digits and `.reverberator-partial`, 54 bytes, after its slash), and that path passes Linux's 4,096-byte path
-    limit there, whatever the link's own name. A link whose own path there passes 4,095 bytes fails every backup instead
-    (deferred: "An entry whose path in the vault passes 4,095 bytes fails every backup");
+  entries it leaves out (an unreadable file, an entry whose path the vault refuses, a symlink whose text the vault's
+  filesystem can't hold) commits no version, but for two cases, each of which commits one version that changes nothing;
+  with Keep N Versions, that version pushes the oldest one out:
   - a file readable when the batch is checked and unreadable or gone when it is copied a moment later;
-  - on a mergerfs pool, a symlink the vault's filesystem can't hold, with its NOT BACKED UP line: there the check counts
-    every symlink as a change, as 0.55.4 did.
+  - on a mergerfs pool, a symlink whose text the vault's filesystem can't hold, with its NOT BACKED UP line: there the
+    check counts every symlink as a change, as 0.55.4 did.
 
-  A file that opens but cannot be read makes such a version too, at every comparison that meets it: a deferred fix, in
-  its own entry ("A file that opens but cannot be read makes a version at every comparison").
-- **Why:** the check that keeps such batches from committing runs before the copy, and probes a link's text, not the
-  path its copy is written under. Telling that path apart needs the new version's name and a length rule, for a rare
-  link; closing the race would need the check and the copy to be one step. On a pool the probe, made in staging, can
-  land on another disk than the link's copy, and on a pool of disks with different filesystems it would then leave out
-  a link the vault can hold, which is worse than an empty version.
-- **Revisit when:** such a link is seen in a monitored tree, or such empty versions are seen.
-- **Approved:** 2026-11-12, "Leave that case out (Recommended)"; 2026-11-13, on the race: "Accept the race
+  A file whose read fails only before its last 64 KiB makes such a version too, at every comparison that meets it: a
+  known limitation, in its own entry ("A file whose read fails only before its last 64 KiB makes a version at every
+  comparison").
+- **Why:** the check that keeps such batches from committing runs before the copy; closing the race would need the check
+  and the copy to be one step. On a pool the probe, made in staging, can land on another disk than the link's copy, and
+  on a pool of disks with different filesystems it would then leave out a link the vault can hold, which is worse than
+  an empty version.
+- **Revisit when:** such empty versions are seen.
+- **Approved:** 2026-11-12, "Leave that case out (Recommended)", for a link in a folder whose path in the vault reaches
+  4,041 bytes, a case 0.55.6's length rule takes out of this entry; 2026-11-13, on the race: "Accept the race
   (Recommended)"; 2026-11-13, on the pool case: "Widen the entry (Recommended)".
 
-### A file that opens but cannot be read makes a version at every comparison
+### A file whose read fails only before its last 64 KiB makes a version at every comparison
 
-- **Kind:** deferred.
-- **What the operator sees:** a regular file that opens but whose read fails (a bad sector under it, say, or a read
-  error of a FUSE or network filesystem), when it is the only difference a full comparison finds or the only entry of a
-  batch, makes one version that changes nothing each time, with its UNREADABLE line, the file keeping its last backed-up
-  copy: at every full comparison (every start, each Full Comparison Interval, when events were lost) and at every batch
-  of its events. With Keep N Versions each such version pushes the oldest one out: in a probe with Keep 3, three full
-  comparisons left the three kept versions holding one content of the file where they had held three. A file that does
-  not open makes no version. This is not the race the approved entry above accepts: the read fails every time, so it
-  comes back at every comparison. 0.55.4 does the same (run on both, with a stand-in for cp that fails as GNU cp does on
-  a read error; not run on a failing device).
-- **Why:** older than 0.55.5: 0.55.4 makes such a version for every unreadable file. 0.55.5's check before the copy
-  (`entries_all_drop_out()`) drops a file that does not open, but only opens it; the read fails later, at the copy, after
-  the tree is handed to the new version. Reading the file whole at the check would read it twice whenever the batch goes
-  on.
-- **Revisit when:** the round after 0.55.5, with the fix at the copy: a batch whose every copy left its file out commits
-  nothing, which needs `do_backup()`'s order of hand-over and copy changed.
+- **Kind:** known limitation.
+- **What the operator sees:** a regular file larger than 64 KiB that opens, whose last 64 KiB read, and whose read
+  fails earlier (a bad sector under its first part, say, or a read error of a FUSE or network filesystem there), when
+  it is the only difference a full comparison finds or the only entry of a batch, makes one version that changes nothing
+  each time, with its UNREADABLE line (the file keeping its last backed-up copy, or, when it is new, left out): at every
+  full comparison (every start, each Full Comparison Interval, when events were lost) and at every batch of its events.
+  With Keep N Versions each such version pushes the oldest one out: in a probe on 0.55.5 with Keep 3 (a stand-in for cp
+  that fails as GNU cp does on a read error; not run on a failing device), three full comparisons left the three kept
+  versions holding one content of the file where they had held three. This is not the race the entry above accepts: the
+  read fails every time, so it comes back at every comparison. A file that does not open, or whose last 64 KiB cannot be
+  read, makes no version, with its UNREADABLE line (0.55.5 made one for every file that opens and cannot be read).
+- **Why:** the check before the hand-over (`entries_all_drop_out()`) reads a file's last 64 KiB, the tail every
+  comparison reads, which the copy then reads from the cache. Catching the rest needs the whole file read at the check,
+  a second read of the first file of every batch, uncached for a large one; or the hand-over taken back when every copy
+  of the batch failed, about 40 lines on the commit path where a mistake makes a wrong version, which is the rollback
+  path declined on 2026-11-13 for the race ("Accept the race (Recommended)").
+- **Revisit when:** one file's UNREADABLE alert repeats at full comparisons and `history` shows a new version each time.
+- **Approved:** 2026-11-15, "Known limitation (Recommended)", the user's pick (through chief), shown that it leaves a
+  wrong result the rules call always worth fixing and that "Fixes round (Recommended)" (2026-11-14) had put its fix in
+  this round.
 
 ### A power cut right after a backup hides its version until the next start
 
@@ -750,66 +784,25 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   job starts again.
 - **Approved:** 2026-11-13, "Accept it (Recommended)".
 
-### A lost manifest stops an unmounted inner disk being paused
-
-- **Kind:** deferred.
-- **What the operator sees:** when a job's vault database is lost or unreadable (removed or damaged from outside; the
-  daemon's own messages suggest removing it in some cases), three things go wrong. First, it forgets which inner mounts
-  it had seen. An inner disk unmounted at that moment then looks like an empty folder: the next comparison commits a
-  version with that folder empty, with no "Inner mounts not mounted" line, and when the disk is mounted again every file
-  is copied back. Under Keep N Versions or a size limit, the versions holding the disk's files can be pruned meanwhile,
-  so a disk that never comes back can lose its backup. Second, when a batch was cut (a kill or a power loss) before the
-  database was lost, a file the cut batch had just copied in new, whose source cannot be read at the retry, keeps the
-  cut copy as its backed-up copy: if the cut damaged that copy, the newest version holds wrong bytes for it, with no
-  line but the file's UNREADABLE one, until the file changes again. With the database standing, the start removes such
-  a copy and the file is left out with its line. Third, on a vault filesystem with no RENAME_EXCHANGE (off a pool too), a
-  batch cut between the two renames that put a folder into the version before it (a folder it records, or makes real
-  there to change something in it: a batch that only deletes `p/d` makes `p` real) leaves that version with nothing at
-  that folder once the database is lost, and what the batch deleted or replaced under it is then in no version: the
-  start empties staging, where the cut left the folder's forward link, and no row gives it back. 0.55.4 does the same
-  (run on both).
-- **Why:** the inner mounts are recorded in the database only, so a rebuilt database has none to pause. And without the
-  database the start cannot tell a file the cut batch made from one of the version before whose forward link a cut
-  between two renames left in staging (on a pool, or a filesystem with no exchange): removing the first would remove the
-  second, which is data loss (the design re-check's run N5), so the start keeps both, as 0.55.4 does. The fix belongs at
-  the source: the version's own state kept outside the database, with the version: its inner mounts, and the forward
-  links a cut staged, which already name their places.
-- **Revisit when:** the round after 0.55.5. For the third case, and off a pool the second: a forward link the cut left
-  in staging names its own place in its text (`forward_text()`), so the scan could give it back to the version before
-  ahead of `empty_staging()`, with no database (reasoned, not run).
-
-### An entry whose path in the vault passes 4,095 bytes fails every backup
-
-- **Kind:** deferred.
-- **What the operator sees:** a symlink whose own path in the vault passes 4,095 bytes (Linux's path limit is 4,096
-  bytes with its terminating NUL), or a regular file in a folder whose path in the vault reaches 4,041 bytes (where the
-  temporary name its copy is written under passes the limit), fails every attempt of its job for as long as it is in
-  the monitored tree, and no version is made: the link with `FAILED: recording <rel> in <version> failed: [Errno 36] File
-  name too long`, before any copy, and the file with `FAILED: copying <path> into the vault failed: cp: ... File name too
-  long`, each retried with the growing delay. A path in the vault is the Vault Path, the job name, the version folder's
-  name (about 30 bytes) and the path below the monitored root, so only a monitored tree some 4,000 bytes deep can meet
-  it. 0.55.4 does the same (run on it).
-- **Why:** older than 0.55.5. Neither the copy's temporary name nor the record made at the entry's own path in the
-  version before has a rule for a path the vault refuses, as a link whose text it refuses has (left out with NOT BACKED
-  UP).
-- **Revisit when:** the round after 0.55.5, with the fix at source: a shorter temporary name, and an entry whose path the
-  vault refuses left out at the record step with its NOT BACKED UP line.
-
 ### An xattr change made while down, in a folder renamed during the start's walk
 
-- **Kind:** deferred.
+- **Kind:** known limitation.
 - **What the operator sees:** an extended-attribute-only change made while the daemon is down, to an entry in a folder
   that is then renamed while the start's full comparison walks the tree (between its parent's listing and its own), is
   never compared: the walk finds the folder gone, and the rename's batch compares extended attributes only from its own
   time, then records its matched time past the change. The change is missing from the versions until the entry changes
-  again, with no line. Run on this round's code, before and after its L10 change.
-- **Why:** older than 0.55.5, and a narrow window: a folder renamed in the moment the walk passes it, after an xattr-only
-  change made while nothing watched.
-- **Revisit when:** the round after 0.55.5.
+  again, with no line. Run on 0.55.5's code, before and after its L10 change.
+- **Why:** older than 0.55.5, and three things must meet: an xattr-only change made while nothing watched, a rename of
+  its folder, and that rename in the moment the walk passes it. Each fix costs more than the case: a second whole-tree
+  walk whenever a folder vanishes during a full comparison (three such lines in a week of a live journal, from all
+  walks), or a part with its own state carrying the gone folders and the comparison's bound to the rename's batch.
+- **Revisit when:** a restore is found missing such a change.
+- **Approved:** chief's decision, 2026-11-15, on the user's words on a rare case, "if unable to do this cleanly I think
+  it also make sense to put as limitations" (2026-10-26).
 
 ### A name its parent lists but the kernel cannot look up drops out of a batch's comparison
 
-- **Kind:** deferred.
+- **Kind:** known limitation.
 - **What the operator sees:** on a monitored filesystem that can list a name it cannot look up (name trouble on a CIFS
   or sshfs mount, say, whose lstat of the name answers ENOENT every time), a batch whose comparison walks such a name as
   a scope it touched (a folder or a path of the batch's events) takes it as gone: its rows are deleted, so the
@@ -818,11 +811,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   at every walk; the watcher counts such a folder unwatched, so it holds the matched time ("A paused inner mount or an
   unwatched folder holds the matched time").
 - **Why:** older than 0.55.5. The scope walks (`iter_scope_entries()`, `scope_path_entry()`) take an lstat's ENOENT as
-  gone, which is the normal answer for every folder and file a batch deleted or moved away; asking the parent's listing
-  each time, as the whole-tree walk does on its error path, would list a parent once per deleted entry, about 8 ms for
-  a parent of 100,000 names.
-- **Revisit when:** the round after 0.55.5: the same parent-listing rule in the scope walks, with one listing per parent
-  kept for the comparison.
+  gone, which is the normal answer for every folder and file a batch deleted or moved away; asking the parent's listing,
+  as the whole-tree walk does on its error path, would list the parent of every path a batch finds gone, on the path
+  every delete takes: about 8 ms a batch with a deletion in a folder of 100,000 names, about 0.1 ms in one of 1,000
+  (scaled from that measure). And the case needs an event naming the very name the server lists and refuses: an event's
+  path is the name a local program used, which on such mounts differs from the one the server lists (a charset it maps,
+  a name it mangles), so it is reasoned rare, not seen.
+- **Revisit when:** a job monitors a CIFS or sshfs mount.
+- **Approved:** 2026-11-15, "Known limitation (Recommended)", the user's pick (through chief), with the watcher's half
+  and the whole-tree walk built, shown that "Fixes round (Recommended)" (2026-11-14) had it in this round.
 
 ### A change to the monitored folder's own metadata alone makes no version
 
@@ -841,3 +838,52 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.6: queue that nameless attribute event as a change of the folder, and commit a
   batch holding only it when the top folder's metadata differs from its record (or record it at a full comparison that
   finds no other difference).
+
+### Two restores into one folder on NFS are not kept apart
+
+- **Kind:** known limitation.
+- **What the operator sees:** a restore locks the folder it writes into, so a second run into the same folder is
+  refused while the first runs. On a filesystem that cannot lock a folder (NFS), both runs go ahead: two runs of one
+  restore copy the same bytes, each under a temporary name renamed into place, and end right, but two different
+  versions restored there leave the folder holding files of both, each run saying it is done. Reasoned from the code,
+  not run on NFS.
+- **Why:** the lock is `flock()` on the folder, which such a filesystem refuses. Keeping the runs apart there needs a
+  lock of another kind where flock fails (a POSIX lock on a lock file of the restore's own in the target, a name kept
+  out of the restore's listing), for two runs into one folder at once on NFS.
+- **Revisit when:** restores into an NFS folder are run side by side.
+- **Approved:** 2026-11-15, "Known limitation (Recommended)", the user's pick (through chief).
+
+### A disk out of the pool at the flush's one listing and back before the commit's check leaves its copies unsynced
+
+- **Kind:** deferred.
+- **What the operator sees:** on a vault on a mergerfs pool, a disk taken out of the pool's list (through mergerfs's
+  control file) just as a backup flushes the vault's disks before its commit, and listed again before the commit checks
+  the pool, is flushed by nothing: the backup commits, with no line, while its copies on that disk are not known to be
+  on it. A power cut soon after can then leave them wrong in the committed version (a filesystem's journal can keep a
+  new file's size without its bytes), and a write error on that disk is not heard by that backup. A disk still out at
+  the commit's check fails the backup, as any disk that leaves the pool during a step does. Reasoned from the code, not
+  run.
+- **Why:** the flush lists the pool's disks once and syncs the job vault on each disk listed then; the part that
+  flushes keeps neither the backup's check of the pool nor the disks the backup began with, and a failure raised there
+  today would carry no disk that left, so the next attempt would not wait for that disk.
+- **Revisit when:** the round after 0.55.6: the disk that left raised through the flush, and the prune's flush, as the
+  pool check raises it, so the backup fails and the next attempt waits for the disk.
+
+### A daemon restarted while a disk that left its pool is still out forgets to wait for it
+
+- **Kind:** deferred.
+- **What the operator sees:** a backup that fails because a disk was taken out of its mergerfs pool's list (`disk <disk>
+  left pool <pool> during this step`) makes the job wait, before its next attempt touches the vault, for the pool to
+  list that disk again. The job keeps that disk in memory only: when reverberator restarts while the disk is still out,
+  the job starts with the pool as it is. On the vault's pool, the start's repair of the failed backup then reads the
+  version before through a pool that hides what that disk holds, and can write a link to the new version over a file of
+  the version before whose own copy is on that disk: once the disk is listed again, that version shows the new
+  version's bytes for the file, or its own, by the pool's order of disks, with no line (shown on a stand-in pool, without
+  the wait). On the monitored path's pool, the start's comparison takes the files on that disk for deleted: the new
+  version lacks them, older versions keep them, and they are copied again, at the latest by the first full comparison
+  after the disk is back (each start; the Full Comparison Interval), as the pool raises no event when it lists a disk
+  again (reasoned).
+- **Why:** the disks a failed attempt saw leave its pool are kept in the daemon's memory, which a restart clears; a
+  restart is also how an operator lets a disk taken out for good go.
+- **Revisit when:** the round after 0.55.6: keep those disks in the job's state across a restart, with another way to
+  let a disk taken out for good go.
