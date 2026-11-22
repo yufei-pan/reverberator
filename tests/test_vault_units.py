@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import sys
+import types
 from collections import OrderedDict
 
 import pytest
@@ -1872,7 +1873,7 @@ def folder_backed_up(job, folder='d', top=True):
 
 
 class CutAfterThePutBack(BaseException):
-	'''A kill once the scan gave the links back, before it empties staging.'''
+	'''A kill once the scan gave the links back (and flushed them), before the rest of the tree's repair.'''
 
 
 @pytest.mark.unit
@@ -1880,9 +1881,10 @@ class CutAfterThePutBack(BaseException):
 def test_a_cut_between_two_renames_over_a_lost_manifest_puts_the_staged_link_back(r_job, monkeypatch, rel):
 	# case 3 of spec section 6, fails on 79220a8 (and on 0.55.4): on a vault with no RENAME_EXCHANGE a batch that deletes <rel>/x.txt makes rel real
 	# in the version before by two renames, its forward link to staging first (p first for p/d); a cut between them, the manifest lost, and a
-	# start. The scan gives the link back to the version before ahead of empty_staging() (put_back_staged_links()); a cut after that and before
-	# staging is emptied leaves the link there, which the next scan finds no longer due, and keeps in staging, as its tree stands (fails on
-	# 4232cf1, which emptied staging there). Once rolled forward every version reads right by the
+	# start. The scan keeps the link in staging (empty_staging()) and gives it back to the version before as the tree is made ready for its
+	# roll-forward (put_back_staged_links(), in prepare_roll_forward()); a cut after that, with the repair not done, leaves the link given
+	# back and the staged one, which the next scan finds no longer due, and keeps in staging, as its tree stands (fails on 4232cf1, which
+	# emptied staging there). Once rolled forward every version reads right by the
 	# oracle: the version before what it read before the cut, the newest the monitored tree. For p/d the time of p, which the cut's first rename
 	# moved, is left out: no row gives it back over a lost manifest (the approved limitation "After a crash, a folder whose row holds no record
 	# can keep the backup's time"). On 79220a8 the link goes with staging: the version before holds nothing at rel, and the retry's delete of
@@ -1894,19 +1896,24 @@ def test_a_cut_between_two_renames_over_a_lost_manifest_puts_the_staged_link_bac
 	tree = tree_of(r_job)
 	text = rv.forward_text(rel, os.path.basename(tree))
 	assert staged_link_texts(r_job) == [text]
+	staging = rv.staging_path(r_job.job_vault)
+	# the cut left the link, and the folder exchange_in() had built beside it (the scan removes it, and keeps the link)
+	names = [name for name in os.listdir(staging) if os.path.islink(os.path.join(staging, name))]
+	assert len(names) == 1 and len(os.listdir(staging)) == 2
 	lose_the_manifest(r_job)
-	def cut(job_vault, keep_for=None):
+	def cut(*args, **kwargs):
 		raise CutAfterThePutBack()
 	with monkeypatch.context() as patched:
-		patched.setattr(rv, 'empty_staging', cut)
+		patched.setattr(rv, 'remove_mixed_names', cut)
 		with pytest.raises(CutAfterThePutBack):
 			rv.get_vault_info(r_job.job_vault)
 	link = os.path.join(previous, rel)
 	assert os.path.islink(link) and os.readlink(link) == text, f'the version before holds nothing at {rel}'
-	assert staged_link_texts(r_job) == [text]
+	assert os.listdir(staging) == names and staged_link_texts(r_job) == [text]
 	rv.get_vault_info(r_job.job_vault)
 	assert os.readlink(link) == text
-	assert staged_link_texts(r_job) == [text], 'the scan removed the link while its tree stands'
+	# the one link, and not the folder the cut left beside it (staged_link_texts() lists only links)
+	assert os.listdir(staging) == names and staged_link_texts(r_job) == [text], 'the scan removed the link while its tree stands'
 	roll_forward(r_job)
 	versions = committed_versions(r_job)
 	assert versions == [previous, tree]
@@ -1943,6 +1950,184 @@ def test_a_link_a_cut_left_in_staging_stays_until_the_scan_after_the_commit(r_jo
 	assert os.listdir(rv.staging_path(r_job.job_vault)) == [], 'the scan after the commit kept the link'
 	assert read_view(r_job.job_vault, os.path.basename(previous)) == before
 	assert contents_of(tree) == contents_of(r_job.monitor)
+
+
+def a_cut_between_the_renames_at_d(r_job, monkeypatch, manifest):
+	'''(version before, tree, the staged link's text): folder_backed_up()'s d cut between the two renames of exchange_in(), the manifest lost with manifest 'lost'.'''
+	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
+	folder_backed_up(r_job)
+	os.remove(os.path.join(r_job.monitor, 'd', 'x.txt'))
+	previous = cut_between_the_renames(r_job, monkeypatch, 'd', [(False, 'delete', 'd/x.txt', None)])
+	tree = tree_of(r_job)
+	if manifest == 'lost':
+		lose_the_manifest(r_job)
+	return previous, tree, rv.forward_text('d', os.path.basename(tree))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('manifest', ['lost', 'kept'])
+def test_the_link_a_scan_gives_back_is_flushed_right_after_it_is_written(r_job, monkeypatch, manifest):
+	# the link a cut between the two renames left in staging is given back to the version before as the tree is made ready (by the rows, or by
+	# its text over a lost manifest). A link a power cut left without its text (f2fs, a checkpoint inside symlink(2)) reads as present at the
+	# next scan, which never writes it again, and the commit removes the staged copy: so the vault's disks are flushed at once, where the
+	# roll-forward's own flush is many copies away. The flush finds the link there; the scan after it, with no link to give back, flushes
+	# nothing for it. Fails on eedbabd: the first scan makes no flush
+	previous, tree, text = a_cut_between_the_renames_at_d(r_job, monkeypatch, manifest)
+	link = os.path.join(previous, 'd')
+	seen = []
+	real = rv.flush_or_fail
+	def flush(*args, **kwargs):
+		seen.append((sys._getframe(1).f_code.co_name, os.path.islink(link) and os.readlink(link) == text))
+		return real(*args, **kwargs)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'flush_or_fail', flush)
+		rv.get_vault_info(r_job.job_vault)
+		assert seen == [('prepare_roll_forward', True)]
+		del seen[:]
+		rv.get_vault_info(r_job.job_vault)
+		assert seen == []
+	roll_forward(r_job)
+	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
+
+
+@pytest.mark.unit
+def test_a_failed_sync_after_the_link_given_back_fails_the_scan_and_the_next_goes_on(r_job, monkeypatch):
+	# nothing goes on past a failed sync: the link is written and its flush fails, so the scan fails (JobFailure) with the link in the version
+	# before and its staged copy kept; the next scan, whose sync works, finds the link there, and the roll-forward commits right. Fails on
+	# eedbabd: the scan does not fail
+	previous, tree, text = a_cut_between_the_renames_at_d(r_job, monkeypatch, 'lost')
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'flush_vault_disks', lambda job_vault, job_name: ['/dev/fake'])
+		with pytest.raises(rv.JobFailure) as failed:
+			rv.get_vault_info(r_job.job_vault)
+	assert '/dev/fake failed a sync' in failed.value.reason
+	assert os.readlink(os.path.join(previous, 'd')) == text and staged_link_texts(r_job) == [text]
+	rv.get_vault_info(r_job.job_vault)
+	roll_forward(r_job)
+	assert committed_versions(r_job) == [previous, tree]
+	assert contents_of(tree) == contents_of(r_job.monitor)
+
+
+def a_link_probe_with_its_text_lost(r_job, monkeypatch):
+	'''
+	A cut batch's tree (a modify of small.txt, and a create of new.txt that the version before does not hold) and, in staging, a link probe
+	(link_refused_by_vault()) a cut left, whose readlink answers ENOENT from the returned context's patch on: an f2fs link whose text missed the
+	checkpoint (is_skeleton() reads it so). Returns (version before, tree, the probe's path, the function that starts the stand-in).
+	'''
+	base(r_job)
+	put_text(r_job.monitor, 'small.txt', 's1')
+	put_text(r_job.monitor, 'new.txt', 'n1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'small.txt', None), (False, 'create', 'new.txt', None)], monkeypatch)
+	tree, previous = tree_of(r_job), committed_versions(r_job)[-1]
+	assert os.path.isfile(os.path.join(tree, 'new.txt')) and not os.path.lexists(os.path.join(previous, 'new.txt'))
+	staging = rv.staging_path(r_job.job_vault)
+	os.makedirs(staging, exist_ok=True)
+	probe = os.path.join(staging, '.link-probe-' + 'a' * 32)
+	os.symlink('x' * 20, probe)
+	real = os.readlink
+	def readlink(path, *args, **kwargs):
+		if os.fspath(path) == probe:
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), probe)
+		return real(path, *args, **kwargs)
+	return previous, tree, probe, lambda patched: patched.setattr(rv.os, 'readlink', readlink)
+
+
+@pytest.mark.unit
+def test_a_staged_link_without_its_text_is_passed_over_by_the_put_back(r_job, monkeypatch):
+	# a link in staging whose readlink says ENOENT (a probe a cut left, its text lost on f2fs) records nothing: the put-back passes it over, and
+	# writes the link due beside it. Fails on eedbabd: the put-back raises FileNotFoundError, as it did at every scan
+	previous, tree, probe, lose_text = a_link_probe_with_its_text_lost(r_job, monkeypatch)
+	os.symlink(rv.forward_text('new.txt', os.path.basename(tree)), os.path.join(rv.staging_path(r_job.job_vault), 'a1b2c3'))
+	with monkeypatch.context() as patched, vault_unit(r_job.job_vault):
+		lose_text(patched)
+		written = rv.put_back_staged_links(previous, tree, r_job.job_vault, rv.PoolGuard([r_job.job_vault]))
+	assert written is True
+	assert os.readlink(os.path.join(previous, 'new.txt')) == rv.forward_text('new.txt', os.path.basename(tree))
+
+
+@pytest.mark.unit
+def test_a_link_probe_with_its_text_lost_does_not_fail_the_scan_over_a_lost_manifest(r_job, monkeypatch):
+	# the scan over a lost manifest read every link in staging to give back what a cut left, and a probe with no text failed it at every scan
+	# (VaultScanError) until it was removed by hand. Now empty_staging() removes it first, as it removes any link that is not the tree's, and the
+	# put-back passes over what is left. Fails on eedbabd: the scan fails
+	previous, tree, probe, lose_text = a_link_probe_with_its_text_lost(r_job, monkeypatch)
+	lose_the_manifest(r_job)
+	with monkeypatch.context() as patched:
+		lose_text(patched)
+		rv.get_vault_info(r_job.job_vault)
+	assert not os.path.lexists(probe)
+	roll_forward(r_job)
+	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('answer', [errno.EIO, errno.ENOENT], ids=['EIO', 'ENOENT'])
+def test_empty_staging_keeps_a_link_it_cannot_read_and_removes_one_with_no_text(r_job, monkeypatch, capsys, answer):
+	# keep_for names the orphan whose forward links stay. A link whose readlink fails with anything but "no link" or "no text" (EIO) may be one
+	# of them, the entry's only record over a lost manifest: it stays, with one "Cannot read" line, for the next scan. ENOENT (an f2fs link
+	# whose text missed the checkpoint) records nothing: it goes, with no line. A link of the tree's own stays by its text (the control). Fails
+	# with the EIO branch gone (`continue`): the link is removed
+	staging = rv.staging_path(r_job.job_vault)
+	os.makedirs(staging)
+	tree_name = 'V3--2021-01-01_00-00-00_-0800'
+	os.symlink(rv.forward_text('d', tree_name), os.path.join(staging, 'own'))
+	os.symlink(rv.forward_text('e', tree_name), os.path.join(staging, 'unreadable'))
+	real = os.readlink
+	def readlink(path, *args, **kwargs):
+		if os.path.basename(os.fspath(path)) == 'unreadable':
+			raise OSError(answer, os.strerror(answer), os.fspath(path))
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(rv.os, 'readlink', readlink)
+	capsys.readouterr()
+	rv.empty_staging(r_job.job_vault, tree_name)
+	out = capsys.readouterr().out
+	cannot = [line for line in out.splitlines() if f'Cannot read {os.path.join(staging, "unreadable")} for now' in line]
+	if answer == errno.EIO:
+		assert sorted(os.listdir(staging)) == ['own', 'unreadable'] and len(cannot) == 1, out
+	else:
+		assert os.listdir(staging) == ['own'] and cannot == [], out
+
+
+@pytest.mark.unit
+def test_the_vault_oracle_takes_only_a_link_naming_the_newest_folder_in_staging(r_job):
+	# check_vault()'s reject side (the crash runs take a link in staging that names the newest version's folder as the vault's own state): a link
+	# naming an older version's folder, one naming the newest in a form no hand-over makes, a link to elsewhere and a folder are left in staging
+	base(r_job)
+	staging = rv.staging_path(r_job.job_vault)
+	os.makedirs(staging, exist_ok=True)
+	assert os.listdir(staging) == []
+	newest = os.path.basename(committed_versions(r_job)[-1])
+	def left():
+		return [line for line in check_vault(r_job.job_vault, {0: snapshot_tree(r_job.monitor)}, set()) if line.startswith('left in staging')]
+	os.symlink(rv.forward_text('d', newest), os.path.join(staging, 'a1b2c3'))
+	assert left() == []
+	for name, text in (('older', '../V0--2000-01-01_00-00-00_-0800/d'), ('badform', f'../../{newest}/d'), ('elsewhere', '/etc/passwd'), ('dotdot', f'../../{newest}/d/../e')):
+		os.symlink(text, os.path.join(staging, name))
+		assert left() == [f"left in staging: ['{name}']"], name
+		os.unlink(os.path.join(staging, name))
+	os.mkdir(os.path.join(staging, 'folder'))
+	assert left() == ["left in staging: ['folder']"]
+	os.rmdir(os.path.join(staging, 'folder'))
+	# a name with a newline is a name (the oracle's pattern, which `.` does not match across)
+	os.symlink(rv.forward_text('a\nb', newest), os.path.join(staging, 'newline'))
+	assert left() == []
+
+
+@pytest.mark.unit
+def test_a_name_in_staging_that_is_taken_is_never_given_out_again(tmp_path, monkeypatch):
+	# a link a cut left in staging stays there until the scan after the tree's commit (empty_staging()), the entry's only record over a lost
+	# manifest, and the 6 hex characters TreeWriter.staged() draws at random can be its name: the rename that comes to that name replaces a link.
+	# staged() draws again. Fails on eedbabd: it returns the kept link's path
+	job_vault = str(tmp_path)
+	staging = rv.staging_path(job_vault)
+	os.makedirs(staging)
+	os.symlink('../V1--x/d', os.path.join(staging, 'aaaaaa'))
+	os.mkdir(os.path.join(staging, 'bbbbbb'))
+	draws = iter(['aaaaaa', 'bbbbbb', 'cccccc'])
+	monkeypatch.setattr(rv.uuid, 'uuid4', lambda: types.SimpleNamespace(hex=next(draws) + '0' * 26))
+	writer = rv.TreeWriter(os.path.join(job_vault, 'V1--x'), previous=os.path.join(job_vault, 'V0--x'), job_vault=job_vault, pooled=False)
+	assert writer.staged() == os.path.join(staging, 'cccccc')
+	assert sorted(os.listdir(staging)) == ['aaaaaa', 'bbbbbb']
 
 
 @pytest.mark.unit

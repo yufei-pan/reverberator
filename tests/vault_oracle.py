@@ -94,7 +94,8 @@ def kept_in_staging(text: str, folder_name: str) -> bool:
 		>>> [kept_in_staging(text, 'V3--y') for text in ('../V3--y/a', '../../V3--y/a/b', '../V3--y/a/b', '../../V2--y/a/b', '../../V3--y/a/../b', '../V3--y', '/v/V3--y/a')]
 		[True, True, False, False, False, False, False]
 	'''
-	match = re.fullmatch(r'(?:\.\./)+' + re.escape(folder_name) + r'/(.+)', text)
+	# DOTALL: a rel may hold a newline
+	match = re.fullmatch(r'(?:\.\./)+' + re.escape(folder_name) + r'/(.+)', text, re.DOTALL)
 	return match is not None and forward_text(match[1], folder_name) == text and not any(part in ('', '.', '..') for part in match[1].split('/'))
 
 
@@ -275,7 +276,8 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 	daemon makes both, and a version's root is recorded in its attribute instead). On design R the newest version is the real
 	tree and holds no daemon link, of 0.54's kind or any, except a user's own link whose text has that form, which the
 	monitored tree holds with that text (expected for the newest version). Staging holds nothing but links a cut left there naming the
-	newest version folder (kept_in_staging()), which the scan keeps while that folder is a cut tree, and the scan after its commit removes.
+	newest version folder (kept_in_staging()). That is accepted whatever the state: the folder is a cut tree until its commit, which the scan keeps the
+	link for, and the newest version after it, where the scan after the commit removes the link, which this check cannot say it did.
 	'''
 	problems = []
 	folders, lists = {}, {}
