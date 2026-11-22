@@ -518,15 +518,17 @@ def test_an_entry_left_out_whose_path_is_gone_gets_no_not_backed_up_line_from_th
 	assert f'Not tracking {rel_of(job, gone)}: source no longer exists' in out.out + out.err
 
 
+@pytest.mark.parametrize('skip', ['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('left_out', ['file', 'folder', 'in_a_new_folder'])
-def test_the_size_estimate_charges_nothing_for_what_the_rule_leaves_out(job, monkeypatch, left_out):
+def test_the_size_estimate_charges_nothing_for_what_the_rule_leaves_out(job, monkeypatch, left_out, skip):
 	# review of Task 9, I5 (fails on 869014d: the estimate charges the 1 MiB file, and a size limit prunes old versions for good to make
 	# room for bytes never written): a batch of a change beside an entry the rule leaves out, a file in a folder of 4,041 bytes or a folder
 	# past the limit with a file in it, whole or inside a new folder. The estimate is what the replay copies: a folder with all under it
-	# left out, and a new folder's walk counts the rest of it
+	# left out, and a new folder's walk counts the rest of it, with a skip list's rels or without
 	seed_monitor(job, {'a': 'a'})
 	holder = deep_folder(job, 4041 if left_out == 'file' else 4000)
-	run_backup(job)
+	options = {'skip_list': rv.SkipList(job.monitor, ['*.tmp'])} if skip == 'skip_list' else {}
+	run_backup(job, **options)
 	counted = [os.path.join(job.monitor, 'a')]
 	if left_out == 'file':
 		created = big = os.path.join(holder, 'f')
@@ -549,7 +551,7 @@ def test_the_size_estimate_charges_nothing_for_what_the_rule_leaves_out(job, mon
 	estimates = []
 	real = rv.get_backup_size_inode
 	monkeypatch.setattr(rv, 'get_backup_size_inode', lambda *args, **kwargs: estimates.append(real(*args, **kwargs)) or estimates[-1])
-	backup(job, ('a', 'modify'), (rel_of(job, created) + ('' if left_out == 'file' else '/'), 'create'))
+	backup(job, ('a', 'modify'), (rel_of(job, created) + ('' if left_out == 'file' else '/'), 'create'), **options)
 	assert estimates == [expected]
 
 

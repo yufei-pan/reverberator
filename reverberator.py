@@ -11262,10 +11262,11 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, monitor
 	prefix = skip_list.folder_rel(path) if skip_list else ''
 	skip = skip_list.skips if skip_list else None
 	if version_bytes is not None:
-		# the rule's rels are the monitored folder's, whether or not a skip list names the same
-		prefix = '' if path.rstrip('/') == monitor_path.rstrip('/') else os.path.relpath(path, monitor_path) + '/'
+		# the rule's rels are the monitored folder's: the walk's own when a skip list gave them their prefix, else this folder's before
+		# them, as the walk (and what a test makes of one) yields them as it always did
+		base = '' if skip_list or path.rstrip('/') == monitor_path.rstrip('/') else os.path.relpath(path, monitor_path) + '/'
 		skips = skip
-		skip = lambda rel: (skips is not None and skips(rel)) or vault_path_too_long(version_bytes, rel, not rel.endswith('/'))
+		skip = lambda rel: (skips is not None and skips(rel)) or vault_path_too_long(version_bytes, base + rel, not rel.endswith('/'))
 	for entry_path, _, _ in iter_tree_entries(path, prefix, skip=skip, follow_root=False):
 		try:
 			st = os.lstat(entry_path)
