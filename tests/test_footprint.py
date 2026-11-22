@@ -5,9 +5,9 @@ process of its own over a small tree, gives back what glibc's allocators freed o
 every start is about 29 MB of garbage whatever the tree's size, so a small tree catches a daemon that keeps it. That gate measures
 after a restart's backup, which leaves about 2 MB for the trim after each commit to give back: it passes without that trim. The
 second (round 0.55.6's spec section 11, D15) measures after a burst of batches, and its run with that trim stubbed out shows it
-fails when the trim goes through the start's commit (V0), in the measured process: the 14 MB or so that commit leaves is what tells.
-It bounds the growth of each later batch only coarsely (more than about 280 kB a batch, 5.5 MB over its 20), and cannot tell a trim
-lost only after the later commits: the burst's batches (100 files) free about 2 MB each, and what one freed the next reuses, so a
+fails when the trim is lost through the start's commit (V0), in the measured process: the 14 MB or so that commit leaves is what tells.
+It bounds the growth of each later batch only coarsely (more than about 280 kB a batch from the highest trimmed run, about 430 kB from
+the lowest: 5.5 to 8.4 MB over its 20), and cannot tell a trim lost only after the later commits: the burst's batches (100 files) free about 2 MB each, and what one freed the next reuses, so a
 daemon that keeps its trim after V0 and loses it after every later commit ends inside the trimmed runs' 3 MB spread. A unit pin
 counts the calls instead: test_every_commit_of_a_job_gives_back_what_it_freed.
 '''
@@ -91,7 +91,7 @@ def stop_and_clear(daemon, job):
 	'''A passed gate's end: the daemon stopped, then the job's tree and vault removed; a failed gate keeps them. The burst leaves 21
 	versions of a 23,000 entry tree, and pytest keeps its last three basetemps.'''
 	daemon.send_signal(signal.SIGTERM)
-	daemon.wait(timeout=60)
+	assert daemon.wait(timeout=60) == 0, 'the daemon did not stop with exit status 0'
 	shutil.rmtree(job.monitor)
 	shutil.rmtree(job.vault)
 
@@ -130,10 +130,11 @@ def test_every_commit_of_a_job_gives_back_what_it_freed(job, poll_fast, monkeypa
 	# pin: counts the calls of release_idle_memory() the backuper makes, one for each commit of a job (V0, and two batches that each
 	# change a file) and one for a batch that commits no version (a scan of a folder that matches the vault: no batch of the burst
 	# gate takes that path). The burst gate below cannot tell a trim lost only after the later commits (a probe that kept the first
-	# call's ended inside the trimmed runs' range)
+	# call's ended inside the trimmed runs' range). Each call is recorded with the versions committed when it is made, so a call moved
+	# before its commit shows, and with the manifest it is given, which must be one (a None would skip sqlite's shrink)
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b', 'd/c.txt': 'c'})
 	calls = []
-	monkeypatch.setattr(rv, 'release_idle_memory', lambda manifest: calls.append(manifest))
+	monkeypatch.setattr(rv, 'release_idle_memory', lambda manifest: calls.append((manifest, len(committed_versions(job)))))
 	queue = rv.ChangeEventQueue(job.monitor)
 	lock = threading.Lock()
 	flag = IdleFlag()
@@ -166,6 +167,8 @@ def test_every_commit_of_a_job_gives_back_what_it_freed(job, poll_fast, monkeypa
 		back_to_waiting(3, 3, 'a second batch')
 		batch([rv.ChangeEvent(time.monotonic(), True, 'scan', os.path.join(job.monitor, 'd'), None)])
 		back_to_waiting(4, 3, 'a batch that makes no version')
+		assert [versions for _, versions in calls] == [1, 2, 3, 3], 'a call made before its commit, or not after each'
+		assert all(isinstance(manifest, rv.VaultManifest) for manifest, _ in calls), calls
 	finally:
 		control.fail('test done')
 		thread.join(timeout=5)
