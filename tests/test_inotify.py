@@ -663,11 +663,10 @@ def test_a_folder_replaced_by_a_link_is_never_watched_through_it(tmp_path, monke
 	# or after its watch and before the walk opens it: no watch on the outside folder or the one in it, nothing watched through
 	# the link, and no ERROR line. Fails on 8b411a5: add_watch follows the link at d's path (given with its /), and the walk
 	# lists the outside folder through it, watching its subfolder
-	from tests.harness import on_folder_open
 	root = str(tmp_path / 'm')
 	d = os.path.join(root, 'd')
 	os.makedirs(os.path.join(d, 'x'))
-	outside, sub, swap_d = _outside_and_swap(tmp_path, d)
+	_, _, swap_d = _outside_and_swap(tmp_path, d)
 	real_add = rv.inotify_simple.INotify.add_watch
 	if swap == 'before_its_watch':
 		def add_watch(self, path, mask):
@@ -684,9 +683,8 @@ def test_a_folder_replaced_by_a_link_is_never_watched_through_it(tmp_path, monke
 		assert rv.initializeFolderWatchers(inotify_obj, root, wdDic, irm, WATCH_FLAGS, unwatched=unwatched) != -1
 		assert os.path.islink(d)
 		assert sorted(path.rstrip('/') for path in wdDic.values()) == [root]
+		# the map holds the root alone, and the kernel holds no watch the map does not: none on the outside folder or its subfolder
 		assert irm.current_user_watches == len(wdDic) == _kernel_watches(inotify_obj)
-		# the watch each outside folder has, held already or added by this look
-		assert [wd for wd in (real_add(inotify_obj, folder, WATCH_FLAGS) for folder in (outside, sub)) if wd in wdDic] == []
 	assert unwatched == set()
 	assert [message for message, error in lines if error] == []
 
@@ -1029,7 +1027,8 @@ def test_a_rewalk_that_cannot_read_a_held_folder_keeps_its_watch(job, poll_fast,
 	failed, failing = [], {'on': True}
 	def fail():
 		if failing['on']:
-			# S renamed in Q after the re-walk listed Q: reading it fails, and its own rename event handles it
+			# the stand-in fails S's open while Q's listing still holds S, as an open does after a rename of S in Q that came
+			# after the re-walk listed Q (no rename is made here): the walk's error on S must leave the watch it holds
 			failed.append(S)
 			raise OSError(errno.ENOENT, os.strerror(errno.ENOENT), S)
 	with _ready_watch(job) as (to_process, lock, flag):

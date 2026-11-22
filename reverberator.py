@@ -2682,9 +2682,12 @@ def slugify(value, allow_unicode=False):
 #%% ---- IRM ----
 def raise_open_file_limit() -> int:
 	'''
-	The soft limit of open files raised to the hard one, which needs no privilege: a walk holds a listing a level of the tree
-	(iter_tree_entries(), iter_folder_entries()), and a login shell starts a process with 1,024. Returns the hard limit, 0 when
-	the limit cannot be read or raised. The daemon calls it at start (inotify_resource_manager), and history and restore at theirs.
+	The soft limit of open files raised to the hard one, which needs no privilege: a walk holds a folder's handle and its listing a
+	level of the tree while the folder is listed (iter_tree_entries(): two descriptors a level, as the listing is of a duplicate of
+	the handle it keeps for its entries' stats; iter_folder_entries(): one, a listing by path), and a login shell starts a process
+	with 1,024. Returns the hard limit, 0 when the limit cannot be read or raised. The daemon calls it at start
+	(inotify_resource_manager) and restore at its own. history does not: it reads each version by lstat (read_walked()), walks
+	no tree and holds no listing a level.
 	'''
 	try:
 		soft , hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -16346,8 +16349,6 @@ def vault_pool_warning(job_vault:str) -> bool:
 
 def history_command(args) -> int:
 	'''Print the versions in which a file or folder changed, newest first. Exits 0 once shown, a path never backed up too, 1 when a disk of the vault's pool is missing, or when FSTAB_PATH cannot be read, as a disk it names under a branch cannot then be told (warned on stderr).'''
-	# as the daemon and restore do, whose walks hold a listing a level: a history reads each version by lstat (read_walked())
-	raise_open_file_limit()
 	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
 	rule, rel = find_job(load_command_rules(rule_path), args.path, args.job)
 	job_vault = job_vault_path(rule)

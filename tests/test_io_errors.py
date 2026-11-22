@@ -1043,7 +1043,7 @@ def test_the_size_estimate_of_a_new_folder_replaced_by_a_link_charges_nothing_of
 
 
 def test_a_root_with_a_trailing_slash_yields_the_same_paths(tmp_path):
-	# review focus 3, a pin: a listing of a handle names its entries only, so the walk joins each path itself, where DirEntry.path
+	# pin: review focus 3: a listing of a handle names its entries only, so the walk joins each path itself, where DirEntry.path
 	# joined it. A root given with a trailing / (a rule path may end with one) yields the same paths as without, none with //, and
 	# the walk of / itself yields paths with one / at their start (only its own names kept, the walk stopped early)
 	import itertools
@@ -1061,7 +1061,7 @@ def test_a_root_with_a_trailing_slash_yields_the_same_paths(tmp_path):
 
 
 def test_a_folder_whose_path_passes_4095_bytes_keeps_its_error_and_unreadable_lines(job, poll_fast, monkeypatch, capsys):
-	# pin (spec section 2, test 9): the kernel refuses a path of 4,096 bytes and more (ENAMETOOLONG), which no swap explains: the
+	# pin: spec section 2, test 9: the kernel refuses a path of 4,096 bytes and more (ENAMETOOLONG), which no swap explains: the
 	# folder whose path passes it keeps its ERROR line and its UNREADABLE alert. The monitored folder is itself deep, so its
 	# files' places in the vault, which is not, stay short
 	# 3,900 bytes of the monitored folder's path, made of names of 200 bytes and one shorter

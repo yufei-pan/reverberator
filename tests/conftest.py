@@ -236,8 +236,8 @@ def pytest_configure(config):
 	config.addinivalue_line('markers', 'on_054: this test is of a vault on 0.54: run_backup() and the vaults it writes are the 0.54 daemon\'s (tests/legacy054.py)')
 	# every process of the suite runs with the open file limit the daemon gives itself at start (soft raised to hard), so no
 	# test depends on whether an earlier one in its worker built the daemon's limits: a 1,500 folder deep tree's rmtree
-	# holds an fd per level, over the 1,024 a login shell starts with (2026-11-09, VM gate, EMFILE). The daemon, history and
-	# restore raise their own the same way: tests/test_deep_trees.py starts them at 1,024
+	# holds an fd per level, over the 1,024 a login shell starts with (2026-11-09, VM gate, EMFILE). The daemon and restore raise
+	# their own the same way (history holds no listing a level): tests/test_deep_trees.py starts all three at 1,024
 	rv.raise_open_file_limit()
 
 
