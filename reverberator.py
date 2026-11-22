@@ -5942,7 +5942,7 @@ def do_backup(backup_entries:dict,
 				folders = []
 				# the rels the length rule leaves out ( vault_path_too_long() ), before anything is written for them: a folder with all
 				# under it, as the walk does not go into it
-				version_bytes = len(os.fsencode(backup_folder))
+				version_bytes = len(os.fsencode(backup_folder)) + pool_surplus(pool_guard,job_vault)
 				too_long = []
 				def first_skip(rel):
 					if walk_skip is not None and walk_skip(rel):
@@ -5953,7 +5953,8 @@ def do_backup(backup_entries:dict,
 					return False
 				for monitorEntry, relativePath, isDir in iter_tree_entries(monitor_path,skip=first_skip,errors=walk_errors):
 					pool_guard.poll()
-					backupEntryPath = os.path.join(backup_folder,relativePath)
+					# a folder's rel ends with /, which makes its path a byte longer than the rule measured
+					backupEntryPath = os.path.join(backup_folder,relativePath.rstrip('/'))
 					manifest.add(relativePath,dirty=True)
 					if isDir:
 						os.makedirs(backupEntryPath,exist_ok=True)
@@ -5998,7 +5999,7 @@ def do_backup(backup_entries:dict,
 				# a batch whose every entry would leave the version as it holds it is dropped and goes on as one with none: compared at
 				# the places it touched when it came with entries, or committing no version when no comparison follows it (a batch of
 				# scanned folders, or the findings of a comparison, which are checked again)
-				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,job_vault,pool_guard,job_name,reported):
+				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,job_vault,pool_guard,job_name,reported,manifest):
 					backuperTeeLogToTl(job_name,f'Each of the {len(backup_entries)} backup entries would be left out of a version: dropping them')
 					backup_entries.clear()
 			if tree is None and backup_entries:
@@ -6076,7 +6077,10 @@ def do_backup(backup_entries:dict,
 			tree_now = latest_version_info.path if tree is None else tree
 			attrib_copies = attribs_to_copy(backup_entries,manifest,monitor_path,tree_now) if only_sync_attributes else frozenset()
 			# vault_inodes already holds the tree, and only what the batch adds is new: a delete frees nothing on design R
-			estimated_backup_size, estimated_backup_inode = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = tree_now,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies)
+			# the new version's folder is the tree's when it is handed over already, else the next number after the newest's, and what the replay
+			# leaves out for its path's length ( vault_path_too_long() ) is not counted
+			estimate_bytes = (len(os.fsencode(tree)) if tree is not None else next_version_bytes(latest_version_info.path)) + pool_surplus(pool_guard,job_vault)
+			estimated_backup_size, estimated_backup_inode = get_backup_size_inode(backup_entries=backup_entries,only_sync_attributes=only_sync_attributes,last_vault_version_path = tree_now,monitor_path = monitor_path,skip_list = skip_list,copied = attrib_copies,version_bytes = estimate_bytes)
 			backuperTeeLogToTl(job_name,f'Estimated backup size {estimated_backup_size} and estimated backup inodes {estimated_backup_inode}')
 			this_version_number = latest_version_info.version_number + 1
 			vault_fs_size, vault_fs_inode = get_path_fs_info(vault_path)
@@ -7850,6 +7854,29 @@ def next_version_bytes(newest_path:str) -> int:
 	number = vault_version_number(os.path.basename(newest_path))
 	return len(os.fsencode(newest_path)) + len(str(number + 1)) - len(str(number))
 
+def pool_surplus(pool_guard:'PoolGuard', job_vault:str) -> int:
+	'''
+	How many bytes longer than in the version a path below it is on the disks of job_vault's pool: mergerfs writes
+	<branch>/<the path below the pool's mount point>, and Linux refuses that path past PATH_LIMIT whichever branch the entry
+	lands on, so the rule counts the longest branch's path over the mount point's. 0 off a pool (pool_guard None, or
+	job_vault on none when the step began), and for a branch no longer than the mount point. The branches are the guard's
+	(read once a batch), as it resolved them (realpath), the vault's path as spelled through the pool's mount point.
+
+	Examples:
+		>>> class Guard:
+		...     def __init__(self, state): self.state = state
+		...     def state_of(self, path): return self.state
+		>>> pool = PoolState('/mnt/pool', (('/mnt/disk1/data', 7), ('/mnt/d2', 8)), None, 9)
+		>>> pool_surplus(Guard(pool), '/mnt/pool/v/job'), pool_surplus(Guard(None), '/v/job'), pool_surplus(None, '/v/job')
+		(6, 0, 0)
+		>>> pool_surplus(Guard(PoolState('/mnt/pool', (('/mnt/d1', 7),), None, 9)), '/mnt/pool/v/job'), pool_surplus(Guard(PoolState(None, (), 'no table', None)), '/v/job')
+		(0, 0)
+	'''
+	state = None if pool_guard is None else pool_guard.state_of(job_vault)
+	if state is None or state.pool is None:
+		return 0
+	return max([0] + [len(os.fsencode(branch)) - len(os.fsencode(state.pool)) for branch, _ in state.ids])
+
 def report_path_too_long(job_name:str, path:str, reported:set, kept:bool) -> None:
 	'''
 	The NOT BACKED UP line of path, a monitored entry the length rule leaves out (vault_path_too_long()), once per batch
@@ -8023,17 +8050,21 @@ def source_readable(path:str) -> bool:
 		return False
 	return True
 
-def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str, job_vault:str, pool_guard:'PoolGuard', job_name:str, reported:set) -> bool:
+def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str, job_vault:str, pool_guard:'PoolGuard', job_name:str, reported:set, manifest:'VaultManifest') -> bool:
 	'''
 	Whether every entry of backup_entries, a batch with no tree to roll forward, would drop out of its version: the replay
-	would leave the version as it holds it, so the batch is compared as one with none (do_backup()). In four passes,
+	would leave the version as it holds it, so the batch is compared as one with none (do_backup()). In three passes,
 	cheapest first, stopping at the first entry that would change the version (False):
-	1. the replay's length rule (vault_path_too_long(), in the version after newest_path: next_version_bytes()), with no syscall: an
-	   entry it leaves out whole drops out, as nothing is written for it: a create, a modify or an attrib whose path, or its copy's
-	   temporary path when it is no folder, passes the limit; a delete whose own path does, which the version keeps; and a move whose
-	   source's own path does and whose target's copy would, replayed as the delete of its source and the copy to its target;
-	2. a delete or a move left changes it, with no syscall (an untracked delete has gone already, drop_untracked_deletes());
-	3. every other entry (a create, a modify or an attrib, of a folder too) has its monitored path looked at, one lstat: a
+	1. the replay's length rule (vault_path_too_long(), in the version after newest_path: next_version_bytes(), and a pool's
+	   surplus, pool_surplus()), with no syscall, on the entries the replay takes: what a folder create above an entry copies
+	   is pruned as the replay prunes it (prune_entries_covered_by_dir_creates()), so a folder left out is one line, not one
+	   for each entry below it. An entry the rule leaves out whole drops out, as nothing is written for it: a create, a modify
+	   or an attrib whose path, or its copy's temporary path when it is no folder, passes the limit; a delete whose own path
+	   does, which the version keeps; and a move whose source's own path does and whose target's copy would, replayed as the
+	   delete of its source and the copy to its target. A delete or a move the rule leaves in changes the version (an untracked
+	   delete has gone already, drop_untracked_deletes()), but for a move whose source the manifest does not track: the replay
+	   renames nothing then, and copies the target, so it is the create of its target, taken as one below;
+	2. every other entry (a create, a modify or an attrib, of a folder too) has its monitored path looked at, one lstat: a
 	   folder changes it, as does a regular file that opens and reads, and an entry of another kind (a FIFO, a socket, a
 	   device, which cp -a copies as itself). A regular file is opened once, non-blocking, and read through that handle: its
 	   last HASH_SIZE bytes (64 KiB), the tail the comparison reads ( hash_file() ), which the copy then reads from the page
@@ -8051,7 +8082,7 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   subfolder's own folders out of the version, with no rows. An attrib entry asks it before its own lstat, as the
 	   replay's attrib branch copies the folder before it looks at the entry: one that is gone or cannot be looked at counts
 	   as a change there, where a create or a modify of a gone path drops out (copy_path() returns at its lexists check first);
-	4. only when every entry is still in doubt, each symlink: it changes the version when newest_path, the newest version
+	3. only when every entry is still in doubt, each symlink: it changes the version when newest_path, the newest version
 	   (the tree before the hand-over), holds an entry at its place, as leaving the link out removes that entry, and otherwise
 	   unless the vault refuses its text (link_refused_by_vault()). On a pool (pool_guard.covers(job_vault)) a symlink always
 	   counts as a change and is never probed, as on 0.55.4: the probe sits in staging, on the branch staging is on, and a pool
@@ -8064,23 +8095,31 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	'''
 	# the lines the drop-outs get, written once every entry is known to drop out
 	lines = []
-	version_bytes = next_version_bytes(newest_path)
+	version_bytes = next_version_bytes(newest_path) + pool_surplus(pool_guard, job_vault)
 	rest = []
-	for key, values in backup_entries.items():
+	for key, values in prune_entries_covered_by_dir_creates(backup_entries).items():
 		path = key.rstrip('/')
 		rel = os.path.relpath(path, monitor_path)
 		copied = not key.endswith('/')
 		if values.event == 'move':
 			source = values.source_path.rstrip('/')
-			if vault_path_too_long(version_bytes, os.path.relpath(source, monitor_path), False) and vault_path_too_long(version_bytes, rel, copied):
-				lines += [('kept', source, None), ('too long', path, None)]
-				continue
-		elif vault_path_too_long(version_bytes, rel, copied and values.event != 'delete'):
-			lines.append(('kept' if values.event == 'delete' else 'too long', path, None))
+			source_rel = os.path.relpath(source, monitor_path)
+			if manifest.tracks(source_rel):
+				if vault_path_too_long(version_bytes, source_rel, False) and vault_path_too_long(version_bytes, rel, copied):
+					lines += [('kept', source, None), ('too long', path, None)]
+					continue
+				return False
+			# nothing of the source is in the version to rename: the replay copies the target
+			values = BackupEntryValues(values.iso_time, 'create', None)
+		if values.event == 'delete':
+			if not vault_path_too_long(version_bytes, rel, False):
+				return False
+			lines.append(('kept', path, None))
+			continue
+		if vault_path_too_long(version_bytes, rel, copied):
+			lines.append(('too long', path, None))
 			continue
 		rest.append((key, values))
-	if any(values.event in ('delete', 'move') for _, values in rest):
-		return False
 	# whether copy_path() would copy a folder whole for the entry at path: its parent is no real folder in newest_path, so the replay
 	# has no row of it ( untracked_folder_above() ). the parents found real are kept, as an entry's siblings share the lstat
 	real_parents = set()
@@ -8163,6 +8202,9 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			return False
 		lines.append(('refused', path, None))
 	for kind, path, error in lines:
+		if kind == 'too long' and not os.path.lexists(path):
+			# gone since the batch was taken: the replay says so, and has nothing to leave out
+			kind = 'gone'
 		if kind == 'gone':
 			backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not tracking {os.path.relpath(path, monitor_path)}: source no longer exists')
 			continue
@@ -11197,13 +11239,17 @@ def vault_charge(st:os.stat_result, block:int) -> int:
 		return min(st.st_blocks * 512, -(-st.st_size // block) * block)
 	return st.st_blocks * 512
 
-def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int) -> tuple:
+def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, monitor_path:str = None, version_bytes:int = None) -> tuple:
 	'''
 	What path takes once copied into a vault with blocks of block bytes (vault_charge()) and its inode count, and for a
 	folder (ending with /) those of what the skip list (None: nothing is skipped) leaves below it, for a copy that leaves
 	the skipped paths out. Skipped folders are not descended into, and entries that vanish are left out. Each name is
-	counted, as the replay copies each name of a hard-linked file on its own.
+	counted, as the replay copies each name of a hard-linked file on its own. With version_bytes, the length of the version
+	folder's path (the length rule is asked of monitor_path's entries), what the replay leaves out (vault_path_too_long()) is
+	left out too: nothing for an entry the rule leaves out, and a folder of them not descended into.
 	'''
+	if version_bytes is not None and vault_path_too_long(version_bytes, os.path.relpath(path, monitor_path), not path.endswith('/')):
+		return 0, 0
 	try:
 		st = os.lstat(path)
 	except OSError:
@@ -11213,8 +11259,14 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int) -> tupl
 		return size, inodes
 	# a folder of the batch, which is not a configured path: one replaced by a link since the batch was taken is not walked through it,
 	# as the copy walk does not copy it
-	walk = iter_tree_entries(path, skip_list.folder_rel(path), skip=skip_list.skips, follow_root=False) if skip_list else iter_tree_entries(path, follow_root=False)
-	for entry_path, _, _ in walk:
+	prefix = skip_list.folder_rel(path) if skip_list else ''
+	skip = skip_list.skips if skip_list else None
+	if version_bytes is not None:
+		# the rule's rels are the monitored folder's, whether or not a skip list names the same
+		prefix = '' if path.rstrip('/') == monitor_path.rstrip('/') else os.path.relpath(path, monitor_path) + '/'
+		skips = skip
+		skip = lambda rel: (skips is not None and skips(rel)) or vault_path_too_long(version_bytes, rel, not rel.endswith('/'))
+	for entry_path, _, _ in iter_tree_entries(path, prefix, skip=skip, follow_root=False):
 		try:
 			st = os.lstat(entry_path)
 		except OSError:
@@ -11223,7 +11275,7 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int) -> tupl
 		inodes += 1
 	return size, inodes
 
-def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset()):
+def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset(),version_bytes:int = None):
 	'''
 	What the vault grows by as the replay copies the backup entries, in bytes and in inodes: each regular file charged what
 	its copy takes in the vault (vault_charge(), with the block size of the vault's filesystem, read once), by one walk of
@@ -11243,6 +11295,8 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 		monitor_path (str): The path of the monitored path
 		skip_list (SkipList): The job's skip list; with patterns, folders are measured without their skipped contents
 		copied (set): The attrib entries the replay copies under only_sync_attributes ( attribs_to_copy() )
+		version_bytes (int): The length of the new version folder's path: with it, what the replay leaves out because its path in the
+			version passes the limit ( vault_path_too_long() ) is not counted, a folder with all under it
 
 	Returns:
 		tuple: The bytes and the inodes the batch adds to the vault
@@ -11267,7 +11321,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	sized_folders = created_folders | {entry for entry, event in taken.items() if event == 'modify' and entry.endswith('/')}
 	for entry in taken:
 		if not inside_folders(entry, sized_folders, parents_from):
-			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block)
+			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block, monitor_path, version_bytes)
 			total_size += entry_size
 			total_inodes += entry_inodes
 	# what a move lands on inside a created folder arrives by the move, and its create copies it not ( mkdir n; mv d n/d ),
@@ -11279,7 +11333,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	carried_folders = {entry for entry in carried_in if entry.endswith('/')}
 	carried_in = [entry for entry in carried_in if not inside_folders(entry, carried_folders)]
 	for entry in carried_in:
-		entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block)
+		entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block, monitor_path, version_bytes)
 		total_size -= entry_size
 		total_inodes -= entry_inodes
 	# what the batch copies under a carried folder went out with the folder: the new folder's walk counted it, and so did the
@@ -11289,7 +11343,7 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 	written_folders = {entry for entry in written if entry.endswith('/')}
 	for entry in written:
 		if not inside_folders(entry, written_folders):
-			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block)
+			entry_size, entry_inodes = get_unskipped_size_inodes(entry, skip_list, block, monitor_path, version_bytes)
 			total_size += entry_size
 			total_inodes += entry_inodes
 	return total_size, total_inodes
@@ -13965,16 +14019,19 @@ def replay_ops(entries:dict, monitor_path:str, only_sync_attributes:bool, versio
 			ops.append((ENTRY_OP, rel))
 	return ops
 
-def settle_ops(folders, sweep = ()) -> list:
+def settle_ops(folders, sweep = (), version_bytes:int = None) -> list:
 	'''
 	What the end of a batch records first, for TreeWriter.pre_record(): each of folders, rels that get the monitored folders' metadata, made real;
-	each rel of sweep, what the sweep removes, recorded.
+	each rel of sweep, what the sweep removes, recorded. With version_bytes, the length of the version folder's path, a folder whose path in the
+	version Linux would refuse (vault_path_too_long()) is none there: the version before has no path to it, so it records nothing.
 
 	Examples:
 		>>> settle_ops(['a/b/', '.', ''], ['c/', 'd'])
 		[('folder', 'a/b'), ('entry', 'c'), ('entry', 'd')]
+		>>> settle_ops(['a/', 'b' * 4000 + '/c/'], ['d'], 100)
+		[('folder', 'a'), ('entry', 'd')]
 	'''
-	return [(FOLDER_OP, rel.strip('/')) for rel in folders if rel.strip('/') not in ('', '.')] + [(ENTRY_OP, rel.rstrip('/')) for rel in sweep]
+	return [(FOLDER_OP, rel.strip('/')) for rel in folders if rel.strip('/') not in ('', '.') and not (version_bytes is not None and vault_path_too_long(version_bytes, rel, False))] + [(ENTRY_OP, rel.rstrip('/')) for rel in sweep]
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,writer:TreeWriter,
 					 skip_list:'SkipList' = None,job_name:str = None,reported:set = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
@@ -14024,8 +14081,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 	if move_targets:
 		walk_skip = (lambda rel: rel in move_targets) if skip_list is None else (lambda rel: rel in move_targets or skip_list.skips(rel))
 	backuperTeeLogToTl(path=monitor_path,message=f'Running reverb backup with {len(backup_entries)} entires to {backup_folder}',ok=True)
-	# the length rule ( vault_path_too_long() ) adds each entry's path to the version folder's, in bytes
-	version_bytes = len(os.fsencode(backup_folder))
+	# the length rule ( vault_path_too_long() ) adds each entry's path to the version folder's, in bytes, and on a pool the longest
+	# branch's surplus over the mount point ( pool_surplus() )
+	version_bytes = len(os.fsencode(backup_folder)) + pool_surplus(pool_guard,os.path.dirname(backup_folder))
 	def left_out(rel,is_dir,kept=False):
 		# whether the length rule leaves the entry at rel out, before anything is written for it, with its line once per batch. one the
 		# version keeps ( a delete: its removal by path would fail ) is measured by its own path, as nothing is copied to it; any other
@@ -14457,7 +14515,7 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 			writer.pre_record(make_ops(),poll_pools)
 	def record_settled(sweep = ()):
 		# what the sweep removes and the folders settle() gives metadata: one phase, so one flush
-		pre_record(lambda: settle_ops([*written.rels, *(() if touched is None else touched.folders)],sweep))
+		pre_record(lambda: settle_ops([*written.rels, *(() if touched is None else touched.folders)],sweep,version_bytes))
 	def verify():
 		# what the batch's events touched is compared with the monitored tree, and the version fixed where they differ:
 		# the collapse into one entry per path cannot replay every order of moves, re-creations and deletes. the rows this

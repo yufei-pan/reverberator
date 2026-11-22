@@ -1459,7 +1459,11 @@ def test_a_fifo_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll_f
 	capsys.readouterr()
 	with monkeypatch.context() as patch:
 		patch.setattr(os, 'lstat', lstat)
-		dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set())
+		manifest = rv.VaultManifest(job.job_vault)
+		try:
+			dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest)
+		finally:
+			manifest.close()
 	assert swapped and dropped is False
 	assert _lines(capsys, 'UNREADABLE', path) == 0
 
