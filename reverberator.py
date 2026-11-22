@@ -4024,7 +4024,7 @@ def unreadable_end(dest_path:str, previous_path:'str | None') -> str:
 	previous_path (None: no version before). Nothing at dest_path: the file is new, and left out of this version. An entry of the version before: its last
 	backed-up copy stays. Otherwise the copy there is the cut backup's own (a roll-forward over a lost manifest on a pool leaves it, as it cannot tell it
 	from a removed entry): it stays, and may be damaged. Only ENOENT and ENOTDIR are nothing there: a look that fails otherwise (EIO, EACCES) is said as
-	what it is, as what stays is not known then.
+	what it is, as what stays is not known then: at previous_path too where nothing is at dest_path.
 
 	Examples:
 		>>> with tempfile.TemporaryDirectory() as folder:
@@ -4036,6 +4036,14 @@ def unreadable_end(dest_path:str, previous_path:'str | None') -> str:
 	try:
 		os.lstat(dest_path)
 	except (FileNotFoundError, NotADirectoryError):
+		if previous_path is not None:
+			try:
+				os.lstat(previous_path)
+			except (FileNotFoundError, NotADirectoryError):
+				pass
+			except OSError as e:
+				# the version before may hold a copy that the version being made does not carry
+				return f'left out of this version; the version before cannot be looked at ({e.strerror or e})'
 		return 'left out of this version'
 	except OSError as e:
 		return f'what this version holds for it cannot be looked at ({e.strerror or e})'

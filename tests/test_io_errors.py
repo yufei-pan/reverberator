@@ -1645,6 +1645,19 @@ def test_the_unreadable_lines_end_says_when_a_place_cannot_be_looked_at(tmp_path
 		assert rv.unreadable_end(dest, previous) == 'keeping the copy this version holds, which may be one a cut backup made, and damaged: the version before cannot be looked at (Input/output error)'
 
 
+def test_the_unreadable_lines_end_says_when_the_version_before_cannot_be_looked_at_for_a_file_left_out(tmp_path, monkeypatch):
+	# fails before the residual round's W2 (the fix wave's second-opinion finding on FW6): with nothing at this version's place the ending was
+	# 'left out of this version' before the version before's place was looked at, so an I/O error there went unnamed, where the README says
+	# the ending names it. The ending stays as it was where that place is not there, or is
+	dest, previous = str(tmp_path / 'this'), str(tmp_path / 'before')
+	assert rv.unreadable_end(dest, None) == 'left out of this version'
+	assert rv.unreadable_end(dest, previous) == 'left out of this version'
+	open(previous, 'w').close()
+	assert rv.unreadable_end(dest, previous) == 'left out of this version'
+	_fail_lstat(monkeypatch, previous, errno.EIO)
+	assert rv.unreadable_end(dest, previous) == 'left out of this version; the version before cannot be looked at (Input/output error)'
+
+
 def test_an_unchanged_readable_file_compares_as_unchanged(job, poll_fast, capsys):
 	# pin: a full comparison reads each file's tail through its non-blocking open, which a file no lease is on takes at once
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b' * (rv.HASH_SIZE + 10)})
