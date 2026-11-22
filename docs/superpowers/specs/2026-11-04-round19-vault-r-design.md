@@ -132,7 +132,8 @@ P/rel **forwards** when it is a symlink whose text is exactly `fwd(rel)` (the fo
 **`record(rel, keep)`.** Runs before T/rel is replaced or removed:
 1. `ensure_real(parent)`.
 2. If P/rel forwards:
-   - **T/rel is a folder:** `RENAME_EXCHANGE(T/rel, P/rel)`, restore P/rel's times and its parent's, then unlink the self-named link left at T/rel.
+   - **T/rel is a folder, `keep` set** (the tree holds on to it for now: a file or link is to replace it, whose copy may fail, or it is a move's source, `hl_record()`): build a hard-link tree of it in staging (its folders made anew with their metadata, everything else hard-linked), `RENAME_EXCHANGE` that copy with P/rel, restore P/rel's times and its parent's, then unlink the link, now in staging. The tree keeps its own folder until the new copy is placed over it (`place()`, through `replace_entry()`), so a copy that fails (its source unreadable) leaves the folder in both versions, as the README says a path that cannot be read keeps its last backed-up copy. This follows the code (`TreeWriter.record()`, through `hard_link_tree()` and `exchange_in()`) and plan S5, where this spec exchanged the tree's own folder in, which loses it from the newest version when the copy fails.
+   - **T/rel is a folder, being deleted:** `RENAME_EXCHANGE(T/rel, P/rel)`, restore P/rel's times and its parent's, then unlink the self-named link left at T/rel.
    - **T/rel is a file, `keep` set** (the tree keeps it until the new copy replaces it): `link()` it to a staging temp, then rename the temp over P/rel.
    - **T/rel is a file, being deleted:** `rename(T/rel, P/rel)`.
 3. Else, if P/rel and T/rel are both real folders: record each entry of T/rel (a merge).
@@ -233,6 +234,8 @@ There are three lock files in the state folder:
 - **A normal batch:** takes them before its retention loops and releases them after its commit or its failure. The comparison before it reads the tree without locks.
 
 ## 3. Scan and roll-forward (R vaults). No deletion on inference.
+**Which rules a vault gets** (one answer for the scan, the start and the CLI): design R's when the manifest's `layout` is 'r', and also when it is not but `.reverberator_staging` is there, which reads as a conversion begun: the R scan, then the conversion (§7, which changes no version that holds no chain link), its sizes pass, and `layout` set. With neither, the 0.54 rules read the vault (§3.1): one holding version folders is 0.54's, and one holding none is new, its first version design R's. Staging present means design R's rules, never 0.54's: a manifest can be lost, `layout` with it, and the 0.54 rules would then remove a cut batch's tree as an orphan, an `rm -rf` of the only real tree; staging is made before any such tree can exist (before the first version's folder, before a conversion changes a version, at every hand-over), so once it is there they never run again. This follows the code (`vault_layout()`, `layout_known()`, `scan_gets_r_rules()`) and plan S1.
+
 **Scan:**
 1. **A commit cut after the manifest named V<n+1>,** with its list complete in a private folder: roll it forward. Swap `current_version`, rename the previous list if it still has its old name (per `previous_list`), then place the new list.
 2. Remove other private list folders, as today.
@@ -243,7 +246,9 @@ There are three lock files in the state folder:
    - A lone V0 orphan is removed; any other orphan is an error, both as today.
 5. Remove a stale list below the oldest version, and move `current_version` forward, both as today.
 
-**Roll-forward.** This is the next attempt, holding the locks from the scan to its commit. A crash during it just repeats it.
+**A lost manifest** names nothing: n is the newest folder with a list, a private list folder goes with the others (step 2), and the orphan at n+1 is judged by step 4 alone, so a cut tree stays and the batch rolls forward. Staging keeps such a vault on these rules (above). This follows the code (`read_job_vault_r()`, `finish_r_commit()`) and the lost-manifest row of plan S3's table. Round 0.55.6 (its D3) adds two steps over a manifest that does not describe the newest version: a forward link a cut between two renames left in staging goes back to that version before staging is emptied, and stays in staging while the orphan does (`put_back_staged_links()`, `empty_staging()`); and off a pool the scan's put-back of the cut tree (0.55.5's, its spec section 1) also removes what the cut batch made (`prepare_roll_forward()`).
+
+**Roll-forward.** This is the next attempt. The scan holds the locks and releases them when it ends; the roll-forward takes them again as any batch does, for its retention loops, and holds them to its commit (§2.8's lock scope; plan S2, which the code follows: the backuper's `scan()` and `do_backup()`). A crash during it just repeats it.
 1. Walk P's real part, through real folders only. These are the recorded paths.
 2. Give each real folder of P back the mtime that version n's manifest row records for it. A rename never moves atime.
    - A folder whose row holds no record keeps its current time. If a crash hit its one-call window, that is the backup's time (a tiny limitation proposed in §14).
@@ -254,7 +259,7 @@ There are three lock files in the state folder:
 7. Sweep the whole tree: tree entries that P does not hold and that no row tracks are removed through `delete()`.
 8. **Always commit V<n+1>.** Once the hand-over has happened, the tree carries V<n+1>'s name and P is the forward-link folder. As soon as anything was recorded, the tree also differs from version n: old copies have moved into P and new ones are in place. Undoing this would need a second writer that moves every record back. Finishing the version is the only consistent way forward, at the cost of one version slot after a crash. (Only a cut that came before any record could be undone, by one exchange. That case is not special-cased.)
 
-### 3.1 Vaults not yet migrated (`layout` ≠ 'r')
+### 3.1 Vaults not yet migrated (`layout` ≠ 'r', and no `.reverberator_staging`)
 At start, still under the locks, the 0.54 rules run unchanged before the migration:
 - `read_job_vault`'s 0.54 orphan rules, `remove_orphan` and `undo_cut_off_commit`;
 - on a pool whose `.reverberator_pruning` names the oldest version, `decrement_stepper` finishes that prune.
@@ -283,7 +288,7 @@ history holds no lock that a batch needs.
 - Without it: wrong reads at 15 starting points. This shows the test can fail.
 
 ### 4.3 The CLI on a vault not yet migrated (spec check 3.3)
-**The rule:** when the manifest's `layout` is not 'r', the same walk follows **0.54 chain links by their text**. A link in V<k> naming the previous version folder plus a clean path is followed backward (`parse_chain_text`, which the migration keeps). No forward rule is used, because no R batch has run yet.
+**The rule:** when the manifest's `layout` is not 'r', the same walk follows **0.54 chain links by their text**. A link in V<k> naming the previous version folder plus a clean path is followed backward (`parse_chain_text`, which the migration keeps), as the last part of a path only, and never after a forward link. The forward rule stays on whatever the layout: a vault on design R whose manifest was lost records no `layout`, and without the forward rule its older versions would read wrong, while no 0.54 vault holds forward text, so the rule costs it nothing. This follows the code (`walk_folder()`: `forward_name()` at every link, `parse_chain_text()` only when `backward`, which the commands set from `read_vault_layout_for_command()` as layout ≠ 'r') and plan S8, in place of this spec's "No forward rule is used, because no R batch has run yet".
 
 **Why this rule:**
 - It is the migration's own rule, so the CLI shows exactly what the vault will be after conversion.
@@ -317,6 +322,8 @@ During a running migration, already-converted versions simply have no chain link
 ## 5. Pools (mergerfs). R ships only with this, and only after the pool cut test passes.
 mergerfs gives EINVAL for `renameat2` flags. A rename can also land on one disk while the removal of its target lands on another.
 
+**A filesystem with no exchange** (`RENAME_EXCHANGE` answering EINVAL, ENOSYS or ENOTSUP: NFS, older ZFS, exfat, a FUSE filesystem) is treated as a pool for the renames, not only mergerfs: its first exchange that fails, at the hand-over or a record, puts the batch's writer on two renames, the hand-over moving its built folder to `staging/skel-<V<n>>` and going on with the six steps below, and from there this section's rules for two renames apply (the folder records by two renames, records always by hard links, the pre-record passes and their flushes, the scan's repair of a cut between two renames), each flush writing out its one filesystem. This follows the code (`exchanged()` and `NO_EXCHANGE_ERRNOS`, `hand_over()`, `TreeWriter.exchange_in()`, `TreeWriter.record()`, `pre_record()`, `repair_pool_vault()`) and plan S11.
+
 **Hand-over:**
 1. Build `staging/skel-<V<n>>`.
 2. Flush every disk.
@@ -331,7 +338,7 @@ Between steps 3 and 5, V<n> is missing: `current_version` and the older versions
 
 **Records** are always hard links, so the tree keeps every entry until its apply phase.
 
-**Pre-record passes.** Before each apply phase (the replay; the verification's fixes; the sweep plus settle), the batch records every path the phase will change (the §2.2 table), then flushes every disk. Records made inline afterwards are no-ops. The prune flushes after its rename; the commit flushes as today.
+**Pre-record passes.** Before each apply phase (the replay; the verification's fixes; the sweep plus settle), the batch records every path the phase will change (the §2.2 table), then flushes every disk. Records made inline afterwards are no-ops, but for one the pass did not foresee (the monitored tree changed after it), which marks the writer, and every disk is flushed before the change it guards (`needs_flush`, `flush_if_needed()`, as the code does and plan S11 settles). The prune flushes after its rename; the commit flushes as today.
 
 **Scan repairs, before staging is emptied:**
 - **A hand-over's tree still under its old name on a disk:** it gets the new name there, directly on that disk, then every disk is flushed.
@@ -368,7 +375,9 @@ The batch counts at the record primitives, using row sizes:
 
 When T later drops a shared inode, the batch that drops it records it into its own P, which is then the newest holder.
 
-At commit, the previous newest version's list is renamed. Removing the oldest version frees exactly its size, so the size-limit loop (`vault_size -= removed_size`) stays right. The estimate made before a batch is unchanged. `measure_version_usage` and `CopiedSizes` go.
+At commit, the previous newest version's list is renamed. Removing the oldest version frees exactly its size, so the size-limit loop (`vault_size -= removed_size`) stays right. `measure_version_usage` and `CopiedSizes` go.
+
+The estimate made before a batch counts only what the batch adds, as `vault_size` and `vault_inodes` already hold the tree. 0.54's inode estimate, the newest version's inodes plus the batch's change, would count the tree twice and make a job whose tree passes half its inode limit prune every version it may, so 0.55 takes the change alone, floored at 0 (plan S6); the size estimate was the change already. 0.55.5 makes the change design R's (its L5): a delete frees nothing, as its entry goes into the previous version as its record, and each copy, a modify's included, adds an inode, so the estimate counts copies and not deletes, and its du goes. This follows the code (`do_backup()`'s estimate, from `get_backup_size_inode()`), in place of this spec's "The estimate made before a batch is unchanged". Round 0.55.6 charges nothing for what the vault's path length rule leaves out of the version (its D4: `get_backup_size_inode(version_bytes=)`).
 
 ## 7. Migration from 0.54 (decided: each version becomes a plain tree)
 **When.** At a job's first 0.55 start, under the locks, after the 0.54 rules in §3.1. It runs when the manifest has no `layout`='r' and versions exist. A manifest that started over determines the layout while it is rebuilt.
@@ -605,6 +614,8 @@ The lines above came from the prototype, which skipped real deletes, the content
 3. **Later release:** remove the 1,927 kept lines, and their tests, once every vault is migrated.
 
 ## 13. README drafts (line numbers are README.md's)
+The line numbers below are README.md's as it stood when this spec was drafted, kept as drafted rather than brought up to date (round 0.55.6's spec, section 14, in place of the round 20 plan's proposed renumbering), as every later README change moves them again: find each line by its text.
+
 - **Line 7:** drop "(a warning for Copy threads)".
 - **Lines 9 and 10:**
   > "14, Chain Length and 15, Copy threads: kept so rule files that have them stay valid; from 0.55 neither has any effect, and any value is accepted without a line."
