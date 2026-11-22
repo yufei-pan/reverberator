@@ -2138,7 +2138,7 @@ def test_the_vault_oracle_passes_over_a_link_in_staging_it_cannot_read(r_job, mo
 	# fails before the residual round's O2 (the fix wave's re-review): check_vault() readlink()ed every link in staging with no try, and
 	# the daemon keeps a link whose text it cannot read (empty_staging(): any readlink error but EINVAL, an f2fs link whose text missed
 	# the checkpoint answers ENOENT) while an orphan stands, so a power-loss run could raise there. It is passed over, as a link whose text
-	# is the forward form is; one that reads and is not, and a folder, are still left in staging (the control)
+	# is the forward form is; one that reads and is not is still left in staging (the control; the test above has the folder)
 	base(r_job)
 	staging = rv.staging_path(r_job.job_vault)
 	os.makedirs(staging, exist_ok=True)
