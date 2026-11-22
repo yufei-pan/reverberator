@@ -7054,8 +7054,9 @@ def empty_staging(job_vault:str) -> None:
 	Remove what staging holds: what a prune cut short left of a version that stopped being one at its rename, a record cut
 	before it reached the previous version, whose tree entry stands, and links swapped out. Nothing else leads there. A
 	link a cut between two renames moved there is the version before's: the scan gives it back first when no manifest row
-	can (put_back_staged_links()), and the rows do it otherwise (put_back_forward_links()). A failure is logged, and leaves
-	it for the next scan, as nothing reads staging but that put-back, which acts only on a link still due.
+	can (put_back_staged_links(), which acts on the links still due, and checks the pool and flushes the vault for any link of that
+	form it finds there), and the rows do it otherwise (put_back_forward_links()). A failure is logged, and leaves it for the next scan,
+	as nothing reads staging but that put-back.
 	'''
 	staging = staging_path(job_vault)
 	try:
@@ -7268,7 +7269,7 @@ def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest', gua
 		raise OSError(errno.EIO, f'cannot read {", ".join(rel or previous for rel, _ in errors)} in {previous}')
 	name = os.path.basename(os.path.normpath(tree))
 	due = [rel for rel in (row.rstrip('/') for row in itertools.chain(manifest.iter_folders(), manifest.iter_files()))
-		if os.path.dirname(rel) in real and not os.path.lexists(os.path.join(previous, rel)) and os.path.lexists(os.path.join(tree, rel))]
+		if os.path.dirname(rel) in real and kind_at(os.path.join(previous, rel)) is None and kind_at(os.path.join(tree, rel)) is not None]
 	if due:
 		guard.require()
 		for rel in due:
@@ -7313,8 +7314,10 @@ def put_back_staged_links(previous:str, tree:str, job_vault:str, guard:PoolGuard
 				continue
 			# once: a link empty_staging() could not remove and a later cut at its rel leave two
 			staged.add(rel)
-			# the parent's folders first: a link above would lead the looks at rel out of the version
-			if real_folders_to(previous, rel) and not os.path.lexists(os.path.join(previous, rel)) and os.path.lexists(os.path.join(tree, rel)):
+			# the parent's folders first: a link above would lead the looks at rel out of the version. A look that fails (EIO, as a pool answers
+			# for an entry changed directly on a disk) is no absence: it raises, and the scan fails with the link kept, as empty_staging() would
+			# remove its only record
+			if real_folders_to(previous, rel, strict=True) and kind_at(os.path.join(previous, rel)) is None and kind_at(os.path.join(tree, rel)) is not None:
 				due.add(rel)
 	if not staged:
 		return
@@ -7671,20 +7674,23 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	'''
 	The scan of a vault on design R (spec section 3, plan S3), whose caller holds the job's locks. A version folder with no list
 	may be the only real tree of a cut batch, so nothing goes by inference: the manifest is read first, and a commit it
-	names is finished. Then the private list folders and staging are emptied; when a tree was found over a manifest that does
-	not describe the newest version, as a lost one, a link a cut between two renames left in staging goes back to that version
-	first (put_back_staged_links()). Of the one orphan there may be, at the one
+	names is finished. Then the private list folders and staging are emptied; only when a tree was found over a manifest that does
+	not describe the newest version, as a lost one (with rows, put_back_forward_links() gives the link back later), a link a cut
+	between two renames left in staging goes back to that version first (put_back_staged_links()). Of the one orphan there may be, at the one
 	after the newest version: a skeleton, empty or holding only links that name their own place (is_skeleton()), goes, with
 	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
 	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt. On a
 	pool the scan checks the pool before each act that a listing through it decides, as a disk gone makes an absence true: the staging
-	repair's renames (repair_pool_vault(), for any vault with leftovers in staging), the links given back from staging (whenever staging
-	holds a link of the forward form to the tree, before the first is written; the vault is flushed after them, before staging is emptied),
-	the skeleton's removal, right before it (which covers the judgement and the walk that gives the folder times back) and right after, and
-	the tree's repair, whose last check is at the end of prepare_roll_forward(): a batch that reuses the scan, with a guard of its own made
-	once every disk is back, never gets the view of a scan taken with a disk gone. What goes by its name alone (the private list folders,
-	staging once repaired and its links of the forward form to the tree given back, the 0.54 files) is garbage whatever the pool shows, and
-	goes unchecked. A lone V0 orphan goes. Any other orphan is an error, before anything is removed. A lost manifest names nothing: its
+	repair's renames (repair_pool_vault(), for any vault with leftovers in staging), the links given back from staging (over a lost
+	manifest, with a tree found: whenever staging holds a link of the forward form to the tree, before the first is written; the vault is
+	flushed after them, before staging is emptied), the emptying of staging when the orphan read as a skeleton (a disk gone since the whole
+	read can have taken every real entry of the tree along, so that it reads as one, and such a link is that entry's only record over a lost
+	manifest), the skeleton's removal, right before it (which covers the judgement and the walk that gives the folder times back) and right
+	after, and the tree's repair, whose last check is at the end of prepare_roll_forward(): a batch that reuses the scan, with a guard of its
+	own made once every disk is back, never gets the view of a scan taken with a disk gone. What goes by its name alone (the private list
+	folders, staging once repaired, the 0.54 files) is garbage whatever the pool shows, and goes unchecked, but for a link of the forward form to
+	the tree's folder over a lost manifest, the entry's only record: the two checks above come before it is removed (with rows, they give
+	it back). A lone V0 orphan goes. Any other orphan is an error, before anything is removed. A lost manifest names nothing: its
 	private list goes, and the orphan is judged the same way, so a cut tree stays.
 	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54. A vault with no version and no orphan
 	is one started over: the manifest's version is forgotten (a conversion begun is no more to finish), and the next batch is V0.
@@ -7745,6 +7751,11 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 				put_back_staged_links(listing.versions[newest].path, tree, job_vault, guard)
 		except (OSError, sqlite3.Error) as e:
 			raise VaultScanError(f'cannot make the tree {tree} ready for its roll-forward: {e}')
+	elif skeleton is not None:
+		# is_skeleton() read the tree through the pool after the whole read: a disk gone since can have taken every real entry of the tree with it,
+		# and a link of the forward form in staging is that entry's only record over a lost manifest (put_back_staged_links()), which the removal
+		# below would not give back, and the check before the skeleton's removal comes after it. A disk missing fails the scan here, with staging kept
+		guard.require()
 	empty_staging(job_vault)
 	if manifest.layout() == 'r':
 		remove_054_files(job_vault)
@@ -8205,14 +8216,16 @@ def is_entry_rel(rel:str) -> bool:
 		return False
 	return all(part not in ('', '.', '..') for part in (rel[:-1] if rel.endswith('/') else rel).split('/'))
 
-def real_folders_to(version_path:str, rel:str, make:bool = False, missing_ok:bool = False, made:list = None) -> bool:
+def real_folders_to(version_path:str, rel:str, make:bool = False, missing_ok:bool = False, made:list = None, strict:bool = False) -> bool:
 	'''
 	Whether every folder between version_path and the entry of rel in it (a folder's rel ending with /) is a real folder
 	there: not a link, a file or nothing. Only then does what is written or removed at rel stay inside version_path, as
 	the path to it follows no link. With make, the missing ones are made, as real folders, the rel of each (no trailing
 	/) appended to made when it is given, outermost first; with missing_ok, a missing
 	one is no obstacle (nothing below it exists to follow), and nothing is made. A rel that is no entry below the
-	version (is_entry_rel(): absolute, the version itself, or with a . or .. part) is never one.
+	version (is_entry_rel(): absolute, the version itself, or with a . or .. part) is never one. A look at a folder that
+	fails otherwise (EIO, EACCES) answers False, as no real folder; with strict it raises its OSError, for a caller that acts
+	on the answer "no" and may not read a failure as one.
 
 	Examples:
 		>>> import tempfile
@@ -8225,6 +8238,8 @@ def real_folders_to(version_path:str, rel:str, make:bool = False, missing_ok:boo
 		(True, True, True)
 		>>> [real_folders_to(version, rel, make=True, missing_ok=True) for rel in ('', '.', './', 'd/../link/f', 'd/./e/f', '..', '../x', '/etc/x', 'd//e')]
 		[False, False, False, False, False, False, False, False, False]
+		>>> [real_folders_to(version, rel, strict=True) for rel in ('d/e/f', 'link/f', 'gone/f')]
+		[True, False, False]
 		>>> import shutil; shutil.rmtree(version)
 	'''
 	if not is_entry_rel(rel):
@@ -8252,6 +8267,8 @@ def real_folders_to(version_path:str, rel:str, make:bool = False, missing_ok:boo
 			except OSError:
 				return False
 		except OSError:
+			if strict:
+				raise
 			return False
 	return True
 
