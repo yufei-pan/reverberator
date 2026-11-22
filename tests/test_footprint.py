@@ -5,17 +5,24 @@ process of its own over a small tree, gives back what glibc's allocators freed o
 every start is about 29 MB of garbage whatever the tree's size, so a small tree catches a daemon that keeps it. That gate measures
 after a restart's backup, which leaves about 2 MB for the trim after each commit to give back: it passes without that trim. The
 second (round 0.55.6's spec section 11, D15) measures after a burst of batches, and its run with that trim stubbed out shows it
-fails when the trim goes.
+fails when the trim goes through the start's commit (V0), in the measured process: the 14 MB or so that commit leaves is what tells.
+It bounds the growth of each later batch only coarsely (more than about 280 kB a batch, 5.5 MB over its 20), and cannot tell a trim
+lost only after the later commits: the burst's batches (100 files) free about 2 MB each, and what one freed the next reuses, so a
+daemon that keeps its trim after V0 and loses it after every later commit ends inside the trimmed runs' 3 MB spread. A unit pin
+counts the calls instead: test_every_commit_of_a_job_gives_back_what_it_freed.
 '''
 import json
 import os
+import shutil
 import signal
+import threading
 import time
 
 import pytest
 
 import reverberator as rv
-from tests.harness import create_job, wait_until, write_rule
+from tests.harness import committed_versions, create_job, seed_monitor, wait_until, write_rule
+from tests.test_jobs import IdleFlag, a_changed_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,8 +46,9 @@ WAVE_FILES = 100
 WAVE_SECONDS = 60
 # its bound, measured on round 0.55.6 (Task 16, Docker, uid 65534, six runs each way, at loads of 5 to 85): after the burst and
 # IDLE_SECONDS, RssAnon + VmSwap 34,912 to 37,928 kB with the trim after each commit, 49,180 to 52,128 kB with it stubbed out.
-# 42.5 MB sits halfway, 5.5 MB from each. [heap] cannot tell them apart and is left out: 5,556 to 5,960 kB trimmed, 15,704 to
-# 18,628 stubbed in five runs of six, but 6,440 in the sixth, whose freed memory sat outside [heap] (its anon was the others')
+# 42.5 MB sits halfway, 5.5 MB from each. [heap] is left out: 5,556 to 5,960 kB trimmed, 15,704 to 18,628 stubbed in five runs of six,
+# but 6,440 in the sixth, whose freed memory sat outside [heap] (its anon was the others'). The figures are disjoint, by 480 kB, but a
+# bound in that gap has about 240 kB of margin each side, under the 404 kB the trimmed runs alone spread
 BURST_ANON_LIMIT_KB = 43520
 
 
@@ -79,6 +87,15 @@ def daemon_env(tmp_path, env):
 	env['PYTHONDONTWRITEBYTECODE'] = '1'
 
 
+def stop_and_clear(daemon, job):
+	'''A passed gate's end: the daemon stopped, then the job's tree and vault removed; a failed gate keeps them. The burst leaves 21
+	versions of a 23,000 entry tree, and pytest keeps its last three basetemps.'''
+	daemon.send_signal(signal.SIGTERM)
+	daemon.wait(timeout=60)
+	shutil.rmtree(job.monitor)
+	shutil.rmtree(job.vault)
+
+
 def heap_kb(pid):
 	'''Rss + Swap of the process's [heap] mapping (glibc's main arena), in kB.'''
 	total, in_heap = 0, False
@@ -108,6 +125,53 @@ def test_the_trim_is_there():
 	assert rv.LIBC_MALLOC_TRIM is not None
 
 
+@pytest.mark.unit
+def test_every_commit_of_a_job_gives_back_what_it_freed(job, poll_fast, monkeypatch):
+	# pin: counts the calls of release_idle_memory() the backuper makes, one for each commit of a job (V0, and two batches that each
+	# change a file) and one for a batch that commits no version (a scan of a folder that matches the vault: no batch of the burst
+	# gate takes that path). The burst gate below cannot tell a trim lost only after the later commits (a probe that kept the first
+	# call's ended inside the trimmed runs' range)
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b', 'd/c.txt': 'c'})
+	calls = []
+	monkeypatch.setattr(rv, 'release_idle_memory', lambda manifest: calls.append(manifest))
+	queue = rv.ChangeEventQueue(job.monitor)
+	lock = threading.Lock()
+	flag = IdleFlag()
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, queue, lock, job.monitor, job.vault, 'N/A', flag),
+		kwargs=dict(job=control), daemon=True)
+	thread.start()
+
+	def back_to_waiting(expected_calls, expected_versions, what):
+		# the backuper waits for a batch again: what follows the commit is done too, so a second call would be counted
+		wait_until(lambda: len(calls) >= expected_calls, message=f'{what}: no call of release_idle_memory() after its commit')
+		flag.idle.clear()
+		wait_until(flag.idle.is_set, message=f'{what}: the backuper never waited for the next batch')
+		assert control.failure is None, control.failure
+		assert (len(calls), len(committed_versions(job))) == (expected_calls, expected_versions), what
+
+	def batch(events):
+		with lock:
+			queue.read_wall_ns = time.time_ns()
+			for event in events:
+				queue.append(event)
+		flag.set()
+
+	try:
+		back_to_waiting(1, 1, 'the first version')
+		batch([a_changed_file(job, 'a.txt')])
+		back_to_waiting(2, 2, 'a first batch')
+		batch([a_changed_file(job, 'b.txt')])
+		back_to_waiting(3, 3, 'a second batch')
+		batch([rv.ChangeEvent(time.monotonic(), True, 'scan', os.path.join(job.monitor, 'd'), None)])
+		back_to_waiting(4, 3, 'a batch that makes no version')
+	finally:
+		control.fail('test done')
+		thread.join(timeout=5)
+		assert not thread.is_alive()
+
+
 @pytest.mark.process
 def test_an_idle_daemon_gives_back_what_its_start_and_its_backup_freed(tmp_path, run_reverberator, process_env):
 	# fails on 2c47969 ([heap] about 34 MB): nothing gave back the compile's garbage or the comparison's
@@ -130,14 +194,17 @@ def test_an_idle_daemon_gives_back_what_its_start_and_its_backup_freed(tmp_path,
 	measured = f'[heap] {heap} kB, RssAnon + VmSwap {anon} kB'
 	assert heap <= HEAP_LIMIT_KB, measured
 	assert anon <= ANON_LIMIT_KB, measured
+	stop_and_clear(daemon, job)
 
 
 @pytest.mark.process
 @pytest.mark.parametrize('trim', ['after_each_commit', 'stubbed'])
 def test_an_idle_daemon_after_a_burst_gives_back_what_its_commits_freed(tmp_path, run_reverberator, process_env, trim):
-	# 'stubbed' must break the bound, so the gate can tell a missing trim: footprint_child.py makes release_idle_memory() a no-op. The
-	# daemon whose release_idle_memory() loses its trim_heap() fails 'after_each_commit' (RssAnon + VmSwap 52,244 kB) and passes the
-	# start gate; one that loses sqlite's shrink alone passes (about 2 MB, inside the runs' 3 MB spread)
+	# 'stubbed' must break the bound, so the gate can tell a missing trim: footprint_child.py makes release_idle_memory() a no-op.
+	# What it tells: a trim lost through the start's commit (V0), in the measured process. The daemon whose release_idle_memory() loses
+	# its trim_heap() fails 'after_each_commit' (RssAnon + VmSwap 52,244 kB) and passes the start gate. What it cannot tell: a trim lost
+	# only after the later commits (a probe that kept the first call's, ended at 37,052 kB, inside the trimmed range), or sqlite's
+	# shrink alone (about 2 MB, inside the runs' 3 MB spread); test_every_commit_of_a_job_gives_back_what_it_freed counts the calls
 	job = create_job(str(tmp_path))
 	files = make_tree(job.monitor)
 	rule = write_rule(job, min_snapshot='1')
@@ -145,6 +212,9 @@ def test_an_idle_daemon_after_a_burst_gives_back_what_its_commits_freed(tmp_path
 	daemon_env(tmp_path, process_env)
 	if trim == 'stubbed':
 		process_env['REVERB_FOOTPRINT_NO_COMMIT_TRIM'] = '1'
+	else:
+		# a shell that exported the switch must not stub the trimmed case
+		process_env.pop('REVERB_FOOTPRINT_NO_COMMIT_TRIM', None)
 	daemon = run_reverberator(rule, script=os.path.join(HERE, 'footprint_child.py'))
 	wait_until(lambda: last_success(state_dir, job.job_name) is not None, timeout=START_SECONDS, message='the start committed no backup')
 	for wave in range(BURST_WAVES):
@@ -157,4 +227,8 @@ def test_an_idle_daemon_after_a_burst_gives_back_what_its_commits_freed(tmp_path
 	assert daemon.poll() is None
 	heap, anon = heap_kb(daemon.pid), anon_kb(daemon.pid)
 	measured = f'trim {trim}: [heap] {heap} kB, RssAnon + VmSwap {anon} kB'
-	assert (anon <= BURST_ANON_LIMIT_KB) == (trim == 'after_each_commit'), measured
+	if trim == 'stubbed':
+		assert anon > BURST_ANON_LIMIT_KB, f'the stubbed daemon no longer breaks the bound: the gate cannot tell a lost trim; measure again (spec section 11). {measured}'
+	else:
+		assert anon <= BURST_ANON_LIMIT_KB, measured
+	stop_and_clear(daemon, job)
