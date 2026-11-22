@@ -30,7 +30,8 @@ NOT_FOLLOWED = {
 
 # every function outside TreeWriter using a helper of WRITE_HELPERS, and which
 USERS = {
-	# V0 of a job: no previous version and nothing older to keep
+	# V0 of a job: no previous version and nothing older to keep; and the commit's record of the monitored root on the version's
+	# own folder, at every batch, which records nothing of the version before (it got a copy of its own at the hand-over)
 	'do_backup': {'copy_file_meta', 'cp_af_copy_path', 'record_root_meta'},
 	# the helpers themselves, on what their callers name
 	'cp_af_copy_path': {'mcae.run_command'},
@@ -126,7 +127,7 @@ def test_helpers_that_write_the_tree_are_used_only_by_named_functions():
 def test_the_writer_is_where_the_writes_are():
 	writer = {name: node for name, node in module_functions(source_tree()).items() if name.startswith('TreeWriter.')}
 	verbs = ('make_folders', 'make_folder', 'copy', 'place', 'discard_temp', 'remove_now', 'remove_queued', 'rename',
-		'folder_times', 'folder_meta', 'file_meta', 'root_meta')
+		'folder_times', 'folder_meta', 'file_meta')
 	assert [verb for verb in verbs if f'TreeWriter.{verb}' not in writer] == []
 	# the writes are here, so the lists above hold because they moved, not because a reading missed them
 	assert names_used(writer['TreeWriter.rename']) >= {'os.rename', 'os.remove', 'remove_entry'}

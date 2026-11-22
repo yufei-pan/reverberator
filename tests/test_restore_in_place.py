@@ -1425,10 +1425,10 @@ def still_root(root):
 
 
 def root_now(root):
-	'''The RootMeta record_root_meta() would write for root now.'''
+	'''The RootMeta a commit's record_root_meta() would write for root now, in a job with no inner mounts.'''
 	st = os.lstat(root)
 	xattrs = {name: os.getxattr(root, name, follow_symlinks=False) for name in rv.xattr_names(root)}
-	return rv.RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs)
+	return rv.RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs, [])
 
 
 def one_file_batch(job, i):
@@ -1517,3 +1517,138 @@ def test_a_skip_ends_a_failed_state_with_its_line(job, monkeypatch):
 	again = [kwargs for args, kwargs in lines if 'is kept on' in kwargs.get('message', '') and 'again' in kwargs['message']]
 	assert len(again) == 1 and not again[0].get('error')
 	assert rv.ROOT_META_TROUBLE == {}
+
+
+# ---- D3, item 1: a version's root-meta record carries its inner mounts ------------------------------------------------------
+
+def test_the_record_carries_the_inner_mounts_and_reads_them_back():
+	# fails on main (no field): the set a commit remembers, stored as the manifest stores it (storable_name()), so a name that is
+	# not UTF-8 reads back as it was; an empty set is written too, and reads back empty, not as never recorded
+	mounts = ['disk/', 'a b/', 'bad\udcff/']
+	meta = rv.RootMeta(1, 2, 0o750, 3, 4, {'user.a': b'b'}, mounts)
+	record = rv.encode_root_meta(meta)
+	assert record.isascii() and json.loads(record)['inner_mounts'] == [rv.storable_name(rel) for rel in mounts]
+	assert list(json.loads(record))[-1] == 'inner_mounts'
+	assert rv.decode_root_meta(record) == meta
+	assert rv.decode_root_meta(rv.encode_root_meta(meta._replace(inner_mounts=[]))).inner_mounts == []
+	# a record made with no set has no field
+	assert 'inner_mounts' not in json.loads(rv.encode_root_meta(meta._replace(inner_mounts=None)))
+
+
+@pytest.mark.parametrize('field', ['absent', 5, ['disk/', 5], 'disk/', None], ids=['absent', 'a number', 'a list holding a number', 'a string', 'null'])
+def test_a_record_without_the_field_or_with_a_damaged_one_reads_none(field):
+	# fails on main (no field): a record 0.55.5 wrote has none, and a damaged field costs a whole-job restore nothing of the root's
+	# metadata
+	record = {'v': 1, 'uid': 1, 'gid': 2, 'mode': 0o750, 'atime_ns': 3, 'mtime_ns': 4, 'xattrs': {'user.a': 'Yg=='}}
+	if field != 'absent':
+		record['inner_mounts'] = field
+	meta = rv.decode_root_meta(json.dumps(record).encode())
+	assert meta.inner_mounts is None
+	assert meta[:6] == (1, 2, 0o750, 3, 4, {'user.a': b'b'})
+
+
+PAUSED_LINE = 'Inner mounts not mounted, keeping their last backed-up contents: disk/'
+
+
+def remove_the_manifest(job):
+	'''The job's vault database gone, as when it is lost or removed from outside.'''
+	for suffix in ('', '-journal'):
+		try:
+			os.remove(os.path.join(job.job_vault, rv.MANIFEST_FILE_NAME + suffix))
+		except FileNotFoundError:
+			pass
+
+
+def a_vault_whose_manifest_is_lost_with_its_inner_disk_unmounted(job, monkeypatch):
+	'''
+	V0 of a.txt and disk/, an inner disk (the mount table stood in for) holding f.txt and sub/g.txt; then the vault database
+	removed, the disk unmounted (out of the table, its folder the empty mount point, what it held moved aside) and a.txt
+	changed. Returns a function that mounts it again, with what it held.
+	'''
+	from tests.test_inner_mounts import _fake_mounts
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f', 'disk/sub/g.txt': 'g'})
+	_fake_mounts(monkeypatch, job, ['disk/'])
+	run_backup(job)
+	remove_the_manifest(job)
+	disk, aside = os.path.join(job.monitor, 'disk'), os.path.join(job.root, 'aside')
+	os.rename(disk, aside)
+	os.mkdir(disk)
+	_fake_mounts(monkeypatch, job, [])
+	write(job, 'a.txt', 'changed')
+	def mount():
+		os.rmdir(disk)
+		os.rename(aside, disk)
+		_fake_mounts(monkeypatch, job, ['disk/'])
+	return mount
+
+
+def disk_inodes(version):
+	'''The inodes of disk/'s files in version: a copy made anew is another inode.'''
+	return {rel: os.lstat(os.path.join(version, 'disk', rel)).st_ino for rel in ('f.txt', 'sub/g.txt')}
+
+
+def holds_the_disk(version):
+	return tree(os.path.join(version, 'disk')) == {'f.txt': 'f', 'sub/': None, 'sub/g.txt': 'g'}
+
+
+def test_a_lost_manifest_still_pauses_an_inner_disk_unmounted_at_that_moment(job, monkeypatch, poll_fast):
+	# fails on main (commits the folder empty): the version's own record names disk/, so the start's comparison over a rebuilt
+	# manifest pauses it, the new version keeps its files, and once it is mounted again nothing is copied
+	from tests.test_inner_mounts import _lines
+	root_meta_store(monkeypatch)
+	mount = a_vault_whose_manifest_is_lost_with_its_inner_disk_unmounted(job, monkeypatch)
+	lines = _lines(monkeypatch)
+	versions = run_backup(job)
+	assert len(versions) == 2 and open(os.path.join(versions[1], 'a.txt')).read() == 'changed'
+	assert holds_the_disk(versions[1])
+	assert PAUSED_LINE in lines
+	inodes = disk_inodes(versions[1])
+	mount()
+	del lines[:]
+	newest = run_backup(job)[-1]
+	assert PAUSED_LINE not in lines
+	assert holds_the_disk(newest) and disk_inodes(newest) == inodes
+
+
+def test_a_rebuild_committed_by_a_comparison_leaves_the_key_absent(job, monkeypatch, poll_fast):
+	# fails on main (commits the folder empty): as above, with the first attempt failing after its comparison committed the
+	# rebuilt manifest (a stand-in raising JobFailure at the estimate). The key stays absent, so the next attempt still reads
+	# the version's record and pauses disk/
+	from tests.test_inner_mounts import _lines
+	root_meta_store(monkeypatch)
+	a_vault_whose_manifest_is_lost_with_its_inner_disk_unmounted(job, monkeypatch)
+	def failing(*args, **kwargs):
+		raise rv.JobFailure('the estimate stood in for fails')
+	with monkeypatch.context() as estimating:
+		estimating.setattr(rv, 'get_backup_size_inode', failing)
+		with pytest.raises(rv.JobFailure, match='stood in for'):
+			run_backup(job)
+	v0 = versions(job)[0].path
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		assert manifest.describes(v0)
+		assert manifest.conn.execute("SELECT value FROM meta WHERE key = 'inner_mounts'").fetchone() is None
+	finally:
+		manifest.close()
+	lines = _lines(monkeypatch)
+	committed = run_backup(job)
+	assert len(committed) == 2 and holds_the_disk(committed[1])
+	assert PAUSED_LINE in lines
+
+
+def test_a_record_whose_write_fails_logs_once_and_the_backup_commits(job, monkeypatch, poll_fast):
+	# pin: the record's write failing at setxattr (EIO) over two batches: one "Cannot keep the metadata" line, and both commit
+	from tests.test_inner_mounts import _lines
+	root_meta_store(monkeypatch)
+	stored = os.setxattr
+	def failing(path, name, *args, **kwargs):
+		if name == rv.ROOT_META_XATTR:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return stored(path, name, *args, **kwargs)
+	monkeypatch.setattr(os, 'setxattr', failing)
+	lines = _lines(monkeypatch)
+	seed_monitor(job, {'sub/f.txt': 'a'})
+	assert len(run_backup(job)) == 1
+	one_file_batch(job, 0)
+	assert len(versions(job)) == 2
+	assert sum('Cannot keep the metadata' in line for line in lines) == 1

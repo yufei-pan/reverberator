@@ -360,7 +360,7 @@ def wrong_contents(rv):
 
 
 def no_root_record(rv):
-	rv.record_root_meta = lambda monitor_path, version_path: True
+	rv.record_root_meta = lambda monitor_path, version_path, inner_mounts=None: True
 
 
 def no_list_placed(rv):

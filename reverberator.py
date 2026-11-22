@@ -4730,6 +4730,23 @@ def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mou
 	kept.update(rel for rel in remembered if any(rel.startswith(folder) for folder in paused))
 	return sorted(rel for rel in kept if not skips_folder_or_parent(skip, rel))
 
+def remembered_inner_mounts(manifest:'VaultManifest', newest_path:'str | None') -> list:
+	'''
+	The inner mount points a batch remembers (folder rels ending with /): manifest's, when it has recorded them; else those
+	the root-meta record of newest_path, the newest committed version's folder, holds (record_root_meta()), when it can be
+	read and has them, so a manifest lost or removed while an inner disk is unmounted still pauses it; else none. A
+	comparison's commit of a rebuilt manifest leaves the key absent, so an attempt that fails after it still reads the
+	record.
+	'''
+	remembered = manifest.inner_mounts
+	if remembered is None and newest_path is not None:
+		try:
+			remembered = load_root_meta(newest_path).inner_mounts
+		except (OSError, ValueError):
+			# none, one 0.55.5 wrote ( it has no field ), or a damaged one: as when nothing was remembered
+			pass
+	return [] if remembered is None else remembered
+
 def skip_paused(skip, paused:set):
 	'''
 	A walk's skip predicate (or None) that also leaves out the paused folders.
@@ -5093,7 +5110,7 @@ def compare_scanned_folders(backup_entries:dict,scan_folders:list,job_name:str,m
 	try:
 		latest_version_info = vaultInfo.vault_info_dict[next(reversed(vaultInfo.vault_info_dict))]
 		# the batch's guard holds the pool of the monitored path, whose disks' mounts below its place are inner mounts too
-		paused = paused_inner_mounts(monitor_path,manifest.inner_mounts,mount_table,None if skip_list is None else skip_list.skips,
+		paused = paused_inner_mounts(monitor_path,remembered_inner_mounts(manifest,latest_version_info.path),mount_table,None if skip_list is None else skip_list.skips,
 			None if pool_guard is None else pool_guard.state_of(monitor_path))
 		backuperTeeLogToTl(job_name,f'Comparing {", ".join(scopes)} with the vault')
 		drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in scopes])
@@ -6039,7 +6056,9 @@ def do_backup(backup_entries:dict,
 		# inner mounts from, as no copy follows its walk. a commit reads the table again, after its copies
 		walked_table = None
 		check_monitored_mount(monitor_path,mount_table,root_mount)
-		remembered_mounts = manifest.inner_mounts
+		# a manifest with none of its own takes those of the newest version's record
+		newest = next(reversed(vaultInfo.vault_info_dict), None)
+		remembered_mounts = remembered_inner_mounts(manifest,None if newest is None else vaultInfo.vault_info_dict[newest].path)
 		paused = paused_inner_mounts(monitor_path,remembered_mounts,mount_table,skip,pool)
 		if paused:
 			backuperTeeLogToTl(job_name,f'Inner mounts not mounted, keeping their last backed-up contents: {", ".join(sorted(paused))}')
@@ -6135,7 +6154,6 @@ def do_backup(backup_entries:dict,
 					# an inner disk unmounted while the walk and its copies ran left out what the walk had not reached under it: it
 					# is paused, so the commit holds the matched time and remembers it, and a comparison with it back copies the rest
 					paused, walked_table = drop_unmounted_entries({},job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,"first version's walk",first_version=True,pool=pool)
-					record_root_meta(monitor_path,backup_folder)
 			finally:
 				# however the backup ends, no copy is left writing into this version. a copy finish_copies did not reach
 				# means this V0 is not committed: the whole folder is removed as an orphan ( by the job's next vault scan ), so unlinking each
@@ -6355,7 +6373,11 @@ def do_backup(backup_entries:dict,
 		manifest.set_skip_fingerprint(skip_list.fingerprint if skip_list is not None else '')
 		# a disk mounted while this backup copied is in the version and is remembered too, so the table is read now, after the
 		# copy phase ( a full comparison's verification does not run, so no read since the last walk would show it )
-		manifest.set_inner_mounts(inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip,pool=pool))
+		remember = inner_mounts_to_remember(monitor_path,remembered_mounts,paused,mount_table,current_mount_table(),skip=skip,pool=pool)
+		# the version's folder keeps the monitored root's metadata as of this batch and the inner mounts it remembers, which a
+		# manifest lost later is read with ( remembered_inner_mounts() ): written before the commit, as the version's copies are
+		record_root_meta(monitor_path,backup_folder,remember)
+		manifest.set_inner_mounts(remember)
 		# a commit says its copies are on the disk (spec section 2.6). they are flushed before the change list is written, as the
 		# list's fsync is a checkpoint, which keeps a new file's size and not its data: whenever the batch placed a copy
 		# (manifest.copies_unsynced), through the handles its unit opened before its first write, so a write error another
@@ -9353,10 +9375,14 @@ class VaultManifest:
 		self._set_meta('skip_fingerprint', fingerprint)
 
 	@property
-	def inner_mounts(self) -> list:
-		'''The inner mount points (folder rels ending with /) recorded with the last committed state, [] when never recorded.'''
+	def inner_mounts(self) -> 'list | None':
+		'''
+		The inner mount points (folder rels ending with /) recorded with the last committed state, None when never recorded:
+		a database lost or removed, discarded or started over since, whose readers take the newest version's record
+		instead (remembered_inner_mounts()).
+		'''
 		row = self.conn.execute("SELECT value FROM meta WHERE key = 'inner_mounts'").fetchone()
-		return [] if row is None else [stored_name(rel) for rel in json.loads(row[0])]
+		return None if row is None else [stored_name(rel) for rel in json.loads(row[0])]
 
 	def set_inner_mounts(self, rels:list):
 		'''Record the inner mount points (folder rels ending with /); the caller holds the transaction.'''
@@ -11308,7 +11334,7 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 		manifest = VaultManifest(os.path.dirname(os.path.abspath(latest_version_info.path)))
 	skips = None if skip_list is None else skip_list.skips
 	if paused is None:
-		paused = paused_inner_mounts(monitor_path, manifest.inner_mounts, current_mount_table(), skips, None if pool_guard is None else pool_guard.state_of(monitor_path))
+		paused = paused_inner_mounts(monitor_path, remembered_inner_mounts(manifest, latest_version_info.path), current_mount_table(), skips, None if pool_guard is None else pool_guard.state_of(monitor_path))
 	scopes = scope_rel if isinstance(scope_rel, TouchedScopes) else TouchedScopes([scope_rel], [], None, changed_since_wall)
 	if scope_rel:
 		# checked before the transaction, as a scope compared nothing in leaves the manifest as it is. compare_scopes()
@@ -12928,7 +12954,7 @@ class WrittenFolders:
 	it made, removed or renamed an entry in, which moves a folder's mtime and ctime and nothing else of it. A rel
 	follows each folder move the replay makes after it (moved()), so it names the folder's place as the batch leaves the
 	version, the monitored folder's own. The version folder itself ('' or '.') is never one: it keeps the daemon's own,
-	and the monitored root's metadata is kept on it by a step of its own, at every batch (record_root_meta()).
+	and the monitored root's metadata is kept on it by the commit, at every batch (do_backup(), record_root_meta()).
 
 	Examples:
 		>>> folders = WrittenFolders()
@@ -13038,13 +13064,16 @@ class WrittenFolders:
 ROOT_META_XATTR = 'trusted.reverberator.root'
 ROOT_META_PREFIX = 'trusted.reverberator.'
 
-# what load_root_meta() gives: the root's owner, mode ( permission bits ), times and extended attributes ( name -> bytes )
-RootMeta = namedtuple('RootMeta', ['uid', 'gid', 'mode', 'atime_ns', 'mtime_ns', 'xattrs'])
+# what load_root_meta() gives: the root's owner, mode ( permission bits ), times and extended attributes ( name -> bytes ), and
+# the inner mount points the version's commit remembered ( folder rels ending with /, inner_mounts_to_remember() ), None when the
+# record has none ( one 0.55.5 wrote, or one made by no commit )
+RootMeta = namedtuple('RootMeta', ['uid', 'gid', 'mode', 'atime_ns', 'mtime_ns', 'xattrs', 'inner_mounts'], defaults=(None,))
 
 def encode_root_meta(meta:RootMeta) -> bytes:
 	'''
 	The value of ROOT_META_XATTR: one line of JSON, ASCII, {"v": 1, "uid", "gid", "mode", "atime_ns", "mtime_ns" (whole
-	numbers), "xattrs": {name: base64 of the value}}. A name that is not UTF-8 is written as Python's surrogateescape
+	numbers), "xattrs": {name: base64 of the value}}, and "inner_mounts": [folder rel ending with /] when meta has them, each
+	as the manifest stores it (storable_name()). A name that is not UTF-8 is written as Python's surrogateescape
 	reads it (a \\udcXX escape). Fields may be added under "v": 1; "v" changes only when a reader of 1 would misread it.
 
 	Examples:
@@ -13054,11 +13083,17 @@ def encode_root_meta(meta:RootMeta) -> bytes:
 		>>> decode_root_meta(encode_root_meta(meta)) == meta
 		True
 	'''
-	return json.dumps({'v': 1, 'uid': meta.uid, 'gid': meta.gid, 'mode': meta.mode, 'atime_ns': meta.atime_ns, 'mtime_ns': meta.mtime_ns,
-		'xattrs': {name: base64.b64encode(value).decode('ascii') for name, value in meta.xattrs.items()}}, separators=(',', ':')).encode('ascii')
+	record = {'v': 1, 'uid': meta.uid, 'gid': meta.gid, 'mode': meta.mode, 'atime_ns': meta.atime_ns, 'mtime_ns': meta.mtime_ns,
+		'xattrs': {name: base64.b64encode(value).decode('ascii') for name, value in meta.xattrs.items()}}
+	if meta.inner_mounts is not None:
+		record['inner_mounts'] = [storable_name(rel) for rel in meta.inner_mounts]
+	return json.dumps(record, separators=(',', ':')).encode('ascii')
 
 def decode_root_meta(data:bytes) -> RootMeta:
-	'''The RootMeta a ROOT_META_XATTR value holds (encode_root_meta()); ValueError when it is not one of version 1.'''
+	'''
+	The RootMeta a ROOT_META_XATTR value holds (encode_root_meta()); ValueError when it is not one of version 1. Its inner
+	mounts are None unless the field is a list of names: one that is damaged costs only itself, not the root's metadata.
+	'''
 	record = json.loads(data.decode('ascii'))
 	if not isinstance(record, dict) or record.get('v') != 1:
 		raise ValueError('not a version 1 record')
@@ -13072,7 +13107,12 @@ def decode_root_meta(data:bytes) -> RootMeta:
 	xattrs = record.get('xattrs')
 	if not isinstance(xattrs, dict) or not all(isinstance(value, str) for value in xattrs.values()):
 		raise ValueError('its extended attributes are not names and values')
-	return RootMeta(*numbers, {name: base64.b64decode(value, validate=True) for name, value in xattrs.items()})
+	mounts = record.get('inner_mounts')
+	if isinstance(mounts, list) and all(isinstance(rel, str) for rel in mounts):
+		mounts = [stored_name(rel) for rel in mounts]
+	else:
+		mounts = None
+	return RootMeta(*numbers, {name: base64.b64decode(value, validate=True) for name, value in xattrs.items()}, mounts)
 
 def load_root_meta(version_path:str) -> RootMeta:
 	'''The monitored root's metadata version_path holds (record_root_meta()); OSError when it cannot be read, ValueError (or UnicodeDecodeError) when it is not a record.'''
@@ -13083,14 +13123,17 @@ def load_root_meta(version_path:str) -> RootMeta:
 # backing up one folder to two vaults are two jobs
 ROOT_META_TROUBLE = {}
 
-def record_root_meta(monitor_path:str, version_path:str) -> bool:
+def record_root_meta(monitor_path:str, version_path:str, inner_mounts:list = None) -> bool:
 	'''
 	Keep on version_path, the folder of a version being written, the monitored root's owner, mode, times and extended
 	attributes as of now (ROOT_META_XATTR, encode_root_meta()), read from the folder monitor_path names (a link to it
-	is followed), so a whole job restored gets its top folder's own back (restore_folder_meta()). version_path itself
+	is followed), so a whole job restored gets its top folder's own back (restore_folder_meta()); and inner_mounts, when
+	given, the inner mount points the version's commit remembers, which a manifest that has none is read with
+	(remembered_inner_mounts()). version_path itself
 	keeps the daemon's owner, mode and times. One that cannot be read or written logs an error line, and that version's
 	whole-job restore gives the top folder the version folder's own. A record too big for one attribute of a folder
-	(the root's attributes take about 1.4 times their size in it) is written without them, saying so. Either is logged
+	(the root's attributes take about 1.4 times their size in it) is written without them, saying so, and keeps
+	inner_mounts. Either is logged
 	on the first batch of a monitored path that has it, not again while it lasts, and an info line says when it works
 	again. A record equal byte for byte to the one version_path holds is not written again (the root's atime moves at most
 	once a day on relatime). Returns whether version_path holds a record, written now or equal already.
@@ -13113,7 +13156,7 @@ def record_root_meta(monitor_path:str, version_path:str) -> bool:
 				# removed since it was listed
 				if e.errno != errno.ENODATA:
 					raise
-		meta = RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs)
+		meta = RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns, xattrs, inner_mounts)
 		record = encode_root_meta(meta)
 		try:
 			# the tree keeps the last batch's record: one equal byte for byte, the full one, needs no write. A trimmed one never
@@ -13847,10 +13890,6 @@ class TreeWriter:
 		'''
 		copy_file_meta(source, self.path(rel), failed)
 
-	def root_meta(self, monitor_path:str) -> None:
-		'''The monitored root's metadata as of now, kept on the tree's own folder (record_root_meta()). Nothing is recorded: the previous version got its own at the hand-over.'''
-		record_root_meta(monitor_path, self.tree)
-
 def hand_over(job_vault:str, newest_path:str, new_path:str, manifest:'VaultManifest' = None, pooled:bool = None) -> TreeWriter:
 	'''
 	The tree in newest_path, the newest version, becomes new_path's, and newest_path becomes a folder of forward links,
@@ -14247,7 +14286,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 	renamed an entry in, and each one touched.folders names, gets the monitored folder's times, and each one they made or
 	synced the attributes of all of the monitored folder's metadata (WrittenFolders), and the rows of those given its times
 	record its mtime; every other folder keeps what it has, which its batch left right. A folder whose whole copy fails is recorded from
-	what the version holds. backup_folder itself keeps its own, and then holds the monitored root's (record_root_meta()).
+	what the version holds. backup_folder itself keeps its own; the commit gives it the monitored root's (do_backup(),
+	record_root_meta()).
 	manifest is updated to describe backup_folder inside a transaction the caller commits once the version is complete.
 	'''
 	global BACKUP_SEMAPHORE
@@ -14787,8 +14827,6 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 	for rel in written.settle(backup_folder,monitor_path,unsynced,paused,poll_pools,writer=writer):
 		if manifest.lookup(as_folder_entry(rel)) is not None:
 			manifest.add(as_folder_entry(rel),dirty=True)
-	# the version folder keeps its own, and holds the monitored root's as of this batch
-	writer.root_meta(monitor_path)
 	record_dirty_entries(manifest,backup_folder)
 	# the rows of the folders given the monitored ones' times record the monitored mtime, read from the vault or not, for
 	# full comparisons ( compare_monitor_entry() ): a vault whose filesystem keeps coarser times holds another

@@ -1474,8 +1474,9 @@ def test_version_folders_stay_the_daemons_and_keep_the_monitored_roots_metadata_
 	seed_monitor(job, {'a.txt': 'a'})
 	os.setxattr(job.monitor, 'user.top', b'0')
 	run_backup(job)
+	# with the inner mounts the commit remembered: none here
 	root_meta = lambda path: (lambda st: rv.RootMeta(st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), st.st_atime_ns, st.st_mtime_ns,
-		{name: os.getxattr(path, name) for name in os.listxattr(path)}))(os.lstat(path))
+		{name: os.getxattr(path, name) for name in os.listxattr(path)}, []))(os.lstat(path))
 	v0_meta = root_meta(job.monitor)
 	assert rv.load_root_meta(rv.list_versions(job.job_vault)[0].path) == v0_meta
 	with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:

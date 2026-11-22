@@ -227,7 +227,7 @@ def test_unknown_schema_is_started_over(job):
 	conn.execute("UPDATE meta SET value = '0' WHERE key = 'schema'")
 	conn.close()
 	manifest = rv.VaultManifest(job.job_vault)
-	assert manifest.files == [] and manifest.skip_fingerprint is None and manifest.inner_mounts == []
+	assert manifest.files == [] and manifest.skip_fingerprint is None and manifest.inner_mounts is None
 	manifest.close()
 	assert schema(job) == rv.VaultManifest.SCHEMA
 

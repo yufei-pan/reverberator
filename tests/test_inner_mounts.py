@@ -423,7 +423,8 @@ def test_manifest_remembers_inner_mounts_and_lists_unseen_rows_of_a_folder(tmp_p
 	version = str(tmp_path / 'V0--2021-01-01_00-00-00_-0800')
 	manifest = tracked_manifest(str(tmp_path), version, files=['a/x', 'a/y', 'ab', 'b/z'], folders=['a/', 'b/'])
 	try:
-		assert manifest.inner_mounts == []
+		# never recorded: a reader takes the newest version's record instead (rv.remembered_inner_mounts())
+		assert manifest.inner_mounts is None
 		manifest.begin()
 		manifest.set_inner_mounts(['a/', 'b/c/'])
 		manifest.commit()
@@ -1042,3 +1043,77 @@ def test_a_batch_emptied_by_the_look_after_the_locks_makes_no_version_and_releas
 		assert _recorded(job)[1] == ['disk/']
 	finally:
 		disk.close()
+
+
+# ---- D3, item 1: a lost manifest takes the inner mounts from the newest version's record --------------------------------------
+
+def _lost_manifest_over_a_real_inner_tmpfs(job, monkeypatch, fail_first):
+	'''
+	disk/, an inner tmpfs (bound from one kept aside, so it comes back with what it held) holding f.txt and sub/g.txt, with real
+	trusted.* records: V0, the vault database removed, disk/ unmounted and a.txt changed, then a start (with fail_first, after an
+	attempt that fails at the estimate once its comparison committed the rebuilt manifest, which leaves the key absent). The
+	new version keeps disk/'s files and "Inner mounts not mounted" is logged; mounted again, nothing is copied.
+	'''
+	from tests.test_restore_in_place import PAUSED_LINE, disk_inodes, holds_the_disk, remove_the_manifest
+	store, disk = os.path.join(job.root, 'store'), os.path.join(job.monitor, 'disk')
+	os.makedirs(store)
+	os.makedirs(disk)
+	subprocess.check_call(['mount', '-t', 'tmpfs', 'tmpfs', store])
+	try:
+		seed_monitor(job, {'a.txt': 'a'})
+		os.makedirs(os.path.join(store, 'sub'))
+		for rel, text in (('f.txt', 'f'), ('sub/g.txt', 'g')):
+			with open(os.path.join(store, rel), 'w', encoding='utf-8') as f:
+				f.write(text)
+		subprocess.check_call(['mount', '--bind', store, disk])
+		v0 = run_backup(job)[0]
+		remove_the_manifest(job)
+		subprocess.check_call(['umount', disk])
+		with open(os.path.join(job.monitor, 'a.txt'), 'w', encoding='utf-8') as f:
+			f.write('changed')
+		lines = _lines(monkeypatch)
+		if fail_first:
+			def failing(*args, **kwargs):
+				raise rv.JobFailure('the estimate stood in for fails')
+			with monkeypatch.context() as estimating:
+				estimating.setattr(rv, 'get_backup_size_inode', failing)
+				with pytest.raises(rv.JobFailure, match='stood in for'):
+					run_backup(job)
+			manifest = rv.VaultManifest(job.job_vault)
+			try:
+				assert manifest.describes(v0)
+				assert manifest.conn.execute("SELECT value FROM meta WHERE key = 'inner_mounts'").fetchone() is None
+			finally:
+				manifest.close()
+			del lines[:]
+		versions = run_backup(job)
+		assert len(versions) == 2 and _read(os.path.join(versions[1], 'a.txt')) == 'changed'
+		assert holds_the_disk(versions[1])
+		assert PAUSED_LINE in lines
+		inodes = disk_inodes(versions[1])
+		subprocess.check_call(['mount', '--bind', store, disk])
+		del lines[:]
+		newest = run_backup(job)[-1]
+		assert PAUSED_LINE not in lines
+		assert holds_the_disk(newest) and disk_inodes(newest) == inodes
+		# a real trusted.* attribute of the version's folder names the disk
+		assert rv.load_root_meta(newest).inner_mounts == ['disk/']
+	finally:
+		subprocess.call(['umount', disk], stderr=subprocess.DEVNULL)
+		subprocess.call(['umount', store])
+
+
+@pytest.mark.privileged
+@needs_root
+def test_a_lost_manifest_still_pauses_a_real_inner_tmpfs(job, poll_fast, monkeypatch):
+	# fails on main (commits the folder empty): the Docker variant is test_restore_in_place.py's
+	# test_a_lost_manifest_still_pauses_an_inner_disk_unmounted_at_that_moment
+	_lost_manifest_over_a_real_inner_tmpfs(job, monkeypatch, fail_first=False)
+
+
+@pytest.mark.privileged
+@needs_root
+def test_a_lost_manifest_rebuilt_by_a_comparison_still_pauses_a_real_inner_tmpfs(job, poll_fast, monkeypatch):
+	# fails on main (commits the folder empty): the Docker variant is test_restore_in_place.py's
+	# test_a_rebuild_committed_by_a_comparison_leaves_the_key_absent
+	_lost_manifest_over_a_real_inner_tmpfs(job, monkeypatch, fail_first=True)

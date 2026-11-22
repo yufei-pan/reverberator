@@ -172,3 +172,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: with fstab unreadable, a path under an unmounted fstab mount point counted as there, and a start could make the vault on the bare mount point.
 - Original design was wrong because: the rule took a failed read for an answer.
 - Lesson: a source a safety rule reads either answers or is a problem; only its own "none" (no such file) is an empty answer.
+
+## 2026-11-14 reverberator 0.55.6: a version's root-meta record carries its inner mounts
+- Changed: the commit writes the inner mounts it remembers into the version folder's root-meta record as well as into the manifest, and a manifest with no such key reads them from the newest version's record.
+- Why we had to change: a lost or damaged manifest forgot which inner disks the job had seen, so one unmounted at that moment read as an empty folder, its files left the new version, and pruning could take the versions that held them.
+- Original design was wrong because: state needed to read the tree right was kept only in a database that is rebuilt from the tree, and the tree cannot say it.
+- Lesson: state a rebuild cannot recover from the data lives with the data, not only in the index rebuilt from it.
