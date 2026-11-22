@@ -2194,13 +2194,13 @@ def test_a_folder_metadata_copy_that_failed_once(umask_022, job, poll_fast, monk
 
 @pytest.mark.parametrize('case, place', sorted({(case, place) for case, place, _ in LEFT_WRONG_ON_MAIN}))
 def test_a_folder_whose_copy_failed_heals_at_the_next_batch_comparing_it(umask_022, job, poll_fast, monkeypatch, capsys, case, place):
-	# fails on main, at the mark assert first (`assert [] == ['P/C/']`: main marks no row), and without it at the last assert (the
-	# batch left C as the failing version held it): the batch that renames P to Q compares the tree under Q (its verification, compare_scopes()), C's record there
-	# matches the monitored C's, and the attribute check does not reach C, so the newest version keeps C as the failing one left it.
-	# Since step 2 C's row holds the mark (it moved with C: VaultManifest.move_tree()), and the batch copies C's metadata again. The
-	# batch is stamped now, as the watcher stamps one (backup_events() stamps its events at a monotonic 1.0 s, near the boot, which
-	# would put every ctime in the window), and VERIFY_CTIME_MARGIN_SECONDS is 0, as for after_another_batch: C's last change came
-	# more than the margin before the batch
+	# fails on main, at the mark assert first (`assert [] == ['P/C/']`: main marks no row), and without it at the assert on Q/C's
+	# reading (the batch left C as the failing version held it): the batch that renames P to Q compares the tree under Q (its
+	# verification, compare_scopes()), C's record there matches the monitored C's, and the attribute check does not reach C, so the
+	# newest version keeps C as the failing one left it. Since step 2 C's row holds the mark (it moved with C:
+	# VaultManifest.move_tree()), and the batch copies C's metadata again. The batch is stamped now, as the watcher stamps one
+	# (backup_events() stamps its events at a monotonic 1.0 s, near the boot, which would put every ctime in the window), and
+	# VERIFY_CTIME_MARGIN_SECONDS is 0, as for after_another_batch: C's last change came more than the margin before the batch
 	parent, folder, failed_at, failing = _failing_version(job, monkeypatch, case, place)
 	failed = _read_in(job, committed_versions(job)[failing], 'P/C', case)
 	assert failed != _case_reading(folder, case), 'the failing version holds C right: nothing to heal'
