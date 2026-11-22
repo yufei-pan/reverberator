@@ -13449,7 +13449,8 @@ def record_root_meta(monitor_path:str, version_path:str, inner_mounts:list = Non
 	less, saying so: without the root's attributes, which keeps its owner, mode, times and inner_mounts; and where that does not fit
 	either, without inner_mounts too, which keeps its owner, mode and times. (The set could have an attribute of its own, so as not to
 	trade with the root's attributes; it has none, as a record whose format a 0.55.5 reads as it always did, and one write, are worth
-	more than the case: it takes about 100 inner mounts, or 4 KiB of the root's own attributes, to hit it.)
+	more than the case: it takes about 2.9 KiB of the root's own attributes on ext4 or f2fs, less beside many inner mounts, to
+	hit the first, and about 100 inner mounts to hit the second.)
 
 	One that cannot be written at all logs an error line. The version then keeps the record it holds, the one the hand-over copied
 	onto it from the version before, so a whole-job restore of it gives the top folder what that batch kept; a first version, with

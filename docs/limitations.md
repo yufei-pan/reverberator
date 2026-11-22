@@ -989,8 +989,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Kind:** deferred.
 - **What the operator sees:** the record of the monitored folder's own metadata that each version's folder keeps (for a
   whole-job restore of the top folder) holds the inner disks' mount points too; when both do not fit in one extended
-  attribute of the version's folder (about 100 inner mounts, or about 4 KiB of the top folder's own extended
-  attributes), the record keeps the mount points and drops the top folder's own extended attributes, with one line
+  attribute of the version's folder (about 2.9 KiB of the top folder's own extended attributes on ext4 or f2fs, less
+  beside many inner mounts), the record keeps the mount points and drops the top folder's own extended attributes, with one line
   saying so: a whole-job restore of that version gives the top folder none of its extended attributes. At about 100
   inner mounts the mount points alone do not fit: the record drops them too, with a line saying so, and keeps the owner,
   mode and times, so over a lost database no inner disk is paused then. When the write
