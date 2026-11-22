@@ -2065,25 +2065,30 @@ def test_a_staged_link_without_its_text_is_passed_over_by_the_put_back(r_job, mo
 @pytest.mark.unit
 def test_a_link_probe_with_its_text_lost_does_not_fail_the_scan_over_a_lost_manifest(r_job, monkeypatch):
 	# the scan over a lost manifest read every link in staging to give back what a cut left, and a probe with no text failed it at every scan
-	# (VaultScanError) until it was removed by hand. Now empty_staging() removes it first, as it removes any link that is not the tree's, and the
-	# put-back passes over what is left. Fails on eedbabd: the scan fails
+	# (VaultScanError) until it was removed by hand. Fails on eedbabd: the scan fails. The put-back passes over a link it cannot read
+	# (readlink's ENOENT), and empty_staging() keeps it while the orphan stands, as any link it cannot read (since the fix wave's FW6: on a
+	# pool ENOENT is also a disk that is out), with its line; the first scan with no orphan, after the roll-forward's commit, removes it
 	previous, tree, probe, lose_text = a_link_probe_with_its_text_lost(r_job, monkeypatch)
 	lose_the_manifest(r_job)
 	with monkeypatch.context() as patched:
 		lose_text(patched)
 		rv.get_vault_info(r_job.job_vault)
+		assert os.path.lexists(probe)
+		roll_forward(r_job)
+		assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
+		rv.get_vault_info(r_job.job_vault)
 	assert not os.path.lexists(probe)
-	roll_forward(r_job)
-	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize('answer', [errno.EIO, errno.ENOENT], ids=['EIO', 'ENOENT'])
-def test_empty_staging_keeps_a_link_it_cannot_read_and_removes_one_with_no_text(r_job, monkeypatch, capsys, answer):
-	# keep_for names the orphan whose forward links stay. A link whose readlink fails with anything but "no link" or "no text" (EIO) may be one
-	# of them, the entry's only record over a lost manifest: it stays, with one "Cannot read" line, for the next scan. ENOENT (an f2fs link
-	# whose text missed the checkpoint) records nothing: it goes, with no line. A link of the tree's own stays by its text (the control). Fails
-	# with the EIO branch gone (`continue`): the link is removed
+def test_empty_staging_keeps_a_link_it_cannot_read(r_job, monkeypatch, capsys, answer):
+	# keep_for names the orphan whose forward links stay. A link whose readlink fails with anything but "no link" (EINVAL) may be one of them,
+	# the entry's only record over a lost manifest: it stays, with one "Cannot read" line, for the next scan. ENOENT too (fails before the fix
+	# wave's FW6, the final review's s10 (1): it was removed, as an f2fs link whose text missed the checkpoint, which records nothing): on a
+	# pool a disk that is out answers ENOENT for a name the listing showed, and the link kept there is removed if the disk is back before the
+	# removal. A link with no text stays only while the orphan stands. A link of the tree's own stays by its text (the control). Fails with
+	# the EIO branch gone (`continue`): the link is removed
 	staging = rv.staging_path(r_job.job_vault)
 	os.makedirs(staging)
 	tree_name = 'V3--2021-01-01_00-00-00_-0800'
@@ -2099,10 +2104,7 @@ def test_empty_staging_keeps_a_link_it_cannot_read_and_removes_one_with_no_text(
 	rv.empty_staging(r_job.job_vault, tree_name)
 	out = capsys.readouterr().out
 	cannot = [line for line in out.splitlines() if f'Cannot read {os.path.join(staging, "unreadable")} for now' in line]
-	if answer == errno.EIO:
-		assert sorted(os.listdir(staging)) == ['own', 'unreadable'] and len(cannot) == 1, out
-	else:
-		assert os.listdir(staging) == ['own'] and cannot == [], out
+	assert sorted(os.listdir(staging)) == ['own', 'unreadable'] and len(cannot) == 1, out
 
 
 @pytest.mark.unit

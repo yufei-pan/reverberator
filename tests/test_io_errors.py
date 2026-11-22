@@ -1550,7 +1550,7 @@ def test_a_fifo_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll_f
 		patch.setattr(os, 'lstat', lstat)
 		manifest = rv.VaultManifest(job.job_vault)
 		try:
-			dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest)
+			dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest, True)
 		finally:
 			manifest.close()
 	assert swapped and dropped is False
@@ -1586,7 +1586,7 @@ def test_a_socket_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll
 			patch.setattr(os, 'lstat', lstat)
 			manifest = rv.VaultManifest(job.job_vault)
 			try:
-				dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest)
+				dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest, True)
 			finally:
 				manifest.close()
 	finally:
@@ -1621,13 +1621,28 @@ def test_a_link_swapped_in_after_the_checks_lstat_counts_as_a_change_and_is_not_
 		patch.setattr(os, 'lstat', lstat)
 		manifest = rv.VaultManifest(job.job_vault)
 		try:
-			dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest)
+			dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest, True)
 		finally:
 			manifest.close()
 	assert swapped and os.path.islink(path)
 	out = capsys.readouterr()
 	assert dropped is False
 	assert 'source no longer exists' not in out.out + out.err and f'UNREADABLE: {path}: ' not in out.out + out.err
+
+
+@pytest.mark.parametrize('failing', ['this_version', 'the_version_before'])
+def test_the_unreadable_lines_end_says_when_a_place_cannot_be_looked_at(tmp_path, monkeypatch, failing):
+	# fails before the fix wave's FW6 (the final review's s04): unreadable_end() read an lstat that fails (EIO, EACCES) as nothing there
+	# (os.path.lexists()), so the UNREADABLE line said 'left out of this version' of a copy that may still be in it, or 'which may be
+	# damaged' of a last backed-up copy. Only ENOENT and ENOTDIR are nothing there: any other error is said as what it is
+	dest, previous = str(tmp_path / 'this'), str(tmp_path / 'before')
+	for path in (dest, previous):
+		open(path, 'w').close()
+	_fail_lstat(monkeypatch, dest if failing == 'this_version' else previous, errno.EIO)
+	if failing == 'this_version':
+		assert rv.unreadable_end(dest, previous) == 'what this version holds for it cannot be looked at (Input/output error)'
+	else:
+		assert rv.unreadable_end(dest, previous) == 'keeping the copy this version holds, which may be one a cut backup made, and damaged: the version before cannot be looked at (Input/output error)'
 
 
 def test_an_unchanged_readable_file_compares_as_unchanged(job, poll_fast, capsys):
@@ -2337,3 +2352,38 @@ def test_a_roll_forward_keeps_a_folders_mark(tmp_path):
 		assert manifest.lookup('G/').kind is None
 	finally:
 		manifest.close()
+
+
+@pytest.mark.parametrize('place', ['file', 'link'])
+def test_a_folder_attrib_refused_where_the_version_holds_no_folder_is_not_marked(job, poll_fast, monkeypatch, capsys, place):
+	# fails before the fix wave's FW1 (the final review's s09 (1), a regression of Task 18): the replay refuses a folder's attrib where the
+	# version holds a file or a link at the folder's place (an outside change to the vault), copying nothing, and the commit marked the
+	# folder's row for a retry all the same (META_RETRY_MODE): every full comparison after it found an attrib there, refused it again with
+	# its ERROR line and committed a version that changed nothing (Keep N then pushes a real version out). Only a folder whose own metadata
+	# copy was tried and failed is marked now. The attrib is the monitored C's user.note alone, which moves no mode, owner or mtime, so
+	# its record still matches the monitored C; VERIFY_CTIME_MARGIN_SECONDS at -3600 keeps the full comparison's attribute check off every
+	# entry, as for a folder last changed more than the margin before the matched time: only a mark can find C there
+	seed_monitor(job, {'a.txt': 'a', 'P/C/f.txt': 'f'})
+	assert _full(job) is True
+	folder = os.path.join(job.monitor, 'P', 'C')
+	held = os.path.join(committed_versions(job)[-1], 'P', 'C')
+	shutil.rmtree(held)
+	if place == 'file':
+		open(held, 'w').close()
+	else:
+		os.symlink('nowhere', held)
+	_give(folder, 'own_xattr')
+	capsys.readouterr()
+	_events(job, [(True, 'attrib', 'P/C', None)])
+	out = capsys.readouterr()
+	assert f'Not syncing the attributes of {folder}/ onto ' in out.out + out.err
+	versions = committed_versions(job)
+	assert _marked_rows(job) == []
+	monkeypatch.setattr(rv, 'VERIFY_CTIME_MARGIN_SECONDS', -3600)
+	_full(job)
+	assert committed_versions(job) == versions, 'the full comparison found the refused folder again and made a version that changes nothing'
+	# the change lists name the sizes of what the rows hold, C/f.txt among them, which the outside change took out of the vault: the
+	# version view oracle's lines on that (and only those) are this test's own, looked at and taken out
+	from tests import version_view_ground_truth as view_truth
+	assert all('its list should be' in line for line in view_truth.WRONG), view_truth.WRONG
+	view_truth.WRONG.clear()

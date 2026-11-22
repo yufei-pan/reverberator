@@ -1546,6 +1546,25 @@ def test_a_set_too_big_for_the_record_is_left_out_and_the_owner_mode_and_times_s
 	assert not [kwargs for args, kwargs in lines if 'Cannot keep' in kwargs.get('message', '')]
 
 
+def test_a_record_that_loses_its_set_after_losing_the_roots_attributes_says_so(job, monkeypatch):
+	# fails before the fix wave's FW7 (the final review's s16 (3)): the two trims shared one state, 'trimmed', so once a batch had said that
+	# the root's attributes did not fit, a later one whose set did not fit either (the record then has no inner mount points) said nothing,
+	# and a vault database lost meanwhile would not say which inner disks were unmounted. Each trim has its state and its line now, said
+	# once while it lasts. A limit of 3,500 bytes: the root's user.big of 3000 bytes leaves the full record over it; a set of two mounts
+	# fits once the attributes are out, a set of 300 does not
+	store, writes = root_meta_store(monkeypatch, limit=3500)
+	lines = logged(monkeypatch)
+	seed_monitor(job, {'a.txt': 'a'})
+	os.setxattr(job.monitor, 'user.big', b'x' * 3000)
+	mounts = [f'mount{i:04}/' for i in range(300)]
+	for i, (inner, said) in enumerate([(['disk/', 'other/'], 1), (['disk/', 'other/'], 1), (mounts, 2), (mounts, 2)]):
+		version = a_version_folder(job, f'V{i}')
+		assert rv.record_root_meta(job.monitor, version, inner)
+		assert len(trimmed_lines(lines)) == said, trimmed_lines(lines)
+	assert rv.load_root_meta(version).inner_mounts is None
+	assert 'without them' in trimmed_lines(lines)[0]['message'] and 'inner mount points of' in trimmed_lines(lines)[1]['message']
+
+
 def test_a_set_too_big_for_a_root_with_no_attributes_is_left_out_the_same(job, monkeypatch):
 	# the root has no attributes of its own: the only thing to leave out is the set
 	store, writes = root_meta_store(monkeypatch, limit=3500)

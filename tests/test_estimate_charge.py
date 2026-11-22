@@ -99,6 +99,23 @@ def test_the_estimate_charges_a_folder_and_a_link_their_blocks(job):
 	assert estimate(job, 'l')[0] == os.lstat(os.path.join(job.monitor, 'l')).st_blocks * 512
 
 
+def test_a_folder_entry_replaced_by_a_link_is_charged_as_the_link(job):
+	# fails before the fix wave's FW4 (the final review's s15 (1)): the estimate's lstat of a batch folder's path with its trailing slash
+	# followed a link put at the folder's name and charged the folder it leads to its blocks, where the replay makes an empty folder (its
+	# copy walk does not follow the link): under a size limit, versions could be pruned that need not be. The folder the link leads to
+	# holds 2,000 names of 104 bytes, about 230 KB of entries, which take blocks of their own on a disk's filesystem
+	elsewhere = os.path.join(job.root, 'elsewhere')
+	os.makedirs(elsewhere)
+	for i in range(2000):
+		open(os.path.join(elsewhere, f'{i:04}' + 'n' * 100), 'w').close()
+	if os.lstat(elsewhere).st_blocks == 0:
+		pytest.skip('the filesystem under the test gives a folder no blocks (tmpfs): a folder and a link would be charged alike')
+	os.makedirs(job.monitor, exist_ok=True)
+	link = os.path.join(job.monitor, 'd')
+	os.symlink(elsewhere, link)
+	assert estimate(job, 'd/') == (os.lstat(link).st_blocks * 512, 1)
+
+
 def test_the_estimate_runs_no_du(job, monkeypatch):
 	os.makedirs(os.path.join(job.monitor, 'd'))
 	with open(os.path.join(job.monitor, 'd', 'f'), 'w') as f:

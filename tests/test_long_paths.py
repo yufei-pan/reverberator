@@ -10,6 +10,7 @@ bytes (deep_folder()), so an entry reaches the limit in the vault, whose version
 root's, while its monitored path stays under it.
 '''
 import datetime
+import errno
 import os
 from collections import OrderedDict, deque
 
@@ -695,3 +696,68 @@ def test_on_a_pool_the_size_estimate_charges_nothing_for_what_the_pools_surplus_
 	monkeypatch.setattr(rv, 'get_backup_size_inode', lambda *args, **kwargs: estimates.append(real(*args, **kwargs)) or estimates[-1])
 	backup(job, ('a', 'modify'), (rel_of(job, big), 'create'))
 	assert estimates == [expected]
+
+
+def mode_in(version, job, folder, name):
+	'''The permission bits of the entry name the version holds in the folder of the monitored folder's place, read through the folder's handle.'''
+	fd = os.open(os.path.join(version, rel_of(job, folder)), os.O_RDONLY | os.O_DIRECTORY)
+	try:
+		return os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode & 0o7777
+	finally:
+		os.close(fd)
+
+
+@pytest.mark.parametrize('alone', [True, False], ids=['alone', 'beside_a_change'])
+def test_an_attrib_synced_in_place_in_a_folder_at_4041_bytes_is_backed_up(job, capsys, alone):
+	# fails before the fix wave's FW5 (the final review's s12): under Only Sync Attributes a file's attrib whose record vouches is synced in
+	# place (TreeWriter.file_meta(), no temporary name), and the replay measured it as a copy, by its temporary name: a file renamed into a
+	# folder whose vault path is 4,041 bytes (its own path fits; a temporary name there would not) kept its old mode with a false NOT
+	# BACKED UP line, and the check dropped a batch of only that attrib (no version). The temporary name is measured only where a copy is
+	# written now, in the replay; the check and the records measure an attrib under Only Sync Attributes by its own path
+	seed_monitor(job, {'a': 'a', 'x': 'x'})
+	folder = deep_folder(job, 4041)
+	run_backup(job)
+	target = os.path.join(folder, 'r' * 20)
+	os.rename(os.path.join(job.monitor, 'x'), target)
+	versions = backup(job, (rel_of(job, target), 'move', 'x'))
+	assert len(versions) == 2 and read_in(versions[-1], job, folder, 'r' * 20) == 'x' and mode_in(versions[-1], job, folder, 'r' * 20) != 0o600
+	os.chmod(target, 0o600)
+	entries = [(rel_of(job, target), 'attrib')]
+	if not alone:
+		write(os.path.join(job.monitor, 'a'), 'a2')
+		entries.append(('a', 'modify'))
+	capsys.readouterr()
+	versions = backup(job, *entries)
+	assert not_backed_up(capsys) == {}
+	assert len(versions) == 3 and mode_in(versions[-1], job, folder, 'r' * 20) == 0o600 and read_in(versions[-1], job, folder, 'r' * 20) == 'x'
+
+
+def test_a_move_whose_target_cannot_be_looked_at_gets_its_unreadable_line(job, monkeypatch, capsys):
+	# fails before the fix wave's FW6 (the final review's s13 (2)): the check took a move's target it could not look at (an lstat that
+	# fails with EIO) for one gone since the batch was taken (os.path.lexists()), and dropped the batch with the source's line alone. An
+	# lstat error is no absence: the target gets its UNREADABLE line (it is left out of this version), and the batch still drops, as the
+	# replay copies nothing to it. The source is past the limit in V10 (held_at_4096_in_v10()), so the version keeps it
+	folder, file = held_at_4096_in_v10(job, monkeypatch)
+	versions = committed_versions(job)
+	target = os.path.join(job.monitor, 'g')
+	os.rename(file, target)
+	real_lstat = os.lstat
+	def lstat(path, *args, **kwargs):
+		if os.fspath(path) == target:
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return real_lstat(path, *args, **kwargs)
+	capsys.readouterr()
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		with monkeypatch.context() as patch:
+			patch.setattr(os, 'lstat', lstat)
+			dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'g', 'move', rel_of(job, file))]), job.monitor, versions[-1], job.job_vault, None, job.job_name, set(), manifest, True)
+	finally:
+		manifest.close()
+	out = capsys.readouterr()
+	text = out.out + out.err
+	assert dropped is True
+	assert not_backed_up_in(text) == {file: [KEPT]}
+	unreadable = [line for line in text.splitlines() if f'UNREADABLE: {target}: ' in line]
+	assert len(unreadable) == 1 and unreadable[0].endswith('; left out of this version'), text
+	assert 'source no longer exists' not in text

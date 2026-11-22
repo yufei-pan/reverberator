@@ -4023,7 +4023,8 @@ def unreadable_end(dest_path:str, previous_path:'str | None') -> str:
 	How the UNREADABLE line of a file that cannot be copied ends, by what the version being made holds at dest_path and what the version before holds at
 	previous_path (None: no version before). Nothing at dest_path: the file is new, and left out of this version. An entry of the version before: its last
 	backed-up copy stays. Otherwise the copy there is the cut backup's own (a roll-forward over a lost manifest on a pool leaves it, as it cannot tell it
-	from a removed entry): it stays, and may be damaged.
+	from a removed entry): it stays, and may be damaged. Only ENOENT and ENOTDIR are nothing there: a look that fails otherwise (EIO, EACCES) is said as
+	what it is, as what stays is not known then.
 
 	Examples:
 		>>> with tempfile.TemporaryDirectory() as folder:
@@ -4032,10 +4033,20 @@ def unreadable_end(dest_path:str, previous_path:'str | None') -> str:
 		...     [unreadable_end(new, None), unreadable_end(old, old), unreadable_end(old, new)]
 		['left out of this version', 'keeping its last backed-up copy', 'keeping the copy a cut backup made of it, which may be damaged']
 	'''
-	if not os.path.lexists(dest_path):
+	try:
+		os.lstat(dest_path)
+	except (FileNotFoundError, NotADirectoryError):
 		return 'left out of this version'
-	if previous_path is not None and os.path.lexists(previous_path):
-		return 'keeping its last backed-up copy'
+	except OSError as e:
+		return f'what this version holds for it cannot be looked at ({e.strerror or e})'
+	if previous_path is not None:
+		try:
+			os.lstat(previous_path)
+			return 'keeping its last backed-up copy'
+		except (FileNotFoundError, NotADirectoryError):
+			pass
+		except OSError as e:
+			return f'keeping the copy this version holds, which may be one a cut backup made, and damaged: the version before cannot be looked at ({e.strerror or e})'
 	return 'keeping the copy a cut backup made of it, which may be damaged'
 
 def check_fs_signature(path:str,signature:str):
@@ -6116,8 +6127,9 @@ def do_backup(backup_entries:dict,
 		reported = set()
 	# the entries whose metadata could not be copied, which may lack their extended attributes in the new version
 	unsynced = []
-	# the folders the replay copied the metadata of again for their rows' mark ( META_RETRY_MODE ), which the commit does not mark again
-	retried = set()
+	# the folders of unsynced the commit does not mark ( META_RETRY_MODE ): those the replay copied the metadata of again for their rows'
+	# mark, and those whose attributes it did not copy where the version holds no real folder (no copy was tried)
+	unmarked = set()
 	opened_manifest = manifest is None
 	# every vault sync of this backup goes through the handles opened here, before its first write into the job vault, and
 	# closed when it ends: a write error another program's sync met first is still heard (VaultUnit)
@@ -6274,7 +6286,7 @@ def do_backup(backup_entries:dict,
 				# a batch whose every entry would leave the version as it holds it is dropped and goes on as one with none: compared at
 				# the places it touched when it came with entries, or committing no version when no comparison follows it (a batch of
 				# scanned folders, or the findings of a comparison, which are checked again)
-				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,job_vault,pool_guard,job_name,reported,manifest):
+				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,job_vault,pool_guard,job_name,reported,manifest,only_sync_attributes):
 					backuperTeeLogToTl(job_name,f'Each of the {len(backup_entries)} backup entries would be left out of a version: dropping them')
 					backup_entries.clear()
 			def drop_what_changes_nothing() -> None:
@@ -6433,7 +6445,7 @@ def do_backup(backup_entries:dict,
 				nonlocal paused
 				paused, _ = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification',pool=pool)
 			do_reverb_backup(backup_entries,backup_folder,only_sync_attributes,manifest,monitor_path,writer,skip_list,job_name,reported,
-				touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,pool_guard=pool_guard,unsynced=unsynced,retried=retried)
+				touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,pool_guard=pool_guard,unsynced=unsynced,unmarked=unmarked)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			manifest.rollback()
@@ -6443,14 +6455,14 @@ def do_backup(backup_entries:dict,
 				return VaultInfo({}, 0, 0), manifest, False
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
 			return vaultInfo, manifest, False
-		# a folder whose own metadata copy failed, recorded from what the version holds, is marked ( META_RETRY_MODE ), so the next
-		# comparison that meets it copies its metadata again, its extended attributes among them, which no record holds; one the replay
-		# took for its mark keeps the record, so a copy that fails every time is tried once more, and then left, where the record then
-		# matches the monitored folder's mode, owner and mtime (its extended attributes alone failed); a failure that leaves one of those
-		# different is retried at every comparison that compares it (a folder's mtime: a full comparison), as before (spec section 16,
-		# step 2)
+		# a folder whose own metadata copy was tried and failed, recorded from what the version holds, is marked ( META_RETRY_MODE ), so
+		# the next comparison that meets it copies its metadata again, its extended attributes among them, which no record holds; one the
+		# replay took for its mark keeps the record, so a copy that fails every time is tried once more, and then left, where the record
+		# then matches the monitored folder's mode, owner and mtime (its extended attributes alone failed); a failure that leaves one of
+		# those different is retried at every comparison that compares it (a folder's mtime: a full comparison), as before (spec section
+		# 16, step 2). One whose copy the replay never tried (the version holds no real folder there) is not marked ( unmarked )
 		if unsynced:
-			manifest.mark_meta_retry(rel for rel in (as_folder_entry(os.path.relpath(path,monitor_path)) for path in unsynced) if rel not in retried)
+			manifest.mark_meta_retry(rel for rel in (as_folder_entry(os.path.relpath(path,monitor_path)) for path in unsynced) if rel not in unmarked)
 		# check the size of the backup
 		this_size, this_inodes = tree_totals(manifest, backup_folder)
 		vault_size += this_size
@@ -7164,7 +7176,7 @@ def empty_staging(job_vault:str, keep_for:'str | None' = None) -> None:
 	text has the forward form to that folder (staged_forward_rel()) stays, however the scan judged it, until a scan finds no orphan by
 	that name: the tree committed under it, which a roll-forward does after its flush of every vault disk, so the link given back is on
 	the disk by then, or removed as a skeleton, which holds nothing such a link leads to. A failure, a link that cannot be read among
-	them, is logged, and leaves it for the next scan: what reads staging otherwise (repair_pool_vault() and finish_conversion_renames(),
+	them (any readlink error but EINVAL, no link, ENOENT included), is logged, and leaves it for the next scan: what reads staging otherwise (repair_pool_vault() and finish_conversion_renames(),
 	by the names of a skeleton and of a conversion's trees) passes over any other name, and the put-back reads only forward-form links.
 	'''
 	staging = staging_path(job_vault)
@@ -7181,8 +7193,10 @@ def empty_staging(job_vault:str, keep_for:'str | None' = None) -> None:
 				if staged_forward_rel(os.readlink(os.path.join(staging, name)), keep_for) is not None:
 					continue
 			except OSError as e:
-				# EINVAL: no link. ENOENT: gone, or an f2fs link whose text missed the checkpoint (is_skeleton()), which records nothing
-				if e.errno not in (errno.EINVAL, errno.ENOENT):
+				# EINVAL: no link. Any other error is no answer, ENOENT among them: on a pool a disk that is out answers it for a name the
+				# listing showed, and the link kept there would be removed if the disk came back before the removal. An f2fs link whose
+				# text missed the checkpoint (is_skeleton()) answers it too: it records nothing, and goes at the first scan with no orphan
+				if e.errno != errno.EINVAL:
 					backuperTeeLogToTl(job_vault, f'Cannot read {os.path.join(staging, name)} for now: {e}', error=True)
 					continue
 		task = multiCMD.run_command(['rm', '-rf', os.path.join(staging, name)], quiet=True, return_object=True)
@@ -8497,7 +8511,7 @@ def source_readable(path:str) -> bool:
 		return False
 	return True
 
-def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str, job_vault:str, pool_guard:'PoolGuard', job_name:str, reported:set, manifest:'VaultManifest') -> bool:
+def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str, job_vault:str, pool_guard:'PoolGuard', job_name:str, reported:set, manifest:'VaultManifest', only_sync_attributes:bool) -> bool:
 	'''
 	Whether every entry of backup_entries, a batch with no tree to roll forward, would drop out of its version: the replay
 	would leave the version as it holds it, so the batch is compared as one with none (do_backup()). In three passes,
@@ -8507,9 +8521,11 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   once, tracks(), and a source past the limit whose target is gone one lstat), on the entries the replay takes: what a folder create above an entry copies
 	   is pruned as the replay prunes it (prune_entries_covered_by_dir_creates()), so a folder left out is one line, not one
 	   for each entry below it. An entry the rule leaves out whole drops out, as nothing is written for it: a create, a modify
-	   or an attrib whose path, or its copy's temporary path when it is no folder, passes the limit; a delete whose own path
-	   does, which the version keeps; and a move whose source's own path does and whose target's copy would, or whose target is gone, replayed as the
-	   delete of its source and the copy to its target. A delete or a move the rule leaves in changes the version (an untracked
+	   or an attrib whose path, or its copy's temporary path when it is no folder, passes the limit (a file's attrib under
+	   only_sync_attributes by its own path alone, as the replay may sync it in place: one it copies instead and leaves out for
+	   its temporary path makes a version that changes nothing, with its line); a delete whose own path
+	   does, which the version keeps; and a move whose source's own path does and whose target's copy would, or whose target is
+	   gone (an lstat that fails otherwise is its UNREADABLE line), replayed as the delete of its source and the copy to its target. A delete or a move the rule leaves in changes the version (an untracked
 	   delete has gone already, drop_untracked_deletes()), but for a move whose source the manifest does not track: the replay
 	   renames nothing then, and copies the target, so it is the create of its target, taken as one below;
 	2. every other entry (a create, a modify or an attrib, of a folder too) has its monitored path looked at, one lstat: a
@@ -8517,7 +8533,7 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   device, which cp -a copies as itself). A regular file is opened once, non-blocking, and read through that handle: its
 	   last HASH_SIZE bytes (64 KiB), the tail the comparison reads ( hash_file() ), which the copy then reads from the page
 	   cache; one its handle shows of another kind (put there since the lstat) changes it unread, as does one whose open
-	   answers ENXIO (a socket put there since). A regular file that does not
+	   answers ENXIO (a socket put there since) or ELOOP (a link put there since, which the open does not follow). A regular file that does not
 	   open, or whose read fails (a bad sector under its tail, an EIO of a network filesystem), drops out, as its copy keeps
 	   the last copy (an attrib too, under Only Sync Attributes: its record cannot vouch, as its tail cannot be read, so the
 	   replay copies it); so does a path that cannot be looked at, and a path gone, which the replay passes over. Two things
@@ -8559,9 +8575,15 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 					if vault_path_too_long(version_bytes, rel, copied):
 						lines += [('kept', source, None), ('too long', path, None)]
 						continue
-					if not os.path.lexists(path):
+					try:
+						os.lstat(path)
+					except (FileNotFoundError, NotADirectoryError):
 						# the target went since the batch was taken: nothing is copied, so the version is as it was
 						lines.append(('kept', source, None))
+						continue
+					except OSError as e:
+						# no absence: the target cannot be looked at, so its copy fails and leaves it out of the version, with its line
+						lines += [('kept', source, None), ('unreadable', path, e)]
 						continue
 				return False
 			# nothing of the source is in the version to rename: the replay copies the target
@@ -8571,7 +8593,7 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 				return False
 			lines.append(('kept', path, None))
 			continue
-		if vault_path_too_long(version_bytes, rel, copied):
+		if vault_path_too_long(version_bytes, rel, copied and not (values.event == 'attrib' and only_sync_attributes)):
 			lines.append(('too long', path, None))
 			continue
 		rest.append((key, values))
@@ -8662,9 +8684,15 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			return False
 		lines.append(('refused', path, None))
 	for kind, path, error in lines:
-		if kind == 'too long' and not os.path.lexists(path):
-			# gone since the batch was taken: the replay says so, and has nothing to leave out
-			kind = 'gone'
+		if kind == 'too long':
+			try:
+				os.lstat(path)
+			except (FileNotFoundError, NotADirectoryError):
+				# gone since the batch was taken: the replay says so, and has nothing to leave out
+				kind = 'gone'
+			except OSError:
+				# no absence: it is left out of the version, as its line says
+				pass
 		if kind == 'gone':
 			backuperTeeLogToTl(path=monitor_path,warning=True,message=f'Not tracking {os.path.relpath(path, monitor_path)}: source no longer exists')
 			continue
@@ -11730,7 +11758,10 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, monitor
 	if vault_path_too_long(version_bytes, os.path.relpath(path, monitor_path), not path.endswith('/')):
 		return 0, 0
 	try:
-		st = os.lstat(path)
+		# by its name, never through a link put at a folder's place since the batch was taken, which the trailing / would follow: it is
+		# charged as itself (a fast link takes no block), about what the empty folder the replay makes there takes, not the folder it
+		# leads to
+		st = os.lstat(path.rstrip('/') or '/')
 	except OSError:
 		return 0, 0
 	size, inodes = vault_charge(st, block), 1
@@ -13386,8 +13417,9 @@ def load_root_meta(version_path:str) -> RootMeta:
 	'''The monitored root's metadata version_path holds (record_root_meta()); OSError when it cannot be read, ValueError (or UnicodeDecodeError) when it is not a record.'''
 	return decode_root_meta(os.getxattr(version_path, ROOT_META_XATTR, follow_symlinks=False))
 
-# the jobs whose last record_root_meta() did not keep all: (monitored path, the job's vault folder) -> 'failed' or 'trimmed', so
-# batch after batch that cannot keep it logs the first and nothing more, and one line says when it works again. Two rows
+# the jobs whose last record_root_meta() did not keep all: (monitored path, the job's vault folder) -> 'failed', 'trimmed' (the
+# root's extended attributes left out) or 'trimmed mounts' (the inner mount points left out too), so batch after batch that cannot
+# keep it logs the first and nothing more, a change between them logs the new one, and one line says when it works again. Two rows
 # backing up one folder to two vaults are two jobs
 ROOT_META_TROUBLE = {}
 
@@ -13460,11 +13492,13 @@ def record_root_meta(monitor_path:str, version_path:str, inner_mounts:list = Non
 			else:
 				# nothing to leave out: the owner, mode and times alone do not fit
 				raise
-			# said only now: a trimmed write that fails too is the 'failed' error below, not this
-			state = 'trimmed'
+			# said only now: a trimmed write that fails too is the 'failed' error below, not this. Each trim has its own state, so a
+			# record that loses its inner mount points after one that lost the root's attributes alone says so
 			if trimmed.inner_mounts is None and inner_mounts is not None:
+				state = 'trimmed mounts'
 				tell(state, f'The extended attributes and the inner mount points of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes, and a vault database lost meanwhile does not say which inner disks were unmounted')
 			else:
+				state = 'trimmed'
 				tell(state, f'The extended attributes of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes')
 	except OSError as e:
 		tell('failed', f'Cannot keep the metadata of {monitor_path} on {version_path}: {e}; the version keeps the record the version before had, or with none a whole-job restore of it gives the top folder the version folder\'s own', error=True)
@@ -14554,7 +14588,9 @@ def replay_ops(entries:dict, monitor_path:str, only_sync_attributes:bool, versio
 			if renamed or not left_out(source_rel, False):
 				ops.append((ENTRY_OP, source_rel))
 			continue
-		if left_out(rel, values.event != 'delete' and not is_dir):
+		# a delete and a folder by their own paths, as the replay measures them, and an attrib under Only Sync Attributes too, which may
+		# be synced in place (a copy it then makes is measured by the replay itself, and records nothing here either way)
+		if left_out(rel, values.event != 'delete' and not is_dir and not (values.event == 'attrib' and only_sync_attributes)):
 			continue
 		if values.event == 'attrib' and is_dir:
 			ops.append((FOLDER_OP, rel))
@@ -14579,7 +14615,7 @@ def settle_ops(folders, sweep = (), version_bytes:int = None) -> list:
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,writer:TreeWriter,
 					 skip_list:'SkipList' = None,job_name:str = None,reported:set = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
-					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,retried:set = None) -> VaultManifest:
+					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,unmarked:set = None) -> VaultManifest:
 	'''
 	Replay backup_entries onto backup_folder, which already holds the tree, the rows describing it, through writer, the one of
 	the batch (hand_over()): each change records first.
@@ -14587,6 +14623,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 	An entry whose path in backup_folder Linux would refuse, or its copy's temporary path (vault_path_too_long()), is left out
 	before anything is recorded or written for it, with its NOT BACKED UP line once per batch through reported, and the rest goes
 	on: a create, a modify or an attrib leaves the version as the tree holds it there, with its row; a folder takes all under it;
+	a file's attrib under Only Sync Attributes, which may be synced in place, is measured by its copy's temporary path only once
+	the replay copies it;
 	a delete leaves the entry and its row in the version, as its removal by path would fail; and a move with a path past the
 	limit is the delete of its source and the copy to its target, each under the rule (spec section 5).
 
@@ -14601,8 +14639,10 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 	pool_guard, when given, is polled while copies are queued and waited for: a disk of its pools that drops stops them
 	with PoolNotReady, so nothing more is written into the version.
 	Each entry whose metadata could not be copied, which may lack its extended attributes, is appended to unsynced
-	( copy_file_meta()'s failed ). retried, when given, gets the rel ( ending with / ) of each folder whose attrib the replay takes while
-	its row holds META_RETRY_MODE, the mark of a copy that failed before: the commit marks none of them again ( do_backup() ).
+	( copy_file_meta()'s failed ), and so is each folder whose attributes the replay does not copy as the version holds no real folder
+	at its place, or above it. unmarked, when given, gets the rel ( ending with / ) of those folders, whose copy was never tried, and of
+	each folder whose attrib the replay takes while its row holds META_RETRY_MODE, the mark of a copy that failed before: the commit
+	marks none of them ( do_backup() ), only a folder whose own metadata copy was tried and failed.
 	Once nothing more is written into backup_folder, each folder of it the replay or the verification made, removed or
 	renamed an entry in, and each one touched.folders names, gets the monitored folder's times, and each one they made or
 	synced the attributes of all of the monitored folder's metadata (WrittenFolders), and the rows of those given its times
@@ -14630,12 +14670,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 	# the length rule ( vault_path_too_long() ) adds each entry's path to the version folder's, in bytes, and on a pool the longest
 	# branch's surplus over the mount point ( pool_surplus() )
 	version_bytes = length_rule_bytes(backup_folder,pool_guard,os.path.dirname(backup_folder))
-	def left_out(rel,is_dir,kept=False):
+	def left_out(rel,in_place,kept=False):
 		# whether the length rule leaves the entry at rel out, before anything is written for it, with its line once per batch. one the
-		# version keeps ( a delete: its removal by path would fail ) is measured by its own path, as nothing is copied to it; any other
-		# but a folder by its copy's temporary path too. a delete says the version keeps what it holds only when it holds something
-		# there: a move's source the version never held has nothing to keep
-		if not vault_path_too_long(version_bytes,rel,not (is_dir or kept)):
+		# version keeps ( a delete: its removal by path would fail ) is measured by its own path, as nothing is copied to it, and so is
+		# one written in place ( in_place: a folder, made where it stands, or a file whose attributes may be synced onto the version's
+		# own entry ); any other by its copy's temporary path too. a delete says the version keeps what it holds only when it holds
+		# something there: a move's source the version never held has nothing to keep
+		if not vault_path_too_long(version_bytes,rel,not (in_place or kept)):
 			return False
 		if not (kept and not manifest.tracks(rel)):
 			report_path_too_long(monitor_path if job_name is None else job_name,os.path.join(monitor_path,rel.rstrip('/')),reported,kept)
@@ -14901,7 +14942,9 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 				applied[event_source_real_path] = copy_path(isDir=isDir,monitor_path=monitor_path,source_real_path=event_source_real_path,
 				 source_relative_path=event_relative_path,mcae=mcae)
 			elif event_values.event == 'attrib':
-				if left_out(event_relative_path,isDir):
+				# under Only Sync Attributes a file's attributes may be synced onto the version's own entry, which writes no temporary
+				# name: it is measured by its own path here, and by its copy's temporary path only where a copy is written ( below )
+				if left_out(event_relative_path,isDir or only_sync_attributes):
 					# nothing synced or copied: the version keeps what the tree holds there, and its row
 					applied[event_source_real_path] = False
 					continue
@@ -14912,14 +14955,21 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 				# the parents a prior version lacked are made, as real folders
 				if not make_folders_to(event_relative_path):
 					not_through_link(event_relative_path,isDir,'syncing attributes onto')
+					# the version does not match the monitored tree there (the matched time holds), and nothing was tried to mark
 					unsynced.append(event_source_real_path)
+					if isDir and unmarked is not None:
+						unmarked.add(as_folder_entry(event_relative_path))
 					applied[event_source_real_path] = False
 					continue
 				if isDir:
 					if os.path.lexists(file_vault_target_path) and (os.path.islink(file_vault_target_path) or not os.path.isdir(file_vault_target_path)):
-						# the folder's metadata would go through the link, or onto another row's entry
+						# the folder's metadata would go through the link, or onto another row's entry. Nothing is copied, so its row is not
+						# marked: a mark would bring the attrib back at every comparison, refused again each time, each a version that changes
+						# nothing; the matched time holds, as the version does not match the monitored folder
 						backuperTeeLogToTl(path=monitor_path,error=True,message=f'Not syncing the attributes of {event_source_real_path} onto {file_vault_target_path}, which is not a real folder in the version')
 						unsynced.append(event_source_real_path)
+						if unmarked is not None:
+							unmarked.add(as_folder_entry(event_relative_path))
 						applied[event_source_real_path] = False
 						continue
 					# the folder's metadata once the batch has written into it: its times alone when nothing else of it
@@ -14931,11 +14981,11 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 					else:
 						written.add(event_relative_path)
 					folder_rel = as_folder_entry(event_relative_path)
-					if retried is not None:
+					if unmarked is not None:
 						# the retry its mark asked for: its row is recorded from the version from here on, as any folder's
 						record = manifest.lookup(folder_rel)
 						if record is not None and record.mode == META_RETRY_MODE:
-							retried.add(folder_rel)
+							unmarked.add(folder_rel)
 					manifest.add(folder_rel,dirty=True)
 				else:
 					# the row's record first, which reads the monitored file only: the replay reads the copy's tail, on the
@@ -14949,7 +14999,11 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 						writer.file_meta(event_source_real_path,event_relative_path,None,unsynced)
 					else:
 						# with other contents in the tree ( a swap the collapse could not replay left them there ), the metadata
-						# would be another file's: the file is copied as it is, as without only_sync_attributes
+						# would be another file's: the file is copied as it is, as without only_sync_attributes, unless its copy's
+						# temporary path passes the limit: then nothing is written, and the version keeps what the tree holds there
+						if left_out(event_relative_path,False):
+							applied[event_source_real_path] = False
+							continue
 						written.wrote_in(event_relative_path)
 						writer.copy(event_source_real_path,event_relative_path,mcae,pending)
 					if vouched:
