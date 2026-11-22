@@ -751,8 +751,8 @@ def filesystem_line(folder):
 		'restored since is not on the disk it began on')
 
 
-def left_line(disk):
-	return f'FAILED proj: the disk {disk} left the pool while the restore ran: what was restored onto it is not known to be on disk'
+def left_line(branch):
+	return f'FAILED proj: the disk {branch} left the pool while the restore ran: what was restored onto it is no longer in the pool'
 
 
 def mounted_over(place, other_filesystem):
@@ -783,6 +783,9 @@ def test_a_restore_whose_folder_changes_filesystem_fails(job, tmp_path, capsys, 
 	# the handle of the claim is synced all the same, once: nothing is handed over
 	assert errseq.synced()[backup_syncs:] == [(target + '.under', 0)]
 	assert f'What {target} holds is not known to be on disk: run the same restore again, which copies everything again' in stdout
+	# nothing is written by the folder's path onto the filesystem mounted over it: the marker there is the claim's, copied as it was, and
+	# the claim's own (under it) says what a run again needs
+	assert 'recopy' not in marker_of(other_filesystem) and marker_of(target + '.under').get('unsynced') is True
 
 
 @pytest.mark.unit
@@ -792,13 +795,19 @@ def test_a_restore_onto_a_pool_whose_mount_point_changes_filesystem_fails(job, t
 	backed_up(job)
 	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
 	target = os.path.join(out, 'proj')
+	# mergerfs made the restore's folder on the disk, so that the disk is one the pool listed at the claim with the folder on it: were
+	# the folder on no pool taken for one the disk left, it would be failed as well
+	held = os.path.join(branches['one'], 'out', 'proj')
+	os.makedirs(held)
 	ran = at_the_first_copy(monkeypatch, mounted_over(str(tmp_path / 'pool'), other_filesystem))
 	backup_syncs = len(errseq.synced())
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
 	# the pool's disk is not called one that left: the folder is on no pool now
 	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [filesystem_line(target)]
-	assert errseq.synced()[backup_syncs:] == [(branches['one'], 0)]
+	assert errseq.synced()[backup_syncs:] == [(held, 0)]
+	# nothing is written by the folder's path onto the filesystem mounted there: its marker is the claim's, copied there as it was
+	assert 'recopy' not in marker_of(os.path.join(other_filesystem, 'out', 'proj'))
 
 
 @pytest.mark.unit
@@ -816,7 +825,7 @@ def test_a_restore_onto_a_pool_whose_disk_leaves_it_fails_naming_the_disk(job, t
 	backup_syncs = len(errseq.synced())
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
-	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [left_line(os.path.dirname(branches['two']))]
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [left_line(branches['two'])]
 	assert sorted(errseq.synced()[backup_syncs:]) == sorted([(branches['one'], 0), (held, 0)])
 	assert marker_of(target).get('recopy') == 'sync failed'
 	# listed again, the run again finishes
@@ -824,6 +833,53 @@ def test_a_restore_onto_a_pool_whose_disk_leaves_it_fails_naming_the_disk(job, t
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert (code, err) == (0, ''), stdout
 	assert whole(target) and not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
+
+
+@pytest.mark.unit
+def test_a_restore_onto_a_pool_whose_disk_got_its_copies_after_the_claim_and_leaves_it_fails_naming_the_disk(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails on 6acf680 (says done): a pool whose create policy keeps no paths (pfrd, mfs, rand) puts the restore's folder on the disk its
+	# first copy lands on, so the folder is not there at the claim on the disk that gets it, and that disk is taken out of the pool's
+	# list (the control file) after the copy. Its handle is synced, and what was restored onto it is in the pool's view no more
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
+	target = os.path.join(out, 'proj')
+	assert not os.path.lexists(os.path.join(branches['two'], 'out'))
+	def copy_lands_on_two_which_then_leaves():
+		os.makedirs(os.path.join(branches['two'], 'out', 'proj'))
+		fake_pool.leave(str(tmp_path / 'pool'), branches['two'])
+	ran = at_the_first_copy(monkeypatch, copy_lands_on_two_which_then_leaves)
+	backup_syncs = len(errseq.synced())
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [left_line(branches['two'])]
+	assert sorted(errseq.synced()[backup_syncs:]) == sorted([(branches['one'], 0), (branches['two'], 0)])
+	assert marker_of(target).get('recopy') == 'sync failed'
+
+
+@pytest.mark.unit
+def test_a_disk_that_leaves_the_pool_without_the_folder_is_passed_over(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# pin: a disk the pool listed at the claim and lists no more, that holds nothing of the restore's folder (nothing can have landed
+	# there), does not fail the restore
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
+	ran = at_the_first_copy(monkeypatch, lambda: fake_pool.leave(str(tmp_path / 'pool'), branches['two']))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and (code, err) == (0, ''), stdout
+	assert 'FAILED' not in stdout
+
+
+@pytest.mark.unit
+def test_a_branch_that_leaves_the_pool_is_named_by_its_branch_not_by_its_disk(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# two branches of one disk, and only one is taken out of the pool: the failure names that branch, as the pool listed it, not the
+	# mount point of the disk, which the other branch (still listed) is on as well
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one-a', 'one-b']})
+	for name in ('one-a', 'one-b'):
+		os.makedirs(os.path.join(branches[name], 'out', 'proj'))
+	ran = at_the_first_copy(monkeypatch, lambda: fake_pool.leave(str(tmp_path / 'pool'), branches['one-b']))
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [left_line(branches['one-b'])]
 
 
 @pytest.mark.unit
