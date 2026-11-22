@@ -828,32 +828,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.5: every restore, on a pool or off one, checks its folder's filesystem
   (`st_dev`) at each sync against the handles it opened, as the daemon's units check theirs.
 
-### A batch whose monitored disk goes while it waits for its locks
-
-- **Kind:** deferred.
-- **What the operator sees:** a full comparison, or another batch, that has walked the tree and then waits for the job's
-  locks (while a restore of the job copies, say) commits, when the monitored disk is unmounted during that wait, a
-  version without the copies of the files that vanished with it: a file it found changed keeps its older copy in that
-  version, and a new file is missing from it, with no alert (at most a warning, `Not tracking <path>: source no longer
-  exists`), until a comparison with the disk back finds them (every start makes one). Reasoned from the code, not run.
-- **Why:** older than 0.55.5. The batch looks for an unmounted monitored disk after its walk, before that wait, and not
-  again after it; 0.55.5 moved the look after the locks for a job's first version only.
-- **Revisit when:** the round after 0.55.5: look again once the locks are held, as a first version does.
-
-### A disk unmounted inside the tree while a first version walks it
-
-- **Kind:** deferred.
-- **What the operator sees:** a disk mounted inside the monitored tree (an inner mount) and unmounted while a job's
-  first version walks the tree leaves out of that version the files under it that the walk had not reached or copied
-  yet, with no line saying so: the walk reads the empty folder the disk left. The versions after it lack them too while
-  the disk stays away (paused, as an inner mount that is not mounted), until a comparison with the disk mounted again
-  finds and copies them: the one the watcher asks for when it is mounted again, or the next full comparison (every
-  start; the Full Comparison Interval). The later walks look for an inner mount gone during them
-  (`drop_unmounted_entries()`, with its line `Inner mounts unmounted during the ...`); a first version's does not.
-  Reasoned from the code, not run.
-- **Why:** older than 0.55.5: 0.55.4 walks a first version the same.
-- **Revisit when:** the round after 0.55.5: the same look after a first version's walk.
-
 ### An /etc/fstab that cannot be read names no disk
 
 - **Kind:** deferred.
