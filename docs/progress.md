@@ -260,6 +260,20 @@ it: the main session's call (2026-11-14).
 Round 0.55.6's questions, from its spec (`specs/2026-11-14-r0556-design.md` section 26, 1e96eeb, where each is written
 out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chief decided Q10 to Q12 (2026-11-15).
 
+- **Q18. A folder whose metadata copy fails every time, beyond its extended attributes** (P16 step 2, Task 18). Q15
+  (a), which the user picked on 2026-11-17, said: "A copy that fails every time is tried once more, then left." Built,
+  that holds for a folder whose extended attributes alone fail to copy (its record then matches the monitored folder).
+  When the failed copy also leaves the folder's mode, owner or time different (an attribute write failing with a full
+  disk or an I/O error before the mode is set; a change of owner the vault's filesystem refuses), every later comparison
+  that meets the folder copies it again, fails again, and makes a version that changes nothing, with its ERROR line, as
+  0.55.5 does today. Under Keep N Versions each such version pushes the oldest out.
+  - (a) Accept it as built and say so in the limitations entry (Recommended: no worse than 0.55.5; the case needs a copy
+    that fails every time, which the ERROR line already reports; a stop needs a second mark with its own state).
+  - (b) Build a "gave up" mark: after the failed retry the row is marked so no comparison copies the folder again until
+    its own metadata changes. One more value and its rules, in the round after 0.55.6.
+  - What waits on it: the limitations entry's wording (Task 20). The user's words it would narrow: "then left"
+    (2026-11-17), for the mode, owner and time cases.
+
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
   yet, keep it open".
