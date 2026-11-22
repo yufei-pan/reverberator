@@ -82,7 +82,8 @@ round (4a60607..21345ea); Task 10 (D8, D7) done and reviewed (582ee3a, 310a19c);
 round (5aba4ed..1f774a3); Task 14 (D3 item 1) done and reviewed (79220a8); Task 15 (D3 items 2, 3) done and reviewed after two fix rounds and
 a design check's rework (d00537b..b9bbde4: a link a cut left in staging stays there until the scan after the commit);
 Task 16 (D15) done and reviewed after one fix round (2159b07, 80398bd: a gate after a burst and a pin counting the
-trim at each commit); Task 17 building; Tasks 18 to 22 not started.
+trim at each commit); Task 17 (P14) done and reviewed after one docs fix round (adc1009, 2cd24c7); Task 18 (P16 step
+2, on Q15's answer) building; Tasks 19 to 22 not started.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -212,8 +213,9 @@ keep is hard-linked, not exchanged), 3 (the staging rule, the lost-manifest row)
 filesystem with no exchange is treated as a pool, not only mergerfs), 6 (the estimate changed) and 13 (line numbers),
 where the round 20 plan's proposed spec edits were applied only in part; the 0.55.5 spec's L4 summary table (three and
 four mount-table reads, not two and three) and its 5.9 (L10 decides "gone" by listing the parent, not by an lstat).
-State: in round 0.55.6 (branch `r0556`), as one docs commit. Behind it: the main session's own housekeeping, with no
-pick of the user's.
+State: built on branch `r0556` (Task 17, adc1009 and its fix 2cd24c7, reviewed): each edit says the rule the code
+follows, with this round's changes in a clause. Done with the round's merge. Behind it: the main session's own
+housekeeping, with no pick of the user's.
 
 **P15. Every test module carries its layer marker.** Source: `specs/2026-08-12-full-test-suite-design.md`, Goals and
 "1 Pytest config". State: built on branch `r0556` (Task 1, c18fc76..5212daf, reviewed): every test carries exactly
