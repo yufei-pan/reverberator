@@ -1180,6 +1180,36 @@ def test_a_failed_mount_table_read_is_not_kept_for_the_batch(job, fake_pool, mon
 	covered_with_a_handle_per_filesystem(job, seen, branches)
 
 
+@pytest.mark.unit
+def test_a_failed_fstab_read_is_not_kept_for_the_batch(job, fake_pool, monkeypatch, poll_fast):
+	# the mount table's twin (review of Task 11, M1): the read of fstab at the vault wait's first poll fails, once, with the mount table read
+	# before it. The poll's reason is that the fstab cannot be read, no look is kept for the batch, and the wait polls again: the batch's
+	# guard sees the pool from a good read, and the batch commits
+	seed_monitor(job, {'a.txt': 'a'})
+	branches = pooled_vault(job, fake_pool)
+	run_backup(job)
+	state = {'armed': False, 'failed': 0, 'after': 0}
+	real = rv.fstab_mount_points
+	def flaky(mount_table):
+		if state['armed'] and threading.current_thread().name == BATCH_THREAD:
+			if not state['failed']:
+				state['failed'] += 1
+				raise OSError(errno.EIO, os.strerror(errno.EIO), rv.FSTAB_PATH)
+			state['after'] += 1
+		return real(mount_table)
+	monkeypatch.setattr(rv, 'fstab_mount_points', flaky)
+	reasons = []
+	begin = rv.JobControl.begin_wait
+	def begin_wait(self, path, reason):
+		reasons.append(reason)
+		return begin(self, path, reason)
+	monkeypatch.setattr(rv.JobControl, 'begin_wait', begin_wait)
+	seen = one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], before=lambda: state.update(armed=True))
+	assert state['failed'] == 1 and state['after'] >= 1 and len(committed_versions(job)) == 2
+	assert f'{rv.FSTAB_PATH} cannot be read: {os.strerror(errno.EIO)}' in reasons
+	covered_with_a_handle_per_filesystem(job, seen, branches)
+
+
 # ---- D9: one fstab read per look -------------------------------------------------------------------------------------
 
 def fstab_reads(monkeypatch) -> dict:

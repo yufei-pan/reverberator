@@ -1467,7 +1467,7 @@ def test_a_recopy_of_a_vault_missing_a_disk_keeps_its_recopy_and_the_target_priv
 	assert code == rv.EXIT_COMMAND_FAILED and handed == []
 	assert marker_of(target).get('recopy') == 'cut' and stat.S_IMODE(os.lstat(target).st_mode) == 0o700
 	assert not whole(target)
-	assert stdout.splitlines()[-1] == f"What {target} holds is not known to be on disk, and a disk of the vault's pool is missing, whose entries this run did not meet: run the same restore again once all the vault's disks are there, which copies everything again. {rv.unfinished_note(target)}"
+	assert stdout.splitlines()[-1] == f"What {target} holds is not known to be on disk, and the vault may be incomplete (a disk of its pool is missing, or {rv.FSTAB_PATH} cannot be read), so entries this run did not meet may be missing: run the same restore again once all the vault's disks are there and {rv.FSTAB_PATH} can be read, which copies everything again. {rv.unfinished_note(target)}"
 	assert 'If that keeps failing' not in stdout
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', os.path.dirname(target), '--version', '0', '--accept')
 	assert code == rv.EXIT_USAGE and 'no sync of what it holds is known to have succeeded' in err
@@ -1578,7 +1578,7 @@ def test_a_dangling_chain_on_a_vault_missing_a_disk_is_not_final(job, tmp_path, 
 def recopy_summary(target, made=True, missing=False):
 	line = f'What {target} holds is not known to be on disk: run the same restore again, which copies everything again. {way_out(target, made)}'
 	if missing:
-		line += " A disk of the vault's pool is missing, whose entries this run did not meet: run it again once all the vault's disks are there."
+		line += f" The vault may be incomplete (a disk of its pool is missing, or {rv.FSTAB_PATH} cannot be read), so entries this run did not meet may be missing: run it again once all the vault's disks are there and {rv.FSTAB_PATH} can be read."
 	return f'{line} {rv.unfinished_note(target)}'
 
 

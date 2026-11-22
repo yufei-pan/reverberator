@@ -2414,13 +2414,23 @@ def signature_folder_problem(path:str) -> 'tuple | None':
 	'''
 	Why an auto file system signature cannot be looked up from path yet, as (what is wrong, what a start waits for), None
 	when path is a folder whose disk is there. The signature of a bare folder under an unmounted mount point would be the
-	root disk's.
+	root disk's. A disk is not there when vault_disk_problem() says so (not mounted, a pool's disk out, a failed one); when
+	the mount table or fstab cannot be read it is not known to be there either, which is said as that, not as a missing disk.
 	'''
 	if not os.path.lexists(path):
 		return 'does not exist yet', 'the folder is there'
 	if not os.path.isdir(path):
 		return 'is not a folder', 'a folder is there, which the job waits for'
-	problem = vault_disk_problem(path)
+	# the two reads vault_disk_problem() makes, here, so that a disk that cannot be looked at is not called one that is not there
+	try:
+		mount_table = read_mount_table()
+	except OSError as e:
+		return f'is on a disk that cannot be looked at: {mount_table_unreadable(e)}', 'the disk can be looked at'
+	try:
+		fstab = fstab_mount_points(mount_table)
+	except OSError as e:
+		return f'is on a disk that cannot be looked at: {fstab_unreadable(e)}', 'the disk can be looked at'
+	problem = vault_disk_problem(path, mount_table, fstab)
 	return None if problem is None else (f'is on a disk that is not there: {problem}', 'the disk is there')
 
 def parse_rules(rule_file:str, read_only:bool = False):
@@ -4364,8 +4374,9 @@ def pool_state(path:str, mount_table:list = None, fstab:list = None) -> 'PoolSta
 	its resolved path, when its statx fails, as for a shut-down XFS that is still mounted, or when it is an f2fs whose
 	checkpoint reports an error. A disk fstab names under a branch, at or above path's place on it, that is not mounted is
 	a missing disk of the pool too (unmounted_fstab_point()), its text saying fstab names it. fstab, the points a look
-	read (fstab_mount_points()), is what that rule takes; with none, fstab is read here, on a pool only, and a read that
-	fails is a problem of the pool (fstab_unreadable()), as such a disk cannot be told.
+	read (fstab_mount_points()), is what that rule takes; with none, fstab is read here, on a pool only, after the branch list,
+	and a read that fails is a problem of the pool (fstab_unreadable()), as such a disk cannot be told. A branch list that
+	cannot be read returns first, with that problem alone: fstab is not read then, so its failure is not told with it.
 	'''
 	if mount_table is None:
 		try:
@@ -16276,7 +16287,8 @@ def require_job_vault(job_vault:str):
 
 def vault_pool_warning(job_vault:str) -> bool:
 	'''
-	Warn on stderr when a disk of the mergerfs pool job_vault is on is missing (or the pool cannot be read), as what is
+	Warn on stderr when a disk of the mergerfs pool job_vault is on is missing (or the pool cannot be read, or FSTAB_PATH, which
+	can name a disk under a branch, cannot), as what is
 	shown of the vault may be incomplete, and say whether it did. Nothing is printed for a vault off any pool, or on a
 	whole one.
 	'''
@@ -16287,7 +16299,7 @@ def vault_pool_warning(job_vault:str) -> bool:
 	return True
 
 def history_command(args) -> int:
-	'''Print the versions in which a file or folder changed, newest first. Exits 0 once shown, a path never backed up too, 1 when a disk of the vault's pool is missing (warned on stderr).'''
+	'''Print the versions in which a file or folder changed, newest first. Exits 0 once shown, a path never backed up too, 1 when a disk of the vault's pool is missing, or when FSTAB_PATH cannot be read, as a disk it names under a branch cannot then be told (warned on stderr).'''
 	# as the daemon and restore do, whose walks hold a listing a level: a history reads each version by lstat (read_walked())
 	raise_open_file_limit()
 	rule_path = command_rule_path(args, read_status(state_dir_path(args.state_dir)))
@@ -16462,7 +16474,8 @@ class RestoreReport:
 	everything was restored.
 	'''
 	def __init__(self, vault_incomplete:bool = False):
-		# whether a disk of the vault's pool is missing (vault_pool_warning()), so the walk of the vault may not meet what it holds
+		# whether a disk of the vault's pool is missing, or FSTAB_PATH cannot be read (vault_pool_warning()), so the walk of the vault may not
+		# meet what it holds
 		self.vault_incomplete = vault_incomplete
 		self.version = None
 		self.rel = ''
@@ -16619,10 +16632,10 @@ class RestoreReport:
 			lines.append(f'{self.failed - len(self.failures)} more failed: shown above as they happened')
 		if self.recopy and self.marker is not None:
 			if self.held_for_vault:
-				lines.append(f"What {self.target} holds is not known to be on disk, and a disk of the vault's pool is missing, whose entries this run did not meet: run the same restore again once all the vault's disks are there, which copies everything again. {unfinished_note(self.target)}")
+				lines.append(f"What {self.target} holds is not known to be on disk, and the vault may be incomplete (a disk of its pool is missing, or {FSTAB_PATH} cannot be read), so entries this run did not meet may be missing: run the same restore again once all the vault's disks are there and {FSTAB_PATH} can be read, which copies everything again. {unfinished_note(self.target)}")
 			else:
 				# a failed sync, or a recopy not done, keeps its own line; a disk of the pool missing is another cause that stands too
-				missing = " A disk of the vault's pool is missing, whose entries this run did not meet: run it again once all the vault's disks are there." if self.vault_incomplete else ''
+				missing = f" The vault may be incomplete (a disk of its pool is missing, or {FSTAB_PATH} cannot be read), so entries this run did not meet may be missing: run it again once all the vault's disks are there and {FSTAB_PATH} can be read." if self.vault_incomplete else ''
 				lines.append(f'What {self.target} holds is not known to be on disk: run the same restore again, which copies everything again. {recopy_way_out(self.target, self.made)}{missing} {unfinished_note(self.target)}')
 		elif self.failed > self.final and self.marker is not None:
 			lines.append(f'{self.failed - self.final} failed: run the same restore again to retry them, or again with --accept to keep the result as it is. {unfinished_note(self.target)}')
@@ -17506,7 +17519,7 @@ def restore_entry(job_vault:str, version:KeptVersion, monitor_path:str, rel:str,
 			report.left_private = True
 			return
 		if recopy and report.vault_incomplete:
-			# a disk of the vault's pool is missing: the walk never met what it holds, so "every entry copied again" is not
+			# a disk of the vault's pool is missing (or FSTAB_PATH cannot be read): the walk never met what it holds, so "every entry copied again" is not
 			# known, and what the killed run left of those entries would be handed over as done. the recopy stays, for a run
 			# again once the vault's disks are all there
 			report.held_for_vault = True

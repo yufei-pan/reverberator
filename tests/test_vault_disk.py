@@ -237,6 +237,21 @@ def test_a_mount_table_that_cannot_be_read_means_not_there(tmp_path, monkeypatch
 	assert rv.vault_disk_problem(str(tmp_path / 'v')).startswith('the mount table cannot be read: ')
 
 
+def test_a_disk_that_cannot_be_looked_at_is_not_called_one_that_is_not_there(tmp_path, monkeypatch, fake_pool):
+	# review of Task 11 (Haiku tests): signature_folder_problem() wrapped every reason in "is on a disk that is not there", and its start
+	# waited for "the disk is there": an unreadable fstab or mount table says nothing of the disk. A failed disk is still one that is not
+	# there (the test of a plain disk that failed)
+	folder = str(tmp_path / 'v')
+	os.makedirs(folder)
+	os.makedirs(rv.FSTAB_PATH)
+	assert rv.signature_folder_problem(folder) == (f'is on a disk that cannot be looked at: {unreadable(errno.EISDIR)}', 'the disk can be looked at')
+	os.rmdir(rv.FSTAB_PATH)
+	assert rv.signature_folder_problem(folder) is None
+	monkeypatch.setattr(rv, 'MOUNTINFO_PATH', str(tmp_path / 'no-mountinfo'))
+	why = rv.signature_folder_problem(folder)
+	assert why[0].startswith('is on a disk that cannot be looked at: the mount table cannot be read: ') and why[1] == 'the disk can be looked at'
+
+
 def test_an_fstab_mount_point_under_a_symlinked_folder_is_checked_by_its_real_path(tmp_path, fake_pool):
 	os.makedirs(tmp_path / 'real' / 'vaults')
 	os.symlink(tmp_path / 'real', tmp_path / 'link')
