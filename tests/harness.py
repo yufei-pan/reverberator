@@ -136,13 +136,14 @@ def deep_tree(root: str, depth: int, leaf: str = 'f') -> str:
 	return root.rstrip('/') + '/d' * depth
 
 
-def on_folder_open(monkeypatch, path: str, action) -> None:
+def on_folder_open(monkeypatch, path: str, action, *, by_path: bool = True) -> None:
 	'''
 	Run action() before each open of the folder at path for a listing, then the real call: action may change the tree (a removal, a
 	link or a file swapped in), or raise what that open is to answer. An open for a listing is os.open() with O_DIRECTORY in its flags
 	(a walk opens each folder so, by its path, and lists the handle) or os.scandir() given a path, not a handle (a listing by path,
 	as folder_gone() takes one, and as the walks did before round 0.55.6, so a test of the walk's open fails there for its own
-	reason). The name is compared as os.path.abspath(name).rstrip('/'), path likewise.
+	reason). With by_path False only the first fires: the walk's own open, not a listing of the path that is not the walk's. The name
+	is compared as os.path.abspath(name).rstrip('/'), path likewise.
 	'''
 	target = os.path.abspath(path).rstrip('/')
 	real_open, real_scandir = os.open, os.scandir
@@ -151,7 +152,7 @@ def on_folder_open(monkeypatch, path: str, action) -> None:
 			action()
 		return real_open(name, flags, *args, **kwargs)
 	def scandir(name='.'):
-		if not isinstance(name, int) and os.path.abspath(os.fsdecode(name)).rstrip('/') == target:
+		if by_path and not isinstance(name, int) and os.path.abspath(os.fsdecode(name)).rstrip('/') == target:
 			action()
 		return real_scandir(name)
 	monkeypatch.setattr(os, 'open', opening)

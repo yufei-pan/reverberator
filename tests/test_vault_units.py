@@ -1156,23 +1156,38 @@ def unreadable_below(monkeypatch, folder):
 	a user other than root, while the folder itself can still be looked at. A real mode 000 would not do: root reads it, and a daemon
 	run as uid 65534 gives its own copy of the folder that mode and then cannot measure its own version. The walk opens a folder with
 	os.open() before it lists it, which is where a folder of mode 000 refuses a user other than root. The list returned holds the
-	folder once for each open of it refused, which a test asserts, as a stand-in the walk no longer meets would deny nothing.
+	folder once for each such open of it refused (the walk's own, not a listing of its path by os.scandir(), which is refused too),
+	which a test asserts, as a stand-in the walk no longer meets would deny nothing.
 	'''
 	real_lstat = os.lstat
 	inside = folder + os.sep
 	opens_refused = []
 	def denied(path):
 		raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
-	def refuse_open():
-		opens_refused.append(folder)
-		denied(folder)
-	on_folder_open(monkeypatch, folder, refuse_open)
+	on_folder_open(monkeypatch, folder, lambda: denied(folder))
+	# installed after the denial, so it runs first: it counts the walk's opens, which the denial then refuses
+	on_folder_open(monkeypatch, folder, lambda: opens_refused.append(folder), by_path=False)
 	def lstat(path, *args, **kwargs):
 		if isinstance(path, str) and path.startswith(inside):
 			denied(path)
 		return real_lstat(path, *args, **kwargs)
 	monkeypatch.setattr(rv.os, 'lstat', lstat)
 	return opens_refused
+
+
+@pytest.mark.unit
+def test_unreadable_below_counts_the_walks_open_and_not_a_listing_of_the_path(tmp_path, monkeypatch):
+	# the list it returns is what two tests assert to say the roll-forward's walk met the folder: a listing of the folder by path is
+	# refused too, and must not be counted for the walk's
+	folder = tmp_path / 'd'
+	folder.mkdir()
+	refused = unreadable_below(monkeypatch, str(folder))
+	with pytest.raises(PermissionError):
+		os.scandir(str(folder))
+	assert refused == []
+	errors = []
+	assert list(rv.iter_tree_entries(str(folder), errors=errors)) == []
+	assert refused == [str(folder)] and [type(error) for _, error in errors] == [PermissionError]
 
 
 @pytest.mark.unit
