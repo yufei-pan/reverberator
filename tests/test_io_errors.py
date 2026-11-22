@@ -5,11 +5,11 @@ import stat
 import sys
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import pytest
 import reverberator as rv
 from tests.harness import on_folder_open, seed_monitor, committed_versions
-from tests.vault_oracle import landing, version_number
+from tests.vault_oracle import landing, rows_match_vault, version_number
 
 pytestmark = pytest.mark.unit
 
@@ -1662,14 +1662,15 @@ DEFAULT_ACL = (2).to_bytes(4, 'little') + b''.join(tag.to_bytes(2, 'little') + p
 FOLDER_COPY_STEPS = ('drop_missing', 'copy_xattrs', 'before_chmod')
 
 
-def fail_folder_copy_once(monkeypatch, vault_rel:str, step:str) -> list:
+def fail_folder_copy_once(monkeypatch, vault_rel:str, step:str, every:bool = False) -> list:
 	'''
 	rv.copy_new_folder_meta() and rv.copy_file_meta() replaced so that the first copy onto any version's folder at vault_rel
 	(<job vault>/V<n>--<time>/<vault_rel>; never one into staging, on its way into the previous version) runs the real
 	copy_file_meta() with its steps after the owner done for real up to step, one of FOLDER_COPY_STEPS, where an EIO stops it:
 	copy_file_meta()'s own except then writes its ERROR line and traceback, appends the source to failed and returns False.
-	Every later call is the real one. Both are replaced, as copy_new_folder_meta()'s fast path falls back to copy_file_meta(),
-	which would mend a single failed request at once. Returns the list of the destination it failed, empty until then.
+	Every later call is the real one; with every, each such copy fails so, a failure that hits every time. Both are replaced, as
+	copy_new_folder_meta()'s fast path falls back to copy_file_meta(), which would mend a single failed request at once. Returns
+	the list of the destinations it failed, empty until then.
 	'''
 	assert step in FOLDER_COPY_STEPS
 	parts = vault_rel.strip('/').split('/')
@@ -1678,7 +1679,7 @@ def fail_folder_copy_once(monkeypatch, vault_rel:str, step:str) -> list:
 
 	def first_at_place(dest:str) -> bool:
 		held = os.path.normpath(dest).split(os.sep)
-		if failed_at or len(held) <= len(parts) or held[-len(parts):] != parts or version_number(held[-len(parts) - 1]) is None:
+		if (failed_at and not every) or len(held) <= len(parts) or held[-len(parts):] != parts or version_number(held[-len(parts) - 1]) is None:
 			return False
 		failed_at.append(dest)
 		return True
@@ -1826,6 +1827,13 @@ PLACES = ['first_version', 'settle', 'attrib']
 # one more batch after the one into C, with the margin left at 10, gave the same cells
 TIMINGS = {'no_batch': (False, None), 'no_batch_old_folder': (False, -1), 'next_commit': (True, None), 'after_another_batch': (True, 0)}
 PLACE_TIMINGS = [(place, timing) for place in PLACES for timing in ('no_batch', 'next_commit', 'after_another_batch')] + [('first_version', 'no_batch_old_folder')]
+# the cells main 0.55.5 left wrong (None there): its full comparison found no difference in C. Since step 2 (spec section 16; the
+# user's answer to Q7, 2026-11-17, "Build the retry (Recommended)") C's row holds a mark from the failing version's commit on
+# (META_RETRY_MODE), which the batches between keep (the batch into C gives C its times only), so they heal at the full comparison
+# (HEALS), and at the next batch that compares C (test_a_folder_whose_copy_failed_heals_at_the_next_batch_comparing_it)
+LEFT_WRONG_ON_MAIN = [('default_acl', 'settle', 'after_another_batch'), ('default_acl', 'attrib', 'after_another_batch'),
+	('own_xattr', 'first_version', 'no_batch_old_folder'), ('own_xattr', 'first_version', 'after_another_batch'),
+	('own_xattr', 'settle', 'after_another_batch'), ('own_xattr', 'attrib', 'after_another_batch'), ('own_xattr_0775', 'attrib', 'after_another_batch')]
 # (case, place, timing): the step of the first version that holds C as the monitored C is, from which every later one does:
 # 'failing' when the failing version already does, 'elsewhere' (after a batch that does not touch C), 'into_c' (after a batch that
 # touches C), 'full' (after the full comparison), None when the last one does not
@@ -1853,40 +1861,43 @@ HEALS = {
 	# removal stopped the times too: the vault's C has its mkdir time), and by the attribute check while it reaches C
 	('default_acl', 'settle', 'no_batch'): 'full',
 	('default_acl', 'settle', 'next_commit'): 'full',
-	# main 0.55.5: does not heal after another batch: the batch that wrote into C gave it its times and recorded them, so C's record no
-	# longer differs, and the attribute check no longer reaches C. It heals by C's mode where that is not the 0755 the ACL gave the
-	# vault's C (probed with 0700, 0750, 0775 and 0777, not pinned)
-	('default_acl', 'settle', 'after_another_batch'): None,
+	# main 0.55.5: None, it did not heal after another batch: the batch that wrote into C gave it its times and recorded them, so C's
+	# record no longer differed, and the attribute check no longer reached C. It healed by C's mode where that was not the 0755 the ACL
+	# gave the vault's C (probed with 0700, 0750, 0775 and 0777, not pinned). Since step 2: at the full comparison, by the mark
+	('default_acl', 'settle', 'after_another_batch'): 'full',
 	# main 0.55.5: heals at the full comparison by the attribute check, which reaches C (its record never differed: an extended
 	# attribute moves no mtime, and the failed copy stopped before it changed anything of C)
 	('default_acl', 'attrib', 'no_batch'): 'full',
 	('default_acl', 'attrib', 'next_commit'): 'full',
-	# main 0.55.5: does not heal after another batch: the attribute check no longer reaches C, and its record never differed
-	('default_acl', 'attrib', 'after_another_batch'): None,
+	# main 0.55.5: None, it did not heal after another batch: the attribute check no longer reached C, and its record never differed.
+	# Since step 2: at the full comparison, by the mark
+	('default_acl', 'attrib', 'after_another_batch'): 'full',
 	# main 0.55.5: heals at the full comparison by the attribute check, which reaches C: the bound (the first version's folder time, or
 	# the matched time of the batch into C, less the margin) is not after C's last change here. This is the only way it heals, with the
 	# monitored C at the mode mkdir gave the vault's C (0755): see own_xattr_0775
 	('own_xattr', 'first_version', 'no_batch'): 'full',
 	('own_xattr', 'first_version', 'next_commit'): 'full',
-	# main 0.55.5: does not heal where the attribute check does not reach C (C last changed more than the margin before the first
-	# version's folder time, or the matched time of a batch is more than the margin after C's last change: the margin 0): C's record
-	# matches the monitored C's, as the times were copied before the failing step and the mode is the 0755 mkdir gave both (at another
-	# mode it heals, by the mode: own_xattr_0775)
-	('own_xattr', 'first_version', 'no_batch_old_folder'): None,
-	('own_xattr', 'first_version', 'after_another_batch'): None,
+	# main 0.55.5: None, it did not heal where the attribute check did not reach C (C last changed more than the margin before the first
+	# version's folder time, or the matched time of a batch more than the margin after C's last change: the margin 0): C's record
+	# matched the monitored C's, as the times were copied before the failing step and the mode is the 0755 mkdir gave both (at another
+	# mode it healed, by the mode: own_xattr_0775). Since step 2: at the full comparison, by the mark
+	('own_xattr', 'first_version', 'no_batch_old_folder'): 'full',
+	('own_xattr', 'first_version', 'after_another_batch'): 'full',
 	# main 0.55.5: heals at the full comparison by the attribute check, which reaches C: C changed after V0's start, where the bound of
 	# no_batch starts, and the matched time of the batch that wrote into C (next_commit) is within the margin of its ctime. The mode
 	# condition is as at the first version
 	('own_xattr', 'settle', 'no_batch'): 'full',
 	('own_xattr', 'settle', 'next_commit'): 'full',
-	# main 0.55.5: does not heal after another batch: C's record matches the monitored C's, as at the first version
-	('own_xattr', 'settle', 'after_another_batch'): None,
+	# main 0.55.5: None, it did not heal after another batch: C's record matched the monitored C's, as at the first version. Since
+	# step 2: at the full comparison, by the mark
+	('own_xattr', 'settle', 'after_another_batch'): 'full',
 	# main 0.55.5: heals at the full comparison by the attribute check, which reaches C (the monitored C's attribute changed after V0's
 	# start, where the bound of no_batch starts; for next_commit, the matched time of the batch into C is within the margin of C's ctime)
 	('own_xattr', 'attrib', 'no_batch'): 'full',
 	('own_xattr', 'attrib', 'next_commit'): 'full',
-	# main 0.55.5: does not heal after another batch: C's record matches the monitored C's (V0 copied the mode and the times)
-	('own_xattr', 'attrib', 'after_another_batch'): None,
+	# main 0.55.5: None, it did not heal after another batch: C's record matched the monitored C's (V0 copied the mode and the times).
+	# Since step 2: at the full comparison, by the mark
+	('own_xattr', 'attrib', 'after_another_batch'): 'full',
 	# main 0.55.5: heals at the full comparison, at any timing, by C's mode against its record: the failed copy stopped before its
 	# chmod, so the vault's C (new here) keeps the 0755 mkdir gave it, and the monitored C is 0775
 	('own_xattr_0775', 'first_version', 'no_batch'): 'full',
@@ -1896,10 +1907,11 @@ HEALS = {
 	('own_xattr_0775', 'settle', 'no_batch'): 'full',
 	('own_xattr_0775', 'settle', 'next_commit'): 'full',
 	('own_xattr_0775', 'settle', 'after_another_batch'): 'full',
-	# main 0.55.5: as own_xattr at attrib: V0 copied the 0775 (C was right), so the full comparison heals it only by the attribute check
+	# main 0.55.5: as own_xattr at attrib: V0 copied the 0775 (C was right), so the full comparison healed it only by the attribute
+	# check, and after another batch not at all (None). Since step 2 that cell heals at the full comparison too, by the mark
 	('own_xattr_0775', 'attrib', 'no_batch'): 'full',
 	('own_xattr_0775', 'attrib', 'next_commit'): 'full',
-	('own_xattr_0775', 'attrib', 'after_another_batch'): None,
+	('own_xattr_0775', 'attrib', 'after_another_batch'): 'full',
 }
 
 
@@ -1916,14 +1928,12 @@ def umask_022():
 		os.umask(old)
 
 
-@pytest.mark.parametrize('case', CASES)
-@pytest.mark.parametrize('place, timing', PLACE_TIMINGS)
-def test_a_folder_metadata_copy_that_failed_once(umask_022, job, poll_fast, monkeypatch, capsys, case, place, timing):
-	# pin: main's answer to the healing check (spec section 16, step 1), which the user is asked about (the spec's Q7). The failing
-	# version, then (by timing) a batch that does not touch C (a file elsewhere) and a batch that touches C (a file in it), and a full
-	# comparison (with a file changed elsewhere, so it commits a version whatever it finds of C): C's setgid bit, its
-	# system.posix_acl_default, or its user.note, read in each version through its daemon links
-	batches, margin = TIMINGS[timing]
+def _failing_version(job, monkeypatch, case:str, place:str, every:bool = False) -> tuple:
+	'''
+	The healing check's failing version: the monitored P and P/C as case (CASES) names them, and C's own metadata copy failing at
+	place (PLACES) through fail_folder_copy_once() (every: at each copy onto C in a version, not only the first). Returns (P, C, the
+	stand-in's list of the destinations it failed, the failing version's index in committed_versions()).
+	'''
 	own = case.startswith('own_xattr')
 	parent, folder = os.path.join(job.monitor, 'P'), os.path.join(job.monitor, 'P', 'C')
 	seed_monitor(job, {'a.txt': 'a'})
@@ -1953,22 +1963,40 @@ def test_a_folder_metadata_copy_that_failed_once(umask_022, job, poll_fast, monk
 
 	if place == 'first_version':
 		make_folder()
-		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case])
+		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case], every)
 		assert _full(job) is True
 	elif place == 'settle':
 		assert _full(job) is True
 		make_folder()
-		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case])
+		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case], every)
 		_events(job, [(True, 'create', 'P/C', None)])
 	else:
 		make_folder()
 		assert _full(job) is True
 		_give(folder, case)
-		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case])
+		failed_at = fail_folder_copy_once(monkeypatch, 'P/C', CASES[case], every)
 		_events(job, [(True, 'attrib', 'P/C', None)])
 	failing = len(committed_versions(job)) - 1
-	# the stand-in failed C's copy in the failing version
+	# the stand-in failed C's copy in the failing version, once
 	assert [os.path.dirname(os.path.dirname(os.path.normpath(dest))) for dest in failed_at] == [committed_versions(job)[failing]]
+	return parent, folder, failed_at, failing
+
+
+def _read_in(job, version:str, rel:str, case:str):
+	'''What case reads of the folder at rel in the committed version folder version, through its daemon links.'''
+	return _case_reading(os.path.join(job.job_vault, *landing(job.job_vault, os.path.basename(version), rel)), case)
+
+
+@pytest.mark.parametrize('case', CASES)
+@pytest.mark.parametrize('place, timing', PLACE_TIMINGS)
+def test_a_folder_metadata_copy_that_failed_once(umask_022, job, poll_fast, monkeypatch, capsys, case, place, timing):
+	# fails on main for the seven cells of LEFT_WRONG_ON_MAIN, which main 0.55.5 left wrong and step 2's mark heals at the full
+	# comparison; every other cell pins main's answer to the healing check (spec section 16, step 1). The failing version, then (by
+	# timing) a batch that does not touch C (a file elsewhere) and a batch that touches C (a file in it), and a full comparison (with a
+	# file changed elsewhere, so it commits a version whatever it finds of C): C's setgid bit, its system.posix_acl_default, or its
+	# user.note, read in each version through its daemon links
+	batches, margin = TIMINGS[timing]
+	parent, folder, failed_at, failing = _failing_version(job, monkeypatch, case, place)
 	steps = ['failing']
 	if batches:
 		steps += ['elsewhere', 'into_c']
@@ -1987,3 +2015,115 @@ def test_a_folder_metadata_copy_that_failed_once(umask_022, job, poll_fast, monk
 	assert (out.out + out.err).count('Failed to copy metadata ') == 1
 	heals, reads = healed_at(job, versions, steps, case, folder, 'P/C')
 	assert heals == HEALS[(case, place, timing)], f'{case} at {place}, {timing}: heals at {heals}; the versions read {reads}, the monitored C {_case_reading(folder, case)!r}'
+
+
+@pytest.mark.parametrize('case, place', sorted({(case, place) for case, place, _ in LEFT_WRONG_ON_MAIN}))
+def test_a_folder_whose_copy_failed_heals_at_the_next_batch_comparing_it(umask_022, job, poll_fast, monkeypatch, capsys, case, place):
+	# fails on main: the batch that renames P to Q compares the tree under Q (its verification, compare_scopes()), C's record there
+	# matches the monitored C's, and the attribute check does not reach C, so the newest version keeps C as the failing one left it.
+	# Since step 2 C's row holds the mark (it moved with C: VaultManifest.move_tree()), and the batch copies C's metadata again. The
+	# batch is stamped now, as the watcher stamps one (backup_events() stamps its events at a monotonic 1.0 s, near the boot, which
+	# would put every ctime in the window), and VERIFY_CTIME_MARGIN_SECONDS is 0, as for after_another_batch: C's last change came
+	# more than the margin before the batch
+	parent, folder, failed_at, failing = _failing_version(job, monkeypatch, case, place)
+	failed = _read_in(job, committed_versions(job)[failing], 'P/C', case)
+	assert failed != _case_reading(folder, case), 'the failing version holds C right: nothing to heal'
+	assert _marked_rows(job) == ['P/C/']
+	moved = os.path.join(job.monitor, 'Q')
+	os.rename(parent, moved)
+	monkeypatch.setattr(rv, 'VERIFY_CTIME_MARGIN_SECONDS', 0)
+	raw = deque([rv.ChangeEvent(time.monotonic(), True, 'move', moved, parent)])
+	_, manifest, committed = rv.do_backup(rv.change_events_to_backup_entries(deque(raw), job.monitor), job_name=job.job_name, monitor_path=job.monitor,
+		vault_path=job.vault, touched=rv.touched_scopes(raw, job.monitor), matched_since=time.time_ns(), **KEPT)
+	manifest.close()
+	assert committed is True and len(committed_versions(job)) == failing + 2
+	want = _case_reading(os.path.join(moved, 'C'), case)
+	assert _read_in(job, committed_versions(job)[-1], 'Q/C', case) == want, f'{case} at {place}: the batch comparing C left it {failed!r}, the monitored C {want!r}'
+	out = capsys.readouterr()
+	assert (out.out + out.err).count('Failed to copy metadata ') == 1
+
+
+def _marked_rows(job) -> list:
+	'''The rels of the manifest rows whose mode is no entry's (below 0): the mark of a folder whose metadata is to be copied again.'''
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return [rv.stored_name(path) for (path,) in manifest.conn.execute('SELECT path FROM entries WHERE mode < 0 ORDER BY path')]
+	finally:
+		manifest.close()
+
+
+@pytest.mark.parametrize('place', PLACES)
+def test_a_folder_copy_that_fails_every_time_is_tried_once_more_and_then_left(umask_022, job, poll_fast, monkeypatch, capsys, place):
+	# fails on main: no comparison meets C again (its record matches the monitored C's, and the attribute check misses it), so its
+	# copy is never tried again: no version follows the failing one. Since step 2 the full comparison after the failing version finds
+	# C by its mark and tries the copy once more, which fails again: one more version, which changes nothing of C, its row recorded from
+	# that version with no mark; the next full comparison finds nothing. The stand-in fails every copy onto C, at copystat()'s attribute
+	# step (own_xattr), with its ERROR line and traceback each time. VERIFY_CTIME_MARGIN_SECONDS at -3600 puts each full comparison's
+	# bound an hour past the version it starts from, so the attribute check reaches no entry, as for a folder last changed more than
+	# the margin before the matched time (after_another_batch, no_batch_old_folder): only the mark can find C
+	parent, folder, failed_at, failing = _failing_version(job, monkeypatch, 'own_xattr', place, every=True)
+	# the failing version's commit marked C's row, which the row oracle passes over (its mode alone)
+	assert _marked_rows(job) == ['P/C/']
+	assert rows_match_vault(job.job_vault) == []
+	monkeypatch.setattr(rv, 'VERIFY_CTIME_MARGIN_SECONDS', -3600)
+	assert _full(job) is True
+	versions = committed_versions(job)
+	assert len(versions) == failing + 2, 'the full comparison after the failing version made no version: C was not tried again'
+	assert [os.path.dirname(os.path.dirname(os.path.normpath(dest))) for dest in failed_at] == versions[failing:]
+	assert _marked_rows(job) == []
+	assert _full(job) is True
+	assert committed_versions(job) == versions, 'a failure every time was tried more than once more'
+	assert len(failed_at) == 2
+	assert _read_in(job, versions[-1], 'P/C', 'own_xattr') is None
+	out = capsys.readouterr()
+	text = out.out + out.err
+	assert text.count('Failed to copy metadata ') == 2
+	assert text.count('Traceback (most recent call last)') == 2
+
+
+def test_a_folder_whose_copy_works_keeps_its_record(job, poll_fast):
+	# pin: no row holds the mark after normal batches: a first version, a batch that makes a folder, changes another's mode and
+	# renames a third, and a full comparison, all of whose copies work. Every row's record describes the version (rows_match_vault()),
+	# and the full comparison finds nothing to back up
+	seed_monitor(job, {'a.txt': 'a', 'P/C/f.txt': 'f', 'P/D/g.txt': 'g', 'P/E/h.txt': 'h'})
+	_give(os.path.join(job.monitor, 'P', 'C'), 'own_xattr')
+	assert _full(job) is True
+	os.mkdir(os.path.join(job.monitor, 'N'))
+	os.chmod(os.path.join(job.monitor, 'P', 'D'), 0o750)
+	os.rename(os.path.join(job.monitor, 'P', 'E'), os.path.join(job.monitor, 'F'))
+	_events(job, [(True, 'create', 'N', None), (True, 'attrib', 'P/D', None), (True, 'move', 'F', 'P/E')])
+	versions = committed_versions(job)
+	assert len(versions) == 2
+	assert _full(job) is True
+	assert committed_versions(job) == versions
+	assert _marked_rows(job) == []
+	assert rows_match_vault(job.job_vault) == []
+
+
+def test_a_roll_forward_keeps_a_folders_mark(tmp_path):
+	# the rows of a cut batch's tree (read_rows_from_tree(), a roll-forward) keep a folder row's mark, so the roll-forward's comparison
+	# copies the folder's metadata again: its mtime, owner and group are read from the tree as any folder's, its mode stays the mark. A
+	# marked folder the tree holds a file in place of loses its record, as any row of another kind; a row with no record is not marked
+	tree, vault = str(tmp_path / 'tree'), str(tmp_path / 'vault')
+	for rel in ('C', 'G', 'U'):
+		os.makedirs(os.path.join(tree, rel))
+	os.makedirs(vault)
+	manifest = rv.VaultManifest(vault)
+	try:
+		manifest.begin()
+		for rel in ('C/', 'G/'):
+			manifest.add(rel, dirty=True)
+		manifest.add('U/')
+		rv.record_dirty_entries(manifest, tree)
+		manifest.mark_meta_retry(['C/', 'G/', 'U/', 'X/'])
+		assert [manifest.lookup(rel).mode for rel in ('C/', 'G/')] == [rv.META_RETRY_MODE] * 2
+		assert manifest.lookup('U/').kind is None and manifest.lookup('U/').mode is None and manifest.lookup('X/') is None
+		st = os.lstat(os.path.join(tree, 'C'))
+		os.utime(os.path.join(tree, 'C'), ns=(st.st_atime_ns, st.st_mtime_ns - 10 ** 9))
+		os.rmdir(os.path.join(tree, 'G'))
+		open(os.path.join(tree, 'G'), 'w').close()
+		rv.read_rows_from_tree(manifest, tree)
+		assert manifest.lookup('C/') == rv.ManifestRecord('d', None, st.st_mtime_ns - 10 ** 9, rv.META_RETRY_MODE, st.st_uid, st.st_gid, None, None, 0)
+		assert manifest.lookup('G/').kind is None
+	finally:
+		manifest.close()

@@ -1102,6 +1102,10 @@ VaultEntry = namedtuple('VaultEntry', VAULT_ENTRY_HEADER)
 # of which the roll-forward copies again each that is a regular file in the monitored tree now (prepare_roll_forward())
 VaultInfo = namedtuple('VaultInfo', VAULT_INFO_HEADER, defaults=[None, ()])
 ManifestRecord = namedtuple('ManifestRecord', MANIFEST_RECORD_HEADER)
+# the mode of a folder row whose own metadata copy failed ( VaultManifest.mark_meta_retry() ): no entry has it, so the next comparison
+# that meets the folder finds an attrib ( compare_monitor_entry(), the one reader of a row's mode that compares it ), and the replay
+# copies all of its metadata again. A release that knows no mark reads it the same way, as a mode that differs
+META_RETRY_MODE = -1
 # a copy queued on an executor, which finish_copies() puts in place
 PendingCopy = namedtuple('PendingCopy', ['task', 'source_path', 'temp_path', 'dest_path'])
 
@@ -6025,6 +6029,8 @@ def do_backup(backup_entries:dict,
 		reported = set()
 	# the entries whose metadata could not be copied, which may lack their extended attributes in the new version
 	unsynced = []
+	# the folders the replay copied the metadata of again for their rows' mark ( META_RETRY_MODE ), which the commit does not mark again
+	retried = set()
 	opened_manifest = manifest is None
 	# every vault sync of this backup goes through the handles opened here, before its first write into the job vault, and
 	# closed when it ends: a write error another program's sync met first is still heard (VaultUnit)
@@ -6335,7 +6341,7 @@ def do_backup(backup_entries:dict,
 				nonlocal paused
 				paused, _ = drop_unmounted_entries(fixes,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'verification',pool=pool)
 			do_reverb_backup(backup_entries,backup_folder,only_sync_attributes,manifest,monitor_path,writer,skip_list,job_name,reported,
-				touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,pool_guard=pool_guard,unsynced=unsynced)
+				touched=touched,paused=paused,verified=verified,recheck_mounts=recheck_mounts,pool_guard=pool_guard,unsynced=unsynced,retried=retried)
 		backup_finished = GREEN_LIGHT.is_set()
 		if not backup_finished:
 			manifest.rollback()
@@ -6347,6 +6353,11 @@ def do_backup(backup_entries:dict,
 			if vaultInfo is None:
 				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 			return vaultInfo, manifest, False
+		# a folder whose own metadata copy failed, recorded from what the version holds, is marked ( META_RETRY_MODE ), so the next
+		# comparison that meets it copies its metadata again, its extended attributes among them, which no record holds; one the replay
+		# took for its mark keeps the record, so a copy that fails every time is tried once more, and then left (spec section 16, step 2)
+		if unsynced:
+			manifest.mark_meta_retry(rel for rel in (as_folder_entry(os.path.relpath(path,monitor_path)) for path in unsynced) if rel not in retried)
 		# check the size of the backup
 		this_size, this_inodes = tree_totals(manifest, backup_folder)
 		vault_size += this_size
@@ -7373,7 +7384,8 @@ def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 	The rows of version n as far as they say what is in the tree of a cut batch: each row's mode and owner, a folder's mtime and a
 	link's text are read from the tree, and a row whose entry is gone or of another kind has no record, which the comparison
 	treats as a new entry. That batch may have changed any of them, and the monitored tree may have gone back since: a
-	comparison with the old row would say nothing differs. Over a standing manifest the scan made each name the batch recorded
+	comparison with the old row would say nothing differs. A folder row's mark ( META_RETRY_MODE ) stays in place of its mode, as
+	the folder's metadata is still to be copied again. Over a standing manifest the scan made each name the batch recorded
 	version n's entry again (prepare_roll_forward()), so a row read here reads version n's entry, and what the roll-forward does not
 	copy again keeps version n's record. The caller holds the transaction, as these rows stand only if the version commits: a repeated
 	roll-forward needs version n's folder times again. One look at each row, on a path that a crash alone takes.
@@ -7394,7 +7406,8 @@ def read_rows_from_tree(manifest:'VaultManifest', tree:str) -> None:
 			continue
 		found = record._replace(mode=st.st_mode, uid=st.st_uid, gid=st.st_gid)
 		if record.kind == 'd':
-			found = found._replace(mtime_ns=st.st_mtime_ns)
+			# a folder marked to have its metadata copied again ( META_RETRY_MODE ) keeps the mark, which the comparison finds
+			found = found._replace(mtime_ns=st.st_mtime_ns, mode=META_RETRY_MODE if record.mode == META_RETRY_MODE else st.st_mode)
 		elif record.kind == 'l':
 			found = found._replace(link=os.readlink(path))
 		if found != record:
@@ -9295,9 +9308,10 @@ class VaultManifest:
 	tree against the recorded size, mtime, mode, owner and tail hash, so it reads the vault only for unverified rows
 	(no record yet), which it then records. Rows a backup writes are dirty until they are recorded from the new
 	version, before its changes commit. kind is d (folder), f (regular file), o (other file type), l (symlink, its
-	target in link) or r (a referenced backup's link to the monitored file itself). A file copied by a backup is recorded
-	checked at its commit, which flushed it first; a row an older release marked unchecked is read back by the next delta
-	generation that walks it, and recorded checked.
+	target in link) or r (a referenced backup's link to the monitored file itself). A folder row whose own metadata copy
+	failed holds META_RETRY_MODE as its mode (mark_meta_retry()) until a comparison meets the folder and its metadata is
+	copied again. A file copied by a backup is recorded checked at its commit, which flushed it first; a row an older release
+	marked unchecked is read back by the next delta generation that walks it, and recorded checked.
 	Paths and link targets are stored through storable_name() and read back through stored_name(), so a name that is
 	not UTF-8 is tracked like any other; rows sort by stored path, in which a folder still comes right before the paths
 	under it. The copy_version column, 0.54's, stays in the table unused until the release that drops the 0.54 reader.
@@ -9704,6 +9718,14 @@ class VaultManifest:
 	def set_folder_mtimes(self, pairs):
 		'''Record the mtime of each folder row of (mtime_ns, folder rel ending with /) pairs that holds a record; the caller holds the transaction.'''
 		self.conn.executemany("UPDATE entries SET mtime_ns = ? WHERE path = ? AND kind = 'd'", ((mtime_ns, storable_name(rel)) for mtime_ns, rel in pairs))
+
+	def mark_meta_retry(self, rels:list) -> None:
+		'''
+		Mark each folder row of rels (folder rels ending with /) that holds a record: its mode becomes META_RETRY_MODE, so the next
+		comparison that meets the folder copies its metadata again. A rel with no row, or whose row has no record, is left alone. The
+		caller holds the transaction.
+		'''
+		self.conn.executemany("UPDATE entries SET mode = ? WHERE path = ? AND kind = 'd'", ((META_RETRY_MODE, storable_name(rel)) for rel in rels))
 
 	def take_dirty_records(self, limit:int) -> list:
 		'''The rels of the dirty rows, each with its record, as (rel, record or None): the record is kept only for a row mark_vouched() marked.'''
@@ -14365,7 +14387,7 @@ def settle_ops(folders, sweep = (), version_bytes:int = None) -> list:
 
 def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:bool,manifest:VaultManifest,monitor_path:str,writer:TreeWriter,
 					 skip_list:'SkipList' = None,job_name:str = None,reported:set = None,touched:TouchedScopes = None,paused:set = frozenset(),verified:list = None,
-					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None) -> VaultManifest:
+					 recheck_mounts = None,pool_guard:'PoolGuard' = None,unsynced:list = None,retried:set = None) -> VaultManifest:
 	'''
 	Replay backup_entries onto backup_folder, which already holds the tree, the rows describing it, through writer, the one of
 	the batch (hand_over()): each change records first.
@@ -14387,7 +14409,8 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 	pool_guard, when given, is polled while copies are queued and waited for: a disk of its pools that drops stops them
 	with PoolNotReady, so nothing more is written into the version.
 	Each entry whose metadata could not be copied, which may lack its extended attributes, is appended to unsynced
-	( copy_file_meta()'s failed ).
+	( copy_file_meta()'s failed ). retried, when given, gets the rel ( ending with / ) of each folder whose attrib the replay takes while
+	its row holds META_RETRY_MODE, the mark of a copy that failed before: the commit marks none of them again ( do_backup() ).
 	Once nothing more is written into backup_folder, each folder of it the replay or the verification made, removed or
 	renamed an entry in, and each one touched.folders names, gets the monitored folder's times, and each one they made or
 	synced the attributes of all of the monitored folder's metadata (WrittenFolders), and the rows of those given its times
@@ -14713,7 +14736,13 @@ def do_reverb_backup(backup_entries:dict,backup_folder:str,only_sync_attributes:
 						written.add(event_relative_path,whole=True)
 					else:
 						written.add(event_relative_path)
-					manifest.add(as_folder_entry(event_relative_path),dirty=True)
+					folder_rel = as_folder_entry(event_relative_path)
+					if retried is not None:
+						# the retry its mark asked for: its row is recorded from the version from here on, as any folder's
+						record = manifest.lookup(folder_rel)
+						if record is not None and record.mode == META_RETRY_MODE:
+							retried.add(folder_rel)
+					manifest.add(folder_rel,dirty=True)
 				else:
 					# the row's record first, which reads the monitored file only: the replay reads the copy's tail, on the
 					# vault's disks, only for a record that does not vouch ( a file whose mtime moved from the recorded one
