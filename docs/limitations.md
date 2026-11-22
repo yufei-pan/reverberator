@@ -828,26 +828,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.5: every restore, on a pool or off one, checks its folder's filesystem
   (`st_dev`) at each sync against the handles it opened, as the daemon's units check theirs.
 
-### A disk fstab mounts under a pool's disk, below a monitored path's place, is not paused
-
-- **Kind:** deferred.
-- **What the operator sees:** on a mergerfs pool, a disk that /etc/fstab mounts under one of the pool's disks, below a
-  monitored path's place on that disk, is not an inner mount of the monitored path: the mount table shows it under the
-  pool's disk, not under the pool, and the fstab rule on a pool looks only at mount points at or above the path's place
-  (the README's "fstab mounts"). While that disk is not mounted, the pool shows the bare folder it covers, and a full
-  comparison takes its files as deleted, with routine lines only (`Deleted file/folder ...`): the new version lacks them
-  while it is away (older versions keep them), and once it is mounted again they are copied again, whole, by the next
-  comparison that walks them. When it is unmounted while a walk passes through it, the folders the walk reaches after
-  that read as gone, with one INFO line each, where 0.55.4 logged UNREADABLE (an alert) and held the vault's matched
-  time: their rows stay for that version, but the matched time moves past them, so an xattr-only change made in them
-  while nothing watched can be missed until the entry next changes. No live job has such a disk (checked 2026-11-13).
-  Reasoned from the code, not run.
-- **Why:** the deleted files are older than 0.55.5 (0.55.4 the same); the walk's part is new in it, from its rule for a
-  folder gone mid-walk, which is no error (L10). Nothing the daemon reads under the monitored path tells it that such a
-  disk is part of the tree.
-- **Revisit when:** the round after 0.55.5: such a disk paused as an inner mount of the monitored path, its files kept and
-  the matched time held, as for a disk mounted inside the tree.
-
 ### An xattr change made while down, in a folder renamed during the start's walk
 
 - **Kind:** deferred.
