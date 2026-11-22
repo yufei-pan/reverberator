@@ -87,7 +87,11 @@ trim at each commit); Task 17 (P14) done and reviewed after one docs fix round (
 recommended answer); the round's cleanup done in three passes (c752e08..21a5f98) and Task 20's docs (f7e7562; the shared
 lessons file's lines committed, not pushed); the flaky watcher test fixed in the test (4c17b53: it wrote before the
 watcher's settle had removed the moved folder's watches; 22 of 240 runs under load failed before, none after); the final
-review running (2026-11-22); the VM gate (Task 22) waiting for memory on a shared host, and the version (Task 21) to come.
+review done (2026-11-22: with fixes; its one Important, an entry already past 4,095 bytes inside a version failing
+every backup when a sibling changes or a folder above is renamed, is deferred to the round after 0.55.6 with ten more
+narrow cases, each a deferred entry; thirteen small fixes in one fix wave, running); the VM gate's whole suite passed
+on 4c17b53 but for one new pool test's teardown check (a fix-wave item), its extra runs (alone, XFS, the full crash
+runs) running; then the fix wave's re-review, the gate again on the final commit, and the version (Task 21).
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
