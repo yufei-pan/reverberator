@@ -7,6 +7,7 @@ import time
 import pytest
 import reverberator as rv
 from tests.harness import committed_versions, event_entry, on_folder_open, run_backup, seed_monitor, tracked_manifest, wait_until
+from tests.test_restore_lock import _logged_lines as _lines
 
 def _privileged():
 	return os.geteuid() == 0 or os.environ.get('REVERB_PRIVILEGED') == '1'
@@ -797,17 +798,6 @@ FAKE_DISK = (b'9999', b'0:99', b'/', b'/dev/fakedisk', b'xfs')
 FIRST_WALK_LINE = "Inner mounts unmounted during the first version's walk, which left out what it had not reached under them: disk/"
 
 
-def _lines(monkeypatch):
-	'''The messages logged through backuperTeeLogToTl() from now on, from any thread.'''
-	lines = []
-	real = rv.backuperTeeLogToTl
-	def record(path, message, **kwargs):
-		lines.append(str(message))
-		return real(path, message, **kwargs)
-	monkeypatch.setattr(rv, 'backuperTeeLogToTl', record)
-	return lines
-
-
 def _recorded(job):
 	'''(matched, inner_mounts) the job vault's manifest records.'''
 	manifest = rv.VaultManifest(job.job_vault)
@@ -825,10 +815,11 @@ def _read(path):
 @pytest.mark.privileged
 @needs_root
 def test_a_first_version_walk_meeting_an_inner_disk_unmounted_midway_holds_the_matched_time(job, poll_fast, monkeypatch):
-	# fails on main (no line, the matched time recorded): disk/ is an inner tmpfs (bound from one kept aside, so it comes back with
-	# what it held), unmounted lazily by a hook in the first version's walk at disk/sub, a folder under it. One line; the matched time
-	# is not recorded; the mount is remembered and paused at the next batch; once mounted again, the next full comparison copies
-	# what the walk left out
+	# fails on main by its line (no line there); the matched time is held on main too in this variant, unlike the Docker one below (the Opus
+	# review of Task 10 says so; it needs root, and was not run here): disk/ is an inner tmpfs (bound from one kept
+	# aside, so it comes back with what it held), unmounted lazily by a hook in the first version's walk at disk/sub, a folder under it.
+	# One line; the matched time is not recorded; the mount is remembered and paused at the next batch; once mounted again, the next
+	# full comparison copies what the walk left out
 	store, disk = os.path.join(job.root, 'store'), os.path.join(job.monitor, 'disk')
 	os.makedirs(store)
 	os.makedirs(disk)
@@ -870,6 +861,61 @@ def test_a_first_version_walk_meeting_an_inner_disk_unmounted_midway_holds_the_m
 	finally:
 		subprocess.call(['umount', disk], stderr=subprocess.DEVNULL)
 		subprocess.call(['umount', store])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('left', ['a gone create', 'an untracked delete'])
+def test_a_batch_the_look_after_the_locks_leaves_with_nothing_to_back_up_commits_no_version(job, poll_fast, monkeypatch, left):
+	# R21 (the Task 10 review's M1 (a)): disk/, an inner mount, is unmounted while the batch waits for its locks; the batch holds a modify of
+	# disk/f.txt, a change the check before the wait sees, and one more entry that changes nothing once it is alone: a create of a file that is
+	# gone by then ("a gone create": entries_all_drop_out() drops it), or a move into disk/ whose source the vault never tracked
+	# ("an untracked delete": the look drops the move, which leaves the delete of its source, drop_untracked_deletes() drops that). The look
+	# drops the modify, and what is left was checked only before the wait, which it did not hold: a version that changes nothing, which
+	# prunes the oldest under Keep N. Now the two checks run again under the locks. Fails on 652397a: a second version
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f', 'plain.txt': 'p'})
+	disk = os.path.join(job.monitor, 'disk')
+	real_table = rv.read_mount_table()
+	mounted = real_table + [(os.path.realpath(disk), FAKE_DISK)]
+	tables = _a_table_you_can_change(monkeypatch, mounted)
+	_backup(job)[1].close()
+	versions = committed_versions(job)
+	assert len(versions) == 1 and tracked_inner_mounts(job) == ['disk/']
+	with open(os.path.join(disk, 'f.txt'), 'w') as f:
+		f.write('changed')
+	entries = [event_entry(job, 'disk/f.txt', 'modify')]
+	if left == 'a gone create':
+		with open(os.path.join(job.monitor, 'new.txt'), 'w') as f:
+			f.write('n')
+		entries.append(event_entry(job, 'new.txt', 'create'))
+	else:
+		# a move of a file the vault does not track (never backed up) into disk/: the move is dropped with the disk's entries and leaves
+		# the delete of its source, a path the vault has no row of
+		with open(os.path.join(job.monitor, 'untracked.txt'), 'w') as f:
+			f.write('u')
+		os.rename(os.path.join(job.monitor, 'untracked.txt'), os.path.join(disk, 'moved.txt'))
+		entries.append(event_entry(job, 'disk/moved.txt', 'move', 'untracked.txt'))
+	lines = _lines(monkeypatch)
+	real_take = rv.BackupLocks.take
+	takes = []
+	def take(self, *args, **kwargs):
+		taken = real_take(self, *args, **kwargs)
+		takes.append(True)
+		if len(takes) > 1:
+			# the wait for the locks after the comparison: the disk goes (the mount point shows an empty folder), and the create's file with it
+			if tables['now'] is mounted:
+				os.rename(disk, os.path.join(job.root, 'aside'))
+				os.mkdir(disk)
+				tables['now'] = real_table
+			if left == 'a gone create':
+				os.remove(os.path.join(job.monitor, 'new.txt'))
+		return taken
+	monkeypatch.setattr(rv.BackupLocks, 'take', take)
+	vault_info, manifest, committed = _backup(job, OrderedDict(entries))
+	manifest.close()
+	assert tables['now'] is real_table, 'the batch never waited for its locks again'
+	assert any(line.startswith('Inner mounts unmounted during the wait for the locks') for line in lines)
+	assert committed is True and committed_versions(job) == versions
+	assert os.path.isfile(os.path.join(versions[0], 'disk', 'f.txt')) and _read(os.path.join(versions[0], 'disk', 'f.txt')) == 'f'
 
 
 @pytest.mark.unit

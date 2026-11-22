@@ -6213,6 +6213,14 @@ def do_backup(backup_entries:dict,
 				if backup_entries and entries_all_drop_out(backup_entries,monitor_path,latest_version_info.path,job_vault,pool_guard,job_name,reported,manifest):
 					backuperTeeLogToTl(job_name,f'Each of the {len(backup_entries)} backup entries would be left out of a version: dropping them')
 					backup_entries.clear()
+			def drop_what_changes_nothing() -> None:
+				# a delete of what the vault holds no path of would make a version with no change. dropping it is safe: deletes
+				# replay first, onto a version that holds only the tracked rows, so such a delete would remove nothing. after
+				# a paused drop, as a move into a paused folder deletes its source, which may be untracked
+				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path)
+				if dropped:
+					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
+				all_drop_out()
 			if tree is None and backup_entries:
 				if paused:
 					# what the watcher saw in a paused folder before its disk went is compared when the disk is back
@@ -6221,13 +6229,7 @@ def do_backup(backup_entries:dict,
 						backuperTeeLogToTl(job_name,f'Dropped {dropped} backup entries in unmounted inner mounts')
 						if not backup_entries:
 							backuperTeeLogToTl(job_name,'No backup entries left outside unmounted inner mounts',ok=True)
-				# a delete of what the vault holds no path of would make a version with no change. dropping it is safe: deletes
-				# replay first, onto a version that holds only the tracked rows, so such a delete would remove nothing. after
-				# the paused drop, as a move into a paused folder deletes its source, which may be untracked
-				dropped = drop_untracked_deletes(backup_entries,manifest,monitor_path)
-				if dropped:
-					backuperTeeLogToTl(job_name,f'Dropped {dropped} delete entries of paths the vault does not track')
-				all_drop_out()
+				drop_what_changes_nothing()
 			if tree is not None:
 				backuperTeeLogToTl(job_name,f'Rolling forward {tree}, the tree of a batch that was cut')
 				rolled = roll_forward_entries(vaultInfo,manifest,monitor_path,skip=None if skip_list is None else skip_list.skips,paused=paused,job_name=job_name,reported=reported,
@@ -6267,7 +6269,6 @@ def do_backup(backup_entries:dict,
 					log_events_to_journal(backup_entries,journalPath)
 			def no_differences() -> tuple:
 				# a batch with nothing to back up, here or once the look after the locks dropped what was left: no version
-				nonlocal vaultInfo
 				backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
 				# no differences after a complete walk, or none left outside paused folders: the tree matches the
 				# manifest under this skip list, if every disk of both pools was there all along
@@ -6282,8 +6283,7 @@ def do_backup(backup_entries:dict,
 				manifest.record_matched(latest_version_info.path,matched_since if full else None,latest_version_info.path)
 				# with nothing written, this commit makes no I/O ( VaultManifest.commit() )
 				manifest.commit()
-				if vaultInfo is None:
-					vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
+				# the scan's own, as a later version has one
 				return vaultInfo, manifest, True
 			if not backup_entries and tree is None:
 				return no_differences()
@@ -6297,12 +6297,18 @@ def do_backup(backup_entries:dict,
 			# the wait (behind a restore that copies, say) can outlast a disk: the monitored one gone fails the attempt, as during
 			# a walk, and an inner one gone is paused, the entries under it dropped. a roll-forward goes on with what is left, as
 			# it always commits
+			paused_before_the_look = paused
 			try:
 				paused, walked_table = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'wait for the locks',pool=pool)
 			except JobFailure:
 				if tree is not None:
 					manifest.rollback()
 				raise
+			if tree is None and backup_entries and paused != paused_before_the_look:
+				# a disk the look paused took its entries along: what is left may be deletes of paths the vault does not track now (a move
+				# into the disk's folder deleted its source), or entries that all drop out (a gone create), which would make a version that
+				# changes nothing, and prune the oldest under Keep N or a size limit. Checked as before the wait, under the locks now
+				drop_what_changes_nothing()
 			if tree is None and not backup_entries:
 				locks.release()
 				return no_differences()
