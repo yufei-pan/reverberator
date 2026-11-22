@@ -7388,8 +7388,9 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGua
 	not describe the previous version, as a lost one, which has no rows, by the text of the link the cut left in staging
 	(put_back_staged_links(); empty_staging() kept it for this). A link hiding what a record put in on another disk goes before that
 	(remove_shadowed_links()). Whichever wrote a link, the vault's disks are flushed before the attempt goes on (flush_or_fail()): a
-	link whose text a power cut lost, as f2fs can with a checkpoint inside symlink(2), would read as present at the next scan and never
-	be written again. A name of the tree left of two kinds
+	link whose text a power cut lost (f2fs can keep one when a checkpoint falls inside symlink(2)) reads as present at the next scan,
+	which never writes it again, so the window for that is the write and this flush, not the roll-forward that follows. A name of the
+	tree left of two kinds
 	goes (remove_mixed_names()). Each real folder of the previous version gets its times back (give_back_folder_times()), and the
 	tree is made version n's again (put_back_recorded()): each name the batch recorded holds version n's entry, and, with the
 	manifest describing the previous version or off a pool whatever the manifest (spec section 6, item 3), what the batch made is
