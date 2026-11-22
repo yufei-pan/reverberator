@@ -8,6 +8,7 @@ comparison no longer syncs; and no failed-sync marker is written. The kernel's r
 import datetime
 import errno
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -1806,8 +1807,8 @@ def cut_between_the_renames(job, monkeypatch, rel, events):
 	'''
 	A batch of events cut between the two renames of TreeWriter.exchange_in() at rel, the real ones (the crash harness's kill point there): the
 	version before's forward link moved to staging, the folder not in its place yet. The vault takes two renames (a pool, or rv.exchanged()
-	faked to answer False). The ground truth's lines of the cut, the version before reading nothing at rel after it, are looked at and taken
-	out. Returns the version before.
+	faked to answer False). The ground truth's lines of the cut are looked at and taken out: the version before reads nothing at rel after
+	it, and each folder above rel, made real on the way, only its mtime moved by the first rename. Returns the version before.
 	'''
 	previous = committed_versions(job)[-1]
 	staging = os.path.normpath(rv.staging_path(job.job_vault))
@@ -1821,10 +1822,32 @@ def cut_between_the_renames(job, monkeypatch, rel, events):
 		with pytest.raises(Cut):
 			backup_events(job, events, **KEPT)
 	assert not os.path.lexists(os.path.join(previous, rel)) and os.path.isdir(os.path.join(tree_of(job), rel))
-	lost = [line for line in view_truth.WRONG if line.startswith(f"{os.path.basename(previous)}:'{rel}")]
+	name = os.path.basename(previous)
+	lost = [line for line in view_truth.WRONG if line.startswith(f"{name}:'{rel}")]
 	assert lost and all(line.endswith('None after it') for line in lost), lost
-	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost]
+	moved = [line for line in view_truth.WRONG if any(line.startswith(f'{name}:{folder!r}: ') for folder in folders_above(rel))]
+	assert all(only_the_mtime_moved(line) for line in moved), moved
+	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost + moved]
 	return previous
+
+
+def folders_above(rel):
+	'''The rels of the folders above rel: 'p' and 'p/q' for 'p/q/d'.'''
+	parts = rel.split('/')
+	return ['/'.join(parts[:depth]) for depth in range(1, len(parts))]
+
+
+def only_the_mtime_moved(line):
+	'''Whether a ground truth line says an entry reads the same before and after its batch but for its mtime.'''
+	was, _, held = line.partition(': read ')[2].partition(' before the batch, ')
+	def timeless(text):
+		return re.sub(r'mtime_ns=\d+', 'mtime_ns=_', text)
+	return timeless(was) == timeless(held.removesuffix(' after it'))
+
+
+def timeless_at(view, folders):
+	'''view with the mtimes of folders left out.'''
+	return {rel: entry._replace(mtime_ns=None) if rel in folders else entry for rel, entry in view.items()}
 
 
 def staged_link_texts(job):
@@ -1833,37 +1856,54 @@ def staged_link_texts(job):
 	return sorted(os.readlink(os.path.join(staging, name)) for name in os.listdir(staging) if os.path.islink(os.path.join(staging, name)))
 
 
-def folder_d_backed_up(job):
-	'''d/x.txt, d/y.txt and top.txt backed up; what the version reads, by the oracle.'''
-	put_text(job.monitor, 'd/x.txt', 'x0')
-	put_text(job.monitor, 'd/y.txt', 'y0')
+def folder_backed_up(job, folder='d'):
+	'''folder/x.txt, folder/y.txt and top.txt backed up; what the version reads, by the oracle.'''
+	put_text(job.monitor, f'{folder}/x.txt', 'x0')
+	put_text(job.monitor, f'{folder}/y.txt', 'y0')
 	put_text(job.monitor, 'top.txt', 't0')
 	run_backup(job, **KEPT)
 	return read_view(job.job_vault, os.path.basename(committed_versions(job)[-1]))
 
 
+class CutAfterThePutBack(BaseException):
+	'''A kill once the scan gave the links back, before it empties staging.'''
+
+
 @pytest.mark.unit
-def test_a_cut_between_two_renames_over_a_lost_manifest_puts_the_staged_link_back(r_job, monkeypatch):
-	# case 3 of spec section 6, fails on 79220a8 (and on 0.55.4): on a vault with no RENAME_EXCHANGE a batch that deletes d/x.txt makes d real in
-	# the version before by two renames, its forward link to staging first; a cut between them, the manifest lost, and a start. The scan gives the
-	# link back to the version before ahead of empty_staging() (put_back_staged_links()), and once rolled forward every version reads right by the
-	# oracle: the version before what it read before the cut, the newest the monitored tree. On 79220a8 the link goes with staging: the version
-	# before holds nothing at d, and the retry's delete of d/x.txt finds nothing to record there, so x.txt is in no version
+@pytest.mark.parametrize('rel', ['d', 'p/d'])
+def test_a_cut_between_two_renames_over_a_lost_manifest_puts_the_staged_link_back(r_job, monkeypatch, rel):
+	# case 3 of spec section 6, fails on 79220a8 (and on 0.55.4): on a vault with no RENAME_EXCHANGE a batch that deletes <rel>/x.txt makes rel real
+	# in the version before by two renames, its forward link to staging first (p first for p/d); a cut between them, the manifest lost, and a
+	# start. The scan gives the link back to the version before ahead of empty_staging() (put_back_staged_links()); a cut after that and before
+	# staging is emptied leaves the link there, which the next scan finds no longer due. Once rolled forward every version reads right by the
+	# oracle: the version before what it read before the cut, the newest the monitored tree. For p/d the time of p, which the cut's first rename
+	# moved, is left out: no row gives it back over a lost manifest (the approved limitation "After a crash, a folder whose row holds no record
+	# can keep the backup's time"). On 79220a8 the link goes with staging: the version before holds nothing at rel, and the retry's delete of
+	# <rel>/x.txt finds nothing to record there, so x.txt is in no version
 	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
-	before = folder_d_backed_up(r_job)
-	os.remove(os.path.join(r_job.monitor, 'd', 'x.txt'))
-	previous = cut_between_the_renames(r_job, monkeypatch, 'd', [(False, 'delete', 'd/x.txt', None)])
+	before = folder_backed_up(r_job, rel)
+	os.remove(os.path.join(r_job.monitor, rel, 'x.txt'))
+	previous = cut_between_the_renames(r_job, monkeypatch, rel, [(False, 'delete', f'{rel}/x.txt', None)])
 	tree = tree_of(r_job)
-	assert staged_link_texts(r_job) == [rv.forward_text('d', os.path.basename(tree))]
+	text = rv.forward_text(rel, os.path.basename(tree))
+	assert staged_link_texts(r_job) == [text]
 	lose_the_manifest(r_job)
+	def cut(job_vault):
+		raise CutAfterThePutBack()
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'empty_staging', cut)
+		with pytest.raises(CutAfterThePutBack):
+			rv.get_vault_info(r_job.job_vault)
+	link = os.path.join(previous, rel)
+	assert os.path.islink(link) and os.readlink(link) == text, f'the version before holds nothing at {rel}'
+	assert staged_link_texts(r_job) == [text]
 	rv.get_vault_info(r_job.job_vault)
-	link = os.path.join(previous, 'd')
-	assert os.path.islink(link) and os.readlink(link) == rv.forward_text('d', os.path.basename(tree)), 'the version before holds nothing at d'
+	assert os.readlink(link) == text
 	assert os.listdir(rv.staging_path(r_job.job_vault)) == []
 	roll_forward(r_job)
 	versions = committed_versions(r_job)
 	assert versions == [previous, tree]
-	assert read_view(r_job.job_vault, os.path.basename(previous)) == before
+	assert timeless_at(read_view(r_job.job_vault, os.path.basename(previous)), folders_above(rel)) == timeless_at(before, folders_above(rel))
 	assert contents_of(tree) == contents_of(r_job.monitor)
 	assert rows_match_vault(r_job.job_vault) == []
 	assert view_truth.wrong_lists(r_job.job_vault) == []
@@ -1902,7 +1942,8 @@ def test_a_cut_create_unreadable_at_the_retry_over_a_lost_manifest_is_left_out(r
 def test_a_users_link_in_staging_naming_another_versions_folder_is_not_put_back(r_job, monkeypatch):
 	# pin: links in staging with the forward form at a rel where the version before holds nothing and the tree holds the entry, but naming the
 	# folder of the version before that one, or of the version before itself, not the tree's: only the tree's name, which the cut batch made,
-	# says a link is the batch's own. The scan leaves the version before as it was, and empties staging
+	# says a link is the batch's own. And one naming the tree's folder at a name the tree does not hold, which would lead nowhere. The scan
+	# leaves the version before as it was, and empties staging
 	base(r_job)
 	put_text(r_job.monitor, 'small.txt', 's1')
 	backup_events(r_job, [(False, 'modify', 'small.txt', None)], **KEPT)
@@ -1914,9 +1955,10 @@ def test_a_users_link_in_staging_naming_another_versions_folder_is_not_put_back(
 	os.makedirs(staging, exist_ok=True)
 	for name, version in (('a1b2c3', older), ('d4e5f6', previous)):
 		os.symlink(rv.forward_text('new.txt', os.path.basename(version)), os.path.join(staging, name))
+	os.symlink(rv.forward_text('gone.txt', os.path.basename(tree_of(r_job))), os.path.join(staging, '0a1b2c'))
 	lose_the_manifest(r_job)
 	rv.get_vault_info(r_job.job_vault)
-	assert not os.path.lexists(os.path.join(previous, 'new.txt'))
+	assert not os.path.lexists(os.path.join(previous, 'new.txt')) and not os.path.lexists(os.path.join(previous, 'gone.txt'))
 	assert os.listdir(staging) == []
 
 
@@ -1953,7 +1995,7 @@ def test_on_a_pool_the_staged_links_wait_for_every_disk(r_job, fake_pool, monkey
 	# written, and the link still in staging for the next scan, which gives it back once the disk is mounted again. Fails on 79220a8: the scan
 	# empties staging and the link is gone (a later check of the scan raises PoolNotReady)
 	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
-	before = folder_d_backed_up(r_job)
+	before = folder_backed_up(r_job)
 	os.remove(os.path.join(r_job.monitor, 'd', 'x.txt'))
 	previous = cut_between_the_renames(r_job, monkeypatch, 'd', [(False, 'delete', 'd/x.txt', None)])
 	tree = tree_of(r_job)
