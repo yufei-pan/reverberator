@@ -1451,7 +1451,8 @@ def root_meta_writes(writes, since=0):
 
 
 def test_an_unchanged_root_record_is_not_written_again(job, monkeypatch):
-	# fails on main: record_root_meta() writes every batch
+	# pin: a root that did not change writes no record at a commit: the hand-over copies the version before's record onto the new version, and a
+	# record equal byte for byte is not written again. On main (1f774a3) the same call came at the end of the replay and found it equal too
 	store, writes = root_meta_store(monkeypatch)
 	a_root_with_v0(job)
 	after_v0 = len(writes)
@@ -1504,9 +1505,70 @@ def test_a_trimmed_record_after_a_restart_is_said_once_more(job, monkeypatch):
 	assert len(trimmed_lines(lines)) == 2
 
 
+def a_version_folder(job, name='V'):
+	version = os.path.join(job.root, name)
+	os.mkdir(version)
+	return version
+
+
+def test_a_set_that_fits_only_without_the_roots_attributes_keeps_the_set(job, monkeypatch):
+	# pin (a limit of 3,500 bytes): a root whose user.big of 3000 bytes does not fit beside the set (the full record is over the limit): the record
+	# is written without the attributes and keeps the set, and says so once
+	store, writes = root_meta_store(monkeypatch, limit=3500)
+	lines = logged(monkeypatch)
+	seed_monitor(job, {'a.txt': 'a'})
+	os.setxattr(job.monitor, 'user.big', b'x' * 3000)
+	version = a_version_folder(job)
+	assert rv.record_root_meta(job.monitor, version, ['disk/', 'other/'])
+	got = rv.load_root_meta(version)
+	assert got.xattrs == {} and got.inner_mounts == ['disk/', 'other/']
+	assert len(trimmed_lines(lines)) == 1 and 'without them' in trimmed_lines(lines)[0]['message']
+
+
+def test_a_set_too_big_for_the_record_is_left_out_and_the_owner_mode_and_times_stay(job, monkeypatch):
+	# a set of about 3.8 KB: the record fits neither with the root's attributes nor with the set (a limit of 3,500 bytes), and the one without the
+	# attributes does not either. It is written without the set, which keeps the owner, mode and times, with one line saying so (an error line,
+	# "Cannot keep the metadata", and no record at all before this change)
+	store, writes = root_meta_store(monkeypatch, limit=3500)
+	lines = logged(monkeypatch)
+	seed_monitor(job, {'a.txt': 'a'})
+	os.chmod(job.monitor, 0o750)
+	os.setxattr(job.monitor, 'user.small', b'1')
+	mounts = [f'mount{i:04}/' for i in range(300)]
+	version = a_version_folder(job)
+	assert len(rv.encode_root_meta(rv.RootMeta(0, 0, 0, 0, 0, {}, mounts))) > 3500
+	for _ in range(3):
+		assert rv.record_root_meta(job.monitor, version, mounts)
+	got = rv.load_root_meta(version)
+	assert got.xattrs == {} and got.inner_mounts is None and got.mode == 0o750
+	said = trimmed_lines(lines)
+	assert len(said) == 1 and not said[0].get('error') and 'inner mount points of' in said[0]['message']
+	assert not [kwargs for args, kwargs in lines if 'Cannot keep' in kwargs.get('message', '')]
+
+
+def test_a_set_too_big_for_a_root_with_no_attributes_is_left_out_the_same(job, monkeypatch):
+	# the root has no attributes of its own: the only thing to leave out is the set
+	store, writes = root_meta_store(monkeypatch, limit=3500)
+	seed_monitor(job, {'a.txt': 'a'})
+	mounts = [f'mount{i:04}/' for i in range(300)]
+	version = a_version_folder(job)
+	assert rv.record_root_meta(job.monitor, version, mounts)
+	assert rv.load_root_meta(version).inner_mounts is None
+
+
+def test_a_record_that_does_not_fit_with_nothing_left_out_is_an_error(job, monkeypatch):
+	# nothing to leave out (no attributes, no set) and the owner, mode and times alone do not fit (a limit of 10 bytes): the 'failed' error
+	store, writes = root_meta_store(monkeypatch, limit=10)
+	lines = logged(monkeypatch)
+	seed_monitor(job, {'a.txt': 'a'})
+	assert not rv.record_root_meta(job.monitor, a_version_folder(job))
+	messages = [kwargs for args, kwargs in lines]
+	assert len(messages) == 1 and messages[0].get('error') and 'Cannot keep the metadata' in messages[0]['message']
+
+
 def test_a_skip_ends_a_failed_state_with_its_line(job, monkeypatch):
-	# fails on main (it writes): a 'failed' state with an equal record on the tree: the next batch writes nothing, says
-	# "is kept on ... again" once, and the state is gone
+	# pin: a 'failed' state with an equal record on the tree (the hand-over's copy of the version before's): the next batch writes nothing, says
+	# "is kept on ... again" once, and the state is gone. The same on main (1f774a3)
 	store, writes = root_meta_store(monkeypatch)
 	a_root_with_v0(job)
 	rv.ROOT_META_TROUBLE[(job.monitor, job.job_vault)] = 'failed'
@@ -1634,6 +1696,81 @@ def test_a_rebuild_committed_by_a_comparison_leaves_the_key_absent(job, monkeypa
 	committed = run_backup(job)
 	assert len(committed) == 2 and holds_the_disk(committed[1])
 	assert PAUSED_LINE in lines
+
+
+def test_a_failed_record_write_leaves_the_record_the_version_had(job, monkeypatch, poll_fast):
+	# the write at a commit fails (EIO) for a root whose mode changed: the version keeps the record the batch before wrote (the hand-over
+	# copied it), the first batch's, with its mode and set (a pin), so a whole-job restore gives the top folder that, and the line says so
+	# (fails on a22bf58: it said the restore gives the version folder's own)
+	from tests.test_inner_mounts import _lines
+	store, writes = root_meta_store(monkeypatch)
+	seed_monitor(job, {'sub/f.txt': 'a'})
+	still_root(job.monitor)
+	v0 = run_backup(job)[-1]
+	first = rv.load_root_meta(v0)
+	stored = os.setxattr
+	def failing(path, name, *args, **kwargs):
+		# the commit's write only: the hand-over's copy of the record onto the new version works
+		if name == rv.ROOT_META_XATTR and sys._getframe(1).f_code.co_name == 'record_root_meta':
+			raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+		return stored(path, name, *args, **kwargs)
+	monkeypatch.setattr(os, 'setxattr', failing)
+	lines = _lines(monkeypatch)
+	os.chmod(job.monitor, 0o750)
+	newest = one_file_batch(job, 0)
+	assert rv.load_root_meta(newest) == first and first.mode != 0o750
+	failed = [line for line in lines if 'Cannot keep the metadata' in line]
+	assert len(failed) == 1 and 'the version keeps the record the version before had' in failed[0]
+
+
+@pytest.mark.parametrize('failure', ['EIO', 'a record that is no JSON', 'a record that is not ASCII', 'a record of another version'])
+def test_a_record_that_is_there_and_cannot_be_read_stops_the_backup_over_a_lost_manifest(job, monkeypatch, poll_fast, failure):
+	# R24: the vault database lost and the newest version's record unreadable (EIO) or undecodable: no answer for the inner mounts, as an empty one
+	# would commit an unmounted inner disk's folder empty. The attempt fails (JobFailure) naming the version folder and the error, and
+	# commits nothing; with the attribute removed (none there) it goes on. Fails on 79220a8: the record is taken for none, and a version commits
+	store, writes = root_meta_store(monkeypatch)
+	a_vault_whose_manifest_is_lost_with_its_inner_disk_unmounted(job, monkeypatch)
+	v0 = versions(job)[0].path
+	real_get = os.getxattr
+	if failure == 'EIO':
+		def getxattr(path, name, *args, **kwargs):
+			if name == rv.ROOT_META_XATTR and os.path.realpath(path) == os.path.realpath(v0):
+				raise OSError(errno.EIO, os.strerror(errno.EIO), path)
+			return real_get(path, name, *args, **kwargs)
+		monkeypatch.setattr(os, 'getxattr', getxattr)
+	else:
+		store[os.path.realpath(v0)] = {'a record that is no JSON': b'{"v": 1,', 'a record that is not ASCII': b'{"v": 1, "uid": "\xff"}', 'a record of another version': b'{"v": 2}'}[failure]
+	with pytest.raises(rv.JobFailure) as stopped:
+		run_backup(job)
+	assert v0 in stopped.value.reason and rv.ROOT_META_XATTR in stopped.value.reason and 'setfattr -x' in stopped.value.reason
+	assert len(versions(job)) == 1
+	if failure == 'EIO':
+		monkeypatch.setattr(os, 'getxattr', real_get)
+	else:
+		del store[os.path.realpath(v0)]
+	assert len(run_backup(job)) == 2
+
+
+@pytest.mark.parametrize('answer', [errno.ENODATA, errno.ENOTSUP], ids=['ENODATA', 'ENOTSUP'])
+def test_no_record_and_no_room_for_one_are_nothing_remembered(job, monkeypatch, answer):
+	# pin: no attribute (ENODATA) and a filesystem with none (ENOTSUP) are the record's own "none": no mounts, no failure. A record with no
+	# field (0.55.5's) reads none too, and the manifest's own key is never overridden by the record
+	os.makedirs(job.job_vault, exist_ok=True)
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		def refuses(version_path):
+			raise OSError(answer, os.strerror(answer), version_path)
+		monkeypatch.setattr(rv, 'load_root_meta', refuses)
+		assert rv.remembered_inner_mounts(manifest, '/v/V0--x') == []
+		monkeypatch.setattr(rv, 'load_root_meta', lambda version_path: rv.RootMeta(1, 2, 0o750, 3, 4, {}))
+		assert rv.remembered_inner_mounts(manifest, '/v/V0--x') == []
+		monkeypatch.setattr(rv, 'load_root_meta', lambda version_path: pytest.fail('the record is read with the manifest holding the set'))
+		manifest.begin()
+		manifest.set_inner_mounts(['disk/'])
+		manifest.commit()
+		assert rv.remembered_inner_mounts(manifest, '/v/V0--x') == ['disk/']
+	finally:
+		manifest.close()
 
 
 def test_a_record_whose_write_fails_logs_once_and_the_backup_commits(job, monkeypatch, poll_fast):

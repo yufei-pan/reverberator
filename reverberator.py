@@ -4757,18 +4757,21 @@ def inner_mounts_to_remember(monitor_path:str, remembered:list, paused:set, *mou
 def remembered_inner_mounts(manifest:'VaultManifest', newest_path:'str | None') -> list:
 	'''
 	The inner mount points a batch remembers (folder rels ending with /): manifest's, when it has recorded them; else those
-	the root-meta record of newest_path, the newest committed version's folder, holds (record_root_meta()), when it can be
-	read and has them, so a manifest lost or removed while an inner disk is unmounted still pauses it; else none. A
-	comparison's commit of a rebuilt manifest leaves the key absent, so an attempt that fails after it still reads the
-	record.
+	the root-meta record of newest_path, the newest committed version's folder, holds (record_root_meta()), so a manifest lost or
+	removed while an inner disk is unmounted still pauses it; else none: no record there (ENODATA, or ENOTSUP on a filesystem
+	with no extended attributes), or one with no such field (0.55.5's, or one trimmed for room). A record that is there and cannot be
+	read (EIO) or decoded is no answer: JobFailure, naming the version folder and the error, as the record is the only place the
+	set lives with the manifest gone, and an empty one would let an inner disk unmounted at that moment read as a folder emptied, its
+	files out of the new version. A comparison's commit of a rebuilt manifest leaves the key absent, so an attempt that fails after
+	it still reads the record.
 	'''
 	remembered = manifest.inner_mounts
 	if remembered is None and newest_path is not None:
 		try:
 			remembered = load_root_meta(newest_path).inner_mounts
-		except (OSError, ValueError):
-			# none, one 0.55.5 wrote ( it has no field ), or a damaged one: as when nothing was remembered
-			pass
+		except (OSError, ValueError) as e:
+			if not (isinstance(e, OSError) and e.errno in (errno.ENODATA, errno.ENOTSUP)):
+				raise JobFailure(f'cannot read the inner mount points the vault database lost and {newest_path} remembers ({ROOT_META_XATTR}): {e}; with the database gone nothing else says which inner disks are unmounted, so no backup is made until it reads (removing the attribute, setfattr -x {ROOT_META_XATTR} {newest_path}, lets the backup go on without them)')
 	return [] if remembered is None else remembered
 
 def skip_paused(skip, paused:set):
@@ -13088,7 +13091,7 @@ class WrittenFolders:
 	it made, removed or renamed an entry in, which moves a folder's mtime and ctime and nothing else of it. A rel
 	follows each folder move the replay makes after it (moved()), so it names the folder's place as the batch leaves the
 	version, the monitored folder's own. The version folder itself ('' or '.') is never one: it keeps the daemon's own,
-	and the monitored root's metadata is kept on it by the commit, at every batch (do_backup(), record_root_meta()).
+	and the monitored root's metadata is kept on it by each commit (do_backup(), record_root_meta()).
 
 	Examples:
 		>>> folders = WrittenFolders()
@@ -13259,18 +13262,24 @@ ROOT_META_TROUBLE = {}
 
 def record_root_meta(monitor_path:str, version_path:str, inner_mounts:list = None) -> bool:
 	'''
-	Keep on version_path, the folder of a version being written, the monitored root's owner, mode, times and extended
-	attributes as of now (ROOT_META_XATTR, encode_root_meta()), read from the folder monitor_path names (a link to it
-	is followed), so a whole job restored gets its top folder's own back (restore_folder_meta()); and inner_mounts, when
-	given, the inner mount points the version's commit remembers, which a manifest that has none is read with
-	(remembered_inner_mounts()). version_path itself
-	keeps the daemon's owner, mode and times. One that cannot be read or written logs an error line, and that version's
-	whole-job restore gives the top folder the version folder's own. A record too big for one attribute of a folder
-	(the root's attributes take about 1.4 times their size in it) is written without them, saying so, and keeps
-	inner_mounts. Either is logged
-	on the first batch of a monitored path that has it, not again while it lasts, and an info line says when it works
-	again. A record equal byte for byte to the one version_path holds is not written again (the root's atime moves at most
-	once a day on relatime). Returns whether version_path holds a record, written now or equal already.
+	Keep on version_path, the folder of a version being written, the monitored root's owner, mode, times and extended attributes
+	as of now (ROOT_META_XATTR, encode_root_meta()), read from the folder monitor_path names (a link to it is followed), so a whole
+	job restored gets its top folder's own back (restore_folder_meta()); and inner_mounts, when given, the inner mount points the
+	version's commit remembers, which a manifest that has none is read with (remembered_inner_mounts()). version_path itself keeps
+	the daemon's owner, mode and times.
+
+	A record too big for one attribute of a folder (the root's attributes take about 1.4 times their size in it) is written with
+	less, saying so: without the root's attributes, which keeps its owner, mode, times and inner_mounts; and where that does not fit
+	either, without inner_mounts too, which keeps its owner, mode and times. (The set could have an attribute of its own, so as not to
+	trade with the root's attributes; it has none, as a record whose format a 0.55.5 reads as it always did, and one write, are worth
+	more than the case: it takes about 100 inner mounts, or 4 KiB of the root's own attributes, to hit it.)
+
+	One that cannot be written at all logs an error line. The version then keeps the record it holds, the one the hand-over copied
+	onto it from the version before, so a whole-job restore of it gives the top folder what that batch kept; a first version, with
+	none, gives the version folder's own. Each trouble is logged on the first batch of a monitored path that has it, not again while
+	it lasts, and an info line says when it works again. A record equal byte for byte to the one version_path holds is not written
+	again (the root's atime moves at most once a day on relatime). Returns whether version_path holds a record, written now or equal
+	already.
 	'''
 	job = (monitor_path, os.path.dirname(version_path))
 	def tell(state:str, message:str, **kind):
@@ -13302,15 +13311,32 @@ def record_root_meta(monitor_path:str, version_path:str, inner_mounts:list = Non
 			if kept != record:
 				os.setxattr(version_path, ROOT_META_XATTR, record, follow_symlinks=False)
 		except OSError as e:
-			if not xattrs or e.errno not in (errno.ENOSPC, errno.E2BIG, errno.ERANGE):
+			if e.errno not in (errno.ENOSPC, errno.E2BIG, errno.ERANGE):
 				raise
-			# the owner, mode and times still fit
-			os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(meta._replace(xattrs={})), follow_symlinks=False)
+			# with less, as much as there is room for: the root's attributes go first, then the inner mount points
+			smaller = []
+			if xattrs:
+				smaller.append(meta._replace(xattrs={}))
+			if inner_mounts is not None:
+				smaller.append(meta._replace(xattrs={}, inner_mounts=None))
+			for at, trimmed in enumerate(smaller):
+				try:
+					os.setxattr(version_path, ROOT_META_XATTR, encode_root_meta(trimmed), follow_symlinks=False)
+					break
+				except OSError as again:
+					if at == len(smaller) - 1 or again.errno not in (errno.ENOSPC, errno.E2BIG, errno.ERANGE):
+						raise
+			else:
+				# nothing to leave out: the owner, mode and times alone do not fit
+				raise
 			# said only now: a trimmed write that fails too is the 'failed' error below, not this
 			state = 'trimmed'
-			tell(state, f'The extended attributes of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes')
+			if trimmed.inner_mounts is None and inner_mounts is not None:
+				tell(state, f'The extended attributes and the inner mount points of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes, and a vault database lost meanwhile does not say which inner disks were unmounted')
+			else:
+				tell(state, f'The extended attributes of {monitor_path} do not fit in one attribute of {version_path} ({e}): its record there has the owner, mode and times without them, so a whole-job restore gives the top folder none of its extended attributes')
 	except OSError as e:
-		tell('failed', f'Cannot keep the metadata of {monitor_path} on {version_path}, so a whole-job restore of it gives the top folder the version folder\'s: {e}', error=True)
+		tell('failed', f'Cannot keep the metadata of {monitor_path} on {version_path}: {e}; the version keeps the record the version before had, or with none a whole-job restore of it gives the top folder the version folder\'s own', error=True)
 		ROOT_META_TROUBLE[job] = 'failed'
 		return False
 	if state is not None:
