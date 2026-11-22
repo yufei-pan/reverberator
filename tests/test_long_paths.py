@@ -91,15 +91,29 @@ def write(path, content):
 		f.write(content)
 
 
-def not_backed_up(capsys):
-	'''{path: [the rest of each NOT BACKED UP line of it]} of what was logged since the last read.'''
-	out = capsys.readouterr()
+def not_backed_up_in(text):
+	'''{path: [the rest of each NOT BACKED UP line of it]} of text.'''
 	found = {}
-	for line in (out.out + out.err).splitlines():
+	for line in text.splitlines():
 		if 'NOT BACKED UP: ' in line:
 			path, _, rest = line.split('NOT BACKED UP: ', 1)[1].partition(': ')
 			found.setdefault(path, []).append(rest)
 	return found
+
+
+def not_backed_up(capsys):
+	'''{path: [the rest of each NOT BACKED UP line of it]} of what was logged since the last read.'''
+	out = capsys.readouterr()
+	return not_backed_up_in(out.out + out.err)
+
+
+def matched(job):
+	'''The vault's matched time: (the version it is recorded for, ns), or None.'''
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return manifest.matched
+	finally:
+		manifest.close()
 
 
 def tracked(job, rel):
@@ -457,7 +471,11 @@ def test_on_a_pool_a_touched_folder_past_the_limit_is_not_recorded(job, fake_poo
 	capsys.readouterr()
 	versions = run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
 	assert len(versions) == 2 and read(os.path.join(versions[-1], 'a')) == 'a2' and listed(versions[-1], job, holder) == []
-	assert not_backed_up(capsys) == {past: [LEFT_OUT]}
+	out = capsys.readouterr()
+	assert not_backed_up_in(out.out + out.err) == {past: [LEFT_OUT]}
+	# the sweep of the touched folder does not look at a path the rule leaves out whole: no error line for it (fails on 33c46c2: "Cannot
+	# look at <version>/<folder>: [Errno 36] File name too long")
+	assert 'Cannot look at' not in out.out + out.err
 
 
 def test_a_first_version_holds_a_folder_at_exactly_4095_bytes(job, capsys):
@@ -514,7 +532,7 @@ def test_an_entry_left_out_whose_path_is_gone_gets_no_not_backed_up_line_from_th
 	capsys.readouterr()
 	assert backup(job, (rel_of(job, gone), 'create')) == versions
 	out = capsys.readouterr()
-	assert not_backed_up(capsys) == {} and 'NOT BACKED UP' not in out.out + out.err
+	assert 'NOT BACKED UP' not in out.out + out.err
 	assert f'Not tracking {rel_of(job, gone)}: source no longer exists' in out.out + out.err
 
 
@@ -556,7 +574,7 @@ def test_the_size_estimate_charges_nothing_for_what_the_rule_leaves_out(job, mon
 
 
 def test_without_a_pool_a_link_at_4090_bytes_is_backed_up(job, capsys):
-	# pin (review of Task 9, I6): the length the next test's pool adds is the pool's alone
+	# pin: (review of Task 9, I6) the length the next test's pool adds is the pool's alone
 	seed_monitor(job, {'a': 'a'})
 	folder = deep_folder(job, 4000)
 	run_backup(job)
@@ -568,12 +586,15 @@ def test_without_a_pool_a_link_at_4090_bytes_is_backed_up(job, capsys):
 
 
 def test_on_a_pool_the_longest_branchs_path_counts_in_the_length_of_the_version(job, fake_pool, tmp_path, capsys):
-	# review of Task 9, I6 (fails on 869014d: the link is backed up in the first version, and in the next its record on the branch is
-	# refused, which a real mergerfs does with ENAMETOOLONG, at every attempt): mergerfs writes <branch>/<the path below the pool's mount
+	# review of Task 9, I6 (fails on 869014d: the link is backed up in the first version, where a real mergerfs, which this fake pool is not,
+	# refuses its record on the branch with ENAMETOOLONG at every attempt): mergerfs writes <branch>/<the path below the pool's mount
 	# point>, so a branch whose path is longer than the pool's mount point leaves its entries that many bytes less room. The rule counts the
-	# longest branch's surplus in the first version's walk, in the check and in the replay, each on the pool
-	branch = fake_pool.add(job.vault, [os.path.join(str(tmp_path), 'disks', 'd' * 60)])[0]
+	# longest branch's surplus in the first version's walk, in the check and in the replay, each on the pool. Shorter branches are listed
+	# before and after it, so a rule that reads the first branch only, or the last, fails
+	short = os.path.join(str(tmp_path), 'd')
+	branch = fake_pool.add(job.vault, [short, os.path.join(str(tmp_path), 'disks', 'd' * 60), os.path.join(str(tmp_path), 'e')])[1]
 	assert len(os.fsencode(branch)) - len(os.fsencode(os.path.realpath(job.vault))) > 50
+	assert len(os.fsencode(short)) < len(os.fsencode(os.path.realpath(job.vault)))
 	seed_monitor(job, {'a': 'a'})
 	folder = deep_folder(job, 4000)
 	link = os.path.join(folder, 'l' * 89)
@@ -590,3 +611,87 @@ def test_on_a_pool_the_longest_branchs_path_counts_in_the_length_of_the_version(
 	versions = backup(job, ('a', 'modify'), (rel_of(job, link), 'create'))
 	assert len(versions) == 2 and read(os.path.join(versions[-1], 'a')) == 'a2' and listed(versions[-1], job, folder) == []
 	assert not_backed_up(capsys) == {link: [LEFT_OUT]}
+
+
+# ---- cleanup 2 (Task 9's minors, rulings R20 and R21's list)
+
+
+def test_a_full_comparison_meeting_only_an_entry_left_out_moves_the_matched_time(job):
+	# fails on 33c46c2: the left-out entry's key in `reported` was its plain path, as an unreadable file's is, which holds the matched time:
+	# an entry that stays in the tree then held it at every full comparison, and widened the next one's extended-attribute window for good
+	seed_monitor(job, {'a': 'a'})
+	folder = deep_folder(job, 4041)
+	run_backup(job, matched_since=1)
+	assert matched(job)[1] == 1
+	times = os.stat(folder)
+	write(os.path.join(folder, 'f'), 'f')
+	os.utime(folder, ns=(times.st_atime_ns, times.st_mtime_ns))
+	versions = committed_versions(job)
+	assert run_backup(job, matched_since=2) == versions
+	assert matched(job) == (os.path.basename(versions[-1]), 2)
+
+
+def test_a_committed_batch_beside_an_entry_left_out_moves_the_matched_time(job):
+	# fails on 33c46c2: as above, at the commit
+	seed_monitor(job, {'a': 'a'})
+	folder = deep_folder(job, 4041)
+	run_backup(job, matched_since=1)
+	file = os.path.join(folder, 'f')
+	write(file, 'f')
+	write(os.path.join(job.monitor, 'a'), 'a2')
+	versions = backup(job, ('a', 'modify'), (rel_of(job, file), 'create'), matched_since=2)
+	assert len(versions) == 2 and matched(job) == (os.path.basename(versions[-1]), 2)
+
+
+def test_a_move_from_a_source_the_version_never_held_to_a_path_that_fits_has_no_line_for_the_source(job, capsys):
+	# fails on 33c46c2 (a "this version keeps it" line for the source, which the version never held): f in a folder of 4,000 bytes is left
+	# out (its path in the vault is 4,097), then mv f g to a short path: the replay deletes the source (nothing to delete) and copies g
+	seed_monitor(job, {'a': 'a'})
+	folder = deep_folder(job, 4000)
+	versions = run_backup(job)
+	source = os.path.join(folder, 'f' * 96)
+	write(source, 'f')
+	assert backup(job, (rel_of(job, source), 'create')) == versions
+	target = os.path.join(job.monitor, 'g')
+	os.rename(source, target)
+	capsys.readouterr()
+	versions = backup(job, ('g', 'move', rel_of(job, source)))
+	assert len(versions) == 2 and read(os.path.join(versions[-1], 'g')) == 'f'
+	assert not_backed_up(capsys) == {}
+
+
+def test_a_move_of_an_entry_the_version_holds_past_the_limit_to_a_target_gone_since_makes_no_version(job, monkeypatch, capsys):
+	# fails on 33c46c2 (a version in which nothing changed): the version keeps the source (its removal by path would fail), the target is
+	# a short path removed since the batch was taken, so nothing is copied. The check says so, with the source's line only
+	folder, file = held_at_4096_in_v10(job, monkeypatch)
+	versions = committed_versions(job)
+	target = os.path.join(job.monitor, 'g')
+	os.rename(file, target)
+	os.remove(target)
+	counter = header_counter(job.job_vault)
+	capsys.readouterr()
+	assert backup(job, ('g', 'move', rel_of(job, file))) == versions
+	assert header_counter(job.job_vault) == counter
+	assert not_backed_up(capsys) == {file: [KEPT]}
+	assert listed(versions[-1], job, folder) == ['f' * 100] and tracked(job, rel_of(job, file))
+
+
+def test_on_a_pool_the_size_estimate_charges_nothing_for_what_the_pools_surplus_leaves_out(job, fake_pool, tmp_path, monkeypatch):
+	# a file whose copy's temporary path fits the limit by the version's own length (4,000 + 55 bytes) and passes it with the longest
+	# branch's surplus (more than 50 bytes): the replay leaves it out, so the estimate charges nothing for it. fails when the estimate
+	# leaves pool_surplus() out (it would charge the 1 MiB)
+	fake_pool.add(job.vault, [os.path.join(str(tmp_path), 'd'), os.path.join(str(tmp_path), 'disks', 'd' * 60), os.path.join(str(tmp_path), 'e')])
+	seed_monitor(job, {'a': 'a'})
+	holder = deep_folder(job, 4000)
+	run_backup(job)
+	big = os.path.join(holder, 'f')
+	with open(big, 'wb') as f:
+		f.write(b'b' * (1 << 20))
+	write(os.path.join(job.monitor, 'a'), 'a2')
+	block = os.statvfs(job.job_vault).f_frsize
+	expected = (rv.vault_charge(os.lstat(os.path.join(job.monitor, 'a')), block), 1)
+	estimates = []
+	real = rv.get_backup_size_inode
+	monkeypatch.setattr(rv, 'get_backup_size_inode', lambda *args, **kwargs: estimates.append(real(*args, **kwargs)) or estimates[-1])
+	backup(job, ('a', 'modify'), (rel_of(job, big), 'create'))
+	assert estimates == [expected]
