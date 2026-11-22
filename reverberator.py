@@ -11764,6 +11764,10 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, monitor
 		# charged as itself (a fast link takes no block), about what the empty folder the replay makes there takes, not the folder it
 		# leads to
 		st = os.lstat(path.rstrip('/') or '/')
+		# a folder's place that now holds a file, a FIFO, or a link that leads to no folder: the replay finds no folder there (copy_path():
+		# the path with its / does not exist) and copies nothing, so nothing is charged, as when the lstat of the path with its / failed
+		if path.endswith('/') and not (stat.S_ISDIR(st.st_mode) or (stat.S_ISLNK(st.st_mode) and os.path.isdir(path))):
+			return 0, 0
 	except OSError:
 		return 0, 0
 	size, inodes = vault_charge(st, block), 1

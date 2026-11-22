@@ -116,6 +116,29 @@ def test_a_folder_entry_replaced_by_a_link_is_charged_as_the_link(job):
 	assert estimate(job, 'd/') == (os.lstat(link).st_blocks * 512, 1)
 
 
+@pytest.mark.parametrize('kind', ['file', 'fifo', 'dangling link', 'link to a file'])
+@pytest.mark.parametrize('event', ['create', 'modify'])
+def test_a_folder_entry_that_something_else_took_the_name_of_is_charged_nothing(job, kind, event):
+	# fails before the residual round's R1 (the fix wave's second-opinion finding on FW4): the estimate's lstat of the folder's name, which
+	# no longer fails when a file stands there, charged the file's bytes and an inode, where the replay finds no folder at the path with its /
+	# (copy_path(): it does not exist) and copies nothing: under a size limit, versions could be pruned that need not be. The file holds
+	# 20 KB, so a charge shows
+	os.makedirs(job.monitor, exist_ok=True)
+	place = os.path.join(job.monitor, 'd')
+	if kind == 'file':
+		with open(place, 'wb') as f:
+			f.write(b'f' * 20000)
+	elif kind == 'fifo':
+		os.mkfifo(place)
+	elif kind == 'dangling link':
+		os.symlink(os.path.join(job.root, 'nowhere'), place)
+	else:
+		with open(os.path.join(job.root, 'a file'), 'wb') as f:
+			f.write(b'f' * 20000)
+		os.symlink(os.path.join(job.root, 'a file'), place)
+	assert estimate(job, 'd/', event=event) == (0, 0)
+
+
 def test_the_estimate_runs_no_du(job, monkeypatch):
 	os.makedirs(os.path.join(job.monitor, 'd'))
 	with open(os.path.join(job.monitor, 'd', 'f'), 'w') as f:
