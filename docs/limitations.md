@@ -991,10 +991,16 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   whole-job restore of the top folder) holds the inner disks' mount points too; when both do not fit in one extended
   attribute of the version's folder (about 100 inner mounts, or about 4 KiB of the top folder's own extended
   attributes), the record keeps the mount points and drops the top folder's own extended attributes, with one line
-  saying so: a whole-job restore of that version gives the top folder none of its extended attributes.
+  saying so: a whole-job restore of that version gives the top folder none of its extended attributes. When the write
+  of that record fails (an I/O error, or no room even for the owner, mode and times), with its ERROR line, the version
+  keeps the record of the version before, whose mount points may be older: if the vault's database is then lost before
+  a later version's record is written, an inner disk mounted since that older record and unmounted at that moment reads
+  as a folder emptied, and the next version lacks its files until the disk is back (the versions before keep them).
+  Removing the old record on a failed write would protect no inner disk at all.
 - **Why:** the record is one attribute, so 0.55.5 reads it as it always did and it is one write; the mount points and
   the top folder's attributes share its room.
-- **Revisit when:** the round after 0.55.6: the mount points in an attribute of their own.
+- **Revisit when:** the round after 0.55.6: the mount points in an attribute of their own, written so a failed write
+  keeps the newest set.
 
 ### An I/O or permission error reads as "not there" in parts of a backup's replay
 
