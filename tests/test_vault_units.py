@@ -24,7 +24,7 @@ from tests.errseq import open_folders
 from tests.harness import committed_versions, create_job, mark_unchecked_by_hand, on_folder_open, run_backup, vault_unit, wait_for_committed_count, wait_until, write_fstab, write_rule
 from tests.scratch_images import needs_mount, ScratchTmpfs
 from tests import version_view_ground_truth as view_truth
-from tests.vault_oracle import check_vault, rows_match_vault, snapshot_tree, version_number
+from tests.vault_oracle import check_vault, read_view, rows_match_vault, snapshot_tree, version_number
 
 KEPT = {'keep_n_versions': 0}
 # past f2fs's inline size and past the 64 KiB tail a comparison reads back: a loss before the tail is what no read-back sees
@@ -1753,14 +1753,17 @@ def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkey
 	# pin, the design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
 	# its forward link to staging first; a cut between them leaves version n's folder in the tree only. With the manifest lost no
 	# row gives the link back, and the source cannot be read at the retry: a file in the folder (mode 000), or a folder in it with
-	# files (unreadable_below()). The newest version keeps them, as the put-back removes what the batch made only over a standing
-	# manifest. It fails on a put-back that removes over a lost manifest; 0.55.4 kept them too
+	# files (unreadable_below()). The newest version keeps them: the scan gives the link back from staging (put_back_staged_links())
+	# before the put-back's pass 2, which since round 0.55.6 runs over a lost manifest off a pool, removes what the version before
+	# does not list. It fails on a pass 2 run over a lost manifest without that link given back first; 0.55.4 kept them too.
+	# Since round 0.55.6 the version before also reads d again (spec section 6, case 3): on 79220a8 its tail fails, d gone
 	put_text(r_job.monitor, 'd/x.bin', big_text('x0'))
 	put_text(r_job.monitor, 'd/sub/s.txt', 's0')
 	put_text(r_job.monitor, 'd/sub/t.txt', 't0')
 	put_text(r_job.monitor, 'top.txt', 't0')
 	run_backup(r_job, **KEPT)
 	held_before = contents_of(committed_versions(r_job)[-1])
+	view_before = read_view(r_job.job_vault, os.path.basename(committed_versions(r_job)[-1]))
 	no_exchange(monkeypatch)
 	def cut_between(self, rel, st, holder):
 		# the first of the two renames, then the cut
@@ -1785,14 +1788,198 @@ def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkey
 			os.chmod(os.path.join(r_job.monitor, 'd/x.bin'), 0o644)
 	if unreadable == 'folder':
 		assert refused, 'the roll-forward\'s walk never opened the unreadable folder'
-	held = contents_of(committed_versions(r_job)[-1])
+	newest = committed_versions(r_job)[-1]
+	held = contents_of(newest)
 	assert {rel: held.get(rel) for rel in held_before} == held_before
-	# the version before keeps nothing at d: the link the cut left in staging goes with staging, and over a lost manifest no row
-	# gives it back, as on 0.55.4 (a pool's case is the entry "A manifest lost in the same cut as a split on a pool"). The ground
-	# truth's lines for it are looked at and taken out; any other line still fails the test
+	# the version before reads at d what it read before the cut, through the link given back (made a real folder again where the
+	# retry's comparison records d/x.bin, whose read failed). The ground truth's lines for d are the cut batch's (nothing after it)
+	# and the retry's (nothing before it, as its scan gave the link back): looked at and taken out; any other line still fails the test
+	assert read_view(r_job.job_vault, os.path.basename(previous)) == view_before
 	lost = [line for line in view_truth.WRONG if line.startswith(f"{os.path.basename(previous)}:'d")]
+	assert lost and all(line.endswith('None after it') or ': read None before the batch, ' in line for line in lost), lost
+	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost]
+
+
+# ---- D3, items 2 and 3 (spec section 6): over a lost manifest a link a cut left in staging goes back, and pass 2 runs off a pool
+
+def cut_between_the_renames(job, monkeypatch, rel, events):
+	'''
+	A batch of events cut between the two renames of TreeWriter.exchange_in() at rel, the real ones (the crash harness's kill point there): the
+	version before's forward link moved to staging, the folder not in its place yet. The vault takes two renames (a pool, or rv.exchanged()
+	faked to answer False). The ground truth's lines of the cut, the version before reading nothing at rel after it, are looked at and taken
+	out. Returns the version before.
+	'''
+	previous = committed_versions(job)[-1]
+	staging = os.path.normpath(rv.staging_path(job.job_vault))
+	real = os.rename
+	def rename(source, dest, *args, **kwargs):
+		real(source, dest, *args, **kwargs)
+		if os.path.normpath(os.fspath(source)) == os.path.join(previous, rel) and os.path.dirname(os.path.normpath(os.fspath(dest))) == staging:
+			raise Cut()
+	with monkeypatch.context() as cut:
+		cut.setattr(rv.os, 'rename', rename)
+		with pytest.raises(Cut):
+			backup_events(job, events, **KEPT)
+	assert not os.path.lexists(os.path.join(previous, rel)) and os.path.isdir(os.path.join(tree_of(job), rel))
+	lost = [line for line in view_truth.WRONG if line.startswith(f"{os.path.basename(previous)}:'{rel}")]
 	assert lost and all(line.endswith('None after it') for line in lost), lost
 	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost]
+	return previous
+
+
+def staged_link_texts(job):
+	'''The texts of the links in job's staging folder, sorted.'''
+	staging = rv.staging_path(job.job_vault)
+	return sorted(os.readlink(os.path.join(staging, name)) for name in os.listdir(staging) if os.path.islink(os.path.join(staging, name)))
+
+
+def folder_d_backed_up(job):
+	'''d/x.txt, d/y.txt and top.txt backed up; what the version reads, by the oracle.'''
+	put_text(job.monitor, 'd/x.txt', 'x0')
+	put_text(job.monitor, 'd/y.txt', 'y0')
+	put_text(job.monitor, 'top.txt', 't0')
+	run_backup(job, **KEPT)
+	return read_view(job.job_vault, os.path.basename(committed_versions(job)[-1]))
+
+
+@pytest.mark.unit
+def test_a_cut_between_two_renames_over_a_lost_manifest_puts_the_staged_link_back(r_job, monkeypatch):
+	# case 3 of spec section 6, fails on 79220a8 (and on 0.55.4): on a vault with no RENAME_EXCHANGE a batch that deletes d/x.txt makes d real in
+	# the version before by two renames, its forward link to staging first; a cut between them, the manifest lost, and a start. The scan gives the
+	# link back to the version before ahead of empty_staging() (put_back_staged_links()), and once rolled forward every version reads right by the
+	# oracle: the version before what it read before the cut, the newest the monitored tree. On 79220a8 the link goes with staging: the version
+	# before holds nothing at d, and the retry's delete of d/x.txt finds nothing to record there, so x.txt is in no version
+	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
+	before = folder_d_backed_up(r_job)
+	os.remove(os.path.join(r_job.monitor, 'd', 'x.txt'))
+	previous = cut_between_the_renames(r_job, monkeypatch, 'd', [(False, 'delete', 'd/x.txt', None)])
+	tree = tree_of(r_job)
+	assert staged_link_texts(r_job) == [rv.forward_text('d', os.path.basename(tree))]
+	lose_the_manifest(r_job)
+	rv.get_vault_info(r_job.job_vault)
+	link = os.path.join(previous, 'd')
+	assert os.path.islink(link) and os.readlink(link) == rv.forward_text('d', os.path.basename(tree)), 'the version before holds nothing at d'
+	assert os.listdir(rv.staging_path(r_job.job_vault)) == []
+	roll_forward(r_job)
+	versions = committed_versions(r_job)
+	assert versions == [previous, tree]
+	assert read_view(r_job.job_vault, os.path.basename(previous)) == before
+	assert contents_of(tree) == contents_of(r_job.monitor)
+	assert rows_match_vault(r_job.job_vault) == []
+	assert view_truth.wrong_lists(r_job.job_vault) == []
+
+
+@pytest.mark.unit
+def test_a_cut_create_unreadable_at_the_retry_over_a_lost_manifest_is_left_out(r_job, monkeypatch, capsys):
+	# case 2 of spec section 6: the design re-check's run N4 over a lost manifest off a pool. A file the cut batch made, its copy's middle lost (a
+	# stand-in writes it damaged), its source mode 000 at the retry (uid 65534 only, as root reads it; the VM gate deselects it by name), the
+	# manifest removed. The put-back's pass 2 runs off a pool whatever the manifest, so the scan removes what the batch made: the newest version
+	# holds nothing there, with one UNREADABLE line, and once the file can be read the next full comparison copies it. Fails on 79220a8: the
+	# newest version keeps the damaged copy (pass 2 stays off over a lost manifest, new_in_tree() lists the copy, and copying it again fails)
+	base(r_job)
+	path = os.path.join(r_job.monitor, 'new.bin')
+	put_text(r_job.monitor, 'new.bin', big_text('n1'))
+	put_text(r_job.monitor, 'small.txt', 's1')
+	cut_before_the_commit(r_job, [(False, 'create', 'new.bin', None), (False, 'modify', 'small.txt', None)], monkeypatch)
+	overwrite_middle(os.path.join(tree_of(r_job), 'new.bin'))
+	lose_the_manifest(r_job)
+	os.chmod(path, 0)
+	try:
+		capsys.readouterr()
+		roll_forward(r_job)
+		out = capsys.readouterr().out
+	finally:
+		os.chmod(path, 0o644)
+	newest = committed_versions(r_job)[-1]
+	assert not os.path.lexists(os.path.join(newest, 'new.bin')), 'the newest version keeps the cut copy'
+	assert read_bytes(os.path.join(newest, 'small.txt')) == b's1'
+	assert len([line for line in out.splitlines() if 'UNREADABLE' in line and path in line]) == 1, out
+	run_backup(r_job, **KEPT)
+	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'new.bin')) == read_bytes(path)
+
+
+@pytest.mark.unit
+def test_a_users_link_in_staging_naming_another_versions_folder_is_not_put_back(r_job, monkeypatch):
+	# pin: links in staging with the forward form at a rel where the version before holds nothing and the tree holds the entry, but naming the
+	# folder of the version before that one, or of the version before itself, not the tree's: only the tree's name, which the cut batch made,
+	# says a link is the batch's own. The scan leaves the version before as it was, and empties staging
+	base(r_job)
+	put_text(r_job.monitor, 'small.txt', 's1')
+	backup_events(r_job, [(False, 'modify', 'small.txt', None)], **KEPT)
+	put_text(r_job.monitor, 'new.txt', 'n1')
+	cut_before_the_commit(r_job, [(False, 'create', 'new.txt', None)], monkeypatch)
+	older, previous = committed_versions(r_job)
+	assert os.path.isfile(os.path.join(tree_of(r_job), 'new.txt')) and not os.path.lexists(os.path.join(previous, 'new.txt'))
+	staging = rv.staging_path(r_job.job_vault)
+	os.makedirs(staging, exist_ok=True)
+	for name, version in (('a1b2c3', older), ('d4e5f6', previous)):
+		os.symlink(rv.forward_text('new.txt', os.path.basename(version)), os.path.join(staging, name))
+	lose_the_manifest(r_job)
+	rv.get_vault_info(r_job.job_vault)
+	assert not os.path.lexists(os.path.join(previous, 'new.txt'))
+	assert os.listdir(staging) == []
+
+
+@pytest.mark.unit
+def test_on_a_pool_a_cut_copy_over_a_lost_manifest_is_kept(r_job, fake_pool, monkeypatch, capsys):
+	# pin: the case above on a pool, where pass 2 stays off over a lost manifest, as on 79220a8: a cut can leave a folder's record on one disk and
+	# not another, and with no rows the repair cannot tell a removed entry from a new one (the approved limitation "A manifest lost in the same
+	# cut as a split on a pool", widened by Q2's answer). The newest version keeps the cut copy, damaged, with its UNREADABLE line. uid 65534
+	# only, as root reads the source; the VM gate deselects it by name
+	pool_vault(r_job, fake_pool)
+	base(r_job)
+	path = os.path.join(r_job.monitor, 'new.bin')
+	put_text(r_job.monitor, 'new.bin', big_text('n1'))
+	cut_before_the_commit(r_job, [(False, 'create', 'new.bin', None)], monkeypatch)
+	overwrite_middle(os.path.join(tree_of(r_job), 'new.bin'))
+	damaged = read_bytes(os.path.join(tree_of(r_job), 'new.bin'))
+	assert damaged != read_bytes(path)
+	lose_the_manifest(r_job)
+	os.chmod(path, 0)
+	try:
+		capsys.readouterr()
+		roll_forward(r_job)
+		out = capsys.readouterr().out
+	finally:
+		os.chmod(path, 0o644)
+	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'new.bin')) == damaged
+	assert [line for line in out.splitlines() if 'UNREADABLE' in line and path in line], out
+
+
+@pytest.mark.unit
+def test_on_a_pool_the_staged_links_wait_for_every_disk(r_job, fake_pool, monkeypatch):
+	# on a pool "the version before holds nothing at d" is an absence, which a disk gone makes true of what it holds: the links due are judged
+	# first, and the pool is checked before the first is written. A branch dropped once the scan read the vault whole: PoolNotReady, nothing
+	# written, and the link still in staging for the next scan, which gives it back once the disk is mounted again. Fails on 79220a8: the scan
+	# empties staging and the link is gone (a later check of the scan raises PoolNotReady)
+	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
+	before = folder_d_backed_up(r_job)
+	os.remove(os.path.join(r_job.monitor, 'd', 'x.txt'))
+	previous = cut_between_the_renames(r_job, monkeypatch, 'd', [(False, 'delete', 'd/x.txt', None)])
+	tree = tree_of(r_job)
+	staged = [rv.forward_text('d', os.path.basename(tree))]
+	assert staged_link_texts(r_job) == staged
+	lose_the_manifest(r_job)
+	real, dropped = rv.read_vault_whole, []
+	def read_whole(*args, **kwargs):
+		listing = real(*args, **kwargs)
+		if not dropped:
+			dropped.append(True)
+			fake_pool.drop(branches[1])
+		return listing
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'read_vault_whole', read_whole)
+		with pytest.raises(rv.PoolNotReady):
+			rv.get_vault_info(r_job.job_vault)
+	assert dropped
+	assert not os.path.lexists(os.path.join(previous, 'd'))
+	assert staged_link_texts(r_job) == staged, 'the link the cut left in staging is gone'
+	fake_pool.mount(branches[1])
+	rv.get_vault_info(r_job.job_vault)
+	assert os.readlink(os.path.join(previous, 'd')) == staged[0]
+	roll_forward(r_job)
+	assert read_view(r_job.job_vault, os.path.basename(previous)) == before
+	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
 
 
 @pytest.mark.unit

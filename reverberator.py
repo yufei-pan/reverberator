@@ -7053,7 +7053,9 @@ def empty_staging(job_vault:str) -> None:
 	'''
 	Remove what staging holds: what a prune cut short left of a version that stopped being one at its rename, a record cut
 	before it reached the previous version, whose tree entry stands, and links swapped out. Nothing else leads there. A
-	failure is logged, and leaves it for the next scan, as nothing reads staging.
+	link a cut between two renames moved there is the version before's: the scan gives it back first when no manifest row
+	can (put_back_staged_links()), and the rows do it otherwise (put_back_forward_links()). A failure is logged, and leaves
+	it for the next scan, as nothing reads staging but that put-back, which acts only on a link still due.
 	'''
 	staging = staging_path(job_vault)
 	try:
@@ -7106,8 +7108,12 @@ def put_back_recorded(previous:str, tree:str, recorded:list, remove_made:bool, g
 	   recorded such a folder whole), then fill.
 	2. With remove_made, what the batch made goes: each entry of a recorded folder of the tree, or of its root, whose name the
 	   previous version's folder does not list (a create, a move's target, a partial copy). That rests on the previous version listing
-	   every entry the tree should keep, a forward link a cut left in staging given back (put_back_forward_links(), which needs the
-	   manifest's rows): over a lost manifest it would remove version n's own entry there, so the caller passes False then. It rests
+	   every entry the tree should keep, a forward link a cut left in staging given back: by the manifest's rows
+	   (put_back_forward_links()), or, over a manifest that does not describe previous, as a lost one, by the link's own text before
+	   staging is emptied (put_back_staged_links()). Off a pool that is all, so the caller passes True whatever the manifest (spec
+	   section 6, item 3). On a pool over such a manifest it passes False: a cut can leave a folder's record on one disk and not
+	   another, and with no rows the repair cannot tell a removed entry from a new one (the known limitation "A manifest lost in the
+	   same cut as a split on a pool"), so what the batch made stays, which the roll-forward copies again (new_in_tree()). It rests
 	   on every disk of a pool being there as well: a branch that is gone hides the forward links on it, and the tree's entry that one
 	   names is the only copy. So each folder's listing of previous is followed by guard.require() before that folder's removals, as
 	   remove_stale_change_lists() does before its own: PoolNotReady, with version n's entries as they were.
@@ -7270,15 +7276,53 @@ def put_back_forward_links(previous:str, tree:str, manifest:'VaultManifest', gua
 		# a pool copying the folders above a link to another disk moves their mtimes, which an lstat would not show for a second, and they go unmended
 		forget_pool_cache(previous)
 
+def put_back_staged_links(previous:str, tree:str, job_vault:str, guard:PoolGuard) -> None:
+	'''
+	What put_back_forward_links() does by the manifest's rows, over a manifest that does not describe previous, as a lost one, which has
+	none (spec section 6, item 2): the link a cut between the two renames of TreeWriter.exchange_in() moved to staging says in its text
+	where it stood. Each link in staging whose text is the forward form to the tree's own folder (staged_forward_rel()) at a rel where
+	previous holds nothing, under real folders of previous, while the tree holds the entry, gets its forward link again, as
+	put_back_forward_links() writes it; the one in staging is empty_staging()'s, which runs after this. The text is the batch's own: it
+	names the tree's folder, a name the batch made, which no entry of version n recorded into staging can hold, as it was made before
+	that name existed. On a pool "holds nothing" is an absence, which a disk that is gone makes true of what it holds: so the links due
+	are judged first, and guard.require() runs before the first is written: PoolNotReady, with nothing written, the link still in
+	staging. A link there is no longer due, so a cut repeats it. One listing of staging, and a readlink per link in it. Raises OSError or
+	PoolNotReady.
+	'''
+	try:
+		entries = os.scandir(staging_path(job_vault))
+	except FileNotFoundError:
+		return
+	name = os.path.basename(os.path.normpath(tree))
+	due = set()
+	with entries:
+		for entry in entries:
+			if not entry.is_symlink():
+				continue
+			rel = staged_forward_rel(os.readlink(entry.path), name)
+			# the parent's folders first: a link above would lead the looks at rel out of the version
+			if rel is not None and real_folders_to(previous, rel) and not os.path.lexists(os.path.join(previous, rel)) and os.path.lexists(os.path.join(tree, rel)):
+				# once: a link empty_staging() could not remove and a later cut at its rel leave two
+				due.add(rel)
+	if due:
+		guard.require()
+		for rel in sorted(due):
+			os.symlink(forward_text(rel, name), os.path.join(previous, rel))
+		# as put_back_forward_links(): the folders above a link a pool copied to another disk read their old mtimes for a second
+		forget_pool_cache(previous)
+
 def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGuard) -> list:
 	'''
 	The tree of a cut batch made ready for its roll-forward, under the locks of the scan (plan S4) and inside its unit of vault work
 	(get_vault_info()), so the versions read exact from here on, and a restore can run before the monitored path is back. A record
 	cut between two renames gets its link back first (put_back_forward_links()), and a link hiding what a record put in on another
-	disk goes before that (remove_shadowed_links()); a lost manifest has no rows to tell it by. A name of the tree left of two kinds
+	disk goes before that (remove_shadowed_links()); a manifest that does not describe the previous version, as a lost one, has no
+	rows to tell it by, and the scan gave that link back from staging before emptying it (put_back_staged_links(), which sits in
+	read_job_vault_r() as staging is emptied before this runs). A name of the tree left of two kinds
 	goes (remove_mixed_names()). Each real folder of the previous version gets its times back (give_back_folder_times()), and the
 	tree is made version n's again (put_back_recorded()): each name the batch recorded holds version n's entry, and, with the
-	manifest describing the previous version, what the batch made is gone, so the comparison finds every change since version n,
+	manifest describing the previous version or off a pool whatever the manifest (spec section 6, item 3), what the batch made is
+	gone, so the comparison finds every change since version n,
 	the batch's own included, and nothing reads a copy the batch made. Where that took a copy (hard links refused), the vault's
 	disks are flushed through the scan's own handles before the attempt goes on. Returns what the batch recorded in the previous
 	version: its real folders, ending with /, its regular files and its links, each of the kind it was, of which the roll-forward
@@ -7299,7 +7343,8 @@ def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGua
 		put_back_forward_links(previous, info.tree, manifest, guard)
 	remove_mixed_names(previous, info.tree, guard)
 	recorded = give_back_folder_times(previous, manifest)
-	if put_back_recorded(previous, info.tree, recorded, described, guard):
+	# off a pool previous lists every entry the tree keeps whatever the manifest, a staged link given back by the scan: pass 2 runs
+	if put_back_recorded(previous, info.tree, recorded, described or not vault_disks(info.tree)[0], guard):
 		job_vault = os.path.dirname(os.path.normpath(previous))
 		flush_or_fail(job_vault, os.path.basename(job_vault), f'{info.tree} is not made ready for its roll-forward; the next attempt puts it back again')
 	# every step above read the previous version through the pool, where a disk gone since the whole read hides what it holds: a short
@@ -7350,7 +7395,8 @@ def roll_forward_entries(info:VaultInfo, manifest:'VaultManifest', monitor_path:
 	its mtime set back: each such file is copied again, never read back (a file may have replaced a link there, whose row, read from
 	the tree, has no record to tell it by, or a folder, which has no row at the file's name until the manifest is rebuilt from the
 	tree). Over a manifest that does not describe the previous version, as a lost one, whose rows are listed from the tree, the scan
-	left what the batch made in the tree, and that is copied again too (new_in_tree()): a write error that some other sync saw before
+	left what the batch made in the tree on a pool (off a pool its put-back removed it, and the comparison finds it new), and that is
+	copied again too (new_in_tree()): a write error that some other sync saw before
 	this attempt's handles opened, or a power cut, may have left it wrong at its right size, mtime and tail. Each of them whose monitored path is
 	a regular file now, through real folders of the monitored tree only (a link above it leads out of that tree: what it leads to is
 	no entry of it), is trusted by the comparison, as present and of its kind, and replayed as a modify; one that is not is compared
@@ -7610,12 +7656,15 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	'''
 	The scan of a vault on design R (spec section 3, plan S3), whose caller holds the job's locks. A version folder with no list
 	may be the only real tree of a cut batch, so nothing goes by inference: the manifest is read first, and a commit it
-	names is finished. Then the private list folders and staging are emptied. Of the one orphan there may be, at the one
+	names is finished. Then the private list folders and staging are emptied; when a tree was found over a manifest that does
+	not describe the newest version, as a lost one, a link a cut between two renames left in staging goes back to that version
+	first (put_back_staged_links()). Of the one orphan there may be, at the one
 	after the newest version: a skeleton, empty or holding only links that name their own place (is_skeleton()), goes, with
 	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
 	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt. On a
 	pool the scan checks the pool before each act that a listing through it decides, as a disk gone makes an absence true: the staging
-	repair's renames (repair_pool_vault(), for any vault with leftovers in staging), the skeleton's removal, right before it (which covers the
+	repair's renames (repair_pool_vault(), for any vault with leftovers in staging), the links given back from staging (before the first is
+	written), the skeleton's removal, right before it (which covers the
 	judgement and the walk that gives the folder times back) and right after, and the tree's repair, whose last check is at the end of
 	prepare_roll_forward(): a batch that reuses the scan, with a guard of its own made once every disk is back, never gets the view of a
 	scan taken with a disk gone. What goes by its name alone (the private list folders, staging once repaired, the 0.54 files) is garbage
@@ -7673,6 +7722,13 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 		except OSError as e:
 			raise VaultScanError(f'cannot read {orphan}, nothing in the vault is removed: {e}')
 	remove_unfinished_change_lists(job_vault, listing)
+	if tree is not None:
+		# with no rows for put_back_forward_links(), a link a cut between two renames left in staging goes back before staging is emptied
+		try:
+			if not manifest.describes(listing.versions[newest].path):
+				put_back_staged_links(listing.versions[newest].path, tree, job_vault, guard)
+		except (OSError, sqlite3.Error) as e:
+			raise VaultScanError(f'cannot make the tree {tree} ready for its roll-forward: {e}')
 	empty_staging(job_vault)
 	if manifest.layout() == 'r':
 		remove_054_files(job_vault)
@@ -13293,6 +13349,29 @@ def forwards_to_version(path:str, rel:str, number:int) -> bool:
 	name = text[len(prefix):-len(suffix)]
 	return is_version_folder_name(name) and vault_version_number(name) == number
 
+def staged_forward_rel(text:str, tree_name:str) -> 'str | None':
+	'''
+	The rel a link's text names when it is forward_text() of that rel and the version folder tree_name: as many ../ as the rel has
+	parts, then tree_name, then the rel, a normal one, with no empty, . or .. part. Else None. A link a cut between the two
+	renames of TreeWriter.exchange_in() left in staging has that text, which says where it stood (put_back_staged_links()).
+
+	Examples:
+		>>> staged_forward_rel('../../V2--2021-01-01_00-00-00_-0800/a/b', 'V2--2021-01-01_00-00-00_-0800'), staged_forward_rel('../V2--x/a', 'V2--x')
+		('a/b', 'a')
+		>>> # a ../ too many, one too few, another version's folder, an absolute text
+		>>> [staged_forward_rel(text, 'V2--x') for text in ('../../../V2--x/a/b', '../V2--x/a/b', '../../V1--x/a/b', '/v/job/V2--x/a/b')]
+		[None, None, None, None]
+		>>> [staged_forward_rel(text, 'V2--x') for text in ('../../../V2--x/a/../b', '../../../V2--x/a//b', '../../V2--x/./b', '../V2--x/', '../V2--x', '../V2--x/..')]
+		[None, None, None, None, None, None]
+	'''
+	ups = 0
+	while text.startswith('../', 3 * ups):
+		ups += 1
+	rel = text[3 * ups:].removeprefix(f'{tree_name}/')
+	if forward_text(rel, tree_name) != text or any(part in ('', '.', '..') for part in rel.split('/')):
+		return None
+	return rel
+
 def is_skeleton(path:str) -> bool:
 	'''
 	Whether the version folder at path holds nothing a kept version can need: it is empty, or holds only links naming their
@@ -13594,7 +13673,8 @@ class TreeWriter:
 		the link in staging, or in the tree under a text naming its own place, and the scan knows both.
 
 		On two renames the link is moved to staging first, then the folder in: the previous version holds nothing at rel between
-		them, and a cut there has the scan put the link back (put_back_forward_links()), as the tree still holds what it led to.
+		them, and a cut there has the scan put the link back, as the tree still holds what it led to: by the manifest's rows
+		(put_back_forward_links()), or by the text of the link in staging when the manifest is lost (put_back_staged_links()).
 		'''
 		link = holder
 		if self.two_renames or not exchanged(holder, self.kept_path(rel)):

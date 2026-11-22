@@ -2,8 +2,8 @@
 The crash harness and its oracle, proven on the 0.54 layout: the oracle finds each kind of damage, a batch uncut is exact,
 and a batch killed before any of its changes of the vault is exact once retried. Everything of round 20 runs on these.
 
-On design R the same kill points run with Only Sync Attributes off and on, then a kill during the retry, the monitored tree
-changing after the crash, a full disk at each record, and two negative controls proving the oracle sees what each rule
+On design R the same kill points run with Only Sync Attributes off and on, then a kill during the retry, both also with the
+vault database removed before each restart (round 0.55.6, spec section 6), the monitored tree changing after the crash, a full disk at each record, and two negative controls proving the oracle sees what each rule
 of the roll-forward is there for. tests/test_crash_power_loss.py holds the power loss model.
 
 REVERB_CRASH_FULL=1 runs every kill point; by default a stride of them, keeping the test under a minute. REVERB_CRASH_ROOT
@@ -449,14 +449,29 @@ def retried(vault, point=None, fault=None):
 	return retry(vault.job, point, fault=fault, options=vault.options)
 
 
-def wrong_after_retry(vault, expected=None, allowed_new=frozenset({3})):
+def wrong_after_retry(vault, expected=None, allowed_new=frozenset({3}), folder_times=True):
 	'''
 	What is wrong with the vault once a retry ran: every version read by the oracle, each list against what the oracle counts,
-	and each checked row's record against the entry it names (rows_match_vault()).
+	and each checked row's record against the entry it names (rows_match_vault()). folder_times False leaves folder mtimes out.
 	'''
 	job_vault = vault.job.job_vault
 	want = after_retries(job_vault, vault.expected) if expected is None else expected
-	return check_vault(job_vault, want, set(allowed_new), free_file_meta=free_meta(vault)) + view_truth.wrong_lists(job_vault) + rows_match_vault(job_vault)
+	return (check_vault(job_vault, want, set(allowed_new), folder_times=folder_times, free_file_meta=free_meta(vault)) + view_truth.wrong_lists(job_vault)
+		+ rows_match_vault(job_vault))
+
+
+def lose_the_manifest(job):
+	'''The vault database removed, its journal with it, as before a restart over a lost one.'''
+	for name in (rv.MANIFEST_FILE_NAME, rv.MANIFEST_FILE_NAME + '-journal'):
+		if os.path.lexists(os.path.join(job.job_vault, name)):
+			os.remove(os.path.join(job.job_vault, name))
+
+
+# the kill-point runs with the vault database removed before each restart (spec section 6, test 6). Over a lost database a kill between
+# a change in a folder of the previous version and giving it its times back leaves the backup's time on it: no row records the time to
+# give back (the approved limitation "After a crash, a folder whose row holds no record can keep the backup's time"), so folder times
+# are left out of the oracle's read there, as the 0.54 layout's run leaves them out for its own approved limitation
+LOST_MANIFEST = pytest.mark.parametrize('lost_manifest', [False, True], ids=['manifest_kept', 'manifest_lost'])
 
 
 def sweep_points(vault, default=DEFAULT_KILL_POINTS):
@@ -482,7 +497,8 @@ def test_batch_3_has_an_attribute_change_on_a_shared_inode(r_vault):
 		assert read_view(job_vault, folder_of(job_vault, 2))['top.txt'].mode == r_vault.base[2]['top.txt'].mode
 
 
-def test_every_kill_point_on_r(r_vault):
+@LOST_MANIFEST
+def test_every_kill_point_on_r(r_vault, lost_manifest):
 	total, points = sweep_points(r_vault)
 	wrong = []
 	for point in points:
@@ -491,18 +507,21 @@ def test_every_kill_point_on_r(r_vault):
 		if cut.error is not None or (point <= total and not cut.killed):
 			wrong.append((point, 'the cut run', cut))
 			continue
+		if lost_manifest:
+			lose_the_manifest(r_vault.job)
 		again = retried(r_vault)
 		if again.error is not None or again.committed is not True:
 			wrong.append((point, 'the retry', again))
 			continue
-		problems = wrong_after_retry(r_vault)
+		problems = wrong_after_retry(r_vault, folder_times=not lost_manifest)
 		if problems:
 			wrong.append((point, problems[:8]))
 	print(f'{len(points)} of {total} kill points run; {len(wrong)} wrong')
 	assert not wrong, f'{len(wrong)} of {len(points)} kill points wrong: {wrong[:4]}'
 
 
-def test_a_kill_during_the_retry_is_safe(r_vault):
+@LOST_MANIFEST
+def test_a_kill_during_the_retry_is_safe(r_vault, lost_manifest):
 	total = cut_batch(r_vault).steps
 	generator = random.Random(19)
 	runs = 500 if os.environ.get('REVERB_CRASH_FULL') else 40
@@ -511,12 +530,16 @@ def test_a_kill_during_the_retry_is_safe(r_vault):
 		first, second = generator.randint(1, total + 2), generator.randint(1, 120)
 		restore(r_vault)
 		cut = cut_batch(r_vault, first)
+		if lost_manifest:
+			lose_the_manifest(r_vault.job)
 		during = retried(r_vault, second)
+		if lost_manifest:
+			lose_the_manifest(r_vault.job)
 		again = retried(r_vault)
 		if cut.error is not None or during.error is not None or again.error is not None or again.committed is not True:
 			wrong.append((first, second, cut, during, again))
 			continue
-		problems = wrong_after_retry(r_vault)
+		problems = wrong_after_retry(r_vault, folder_times=not lost_manifest)
 		if problems:
 			wrong.append((first, second, problems[:8]))
 	print(f'{runs} double kills; {len(wrong)} wrong')
