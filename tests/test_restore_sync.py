@@ -742,6 +742,90 @@ def test_a_mount_made_at_the_restore_folders_place_during_the_restore_fails_it(j
 	assert marker_of(target).get('recopy') == 'sync failed'
 
 
+# ---- D6: at each sync the restore's folder must be on the filesystem it was on when the run opened it, on a pool and off one, and on
+# a pool no disk that held the folder at the claim may have left it. A symlink to a folder on /dev/shm stands in for a filesystem
+# mounted over a folder, as os.stat() follows it to another st_dev
+
+def filesystem_line(folder):
+	return (f'FAILED proj: the filesystem holding {folder} changed while the restore ran (unmounted, or another mounted over it): what was '
+		'restored since is not on the disk it began on')
+
+
+def left_line(disk):
+	return f'FAILED proj: the disk {disk} left the pool while the restore ran: what was restored onto it is not known to be on disk'
+
+
+def mounted_over(place, other_filesystem):
+	'''
+	What runs to mount another filesystem over the folder at place, one that holds what place held so far (a copy of it put in
+	other_filesystem), so the restore goes on there unhindered: place is moved aside, and a symlink to other_filesystem put there.
+	'''
+	def mount():
+		os.rename(place, place + '.under')
+		shutil.copytree(place + '.under', other_filesystem, symlinks=True, dirs_exist_ok=True)
+		os.symlink(other_filesystem, place)
+	return mount
+
+
+@pytest.mark.unit
+def test_a_restore_whose_folder_changes_filesystem_fails(job, tmp_path, capsys, monkeypatch, errseq, other_filesystem):
+	# fails on main (says done): off a pool a restore's syncs checked nothing of its folder. Here another filesystem is mounted over the
+	# restore's folder at its first copy: the copies land there, on a filesystem the handle of the claim is not of, so no sync of the
+	# restore wrote them out
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	ran = at_the_first_copy(monkeypatch, mounted_over(target, other_filesystem))
+	backup_syncs = len(errseq.synced())
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [filesystem_line(target)]
+	# the handle of the claim is synced all the same, once: nothing is handed over
+	assert errseq.synced()[backup_syncs:] == [(target + '.under', 0)]
+	assert f'What {target} holds is not known to be on disk: run the same restore again, which copies everything again' in stdout
+
+
+@pytest.mark.unit
+def test_a_restore_onto_a_pool_whose_mount_point_changes_filesystem_fails(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails on main (says done): on a pool its syncs looked for a disk that joined the pool, not at the pool itself. Here the pool is
+	# unmounted, or another filesystem mounted over its mount point, at the restore's first copy: the copies land on no disk of the pool
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one']})
+	target = os.path.join(out, 'proj')
+	ran = at_the_first_copy(monkeypatch, mounted_over(str(tmp_path / 'pool'), other_filesystem))
+	backup_syncs = len(errseq.synced())
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	# the pool's disk is not called one that left: the folder is on no pool now
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [filesystem_line(target)]
+	assert errseq.synced()[backup_syncs:] == [(branches['one'], 0)]
+
+
+@pytest.mark.unit
+def test_a_restore_onto_a_pool_whose_disk_leaves_it_fails_naming_the_disk(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails on main (says done): a disk the pool listed at the claim, with the restore's folder on it, is taken out of the pool's list
+	# (mergerfs's control file) at the first copy, still mounted: what a copy put there is in the pool's view no more. Beyond the
+	# entry (Calls to confirm): D5's rule, in the restore. Its handle is synced all the same
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two']}, other_filesystem)
+	target = os.path.join(out, 'proj')
+	# mergerfs made the restore's folder on disk two
+	held = os.path.join(branches['two'], 'out', 'proj')
+	os.makedirs(held)
+	ran = at_the_first_copy(monkeypatch, lambda: fake_pool.leave(str(tmp_path / 'pool'), branches['two']))
+	backup_syncs = len(errseq.synced())
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [left_line(os.path.dirname(branches['two']))]
+	assert sorted(errseq.synced()[backup_syncs:]) == sorted([(branches['one'], 0), (held, 0)])
+	assert marker_of(target).get('recopy') == 'sync failed'
+	# listed again, the run again finishes
+	fake_pool.come_back(str(tmp_path / 'pool'), branches['two'])
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert (code, err) == (0, ''), stdout
+	assert whole(target) and not os.path.lexists(os.path.join(target, rv.RESTORE_MARKER_NAME))
+
+
 @pytest.mark.unit
 @pytest.mark.skipif(os.geteuid() == 0, reason='root opens any folder')
 def test_a_place_the_user_can_go_through_but_not_read_is_synced_through_its_branch(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
@@ -1500,3 +1584,23 @@ def test_a_restore_onto_a_real_mount_of_its_own_on_a_branch_is_synced_through_it
 			for rel in FILES:
 				with open(os.path.join(pool, 'out', rel), 'rb') as f, open(os.path.join(job.monitor, rel), 'rb') as g:
 					assert f.read() == g.read(), rel
+
+
+@pytest.mark.privileged
+@needs_mount
+def test_a_restore_onto_a_tmpfs_lazily_unmounted_fails(job, tmp_path, capsys, monkeypatch):
+	# D6, the test VM: test_a_restore_whose_folder_changes_filesystem_fails with a real tmpfs at the restore's destination, out, lazily
+	# unmounted (umount -l) at the restore's first copy, as a disk taken away under a running restore: out then reads as the folder it
+	# was mounted on, and what the restore writes after it lands on the basetemp's filesystem, which no handle of its own is of. The
+	# restore fails with the filesystem line. Main says done
+	backed_up(job)
+	out = destination(tmp_path)
+	target = os.path.join(out, 'proj')
+	# the folder the tmpfs is mounted on holds the folders the restore makes, as one a disk was mounted over can, so the copies after
+	# the unmount land there unhindered
+	os.makedirs(os.path.join(target, 'sub'))
+	with ScratchTmpfs(out) as own:
+		ran = at_the_first_copy(monkeypatch, own.unmount)
+		code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert [line for line in stdout.splitlines() if line.startswith('FAILED')] == [filesystem_line(target)]
