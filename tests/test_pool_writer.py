@@ -914,7 +914,10 @@ def test_a_branch_removed_through_the_control_file_during_a_batch_fails_it(monke
 	# on a real mergerfs pool (real_pool()'s, the job vault on it). Between the batch's copies and its commit flush a branch is taken out
 	# of the pool through mergerfs's control file, its disk still mounted: the attempt fails naming it, nothing commits; the branch is
 	# put back, and the next attempt, a full comparison, rolls forward. Every version reads as the tree it was taken from (the oracle).
-	# On main the batch commits, its flush syncing only the branch the pool still lists
+	# On main the batch commits, its flush syncing only the branch the pool still lists. The version view oracle reads V0 through the
+	# pool as the failed batch ends, with the branch still out, so V0's entries only that branch holds read as nothing then (the VM
+	# gate's vmg1-1 on 4c17b53: f3, f5 and f7, as the create policy placed them, an error at teardown): the test looks at those lines
+	# (each such entry is on the branch, and V0 reads as before once it is back) and takes them out, the plugin's negative control
 	with real_pool() as root:
 		job = create_job(root)
 		control = os.path.join(job.vault, rv.MERGERFS_CONTROL_FILE)
@@ -923,6 +926,8 @@ def test_a_branch_removed_through_the_control_file_during_a_batch_fails_it(monke
 		seed_monitor(job, {**files, 'd/a.txt': 'a0'})
 		run_backup(job, only_sync_attributes=False)
 		expected = {0: snapshot_tree(job.monitor)}
+		v0 = os.path.basename(committed_versions(job)[0])
+		before = read_view(job.job_vault, v0)
 		for name in files:
 			put_text(job.monitor, name, past_inline(f'G{name}'))
 		put_text(job.monitor, 'd/new.txt', 'n')
@@ -933,17 +938,106 @@ def test_a_branch_removed_through_the_control_file_during_a_batch_fails_it(monke
 				removed.append(True)
 			return real(*args, **kwargs)
 		monkeypatch.setattr(rv, 'flush_copies', flushing)
+		hidden = None
 		try:
 			with pytest.raises(rv.PoolNotReady) as failure:
 				backup_events(job, [(False, 'modify', name, None) for name in files] + [(False, 'create', 'd/new.txt', None)])
 		finally:
 			if removed:
+				# V0 as the oracle read it after the batch: through the pool, the branch out
+				hidden = read_view(job.job_vault, v0)
 				os.setxattr(control, 'user.mergerfs.branches', os.fsencode('+>' + branch))
 		assert removed and failure.value.reason == f'disk {os.path.realpath(branch)} left pool {rv.pool_state(job.vault).pool} during this step'
 		assert len(committed_versions(job)) == 1
+		# the oracle's lines on V0 are its entries that read otherwise with the branch out: those only that branch holds read as nothing
+		# (each is on the branch's disk), and a forward link whose target only that branch holds reads as leading nowhere (the create
+		# policy places each entry at random, so which entries, if any, differs from run to run); V0 reads as it did before the batch
+		# once the branch is back
+		gone = sorted(rel for rel in before if rel not in hidden)
+		unreached = sorted(rel for rel in before if rel in hidden and hidden[rel].kind == 'dangling' and before[rel].kind != 'dangling')
+		on_branch = os.path.join(branch, os.path.relpath(job.job_vault, job.vault), v0)
+		assert all(os.path.lexists(os.path.join(on_branch, rel)) for rel in gone), (gone, on_branch)
+		assert view_truth.differences(job.job_vault, {v0: before}, False) == []
+		lost = [line for line in view_truth.WRONG if line.startswith(f'{v0}:')]
+		named = {line.split(': read ', 1)[0] for line in lost}
+		assert not view_truth.ENABLED or ({f'{v0}:{rel!r}' for rel in gone} <= named <= {f'{v0}:{rel!r}' for rel in gone + unreached}), (lost, gone, unreached)
+		view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost]
 		monkeypatch.setattr(rv, 'flush_copies', real)
 		assert rv.read_pool_branches(job.vault)[-1] == branch
 		expected[1] = snapshot_tree(job.monitor)
 		run_backup(job, only_sync_attributes=False, matched_since=time.time_ns())
 		assert len(committed_versions(job)) == 2
 		assert check_vault(job.job_vault, expected, set()) == []
+
+
+@contextlib.contextmanager
+def surplus_pool(root, branch):
+	'''A mergerfs at root/p over the one branch given (a folder, or a link to one), with the options the pool tests run with: its mount point while the block runs.'''
+	mount = os.path.join(root, 'p')
+	os.mkdir(mount)
+	subprocess.run(['mergerfs', branch, mount, '-o', MERGERFS_OPTIONS], check=True)
+	try:
+		yield mount
+	finally:
+		subprocess.run(['fusermount3', '-u', mount], check=True)
+
+
+def chain_of_length(start, length):
+	'''The path, length bytes long, of a folder under start at the end of a chain of names of 200 bytes; the folders above it made, not it.'''
+	room = length - len(os.fsencode(start)) - 1
+	parts = []
+	while room > 201:
+		parts.append('c' * 200)
+		room -= 201
+	parts.append('c' * room)
+	path = os.path.join(start, *parts)
+	os.makedirs(os.path.dirname(path), exist_ok=True)
+	assert len(os.fsencode(path)) == length
+	return path
+
+
+@pytest.mark.privileged
+@needs_mergerfs
+@pytest.mark.parametrize('reached', ['as_spelled', 'through_a_shorter_link', 'branch_given_as_a_link'])
+def test_a_real_pool_refuses_a_path_past_the_limit_by_what_pool_surplus_counts(reached):
+	# the fix wave's FW12: the I6 probe of Task 9's review, run as a test (the length rule's pool clause was reasoned, not run on a real
+	# pool: docs/limitations.md, "A symlink or a path the vault can't hold is left out"). mergerfs writes <branch>/<the path below its
+	# mount point>, so on a pool whose branch path is S bytes longer than its mount point, a pool path of 4,095 - S bytes is 4,095 on the
+	# branch and is made, and one of 4,095 - S + 1 is refused (ENAMETOOLONG), where S is pool_surplus(): the branch's length over the
+	# mount point's, plus what a shorter link into the pool leaves out of the vault's path (through_a_shorter_link), with the branch as
+	# the guard resolves it (branch_given_as_a_link: mergerfs is given a link 120 bytes long to a folder of about 60, so a mergerfs
+	# that writes through the link as given refuses a path the rule takes). Fails, saying so, when mergerfs refuses nothing past the
+	# limit (then pool_surplus() and its README clause can go), or refuses at another length than S says
+	os.makedirs(SCRATCH, exist_ok=True)
+	root = tempfile.mkdtemp(prefix='pool-surplus-', dir=SCRATCH)
+	try:
+		real_branch = os.path.join(root, 'disks', 'b' * 60)
+		os.makedirs(real_branch)
+		branch = real_branch
+		if reached == 'branch_given_as_a_link':
+			branch = os.path.join(root, 'k' * 120)
+			os.symlink(real_branch, branch)
+		with surplus_pool(root, branch) as mount:
+			vault = os.path.join(mount, 'v' * 40)
+			os.mkdir(vault)
+			job_vault = vault
+			if reached == 'through_a_shorter_link':
+				job_vault = os.path.join(root, 'l')
+				os.symlink(vault, job_vault)
+				assert len(os.fsencode(os.path.realpath(job_vault))) > len(os.fsencode(job_vault))
+			surplus = rv.pool_surplus(rv.PoolGuard([job_vault]), job_vault)
+			assert surplus > 0, f'pool_surplus() finds no surplus for {job_vault} on {mount} over {branch}'
+			fits = chain_of_length(job_vault, rv.PATH_LIMIT - surplus)
+			try:
+				os.mkdir(fits)
+			except OSError as e:
+				pytest.fail(f'mergerfs refused a path of {rv.PATH_LIMIT - surplus} bytes through the pool, {rv.PATH_LIMIT} on its branch as pool_surplus() counts it ({surplus} bytes more): {e}; it writes a longer path than the rule counts')
+			refused = chain_of_length(job_vault, rv.PATH_LIMIT - surplus + 1)
+			try:
+				os.mkdir(refused)
+			except OSError as e:
+				assert e.errno == errno.ENAMETOOLONG, e
+			else:
+				pytest.fail(f'mergerfs made a folder whose path is {rv.PATH_LIMIT - surplus + 1} bytes through the pool and {rv.PATH_LIMIT + 1} on its branch as pool_surplus() counts it: it refuses no such path, so the rule counts a surplus mergerfs does not have (pool_surplus() and its README clause can go)')
+	finally:
+		shutil.rmtree(root)
