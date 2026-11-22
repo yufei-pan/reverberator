@@ -93,10 +93,10 @@ container suite on the version commit; version 0.55.6 at e166baa. Waiting for th
 (Q19); a history cleanup before the push is done (2026-11-22). The round's record (measurements, Calls to confirm,
 the build's rulings): `docs/progress/r0556.md`. Next while Q19 waits: the round after 0.55.6 (0.55.7, its fourteen
 deferred entries): its spec (`specs/2026-11-22-r0557-design.md`, 2026-11-22) is written, checked by fresh agents four
-times and revised after each (a step back redesigned two parts that drew findings in every round), with questions Q20
-to Q23 below; its plan is written (`plans/2026-11-22-r0557.md`, 20 tasks, on each question's recommended option: a
-table at its top and a [Q<n>] mark on each task say what another answer changes). It is built on its own branch after
-Q19's answer (no build on top of the unreleased round), and its marked tasks wait for Q20 to Q23.
+times and revised after each (a step back redesigned two parts that drew findings in every round); its questions Q20
+to Q23 are decided, each on its recommended option (chief's decisions, 2026-11-22; Closed); its plan is written
+(`plans/2026-11-22-r0557.md`, 20 tasks, on those options: a table at its top and a [Q<n>] mark on each task say what
+another answer would change). It is built on its own branch after Q19's answer (no build on top of the unreleased round).
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
@@ -282,52 +282,6 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     words behind it: "Fixes round (Recommended)" (2026-11-14); each release rolls out on the user's pick for it
     (standing decisions).
 
-Round 0.55.7's questions (the round after 0.55.6: its spec, `specs/2026-11-22-r0557-design.md`, section "Questions for
-the user", writes each out at length; the spec waits on them and on Q19 before its plan is built on):
-
-- **Q20. A monitored folder with more than about 2.9 KiB of extended attributes, on an ext4 or f2fs vault.** The record
-  of the top folder (for a whole-job restore) keeps its owner, mode, times and extended attributes in one attribute of the
-  version's folder; on ext4 and f2fs a folder's attributes share about 4 KiB, so a top folder with more than about 2.9 KiB
-  of its own keeps them out of its record, with one log line: a whole-job restore gives it none of them.
-  - (a) Known limitation (Recommended): such top folders are rare (ACLs and security labels take tens of bytes).
-  - (b) Store them raw, one attribute each, beside the record: a second record form, kept for good.
-  - What waits on it: the limitations entry and the spec's section 4.1 text. The user's words it would narrow: "Fixes
-    round (Recommended)" (2026-11-14), which put the whole deferred entry in this round.
-- **Q21. Whether a job still waits, after reverberator restarts, for a disk taken out of its mergerfs pool.** From this
-  round every job on a pool waits for a disk that pool mount listed and lists no more (the idle entry, fixed for every
-  pool). Open is the restart: 0.55.6 forgets such a disk at a restart, and the backup after can make the version before
-  show another version's bytes for a file on that disk (a wrong result).
-  - (a) Keep the record in the state folder too (Recommended, what is built): both entries fixed across daemon restarts
-    within one boot. Its cost: a disk taken out of the pool on purpose blocks every job on that pool until the pool is
-    mounted again, the machine rebooted, or the record file removed while reverberator is stopped; a restart no longer
-    lets it go. On kernels before 6.8 the record stays in memory, which widens the approved "Kernels before 6.8 and the
-    pool check" (2026-10-26).
-  - (b) In memory only: the restart entry stays, a known limitation; a restart or a remount lets a disk go.
-  - What waits on it: the spec's section 3.1 file and README line 76. The user's words: "Fixes round (Recommended)"
-    (2026-11-14) put the restart entry in this round; "Support pools with a limitation" (2026-11-04) covers a limitation
-    on pools, so chief may decide it.
-- **Q22. An entry whose path grows past Linux's 4,095-byte limit after it was backed up** (the version number gaining a
-  digit, a folder above it renamed longer, the vault moved to a longer path). Today every backup of the job then fails
-  once a change reaches its folder.
-  - (a) Leave it out before it grows (Recommended, what is built): from that growth on it is in no new version, with its
-    NOT BACKED UP line; the versions before keep it until the prune takes them. One scan of the vault database at each
-    growth, one range query per folder moved longer. Left as on 0.55.6: an entry a version already holds past the limit
-    (named by its own line), and an untracked one a rename puts past.
-  - (b) Keep it, reaching it through folder handles (the fix the deferred entry named): every part that reads a version
-    by path must change (eight sites found so far; a missed one stops the job a version later), it cannot work on a vault
-    on a mergerfs pool, and restores of such entries fail until they take handles too.
-  - What waits on it: the spec's section 1. The user's words: "Accept: leave it out, warn (Recommended)" (2026-11-09),
-    which (a) extends to the growing case, as chief extended it on 2026-11-15; (a) narrows "Fixes round (Recommended)"
-    (2026-11-14). Chief may decide it under that pick.
-- **Q23. A disk that joins a pool and leaves it again within one batch of a restore's copies.** From this round a folder
-  restore on a pool reads the pool's list once per 1,000 copies and fails when a disk it saw has left; a disk added and
-  taken out between two looks is still not seen (its copies out of the pool's view, the restore saying done).
-  - (a) Known limitation (Recommended): it needs an operator to add and remove a disk within one batch of a restore they
-    run.
-  - (b) Close it: before its sync the restore looks up every entry it copied (one lstat each).
-  - What waits on it: the limitations entry, or the spec's section 6 check. The user's words it would narrow: "Fixes round
-    (Recommended)" (2026-11-14).
-
 - **Q18. A folder whose metadata copy fails every time, beyond its extended attributes** (P16 step 2, Task 18). Q15
   (a), which the user picked on 2026-11-17, said: "A copy that fails every time is tried once more, then left." Built,
   that holds for a folder whose extended attributes alone fail to copy (its record then matches the monitored folder).
@@ -370,6 +324,21 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Q20 to Q23, round 0.55.7's questions (`specs/2026-11-22-r0557-design.md`, where each is written out at length), each
+  decided on its recommended option, the one the spec and plan build: chief's decisions, 2026-11-22. A known limitation's
+  approved field says "chief's decision, 2026-11-22"; the plan's Task 18 says what a reversal by the user changes.
+  - Q20, a top folder with more than about 2.9 KiB of its own extended attributes on an ext4 or f2fs vault keeps them out of
+    its record (a whole-job restore gives it none): (a), a known limitation; such top folders are rare (ACLs and security
+    labels take tens of bytes). Reversed by "store them raw".
+  - Q21, the wait after a restart for a disk taken out of its pool: (a), the record kept in the state folder too, and
+    "Kernels before 6.8 and the pool check" widened. (b) would leave a wrong result in a backup; (a)'s block is loud and a
+    remount undoes it, so the README line and the log line say how to let a disk go on purpose. Reversed by "a restart lets
+    the disk go".
+  - Q22, an entry whose path grows past the 4,095-byte limit: (a), left out before it grows, with its NOT BACKED UP line,
+    under the user's pick "Accept: leave it out, warn (Recommended)" (2026-11-09). Reversed by "keep it through folder
+    handles".
+  - Q23, a disk that joins a pool and leaves it within one batch of a restore's copies: (a), a known limitation (it needs an
+    operator to add and remove a disk within one batch of a restore they run). Reversed by "check every restored entry".
 - Q15, a folder whose own metadata copy failed (P16, step 2; the healing check's 40 results, Task 2, asked in 5bad9b5):
   setgid is mended at the next full comparison, but a default ACL the folder inherited and its own extended attributes
   usually stay wrong until the folder's own metadata changes. (a), build plan Task 18: the failed folder's row is
