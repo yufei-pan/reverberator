@@ -396,7 +396,7 @@ def rows_match_vault(job_vault: str) -> list:
 	The rows of the manifest's version whose record does not describe the entry at their path in it, one line each: of the
 	rows that hold a record and are checked (unchecked = 0), the entry's kind, mode, uid and gid; a file's size, mtime and
 	tail hash; a link's text. A folder's mtime is left out, as its row's is the monitored one by the next comparison, and so is the
-	mode of a folder row holding the mark of a metadata copy that failed (META_RETRY_MODE), which no entry has: its kind, owner and
+	mode of a folder row holding the mark of a metadata copy that failed (-1, the daemon's META_RETRY_MODE), which no entry has: its kind, owner and
 	group are checked. A row of 0.54's referenced backups (kind 'r') is left out. [] when every such row matches, or when there is
 	no manifest.
 
@@ -429,8 +429,10 @@ def rows_match_vault(job_vault: str) -> list:
 		found = 'd' if stat.S_ISDIR(st.st_mode) else 'l' if stat.S_ISLNK(st.st_mode) else 'f' if stat.S_ISREG(st.st_mode) else 'o'
 		wanted = (kind, mode, uid, gid)
 		held = (found, st.st_mode, st.st_uid, st.st_gid)
-		if mode == rv.META_RETRY_MODE:
-			# the next comparison that meets the folder copies its metadata again, and records its mode then
+		if kind == 'd' and mode == -1:
+			# -1 is the daemon's mark of a folder whose metadata copy failed (META_RETRY_MODE), written as a literal here: the
+			# oracle reads nothing of the daemon's but names and the hash. the next comparison that meets the folder copies its
+			# metadata again, and records its mode then
 			wanted, held = (kind, uid, gid), (found, st.st_uid, st.st_gid)
 		if found == 'f':
 			wanted += (size, mtime_ns, file_hash)

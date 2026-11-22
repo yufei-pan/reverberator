@@ -2019,7 +2019,8 @@ def test_a_folder_metadata_copy_that_failed_once(umask_022, job, poll_fast, monk
 
 @pytest.mark.parametrize('case, place', sorted({(case, place) for case, place, _ in LEFT_WRONG_ON_MAIN}))
 def test_a_folder_whose_copy_failed_heals_at_the_next_batch_comparing_it(umask_022, job, poll_fast, monkeypatch, capsys, case, place):
-	# fails on main: the batch that renames P to Q compares the tree under Q (its verification, compare_scopes()), C's record there
+	# fails on main, at the mark assert first (`assert [] == ['P/C/']`: main marks no row), and without it at the last assert (the
+	# batch left C as the failing version held it): the batch that renames P to Q compares the tree under Q (its verification, compare_scopes()), C's record there
 	# matches the monitored C's, and the attribute check does not reach C, so the newest version keeps C as the failing one left it.
 	# Since step 2 C's row holds the mark (it moved with C: VaultManifest.move_tree()), and the batch copies C's metadata again. The
 	# batch is stamped now, as the watcher stamps one (backup_events() stamps its events at a monotonic 1.0 s, near the boot, which
@@ -2054,7 +2055,8 @@ def _marked_rows(job) -> list:
 
 @pytest.mark.parametrize('place', PLACES)
 def test_a_folder_copy_that_fails_every_time_is_tried_once_more_and_then_left(umask_022, job, poll_fast, monkeypatch, capsys, place):
-	# fails on main: no comparison meets C again (its record matches the monitored C's, and the attribute check misses it), so its
+	# fails on main, at the mark assert first (`assert [] == ['P/C/']`: main marks no row), and would fail at the count of versions
+	# without it: no comparison meets C again (its record matches the monitored C's, and the attribute check misses it), so its
 	# copy is never tried again: no version follows the failing one. Since step 2 the full comparison after the failing version finds
 	# C by its mark and tries the copy once more, which fails again: one more version, which changes nothing of C, its row recorded from
 	# that version with no mark; the next full comparison finds nothing. The stand-in fails every copy onto C, at copystat()'s attribute

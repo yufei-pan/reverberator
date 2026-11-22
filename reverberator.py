@@ -6355,7 +6355,9 @@ def do_backup(backup_entries:dict,
 			return vaultInfo, manifest, False
 		# a folder whose own metadata copy failed, recorded from what the version holds, is marked ( META_RETRY_MODE ), so the next
 		# comparison that meets it copies its metadata again, its extended attributes among them, which no record holds; one the replay
-		# took for its mark keeps the record, so a copy that fails every time is tried once more, and then left (spec section 16, step 2)
+		# took for its mark keeps the record, so a copy that fails every time is tried once more, and then left, where the record then
+		# matches the monitored folder's mode, owner and mtime (its extended attributes alone failed); a failure that leaves one of those
+		# different is retried at every comparison that meets it, as before (spec section 16, step 2)
 		if unsynced:
 			manifest.mark_meta_retry(rel for rel in (as_folder_entry(os.path.relpath(path,monitor_path)) for path in unsynced) if rel not in retried)
 		# check the size of the backup
