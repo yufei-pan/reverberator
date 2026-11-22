@@ -17188,8 +17188,9 @@ def claim_restore_target(target:str, check = None) -> int:
 # pool listed it, the folder's place on it) of each branch the pool listed at the claim, whether the folder was there or not, for
 # sync_restore() to look at each one the pool no longer lists; empty off a pool; denied, {place: the st_dev of the nearest existing
 # folder at it as the claim found it, None when it could not be looked at} of the places in passed that were left out because the
-# restoring user could not open them (warned of), not because their handle failed (a sync fails with that), which the looks for a
-# disk the pool no longer lists, and for one unmounted or replaced since, do not pass over (the latter by that filesystem)
+# restoring user could not open them (warned of, unless a handle is of the filesystem they are on), not because their handle failed (a
+# sync fails with that), which the looks for a disk the pool no longer lists, and for one unmounted or replaced since, do not pass over
+# (the latter by that filesystem)
 RestoreDisks = namedtuple('RestoreDisks', ['handles', 'devs', 'passed', 'dev', 'held', 'denied'])
 
 def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> RestoreDisks:
@@ -17214,9 +17215,12 @@ def open_restore_disks(folder:str, fd:int, report:RestoreReport, rel:str) -> Res
 	are of, which sync_restore() checks the pool against later: a filesystem that holds folder on a branch then and no
 	handle is of (a disk that joined, or one mounted at a folder on the way) has no handle, and one opened now would miss
 	an error another sync of it has seen. .passed is the folder's place on each branch left out (that check passes them
-	over, as they are failed or warned of already; .denied the ones among them that were warned of, not failed). .dev is fd's st_dev, on a pool and off one: sync_restore() checks that
-	folder is still on that filesystem, which a lazy unmount, or another filesystem mounted over it, ends. .held is (the
-	branch as the pool lists it, the folder's place on it) of every branch the pool lists now, with no look at the place: a
+	over, as they are failed or warned of already). .denied is {place: the st_dev of the nearest existing folder at it as
+	the claim found it, or None when it could not be looked at} of the places among them that the user could not open,
+	not failed: those warned of, and those whose filesystem another branch's handle is of, which syncs them, so they are
+	not warned of; sync_restore() compares each with the filesystem now. .dev is fd's st_dev, on a pool and off one:
+	sync_restore() checks that folder is still on that filesystem, which a lazy unmount, or another filesystem mounted over
+	it, ends. .held is (the branch as the pool lists it, the folder's place on it) of every branch the pool lists now, with no look at the place: a
 	copy may land on a branch where the folder is not yet (mergerfs's create policies that keep no paths put it where the
 	copy goes), so which branches hold it is known only at a sync, which checks the pool still lists each one;
 	empty off a pool. close_restore_disks() closes what this opened.
