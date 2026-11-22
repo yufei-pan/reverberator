@@ -795,39 +795,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.5, with the fix at source: a shorter temporary name, and an entry whose path the
   vault refuses left out at the record step with its NOT BACKED UP line.
 
-### A disk taken out of a pool through its control file goes unseen
-
-- **Kind:** deferred.
-- **What the operator sees:** on a vault on a mergerfs pool, when a disk is taken out of the pool through mergerfs's
-  control file while a batch runs, the batch's flush syncs only the disks the pool lists by then: what the batch wrote to
-  that disk is not synced, and the batch is not failed but commits, with no alert. The same removal while the start
-  after a cut puts the cut batch's tree back is seen by no guard either: the version before's listing misses the names
-  on that disk, and the scan's removals of what the cut batch made (the put-back's, and those of a name left a folder on
-  one disk and something else on another) can remove an entry that version's forward link names, so once the disk is
-  back that version has lost it. A disk unmounted at that moment is caught: the start's repair checks the pool before
-  every act that a listing through the pool decides (its staging renames, its links and the removals of what the cut
-  batch made, a leftover version folder's removal, and its end, before a backup uses the scan; what it removes by name
-  alone, as staging's leftovers, is garbage either way), and stops with nothing removed that a version needs (the user's
-  pick of 2026-11-13, "Finish the check rule (Recommended)"; a test on a real mergerfs pool shows it). The control-file case is reasoned from the code, not run.
-- **Why:** older than 0.55.5. A flush picks its handles by the disks the pool lists at that moment, and the pool check
-  looks for a listed disk that is missing or was mounted again, not for one the pool stopped listing; the scan's guard
-  asks the same.
-- **Revisit when:** the round after 0.55.5: check it by a run, and fail the batch, or stop the scan, when a disk it began
-  with has left the pool.
-
-### A restore does not notice its filesystem change under it
-
-- **Kind:** deferred.
-- **What the operator sees:** a restore onto a mergerfs pool checks at each of its syncs for a disk that joined the
-  pool, or a filesystem mounted at its folder's place on a disk, while it ran, but not for the pool itself unmounted (a
-  lazy unmount) or another filesystem mounted over it; off a pool a restore checks for no such change. Its later copies then
-  land on a filesystem none of its handles is on, its syncs do not cover them, and it can say it is done for files no
-  sync of its own wrote out: a write error there is not heard, and a power cut soon after can lose them.
-- **Why:** older than 0.55.5. The end check runs only while the folder is still on a pool, and off a pool there is
-  none.
-- **Revisit when:** the round after 0.55.5: every restore, on a pool or off one, checks its folder's filesystem
-  (`st_dev`) at each sync against the handles it opened, as the daemon's units check theirs.
-
 ### An xattr change made while down, in a folder renamed during the start's walk
 
 - **Kind:** deferred.
