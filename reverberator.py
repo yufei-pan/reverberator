@@ -7284,32 +7284,47 @@ def put_back_staged_links(previous:str, tree:str, job_vault:str, guard:PoolGuard
 	previous holds nothing, under real folders of previous, while the tree holds the entry, gets its forward link again, as
 	put_back_forward_links() writes it; the one in staging is empty_staging()'s, which runs after this. The text is the batch's own: it
 	names the tree's folder, a name the batch made, which no entry of version n recorded into staging can hold, as it was made before
-	that name existed. On a pool "holds nothing" is an absence, which a disk that is gone makes true of what it holds: so the links due
-	are judged first, and guard.require() runs before the first is written: PoolNotReady, with nothing written, the link still in
-	staging. A link there is no longer due, so a cut repeats it. One listing of staging, and a readlink per link in it. Raises OSError or
-	PoolNotReady.
+	that name existed. That staged link is the entry's only record over a lost manifest, so two things hold before staging is emptied, with
+	a link of that form in it, due or not:
+	- on a pool "holds nothing" and "the tree holds the entry" are absences, which a disk that is gone makes true of what it holds (and
+	  makes a folder above rel no real folder): so guard.require() runs whenever a link of that form is in staging, before the first
+	  one due is written, and a disk missing fails the scan, PoolNotReady, with nothing written and the link still in staging. Off a
+	  pool it checks nothing.
+	- the vault is flushed after the links are written (flush_or_fail()), as the new link and the staged one are the same entry's only
+	  two copies, and a power cut after the removal of the second reaches the disk and before the first does (on a pool they can sit on
+	  different branches, whose checkpoints are out of step; on f2fs a long link's text is data a checkpoint does not keep) loses the
+	  entry for good. A scan that finds its link written already (the first one's flush failed or was cut, which leaves the link there
+	  and staged) flushes too: it is the one that empties staging. JobFailure, with staging kept, when a sync fails.
+	A link there is no longer due, so a cut repeats it. One listing of staging, and a readlink per link in it. Raises OSError, PoolNotReady
+	or JobFailure.
 	'''
 	try:
 		entries = os.scandir(staging_path(job_vault))
 	except FileNotFoundError:
 		return
 	name = os.path.basename(os.path.normpath(tree))
-	due = set()
+	staged, due = set(), set()
 	with entries:
 		for entry in entries:
 			if not entry.is_symlink():
 				continue
 			rel = staged_forward_rel(os.readlink(entry.path), name)
+			if rel is None:
+				continue
+			# once: a link empty_staging() could not remove and a later cut at its rel leave two
+			staged.add(rel)
 			# the parent's folders first: a link above would lead the looks at rel out of the version
-			if rel is not None and real_folders_to(previous, rel) and not os.path.lexists(os.path.join(previous, rel)) and os.path.lexists(os.path.join(tree, rel)):
-				# once: a link empty_staging() could not remove and a later cut at its rel leave two
+			if real_folders_to(previous, rel) and not os.path.lexists(os.path.join(previous, rel)) and os.path.lexists(os.path.join(tree, rel)):
 				due.add(rel)
+	if not staged:
+		return
+	guard.require()
+	for rel in sorted(due):
+		os.symlink(forward_text(rel, name), os.path.join(previous, rel))
 	if due:
-		guard.require()
-		for rel in sorted(due):
-			os.symlink(forward_text(rel, name), os.path.join(previous, rel))
 		# as put_back_forward_links(): the folders above a link a pool copied to another disk read their old mtimes for a second
 		forget_pool_cache(previous)
+	flush_or_fail(job_vault, os.path.basename(job_vault), f'the links in {staging_path(job_vault)} stay, and the next scan goes on with them')
 
 def prepare_roll_forward(info:VaultInfo, manifest:'VaultManifest', guard:PoolGuard) -> list:
 	'''
@@ -7663,17 +7678,18 @@ def read_job_vault_r(job_vault:str, manifest:'VaultManifest', job_name:str) -> V
 	the previous version's folders given their times back first, so a cut between the two repeats it; any other is
 	the tree, kept, made ready for its roll-forward (prepare_roll_forward()) and returned in VaultInfo.tree for the next attempt. On a
 	pool the scan checks the pool before each act that a listing through it decides, as a disk gone makes an absence true: the staging
-	repair's renames (repair_pool_vault(), for any vault with leftovers in staging), the links given back from staging (before the first is
-	written), the skeleton's removal, right before it (which covers the
-	judgement and the walk that gives the folder times back) and right after, and the tree's repair, whose last check is at the end of
-	prepare_roll_forward(): a batch that reuses the scan, with a guard of its own made once every disk is back, never gets the view of a
-	scan taken with a disk gone. What goes by its name alone (the private list folders, staging once repaired, the 0.54 files) is garbage
-	whatever the pool shows, and goes unchecked. A lone V0 orphan goes. Any other orphan is an error, before
-	anything is removed. A lost manifest names nothing: its private list goes, and the orphan is judged the same way, so a cut tree stays.
+	repair's renames (repair_pool_vault(), for any vault with leftovers in staging), the links given back from staging (whenever staging
+	holds a link of the forward form to the tree, before the first is written; the vault is flushed after them, before staging is emptied),
+	the skeleton's removal, right before it (which covers the judgement and the walk that gives the folder times back) and right after, and
+	the tree's repair, whose last check is at the end of prepare_roll_forward(): a batch that reuses the scan, with a guard of its own made
+	once every disk is back, never gets the view of a scan taken with a disk gone. What goes by its name alone (the private list folders,
+	staging once repaired and its links of the forward form to the tree given back, the 0.54 files) is garbage whatever the pool shows, and
+	goes unchecked. A lone V0 orphan goes. Any other orphan is an error, before anything is removed. A lost manifest names nothing: its
+	private list goes, and the orphan is judged the same way, so a cut tree stays.
 	Then a stale list below the oldest version goes and current_version moves forward, as on 0.54. A vault with no version and no orphan
 	is one started over: the manifest's version is forgotten (a conversion begun is no more to finish), and the next batch is V0.
 	A cut between two renames is finished first (repair_pool_vault()).
-	Raises VaultScanError, or PoolNotReady with a disk of the vault's pool missing, as get_vault_info() does.
+	Raises VaultScanError, or PoolNotReady with a disk of the vault's pool missing, as get_vault_info() does, or JobFailure when a flush fails.
 	'''
 	guard = PoolGuard([job_vault])
 	try:

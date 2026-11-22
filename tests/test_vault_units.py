@@ -1751,13 +1751,14 @@ def test_a_disk_dropped_during_the_starts_put_back_stops_the_scan_before_its_fir
 @pytest.mark.unit
 @pytest.mark.parametrize('unreadable', ['file', 'folder'])
 def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkeypatch, unreadable):
-	# pin, the design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
+	# pin for the newest version (passes before and after round 0.55.6's change), and case 3's test for the version before (its tail fails on
+	# 79220a8). The design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
 	# its forward link to staging first; a cut between them leaves version n's folder in the tree only. With the manifest lost no
 	# row gives the link back, and the source cannot be read at the retry: a file in the folder (mode 000), or a folder in it with
 	# files (unreadable_below()). The newest version keeps them: the scan gives the link back from staging (put_back_staged_links())
 	# before the put-back's pass 2, which since round 0.55.6 runs over a lost manifest off a pool, removes what the version before
-	# does not list. It fails on a pass 2 run over a lost manifest without that link given back first; 0.55.4 kept them too.
-	# Since round 0.55.6 the version before also reads d again (spec section 6, case 3): on 79220a8 its tail fails, d gone
+	# does not list. It fails on a pass 2 run over a lost manifest without that link given back first; 0.55.4 kept them too. The version
+	# before reads d again too (spec section 6, case 3): on 79220a8 its tail fails, d gone
 	put_text(r_job.monitor, 'd/x.bin', big_text('x0'))
 	put_text(r_job.monitor, 'd/sub/s.txt', 's0')
 	put_text(r_job.monitor, 'd/sub/t.txt', 't0')
@@ -1796,7 +1797,7 @@ def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkey
 	# retry's comparison records d/x.bin, whose read failed). The ground truth's lines for d are the cut batch's (nothing after it)
 	# and the retry's (nothing before it, as its scan gave the link back): looked at and taken out; any other line still fails the test
 	assert read_view(r_job.job_vault, os.path.basename(previous)) == view_before
-	lost = [line for line in view_truth.WRONG if line.startswith(f"{os.path.basename(previous)}:'d")]
+	lost = lines_at(os.path.basename(previous), 'd')
 	assert lost and all(line.endswith('None after it') or ': read None before the batch, ' in line for line in lost), lost
 	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost]
 
@@ -1823,12 +1824,17 @@ def cut_between_the_renames(job, monkeypatch, rel, events):
 			backup_events(job, events, **KEPT)
 	assert not os.path.lexists(os.path.join(previous, rel)) and os.path.isdir(os.path.join(tree_of(job), rel))
 	name = os.path.basename(previous)
-	lost = [line for line in view_truth.WRONG if line.startswith(f"{name}:'{rel}")]
+	lost = lines_at(name, rel)
 	assert lost and all(line.endswith('None after it') for line in lost), lost
 	moved = [line for line in view_truth.WRONG if any(line.startswith(f'{name}:{folder!r}: ') for folder in folders_above(rel))]
 	assert all(only_the_mtime_moved(line) for line in moved), moved
 	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost + moved]
 	return previous
+
+
+def lines_at(name, rel):
+	'''The ground truth's lines about the entry rel, and those below it, in the version folder name (not those of a sibling whose name starts like rel).'''
+	return [line for line in view_truth.WRONG if line.startswith(f'{name}:{rel!r}: ') or line.startswith(f"{name}:'{rel}/")]
 
 
 def folders_above(rel):
@@ -1943,7 +1949,8 @@ def test_a_users_link_in_staging_naming_another_versions_folder_is_not_put_back(
 	# pin: links in staging with the forward form at a rel where the version before holds nothing and the tree holds the entry, but naming the
 	# folder of the version before that one, or of the version before itself, not the tree's: only the tree's name, which the cut batch made,
 	# says a link is the batch's own. And one naming the tree's folder at a name the tree does not hold, which would lead nowhere. The scan
-	# leaves the version before as it was, and empties staging
+	# leaves every committed version reading what it read before (by the oracle, read here as the scan runs outside a batch, which the ground
+	# truth does not watch), and empties staging
 	base(r_job)
 	put_text(r_job.monitor, 'small.txt', 's1')
 	backup_events(r_job, [(False, 'modify', 'small.txt', None)], **KEPT)
@@ -1957,8 +1964,10 @@ def test_a_users_link_in_staging_naming_another_versions_folder_is_not_put_back(
 		os.symlink(rv.forward_text('new.txt', os.path.basename(version)), os.path.join(staging, name))
 	os.symlink(rv.forward_text('gone.txt', os.path.basename(tree_of(r_job))), os.path.join(staging, '0a1b2c'))
 	lose_the_manifest(r_job)
+	before = {os.path.basename(version): read_view(r_job.job_vault, os.path.basename(version)) for version in (older, previous)}
 	rv.get_vault_info(r_job.job_vault)
 	assert not os.path.lexists(os.path.join(previous, 'new.txt')) and not os.path.lexists(os.path.join(previous, 'gone.txt'))
+	assert {name: read_view(r_job.job_vault, name) for name in before} == before
 	assert os.listdir(staging) == []
 
 
@@ -1988,40 +1997,134 @@ def test_on_a_pool_a_cut_copy_over_a_lost_manifest_is_kept(r_job, fake_pool, mon
 	assert [line for line in out.splitlines() if 'UNREADABLE' in line and path in line], out
 
 
+def hide(path, into):
+	'''
+	path moved to into, as a pool shows it while the disk holding it is out (FakePool shows every branch's files, so a test hides what the disk
+	holds itself). Returns the function that brings it back, the mtime of the folder above kept as a disk that comes back does.
+	'''
+	parent = os.path.dirname(path)
+	st = os.lstat(parent)
+	os.rename(path, into)
+	def bring_back():
+		os.rename(into, path)
+		os.utime(parent, ns=(st.st_atime_ns, st.st_mtime_ns))
+	return bring_back
+
+
 @pytest.mark.unit
-def test_on_a_pool_the_staged_links_wait_for_every_disk(r_job, fake_pool, monkeypatch):
-	# on a pool "the version before holds nothing at d" is an absence, which a disk gone makes true of what it holds: the links due are judged
-	# first, and the pool is checked before the first is written. A branch dropped once the scan read the vault whole: PoolNotReady, nothing
-	# written, and the link still in staging for the next scan, which gives it back once the disk is mounted again. Fails on 79220a8: the scan
-	# empties staging and the link is gone (a later check of the scan raises PoolNotReady)
+@pytest.mark.parametrize('hidden', ['nothing', 'the tree entry', 'a folder above in the version before'])
+def test_on_a_pool_the_staged_links_wait_for_every_disk(r_job, fake_pool, monkeypatch, tmp_path, hidden):
+	# on a pool "the version before holds nothing at d" and "the tree holds d" are looks through the pool, which a disk gone answers as if the
+	# entry were not there: the pool is checked once a link in staging has the forward form to the tree's folder, before the links due are
+	# written or staging is emptied, so the link, its only record over a lost manifest, stays for the scan that finds every disk. A branch
+	# dropped after the orphan was judged: PoolNotReady, nothing written, and the link still in staging, with the disk out holding (as FakePool
+	# shows every branch's files, the test moves it out of the vault meanwhile): nothing (the link is due, and the check before the first
+	# write is the one that fails), the tree's d (the link is not due: the tree holds nothing there), or a folder above rel in the version
+	# before, p (not due: its parent is no real folder). Once the disk is back the next scan gives the link back. Fails on eaa1ed6 with a
+	# disk's entry out: the scan empties staging and the link is gone (a later check of the scan raises PoolNotReady); on 79220a8 in all three
+	rel = 'p/d' if hidden.startswith('a folder') else 'd'
 	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
-	before = folder_backed_up(r_job)
-	os.remove(os.path.join(r_job.monitor, 'd', 'x.txt'))
-	previous = cut_between_the_renames(r_job, monkeypatch, 'd', [(False, 'delete', 'd/x.txt', None)])
+	before = folder_backed_up(r_job, rel)
+	os.remove(os.path.join(r_job.monitor, rel, 'x.txt'))
+	previous = cut_between_the_renames(r_job, monkeypatch, rel, [(False, 'delete', f'{rel}/x.txt', None)])
 	tree = tree_of(r_job)
-	staged = [rv.forward_text('d', os.path.basename(tree))]
+	staged = [rv.forward_text(rel, os.path.basename(tree))]
 	assert staged_link_texts(r_job) == staged
 	lose_the_manifest(r_job)
-	real, dropped = rv.read_vault_whole, []
-	def read_whole(*args, **kwargs):
-		listing = real(*args, **kwargs)
+	held = {'nothing': None, 'the tree entry': os.path.join(tree, rel), 'a folder above in the version before': os.path.join(previous, 'p')}[hidden]
+	real, dropped, bring_back = rv.remove_unfinished_change_lists, [], []
+	def judged(*args, **kwargs):
+		# the scan's next step after the judgement of the orphan
+		real(*args, **kwargs)
 		if not dropped:
 			dropped.append(True)
 			fake_pool.drop(branches[1])
-		return listing
+			if held is not None:
+				bring_back.append(hide(held, os.path.join(str(tmp_path), 'out_with_the_disk')))
 	with monkeypatch.context() as patched:
-		patched.setattr(rv, 'read_vault_whole', read_whole)
+		patched.setattr(rv, 'remove_unfinished_change_lists', judged)
 		with pytest.raises(rv.PoolNotReady):
 			rv.get_vault_info(r_job.job_vault)
 	assert dropped
-	assert not os.path.lexists(os.path.join(previous, 'd'))
+	assert not os.path.lexists(os.path.join(previous, rel))
 	assert staged_link_texts(r_job) == staged, 'the link the cut left in staging is gone'
+	for back in bring_back:
+		back()
 	fake_pool.mount(branches[1])
 	rv.get_vault_info(r_job.job_vault)
-	assert os.readlink(os.path.join(previous, 'd')) == staged[0]
+	assert os.readlink(os.path.join(previous, rel)) == staged[0]
 	roll_forward(r_job)
-	assert read_view(r_job.job_vault, os.path.basename(previous)) == before
+	assert timeless_at(read_view(r_job.job_vault, os.path.basename(previous)), folders_above(rel)) == timeless_at(before, folders_above(rel))
 	assert contents_of(committed_versions(r_job)[-1]) == contents_of(r_job.monitor)
+
+
+@pytest.mark.unit
+def test_the_links_given_back_are_flushed_before_staging_is_emptied(r_job, monkeypatch):
+	# the link given back to the version before and the one in staging are the same entry's only two copies over a lost manifest, and
+	# empty_staging() removes the second: a power cut after that removal reaches the disk and before the new link does (on a pool they can sit
+	# on different branches whose checkpoints are out of step; on f2fs a long link's text is data a checkpoint does not keep) loses the entry for
+	# good, so the vault is flushed between (flush_or_fail(), as the code around it does) and staging stays when that fails. A scan that finds
+	# its link given back already (the first one's flush failed, or was cut) flushes too: it is the one that empties staging. The real
+	# durability is not observable here: the order of the link, the flush and the removal is. Fails on eaa1ed6: staging is emptied with no flush
+	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
+	folder_backed_up(r_job)
+	os.remove(os.path.join(r_job.monitor, 'd', 'x.txt'))
+	previous = cut_between_the_renames(r_job, monkeypatch, 'd', [(False, 'delete', 'd/x.txt', None)])
+	tree = tree_of(r_job)
+	text = rv.forward_text('d', os.path.basename(tree))
+	lose_the_manifest(r_job)
+	events, failing = [], [True]
+	real_symlink, real_flush, real_empty = os.symlink, rv.flush_vault_disks, rv.empty_staging
+	def symlink(source, dest, *args, **kwargs):
+		real_symlink(source, dest, *args, **kwargs)
+		if os.path.normpath(os.fspath(dest)) == os.path.join(previous, 'd'):
+			events.append('link')
+	def flush(job_vault, job_name):
+		events.append('flush')
+		return ['a disk'] if failing else real_flush(job_vault, job_name)
+	def empty(job_vault):
+		events.append('empty')
+		return real_empty(job_vault)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv.os, 'symlink', symlink)
+		patched.setattr(rv, 'flush_vault_disks', flush)
+		patched.setattr(rv, 'empty_staging', empty)
+		with pytest.raises(rv.JobFailure) as failed:
+			rv.get_vault_info(r_job.job_vault)
+		assert events == ['link', 'flush'], events
+		assert 'a disk failed a sync' in failed.value.reason
+		assert os.readlink(os.path.join(previous, 'd')) == text and staged_link_texts(r_job) == [text]
+		failing.clear()
+		events.clear()
+		rv.get_vault_info(r_job.job_vault)
+	assert events[:2] == ['flush', 'empty'], events
+	assert os.readlink(os.path.join(previous, 'd')) == text and os.listdir(rv.staging_path(r_job.job_vault)) == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('above', ['nothing', 'a link to elsewhere'])
+def test_a_staged_link_is_not_written_through_a_parent_that_is_no_real_folder(r_job, monkeypatch, tmp_path, above):
+	# pin: a link in staging with the forward form to the tree's folder at p/d, which the tree holds, where the version before holds nothing at
+	# p/d, but its parent p in the version before is no real folder: missing, or a link of the user's leading out of it. exchange_in() makes
+	# the folders above real first, so a cut cannot leave this, and the link would be written through p (a link leading out of the version
+	# takes the entry to where it points, a missing p fails the scan): it is not due, and nothing is written
+	base(r_job)
+	put_text(r_job.monitor, 'small.txt', 's1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'small.txt', None)], monkeypatch)
+	tree, previous = tree_of(r_job), committed_versions(r_job)[-1]
+	put_text(tree, 'p/d', 'd1')
+	outside = os.path.join(str(tmp_path), 'outside')
+	os.mkdir(outside)
+	if above == 'a link to elsewhere':
+		os.symlink(outside, os.path.join(previous, 'p'))
+	staging = rv.staging_path(r_job.job_vault)
+	os.makedirs(staging, exist_ok=True)
+	os.symlink(rv.forward_text('p/d', os.path.basename(tree)), os.path.join(staging, 'a1b2c3'))
+	before = os.listdir(previous)
+	with vault_unit(r_job.job_vault):
+		rv.put_back_staged_links(previous, tree, r_job.job_vault, rv.PoolGuard([r_job.job_vault]))
+	assert os.listdir(outside) == []
+	assert sorted(os.listdir(previous)) == sorted(before) and not os.path.lexists(os.path.join(previous, 'p', 'd'))
 
 
 @pytest.mark.unit
