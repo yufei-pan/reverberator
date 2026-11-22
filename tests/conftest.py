@@ -269,7 +269,7 @@ def pytest_collection_modifyitems(config, items):
 	# missed theirs, and `pytest -m unit` left most of design R's unit tests out. first, so no -m has deselected it yet. a
 	# collection error and not a UsageError, because an xdist worker hands it on as any other, where a UsageError ends the
 	# controller in an INTERNALERROR that names one test (xdist's crashed item) and loses the reason. Without xdist the error
-	# interrupts the run (exit 2, no test runs); under xdist the ERROR line shows, the run exits 1, and the other tests still run
+	# interrupts the run (exit 2, no test runs); under xdist the ERROR line shows, the run exits 1, and every test runs, the named ones too
 	report_layer_errors(config, unmarked_tests(items), 'no layer marker')
 	report_layer_errors(config, multi_layer_tests(items), 'more than one layer marker')
 	if sys.platform == 'linux':

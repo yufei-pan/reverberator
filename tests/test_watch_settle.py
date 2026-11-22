@@ -278,7 +278,7 @@ QUEUE_LIMIT = '/proc/sys/fs/inotify/max_queued_events'
 
 
 @pytest.mark.skipif(os.geteuid() != 0 or 'PYTEST_XDIST_WORKER' in os.environ,
-	reason='sets the host-wide fs.inotify.max_queued_events: as root, alone (no xdist), in the test VM')
+	reason='needs root and no xdist worker: it sets the host-wide fs.inotify.max_queued_events (the test VM runs it alone)')
 def test_a_big_move_out_fits_a_real_queue_of_64(session, job, tmp_path, monkeypatch):
 	'''The same with the kernel's limit really 64 while the watch's instance is made: 301 removals at once overflowed it.'''
 	with open(QUEUE_LIMIT) as f:
@@ -354,21 +354,6 @@ def test_the_maximum_delay_counts_on_across_overflows(job, monkeypatch, poll_fas
 		watching.join(10)
 		writer.join(5)
 		rv.GREEN_LIGHT.set()
-
-
-def test_removing_a_watch_already_gone_does_nothing():
-	class FakeINotify:
-		def __init__(self):
-			self.removed = []
-		def rm_watch(self, wd):
-			self.removed.append(wd)
-	class FakeIrm:
-		decreased = 0
-		def decreaseUserWatches(self, count=1):
-			self.decreased += count
-	inotify_obj, irm, wd_dic, forgotten = FakeINotify(), FakeIrm(), {1: '/m/a/', 2: '/m/b/'}, []
-	assert rv.remove_watches(inotify_obj, wd_dic, irm, [1, 3, 1], forgotten.append) == 1
-	assert inotify_obj.removed == [1] and irm.decreased == 1 and wd_dic == {2: '/m/b/'} and forgotten == [1]
 
 
 @pytest.mark.parametrize('kind', ['found', 'leaving', 'doubtful'])

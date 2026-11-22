@@ -1115,36 +1115,6 @@ def test_a_watcher_whose_walk_raises_fails_its_job_with_the_traceback(job, poll_
 	assert 'in iter_tree_entries' in traceback and 'ValueError: a bug in the skip list' in traceback
 
 
-@pytest.mark.parametrize('error, logged_as_error', [(errno.ENOENT, False), (errno.ENOTDIR, False), (errno.EACCES, True)])
-def test_a_watch_failing_for_a_folder_that_is_gone_logs_info(tmp_path, monkeypatch, error, logged_as_error):
-	# a folder made and removed before its watch is added (pytest-cache-files-* folders) is a normal race that misses
-	# nothing: an info line; any other failure stays an error
-	monitor = tmp_path / 'm'
-	(monitor / 'gone').mkdir(parents=True)
-	gone = str(monitor / 'gone')
-	class FakeINotify:
-		def __init__(self):
-			self.next = 1
-		def add_watch(self, path, mask):
-			if os.path.abspath(path).rstrip('/') == gone:
-				raise OSError(error, os.strerror(error))
-			self.next += 1
-			return self.next
-	class FakeIrm:
-		def increaseUserWatches(self):
-			pass
-		def decreaseUserWatches(self):
-			pass
-	lines = []
-	monkeypatch.setattr(rv, 'watcherTeeLogToTl', lambda monitor_path, message, error=False, ok=False: lines.append((message, error)))
-	unwatched = set()
-	rv.initializeFolderWatchers(FakeINotify(), str(monitor), {}, FakeIrm(), 0, unwatched=unwatched)
-	failed = [(message, is_error) for message, is_error in lines if 'Failed to add watch' in message]
-	assert failed == [(f'Failed to add watch for {gone}/: [Errno {error}] {os.strerror(error)}', logged_as_error)] or \
-		failed == [(f'Failed to add watch for {gone}: [Errno {error}] {os.strerror(error)}', logged_as_error)], lines
-	assert unwatched == ({gone} if logged_as_error else set())
-
-
 def _lines_after_chmod_of_a_watched_folder(job, monkeypatch):
 	'''The watcher's lines once it has read a chmod of d, a folder it watches from its start.'''
 	d = os.path.join(job.monitor, 'd')

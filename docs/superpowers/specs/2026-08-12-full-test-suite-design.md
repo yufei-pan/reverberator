@@ -10,7 +10,7 @@ Scope: pytest suite under `tests/`, small hooks in `reverberator.py`, pytest con
 - Design tests to hit as many branches as those paths reasonably contain. Line/branch coverage is a report, not a CI fail-the-build gate.
 - Default `uv run --extra test pytest` runs the full **unprivileged** suite (unit + live inotify + process).
 - Fast loop: `uv run --extra test pytest -m unit`.
-- Privileged mount/unmount tests exist but skip unless root or `REVERB_PRIVILEGED=1`.
+- Privileged tests (a real mount: tmpfs, a loop image, mergerfs, dm) exist but skip where the machine cannot run them (not root, or the image tool, mergerfs or `/dev/fuse` missing); the test VM's gate runs them, and a skip there counts as a failure. Three older modules also let `REVERB_PRIVILEGED=1` stand for root.
 - Keep doctests in `reverberator.py`; pytest collects them.
 - Do not split `reverberator.py`. Production changes are thin hooks only.
 
@@ -41,12 +41,12 @@ The daemon stays a single module. Tests are a layered pytest suite.
 
 | Marker | Meaning | Default `pytest` |
 |--------|---------|------------------|
-| `unit` | In-process, temp dirs, no kernel watch, no daemon or CLI process (a helper such as `cp` may run, and root may be needed for a `trusted.*` attribute or a chown): this follows the rule of round 0.55.6's Task 1 | run |
+| `unit` | In-process, temp dirs, no kernel watch, no daemon or CLI process (a helper such as `cp`, or a child that only runs library code, may run, and root may be needed for a `trusted.*` attribute or a chown): this follows the rule of round 0.55.6's Task 1 | run |
 | `inotify` | Real `inotify_simple` on a temp tree | run |
 | `process` | Spawn `reverberator.py` CLI | run |
-| `privileged` | Real bind-mount / unmount | collect, **skip** unless `os.geteuid() == 0` or env `REVERB_PRIVILEGED=1` |
+| `privileged` | A real mount (tmpfs, a loop image, mergerfs, dm) | collect, **skip** where the machine cannot run it (each test names what it needs: root, `mkfs.f2fs`, mergerfs, `/dev/fuse`, a scratch image) |
 
-`privileged` is test-side only. Production code does not read `REVERB_PRIVILEGED`.
+`privileged` is test-side only. Production code does not read `REVERB_PRIVILEGED`, which only `test_privileged.py`, `test_fs_monitor.py` and `test_inner_mounts.py` read.
 
 Skip `inotify` and `process` on non-Linux (`sys.platform != "linux"`). This project already declares POSIX Linux.
 
