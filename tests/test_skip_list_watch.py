@@ -121,11 +121,17 @@ def test_move_out_of_skipped_name_is_create(job, poll_fast):
 
 def test_folder_moved_into_skipped_name_loses_watches(job, poll_fast):
 	seed_monitor(job, {'d/sub/': None})
-	thread, to_process, lock = _start(job, ['old_*/'])
+	quiet = threading.Event()
+	thread, to_process, lock = _start(job, ['old_*/'], quiet)
 	try:
 		os.rename(os.path.join(job.monitor, 'd'), os.path.join(job.monitor, 'old_d'))
 		src = os.path.join(job.monitor, 'd')
 		wait_until(lambda: any(e.event == 'delete' and e.path == src and e.is_dir for e in _events(to_process, lock)), message='no delete')
+		# the delete is queued as the move is read, and the watches go at the settle once the event queue is empty ( settle() ):
+		# a write before it comes at d/sub/x. the quiet signal set after the delete comes from a read that found the queue
+		# empty, after its settle
+		quiet.clear()
+		assert quiet.wait(10), 'watcher did not signal quiet'
 		open(os.path.join(job.monitor, 'old_d', 'sub', 'x'), 'w').write('x')
 		_probe(job, to_process, lock)
 		assert _paths(to_process, lock, 'old_d') == []
