@@ -854,3 +854,51 @@ def test_a_job_vault_on_a_real_mount_of_its_own_on_a_branch_commits_and_is_synce
 			backup_events(job, [(False, 'modify', 'a.txt', None)])
 			assert len(committed_versions(job)) == 2
 			assert os.stat(own.folder).st_dev in synced
+
+
+@pytest.mark.privileged
+@needs_mergerfs
+def test_a_tmpfs_under_a_real_branch_is_paused_when_unmounted(monkeypatch):
+	# fails on main (taken as deleted, then copied back): the monitored path on a real mergerfs pool (real_pool()'s, the vault off it),
+	# a tmpfs (bound from one kept aside, so it comes back with what it held) mounted under the first branch at the monitored path's
+	# place; a first version; the tmpfs unmounted and a.txt changed, a full comparison: the version keeps the tmpfs's files, "Inner
+	# mounts not mounted" logged; mounted again, the next full comparison copies nothing under it
+	from tests.test_inner_mounts import _lines, _read
+	with real_pool() as root:
+		pool = os.path.join(root, 'vault')
+		job = create_job(os.path.join(root, 'job'))._replace(monitor=os.path.join(pool, 'data'))
+		place = os.path.join(rv.read_pool_branches(pool)[0], 'data', 'sub')
+		store = os.path.join(root, 'store')
+		os.makedirs(place)
+		os.makedirs(store)
+		subprocess.check_call(['mount', '-t', 'tmpfs', '-o', 'size=16m', 'tmpfs', store])
+		try:
+			# written on the tmpfs itself: through the pool, a create can land on another branch
+			for rel, text in (('f.txt', 'f'), ('g/h.txt', 'h')):
+				put_text(store, rel, text)
+			subprocess.check_call(['mount', '--bind', store, place])
+			put_text(job.monitor, 'a.txt', 'a')
+			run_backup(job, matched_since=time.time_ns())
+			assert _read(os.path.join(committed_versions(job)[0], 'sub', 'g', 'h.txt')) == 'h'
+			subprocess.check_call(['umount', place])
+			assert os.listdir(os.path.join(job.monitor, 'sub')) == []
+			put_text(job.monitor, 'a.txt', 'changed')
+			lines = _lines(monkeypatch)
+			run_backup(job, matched_since=time.time_ns())
+			v1 = committed_versions(job)[1]
+			assert _read(os.path.join(v1, 'sub', 'f.txt')) == 'f' and _read(os.path.join(v1, 'sub', 'g', 'h.txt')) == 'h'
+			assert _read(os.path.join(v1, 'a.txt')) == 'changed'
+			assert 'Inner mounts not mounted, keeping their last backed-up contents: sub/' in lines
+			subprocess.check_call(['mount', '--bind', store, place])
+			copied = []
+			real = rv.cp_af_copy_path
+			def recorder(source_path, *args, **kwargs):
+				copied.append(source_path)
+				return real(source_path, *args, **kwargs)
+			monkeypatch.setattr(rv, 'cp_af_copy_path', recorder)
+			run_backup(job, matched_since=time.time_ns())
+			assert [path for path in copied if path.startswith(os.path.join(job.monitor, 'sub') + '/')] == []
+			assert _read(os.path.join(committed_versions(job)[-1], 'sub', 'g', 'h.txt')) == 'h'
+		finally:
+			subprocess.call(['umount', place], stderr=subprocess.DEVNULL)
+			subprocess.call(['umount', store])

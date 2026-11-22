@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 import pytest
 import reverberator as rv
-from tests.harness import (write_scan_leftover, committed_versions, latest_version, seed_monitor, wait_for_committed_count, wait_until,
+from tests.harness import (write_scan_leftover, change_list_of, committed_versions, latest_version, run_backup, seed_monitor, wait_for_committed_count, wait_until,
 	write_fstab, write_incomplete_version)
 
 
@@ -513,3 +513,127 @@ def test_the_guard_of_a_batch_answers_for_the_job_folder_however_the_vault_path_
 	for asked in (plain, os.path.join(job.vault, job.job_name), plain + '/'):
 		assert guard.covers(asked), asked
 	assert not guard.covers(os.path.join(plain, 'other'))
+
+
+# ---- D10: a disk mounted under a pool's disk at the monitored path's place -------------------------------------------------
+
+def _a_pool_with_a_disk_under_its_branch(tmp_path, fake_pool):
+	'''
+	The pool at <tmp>/pool of one disk, disk1, the monitored path <tmp>/pool/data, and a disk mounted at <disk1>/data/sub, which the
+	pool shows at <tmp>/pool/data/sub (the fake pool's folder stands for what the pool shows): (the monitored path, the disk's mount
+	point).
+	'''
+	pool = os.path.realpath(tmp_path / 'pool')
+	disk1, = fake_pool.add(pool, ['disk1'])
+	monitor = os.path.join(pool, 'data')
+	os.makedirs(os.path.join(monitor, 'sub'))
+	return monitor, fake_pool.add_mount(os.path.join(disk1, 'data', 'sub'))
+
+
+@pytest.mark.unit
+def test_a_mount_under_a_branch_at_the_paths_place_is_an_inner_mount(tmp_path, fake_pool):
+	# fails on main (no pool parameter; the mount table shows the disk under disk1, not under the monitored path): the disk at
+	# <disk1>/data/sub is an inner mount of <tmp>/pool/data, as the pool shows it. One at the place itself (<disk1>/data) is the
+	# fstab wait's, not an inner mount
+	monitor, disk = _a_pool_with_a_disk_under_its_branch(tmp_path, fake_pool)
+	table = rv.read_mount_table()
+	state = rv.pool_state(monitor, table)
+	assert rv.inner_mount_rels(table, monitor, pool=state) == {'sub/'}
+	assert rv.pool_inner_mounts(table, monitor, state) == {os.path.join(monitor, 'sub'): disk}
+	fake_pool.add_mount(os.path.dirname(disk))
+	table = rv.read_mount_table()
+	assert rv.inner_mount_rels(table, monitor, pool=rv.pool_state(monitor, table)) == {'sub/'}
+
+
+@pytest.mark.unit
+def test_a_full_comparison_with_it_unmounted_keeps_its_rows(job, tmp_path, fake_pool, monkeypatch, poll_fast):
+	# fails on main (its rows deleted): a first version with the disk mounted holds its files; the disk unmounted (out of the table,
+	# its folder empty through the pool) and a.txt changed, the full comparison pauses it: "Inner mounts not mounted" logged, the new
+	# version keeps the disk's last copies, the matched time is the first version's carried forward, and the mount is remembered
+	from tests.test_inner_mounts import _lines, _read, _recorded
+	monitor, disk = _a_pool_with_a_disk_under_its_branch(tmp_path, fake_pool)
+	job = job._replace(monitor=monitor)
+	seed_monitor(job, {'a.txt': 'a', 'sub/f.txt': 'f', 'sub/g/h.txt': 'h'})
+	run_backup(job, matched_since=time.time_ns())
+	(_, since), _ = _recorded(job)
+	fake_pool.drop(disk)
+	shutil.rmtree(os.path.join(monitor, 'sub'))
+	os.mkdir(os.path.join(monitor, 'sub'))
+	seed_monitor(job, {'a.txt': 'changed'})
+	lines = _lines(monkeypatch)
+	run_backup(job, matched_since=time.time_ns())
+	v1 = committed_versions(job)[1]
+	assert _read(os.path.join(v1, 'sub', 'f.txt')) == 'f' and _read(os.path.join(v1, 'sub', 'g', 'h.txt')) == 'h'
+	assert _read(os.path.join(v1, 'a.txt')) == 'changed'
+	assert 'Inner mounts not mounted, keeping their last backed-up contents: sub/' in lines
+	assert os.path.join(monitor, 'sub') not in _read(change_list_of(v1))
+	assert _recorded(job) == ((os.path.basename(v1), since), ['sub/'])
+
+
+
+@pytest.mark.unit
+def test_its_files_deleted_while_it_is_mounted_are_deleted(job, tmp_path, fake_pool, poll_fast):
+	# pin: the disk mounted and emptied is not paused, as the batch's pool is passed to every look at it: the backuper's comparison of
+	# a scanned folder (the watcher's scan of it) finds its file deleted, and so does a full comparison, whose version lacks it
+	monitor, _ = _a_pool_with_a_disk_under_its_branch(tmp_path, fake_pool)
+	job = job._replace(monitor=monitor)
+	seed_monitor(job, {'a.txt': 'a', 'sub/f.txt': 'f'})
+	run_backup(job)
+	os.remove(os.path.join(monitor, 'sub', 'f.txt'))
+	table = rv.read_mount_table()
+	entries = OrderedDict()
+	_, manifest, full = rv.compare_scanned_folders(entries, [os.path.join(monitor, 'sub')], job.job_name, monitor, job.vault,
+		vaultInfo=rv.get_vault_info(job.job_vault), pool_guard=rv.PoolGuard([job.job_vault, monitor], mount_table=table), mount_table=table)
+	manifest.close()
+	assert not full and entries[os.path.join(monitor, 'sub', 'f.txt')].event == 'delete'
+	run_backup(job)
+	assert not os.path.lexists(os.path.join(committed_versions(job)[1], 'sub', 'f.txt'))
+
+@pytest.mark.unit
+def test_its_fingerprint_is_the_disks_own(tmp_path, fake_pool):
+	# fails on main (no pool parameter): the watcher's fingerprint of the inner mount at <tmp>/pool/data/sub is the one of the disk
+	# mounted at <disk1>/data/sub, not the pool's, which a disk under a branch never changes
+	monitor, disk = _a_pool_with_a_disk_under_its_branch(tmp_path, fake_pool)
+	table = rv.read_mount_table()
+	watched = rv.watched_inner_mounts(table, monitor, pool=rv.pool_state(monitor, table))
+	assert watched == {os.path.join(monitor, 'sub'): rv.mount_fingerprint(table, disk)}
+	assert watched[os.path.join(monitor, 'sub')] != rv.mount_fingerprint(table, os.path.join(monitor, 'sub'))
+
+
+@pytest.mark.unit
+def test_the_watcher_compares_it_when_it_is_mounted_again(tmp_path, fake_pool):
+	# fails on main (nothing queued): the watcher follows the disk under the branch as an inner mount, each change of it (mounted,
+	# unmounted, mounted again) a scan of its folder through the pool
+	monitor, disk = _a_pool_with_a_disk_under_its_branch(tmp_path, fake_pool)
+	queue = rv.ChangeEventQueue(monitor)
+	class FakeINotify:
+		def rm_watch(self, wd):
+			pass
+		def add_watch(self, path, mask):
+			return 1
+	inner = {}
+	def follow():
+		return rv.follow_inner_mounts(FakeINotify(), monitor, rv.read_mount_table(), inner, {}, rv.inotify_resource_manager(), 0, queue, threading.Lock())
+	assert follow() == 1
+	fake_pool.drop(disk)
+	assert follow() == 1 and inner == {}
+	fake_pool.mount(disk)
+	assert follow() == 1 and list(inner) == [os.path.join(monitor, 'sub')]
+	assert [(event.event, event.path) for event in queue] == [('scan', os.path.join(monitor, 'sub'))] * 3
+
+
+@pytest.mark.unit
+def test_off_a_pool_inner_mounts_are_as_today(tmp_path):
+	# pin: off a pool, an inner mount is a mount point under the monitored path, and a disk mounted at a folder of the same name
+	# elsewhere is none: pool_state() is None there, so no caller passes a pool
+	root = os.path.realpath(tmp_path)
+	monitor = os.path.join(root, 'm')
+	for folder in ('m/disk', 'disk1/m/sub'):
+		os.makedirs(os.path.join(root, folder))
+	disk = (b'2', b'8:17', b'/', b'/dev/sdb1', b'xfs')
+	table = [('/', (b'1', b'8:1', b'/', b'/dev/sda1', b'ext4')), (os.path.join(monitor, 'disk'), disk),
+		(os.path.join(root, 'disk1'), (b'3', b'8:33', b'/', b'/dev/sdc1', b'xfs')), (os.path.join(root, 'disk1', 'm', 'sub'), (b'4', b'8:49', b'/', b'/dev/sdd1', b'xfs'))]
+	assert rv.pool_state(monitor, table) is None
+	assert rv.inner_mount_rels(table, monitor) == {'disk/'}
+	assert rv.watched_inner_mounts(table, monitor) == {os.path.join(monitor, 'disk'): disk}
+	assert rv.paused_inner_mounts(monitor, ['disk/', 'gone/'], table) == set()
