@@ -828,19 +828,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.5: every restore, on a pool or off one, checks its folder's filesystem
   (`st_dev`) at each sync against the handles it opened, as the daemon's units check theirs.
 
-### An /etc/fstab that cannot be read names no disk
-
-- **Kind:** deferred.
-- **What the operator sees:** while /etc/fstab cannot be read for another reason than its absence (a read error; the
-  daemon reads it as root, so in practice a failing root filesystem), the disk check takes it as naming no mount point,
-  as it takes a missing one, and says nothing: a path under an unmounted fstab mount point counts as there, so a start
-  makes the Vault Path and the job's own folder on the bare mount point and, with an N/A or auto Vault File System
-  Signature, backs up there, as for a disk mounted outside fstab (see "Vault disks mounted outside fstab").
-- **Why:** older than 0.55.5 for the Vault Path; 0.55.5's wait on the job's own folder takes the same rule. A missing file
-  is an answer; a read error is none, and an absence counts as evidence only when the source answered.
-- **Revisit when:** the round after 0.55.5: a read error other than "no such file" is a problem that the wait names and
-  waits on.
-
 ### A disk fstab mounts under a pool's disk, below a monitored path's place, is not paused
 
 - **Kind:** deferred.
@@ -860,20 +847,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   disk is part of the tree.
 - **Revisit when:** the round after 0.55.5: such a disk paused as an inner mount of the monitored path, its files kept and
   the matched time held, as for a disk mounted inside the tree.
-
-### On a pool, every pool check reads /etc/fstab again
-
-- **Kind:** deferred.
-- **What the operator sees:** nothing but cost. For a job whose monitored tree or vault is on a mergerfs pool, each check
-  of the pool (every check of a batch's pool guard, one a second at most during a long walk or copy, and every look of a
-  wait) reads /etc/fstab again, and a wait's look reads it twice. A one-file batch with its tree on a pool reads it 9
-  times where 0.55.4 read it twice: about 1.9 ms a batch on the mount table and fstab reads, where about 1.4 ms was
-  within reach (0.55.4 spent about 2.5 ms, as it read the mount table more often).
-- **Why:** new in 0.55.5. The rule for a disk fstab mounts under a pool's disk (R40) is in `pool_state()`, which every
-  guard check and every wait calls, and `vault_disk_problem()` reads fstab once more for its own rule before it asks
-  `pool_state()`. The answer matters only where fstab names a mount point under a pool's disk.
-- **Revisit when:** the next round's lightness list: one fstab read per look, as L4 did for the mount table (the wait
-  hands the points it read to `pool_state()`, and a guard keeps those under its disks from when its step began).
 
 ### An xattr change made while down, in a folder renamed during the start's walk
 
