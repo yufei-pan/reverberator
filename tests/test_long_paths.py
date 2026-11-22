@@ -11,7 +11,7 @@ root's, while its monitored path stays under it.
 '''
 import datetime
 import os
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 import pytest
 
@@ -248,6 +248,26 @@ def test_a_full_comparison_meeting_only_an_entry_left_out_makes_no_version(job, 
 		assert run_backup(job) == versions
 		assert not_backed_up(capsys) == {file: [LEFT_OUT]}
 
+
+def test_the_verification_of_a_batch_meets_what_it_left_out_and_logs_it_once(job, capsys):
+	# fails on main ("JobFailure: recording ... failed: [Errno 36] File name too long"). As the daemon runs a batch: its touched scopes are
+	# compared with the tree after the replay, which finds the entries left out untracked again: their fixes are left out by the same
+	# rule, with no second line, and the batch commits the rest
+	seed_monitor(job, {'a': 'a'})
+	folder = deep_folder(job, 4000)
+	run_backup(job)
+	link = os.path.join(folder, 'l' * 95)
+	os.symlink('target', link)
+	past = os.path.join(folder, 'h' * 96)
+	os.mkdir(past)
+	write(os.path.join(past, 'x'), 'x')
+	write(os.path.join(job.monitor, 'a'), 'a2')
+	events = [rv.ChangeEvent(float(i), is_dir, event, path, None) for i, (event, path, is_dir) in
+		enumerate([('modify', os.path.join(job.monitor, 'a'), False), ('create', link, False), ('create', past, True)])]
+	capsys.readouterr()
+	versions = run_backup(job, rv.change_events_to_backup_entries(deque(events), job.monitor), touched=rv.touched_scopes(events, job.monitor))
+	assert len(versions) == 2 and read(os.path.join(versions[-1], 'a')) == 'a2' and listed(versions[-1], job, folder) == []
+	assert not_backed_up(capsys) == {link: [LEFT_OUT], past: [LEFT_OUT]}
 
 def test_a_move_to_a_path_past_the_limit_takes_its_source_out_and_leaves_it_out(job, capsys):
 	# fails on main: "JobFailure: recording ... failed: [Errno 36] File name too long" at the rename's record of its target. A move one
