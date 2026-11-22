@@ -75,6 +75,10 @@ def test_a_pending_file_an_older_release_left_stays_unread_and_the_start_backs_u
 	a = os.path.join(job.monitor, 'a.txt')
 	os.makedirs(job.job_vault, exist_ok=True)
 	pending = write_pending(job, [rv.ChangeEvent(1.0, False, 'modify', a, None)])
+	# bytes no reader of the old format accepts: a start that read the file would fail on it or remove it, which its event (a modify of a file
+	# the start's full comparison copies anyway) could not show
+	with open(pending, 'wb') as f:
+		f.write(b'\xff\xfe not a pending file: nothing reads it\n')
 	with open(pending, 'rb') as f:
 		written = f.read()
 	run_reverberator(job.rule_path)

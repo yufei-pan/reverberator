@@ -174,7 +174,9 @@ def test_the_first_version_names_the_tree(r_job, run):
 
 
 def test_a_lost_manifest_still_names_the_tree_by_what_it_holds(r_job, run):
-	# rows listed again from the tree hold no record, and a size of no bytes would leave the tree out of the size limit
+	# rows listed again from the tree hold no record, and a size of no bytes would leave the tree out of the size limit. The loss is
+	# followed by the full comparison every attempt starts with, which lists the tree and finds the two changes (a batch with entries
+	# never comes first over a lost manifest)
 	one = run()
 	one.base()
 	one.close()
@@ -182,8 +184,11 @@ def test_a_lost_manifest_still_names_the_tree_by_what_it_holds(r_job, run):
 	os.remove(os.path.join(r_job.job_vault, '.reverberator_manifest.sqlite'))
 	put_text(r_job.monitor, 'top.txt', 'after the loss')
 	shutil.rmtree(os.path.join(r_job.monitor, 'big'))
-	one.events([(False, 'modify', 'top.txt', None), (True, 'delete', 'big', None)])
+	one.backup()
 	assert_sizes(one)
+	folders = folders_of(r_job)
+	newest = os.path.join(r_job.job_vault, folders[max(folders)])
+	assert max(folders) == 3 and not os.path.lexists(os.path.join(newest, 'big')) and open(os.path.join(newest, 'top.txt')).read() == 'after the loss'
 
 
 # --- removing ---

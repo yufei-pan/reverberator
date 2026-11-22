@@ -12,12 +12,12 @@ from tests.harness import seed_monitor, wait_until, committed_versions, create_j
 from tests.test_log_text import alerting_lines
 
 
-def _run_backuper(paths, job, startup=None, to_process=None):
+def _run_backuper(paths, job, startup=None, to_process=None, to_process_flag=None):
 	to_process = rv.ChangeEventQueue(paths.monitor) if to_process is None else to_process
 	flag = threading.Event()
 	flag.set()
 	thread = threading.Thread(target=rv.backuper, args=(paths.job_name, to_process, threading.Lock(), paths.monitor,
-		paths.vault, 'N/A', threading.Event(), flag), kwargs=dict(startup=startup, job=job), daemon=True)
+		paths.vault, 'N/A', threading.Event() if to_process_flag is None else to_process_flag, flag), kwargs=dict(startup=startup, job=job), daemon=True)
 	thread.start()
 	return thread, to_process
 
@@ -43,18 +43,26 @@ def test_marker_helpers_exact_text(capsys):
 @pytest.mark.unit
 def test_backuper_failure_stops_only_its_job_and_saves_nothing(job, poll_fast, monkeypatch):
 	seed_monitor(job, {'a.txt': 'a'})
-	def broken(*args, **kwargs):
-		raise OSError(5, 'Input/output error')
-	monkeypatch.setattr(rv, 'do_backup', broken)
 	control = rv.JobControl(job.job_name)
 	control.start_attempt()
 	queue = rv.ChangeEventQueue(job.monitor)
-	queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
-	thread, queue = _run_backuper(job, control, to_process=queue)
+	entries = []
+	queued = threading.Event()
+	def broken(*args, **kwargs):
+		entries.append(len(args[0]))
+		if len(entries) == 1:
+			# the first batch, the whole tree's comparison (no entries), commits; a change queued meanwhile is the next batch's entry
+			queue.append(rv.ChangeEvent(1.0, False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+			queued.set()
+			return rv.VaultInfo({}, 0, 0), None, True
+		raise OSError(5, 'Input/output error')
+	monkeypatch.setattr(rv, 'do_backup', broken)
+	thread, queue = _run_backuper(job, control, to_process=queue, to_process_flag=queued)
 	thread.join(timeout=5)
 	assert not thread.is_alive() and rv.GREEN_LIGHT.is_set()
 	assert 'Input/output error' in control.failure.reason and not control.failure.permanent
-	# the batch is not handed back: the job's next attempt compares the whole tree first
+	# the batch that failed held one entry, and it is not handed back: the job's next attempt compares the whole tree first
+	assert entries == [0, 1]
 	assert len(queue) == 0
 	assert not os.path.exists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
 
@@ -92,6 +100,27 @@ def test_backuper_reports_permanent_startup_failure(job, poll_fast):
 	thread, _ = _run_backuper(job, control, startup=rv.JobStartup(job.job_name, job.monitor, bad))
 	thread.join(timeout=5)
 	assert control.failure.permanent and rv.GREEN_LIGHT.is_set()
+
+
+@pytest.mark.unit
+def test_a_file_deleted_while_the_manifest_is_lost_is_gone_from_the_attempts_first_version(job, poll_fast):
+	# pin: the reachable outcome of a tracked delete over a lost manifest: the manifest is lost (removed from outside) and b.txt deleted between
+	# two attempts. The start's first batch, the whole tree's comparison, lists the tree into a manifest again and finds b.txt gone: the
+	# new version holds a.txt and not b.txt, and the version before still holds both
+	from tests.test_vault_units import lose_the_manifest
+	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
+	v0 = run_backup(job)[0]
+	lose_the_manifest(job)
+	os.remove(os.path.join(job.monitor, 'b.txt'))
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	thread, _ = _run_backuper(job, control)
+	versions = wait_for_committed_count(job, 2, timeout=10)
+	control.fail('the test is over')
+	thread.join(timeout=5)
+	assert not thread.is_alive()
+	assert os.path.isfile(os.path.join(versions[-1], 'a.txt')) and not os.path.lexists(os.path.join(versions[-1], 'b.txt'))
+	assert os.path.isfile(os.path.join(v0, 'a.txt')) and os.path.isfile(os.path.join(v0, 'b.txt'))
 
 
 @pytest.mark.unit

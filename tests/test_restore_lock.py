@@ -382,14 +382,22 @@ def test_a_stop_while_waiting_returns_at_once_and_saves_nothing(job, monkeypatch
 	lines = _logged_lines(monkeypatch)
 	restore = []
 	real_do_backup = rv.do_backup
-	def restore_starts_first(*args, **kwargs):
-		# a restore takes its lock once the job's start has scanned the vault
-		restore.append(Held('restore'))
-		return real_do_backup(*args, **kwargs)
-	monkeypatch.setattr(rv, 'do_backup', restore_starts_first)
-	_change(job, 3)
 	to_process = rv.ChangeEventQueue(job.monitor)
-	to_process.append(rv.ChangeEvent(time.monotonic(), False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+	queued = threading.Event()
+	entries = []
+	def restore_starts_first(*args, **kwargs):
+		entries.append(len(args[0]))
+		if len(entries) == 2:
+			# a restore takes its lock once the first batch, the whole tree's comparison, has ended: the batch of the change queued
+			# meanwhile, one entry, waits for it
+			restore.append(Held('restore'))
+		result = real_do_backup(*args, **kwargs)
+		if len(entries) == 1:
+			_change(job, 3)
+			to_process.append(rv.ChangeEvent(time.monotonic(), False, 'modify', os.path.join(job.monitor, 'a.txt'), None))
+			queued.set()
+		return result
+	monkeypatch.setattr(rv, 'do_backup', restore_starts_first)
 	monitor_fs_flag = threading.Event()
 	monitor_fs_flag.set()
 	stopped = []
@@ -400,7 +408,7 @@ def test_a_stop_while_waiting_returns_at_once_and_saves_nothing(job, monkeypatch
 	stopper = threading.Thread(target=stop, daemon=True)
 	stopper.start()
 	try:
-		rv.backuper('job', to_process, threading.Lock(), job.monitor, job.vault, 'N/A', threading.Event(), monitor_fs_flag, keep_n_versions=3)
+		rv.backuper('job', to_process, threading.Lock(), job.monitor, job.vault, 'N/A', queued, monitor_fs_flag, keep_n_versions=3)
 		returned = time.monotonic()
 	finally:
 		rv.GREEN_LIGHT.set()
@@ -408,8 +416,9 @@ def test_a_stop_while_waiting_returns_at_once_and_saves_nothing(job, monkeypatch
 			held.release()
 	stopper.join(5)
 	assert stopped and returned - stopped[0] < 2
+	assert entries == [0, 1]
 	assert _numbers(job) == [0, 1, 2]
-	# the batch is not handed back, and no pending file is written: the next start compares the whole tree
+	# the batch that waited held one entry, and it is not handed back, and no pending file is written: the next start compares the whole tree
 	assert len(to_process) == 0 and not os.path.lexists(os.path.join(job.job_vault, rv.PENDING_TRANSACTIONS_FILE_NAME))
 	assert _free('backup') and _free('restore')
 

@@ -1656,11 +1656,10 @@ def test_an_unreadable_file_under_a_folder_the_version_has_a_row_of_still_makes_
 
 @needs_unreadable
 def test_an_unreadable_file_under_a_folder_over_a_lost_manifest_still_makes_no_version(job, poll_fast, capsys):
-	# fails on ea4f8a3: a manifest that does not describe the newest version answered no lookup there, so every entry under a folder
-	# counted as a change and the batch made a version that changes nothing. The check asks the newest tree: the replay's rows come
-	# from it (do_backup() lists a lost manifest from that tree before the replay), and the folder the version holds is a real folder
-	# there, so the file drops out, as on 260f399 and as with a manifest that describes the version
-	from tests.harness import event_entry
+	# pin: the attempt's first batch over a lost manifest, the full comparison, lists the tree into the manifest from the newest version
+	# (the rows the replay and the check ask), finds u.txt changed and cannot read it: the check drops it, as it does with a manifest that
+	# describes the version, so the batch makes no version, with one UNREADABLE line. (Before round 0.55.6 this sent a batch with entries over
+	# the lost manifest, a state the daemon never reaches: a batch with entries comes after the attempt's first batch.)
 	from tests.test_vault_units import lose_the_manifest
 	seed_monitor(job, {'a.txt': 'a', 'd/r.txt': 'r', 'd/u.txt': 'u'})
 	before = _settled(job)
@@ -1670,7 +1669,7 @@ def test_an_unreadable_file_under_a_folder_over_a_lost_manifest_still_makes_no_v
 	os.chmod(path, 0)
 	lose_the_manifest(job)
 	capsys.readouterr()
-	_, manifest, committed = _backup(job, OrderedDict([event_entry(job, 'd/u.txt', 'modify')]))
+	_, manifest, committed = _backup(job)
 	manifest.close()
 	assert committed is True and committed_versions(job) == before
 	assert _lines(capsys, 'UNREADABLE', path) == 1

@@ -6353,11 +6353,10 @@ def do_backup(backup_entries:dict,
 				this_timestamp = os.path.basename(tree).partition('--')[2]
 				writer = TreeWriter(tree,previous=latest_version_info.path,job_vault=job_vault,manifest=manifest,pooled=on_pool)
 			else:
-				# the rows are read from the tree while it still has the latest version's name: once it is handed over, that name holds links
+				# the manifest describes the newest version: a batch with entries comes after its attempt's first batch (the whole tree's comparison,
+				# which lists the tree into a manifest that does not describe it, while the tree still has the latest version's name: once it is
+				# handed over, that name holds links), a roll-forward or a first version (drop_untracked_deletes())
 				manifest.begin()
-				if not manifest.describes(latest_version_info.path):
-					backuperTeeLogToTl(job_name,f'Manifest does not describe {latest_version_info.path}, listing it')
-					manifest.rebuild(latest_version_info.path)
 				try:
 					writer = hand_over(job_vault,latest_version_info.path,backup_folder,manifest,on_pool)
 				except FileExistsError:
@@ -6543,7 +6542,8 @@ def log_version_folder_taken(job_name:str, path:str) -> None:
 
 def vault_layout(job_vault:str, manifest:'VaultManifest') -> str:
 	'''
-	Which rules job_vault gets, the one answer for the scan, the start and the CLI: 'r' when its manifest says so;
+	Which rules job_vault gets, the one answer for the scan and the start (the commands read the manifest's layout alone,
+	read_command_layout()): 'r' when its manifest says so;
 	'converting' when it does not but staging is there, as a manifest can be lost and the 0.54 rules would remove a cut
 	batch's tree as an orphan, while staging is made before any such tree (hand_over()); '0.54' with neither and a version
 	folder there; 'r' with no version folder, as a new vault is on design R. Raises OSError when the job vault cannot be listed.
@@ -8412,8 +8412,8 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   EWOULDBLOCK (BlockingIOError), as when another process holds a write lease on the file (an NFS server's delegation,
 	   Samba's oplocks), which the O_NONBLOCK open of the check cannot wait for but the blocking cp of the copy does, and
 	   the copy then backs it up; and a parent folder that newest_path does not hold as a real folder (one lstat of it,
-	   once per parent): the replay's rows are the newest tree's (do_backup() lists a manifest that does not describe it
-	   first), so a parent with no row is one the tree lacks, and copy_path()'s untracked_folder_above() then copies that
+	   once per parent): the replay's rows are the newest tree's (the attempt's first batch listed a manifest that does not
+	   describe it, as a lost one, from the tree), so a parent with no row is one the tree lacks, and copy_path()'s untracked_folder_above() then copies that
 	   folder whole. It comes from a folder's copy walk that cannot list a subfolder (EIO, say), which leaves that
 	   subfolder's own folders out of the version, with no rows. An attrib entry asks it before its own lstat, as the
 	   replay's attrib branch copies the folder before it looks at the entry: one that is gone or cannot be looked at counts

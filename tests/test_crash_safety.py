@@ -119,12 +119,17 @@ def test_uncommitted_backup_while_green_light_set_clears_green_light_and_requeue
 	rv.GREEN_LIGHT.set()
 	os.makedirs(os.path.join(tmp, 'monitor'))
 	calls = []
+	to_process = rv.ChangeEventQueue(os.path.join(tmp, 'monitor'))
+	flag = threading.Event()
 	def uncommitted(*args, **kwargs):
-		calls.append(args)
+		calls.append(len(args[0]))
+		if len(calls) == 1:
+			# the first batch, the whole tree's comparison (no entries), commits; a change queued meanwhile is the next batch's entry
+			to_process.append(rv.ChangeEvent(1, False, 'modify', os.path.join(tmp, 'monitor', 'f.txt'), None))
+			flag.set()
+			return rv.VaultInfo({}, 0, 0), None, True
 		return None, None, False
 	monkeypatch.setattr(rv, 'do_backup', uncommitted)
-	to_process = rv.ChangeEventQueue(os.path.join(tmp, 'monitor'))
-	to_process.append(rv.ChangeEvent(1, False, 'modify', os.path.join(tmp, 'monitor', 'f.txt'), None))
 	monitor_fs_flag = threading.Event()
 	monitor_fs_flag.set()
 	rv.backuper(
@@ -134,13 +139,12 @@ def test_uncommitted_backup_while_green_light_set_clears_green_light_and_requeue
 		os.path.join(tmp, 'monitor'),
 		os.path.join(tmp, 'vault'),
 		'N/A',
-		threading.Event(),
+		flag,
 		monitor_fs_flag,
 	)
-	# the backuper took the queue and ran its first batch, the whole tree's comparison (no entries): an error before do_backup()
-	# would leave the same three states
-	assert len(calls) == 1 and not calls[0][0]
-	# the queued event is not handed back: the next start compares the whole tree
+	# the first batch was the whole tree's comparison (no entries), the second the queued change, one entry: it did not commit
+	assert calls == [0, 1]
+	# its entry is not handed back: the next start compares the whole tree
 	assert len(to_process) == 0
 	assert not os.path.lexists(os.path.join(tmp, 'vault', 'job', rv.PENDING_TRANSACTIONS_FILE_NAME))
 	assert not rv.GREEN_LIGHT.is_set()

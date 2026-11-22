@@ -15,7 +15,7 @@ from collections import OrderedDict
 import pytest
 
 import reverberator as rv
-from tests.crash_batches import backup_events, build_base, put_text
+from tests.crash_batches import backup_events, build_base, OPTIONS, put_text
 from tests.harness import create_job, run_backup, write_committed_version, write_incomplete_version
 from tests.vault_oracle import check_vault, compared, read_view, snapshot_tree, version_number
 
@@ -628,7 +628,8 @@ def test_a_batch_on_a_vault_with_no_layout_leaves_it_to_the_migration(r_job):
 	lose_manifest(r_job)
 	put_text(r_job.monitor, 'a/x.txt', 'the new contents')
 	expected[3] = snapshot_tree(r_job.monitor)
-	backup_events(r_job, [(False, 'modify', 'a/x.txt', None)], **KEPT)
+	# the loss is followed by the full comparison every attempt starts with: a batch with entries never comes first over a lost manifest
+	run_backup(r_job, **{**OPTIONS, **KEPT})
 	manifest = opened_manifest(r_job)
 	assert manifest.layout() is None and rv.vault_layout(r_job.job_vault, manifest) == 'converting'
 	manifest.close()

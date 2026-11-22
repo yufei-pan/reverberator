@@ -265,11 +265,13 @@ def test_v0_on_r_is_a_complete_copy(r_job):
 
 
 def test_a_lost_manifest_on_r_lists_the_tree_before_the_hand_over(r_job):
+	# the loss is followed by the full comparison every attempt starts with, which lists the tree into the manifest while it still has the
+	# newest version's name, finds the change and hands the tree over (a batch with entries never comes first over a lost manifest)
 	expected = build_base(r_job, **KEPT)
 	os.remove(os.path.join(r_job.job_vault, '.reverberator_manifest.sqlite'))
-	events = item_modify(r_job.monitor)
+	item_modify(r_job.monitor)
 	expected[3] = snapshot_tree(r_job.monitor)
-	backup_events(r_job, events, **KEPT)
+	run_backup(r_job, **{**OPTIONS, **KEPT})
 	assert check_vault(r_job.job_vault, expected, set()) == []
 	manifest = rv.VaultManifest(r_job.job_vault)
 	# the layout comes back through the migration's sizes pass (plan S1), never a batch
