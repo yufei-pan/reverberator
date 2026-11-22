@@ -90,7 +90,10 @@ watcher's settle had removed the moved folder's watches; 22 of 240 runs under lo
 review done (2026-11-22: with fixes), its fix wave, re-review and residual pass done, every finding fixed or
 bucketed (fourteen deferred entries for the round after 0.55.6); the VM gate passed on the last code commit and the
 container suite on the version commit; version 0.55.6 at e166baa. Waiting for the user's pick to merge and roll out
-(Q19). The round's record (measurements, Calls to confirm, the build's rulings): `docs/progress/r0556.md`.
+(Q19); a history cleanup before the push is done (2026-11-22). The round's record (measurements, Calls to confirm,
+the build's rulings): `docs/progress/r0556.md`. Next while Q19 waits: the spec of the round after 0.55.6 (its fourteen
+deferred entries, the final review's Important finding and the pool pause rule first), its check and its plan; no build
+on top of the unreleased round before Q19's answer.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
