@@ -824,17 +824,6 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.5: the same parent-listing rule in the scope walks, with one listing per parent
   kept for the comparison.
 
-### The footprint gate does not catch a missing trim after a commit
-
-- **Kind:** deferred.
-- **What the operator sees:** nothing, today: the daemon trims its heap after each commit. The test that holds its idle
-  memory down (`tests/test_footprint.py`) measures after a restart and one backup, so it fails when the trim after the
-  start goes, not when the trim after each commit does: that one could be lost without a test failing, and the memory
-  a busy job keeps between backups would go unchecked.
-- **Why:** a growth gate needs a burst of changes and a bound for what memory may keep after it, and that bound is not
-  measured yet.
-- **Revisit when:** the round after 0.55.5: a gate after a burst of changes, once its bound is measured.
-
 ### A change to the monitored folder's own metadata alone makes no version
 
 - **Kind:** deferred.
