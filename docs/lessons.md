@@ -36,3 +36,4 @@ Claude Code read returns, measured 2026-11-15), ask the user.
 - **2026-11-14 reverberator 0.55.6: an /etc/fstab that cannot be read is a problem, not an empty one**: a source a safety rule reads either answers or is a problem; only its own "none" (no such file) is an empty answer.
 - **2026-11-14 reverberator 0.55.6: a version's root-meta record carries its inner mounts**: state a rebuild cannot recover from the data lives with the data, not only in the index rebuilt from it.
 - **2026-11-17 reverberator 0.55.6: a folder whose metadata copy failed is marked in its manifest row**: when a write fails, record that it failed, in a value no reader can take for a success, not what the failure left.
+- **2026-11-22 reverberator 0.55.6: the UNREADABLE line says what stays, for each case it is printed**: a line that tells the operator what is safe is computed from the state it describes, never a fixed sentence written for the common case.

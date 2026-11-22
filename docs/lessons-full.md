@@ -184,3 +184,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: the row was recorded from what the version held after the failed copy, which matched the monitored folder whenever the folder was made with its mode and only its extended attributes failed (an inherited default ACL, or the source's own attributes), so no comparison read the folder's attributes again and every later version kept the wrong ones.
 - Original design was wrong because: a record read back from a failed write described the failure as the goal.
 - Lesson: when a write fails, record that it failed, in a value no reader can take for a success, not what the failure left.
+
+## 2026-11-22 reverberator 0.55.6: the UNREADABLE line says what stays, for each case it is printed
+- Changed: the end of the UNREADABLE line of a file that cannot be copied follows what the version holds: "keeping its last backed-up copy" where the version before holds an entry, "left out of this version" for a new file (nothing of it is in the version), and "keeping the copy a cut backup made of it, which may be damaged" where the copy there is the one a cut backup left (a lost manifest on a mergerfs pool). The start, `reverberator job <name> UNREADABLE: <path>: <error>;`, is unchanged, so the firewatcher pattern, which matches the marker alone, and any grep on it still match.
+- Why we had to change: the line promised a last backed-up copy for a new file that has none, and for a cut backup's copy that may be damaged; an operator reading it would take the file for backed up.
+- Original design was wrong because: one fixed sentence stood for three states, true of the commonest.
+- Lesson: a line that tells the operator what is safe is computed from the state it describes, never a fixed sentence written for the common case.
