@@ -31,7 +31,7 @@ def deep_rels(depth: int) -> list:
 def test_a_tree_1200_levels_deep_is_backed_up_listed_and_restored(job, tmp_path, run_reverberator, process_env):
 	# the daemon and the commands, each started with a soft limit of 1,024 open files, as from a login shell: the daemon and restore
 	# raise their own, as a walk holds a listing a level, and history, which reads each version by lstat and holds none, raises
-	# nothing (its run at 1,024 is the pin). Fails on 1a4eeae: the walk stops some 990 levels down at Python's recursion limit, taken
+	# nothing (its run at 1,024 is the pin). Fails on 591296d: the walk stops some 990 levels down at Python's recursion limit, taken
 	# for an unreadable folder, so the bottom file is never backed up
 	bottom = deep_tree(job.monitor, DEPTH)
 	rel = 'd/' * DEPTH + 'f'
@@ -62,7 +62,7 @@ def test_a_tree_1200_levels_deep_is_backed_up_listed_and_restored(job, tmp_path,
 @pytest.mark.parametrize('walk', ['iter_tree_entries', 'iter_folder_entries', 'settle'])
 def test_a_walk_needs_no_frame_a_level(tmp_path, walk):
 	# with the stack limited to the frames in use and half the tree's depth, a walk that took a frame a level stops half way down.
-	# Fails on 1a4eeae: iter_tree_entries() and iter_folder_entries() take the RecursionError for an unreadable folder, ending the
+	# Fails on 591296d: iter_tree_entries() and iter_folder_entries() take the RecursionError for an unreadable folder, ending the
 	# walk there with an error, and settle()'s is_real() raises it
 	if walk == 'iter_tree_entries':
 		root = str(tmp_path / 't')

@@ -837,7 +837,7 @@ def test_a_restore_onto_a_pool_whose_disk_leaves_it_fails_naming_the_disk(job, t
 
 @pytest.mark.unit
 def test_a_restore_onto_a_pool_whose_disk_got_its_copies_after_the_claim_and_leaves_it_fails_naming_the_disk(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
-	# fails on 6acf680 (says done): a pool whose create policy keeps no paths (pfrd, mfs, rand) puts the restore's folder on the disk its
+	# fails on 0392dcc (says done): a pool whose create policy keeps no paths (pfrd, mfs, rand) puts the restore's folder on the disk its
 	# first copy lands on, so the folder is not there at the claim on the disk that gets it, and that disk is taken out of the pool's
 	# list (the control file) after the copy. Its handle is synced, and what was restored onto it is in the pool's view no more
 	backed_up(job)
@@ -891,7 +891,7 @@ def unmounted_lazily(mount, branch, at_the_mount, under='/proc'):
 @pytest.mark.parametrize('listed', [False, True], ids=['taken_out', 'still_listed'])
 @pytest.mark.parametrize('at_the_mount', [False, True], ids=['branch_below_the_mount', 'branch_is_the_mount'])
 def test_a_branch_whose_disk_was_unmounted_lazily_fails_the_restore(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem, listed, at_the_mount):
-	# fails on 873cd90 (says done): the disk of branch two held the restore's folder at the claim, a copy landed on it, and then it was
+	# fails on 2f38564 (says done): the disk of branch two held the restore's folder at the claim, a copy landed on it, and then it was
 	# unmounted lazily (the pool still lists it, or it was taken out first): its branch folder reads ENOENT, or is the empty mount
 	# point under the mount, and the folder at its place ENOENT, which both loops took for "nothing of the restore can be there". The
 	# filesystem of the nearest existing folder at its place is no longer one a handle is of
@@ -920,7 +920,7 @@ def test_a_branch_whose_disk_was_unmounted_lazily_fails_the_restore(job, tmp_pat
 @pytest.mark.unit
 @pytest.mark.skipif(os.geteuid() == 0, reason='root opens any folder')
 def test_a_branch_the_user_could_not_open_that_leaves_the_pool_fails_the_restore(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
-	# fails on 873cd90 (a warning, exit 0): the claim could not open branch two's place (a mode that shuts the user out, as deny() does),
+	# fails on 2f38564 (a warning, exit 0): the claim could not open branch two's place (a mode that shuts the user out, as deny() does),
 	# which was warned of and left out of what the look for a joined disk passes over; the left loop passed it over too, so the disk taken
 	# out of the pool with the restore's folder on it did not fail the restore
 	backed_up(job)
@@ -1028,7 +1028,7 @@ def syncing_once_then(monkeypatch, then):
 
 @pytest.mark.unit
 def test_a_restore_whose_folder_changes_filesystem_while_it_syncs_fails(job, tmp_path, capsys, monkeypatch, errseq, other_filesystem):
-	# fails on 873cd90 (says done, the marker and the folders' metadata written onto the other filesystem): the folder was on the
+	# fails on 2f38564 (says done, the marker and the folders' metadata written onto the other filesystem): the folder was on the
 	# claim's filesystem at the check before the syncs, and another is mounted over it as the first sync runs. The folder is looked at
 	# again once the syncs ran
 	backed_up(job)
@@ -1044,7 +1044,7 @@ def test_a_restore_whose_folder_changes_filesystem_while_it_syncs_fails(job, tmp
 @pytest.mark.unit
 @pytest.mark.parametrize('when', ['before the first sync', 'while it syncs'])
 def test_accept_on_a_folder_that_changed_filesystem_fails_and_changes_nothing(job, tmp_path, capsys, monkeypatch, errseq, other_filesystem, when):
-	# pin for 'before the first sync', fails on 873cd90 for 'while it syncs': --accept finds the restore's folder on another filesystem
+	# pin for 'before the first sync', fails on 2f38564 for 'while it syncs': --accept finds the restore's folder on another filesystem
 	# than its claim's (a lazy unmount, or another mounted over it): it fails with that line and hands nothing over; nothing is written
 	# onto the other filesystem, and the marker on the claim's stays as it was, with no record of the failed sync (README, restore)
 	backed_up(job)

@@ -975,7 +975,7 @@ def _holding(job, name):
 def test_a_folder_replaced_at_its_open_is_gone_with_one_info_line(tmp_path, monkeypatch, replaced_by):
 	# spec section 2, test 4: d, listed by its parent, is replaced before the walk opens it by a link to a folder outside the tree
 	# (mv d d.old; ln -s /srv/other d) or by a file: no entry of the outside folder, one INFO line, no ERROR line, a FolderGone.
-	# Fails on 8b411a5: the walk lists the outside folder through the link; for the file, "Error scanning" at ERROR
+	# Fails on ed959e0: the walk lists the outside folder through the link; for the file, "Error scanning" at ERROR
 	from tests.harness import write_tree
 	root = str(tmp_path / 'm')
 	write_tree(root, {'a.txt': 'a', 'd/x.txt': 'x', 'e/y.txt': 'y'})
@@ -990,7 +990,7 @@ def test_a_folder_replaced_at_its_open_is_gone_with_one_info_line(tmp_path, monk
 
 
 def test_a_full_comparison_meeting_a_link_swapped_in_mid_walk_commits_nothing_from_outside(job, tmp_path, poll_fast, monkeypatch):
-	# spec section 2, test 4: the same swap while a full comparison walks the tree. Fails on 8b411a5: the walk lists the outside
+	# spec section 2, test 4: the same swap while a full comparison walks the tree. Fails on ed959e0: the walk lists the outside
 	# folder through the link, and the version holds its files under d, with their rows
 	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
 	_settled(job)
@@ -1005,7 +1005,7 @@ def test_a_full_comparison_meeting_a_link_swapped_in_mid_walk_commits_nothing_fr
 def test_a_new_folder_replaced_by_a_link_before_its_copy_walk_is_not_followed(job, tmp_path, poll_fast, monkeypatch):
 	# review focus 2 (beyond the spec): a batch's create of a folder copies it with a walk from that folder, which is not a
 	# configured path: n is replaced by a link to a folder outside the tree before that walk opens it, and nothing of the outside
-	# folder is copied. Fails on 8b411a5: the copy walk opens its root following the link, and the version holds the outside
+	# folder is copied. Fails on ed959e0: the copy walk opens its root following the link, and the version holds the outside
 	# folder's files under n
 	from tests.harness import event_entry, run_backup
 	seed_monitor(job, {'a.txt': 'a'})
@@ -1024,7 +1024,7 @@ def test_the_size_estimate_of_a_new_folder_replaced_by_a_link_charges_nothing_of
 	# review of Task 6, I1: the size estimate walks each folder entry of a batch from that folder, which is not a configured path: n
 	# is replaced by a link to a folder outside the tree after the estimate's lstat found it and before its walk opens it. The
 	# copy walk copies none of the outside folder, so the estimate must charge none of it either (a limit would otherwise prune the
-	# oldest versions for good to make room for bytes never written). Fails on 2cdd763: the walk opens n following the link and
+	# oldest versions for good to make room for bytes never written). Fails on 3869779: the walk opens n following the link and
 	# charges the outside folder's file and subfolder
 	seed_monitor(job, {'n/inner.txt': 'i' * 5000})
 	folder = os.path.join(job.monitor, 'n')
@@ -1107,7 +1107,7 @@ def _listings_of(monkeypatch, folder):
 def test_a_mass_deletion_while_the_walk_passes_lists_the_parent_at_most_twice(tmp_path, monkeypatch):
 	# spec section 2, test 6 (D14): 200 sibling folders, all removed as the walk opens the first of them (an rm -rf of a build's
 	# output while a full comparison passes): one listing of their parent, kept, tells the rest gone, rather than a listing a
-	# folder. Each is still a FolderGone with its INFO line. Fails on c4c5553: the parent is listed 201 times (its own listing,
+	# folder. Each is still a FolderGone with its INFO line. Fails on 249ee52: the parent is listed 201 times (its own listing,
 	# then once for each folder gone)
 	root = str(tmp_path / 'm')
 	parent = os.path.join(root, 'p')
@@ -1180,7 +1180,7 @@ def test_a_walk_raises_what_its_skip_raises(tmp_path):
 	# spec section 2, test 8 (P12): a bug in what the walk calls between its reads (here its skip, at the bottom of a deep tree) is
 	# raised to the caller with its traceback, not taken for an unreadable folder. And with that exception and its traceback still
 	# held, every listing the walk had open is closed: the traceback keeps the walk's frame, so only the walk's own finally closes
-	# them (a walk stopped early by a break or a close() is freed with its listings anyway). Fails on c4c5553: the ValueError is
+	# them (a walk stopped early by a break or a close() is freed with its listings anyway). Fails on 249ee52: the ValueError is
 	# swallowed as an unreadable folder (the one whose listing called the skip), with an "Error scanning" line, and the walk goes on
 	from tests.harness import deep_tree
 	from tests.test_deep_trees import open_fds
@@ -1266,7 +1266,7 @@ class _FailingEntry:
 def test_an_oserror_of_a_listings_next_entry_or_an_entrys_type_is_the_folders_error(tmp_path, monkeypatch, fail_at):
 	# pin: ruling R17, the reads the walk catches (P12): d is listed and its entries x then y come, the next entry after x, or the
 	# type of y, failing with EIO. That is d's error and no other's: the entry before it is yielded, d gets its ERROR line and its
-	# errors entry (no FolderGone), and the walk goes on with the next folder and its files. It passes on c4c5553 too, whose broad
+	# errors entry (no FolderGone), and the walk goes on with the next folder and its files. It passes on 249ee52 too, whose broad
 	# catch took these errors as well: it keeps what the narrower catch must not lose, and fails on a walk with no catch of its
 	# reads (the OSError leaves the walk)
 	from tests.harness import listed_folder, write_tree
@@ -1297,7 +1297,7 @@ def test_a_start_whose_skip_raises_fails_the_attempt(job, poll_fast, monkeypatch
 	# spec section 2, test 8 (P12), the backuper's half: the job's skip list raises a ValueError at d/ (a bug in it), and the
 	# start's walk raises it: the attempt fails with it, and nothing is committed. With no version the walk is the first version's
 	# (do_backup()'s, with first_skip); with one in place it is the full comparison's (compare_scopes()): the two walks a start makes.
-	# Fails on c4c5553: the walk swallows it as an unreadable folder, the one whose listing called the skip (here the monitored
+	# Fails on 249ee52: the walk swallows it as an unreadable folder, the one whose listing called the skip (here the monitored
 	# folder), so the attempt fails as "cannot read <the monitored folder>: a bug in the skip list", and with the skip at a deeper
 	# folder it would commit V0 without that one
 	from tests.harness import wait_until
@@ -1457,7 +1457,7 @@ def test_a_fifo_swapped_in_after_the_ewouldblock_does_not_hold_the_comparison(tm
 
 @pytest.mark.parametrize('stopping', [True, False], ids=['stopping', 'running'])
 def test_a_stopping_daemon_does_not_wait_for_a_lease_to_break(tmp_path, monkeypatch, stopping):
-	# fails on 71cf83a with GREEN_LIGHT clear: the opener meets EWOULDBLOCK (a stand-in on the non-blocking open, as a lease answers it)
+	# fails on b73897c with GREEN_LIGHT clear: the opener meets EWOULDBLOCK (a stand-in on the non-blocking open, as a lease answers it)
 	# and reopens the file through its O_PATH handle and a blocking open, which waits for the lease to break (the lease-break time, 45 s
 	# by default), and every comparison still queued on the pool would wait again. A stopping daemon raises the BlockingIOError at once
 	# and opens nothing more; a running one (the pin) reopens, as cp's open waits, and hashes the file
@@ -1558,7 +1558,7 @@ def test_a_fifo_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll_f
 
 
 def test_a_socket_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll_fast, monkeypatch, capsys):
-	# fails on 71cf83a: the check's lstat sees a regular file f, then a socket is put at f's place, which no open takes (ENXIO): the
+	# fails on b73897c: the check's lstat sees a regular file f, then a socket is put at f's place, which no open takes (ENXIO): the
 	# check read it as an unreadable file and dropped the batch with a false UNREADABLE line. An entry of another kind changes the
 	# version (cp -a copies it as itself), as the FIFO's case above, which opens. The socket is bound at a short relative name (a
 	# socket's path holds 107 bytes) and renamed into place

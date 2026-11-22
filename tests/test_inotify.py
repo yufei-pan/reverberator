@@ -661,7 +661,7 @@ def _outside_and_swap(tmp_path, folder):
 def test_a_folder_replaced_by_a_link_is_never_watched_through_it(tmp_path, monkeypatch, swap):
 	# spec section 2, test 5: d, listed by the walk, is replaced by a link to a folder outside the tree before its watch is added,
 	# or after its watch and before the walk opens it: no watch on the outside folder or the one in it, nothing watched through
-	# the link, and no ERROR line. Fails on 8b411a5: add_watch follows the link at d's path (given with its /), and the walk
+	# the link, and no ERROR line. Fails on ed959e0: add_watch follows the link at d's path (given with its /), and the walk
 	# lists the outside folder through it, watching its subfolder
 	root = str(tmp_path / 'm')
 	d = os.path.join(root, 'd')
@@ -694,7 +694,7 @@ def test_a_new_folder_replaced_by_a_link_before_its_walk_is_not_followed(job, tm
 	# review focus 2 (beyond the spec): the watcher walks a folder made in the tree from that folder, which is not a configured
 	# path; n, made, is replaced by a link to a folder outside the tree before its watch is added (the watch is refused, and the walk
 	# never starts), or after its watch and before the walk opens it (the walk's own open of its root): nothing of the outside folder
-	# is watched (the copy walk's half is in test_io_errors.py). Fails on 8b411a5: the walk's root is watched and listed following
+	# is watched (the copy walk's half is in test_io_errors.py). Fails on ed959e0: the walk's root is watched and listed following
 	# the link, so the outside folder and the one in it are watched; the second case fails with the walk's root opened following a
 	# link (follow_root=True), which the first never reaches
 	n = os.path.join(job.monitor, 'n')
@@ -767,7 +767,7 @@ def test_a_folder_whose_watch_fails_is_left_unwatched_unless_it_is_gone(tmp_path
 
 def test_a_tree_1200_levels_deep_is_watched_to_its_bottom(tmp_path, monkeypatch):
 	# past Python's 1,000 frames the walk keeps a stack, not a call a level (spec section 2, P10): every folder is watched, and a
-	# file made at the bottom raises its create. Fails on 1a4eeae: the walk stops some 990 levels down at the recursion limit, taken
+	# file made at the bottom raises its create. Fails on 591296d: the walk stops some 990 levels down at the recursion limit, taken
 	# for an unreadable folder ("Error scanning ...: maximum recursion depth exceeded"), and the folders below are left unwatched
 	root = str(tmp_path / 'm')
 	bottom = deep_tree(root, 1200)
@@ -1048,7 +1048,7 @@ def test_a_folder_its_parent_lists_and_its_open_cannot_find_is_counted_unwatched
 	# spec section 2, test 7 (D13, the watcher's half): d, which its parent lists, cannot be opened, ENOENT every time (name trouble
 	# on a FUSE, CIFS or sshfs mount): it gets no watch and no event reports a change in it, so the watcher counts it unwatched and
 	# publishes no read time for a batch to claim; and the next full comparison, which cannot read it either, keeps the matched
-	# time. Fails on c4c5553: its error is an ENOENT, which the watcher took for a folder gone, so it was not counted unwatched
+	# time. Fails on 249ee52: its error is an ENOENT, which the watcher took for a folder gone, so it was not counted unwatched
 	seed_monitor(job, {'a.txt': 'a', 'd/x.txt': 'x'})
 	v0 = run_backup(job, matched_since=100)[-1]
 	d = os.path.join(job.monitor, 'd')
@@ -1074,7 +1074,7 @@ def test_a_watcher_whose_walk_raises_fails_its_job_with_the_traceback(job, poll_
 	# spec section 2, test 8 (P12), the watcher's half: the job's skip list raises a ValueError at the first folder (a bug in it)
 	# while the watcher walks the tree to watch it. The watcher's thread ends with it, its traceback is logged
 	# (log_thread_exception()), and run_job() fails the job, so the next attempt starts a watcher again rather than leave the job
-	# with none. Fails on c4c5553: the walk swallows the error as an unreadable folder, the one whose listing called the skip (here
+	# with none. Fails on 249ee52: the walk swallows the error as an unreadable folder, the one whose listing called the skip (here
 	# the monitored folder, which keeps its watch), and the watcher runs on; the job fails only at the backuper's comparison, for
 	# "cannot read" the monitored folder
 	os.makedirs(os.path.join(job.monitor, 'd'))
@@ -1130,7 +1130,7 @@ def _lines_after_chmod_of_a_watched_folder(job, monkeypatch):
 def test_a_chmod_of_a_watched_folder_logs_no_event_name_line(job, poll_fast, monkeypatch):
 	# a chmod or touch of a watched folder also comes to its own watch, with no name: that event is ignored, and says so only
 	# under DEBUG, as a chmod -R of 5,000 folders wrote 5,000 INFO lines (spec section 13).
-	# Fails on fc0fdb1: the line is logged once
+	# Fails on 1982612: the line is logged once
 	assert 'Event name not found, ignoring event' not in _lines_after_chmod_of_a_watched_folder(job, monkeypatch)
 
 

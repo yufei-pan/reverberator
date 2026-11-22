@@ -65,31 +65,31 @@ limits are kept outside this public repo, in the agent's private notes beside it
 (2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports are
 in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
 corrected, 4 rejected with reasons in its commits). Its questions were Q9 to Q15, all closed (the user's picks and
-chief's decisions). The plan is written (`plans/2026-11-15-r0556.md`, 973c57d, 22 tasks) on the recommended options; a
+chief's decisions). The plan is written (`plans/2026-11-15-r0556.md`, 68fc1b0, 22 tasks) on the recommended options; a
 table at its top and a [Q<n>] mark on each task say what another answer changes, Task 18 runs only on Q15 (a), and Task
 2 (the healing test) runs second so Q15 can be asked while the round builds. The plan corrects the spec in places
 (listed in its Calls to confirm; the spec stays as written). Building since 2026-11-16 22:15 PST (chief's decision of
 that time), by subagent-driven development, on the recommended options, which Q9 to
 Q15's answers all took; the build's ledger (task by task, rulings, deferred minors) is the git-ignored
 `.superpowers/sdd/2026-11-15-r0556/progress.md` in the worktree. Where it stands (2026-11-17 11:20 PST): Task 1 (P15)
-done and reviewed (c18fc76..5212daf); Task 2 (P16's healing check) done and reviewed after two fix rounds
-(85e8e5d..2dfb89d), its results asked as Q15 (answered (a) 2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and
-reviewed (6b77746); Task 4 (P13) done and reviewed (8b3f23d); Task 5 (P10) done and reviewed (aa5834d); Task 6 (P11)
-done and reviewed after one fix round (2cdd763..8c50ca9); Task 7 (P12, D14, D13's watcher half) done and reviewed (094394b..91c80b4; the walk's loop in the faster shape the main
-session ruled on, 7e7feff, at Task 6's figure); Task 8 (D2, D1) done and reviewed (1144d8a); Task 9 (D4) done and reviewed after one fix
-round (4a60607..21345ea); Task 10 (D8, D7) done and reviewed (582ee3a, 310a19c); Task 11 (D9, D11) done and reviewed
-(bce95b0: a one-file batch reads /etc/fstab once, 18 times on a pool before); Task 12 (D10) done and reviewed (79d42c5); Task 13 (D5, D6) done and reviewed after one fix
-round (5aba4ed..1f774a3); Task 14 (D3 item 1) done and reviewed (79220a8); Task 15 (D3 items 2, 3) done and reviewed after two fix rounds and
-a design check's rework (d00537b..b9bbde4: a link a cut left in staging stays there until the scan after the commit);
-Task 16 (D15) done and reviewed after one fix round (2159b07, 80398bd: a gate after a burst and a pin counting the
-trim at each commit); Task 17 (P14) done and reviewed after one docs fix round (adc1009, 2cd24c7); Task 18 (P16 step
-2, on Q15's answer) done and reviewed (4cedc54, eedbabd); Task 19 not built (every question took its
-recommended answer); the round's cleanup done in three passes (c752e08..21a5f98) and Task 20's docs (f7e7562; the shared
-lessons file's lines committed, not pushed); the flaky watcher test fixed in the test (4c17b53: it wrote before the
+done and reviewed (71e4e42..1b5febe); Task 2 (P16's healing check) done and reviewed after two fix rounds
+(2dc2fd0..8aed9ab), its results asked as Q15 (answered (a) 2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and
+reviewed (926e963); Task 4 (P13) done and reviewed (4670ea0); Task 5 (P10) done and reviewed (c8eb142); Task 6 (P11)
+done and reviewed after one fix round (3869779..f255db9); Task 7 (P12, D14, D13's watcher half) done and reviewed (b509e24..a41adcd; the walk's loop in the faster shape the main
+session ruled on, a2d3a28, at Task 6's figure); Task 8 (D2, D1) done and reviewed (789edec); Task 9 (D4) done and reviewed after one fix
+round (4f712ac..db9bd4b); Task 10 (D8, D7) done and reviewed (2b252b4, 93f6be9); Task 11 (D9, D11) done and reviewed
+(8a8dfb7: a one-file batch reads /etc/fstab once, 18 times on a pool before); Task 12 (D10) done and reviewed (8c70fd6); Task 13 (D5, D6) done and reviewed after one fix
+round (a15a420..b565fd2); Task 14 (D3 item 1) done and reviewed (102cf04); Task 15 (D3 items 2, 3) done and reviewed after two fix rounds and
+a design check's rework (4449b76..07aba64: a link a cut left in staging stays there until the scan after the commit);
+Task 16 (D15) done and reviewed after one fix round (46d124f, ee55869: a gate after a burst and a pin counting the
+trim at each commit); Task 17 (P14) done and reviewed after one docs fix round (8c127fd, d2070f3); Task 18 (P16 step
+2, on Q15's answer) done and reviewed (4652c40, eedbabd); Task 19 not built (every question took its
+recommended answer); the round's cleanup done in three passes (88738db..cd8893e) and Task 20's docs (d2081b6; the shared
+lessons file's lines committed, not pushed); the flaky watcher test fixed in the test (28e879c: it wrote before the
 watcher's settle had removed the moved folder's watches; 22 of 240 runs under load failed before, none after); the final
 review done (2026-11-22: with fixes), its fix wave, re-review and residual pass done, every finding fixed or
 bucketed (fourteen deferred entries for the round after 0.55.6); the VM gate passed on the last code commit and the
-container suite on the version commit; version 0.55.6 at 99ce063. Waiting for the user's pick to merge and roll out
+container suite on the version commit; version 0.55.6 at e166baa. Waiting for the user's pick to merge and roll out
 (Q19). The round's record (measurements, Calls to confirm, the build's rulings): `docs/progress/r0556.md`.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
@@ -110,7 +110,7 @@ with "the no-copy move into a new folder gets its own design round after".
 
 **P4. Remove the backuper's dead branch** at `reverberator.py` ~4988-4995. **P5. Remove the lost-manifest branch of
 `drop_untracked_deletes(newest_path=)`.** **P6. Remove `remove_pending_file()`.** Source: round 0.55.5's final review
-and its second opinions (parts that can go; not in a spec). State: built on branch `r0556` (Task 3, 6b77746, reviewed;
+and its second opinions (parts that can go; not in a spec). State: built on branch `r0556` (Task 3, 926e963, reviewed;
 41 lines fewer). The review found one more unreachable part of the same kind, the rebuild before `hand_over()` in
 `do_backup()`, with tests that reach it by hand: it goes in the round's cleanup before the final review (the main
 session's call, as these were). Done with the round's merge. Behind them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own
@@ -194,23 +194,23 @@ and says nothing of these. State: in round 0.55.6 (branch `r0556`), spec in its 
 picks 2026-11-14, "Carry all four (Recommended)" and "Fixes round (Recommended)".
 - **P10. A tree walk without recursion** (its 2.3): `iter_tree_entries()` recursed by `yield from`, so a tree
   deeper than about 1,000 levels left its deepest folders unwatched, and the comparison, restore and vault walks
-  through the same function stopped at the same depth. Built on branch `r0556` (Task 5, aa5834d, reviewed): both walks
+  through the same function stopped at the same depth. Built on branch `r0556` (Task 5, c8eb142, reviewed): both walks
   and `settle()`'s `is_real()` keep a stack, with the same yields in the same order; a tree 1,200 levels deep is
   watched, backed up, listed and restored. Done with the round's merge.
 - **P11. The walk follows no link that replaced a folder while it ran** (2.5, item 7): the tree's watches were added
-  without `IN_DONT_FOLLOW`, and the listing followed such a link. Built on branch `r0556` (Task 6, 2cdd763 and its fix
-  8c50ca9, reviewed): each folder below a walk's root is opened with `O_NOFOLLOW` and listed by its handle, its watch
+  without `IN_DONT_FOLLOW`, and the listing followed such a link. Built on branch `r0556` (Task 6, 3869779 and its fix
+  f255db9, reviewed): each folder below a walk's root is opened with `O_NOFOLLOW` and listed by its handle, its watch
   added with `IN_ONLYDIR | IN_DONT_FOLLOW`; a folder replaced by a link or a file is gone, with one INFO line; the walks
   of folders the tree just made, and the size estimate, follow no link at their root. One case three second opinions
   raised, a folder *above* replaced by a link after the walk entered it, the spec rules Not an issue; one of them adds a
   file protected only by an ancestor folder's mode, which the final review weighs (the build's ledger). Done with the
   round's merge.
 - **P12. The walk catches `OSError`, not every `Exception`** (section 7): the broad catch hid
-  `tests/test_inner_mounts.py:91`, which used `errno` without importing it. Built on branch `r0556` (Task 7, 094394b and
-  7e7feff, reviewed): the walk catches only its reads' OSError, so a bug in what it calls fails the backup attempt or
+  `tests/test_inner_mounts.py:91`, which used `errno` without importing it. Built on branch `r0556` (Task 7, b509e24 and
+  a2d3a28, reviewed): the walk catches only its reads' OSError, so a bug in what it calls fails the backup attempt or
   the watcher's job with its traceback; it lists a parent once when many of its folders vanish (D14), and the watcher
   counts a folder it cannot open unwatched (D13's watcher half). Done with the round's merge.
-- **P13. "Event name not found, ignoring event" as a DEBUG line** (item 9): built on branch `r0556` (Task 4, 8b3f23d,
+- **P13. "Event name not found, ignoring event" as a DEBUG line** (item 9): built on branch `r0556` (Task 4, 4670ea0,
   reviewed): no log-file line for every chmod or touch of a watched folder any more, unless DEBUG. Its review found that
   a change to the monitored folder's own metadata alone makes no version (older than this round): a deferred entry in
   `docs/limitations.md` for the round after 0.55.6.
@@ -220,12 +220,12 @@ keep is hard-linked, not exchanged), 3 (the staging rule, the lost-manifest row)
 filesystem with no exchange is treated as a pool, not only mergerfs), 6 (the estimate changed) and 13 (line numbers),
 where the round 20 plan's proposed spec edits were applied only in part; the 0.55.5 spec's L4 summary table (three and
 four mount-table reads, not two and three) and its 5.9 (L10 decides "gone" by listing the parent, not by an lstat).
-State: built on branch `r0556` (Task 17, adc1009 and its fix 2cd24c7, reviewed): each edit says the rule the code
+State: built on branch `r0556` (Task 17, 8c127fd and its fix d2070f3, reviewed): each edit says the rule the code
 follows, with this round's changes in a clause. Done with the round's merge. Behind it: the main session's own
 housekeeping, with no pick of the user's.
 
 **P15. Every test module carries its layer marker.** Source: `specs/2026-08-12-full-test-suite-design.md`, Goals and
-"1 Pytest config". State: built on branch `r0556` (Task 1, c18fc76..5212daf, reviewed): every test carries exactly
+"1 Pytest config". State: built on branch `r0556` (Task 1, 71e4e42..1b5febe, reviewed): every test carries exactly
 one layer by what it does (twenty modules had tests with none, not the eight first counted; about twenty tests had a
 wrong or a second layer), the collection fails a module with an unmarked or a two-layer test, and the two `unittest`
 modules are pytest functions. A few wording points and one more test's layer wait for the round's cleanup. Done with
@@ -237,7 +237,7 @@ when its own metadata copy fails (an ERROR line, and the folder listed as unsync
 or commit has a result. Round 18 (0.54) and design R changed how folder metadata is copied since, so the check runs on
 the current release. The entry "A folder whose extended attributes alone fail to copy keeps the wrong ones" covers
 only the xattr case. State: in round 0.55.6 (branch `r0556`). Step 1, the check, is built and reviewed (Task 2,
-85e8e5d..2dfb89d, tests/test_io_errors.py: 40 results, the same on 0.55.5's code). Its results were Q15, which the
+2dc2fd0..8aed9ab, tests/test_io_errors.py: 40 results, the same on 0.55.5's code). Its results were Q15, which the
 user answered (a) on 2026-11-17: step 2 is plan Task 18 (the failed folder's row is marked, so the next comparison that
 meets the folder copies its metadata again, once), not started. Spec section 16's reasoned list ("reasoned, not run")
 is superseded by those results. Behind it: that pick, "Fixes round (Recommended)" (2026-11-14), and Q15's answer,
@@ -265,7 +265,7 @@ it: the main session's call (2026-11-14).
 Round 0.55.6's questions, from its spec (`specs/2026-11-14-r0556-design.md` section 26, 1e96eeb, where each is written
 out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chief decided Q10 to Q12 (2026-11-15).
 
-- **Q19. Roll out 0.55.6** (P1; branch `r0556` at 99ce063, gated: the container suite fails only main's 265 root-needing
+- **Q19. Roll out 0.55.6** (P1; branch `r0556` at e166baa, gated: the container suite fails only main's 265 root-needing
   tests, and the test VM's whole suite, crash and power-loss runs pass). The round's Calls to confirm are in
   `docs/progress/r0556.md`: the final review's one Important finding and the pool pause rule deferred, not asked; the
   folder-above-a-link case Not an issue; a few behaviour and wording changes.
@@ -318,7 +318,7 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
-- Q15, a folder whose own metadata copy failed (P16, step 2; the healing check's 40 results, Task 2, asked in 90e1003):
+- Q15, a folder whose own metadata copy failed (P16, step 2; the healing check's 40 results, Task 2, asked in 5bad9b5):
   setgid is mended at the next full comparison, but a default ACL the folder inherited and its own extended attributes
   usually stay wrong until the folder's own metadata changes. (a), build plan Task 18: the failed folder's row is
   marked, so the next comparison that meets it copies its metadata again, once. The user's answer 2026-11-17 (dialog of

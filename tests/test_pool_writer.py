@@ -916,7 +916,7 @@ def test_a_branch_removed_through_the_control_file_during_a_batch_fails_it(monke
 	# put back, and the next attempt, a full comparison, rolls forward. Every version reads as the tree it was taken from (the oracle).
 	# On main the batch commits, its flush syncing only the branch the pool still lists. The version view oracle reads V0 through the
 	# pool as the failed batch ends, with the branch still out, so V0's entries only that branch holds read as nothing then (the VM
-	# gate's vmg1-1 on 4c17b53: f3, f5 and f7, as the create policy placed them, an error at teardown): the test looks at those lines
+	# gate's vmg1-1 on 28e879c: f3, f5 and f7, as the create policy placed them, an error at teardown): the test looks at those lines
 	# (each such entry is on the branch, and V0 reads as before once it is back) and takes them out, the plugin's negative control
 	with real_pool() as root:
 		job = create_job(root)

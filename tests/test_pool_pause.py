@@ -274,7 +274,7 @@ def _attempt_that_loses_a_disk(job, fake_pool, monkeypatch, pool):
 @pytest.mark.unit
 @pytest.mark.parametrize('side', ['vault', 'monitor'])
 def test_the_attempt_after_a_disk_was_taken_out_of_the_pool_waits_for_it_to_be_listed_again(job, fake_pool, grace, board, output, monkeypatch, tmp_path, side):
-	# fails on 6acf680 (goes on): the retry of a step that failed for a disk taken out of its pool's list (mergerfs's control file) finds the
+	# fails on 0392dcc (goes on): the retry of a step that failed for a disk taken out of its pool's list (mergerfs's control file) finds the
 	# pool whole as it is then, as no wait sees a disk that is mounted still. Its scan then acts on a view that hides what that disk holds,
 	# such as a version's real entry on it, over which the scan writes a forward link to the cut batch's new copy: once the roll-forward
 	# commits, version n shows the new bytes. The retry waits for the disk to be listed again instead, before it does anything with the
@@ -303,7 +303,7 @@ def test_the_attempt_after_a_disk_was_taken_out_of_the_pool_waits_for_it_to_be_l
 @pytest.mark.unit
 @pytest.mark.parametrize('unreadable', ['the branch list', 'the mount table'])
 def test_a_wait_for_a_disk_that_left_the_pool_goes_on_while_the_pool_cannot_be_read(job, tmp_path, fake_pool, monkeypatch, unreadable):
-	# review of Task 13 (Haiku c1 (3)), fails on 1f774a3 (the wait ends: left_reason() answered None): the pool's branch list, or the mount
+	# review of Task 13 (Haiku c1 (3)), fails on b565fd2 (the wait ends: left_reason() answered None): the pool's branch list, or the mount
 	# table, cannot be read at the moment the wait looks for the disk the failed attempt saw leave. It is the wait's reason, as the pool's
 	# own is (pool_state()), not an end to the wait with the disk possibly still out
 	_, b = fake_pool.add(job.vault, ['a', 'b'])
@@ -730,7 +730,7 @@ def test_the_watcher_compares_it_when_it_is_mounted_again(tmp_path, fake_pool):
 
 @pytest.mark.unit
 def test_the_watcher_reads_the_branch_list_alone_and_keeps_the_last_one_when_a_read_fails(tmp_path, fake_pool, monkeypatch):
-	# review of Task 12, M2 (fails on 829bb9f, which read the whole pool_state() at each table: fstab, a statx of the pool and each branch, so its
+	# review of Task 12, M2 (fails on 8212548, which read the whole pool_state() at each table: fstab, a statx of the pool and each branch, so its
 	# read of the branch list failing gave no disks, the disk under the branch read as unmounted, its watches went and a scan was queued, and
 	# the next table mounted it again: a large inner disk compared twice for a read that failed). The watcher takes the pool's mount point and
 	# the branch list from the control file alone, and keeps the last list when a read fails

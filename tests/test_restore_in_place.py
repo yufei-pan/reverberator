@@ -1452,7 +1452,7 @@ def root_meta_writes(writes, since=0):
 
 def test_an_unchanged_root_record_is_not_written_again(job, monkeypatch):
 	# pin: a root that did not change writes no record at a commit: the hand-over copies the version before's record onto the new version, and a
-	# record equal byte for byte is not written again. On main (1f774a3) the same call came at the end of the replay and found it equal too
+	# record equal byte for byte is not written again. On main (b565fd2) the same call came at the end of the replay and found it equal too
 	store, writes = root_meta_store(monkeypatch)
 	a_root_with_v0(job)
 	after_v0 = len(writes)
@@ -1593,7 +1593,7 @@ def test_a_record_that_does_not_fit_with_nothing_left_out_is_an_error(job, monke
 
 def test_a_skip_ends_a_failed_state_with_its_line(job, monkeypatch):
 	# pin: a 'failed' state with an equal record on the tree (the hand-over's copy of the version before's): the next batch writes nothing, says
-	# "is kept on ... again" once, and the state is gone. The same on main (1f774a3)
+	# "is kept on ... again" once, and the state is gone. The same on main (b565fd2)
 	store, writes = root_meta_store(monkeypatch)
 	a_root_with_v0(job)
 	rv.ROOT_META_TROUBLE[(job.monitor, job.job_vault)] = 'failed'
@@ -1726,7 +1726,7 @@ def test_a_rebuild_committed_by_a_comparison_leaves_the_key_absent(job, monkeypa
 def test_a_failed_record_write_leaves_the_record_the_version_had(job, monkeypatch, poll_fast):
 	# the write at a commit fails (EIO) for a root whose mode changed: the version keeps the record the batch before wrote (the hand-over
 	# copied it), the first batch's, with its mode and set (a pin), so a whole-job restore gives the top folder that, and the line says so
-	# (fails on a22bf58: it said the restore gives the version folder's own)
+	# (fails on 13e92a0: it said the restore gives the version folder's own)
 	from tests.test_inner_mounts import _lines
 	store, writes = root_meta_store(monkeypatch)
 	seed_monitor(job, {'sub/f.txt': 'a'})
@@ -1752,7 +1752,7 @@ def test_a_failed_record_write_leaves_the_record_the_version_had(job, monkeypatc
 def test_a_record_that_is_there_and_cannot_be_read_stops_the_backup_over_a_lost_manifest(job, monkeypatch, poll_fast, failure):
 	# R24: the vault database lost and the newest version's record unreadable (EIO) or undecodable: no answer for the inner mounts, as an empty one
 	# would commit an unmounted inner disk's folder empty. The attempt fails (JobFailure) naming the version folder and the error, and
-	# commits nothing; with the attribute removed (none there) it goes on. Fails on 79220a8: the record is taken for none, and a version commits
+	# commits nothing; with the attribute removed (none there) it goes on. Fails on 102cf04: the record is taken for none, and a version commits
 	store, writes = root_meta_store(monkeypatch)
 	a_vault_whose_manifest_is_lost_with_its_inner_disk_unmounted(job, monkeypatch)
 	v0 = versions(job)[0].path

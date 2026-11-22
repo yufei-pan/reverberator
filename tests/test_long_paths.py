@@ -426,7 +426,7 @@ def left_out_folder_of_three_files(holder, name='h' * 96):
 
 
 def test_a_full_comparison_meeting_a_left_out_folder_gives_one_line_and_no_version(job, capsys):
-	# review of Task 9, I1 (fails on 869014d: four lines each time, one for the folder and one for each of its files): a full comparison
+	# review of Task 9, I1 (fails on d37e716: four lines each time, one for the folder and one for each of its files): a full comparison
 	# gives each untracked entry its own create, and the check leaves out what the replay would and writes the lines it would: one, for the folder
 	seed_monitor(job, {'a': 'a'})
 	holder = deep_folder(job, 4000)
@@ -442,7 +442,7 @@ def test_a_full_comparison_meeting_a_left_out_folder_gives_one_line_and_no_versi
 
 
 def test_a_batch_of_a_left_out_folder_and_the_events_of_its_files_gives_one_line_and_no_version(job, capsys):
-	# review of Task 9, I1 (fails on 869014d: four lines): the batch of a folder made and filled, whose entries the replay prunes under the folder's create
+	# review of Task 9, I1 (fails on d37e716: four lines): the batch of a folder made and filled, whose entries the replay prunes under the folder's create
 	seed_monitor(job, {'a': 'a'})
 	holder = deep_folder(job, 4000)
 	versions = run_backup(job)
@@ -455,7 +455,7 @@ def test_a_batch_of_a_left_out_folder_and_the_events_of_its_files_gives_one_line
 
 
 def test_on_a_pool_a_touched_folder_past_the_limit_is_not_recorded(job, fake_pool, capsys):
-	# review of Task 9, I2 (fails on 869014d: "JobFailure: recording in ... before the batch writes ... failed: [Errno 36] File name too
+	# review of Task 9, I2 (fails on d37e716: "JobFailure: recording in ... before the batch writes ... failed: [Errno 36] File name too
 	# long"): a batch the daemon runs, with its touched scopes verified after the replay, whose events make a folder past the limit and a
 	# file in it. The folders the batch's events touched are recorded in the version before on a pool (record_settled()), the folder
 	# past the limit too, which no path of the version before names
@@ -474,13 +474,13 @@ def test_on_a_pool_a_touched_folder_past_the_limit_is_not_recorded(job, fake_poo
 	assert len(versions) == 2 and read(os.path.join(versions[-1], 'a')) == 'a2' and listed(versions[-1], job, holder) == []
 	out = capsys.readouterr()
 	assert not_backed_up_in(out.out + out.err) == {past: [LEFT_OUT]}
-	# the sweep of the touched folder does not look at a path the rule leaves out whole: no error line for it (fails on 33c46c2: "Cannot
+	# the sweep of the touched folder does not look at a path the rule leaves out whole: no error line for it (fails on 2c0159d: "Cannot
 	# look at <version>/<folder>: [Errno 36] File name too long")
 	assert 'Cannot look at' not in out.out + out.err
 
 
 def test_a_first_version_holds_a_folder_at_exactly_4095_bytes(job, capsys):
-	# review of Task 9, I3 (fails on 869014d: "OSError: [Errno 36] File name too long" from os.makedirs(), and no V0 ever): the rule lets a
+	# review of Task 9, I3 (fails on d37e716: "OSError: [Errno 36] File name too long" from os.makedirs(), and no V0 ever): the rule lets a
 	# folder of 4,095 bytes through, and the first version's walk made it by its rel, whose trailing / made the path 4,096 bytes
 	seed_monitor(job, {'a': 'a'})
 	folder = deep_folder(job, 4095)
@@ -490,7 +490,7 @@ def test_a_first_version_holds_a_folder_at_exactly_4095_bytes(job, capsys):
 
 
 def test_a_move_from_an_entry_the_version_does_not_hold_to_a_path_left_out_makes_no_version(job, capsys):
-	# review of Task 9, I4 (fails on 869014d: a version in which nothing changed): f in a folder of 4,041 bytes is left out (its copy's
+	# review of Task 9, I4 (fails on d37e716: a version in which nothing changed): f in a folder of 4,041 bytes is left out (its copy's
 	# temporary path passes), then mv f g: the replay renames nothing, as no row tracks f, and leaves g's copy out. The check takes it as
 	# the create of g, which it is, so it drops it, with g's line and none for f, which the version never held
 	seed_monitor(job, {'a': 'a'})
@@ -509,7 +509,7 @@ def test_a_move_from_an_entry_the_version_does_not_hold_to_a_path_left_out_makes
 
 
 def test_a_move_between_two_paths_past_the_limit_that_the_version_never_held_logs_the_target_only(job, capsys):
-	# review of Task 9, I4 (fails on 869014d: a "this version keeps it" line for the source, which the version never held)
+	# review of Task 9, I4 (fails on d37e716: a "this version keeps it" line for the source, which the version never held)
 	seed_monitor(job, {'a': 'a'})
 	folder = deep_folder(job, 4000)
 	versions = run_backup(job)
@@ -524,7 +524,7 @@ def test_a_move_between_two_paths_past_the_limit_that_the_version_never_held_log
 
 
 def test_an_entry_left_out_whose_path_is_gone_gets_no_not_backed_up_line_from_the_check(job, capsys):
-	# review of Task 9, same lines as I1 (fails on 869014d: the NOT BACKED UP line): a create of a file in a folder of 4,041 bytes, removed
+	# review of Task 9, same lines as I1 (fails on d37e716: the NOT BACKED UP line): a create of a file in a folder of 4,041 bytes, removed
 	# before the batch ran. The replay says "Not tracking ...: source no longer exists" for such a path, and the check says the same
 	seed_monitor(job, {'a': 'a'})
 	folder = deep_folder(job, 4041)
@@ -540,7 +540,7 @@ def test_an_entry_left_out_whose_path_is_gone_gets_no_not_backed_up_line_from_th
 @pytest.mark.parametrize('skip', ['no_skip_list', 'skip_list'])
 @pytest.mark.parametrize('left_out', ['file', 'folder', 'in_a_new_folder'])
 def test_the_size_estimate_charges_nothing_for_what_the_rule_leaves_out(job, monkeypatch, left_out, skip):
-	# review of Task 9, I5 (fails on 869014d: the estimate charges the 1 MiB file, and a size limit prunes old versions for good to make
+	# review of Task 9, I5 (fails on d37e716: the estimate charges the 1 MiB file, and a size limit prunes old versions for good to make
 	# room for bytes never written): a batch of a change beside an entry the rule leaves out, a file in a folder of 4,041 bytes or a folder
 	# past the limit with a file in it, whole or inside a new folder. The estimate is what the replay copies: a folder with all under it
 	# left out, and a new folder's walk counts the rest of it, with a skip list's rels or without
@@ -587,7 +587,7 @@ def test_without_a_pool_a_link_at_4090_bytes_is_backed_up(job, capsys):
 
 
 def test_on_a_pool_the_longest_branchs_path_counts_in_the_length_of_the_version(job, fake_pool, tmp_path, capsys):
-	# review of Task 9, I6 (fails on 869014d: the link is backed up in the first version, where a real mergerfs, which this fake pool is not,
+	# review of Task 9, I6 (fails on d37e716: the link is backed up in the first version, where a real mergerfs, which this fake pool is not,
 	# refuses its record on the branch with ENAMETOOLONG at every attempt): mergerfs writes <branch>/<the path below the pool's mount
 	# point>, so a branch whose path is longer than the pool's mount point leaves its entries that many bytes less room. The rule counts the
 	# longest branch's surplus in the first version's walk, in the check and in the replay, each on the pool. Shorter branches are listed
@@ -618,7 +618,7 @@ def test_on_a_pool_the_longest_branchs_path_counts_in_the_length_of_the_version(
 
 
 def test_a_full_comparison_meeting_only_an_entry_left_out_moves_the_matched_time(job):
-	# fails on 33c46c2: the left-out entry's key in `reported` was its plain path, as an unreadable file's is, which holds the matched time:
+	# fails on 2c0159d: the left-out entry's key in `reported` was its plain path, as an unreadable file's is, which holds the matched time:
 	# an entry that stays in the tree then held it at every full comparison, and widened the next one's extended-attribute window for good
 	seed_monitor(job, {'a': 'a'})
 	folder = deep_folder(job, 4041)
@@ -633,7 +633,7 @@ def test_a_full_comparison_meeting_only_an_entry_left_out_moves_the_matched_time
 
 
 def test_a_committed_batch_beside_an_entry_left_out_moves_the_matched_time(job):
-	# fails on 33c46c2: as above, at the commit
+	# fails on 2c0159d: as above, at the commit
 	seed_monitor(job, {'a': 'a'})
 	folder = deep_folder(job, 4041)
 	run_backup(job, matched_since=1)
@@ -645,7 +645,7 @@ def test_a_committed_batch_beside_an_entry_left_out_moves_the_matched_time(job):
 
 
 def test_a_move_from_a_source_the_version_never_held_to_a_path_that_fits_has_no_line_for_the_source(job, capsys):
-	# fails on 33c46c2 (a "this version keeps it" line for the source, which the version never held): f in a folder of 4,000 bytes is left
+	# fails on 2c0159d (a "this version keeps it" line for the source, which the version never held): f in a folder of 4,000 bytes is left
 	# out (its path in the vault is 4,097), then mv f g to a short path: the replay deletes the source (nothing to delete) and copies g
 	seed_monitor(job, {'a': 'a'})
 	folder = deep_folder(job, 4000)
@@ -662,7 +662,7 @@ def test_a_move_from_a_source_the_version_never_held_to_a_path_that_fits_has_no_
 
 
 def test_a_move_of_an_entry_the_version_holds_past_the_limit_to_a_target_gone_since_makes_no_version(job, monkeypatch, capsys):
-	# fails on 33c46c2 (a version in which nothing changed): the version keeps the source (its removal by path would fail), the target is
+	# fails on 2c0159d (a version in which nothing changed): the version keeps the source (its removal by path would fail), the target is
 	# a short path removed since the batch was taken, so nothing is copied. The check says so, with the source's line only
 	folder, file = held_at_4096_in_v10(job, monkeypatch)
 	versions = committed_versions(job)

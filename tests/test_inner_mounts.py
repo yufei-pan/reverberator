@@ -871,7 +871,7 @@ def test_a_batch_the_look_after_the_locks_leaves_with_nothing_to_back_up_commits
 	# gone by then ("a gone create": entries_all_drop_out() drops it), or a move into disk/ whose source the vault never tracked
 	# ("an untracked delete": the look drops the move, which leaves the delete of its source, drop_untracked_deletes() drops that). The look
 	# drops the modify, and what is left was checked only before the wait, which it did not hold: a version that changes nothing, which
-	# prunes the oldest under Keep N. Now the two checks run again under the locks. Fails on 652397a: a second version
+	# prunes the oldest under Keep N. Now the two checks run again under the locks. Fails on 8530ca6: a second version
 	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f', 'plain.txt': 'p'})
 	disk = os.path.join(job.monitor, 'disk')
 	real_table = rv.read_mount_table()

@@ -412,7 +412,7 @@ def test_the_change_list_is_not_placed_when_a_disk_drops_after_the_commit_check(
 
 
 def test_the_guard_collects_the_disks_that_left_every_pool_it_holds(job, fake_pool):
-	# review of Task 13 (Opus M3, Haiku c1 (1)), fails on 1f774a3 (a disk of the second pool is not remembered): the vault and the monitored
+	# review of Task 13 (Opus M3, Haiku c1 (1)), fails on b565fd2 (a disk of the second pool is not remembered): the vault and the monitored
 	# path on two pools, a disk of each taken out of its list in the same check. The problem is the first path's text, and left holds both,
 	# as the job waits for each of them. Without a left list the check stops at the first problem
 	vault_pool, monitor_pool = job.vault, job.monitor

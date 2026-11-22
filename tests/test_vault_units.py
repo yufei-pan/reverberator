@@ -1768,13 +1768,13 @@ def test_a_disk_dropped_during_the_starts_put_back_stops_the_scan_before_its_fir
 @pytest.mark.parametrize('unreadable', ['file', 'folder'])
 def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkeypatch, unreadable):
 	# pin for the newest version (passes before and after round 0.55.6's change), and case 3's test for the version before (its tail fails on
-	# 79220a8). The design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
+	# 102cf04). The design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,
 	# its forward link to staging first; a cut between them leaves version n's folder in the tree only. With the manifest lost no
 	# row gives the link back, and the source cannot be read at the retry: a file in the folder (mode 000), or a folder in it with
 	# files (unreadable_below()). The newest version keeps them: the scan gives the link back from staging (put_back_staged_links())
 	# before the put-back's pass 2, which since round 0.55.6 runs over a lost manifest off a pool, removes what the version before
 	# does not list. It fails on a pass 2 run over a lost manifest without that link given back first; 0.55.4 kept them too. The version
-	# before reads d again too (spec section 6, case 3): on 79220a8 its tail fails, d gone
+	# before reads d again too (spec section 6, case 3): on 102cf04 its tail fails, d gone
 	put_text(r_job.monitor, 'd/x.bin', big_text('x0'))
 	put_text(r_job.monitor, 'd/sub/s.txt', 's0')
 	put_text(r_job.monitor, 'd/sub/t.txt', 't0')
@@ -1896,15 +1896,15 @@ class CutAfterThePutBack(BaseException):
 @pytest.mark.unit
 @pytest.mark.parametrize('rel', ['d', 'p/d'])
 def test_a_cut_between_two_renames_over_a_lost_manifest_puts_the_staged_link_back(r_job, monkeypatch, rel):
-	# case 3 of spec section 6, fails on 79220a8 (and on 0.55.4): on a vault with no RENAME_EXCHANGE a batch that deletes <rel>/x.txt makes rel real
+	# case 3 of spec section 6, fails on 102cf04 (and on 0.55.4): on a vault with no RENAME_EXCHANGE a batch that deletes <rel>/x.txt makes rel real
 	# in the version before by two renames, its forward link to staging first (p first for p/d); a cut between them, the manifest lost, and a
 	# start. The scan keeps the link in staging (empty_staging()) and gives it back to the version before as the tree is made ready for its
 	# roll-forward (put_back_staged_links(), in prepare_roll_forward()); a cut after that, with the repair not done, leaves the link given
-	# back and the staged one, which the next scan finds no longer due, and keeps in staging, as its tree stands (fails on 4232cf1, which
+	# back and the staged one, which the next scan finds no longer due, and keeps in staging, as its tree stands (fails on 46ae3f2, which
 	# emptied staging there). Once rolled forward every version reads right by the
 	# oracle: the version before what it read before the cut, the newest the monitored tree. For p/d the time of p, which the cut's first rename
 	# moved, is left out: no row gives it back over a lost manifest (the approved limitation "After a crash, a folder whose row holds no record
-	# can keep the backup's time"). On 79220a8 the link goes with staging: the version before holds nothing at rel, and the retry's delete of
+	# can keep the backup's time"). On 102cf04 the link goes with staging: the version before holds nothing at rel, and the retry's delete of
 	# <rel>/x.txt finds nothing to record there, so x.txt is in no version
 	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
 	before = folder_backed_up(r_job, rel)
@@ -1947,7 +1947,7 @@ def test_a_link_a_cut_left_in_staging_stays_until_the_scan_after_the_commit(r_jo
 	# there (empty_staging() with the orphan's name), whatever it judged, until a scan finds no orphan by its tree's name. The roll-forward
 	# commits the tree under that name after its flush of every vault disk (flush_copies()), so the link given back is on the disk before its
 	# staged copy goes: the link is still in staging once the roll-forward committed, and the scan after the commit removes it. With the
-	# manifest kept the rows give the link back, and the staged one is kept the same way. Fails on 4232cf1: the first scan empties staging
+	# manifest kept the rows give the link back, and the staged one is kept the same way. Fails on 46ae3f2: the first scan empties staging
 	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
 	before = folder_backed_up(r_job)
 	os.remove(os.path.join(r_job.monitor, 'd', 'x.txt'))
@@ -2177,7 +2177,7 @@ def test_a_cut_create_unreadable_at_the_retry_over_a_lost_manifest_is_left_out(r
 	# case 2 of spec section 6: the design re-check's run N4 over a lost manifest off a pool. A file the cut batch made, its copy's middle lost (a
 	# stand-in writes it damaged), its source mode 000 at the retry (uid 65534 only, as root reads it; the VM gate deselects it by name), the
 	# manifest removed. The put-back's pass 2 runs off a pool whatever the manifest, so the scan removes what the batch made: the newest version
-	# holds nothing there, with one UNREADABLE line, and once the file can be read the next full comparison copies it. Fails on 79220a8: the
+	# holds nothing there, with one UNREADABLE line, and once the file can be read the next full comparison copies it. Fails on 102cf04: the
 	# newest version keeps the damaged copy (pass 2 stays off over a lost manifest, new_in_tree() lists the copy, and copying it again fails)
 	base(r_job)
 	path = os.path.join(r_job.monitor, 'new.bin')
@@ -2209,7 +2209,7 @@ def test_a_users_link_in_staging_naming_another_versions_folder_is_not_put_back(
 	# the cut batch made, says a link is the batch's own. And one naming the tree's folder at a name the tree does not hold, which would lead
 	# nowhere. The scan leaves every committed version reading what it read before (by the oracle, read here as the scan runs outside a batch,
 	# which the ground truth does not watch). Its last line is the rule of what staging keeps, which it changed: the links naming other
-	# versions' folders go, the one naming the tree's stays while the tree does (empty_staging()); 4232cf1 emptied staging
+	# versions' folders go, the one naming the tree's stays while the tree does (empty_staging()); 46ae3f2 emptied staging
 	base(r_job)
 	put_text(r_job.monitor, 'small.txt', 's1')
 	backup_events(r_job, [(False, 'modify', 'small.txt', None)], **KEPT)
@@ -2232,7 +2232,7 @@ def test_a_users_link_in_staging_naming_another_versions_folder_is_not_put_back(
 
 @pytest.mark.unit
 def test_on_a_pool_a_cut_copy_over_a_lost_manifest_is_kept(r_job, fake_pool, monkeypatch, capsys):
-	# pin: the case above on a pool, where pass 2 stays off over a lost manifest, as on 79220a8: a cut can leave a folder's record on one disk and
+	# pin: the case above on a pool, where pass 2 stays off over a lost manifest, as on 102cf04: a cut can leave a folder's record on one disk and
 	# not another, and with no rows the repair cannot tell a removed entry from a new one (the approved limitation "A manifest lost in the same
 	# cut as a split on a pool", widened by Q2's answer). The newest version keeps the cut copy, damaged, with its UNREADABLE line. uid 65534
 	# only, as root reads the source; the VM gate deselects it by name
@@ -2286,8 +2286,8 @@ def test_on_a_pool_the_staged_links_wait_for_every_disk(r_job, fake_pool, monkey
 	# fails it, put_back_recorded()), a folder above rel in the version before, p (not due: its parent is no real folder; the same check), or
 	# all of the tree, whose only top-level entry is d, the disk going once the scan's whole read is done, before the orphan is judged (the tree
 	# is empty, so it reads as a skeleton: nothing is put back, and the check before the skeleton's removal fails the scan). Once the disk is
-	# back the next scan gives the link back. Fails, the link gone with staging (a later check of the scan raises PoolNotReady): on 79220a8 in
-	# every case, on eaa1ed6 in all but the control, on df30259 in the skeleton case
+	# back the next scan gives the link back. Fails, the link gone with staging (a later check of the scan raises PoolNotReady): on 102cf04 in
+	# every case, on 70c1661 in all but the control, on 228d584 in the skeleton case
 	skeleton = hidden.startswith('all of the tree')
 	rel = 'p/d' if hidden.startswith('a folder') else 'd'
 	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
@@ -2404,7 +2404,7 @@ def test_a_look_that_fails_is_no_absence_to_a_staged_link(r_job, monkeypatch, fa
 	# commits it with the version before holding nothing at rel, and the scan after the commit removes the link, the entry's only record
 	# over a lost manifest. At the version before's entry it would judge the link due, which writes it only where nothing is (os.symlink()
 	# fails, EEXIST, on an entry there), as here: that case pins the rule alone. The scan fails instead, the link kept (VaultScanError), and
-	# the next scan, whose looks work, gives it back. Fails on df30259: the scan does not fail (the link gone with staging, or written where
+	# the next scan, whose looks work, gives it back. Fails on 228d584: the scan does not fail (the link gone with staging, or written where
 	# the look failed)
 	rel = 'p/d' if failing.startswith('a folder') else 'd'
 	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
@@ -2436,7 +2436,7 @@ def test_a_look_that_fails_is_no_absence_to_a_forward_link_a_row_gives_back(r_jo
 	# the same look in put_back_forward_links() (the rows' put-back over a manifest that stands, pre-existing): an EIO at the tree's entry judged
 	# the row not due, and the version before kept holding nothing at d, the batch's delete of d/x.txt in no version; at the version before's
 	# entry it judged it due, which writes the link only where nothing is (os.symlink() fails, EEXIST, on an entry there), as here: that case
-	# pins the rule alone. The scan fails instead (VaultScanError) and the next scan, whose looks work, gives the link back. Fails on df30259:
+	# pins the rule alone. The scan fails instead (VaultScanError) and the next scan, whose looks work, gives the link back. Fails on 228d584:
 	# the scan does not fail
 	monkeypatch.setattr(rv, 'exchanged', lambda a, b: False)
 	before = folder_backed_up(r_job)
