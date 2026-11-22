@@ -8405,7 +8405,8 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   folder changes it, as does a regular file that opens and reads, and an entry of another kind (a FIFO, a socket, a
 	   device, which cp -a copies as itself). A regular file is opened once, non-blocking, and read through that handle: its
 	   last HASH_SIZE bytes (64 KiB), the tail the comparison reads ( hash_file() ), which the copy then reads from the page
-	   cache; one its handle shows of another kind (put there since the lstat) changes it unread. A regular file that does not
+	   cache; one its handle shows of another kind (put there since the lstat) changes it unread, as does one whose open
+	   answers ENXIO (a socket put there since). A regular file that does not
 	   open, or whose read fails (a bad sector under its tail, an EIO of a network filesystem), drops out, as its copy keeps
 	   the last copy (an attrib too, under Only Sync Attributes: its record cannot vouch, as its tail cannot be read, so the
 	   replay copies it); so does a path that cannot be looked at, and a path gone, which the replay passes over. Two things
@@ -8505,6 +8506,10 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			# another process's lease on the file: the copy's blocking open waits for the break and reads it
 			return False
 		except OSError as e:
+			if e.errno == errno.ENXIO:
+				# a socket put at the file's place since the lstat (a FIFO opens, a socket answers ENXIO): an entry of another kind,
+				# a change as the lstat pass counts one, which cp -a copies as itself, not an unreadable file
+				return False
 			if under_untracked_folder(path):
 				return False
 			lines.append(('unreadable', path, e))
@@ -11512,7 +11517,8 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 def hash_file(path,size = ...,full_hash=False):
 	'''
 	Hash file contents with xxhash (last HASH_SIZE bytes unless full_hash is True). The open never blocks on what is not a
-	regular file (OSError, "Not a regular file"), and waits for another process's write lease to break, as cp's open does.
+	regular file (OSError, "Not a regular file"), and waits for another process's write lease to break, as cp's open does,
+	unless the daemon is stopping (GREEN_LIGHT clear): then the BlockingIOError of the open is raised at once.
 
 	Examples:
 		>>> digest = hash_file(__file__, full_hash=True)
@@ -11539,6 +11545,11 @@ def hash_file(path,size = ...,full_hash=False):
 		try:
 			return os.open(file, flags | os.O_NONBLOCK | os.O_NOCTTY)
 		except BlockingIOError:
+			if not GREEN_LIGHT.is_set():
+				# the daemon is stopping: no wait for a lease to break (up to the lease-break time, 45 s by default, and the server's
+				# own period for a network filesystem), and no comparison still queued on the pool starts one. The caller takes it as
+				# a file that cannot be read, as before this open waited
+				raise
 			# another process's write lease (an NFS write delegation, Samba's oplocks) answers that open so too: the file is
 			# opened again through a handle that cannot block, and only a regular file is then opened blocking, through that
 			# handle's inode, which waits for the lease to break as cp's open does

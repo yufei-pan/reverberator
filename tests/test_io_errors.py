@@ -1,6 +1,7 @@
 import errno
 import os
 import shutil
+import socket
 import stat
 import sys
 import threading
@@ -1399,6 +1400,37 @@ def test_a_fifo_swapped_in_after_the_ewouldblock_does_not_hold_the_comparison(tm
 	assert (outcome[0].errno, outcome[0].strerror) == (errno.EINVAL, 'Not a regular file'), outcome[0]
 
 
+@pytest.mark.parametrize('stopping', [True, False], ids=['stopping', 'running'])
+def test_a_stopping_daemon_does_not_wait_for_a_lease_to_break(tmp_path, monkeypatch, stopping):
+	# fails on 71cf83a with GREEN_LIGHT clear: the opener meets EWOULDBLOCK (a stand-in on the non-blocking open, as a lease answers it)
+	# and reopens the file through its O_PATH handle and a blocking open, which waits for the lease to break (the lease-break time, 45 s
+	# by default), and every comparison still queued on the pool would wait again. A stopping daemon raises the BlockingIOError at once
+	# and opens nothing more; a running one (the pin) reopens, as cp's open waits, and hashes the file
+	path = str(tmp_path / 'f')
+	with open(path, 'w') as f:
+		f.write('f')
+	real_open = os.open
+	reopened = []
+	def opening(target, flags, *args, **kwargs):
+		if os.fspath(target) == path and flags & os.O_NONBLOCK:
+			raise BlockingIOError(errno.EWOULDBLOCK, os.strerror(errno.EWOULDBLOCK), target)
+		if flags & os.O_PATH or os.fspath(target).startswith('/proc/self/fd/'):
+			reopened.append(os.fspath(target))
+		return real_open(target, flags, *args, **kwargs)
+	monkeypatch.setattr(os, 'open', opening)
+	try:
+		if stopping:
+			rv.GREEN_LIGHT.clear()
+			with pytest.raises(BlockingIOError):
+				rv.hash_file(path, 1)
+			assert reopened == []
+		else:
+			assert rv.hash_file(path, 1) == rv.xxhash.xxh64(b'f').hexdigest()
+			assert len(reopened) == 2
+	finally:
+		rv.GREEN_LIGHT.set()
+
+
 @pytest.mark.parametrize('changed', [True, False], ids=['changed', 'unchanged'])
 def test_a_file_whose_tail_cannot_be_read_makes_no_version(job, poll_fast, monkeypatch, capsys, changed):
 	# fails on main (a version that changes nothing): b.txt opens and its read fails with EIO (a bad sector under its tail), at the
@@ -1467,6 +1499,46 @@ def test_a_fifo_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll_f
 		finally:
 			manifest.close()
 	assert swapped and dropped is False
+	assert _lines(capsys, 'UNREADABLE', path) == 0
+
+
+def test_a_socket_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll_fast, monkeypatch, capsys):
+	# fails on 71cf83a: the check's lstat sees a regular file f, then a socket is put at f's place, which no open takes (ENXIO): the
+	# check read it as an unreadable file and dropped the batch with a false UNREADABLE line. An entry of another kind changes the
+	# version (cp -a copies it as itself), as the FIFO's case above, which opens. The socket is bound at a short relative name (a
+	# socket's path holds 107 bytes) and renamed into place
+	from tests.harness import event_entry
+	seed_monitor(job, {'a.txt': 'a', 'f': 'f'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'f')
+	real_lstat = os.lstat
+	swapped = []
+	sockets = []
+	def lstat(target, *args, **kwargs):
+		got = real_lstat(target, *args, **kwargs)
+		if not swapped and os.fspath(target) == path:
+			swapped.append(True)
+			bound = socket.socket(socket.AF_UNIX)
+			sockets.append(bound)
+			with monkeypatch.context() as inside:
+				inside.chdir(job.monitor)
+				bound.bind('f.sock')
+			os.replace(os.path.join(job.monitor, 'f.sock'), path)
+		return got
+	capsys.readouterr()
+	try:
+		with monkeypatch.context() as patch:
+			patch.setattr(os, 'lstat', lstat)
+			manifest = rv.VaultManifest(job.job_vault)
+			try:
+				dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest)
+			finally:
+				manifest.close()
+	finally:
+		for bound in sockets:
+			bound.close()
+	assert swapped and stat.S_ISSOCK(os.lstat(path).st_mode)
+	assert dropped is False
 	assert _lines(capsys, 'UNREADABLE', path) == 0
 
 
@@ -1546,7 +1618,10 @@ def test_a_new_file_whose_tail_cannot_be_read_is_left_out_and_its_line_says_so(j
 
 def test_a_readable_change_beside_a_file_whose_tail_cannot_be_read_commits(job, poll_fast, monkeypatch, capsys):
 	# pin: the check's read of b.txt fails (EIO at os.pread), and it goes on to a.txt, a readable change, so the batch commits; b.txt's
-	# copy fails as cp fails on a read error, and it keeps its last copy with its UNREADABLE line, once
+	# copy fails as cp fails on a read error, and it keeps its last copy with its UNREADABLE line, once. b.txt leads the batch (checked:
+	# the batch is [b.txt, a.txt] for these events), and the stand-in records each read, so the test asserts the check met the
+	# unreadable file first and then read the readable one: it fails when the check stops at an unreadable entry (the batch is then
+	# dropped to a comparison, which finds a.txt's change: the same version, a second walk), or never reads b.txt
 	seed_monitor(job, {'a.txt': 'a', 'b.txt': 'b'})
 	before = _settled(job)
 	path = os.path.join(job.monitor, 'b.txt')
@@ -1555,13 +1630,24 @@ def test_a_readable_change_beside_a_file_whose_tail_cannot_be_read_commits(job, 
 	with open(os.path.join(job.monitor, 'a.txt'), 'w') as f:
 		f.write('a changed')
 	st = os.lstat(path)
+	other = os.lstat(os.path.join(job.monitor, 'a.txt'))
 	real_pread = os.pread
+	read = []
 	def pread(fd, length, offset):
 		held = os.fstat(fd)
 		if (held.st_dev, held.st_ino) == (st.st_dev, st.st_ino):
+			read.append('b.txt')
 			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		if (held.st_dev, held.st_ino) == (other.st_dev, other.st_ino):
+			read.append('a.txt')
 		return real_pread(fd, length, offset)
 	monkeypatch.setattr(os, 'pread', pread)
+	real_check = rv.entries_all_drop_out
+	checks = []
+	def check(*args, **kwargs):
+		checks.append(True)
+		return real_check(*args, **kwargs)
+	monkeypatch.setattr(rv, 'entries_all_drop_out', check)
 	real_command = rv.copy_command
 	def copy_command(source_path, dest_path):
 		if source_path == path:
@@ -1570,6 +1656,10 @@ def test_a_readable_change_beside_a_file_whose_tail_cannot_be_read_commits(job, 
 	monkeypatch.setattr(rv, 'copy_command', copy_command)
 	capsys.readouterr()
 	_events(job, [(False, 'modify', 'b.txt', None), (False, 'modify', 'a.txt', None)])
+	# the check read the unreadable file first, failed it, and went on to the readable one, whose read it stopped at: once, the batch
+	# not dropped to a comparison (a check that stops at an unreadable entry says the batch drops out, and do_backup() compares as
+	# one with none: the same version, a second walk)
+	assert read == ['b.txt', 'a.txt'] and len(checks) == 1
 	versions = committed_versions(job)
 	assert len(versions) == len(before) + 1
 	with open(os.path.join(versions[-1], 'a.txt')) as f:
