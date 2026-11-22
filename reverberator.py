@@ -606,8 +606,9 @@ class VaultScanError(JobFailure):
 
 class PoolNotReady(JobFailure):
 	'''
-	A disk of a mergerfs pool a step works on is missing, or was mounted again during the step (PoolGuard): its reason
-	is pool_problem()'s text. Never permanent: the next attempt waits for the disk.
+	A disk of a mergerfs pool a step works on is missing, or was mounted again or left the pool during the step
+	(PoolGuard): its reason is pool_problem()'s text. Never permanent: the next attempt waits for a missing disk, and
+	begins with the pool as it is then.
 	'''
 	def __init__(self, reason:str):
 		super().__init__(reason, permanent=False)
@@ -4370,8 +4371,10 @@ def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None, fs
 	'''
 	What is wrong now with the mergerfs pool holding path, None when nothing is or path is on no pool. With since (a
 	pool_state() taken when a step began), the pool gone or mounted again since then counts too, and so does a disk
-	mounted since then, even one dropped and back. A step that began with a problem (since's) keeps it: with no whole
-	pool to compare with, the step fails, and the next one takes a fresh state. fstab goes to pool_state().
+	mounted since then, even one dropped and back, and a disk the pool no longer lists, taken out through mergerfs's
+	control file while still mounted: the step's flush syncs only the disks listed by then, and what the pool shows hides
+	what that disk holds. A step that began with a problem (since's) keeps it: with no whole pool to compare with, the
+	step fails, and the next one takes a fresh state. fstab goes to pool_state().
 	'''
 	if since is not None and since.problem:
 		return since.problem
@@ -4389,6 +4392,10 @@ def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None, fs
 		before = dict(since.ids)
 		problems.extend(f'disk {branch} of pool {state.pool} was mounted again during this step'
 			for branch, mount_id in state.ids if mount_id is not None and before.get(branch) != mount_id)
+		# a branch list that cannot be read has no ids, and its problem says so: it names no disk as gone
+		if state.ids or not state.problem:
+			listed = dict(state.ids)
+			problems.extend(f'disk {branch} left pool {state.pool} during this step' for branch, _ in since.ids if branch not in listed)
 	return '; '.join(problems) or None
 
 def parse_fstab(content:bytes) -> list:
@@ -4504,8 +4511,9 @@ def plain_disk_problem(path:str, mount_table:list) -> 'str | None':
 class PoolGuard:
 	'''
 	The mergerfs pools holding paths, as they were when a step began. require() fails the step with PoolNotReady once a
-	disk of one is missing or was mounted again since; poll() does so at most once every POOL_CHECK_SECONDS, so it can
-	run per entry. Paths on no pool are never checked; while the mount table cannot be read, each path counts as on one.
+	disk of one is missing, was mounted again since, or is no longer listed (pool_problem()); poll() does so at most once
+	every POOL_CHECK_SECONDS, so it can run per entry. Paths on no pool are never checked; while the mount table cannot be
+	read, each path counts as on one.
 	A path is held and asked in its normal spelling (os.path.normpath), as a rule's vault path is not normalised: a guard built on
 	vault// and asked about vault/job must agree. mount_table, when given, is the table the step began with: none is read
 	for the pools' states then. fstab, when given, is the points the step's look read (Look.fstab): every check of the

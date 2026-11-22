@@ -598,6 +598,19 @@ class FakePool:
 		self.write()
 		return branch
 
+	def leave(self, pool_mount:str, branch:str):
+		'''
+		The branch is taken out of the pool at pool_mount's list, as through mergerfs's control file (user.mergerfs.branches):
+		its disk stays mounted, and the mount table does not change.
+		'''
+		real = self.branch_path(branch)
+		listed = self.pools[os.path.realpath(pool_mount)]
+		listed[:] = [b for b in listed if os.path.realpath(b) != real]
+
+	def come_back(self, pool_mount:str, branch:str):
+		'''The branch is listed again by the pool at pool_mount, last, as mergerfs's control file appends it.'''
+		self.pools[os.path.realpath(pool_mount)].append(self.named(branch))
+
 	def drop(self, branch:str):
 		'''The branch's (or a pool's) line goes; its folder stays, as a disk's mount point does.'''
 		real = self.branch_path(branch)

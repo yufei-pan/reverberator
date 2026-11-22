@@ -22,7 +22,7 @@ import pytest
 import reverberator as rv
 from tests import version_view_ground_truth as view_truth
 from tests.conftest import REAL_SYNC_VAULT_FILESYSTEMS
-from tests.crash_batches import after_retries, backup_events, batch3_of, OPTIONS, prepare, put_text, restore
+from tests.crash_batches import after_retries, backup_events, batch3_of, OPTIONS, past_inline, prepare, put_text, restore
 from tests.crash_child import in_child, kill_run, retry
 from tests.harness import committed_versions, create_job, event_entry, run_backup, seed_monitor, write_rule
 from tests.scratch_images import LoopImage, needs_f2fs, needs_mount, SCRATCH, ScratchTmpfs
@@ -902,3 +902,45 @@ def test_a_tmpfs_under_a_real_branch_is_paused_when_unmounted(monkeypatch):
 		finally:
 			subprocess.call(['umount', place], stderr=subprocess.DEVNULL)
 			subprocess.call(['umount', store])
+
+
+@pytest.mark.privileged
+@needs_mergerfs
+def test_a_branch_removed_through_the_control_file_during_a_batch_fails_it(monkeypatch):
+	# D5, the entry's "check it by a run" (the test VM): test_pool_guards.py's test_a_disk_dropped_from_the_pools_list_during_a_batch_fails_it
+	# on a real mergerfs pool (real_pool()'s, the job vault on it). Between the batch's copies and its commit flush a branch is taken out
+	# of the pool through mergerfs's control file, its disk still mounted: the attempt fails naming it, nothing commits; the branch is
+	# put back, and the next attempt, a full comparison, rolls forward. Every version reads as the tree it was taken from (the oracle).
+	# On main the batch commits, its flush syncing only the branch the pool still lists
+	with real_pool() as root:
+		job = create_job(root)
+		control = os.path.join(job.vault, rv.MERGERFS_CONTROL_FILE)
+		branch = rv.read_pool_branches(job.vault)[1]
+		files = {f'f{i}.txt': past_inline(f'F{i}') for i in range(8)}
+		seed_monitor(job, {**files, 'd/a.txt': 'a0'})
+		run_backup(job, only_sync_attributes=False)
+		expected = {0: snapshot_tree(job.monitor)}
+		for name in files:
+			put_text(job.monitor, name, past_inline(f'G{name}'))
+		put_text(job.monitor, 'd/new.txt', 'n')
+		real, removed = rv.flush_copies, []
+		def flushing(*args, **kwargs):
+			if not removed:
+				os.setxattr(control, 'user.mergerfs.branches', os.fsencode('-' + branch))
+				removed.append(True)
+			return real(*args, **kwargs)
+		monkeypatch.setattr(rv, 'flush_copies', flushing)
+		try:
+			with pytest.raises(rv.PoolNotReady) as failure:
+				backup_events(job, [(False, 'modify', name, None) for name in files] + [(False, 'create', 'd/new.txt', None)])
+		finally:
+			if removed:
+				os.setxattr(control, 'user.mergerfs.branches', os.fsencode('+>' + branch))
+		assert removed and failure.value.reason == f'disk {os.path.realpath(branch)} left pool {rv.pool_state(job.vault).pool} during this step'
+		assert len(committed_versions(job)) == 1
+		monkeypatch.setattr(rv, 'flush_copies', real)
+		assert rv.read_pool_branches(job.vault)[-1] == branch
+		expected[1] = snapshot_tree(job.monitor)
+		run_backup(job, only_sync_attributes=False, matched_since=time.time_ns())
+		assert len(committed_versions(job)) == 2
+		assert check_vault(job.job_vault, expected, set()) == []

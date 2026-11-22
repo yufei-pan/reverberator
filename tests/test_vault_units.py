@@ -1714,6 +1714,40 @@ def test_a_pool_branch_gone_before_the_put_back_acts_fails_the_scan_with_the_tre
 
 
 @pytest.mark.unit
+def test_a_disk_dropped_during_the_starts_put_back_stops_the_scan_before_its_first_removal(r_job, fake_pool, monkeypatch):
+	# fails on main (goes on): a disk taken out of the pool's list through mergerfs's control file, still mounted, as the start's
+	# put-back of a cut tree begins. The pool then hides what that disk holds, a forward link of version n among it, so the names the
+	# walk listed and the put-back's own listings no longer say what version n holds there. Pass 1's check before its first act names
+	# the disk: PoolNotReady, with the tree as the cut batch left it and version n as it was. Once the disk is listed again the next
+	# attempt rolls forward. On main no check sees a disk the pool stopped listing, and pass 1 replaces the tree's entries
+	branches = pool_vault(r_job, fake_pool, ['a', 'b', 'c'])
+	put_text(r_job.monitor, 'd/other.txt', 'o0')
+	base(r_job)
+	put_text(r_job.monitor, 'd/inner.txt', 'i1')
+	cut_before_the_commit(r_job, [(False, 'modify', 'd/inner.txt', None)], monkeypatch)
+	tree, previous = tree_of(r_job), committed_versions(r_job)[-1]
+	before = (contents_of(tree), contents_of(previous))
+	assert before[0]['d/inner.txt'] == ('f', b'i1')
+	real, left = rv.put_back_recorded, []
+	def putting_back(*args, **kwargs):
+		if not left:
+			fake_pool.leave(r_job.vault, branches[1])
+			left.append(True)
+		return real(*args, **kwargs)
+	with monkeypatch.context() as patched:
+		patched.setattr(rv, 'put_back_recorded', putting_back)
+		with pytest.raises(rv.PoolNotReady) as failure:
+			rv.get_vault_info(r_job.job_vault)
+	assert left and failure.value.reason == f'disk {branches[1]} left pool {r_job.vault} during this step'
+	assert (contents_of(tree), contents_of(previous)) == before
+	fake_pool.come_back(r_job.vault, branches[1])
+	roll_forward(r_job)
+	versions = committed_versions(r_job)
+	assert read_bytes(os.path.join(versions[0], 'd', 'inner.txt')) == b'i0'
+	assert contents_of(versions[-1]) == contents_of(r_job.monitor)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize('unreadable', ['file', 'folder'])
 def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkeypatch, unreadable):
 	# pin, the design re-check's run N5: on a vault with no RENAME_EXCHANGE a folder goes into the previous version by two renames,

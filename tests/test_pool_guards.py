@@ -409,3 +409,29 @@ def test_the_change_list_is_not_placed_when_a_disk_drops_after_the_commit_check(
 	assert os.readlink(os.path.join(job.job_vault, 'current_version')) == os.path.basename(v1)
 	assert lists_of(job, v1) and private() == []
 	assert committed_versions(job) == [v0, v1]
+
+
+def test_a_disk_dropped_from_the_pools_list_during_a_batch_fails_it(job, fake_pool, monkeypatch):
+	# fails on main (commits): a disk taken out of the pool's branch list (mergerfs's control file), still mounted, after the batch's
+	# copies and before its flush: the flush syncs only the disks the pool lists by then, so what the batch wrote there is not known
+	# to be on disk. The guard's check before the commit names it, and the next attempt begins with the pool as it is now
+	seed_monitor(job, {'a.txt': 'a'})
+	assert backup(job)
+	v0 = version_folder(job, 0)
+	_, b = fake_pool.add(job.vault, ['a', 'b'])
+	seed_monitor(job, {'b.txt': 'b'})
+	real, left = rv.flush_copies, []
+	def flushing(*args, **kwargs):
+		if not left:
+			fake_pool.leave(job.vault, b)
+			left.append(True)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'flush_copies', flushing)
+	with pytest.raises(rv.PoolNotReady) as failure:
+		backup(job, OrderedDict([event_entry(job, 'b.txt', 'create')]))
+	assert left and failure.value.reason == f'disk {b} left pool {job.vault} during this step'
+	assert committed_versions(job) == [v0]
+	assert os.readlink(os.path.join(job.job_vault, 'current_version')) == os.path.basename(v0)
+	assert backup(job)
+	with open(os.path.join(committed_versions(job)[-1], 'b.txt')) as f:
+		assert f.read() == 'b'
