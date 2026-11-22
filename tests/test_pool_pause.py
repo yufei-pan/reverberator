@@ -235,6 +235,78 @@ def test_an_idle_job_reports_a_missing_pool_disk(job, fake_pool, grace, output, 
 		_stop(control, thread)
 
 
+def _left_reason(pool, branch):
+	return (f'disk {branch} left pool {pool} during the last attempt: waiting for it to be listed again '
+		'(restart reverberator if it was taken out for good)')
+
+
+def _attempt_that_loses_a_disk(job, fake_pool, monkeypatch, pool):
+	"""
+	A job with a change since its V0 and a pool of two disks at pool (the vault's or the monitored path's), whose first attempt has one
+	taken out of the pool's list, still mounted, as the first batch's copies are flushed: the JobControl once that attempt failed, and
+	the disk.
+	"""
+	seed_monitor(job, {'a.txt': 'a'})
+	_v0(job)
+	seed_monitor(job, {'b.txt': 'b'})
+	_, b = fake_pool.add(pool, ['a', 'b'])
+	real, left = rv.flush_copies, []
+	def flushing(*args, **kwargs):
+		if not left:
+			fake_pool.leave(pool, b)
+			left.append(True)
+		return real(*args, **kwargs)
+	monkeypatch.setattr(rv, 'flush_copies', flushing)
+	control = _control(job)
+	thread = _run_backuper(job, control)
+	thread.join(timeout=10)
+	assert left and not thread.is_alive()
+	assert control.failure.reason == f'disk {b} left pool {pool} during this step'
+	return control, b
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('side', ['vault', 'monitor'])
+def test_the_attempt_after_a_disk_was_taken_out_of_the_pool_waits_for_it_to_be_listed_again(job, fake_pool, grace, board, output, monkeypatch, tmp_path, side):
+	# fails on 6acf680 (goes on): the retry of a step that failed for a disk taken out of its pool's list (mergerfs's control file) finds the
+	# pool whole as it is then, as no wait sees a disk that is mounted still. Its scan then acts on a view that hides what that disk holds,
+	# such as a version's real entry on it, over which the scan writes a forward link to the cut batch's new copy: once the roll-forward
+	# commits, version n shows the new bytes. The retry waits for the disk to be listed again instead, before it does anything with the
+	# vault (the vault scan, or for the monitored pool's disk the walk of the monitored tree)
+	pool = job.vault if side == 'vault' else job.monitor
+	control, b = _attempt_that_loses_a_disk(job, fake_pool, monkeypatch, pool)
+	orphan = write_scan_leftover(job)
+	control.start_attempt()
+	thread = _run_backuper(job, control)
+	try:
+		reason = _left_reason(pool, b)
+		wait_until(lambda: _marker(pool, reason) in output(), timeout=5, message='no waiting marker')
+		assert (os.path.lexists(orphan) if side == 'vault' else not os.path.lexists(orphan)), 'the vault was scanned while a disk of its pool is out'
+		assert len(committed_versions(job)) == 1
+		assert _state(tmp_path)['state'] == 'waiting' and _state(tmp_path)['detail'] == f'{pool}: {reason}'
+		fake_pool.come_back(pool, b)
+		wait_for_committed_count(job, 2)
+		wait_until(lambda: _goes_on(pool) in output(), timeout=5, message='no goes on line')
+		assert not os.path.lexists(orphan) and not control.left
+		assert os.path.isfile(os.path.join(latest_version(job).path, 'b.txt'))
+	finally:
+		_stop(control, thread)
+
+
+@pytest.mark.unit
+def test_the_attempt_after_a_disk_taken_out_and_listed_again_goes_on_at_once(job, fake_pool, grace, board, output, monkeypatch):
+	# pin: the disk is listed again before the retry looks, so nothing waits and the memory of it is gone
+	control, b = _attempt_that_loses_a_disk(job, fake_pool, monkeypatch, job.vault)
+	fake_pool.come_back(job.vault, b)
+	control.start_attempt()
+	thread = _run_backuper(job, control)
+	try:
+		wait_for_committed_count(job, 2)
+		assert 'FAILED: waiting' not in output()
+	finally:
+		_stop(control, thread)
+
+
 def _wait_in_thread(control, flag, path, results):
 	thread = threading.Thread(target=lambda: results.append(rv.wait_for_path(control, flag, path,
 		'monitored filesystem not ready')), daemon=True)

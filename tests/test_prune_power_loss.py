@@ -775,7 +775,7 @@ def test_every_cut_state_on_a_pool_loses_nothing_after_the_rerun(monkeypatch):
 	monkeypatch.setattr(rv, 'mount_holding', lambda table, path: None)
 	# and folders, not mounts: the pool's check would take them for disks not mounted, in the daemon that builds the vault too
 	for module in (rv, daemon()):
-		monkeypatch.setattr(module.PoolGuard, 'problem', lambda self: None)
+		monkeypatch.setattr(module.PoolGuard, 'problem', lambda self, left=None: None)
 	pool.mount()
 	try:
 		# the monitored tree off the pool, the vault on it

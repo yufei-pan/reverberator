@@ -194,7 +194,7 @@ def inject(monkeypatch, failures, how):
 	monkeypatch.setattr(os, 'link', link)
 	monkeypatch.setattr(os, 'rename', rename)
 	problems = [0]
-	def problem(self):
+	def problem(self, left=None):
 		problems[0] += 1
 		return 'disk /b1 of pool /pool is not mounted' if problems[0] == how['pool_drop'] else None
 	monkeypatch.setattr(rv.PoolGuard, 'problem', problem)

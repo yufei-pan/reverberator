@@ -608,10 +608,12 @@ class PoolNotReady(JobFailure):
 	'''
 	A disk of a mergerfs pool a step works on is missing, or was mounted again or left the pool during the step
 	(PoolGuard): its reason is pool_problem()'s text. Never permanent: the next attempt waits for a missing disk, and
-	begins with the pool as it is then.
+	for one that left the pool (left, the (pool, branch) of each: JobControl.left_reason()), which no wait sees, as it is
+	still mounted; it begins with the pool as it is then.
 	'''
-	def __init__(self, reason:str):
+	def __init__(self, reason:str, left:tuple = ()):
 		super().__init__(reason, permanent=False)
+		self.left = tuple(left)
 
 class JobControl:
 	'''
@@ -633,6 +635,10 @@ class JobControl:
 		self._since = time.time()
 		self._retry_at = None
 		self._failures = 0
+		# (pool, branch) of each disk a failed attempt found taken out of its pool's list while still mounted (PoolNotReady.left): no wait
+		# sees it, and an attempt that went on would act on a view of the pool that hides what it holds, so the next attempt waits for it to be
+		# listed again (left_reason()). In process: a restart forgets it, which is how a disk taken out for good is let go
+		self.left = set()
 		# the waits for a disk now going on, oldest first, as [token, path, what, started]
 		self._waits = []
 		# the status records, taken in order under _lock and written outside it, one at a time ( _write() )
@@ -646,11 +652,42 @@ class JobControl:
 			self.committed.clear()
 			self.running.set()
 
-	def fail(self, reason:str, permanent:bool = False):
+	def fail(self, reason:str, permanent:bool = False, left:tuple = ()):
+		'''Fail the attempt with reason (the first of an attempt is the one kept). left, PoolNotReady.left, is remembered whichever failure is kept.'''
 		with self._lock:
+			self.left.update(left)
 			if self.failure is None:
 				self.failure = JobFailure(reason, permanent)
 			self.running.clear()
+
+	def left_reason(self, path:str, mount_table:list = None) -> 'str | None':
+		'''
+		Why a wait for path goes on for the disks a failed attempt saw leave the pool holding path (left): None when none of them is
+		out still, else the text of the wait. Each is out while the pool does not list it (its branch list read now, with no mount
+		table read when nothing is remembered); one listed again is forgotten. Nothing is said while the pool cannot be listed (its own
+		problem is the wait's reason then) or path is on no pool now. mount_table, when given, is the one the wait looked at.
+		'''
+		with self._lock:
+			remembered = set(self.left)
+		if not remembered:
+			return None
+		try:
+			pool = mergerfs_mount(read_mount_table() if mount_table is None else mount_table, path)
+			if pool is None:
+				return None
+			listed = {os.path.realpath(branch) for branch in read_pool_branches(pool)}
+		except OSError:
+			return None
+		back = {(held, branch) for held, branch in remembered if held == pool and branch in listed}
+		if back:
+			with self._lock:
+				self.left -= back
+		out = sorted(branch for held, branch in remembered if held == pool and branch not in listed)
+		if not out:
+			return None
+		many = len(out) > 1
+		return (f'{"disks" if many else "disk"} {", ".join(out)} left pool {pool} during the last attempt: waiting for {"them" if many else "it"} '
+			'to be listed again (restart reverberator if it was taken out for good)')
 
 	def should_run(self) -> bool:
 		return GREEN_LIGHT.is_set() and self.running.is_set()
@@ -1194,7 +1231,8 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 	job None, GREEN_LIGHT) says stop. The disk is checked live on every poll, as the flag can lag behind it, and the
 	wait's reason is its problem while there is one, else what. Every wait, a monitored path's as well as the vault's,
 	needs the disk holding path there (vault_disk_problem()): no fstab mount at or above path unmounted, fstab read (only
-	its absence names nothing), no disk of a mergerfs pool holding it missing. flag None: no signature flag, the wait
+	its absence names nothing), no disk of a mergerfs pool holding it missing, and no disk a failed attempt of the job saw
+	taken out of that pool's list listed again yet (JobControl.left_reason()). flag None: no signature flag, the wait
 	ends once the disk is there and path is a folder. create: once the disk is there and nothing is at path, it is made
 	(os.makedirs), so never under a bare mount point; a path that cannot be made raises JobFailure.
 	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS, and once the wait
@@ -1230,6 +1268,8 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 							reason = fstab_unreadable(e)
 				if reason is None:
 					reason = vault_disk_problem(path, table[0].mount_table, table[0].fstab)
+			if reason is None and job is not None:
+				reason = job.left_reason(path, table[0].mount_table if table else None)
 			polled = True
 			if reason is None and create and not os.path.lexists(path):
 				try:
@@ -4367,14 +4407,15 @@ def pool_state(path:str, mount_table:list = None, fstab:list = None) -> 'PoolSta
 	problems.extend(failed)
 	return PoolState(pool, tuple(ids), '; '.join(problems) or None, pool_id)
 
-def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None, fstab:list = None) -> 'str | None':
+def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None, fstab:list = None, left:list = None) -> 'str | None':
 	'''
 	What is wrong now with the mergerfs pool holding path, None when nothing is or path is on no pool. With since (a
 	pool_state() taken when a step began), the pool gone or mounted again since then counts too, and so does a disk
 	mounted since then, even one dropped and back, and a disk the pool no longer lists, taken out through mergerfs's
 	control file while still mounted: the step's flush syncs only the disks listed by then, and what the pool shows hides
 	what that disk holds. A step that began with a problem (since's) keeps it: with no whole pool to compare with, the
-	step fails, and the next one takes a fresh state. fstab goes to pool_state().
+	step fails, and the next one takes a fresh state. fstab goes to pool_state(). left, a list, gets (the pool, the
+	branch) of each disk named as left the pool: PoolNotReady keeps them for the job's next attempt to wait for.
 	'''
 	if since is not None and since.problem:
 		return since.problem
@@ -4395,7 +4436,10 @@ def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None, fs
 		# a branch list that cannot be read has no ids, and its problem says so: it names no disk as gone
 		if state.ids or not state.problem:
 			listed = dict(state.ids)
-			problems.extend(f'disk {branch} left pool {state.pool} during this step' for branch, _ in since.ids if branch not in listed)
+			gone = [branch for branch, _ in since.ids if branch not in listed]
+			problems.extend(f'disk {branch} left pool {state.pool} during this step' for branch in gone)
+			if left is not None:
+				left.extend((state.pool, branch) for branch in gone)
 	return '; '.join(problems) or None
 
 def parse_fstab(content:bytes) -> list:
@@ -4527,17 +4571,19 @@ class PoolGuard:
 		self.next_check = None
 		self.lock = threading.Lock()
 
-	def problem(self) -> 'str | None':
+	def problem(self, left:list = None) -> 'str | None':
+		'''The first path's problem (pool_problem()); left, a list, gets (the pool, the branch) of each disk that left that path's pool.'''
 		for path, since in self.states:
-			problem = pool_problem(path, since, fstab=self.fstab)
+			problem = pool_problem(path, since, fstab=self.fstab, left=left)
 			if problem:
 				return problem
 		return None
 
 	def require(self) -> None:
-		problem = self.problem()
+		left = []
+		problem = self.problem(left)
 		if problem:
-			raise PoolNotReady(problem)
+			raise PoolNotReady(problem, left)
 
 	def covers(self, path:str) -> bool:
 		'''Whether path, one of the paths, was on a pool when the step began (or the mount table could not be read).'''
@@ -5272,7 +5318,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		if job is None:
 			GREEN_LIGHT.clear()
 		else:
-			job.fail(e.reason, e.permanent)
+			job.fail(e.reason, e.permanent, e.left if isinstance(e, PoolNotReady) else ())
 	except Exception as e:
 		import traceback
 		backuperTeeLogToTl(job_name, traceback.format_exc(), error=True)
@@ -7644,10 +7690,11 @@ def read_vault_whole(job_vault_path:str, guard:PoolGuard, judge_orphans:bool = T
 		listing = read_job_vault(job_vault_path, judge_orphans)
 	except VaultScanError as e:
 		# what the read found wrong, as a change list missing, can be a disk's that dropped meanwhile
-		problem = guard.problem()
+		left = []
+		problem = guard.problem(left)
 		if problem:
 			backuperTeeLogToTl(job_vault_path, f'Cannot scan the vault, nothing in it is removed: {problem}', error=True)
-			raise PoolNotReady(problem) from e
+			raise PoolNotReady(problem, left) from e
 		backuperTeeLogToTl(job_vault_path, f'Cannot read the vault, nothing in it is removed: {e.reason}', error=True)
 		raise
 	try:
@@ -12367,10 +12414,11 @@ def decrement_stepper(vault_info_dict:OrderedDict, job_name:str, monitor_path:st
 	def require_pools() -> None:
 		# the reference vault kept, and the attempt failed: its retry scans the vault again, so the caller's sums need not
 		# be right
-		problem = guard.problem()
+		left = []
+		problem = guard.problem(left)
 		if problem:
 			keep_oldest(problem)
-			raise PoolNotReady(problem)
+			raise PoolNotReady(problem, left)
 	# on a mergerfs pool one request can change two disks (a rename lands on one and unlinks on another), and each comes
 	# back from a power loss at its own last checkpoint: the walk's links are flushed on every disk before the oldest
 	# version goes, and its removal before its change lists go. a single filesystem keeps its own order
