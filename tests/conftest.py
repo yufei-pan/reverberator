@@ -188,9 +188,10 @@ def run_reverberator(tmp_path, process_env):
 		except Exception:
 			pass
 
-	def _run(rule_path, extra_args=(), preexec_fn=None):
+	def _run(rule_path, extra_args=(), preexec_fn=None, script=None):
+		'''The daemon over rule_path in a process of its own: reverberator_script(), or script, a launcher of the same kind.'''
 		p = subprocess.Popen(
-			[sys.executable, reverberator_script(), '--no_log', '-ld', log_dir, *list(extra_args), str(rule_path)],
+			[sys.executable, script or reverberator_script(), '--no_log', '-ld', log_dir, *list(extra_args), str(rule_path)],
 			env=process_env,
 			stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE,
