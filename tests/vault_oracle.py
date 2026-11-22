@@ -84,6 +84,20 @@ def linked_place(folder_name: str, rel: str, text: str, backward: bool = True):
 	return None
 
 
+def kept_in_staging(text: str, folder_name: str) -> bool:
+	'''
+	Whether a link in staging with text is one the scan keeps while the version folder folder_name is a cut batch's tree: the forward
+	link a record cut between its two renames, or between its exchange and its unlink, left there, which names its rel in folder_name
+	(forward_text() of a rel with no empty, . or .. part). The scan after that tree's commit removes it.
+
+	Examples:
+		>>> [kept_in_staging(text, 'V3--y') for text in ('../V3--y/a', '../../V3--y/a/b', '../V3--y/a/b', '../../V2--y/a/b', '../../V3--y/a/../b', '../V3--y', '/v/V3--y/a')]
+		[True, True, False, False, False, False, False]
+	'''
+	match = re.fullmatch(r'(?:\.\./)+' + re.escape(folder_name) + r'/(.+)', text)
+	return match is not None and forward_text(match[1], folder_name) == text and not any(part in ('', '.', '..') for part in match[1].split('/'))
+
+
 def landing(job_vault: str, folder_name: str, rel: str, backward: bool = None):
 	'''
 	(version folder name, path in it) that holds rel of folder_name once every daemon link on the way is followed, one
@@ -260,10 +274,12 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 	reported, and the check is not widened for it. A version's own folder must have the mode and owner of the job vault's (the
 	daemon makes both, and a version's root is recorded in its attribute instead). On design R the newest version is the real
 	tree and holds no daemon link, of 0.54's kind or any, except a user's own link whose text has that form, which the
-	monitored tree holds with that text (expected for the newest version).
+	monitored tree holds with that text (expected for the newest version). Staging holds nothing but links a cut left there naming the
+	newest version folder (kept_in_staging()), which the scan keeps while that folder is a cut tree, and the scan after its commit removes.
 	'''
 	problems = []
 	folders, lists = {}, {}
+	staged = []
 	for name in sorted(os.listdir(job_vault)):
 		path = os.path.join(job_vault, name)
 		listed = VERSION_LIST.fullmatch(name)
@@ -278,11 +294,15 @@ def check_vault(job_vault: str, expected: dict, allowed_new: set, folder_times: 
 			else:
 				folders[number] = name
 		elif name == STAGING:
-			held = os.listdir(path) if os.path.isdir(path) and not os.path.islink(path) else ['(not a folder)']
-			if held:
-				problems.append(f'left in staging: {sorted(held)}')
+			staged = os.listdir(path) if os.path.isdir(path) and not os.path.islink(path) else ['(not a folder)']
 		elif name not in KEPT_NAMES:
 			problems.append(f'left over in the job vault: {name}')
+	if folders:
+		staging = os.path.join(job_vault, STAGING)
+		staged = [name for name in staged
+			if not (os.path.islink(os.path.join(staging, name)) and kept_in_staging(os.readlink(os.path.join(staging, name)), folders[max(folders)]))]
+	if staged:
+		problems.append(f'left in staging: {sorted(staged)}')
 	for folder_name, names in lists.items():
 		if version_number(folder_name) not in folders or folders[version_number(folder_name)] != folder_name:
 			problems.append(f'a list with no version folder: {names}')
