@@ -79,8 +79,9 @@ def test_get_args_defaults_and_flags():
 def test_hash_file_full_vs_partial(tmp_path):
 	p = tmp_path / 'blob.bin'
 	p.write_bytes(b'x' * (rv.HASH_SIZE + 100) + b'TAIL')
-	full = rv.hash_file(str(p), full_hash=True)
-	part = rv.hash_file(str(p), full_hash=False)
+	size = p.stat().st_size
+	full = rv.hash_file(str(p), size, full_hash=True)
+	part = rv.hash_file(str(p), size, full_hash=False)
 	assert len(full) == 16
 	assert len(part) == 16
 	assert full != part
@@ -102,6 +103,20 @@ def test_hash_file_refuses_fifo_without_blocking(tmp_path):
 	worker.join(timeout=5)
 	assert not worker.is_alive(), 'hash_file blocked opening a FIFO'
 	assert isinstance(outcome[0], OSError)
+
+
+@pytest.mark.parametrize('full_hash', [False, True], ids=['tail', 'whole'])
+def test_hash_file_does_not_follow_a_link_swapped_in_after_the_lstat(tmp_path, full_hash):
+	# fails before the fix wave's FW3 (the final review's s14 (3), s15 (2)): the first open followed a link, so a file its caller's
+	# lstat saw, swapped for a link since, was hashed as the file the link leads to, wherever that is (record_vouches() then vouched for
+	# a stale copy for a batch). The open takes no link now: ELOOP, an OSError every caller takes as a file not read
+	outside = tmp_path / 'outside'
+	outside.write_bytes(b'not the monitored file')
+	path = str(tmp_path / 'was_a_file')
+	os.symlink(str(outside), path)
+	with pytest.raises(OSError) as raised:
+		rv.hash_file(path, outside.stat().st_size, full_hash=full_hash)
+	assert raised.value.errno == errno.ELOOP
 
 
 def test_check_fs_signature_mismatch(tmp_path):

@@ -1037,7 +1037,7 @@ def test_the_size_estimate_of_a_new_folder_replaced_by_a_link_charges_nothing_of
 	on_folder_open(monkeypatch, folder, _swap(folder, str(tmp_path / 'n.old'), 'link', outside))
 	entries = OrderedDict([(folder + '/', rv.BackupEntryValues('t', 'create', None))])
 	skip_list = rv.SkipList(job.monitor, ['*.tmp']) if skip == 'skip_list' else None
-	size, inodes = rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, skip_list)
+	size, inodes = rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, skip_list, version_bytes=0)
 	assert os.path.islink(folder)
 	assert (size, inodes) == (own_blocks, 1)
 
@@ -1595,6 +1595,39 @@ def test_a_socket_swapped_in_after_the_checks_lstat_counts_as_a_change(job, poll
 	assert swapped and stat.S_ISSOCK(os.lstat(path).st_mode)
 	assert dropped is False
 	assert _lines(capsys, 'UNREADABLE', path) == 0
+
+
+def test_a_link_swapped_in_after_the_checks_lstat_counts_as_a_change_and_is_not_followed(job, poll_fast, monkeypatch, capsys):
+	# fails before the fix wave's FW3 (the final review's s13 (3)): the check's lstat sees a regular file f, then a link is put at f's
+	# place, which the check's open followed: here to a path that is not there, so the check took f for gone ("Not tracking f: source
+	# no longer exists") and dropped the batch, which the replay would have given the link (cp -a copies it as itself); to a file
+	# elsewhere it read that file's last 64 KiB. The open takes no link now (ELOOP): an entry of another kind changes the version, as
+	# the FIFO's and the socket's above
+	from tests.harness import event_entry
+	seed_monitor(job, {'a.txt': 'a', 'f': 'f'})
+	before = _settled(job)
+	path = os.path.join(job.monitor, 'f')
+	real_lstat = os.lstat
+	swapped = []
+	def lstat(target, *args, **kwargs):
+		got = real_lstat(target, *args, **kwargs)
+		if not swapped and os.fspath(target) == path:
+			swapped.append(True)
+			os.remove(path)
+			os.symlink(os.path.join(job.root, 'nowhere'), path)
+		return got
+	capsys.readouterr()
+	with monkeypatch.context() as patch:
+		patch.setattr(os, 'lstat', lstat)
+		manifest = rv.VaultManifest(job.job_vault)
+		try:
+			dropped = rv.entries_all_drop_out(OrderedDict([event_entry(job, 'f', 'modify')]), job.monitor, before[-1], job.job_vault, None, job.job_name, set(), manifest)
+		finally:
+			manifest.close()
+	assert swapped and os.path.islink(path)
+	out = capsys.readouterr()
+	assert dropped is False
+	assert 'source no longer exists' not in out.out + out.err and f'UNREADABLE: {path}: ' not in out.out + out.err
 
 
 def test_an_unchanged_readable_file_compares_as_unchanged(job, poll_fast, capsys):

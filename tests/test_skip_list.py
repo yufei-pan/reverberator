@@ -369,9 +369,9 @@ def test_size_estimate_walks_around_skipped_content(job):
 	os.makedirs(job.job_vault)
 	proj = _project_with_skipped_cache(job)
 	entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'create', None)})
-	full_size, full_inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor)
+	full_size, full_inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, version_bytes=0)
 	assert full_size >= 3 << 20 and full_inodes == 6
-	size, inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/']))
+	size, inodes = rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/']), version_bytes=0)
 	# proj/ and proj/src.c only
 	assert inodes == 2
 	assert 0 < size < 1 << 20
@@ -379,10 +379,10 @@ def test_size_estimate_walks_around_skipped_content(job):
 	# a folder modify is sized by the same walk, its inodes too; a folder attrib copies nothing, so it is not sized
 	for event, sized in (('modify', (size, inodes)), ('attrib', (0, 0))):
 		entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', event, None)})
-		assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/'])) == sized
+		assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['node_modules/']), version_bytes=0) == sized
 	entries = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'modify', None)})
 	# no patterns: the same walk, nothing left out
-	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, [])) == (full_size, full_inodes)
+	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, []), version_bytes=0) == (full_size, full_inodes)
 
 
 def test_skipped_content_does_not_prune_history(job, poll_fast):
@@ -436,9 +436,9 @@ def test_size_estimate_counts_nested_creates_once(job):
 	assert len(entries) == 10
 	expected = _usage([proj] + [path for path, _, _ in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips)], job.job_vault)
 	assert expected[0] >= 1 << 20 and expected[1] == 10
-	assert rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl) == expected
+	assert rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl, version_bytes=0) == expected
 	single = OrderedDict({proj + '/': rv.BackupEntryValues('t', 'create', None)})
-	assert rv.get_backup_size_inode(single, True, job.job_vault, job.monitor, sl) == expected
+	assert rv.get_backup_size_inode(single, True, job.job_vault, job.monitor, sl, version_bytes=0) == expected
 
 
 def test_size_estimate_counts_nested_folder_attribs_once(job):
@@ -451,12 +451,12 @@ def test_size_estimate_counts_nested_folder_attribs_once(job):
 	# synced (a folder's attrib copies nothing)
 	entries = _tree_entries(proj, sl, 'attrib')
 	expected = _usage([path for path, _, is_dir in rv.iter_tree_entries(proj, 'proj/', skip=sl.skips) if not is_dir], job.job_vault)
-	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == expected
+	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl, version_bytes=0) == expected
 	# without patterns the same size: nested entries are counted once
 	no_cache = OrderedDict((path, values) for path, values in entries.items() if 'node_modules' not in path)
 	import shutil
 	shutil.rmtree(os.path.join(proj, 'd0', 'node_modules'))
-	assert rv.get_backup_size_inode(no_cache, False, job.job_vault, job.monitor) == expected
+	assert rv.get_backup_size_inode(no_cache, False, job.job_vault, job.monitor, version_bytes=0) == expected
 
 
 def test_size_estimate_counts_creates_inside_a_sized_folder(job):
@@ -472,7 +472,7 @@ def test_size_estimate_counts_creates_inside_a_sized_folder(job):
 	])
 	# the folder's attrib copies nothing: the new folder and its file are its bytes and its new inodes
 	size = _usage([os.path.join(proj, 'new'), os.path.join(proj, 'new', 'f.txt')], job.job_vault)[0]
-	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl) == (size, 2)
+	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, sl, version_bytes=0) == (size, 2)
 
 
 def test_size_estimate_counts_each_hard_link_name(job):
@@ -488,9 +488,9 @@ def test_size_estimate_counts_each_hard_link_name(job):
 	assert expected[0] >= 4 << 20 and expected[1] == 5
 	entries = _tree_entries(new, sl, 'create')
 	assert len(entries) == 5
-	assert rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl) == expected
+	assert rv.get_backup_size_inode(entries, True, job.job_vault, job.monitor, sl, version_bytes=0) == expected
 	single = OrderedDict({new + '/': rv.BackupEntryValues('t', 'create', None)})
-	assert rv.get_backup_size_inode(single, True, job.job_vault, job.monitor, sl) == expected
+	assert rv.get_backup_size_inode(single, True, job.job_vault, job.monitor, sl, version_bytes=0) == expected
 
 
 @pytest.mark.parametrize('patterns', [None, ['*.tmp']])

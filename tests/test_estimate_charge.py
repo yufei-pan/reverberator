@@ -34,7 +34,7 @@ def preallocated(path, size, extra):
 def estimate(job, *rels, event='create'):
 	entries = OrderedDict((os.path.join(job.monitor, rel), rv.BackupEntryValues('t', event, None)) for rel in rels)
 	os.makedirs(job.job_vault, exist_ok=True)
-	return rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor)
+	return rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, version_bytes=0)
 
 
 def block_of(job):
@@ -62,8 +62,8 @@ def test_the_estimate_walk_charges_a_preallocated_file_its_size_rounded_up(job):
 	preallocated(os.path.join(folder, 'appended'), 5000, 4 << 20)
 	entries = OrderedDict({folder + '/': rv.BackupEntryValues('t', 'create', None)})
 	expected = os.lstat(folder).st_blocks * 512 + -(-5000 // block) * block, 2
-	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor) == expected
-	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['*.tmp'])) == expected
+	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, version_bytes=0) == expected
+	assert rv.get_backup_size_inode(entries, False, job.job_vault, job.monitor, rv.SkipList(job.monitor, ['*.tmp']), version_bytes=0) == expected
 
 
 def test_the_estimate_charges_a_sparse_file_its_blocks(job):

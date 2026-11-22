@@ -853,7 +853,7 @@ def test_a_folder_made_then_a_folder_moved_into_it_copies_nothing(job, logged, m
 	os.mkdir(f'{m}/n')
 	os.rename(f'{m}/d', f'{m}/n/d')
 	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'))
-	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m)
+	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, version_bytes=0)
 	assert size < 100000 and inodes == 1
 	copies = copies_made(monkeypatch)
 	v1 = run_backup(job, entries)[-1]
@@ -1061,7 +1061,7 @@ def test_the_estimate_leaves_a_move_inside_another_out_once(job):
 	os.rename(f'{m}/d', f'{m}/n/d')
 	os.rename(f'{m}/y', f'{m}/n/d/y')
 	entries = batch(job, (True, 'create', 'n', None), (False, 'create', 'n/own', None), (True, 'move', 'n/d', 'd'), (False, 'move', 'n/d/y', 'y'))
-	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m))
+	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m), version_bytes=0)
 	assert (size, inodes) == (charge(f'{m}/n/own', job.job_vault) + charge(f'{m}/n', job.job_vault), 2)
 
 
@@ -1080,7 +1080,7 @@ def test_the_estimate_puts_back_what_is_written_under_a_folder_it_took_out(job, 
 	with open(f'{m}/n/d/s/old', 'a') as f:
 		f.write('m' * 50000)
 	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'), (True, 'modify', 'n/d/s', None), (False, 'create', 'n/d/s/z', None), (False, 'modify', 'n/d/s/old', None))
-	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None)
+	size, inodes = rv.get_backup_size_inode(entries, True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None, version_bytes=0)
 	assert (size, inodes) == (sum(charge(f'{m}/{rel}', job.job_vault) for rel in ('n', 'n/d/s', 'n/d/s/z', 'n/d/s/old')), 4)
 
 
@@ -1100,7 +1100,7 @@ def test_the_estimate_counts_a_file_made_in_a_made_folder_once(job, skip, carrie
 	with open(f'{m}/{base}/s/f', 'w') as f:
 		f.write('f' * 200000)
 	events = [(True, 'create', 'n', None)] + ([(True, 'move', 'n/d', 'd')] if carried else []) + [(True, 'create', f'{base}/s', None), (False, 'create', f'{base}/s/f', None)]
-	size, inodes = rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None)
+	size, inodes = rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None, version_bytes=0)
 	assert (size, inodes) == (sum(charge(f'{m}/{rel}', job.job_vault) for rel in ('n', f'{base}/s', f'{base}/s/f')), 3)
 
 
@@ -1117,7 +1117,7 @@ def test_the_estimate_counts_an_attribute_copy_under_a_folder_moved_into_a_new_o
 	os.chmod(f'{m}/n/d/h', 0o600)
 	entries = batch(job, (True, 'create', 'n', None), (True, 'move', 'n/d', 'd'), (False, 'attrib', 'n/d/h', None))
 	size, inodes = rv.get_backup_size_inode(entries, only_sync_attributes, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None,
-		copied={f'{m}/n/d/h'} if copied else frozenset())
+		copied={f'{m}/n/d/h'} if copied else frozenset(), version_bytes=0)
 	copies = copied or not only_sync_attributes
 	assert (size, inodes) == (charge(f'{m}/n', job.job_vault) + (charge(f'{m}/n/d/h', job.job_vault) if copies else 0), 1 + copies)
 
@@ -1209,7 +1209,7 @@ def test_a_touch_is_counted_by_the_estimate(job):
 	try:
 		latest = rv.list_versions(job.job_vault)[-1].path
 		copied = rv.attribs_to_copy(entries, manifest, m, latest)
-		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
+		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied, version_bytes=0)
 	finally:
 		manifest.close()
 	assert copied == {f'{m}/big'} and size >= 300000
@@ -1232,7 +1232,7 @@ def test_an_attrib_that_copies_is_counted_by_the_estimate(job, logged):
 	try:
 		latest = rv.list_versions(job.job_vault)[-1].path
 		copied = rv.attribs_to_copy(entries, manifest, m, latest)
-		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
+		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied, version_bytes=0)
 		assert copied == {f'{m}/b'} and size >= 200000
 	finally:
 		manifest.close()
@@ -1255,7 +1255,7 @@ def test_an_attrib_after_chained_moves_is_counted_by_the_estimate(job):
 	try:
 		latest = rv.list_versions(job.job_vault)[-1].path
 		copied = rv.attribs_to_copy(entries, manifest, m, latest)
-		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied)
+		size, _ = rv.get_backup_size_inode(entries, True, latest, m, copied=copied, version_bytes=0)
 	finally:
 		manifest.close()
 	assert copied == {f'{m}/a/big'} and size >= 300000
@@ -2041,5 +2041,5 @@ def test_the_estimate_of_a_batch_with_nothing_carried_in_and_no_folder_made_asks
 	asked = []
 	real = rv.inside_folders
 	monkeypatch.setattr(rv, 'inside_folders', lambda *args: asked.append(args[0]) or real(*args))
-	rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None)
+	rv.get_backup_size_inode(batch(job, *events), True, rv.list_versions(job.job_vault)[-1].path, m, NothingSkipped(m) if skip == 'skip_list' else None, version_bytes=0)
 	assert len(asked) == len(events)

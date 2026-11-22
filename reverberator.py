@@ -6442,8 +6442,6 @@ def do_backup(backup_entries:dict,
 				backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}: the next attempt finishes it', error=True)
 				return VaultInfo({}, 0, 0), manifest, False
 			backuperTeeLogToTl(job_name, f'Backup incomplete for {backup_folder}; not writing content file', error=True)
-			if vaultInfo is None:
-				vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 			return vaultInfo, manifest, False
 		# a folder whose own metadata copy failed, recorded from what the version holds, is marked ( META_RETRY_MODE ), so the next
 		# comparison that meets it copies its metadata again, its extended attributes among them, which no record holds; one the replay
@@ -8616,7 +8614,8 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 		if not stat.S_ISREG(mode):
 			return False
 		try:
-			fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+			# a link put at the file's place since the lstat is not followed (ELOOP): what it leads to is read by nothing here
+			fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
 		except (FileNotFoundError, NotADirectoryError):
 			# gone between the lstat and the open
 			lines.append(('gone', path, None))
@@ -8625,9 +8624,9 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			# another process's lease on the file: the copy's blocking open waits for the break and reads it
 			return False
 		except OSError as e:
-			if e.errno == errno.ENXIO:
-				# a socket put at the file's place since the lstat (a FIFO opens, a socket answers ENXIO): an entry of another kind,
-				# a change as the lstat pass counts one, which cp -a copies as itself, not an unreadable file
+			if e.errno in (errno.ENXIO, errno.ELOOP):
+				# a socket put at the file's place since the lstat (a FIFO opens, a socket answers ENXIO), or a link (ELOOP): an entry
+				# of another kind, a change as the lstat pass counts one, which cp -a copies as itself, not an unreadable file
 				return False
 			if under_untracked_folder(path):
 				return False
@@ -11634,17 +11633,18 @@ def delta_generate_backup_entries(backupEntries:dict,latest_version_info:VaultEn
 	manifest.commit(version_path)
 	return manifest
 
-def hash_file(path,size = ...,full_hash=False):
+def hash_file(path,size:int,full_hash=False):
 	'''
-	Hash file contents with xxhash (last HASH_SIZE bytes unless full_hash is True). The open never blocks on what is not a
-	regular file (OSError, "Not a regular file"), and waits for another process's write lease to break, as cp's open does,
-	unless the daemon is stopping (GREEN_LIGHT clear): then the BlockingIOError of the open is raised at once.
+	Hash file contents with xxhash (last HASH_SIZE bytes unless full_hash is True): size is the file's size as its caller's
+	lstat read it, which the tail read seeks back by (unread with full_hash). The open never blocks on what is not a regular
+	file (OSError, "Not a regular file"), and waits for another process's write lease to break, as cp's open does, unless the
+	daemon is stopping (GREEN_LIGHT clear): then the BlockingIOError of the open is raised at once.
 
 	Examples:
-		>>> digest = hash_file(__file__, full_hash=True)
+		>>> digest = hash_file(__file__, 0, full_hash=True)
 		>>> len(digest) == 16
 		True
-		>>> digest == hash_file(__file__, full_hash=True)
+		>>> digest == hash_file(__file__, 0, full_hash=True)
 		True
 	'''
 	#From hpcp: https://github.com/yufei-pan/hpcp
@@ -11652,18 +11652,13 @@ def hash_file(path,size = ...,full_hash=False):
 	if HASH_SIZE <= 0:
 		# Do not hash
 		return ''
-	if size == ...:
-		try:
-			size = max(os.lstat(path).st_size,4096)
-		except Exception as _:
-			# if the file does not exist / cannot be accessed, return empty hash
-			backuperTeeLogToTl(path='hash_file',error=True,message=f'Error getting size for {path}')
-			return ''
 	hasher = xxhash.xxh64()
 	def opener(file, flags):
-		# a file swapped for a FIFO after its lstat would block a plain open forever with no writer
+		# a file swapped for a FIFO after its lstat would block a plain open forever with no writer, and one swapped for a link would
+		# have the file it leads to read, wherever that is: the open takes no link (ELOOP), an OSError every caller takes as a file
+		# not read
 		try:
-			return os.open(file, flags | os.O_NONBLOCK | os.O_NOCTTY)
+			return os.open(file, flags | os.O_NONBLOCK | os.O_NOCTTY | os.O_NOFOLLOW)
 		except BlockingIOError:
 			if not GREEN_LIGHT.is_set():
 				# the daemon is stopping: no wait for a lease to break (up to the lease-break time, 45 s by default, and the server's
@@ -11723,16 +11718,16 @@ def vault_charge(st:os.stat_result, block:int) -> int:
 		return min(st.st_blocks * 512, -(-st.st_size // block) * block)
 	return st.st_blocks * 512
 
-def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, monitor_path:str = None, version_bytes:int = None) -> tuple:
+def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, monitor_path:str, version_bytes:int) -> tuple:
 	'''
 	What path takes once copied into a vault with blocks of block bytes (vault_charge()) and its inode count, and for a
 	folder (ending with /) those of what the skip list (None: nothing is skipped) leaves below it, for a copy that leaves
 	the skipped paths out. Skipped folders are not descended into, and entries that vanish are left out. Each name is
-	counted, as the replay copies each name of a hard-linked file on its own. With version_bytes, the length of the version
-	folder's path (the length rule is asked of monitor_path's entries), what the replay leaves out (vault_path_too_long()) is
-	left out too: nothing for an entry the rule leaves out, and a folder of them not descended into.
+	counted, as the replay copies each name of a hard-linked file on its own. version_bytes is the length of the version
+	folder's path (the length rule is asked of monitor_path's entries): what the replay leaves out (vault_path_too_long()) is
+	left out too, nothing for an entry the rule leaves out, and a folder of them not descended into.
 	'''
-	if version_bytes is not None and vault_path_too_long(version_bytes, os.path.relpath(path, monitor_path), not path.endswith('/')):
+	if vault_path_too_long(version_bytes, os.path.relpath(path, monitor_path), not path.endswith('/')):
 		return 0, 0
 	try:
 		st = os.lstat(path)
@@ -11744,13 +11739,11 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, monitor
 	# a folder of the batch, which is not a configured path: one replaced by a link since the batch was taken is not walked through it,
 	# as the copy walk does not copy it
 	prefix = skip_list.folder_rel(path) if skip_list else ''
-	skip = skip_list.skips if skip_list else None
-	if version_bytes is not None:
-		# the rule's rels are the monitored folder's: the walk's own when a skip list gave them their prefix, else this folder's before
-		# them, as the walk (and what a test makes of one) yields them as it always did
-		base = '' if skip_list or path.rstrip('/') == monitor_path.rstrip('/') else os.path.relpath(path, monitor_path) + '/'
-		skips = skip
-		skip = lambda rel: (skips is not None and skips(rel)) or vault_path_too_long(version_bytes, base + rel, not rel.endswith('/'))
+	skips = skip_list.skips if skip_list else None
+	# the rule's rels are the monitored folder's: the walk's own when a skip list gave them their prefix, else this folder's before
+	# them, as the walk (and what a test makes of one) yields them as it always did
+	base = '' if skip_list or path.rstrip('/') == monitor_path.rstrip('/') else os.path.relpath(path, monitor_path) + '/'
+	skip = lambda rel: (skips is not None and skips(rel)) or vault_path_too_long(version_bytes, base + rel, not rel.endswith('/'))
 	for entry_path, _, _ in iter_tree_entries(path, prefix, skip=skip, follow_root=False):
 		try:
 			st = os.lstat(entry_path)
@@ -11760,7 +11753,7 @@ def get_unskipped_size_inodes(path:str, skip_list:'SkipList', block:int, monitor
 		inodes += 1
 	return size, inodes
 
-def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset(),version_bytes:int = None):
+def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vault_version_path:str,monitor_path:str,skip_list:'SkipList' = None,copied = frozenset(),*,version_bytes:int):
 	'''
 	What the vault grows by as the replay copies the backup entries, in bytes and in inodes: each regular file charged what
 	its copy takes in the vault (vault_charge(), with the block size of the vault's filesystem, read once), by one walk of
@@ -11780,8 +11773,8 @@ def get_backup_size_inode(backup_entries:dict,only_sync_attributes:bool,last_vau
 		monitor_path (str): The path of the monitored path
 		skip_list (SkipList): The job's skip list; with patterns, folders are measured without their skipped contents
 		copied (set): The attrib entries the replay copies under only_sync_attributes ( attribs_to_copy() )
-		version_bytes (int): The length of the new version folder's path: with it, what the replay leaves out because its path in the
-			version passes the limit ( vault_path_too_long() ) is not counted, a folder with all under it
+		version_bytes (int): The length of the new version folder's path ( length_rule_bytes() ): what the replay leaves out because its
+			path in the version passes the limit ( vault_path_too_long() ) is not counted, a folder with all under it
 
 	Returns:
 		tuple: The bytes and the inodes the batch adds to the vault
