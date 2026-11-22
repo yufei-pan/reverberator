@@ -166,3 +166,9 @@ entries go last, in the same commit as the change:
 - Why we had to change: one deep entry stopped every backup of the job, a first version included, for as long as it stayed in the monitored tree.
 - Original design was wrong because: a limit no retry can lift was handled as a failure a retry might fix.
 - Lesson: a limit of the target that no retry lifts is met per entry, by a rule that decides before writing; the entry is reported, and the rest goes on.
+
+## 2026-11-14 reverberator 0.55.6: an /etc/fstab that cannot be read is a problem, not an empty one
+- Changed: a read of /etc/fstab that fails other than with ENOENT is a problem the job's wait names and waits on; before, it read as fstab naming no mount point.
+- Why we had to change: with fstab unreadable, a path under an unmounted fstab mount point counted as there, and a start could make the vault on the bare mount point.
+- Original design was wrong because: the rule took a failed read for an answer.
+- Lesson: a source a safety rule reads either answers or is a problem; only its own "none" (no such file) is an empty answer.

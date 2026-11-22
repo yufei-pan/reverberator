@@ -1,9 +1,12 @@
 import errno
+import json
 import os
 import shutil
+import threading
+import time
 import pytest
 import reverberator as rv
-from tests.harness import write_fstab
+from tests.harness import seed_monitor, wait_until, write_fstab
 
 pytestmark = pytest.mark.unit
 
@@ -82,10 +85,151 @@ def test_a_commented_fstab_line_names_nothing(tmp_path, fake_pool):
 
 
 @pytest.mark.parametrize('fstab', ['missing', 'a folder'])
-def test_an_fstab_that_cannot_be_read_names_nothing(tmp_path, fake_pool, fstab):
+def test_an_fstab_that_cannot_be_read_is_a_problem_and_a_missing_one_names_nothing(tmp_path, fake_pool, fstab):
+	# 'missing' is a pin; 'a folder' (EISDIR, a read that fails other than with ENOENT) named nothing before 0.55.6
 	if fstab == 'a folder':
 		os.makedirs(rv.FSTAB_PATH)
-	assert rv.vault_disk_problem(str(tmp_path / 'vaults' / 'v')) is None
+	expected = None if fstab == 'missing' else unreadable(errno.EISDIR)
+	assert rv.vault_disk_problem(str(tmp_path / 'vaults' / 'v')) == expected
+
+
+def unreadable(err:int = errno.EIO) -> str:
+	return f'{rv.FSTAB_PATH} cannot be read: {os.strerror(err)}'
+
+
+class FailingRead:
+	'''An open file whose read fails with err.'''
+	def __init__(self, err:int):
+		self.err = err
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		return False
+
+	def read(self, *args):
+		raise OSError(self.err, os.strerror(self.err))
+
+
+def fstab_read_fails(monkeypatch, err:int = errno.EIO) -> dict:
+	'''
+	FSTAB_PATH opens and its read fails with err, as on a root disk going bad: a stand-in on reverberator's open for that
+	path alone, failing while the dict returned says so ('failing').
+	'''
+	state = {'failing': True}
+	real = open
+	def opener(path, *args, **kwargs):
+		if state['failing'] and path == rv.FSTAB_PATH:
+			return FailingRead(err)
+		return real(path, *args, **kwargs)
+	monkeypatch.setattr(rv, 'open', opener, raising=False)
+	return state
+
+
+def test_an_fstab_that_cannot_be_read_makes_the_job_wait(job, poll_fast, monkeypatch, tmp_path, capsys):
+	# fails on main (makes the job's folder and backs up): fstab names the vault's disk, which is not mounted, and its
+	# read fails with EIO: the job's first wait, for its Vault Path, waits on the read with the FAILED: waiting marker and
+	# its status saying so, and makes nothing; once the read answers, its answer decides (the disk is not mounted)
+	seed_monitor(job, {'a.txt': 'a'})
+	write_fstab(job.vault)
+	reads = fstab_read_fails(monkeypatch)
+	monkeypatch.setattr(rv, 'DISK_WAIT_GRACE_SECONDS', 0.1)
+	rv.STATUS_BOARD = rv.StatusBoard(str(tmp_path / 'state'), '/r.tsv')
+	control = rv.JobControl(job.job_name)
+	control.start_attempt()
+	ready = threading.Event()
+	ready.set()
+	thread = threading.Thread(target=rv.backuper, args=(job.job_name, rv.ChangeEventQueue(job.monitor), threading.Lock(), job.monitor,
+		job.vault, 'N/A', threading.Event(), ready), kwargs=dict(job=control), daemon=True)
+	thread.start()
+	printed = ''
+	def status() -> dict:
+		try:
+			with open(tmp_path / 'state' / f'job-{job.job_name}.json') as f:
+				return json.load(f)
+		except (OSError, ValueError):
+			return {}
+	def waiting(reason) -> bool:
+		nonlocal printed
+		out = capsys.readouterr()
+		printed += out.out + out.err
+		return f'reverberator job {job.job_name} FAILED: waiting 0 min for {job.vault}: {reason}' in printed
+	try:
+		wait_until(lambda: waiting(unreadable()) or control.committed.is_set() or control.failure is not None, timeout=10,
+			message='the job neither waited nor backed up')
+		assert control.failure is None and not control.committed.is_set() and not os.path.lexists(job.job_vault)
+		assert [wait[1:3] for wait in control._waits] == [[job.vault, unreadable()]]
+		wait_until(lambda: status().get('state') == 'waiting', timeout=5, message='no waiting status')
+		assert status()['detail'] == f'{job.vault}: {unreadable()}'
+		time.sleep(0.3)
+		assert thread.is_alive() and control.failure is None and not os.path.lexists(job.job_vault)
+		reads['failing'] = False
+		wait_until(lambda: [wait[2] for wait in control._waits] == [not_mounted(job.vault)], timeout=5,
+			message='the wait never took the answer of the read')
+		assert not os.path.lexists(job.job_vault)
+	finally:
+		control.fail('test done')
+		thread.join(timeout=5)
+	assert not thread.is_alive()
+
+
+def test_a_missing_fstab_names_nothing(tmp_path, fake_pool):
+	# pin: no fstab is an answer, none named: no disk problem off a pool or on one, and a wait does not wait
+	pool = str(tmp_path / 'pool')
+	fake_pool.add(pool, ['a', 'b'])
+	assert not os.path.lexists(rv.FSTAB_PATH)
+	for path in (str(tmp_path / 'vaults' / 'v'), os.path.join(pool, 'v')):
+		assert rv.vault_disk_problem(path) is None, path
+	assert rv.pool_state(os.path.join(pool, 'v')).problem is None
+	control = rv.JobControl('job')
+	control.start_attempt()
+	waits = []
+	real = control.begin_wait
+	control.begin_wait = lambda *args: waits.append(args) or real(*args)
+	os.makedirs(os.path.join(pool, 'v'))
+	assert rv.wait_for_path(control, None, os.path.join(pool, 'v'), 'vault filesystem not ready') is True
+	assert waits == []
+
+
+def test_a_pool_state_with_fstab_unreadable_says_so(tmp_path, fake_pool, monkeypatch):
+	# fails on main (no problem): which pool holds the path and its disks' ids are known; fstab's points are not, so a
+	# disk fstab names under a pool's disk cannot be told, and the state's problem says why
+	pool = str(tmp_path / 'pool')
+	a, b = fake_pool.add(pool, ['a', 'b'])
+	path = os.path.join(pool, 'v')
+	fstab_read_fails(monkeypatch)
+	state = rv.pool_state(path)
+	assert state.pool == os.path.realpath(pool) and [branch for branch, _ in state.ids] == [a, b]
+	assert all(mount_id is not None for _, mount_id in state.ids)
+	assert state.problem == unreadable()
+	assert rv.pool_problem(path) == unreadable() and rv.vault_disk_problem(path) == unreadable()
+	fake_pool.drop(a)
+	assert rv.pool_problem(path) == f'disk {a} of pool {os.path.realpath(pool)} is not mounted; {unreadable()}'
+
+
+def test_a_guard_checks_against_the_fstab_its_batch_began_with(tmp_path, fake_pool, monkeypatch):
+	# a disk fstab names under a pool's disk at the path's place, mounted when the batch looked; then fstab loses its line
+	# and the disk goes: the guard's checks answer by the points its look read, and read no fstab
+	pool = str(tmp_path / 'pool')
+	a, _ = fake_pool.add(pool, ['a', 'b'])
+	path = os.path.join(pool, 'v')
+	place = fake_pool.add_mount(os.path.join(a, 'v'))
+	write_fstab(place)
+	table = rv.read_mount_table()
+	guard = rv.PoolGuard([path], mount_table=table, fstab=rv.fstab_mount_points(table))
+	guard.require()
+	write_fstab()
+	fake_pool.drop(place)
+	reads = []
+	real = rv.parse_fstab
+	monkeypatch.setattr(rv, 'parse_fstab', lambda content: reads.append(content) or real(content))
+	with pytest.raises(rv.PoolNotReady) as failed:
+		guard.require()
+	assert failed.value.args[0] == f'disk {place} of pool {os.path.realpath(pool)} is not mounted ({rv.FSTAB_PATH} names it)'
+	assert reads == []
+	# a check with no points kept reads fstab now, which names no disk there
+	assert rv.pool_problem(path) is None and len(reads) == 1
 
 
 def test_a_mount_table_that_cannot_be_read_means_not_there(tmp_path, monkeypatch):

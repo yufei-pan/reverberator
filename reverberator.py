@@ -1192,16 +1192,17 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 	Wait until the disk holding path is there, flag is set and path is a directory. Returns False when the job (with
 	job None, GREEN_LIGHT) says stop. The disk is checked live on every poll, as the flag can lag behind it, and the
 	wait's reason is its problem while there is one, else what. Every wait, a monitored path's as well as the vault's,
-	needs the disk holding path there (vault_disk_problem()): no fstab mount at or above path unmounted, no disk of a
-	mergerfs pool holding it missing. flag None: no signature flag, the wait ends once the disk is there and path is a
-	folder. create: once the disk is there and nothing is at path, it is made (os.makedirs), so never under a bare
-	mount point; a path that cannot be made raises JobFailure.
+	needs the disk holding path there (vault_disk_problem()): no fstab mount at or above path unmounted, fstab read (only
+	its absence names nothing), no disk of a mergerfs pool holding it missing. flag None: no signature flag, the wait
+	ends once the disk is there and path is a folder. create: once the disk is there and nothing is at path, it is made
+	(os.makedirs), so never under a bare mount point; a path that cannot be made raises JobFailure.
 	Logs nothing for DISK_WAIT_GRACE_SECONDS, then an alert, repeated every DISK_WAIT_REPEAT_SECONDS, and once the wait
 	it alerted for ends, one line saying the job goes on. Of the job's waits for one path, only the oldest alerts
 	(JobControl.alerts).
-	table, a one-item list a batch's waits share: the first poll looks at the mount table it holds, or reads one and puts it
-	there when it is empty, and every later poll reads it live and puts that there, so once the wait returns it holds the
-	table the wait saw last, with no wait after it. Only a read that succeeded goes in it.
+	table, a one-item list a batch's waits share: the first poll looks at the Look it holds (the mount table and the fstab
+	points read with it), or reads both and puts their Look there when it is empty, and every later poll reads both live
+	and puts them there, so once the wait returns it holds the look the wait saw last, with no wait after it. Only a look
+	whose two reads succeeded goes in it; a read that failed is the poll's reason.
 	'''
 	running = GREEN_LIGHT.is_set if job is None else job.should_run
 	started = clock()
@@ -1218,11 +1219,16 @@ def wait_for_path(job:JobControl, flag:threading.Event, path:str, what:str, cloc
 				if polled or not table:
 					table.clear()
 					try:
-						table.append(read_mount_table())
+						mount_table = read_mount_table()
 					except OSError as e:
 						reason = mount_table_unreadable(e)
+					else:
+						try:
+							table.append(Look(mount_table, fstab_mount_points(mount_table)))
+						except OSError as e:
+							reason = fstab_unreadable(e)
 				if reason is None:
-					reason = vault_disk_problem(path, table[0])
+					reason = vault_disk_problem(path, table[0].mount_table, table[0].fstab)
 			polled = True
 			if reason is None and create and not os.path.lexists(path):
 				try:
@@ -4240,13 +4246,15 @@ def f2fs_failed(mount_table:list, mount_point:str) -> bool:
 # pool is None when the mount table cannot be read (problem says so): which pool holds the path is not known.
 PoolState = namedtuple('PoolState', ['pool', 'ids', 'problem', 'pool_id'])
 
-def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
+def pool_state(path:str, mount_table:list = None, fstab:list = None) -> 'PoolState | None':
 	'''
 	The state of the mergerfs pool holding path: its branches' mount ids, and what is wrong (pool_problem()'s texts).
 	None when path is on no mergerfs mount; no branch list is read then. A branch is missing when nothing is mounted at
 	its resolved path, when its statx fails, as for a shut-down XFS that is still mounted, or when it is an f2fs whose
 	checkpoint reports an error. A disk fstab names under a branch, at or above path's place on it, that is not mounted is
-	a missing disk of the pool too (unmounted_fstab_point()), its text saying fstab names it.
+	a missing disk of the pool too (unmounted_fstab_point()), its text saying fstab names it. fstab, the points a look
+	read (fstab_mount_points()), is what that rule takes; with none, fstab is read here, on a pool only, and a read that
+	fails is a problem of the pool (fstab_unreadable()), as such a disk cannot be told.
 	'''
 	if mount_table is None:
 		try:
@@ -4286,7 +4294,13 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 	# when the disk is mounted again. The rule of vault_disk_problem(), on the path's place on each branch; a point at or
 	# above a branch is the branch's own check above
 	nested = []
-	inner = [point for point in fstab_mount_points(mount_table) if any(point.startswith(branch.rstrip('/') + '/') for branch, _ in ids)]
+	unread = None
+	if fstab is None:
+		try:
+			fstab = fstab_mount_points(mount_table)
+		except OSError as e:
+			fstab, unread = [], fstab_unreadable(e)
+	inner = [point for point in fstab if any(point.startswith(branch.rstrip('/') + '/') for branch, _ in ids)]
 	if inner:
 		rel = os.path.relpath(os.path.realpath(path), pool)
 		for branch, _ in ids:
@@ -4301,19 +4315,21 @@ def pool_state(path:str, mount_table:list = None) -> 'PoolState | None':
 			problems.append(f'disk {disks[0]} of pool {pool} is not mounted{named}')
 		elif disks:
 			problems.append(f'disks {", ".join(disks)} of pool {pool} are not mounted{named}')
+	if unread is not None:
+		problems.append(unread)
 	problems.extend(failed)
 	return PoolState(pool, tuple(ids), '; '.join(problems) or None, pool_id)
 
-def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None) -> 'str | None':
+def pool_problem(path:str, since:'PoolState' = None, mount_table:list = None, fstab:list = None) -> 'str | None':
 	'''
 	What is wrong now with the mergerfs pool holding path, None when nothing is or path is on no pool. With since (a
 	pool_state() taken when a step began), the pool gone or mounted again since then counts too, and so does a disk
 	mounted since then, even one dropped and back. A step that began with a problem (since's) keeps it: with no whole
-	pool to compare with, the step fails, and the next one takes a fresh state.
+	pool to compare with, the step fails, and the next one takes a fresh state. fstab goes to pool_state().
 	'''
 	if since is not None and since.problem:
 		return since.problem
-	state = pool_state(path, mount_table)
+	state = pool_state(path, mount_table, fstab)
 	if state is None:
 		# a lazy umount of the pool leaves the path on its empty mount folder
 		return None if since is None else f'pool {since.pool} is not mounted'
@@ -4353,13 +4369,15 @@ def parse_fstab(content:bytes) -> list:
 
 def fstab_mount_points(mount_table:list) -> list:
 	'''
-	The mount points FSTAB_PATH names now, resolved as the mount table lists them; [] when it cannot be read. One the
-	table lists is resolved already, so no mounted filesystem is asked (a hung one would block, an automount fire).
+	The mount points FSTAB_PATH names now, resolved as the mount table lists them; [] when there is no such file, which
+	names none. Raises the OSError of a read that failed otherwise (EIO, EISDIR): that is no answer, and a disk the file
+	names would count as there. One the table lists is resolved already, so no mounted filesystem is asked (a hung one
+	would block, an automount fire).
 	'''
 	try:
 		with open(FSTAB_PATH, 'rb') as f:
 			points = parse_fstab(f.read())
-	except OSError:
+	except FileNotFoundError:
 		return []
 	mounted = {point for point, _ in mount_table}
 	return [point if point in mounted else os.path.realpath(point) for point in points]
@@ -4368,25 +4386,38 @@ def mount_table_unreadable(e:OSError) -> str:
 	'''What a wait says while the mount table cannot be read.'''
 	return f'the mount table cannot be read: {e.strerror or e}'
 
-def vault_disk_problem(path:str, mount_table:list = None) -> 'str | None':
+def fstab_unreadable(e:OSError) -> str:
+	'''What a wait, and a pool's state, say while FSTAB_PATH cannot be read (fstab_mount_points() raised e).'''
+	return f'{FSTAB_PATH} cannot be read: {e.strerror or e}'
+
+# what one look at the disks read: the mount table and the fstab points read with it (fstab_mount_points()). A batch's
+# waits share one (wait_for_path(table=)), and its PoolGuard keeps the points
+Look = namedtuple('Look', ['mount_table', 'fstab'])
+
+def vault_disk_problem(path:str, mount_table:list = None, fstab:list = None) -> 'str | None':
 	'''
 	Why the disk holding the vault path is not there, None when it is. It is not there when the longest fstab mount
 	point at or above the path is not mounted (a bare folder left under it is not that disk, and neither is anything
 	mounted below it: telling a disk from a bind mount or a tmpfs there needs rules this host has no use for), when the mount table cannot be
-	read, when a mergerfs pool holding the path has a disk missing (pool_problem()'s text, a disk fstab names under a
-	branch at the path's place on it included), or when the disk holding it
-	off a pool has failed as a pool's disk can (plain_disk_problem()). path need not exist. mount_table, when given, is the
-	table to look at: none is read then.
+	read, or fstab cannot be read for another reason than its absence, when a mergerfs pool holding the path has a disk
+	missing (pool_problem()'s text, a disk fstab names under a branch at the path's place on it included), or when the
+	disk holding it off a pool has failed as a pool's disk can (plain_disk_problem()). path need not exist. mount_table
+	and fstab (its points, fstab_mount_points()), when given, are what to look at: neither is read then.
 	'''
 	if mount_table is None:
 		try:
 			mount_table = read_mount_table()
 		except OSError as e:
 			return mount_table_unreadable(e)
-	missing = unmounted_fstab_point(os.path.realpath(path), mount_table, fstab_mount_points(mount_table))
+	if fstab is None:
+		try:
+			fstab = fstab_mount_points(mount_table)
+		except OSError as e:
+			return fstab_unreadable(e)
+	missing = unmounted_fstab_point(os.path.realpath(path), mount_table, fstab)
 	if missing is not None:
 		return f'{missing} is not mounted ({FSTAB_PATH} names it)'
-	return pool_problem(path, mount_table=mount_table) or plain_disk_problem(path, mount_table)
+	return pool_problem(path, mount_table=mount_table, fstab=fstab) or plain_disk_problem(path, mount_table)
 
 def unmounted_fstab_point(real:str, mount_table:list, points:list) -> 'str | None':
 	'''
@@ -4431,17 +4462,20 @@ class PoolGuard:
 	run per entry. Paths on no pool are never checked; while the mount table cannot be read, each path counts as on one.
 	A path is held and asked in its normal spelling (os.path.normpath), as a rule's vault path is not normalised: a guard built on
 	vault// and asked about vault/job must agree. mount_table, when given, is the table the step began with: none is read
-	for the pools' states then.
+	for the pools' states then. fstab, when given, is the points the step's look read (Look.fstab): every check of the
+	guard takes them, so it reads no fstab, and a change to fstab during the step reaches the next step's look; with none,
+	each check reads fstab.
 	'''
-	def __init__(self, paths, clock = time.monotonic, mount_table:list = None):
-		self.states = [(path, state) for path, state in ((path, pool_state(path, mount_table)) for path in map(os.path.normpath, paths)) if state is not None]
+	def __init__(self, paths, clock = time.monotonic, mount_table:list = None, fstab:list = None):
+		self.fstab = fstab
+		self.states = [(path, state) for path, state in ((path, pool_state(path, mount_table, fstab)) for path in map(os.path.normpath, paths)) if state is not None]
 		self.clock = clock
 		self.next_check = None
 		self.lock = threading.Lock()
 
 	def problem(self) -> 'str | None':
 		for path, since in self.states:
-			problem = pool_problem(path, since)
+			problem = pool_problem(path, since, fstab=self.fstab)
 			if problem:
 				return problem
 		return None
@@ -5064,9 +5098,9 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 		vaultInfo = scanned
 		# to_process: ChangeEventQueue of ChangeEvent(monotonic_time, is_dir, event, path, moved_from), oldest first
 		while running():
-			# the mount table the batch's waits read last: one read looks at the vault's disk, the monitored path's, the pools
-			# and the batch's inner mounts, a wait that polls again reading it live ( wait_for_path() ), so no table the batch
-			# takes was read before a wait
+			# the look the batch's waits read last (a Look: the mount table and the fstab points read with it): one look checks
+			# the vault's disk, the monitored path's, the pools and the batch's inner mounts, a wait that polls again reading both
+			# live ( wait_for_path() ), so no table the batch takes was read before a wait, and fstab is read once a batch
 			table = []
 			wait_for_vault(vault_fs_flag, table)
 			if not running():
@@ -5076,7 +5110,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			if not running():
 				break
 			# the pools as the batch begins: a disk that drops from here on stops it ( do_backup() ), by the job's own folder, which is what the writer asks of them
-			pool_guard = PoolGuard([job_vault, monitor_path], mount_table=table[0])
+			pool_guard = PoolGuard([job_vault, monitor_path], mount_table=table[0].mount_table, fstab=table[0].fstab)
 			# whether scanned folders were walked since the waits
 			walked = False
 			# an unreadable path is reported once for the batch, by its comparison or its backup
@@ -5084,7 +5118,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 			if scan_folders and not full_comparison:
 				vaultInfo,manifest,full_comparison = compare_scanned_folders(backupEntries,scan_folders,job_name,monitor_path,vault_path,
 					vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,reported=reported,pool_guard=pool_guard,job=job,
-					mount_table=table[0])
+					mount_table=table[0].mount_table)
 				if not running():
 					break
 				walked = not full_comparison
@@ -5106,7 +5140,7 @@ def backuper(job_name:str,to_process:ChangeEventQueue,to_process_lock:threading.
 				matched_since = time.time_ns() if full_comparison else to_process_temp.read_wall_ns
 				# read again after a walk of scanned folders: an inner disk unmounted while it ran is paused by do_backup(), which
 				# drops their deletes
-				batch_table = current_mount_table() if walked else table[0]
+				batch_table = current_mount_table() if walked else table[0].mount_table
 				vaultInfo,manifest,committed = do_backup(backupEntries,job_name=job_name,monitor_path=monitor_path,vault_path=vault_path,
 					  only_sync_attributes=only_sync_attributes, keep_n_versions=keep_n_versions, 
 					  backup_size_limit=backup_size_limit, log_journal=log_journal,vaultInfo=vaultInfo,manifest=manifest,skip_list=skip_list,root_mount=root_mount,

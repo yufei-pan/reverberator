@@ -1149,3 +1149,47 @@ def test_a_failed_mount_table_read_is_not_kept_for_the_batch(job, fake_pool, mon
 	seen = one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], before=lambda: state.update(armed=True))
 	assert state['failed'] == 1 and state['after'] >= 1 and len(committed_versions(job)) == 2
 	covered_with_a_handle_per_filesystem(job, seen, branches)
+
+
+# ---- D9: one fstab read per look -------------------------------------------------------------------------------------
+
+def fstab_reads(monkeypatch) -> dict:
+	'''The parse_fstab() calls, one for each read of FSTAB_PATH that answered, made on the backuper's thread while armed.'''
+	counts = {'armed': False, 'reads': 0}
+	real = rv.parse_fstab
+	def counted(content):
+		if counts['armed'] and threading.current_thread().name == BATCH_THREAD:
+			counts['reads'] += 1
+		return real(content)
+	monkeypatch.setattr(rv, 'parse_fstab', counted)
+	return counts
+
+
+@pytest.mark.unit
+def test_a_one_file_batch_on_a_pool_reads_fstab_once(job, fake_pool, monkeypatch, poll_fast):
+	# fails on main: the batch's look reads fstab once, and its waits, its guard and the guard's checks take the points it
+	# read; main read it in each wait's disk check and in every pool check, each wait's and the guard's (main: 18 with the
+	# vault and the monitored tree on pools, as the guard checks at every poll here; 9 with the tree alone on one, 11 with
+	# the vault alone)
+	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	pooled_vault(job, fake_pool)
+	fake_pool.add(job.monitor, ['m1', 'm2'])
+	run_backup(job)
+	# fstab names the vault's pool, which is mounted: every read of it parses a line, and none makes the batch wait
+	write_fstab(job.vault)
+	counts = fstab_reads(monkeypatch)
+	one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], counts)
+	assert len(committed_versions(job)) == 2
+	assert counts['reads'] == 1
+
+
+@pytest.mark.unit
+def test_a_one_file_batch_off_a_pool_reads_fstab_once(job, monkeypatch, poll_fast):
+	# fails on main: one read for the batch's look, where each of its three waits read fstab (main: 3) and nothing else did
+	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
+	run_backup(job)
+	write_fstab(os.path.join(job.root, 'elsewhere'))
+	counts = fstab_reads(monkeypatch)
+	one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], counts)
+	assert len(committed_versions(job)) == 2
+	assert counts['reads'] == 1
