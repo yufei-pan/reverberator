@@ -1062,22 +1062,23 @@ def a_changed_file(job, rel='a.txt'):
 
 
 @pytest.mark.unit
-def test_a_one_file_batch_reads_the_mount_table_three_times(job, poll_fast, monkeypatch):
+def test_a_one_file_batch_reads_the_mount_table_four_times(job, poll_fast, monkeypatch):
 	# fails on main: off a pool, through backuper(): one read for both waits, the guard and do_backup(); one after the
-	# verification's walk, for its check of the monitored mount and its paused set; one at the commit, after the copies,
-	# which the inner mounts it remembers come from (main: seven, and two in the fsyncs after the commit, which go off a pool)
+	# wait for the locks, before the estimate, for its check of the monitored mount and its paused set (D7); one after the
+	# verification's walk, for the same; one at the commit, after the copies, which the inner mounts it remembers come from
+	# (main: seven, and two in the fsyncs after the commit, which go off a pool; three before the look after the locks)
 	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
 	run_backup(job)
 	counts = mount_table_reads(monkeypatch, counting_fsyncs=True)
 	one_batch_through_the_backuper(job, monkeypatch, lambda: [a_changed_file(job)], counts)
 	assert len(committed_versions(job)) == 2
-	assert counts['reads'] == 3
+	assert counts['reads'] == 4
 
 
 @pytest.mark.unit
-def test_a_batch_with_a_scanned_folder_reads_the_mount_table_four_times(job, poll_fast, monkeypatch):
-	# fails on main: the three reads above and one more, after the scanned folders' walk, for do_backup() (main: eight, and
-	# two in the fsyncs)
+def test_a_batch_with_a_scanned_folder_reads_the_mount_table_five_times(job, poll_fast, monkeypatch):
+	# fails on main: the four reads above and one more, after the scanned folders' walk, for do_backup() (main: eight, and
+	# two in the fsyncs; four before the look after the locks)
 	seed_monitor(job, {'a.txt': 'a', 'd/b.txt': 'b'})
 	run_backup(job)
 	counts = mount_table_reads(monkeypatch, counting_fsyncs=True)
@@ -1087,7 +1088,7 @@ def test_a_batch_with_a_scanned_folder_reads_the_mount_table_four_times(job, pol
 		return [a_changed_file(job), rv.ChangeEvent(time.monotonic(), True, 'scan', os.path.join(job.monitor, 'd'), None)]
 	one_batch_through_the_backuper(job, monkeypatch, batch, counts)
 	assert len(committed_versions(job)) == 2
-	assert counts['reads'] == 4
+	assert counts['reads'] == 5
 
 
 def pooled_vault(job, fake_pool):

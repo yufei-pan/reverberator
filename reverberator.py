@@ -5770,13 +5770,14 @@ def log_events_to_journal(backup_entries:dict,journal_path:str):
 
 def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str, first_version:bool = False) -> tuple:
 	'''
-	After a walk of the monitored tree (named by walk in the log): a disk unmounted while it ran was walked as the empty
-	folder it left, so what the walk found under it is dropped from backup_entries, and its rows are linked forward as
-	for a disk paused before the walk. JobFailure is raised when the monitored root itself shows another filesystem than
-	root_mount. mount_table is the one read before the walk, remembered_mounts the inner mounts the manifest recorded.
-	With first_version, after a first version's walk, which copied as it went and keeps no last copy under such a disk:
-	backup_entries is empty, and the line says the walk left out what it had not reached under it. Returns (paused with
-	the inner mounts that went away added, the table read after the walk).
+	After a walk of the monitored tree, or the wait for the job's locks that follows a comparison (named by walk in the
+	log): a disk unmounted meanwhile was walked as the empty folder it left, or is gone now, so what the batch found under
+	it is dropped from backup_entries, and its rows are linked forward as for a disk paused before the walk. JobFailure is
+	raised when the monitored root itself shows another filesystem than root_mount. mount_table is the one read before
+	the walk, remembered_mounts the inner mounts the manifest recorded. With first_version, after a first version's walk,
+	which copied as it went and keeps no last copy under such a disk: backup_entries is empty, and the line says the walk
+	left out what it had not reached under it. Returns (paused with the inner mounts that went away added, the table read
+	now).
 	'''
 	walked_table = current_mount_table()
 	check_monitored_mount(monitor_path,walked_table,root_mount)
@@ -5822,7 +5823,8 @@ def do_backup(backup_entries:dict,
 	# the old time forward
 	# job: the job's JobControl, None outside the daemon: the wait for the locks shows in its status and ends when it stops running
 	# mount_table: the mount table the batch takes ( backuper(): its waits' last read, or one read after its scans walk ), read
-	# here when None, and read again here after the locks a vault with no version takes first
+	# here when None, and read again here after the locks: those a vault with no version takes first, and those a later version
+	# takes after its comparison, before its estimate ( drop_unmounted_entries() )
 	# a vaultInfo with a tree (design R) holds a cut batch's tree: this backup rolls it forward, a batch with no hand-over that
 	# compares the whole tree and always commits (spec section 3, plan S4); it is the first batch of an attempt, the start's full
 	# comparison, and the entries given are not used (roll_forward_entries())
@@ -5863,9 +5865,10 @@ def do_backup(backup_entries:dict,
 	except BaseException:
 		unit.close()
 		raise
-	# the job's backup and restore locks, held from before the versions are changed to the end of this backup, so no restore
-	# reads them while they change. the comparison, which commits what it read of the vault, and the check's probe link in
-	# staging (entries_all_drop_out()), which no restore reads, run without them
+	# the job's backup and restore locks, held from before the versions are changed (from a first version's vault scan, or a
+	# later version's estimate) to the end of this backup, so no restore reads them while they change. the comparison, which
+	# commits what it read of the vault, and the check's probe link in staging (entries_all_drop_out()), which no restore reads,
+	# run without them
 	locks = BackupLocks(job_name, job=job)
 	try:
 		if not vaultInfo or not vaultInfo.vault_info_dict:
@@ -6062,7 +6065,9 @@ def do_backup(backup_entries:dict,
 				if log_journal:
 					log_to_journal(journalPath,monitor_path,f'delta_generated_{len(backup_entries)}_differences',monitor_path)
 					log_events_to_journal(backup_entries,journalPath)
-			if not backup_entries and tree is None:
+			def no_differences() -> tuple:
+				# a batch with nothing to back up, here or once the look after the locks dropped what was left: no version
+				nonlocal vaultInfo
 				backuperTeeLogToTl(job_name, 'No differences after delta; skipping new version', ok=True)
 				# no differences after a complete walk, or none left outside paused folders: the tree matches the
 				# manifest under this skip list, if every disk of both pools was there all along
@@ -6080,6 +6085,27 @@ def do_backup(backup_entries:dict,
 				if vaultInfo is None:
 					vaultInfo = VaultInfo(vault_info_dict, vault_size, vault_inodes)
 				return vaultInfo, manifest, True
+			if not backup_entries and tree is None:
+				return no_differences()
+			# from the estimate on, under the locks: the vault changes from the prunes on, and the estimate, the limits and the prunes
+			# count what the batch copies once the look below has dropped what a disk that went during the wait took along
+			if not locks.take():
+				if tree is not None:
+					# what the comparison read of the tree stands only if the version commits
+					manifest.rollback()
+				return VaultInfo(vault_info_dict, vault_size, vault_inodes, tree, vaultInfo.recorded), manifest, False
+			# the wait (behind a restore that copies, say) can outlast a disk: the monitored one gone fails the attempt, as during
+			# a walk, and an inner one gone is paused, the entries under it dropped. a roll-forward goes on with what is left, as
+			# it always commits
+			try:
+				paused, walked_table = drop_unmounted_entries(backup_entries,job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,'wait for the locks')
+			except JobFailure:
+				if tree is not None:
+					manifest.rollback()
+				raise
+			if tree is None and not backup_entries:
+				locks.release()
+				return no_differences()
 			# an attribute change copies its file where the vault's copy holds other contents ( do_reverb_backup() )
 			# what the size limit counts is against the tree, wherever it is now
 			tree_now = latest_version_info.path if tree is None else tree
@@ -6096,12 +6122,6 @@ def do_backup(backup_entries:dict,
 			backup_limit_size, backup_limit_inode = get_backup_limits_from_str(backup_size_limit=backup_size_limit,vault_fs_size=vault_fs_size,vault_fs_inode=vault_fs_inode)
 			backuperTeeLogToTl(job_name,f'Calculated backup size limit {backup_limit_size} and backup inode limit {backup_limit_inode}')
 			backuperTeeLogToTl(job_name,f'Vault size {vault_size} and vault inodes {vault_inodes}')
-			# from the prunes on, the vault changes
-			if not locks.take():
-				if tree is not None:
-					# what the comparison read of the tree stands only if the version commits
-					manifest.rollback()
-				return VaultInfo(vault_info_dict, vault_size, vault_inodes, tree, vaultInfo.recorded), manifest, False
 			if backup_limit_size:
 				while vault_size + estimated_backup_size > backup_limit_size:
 					backuperTeeLogToTl(job_name,f'Vault size {vault_size} + estimated backup size {estimated_backup_size} exceeds backup size limit {backup_limit_size}')

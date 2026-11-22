@@ -912,3 +912,133 @@ def test_a_first_version_walk_with_its_inner_mount_gone_from_the_table_pauses_it
 	assert _read(os.path.join(latest, 'disk', 'f.txt')) == 'f'
 	assert _read(os.path.join(latest, 'disk', 'sub', 'g.txt')) == 'g'
 
+
+# ---- D7: a batch that waited for its locks looks at the disks again --------------------------------------------------------
+
+# each D7 test runs on a real mount in the test VM, and on the mount table stood in for in Docker
+VENUES = [pytest.param('vm', marks=[pytest.mark.privileged, needs_root]), pytest.param('stand_in', marks=pytest.mark.unit)]
+
+
+class _Disk:
+	'''
+	A disk mounted at folder: a real tmpfs in the test VM ('vm'), unmounted lazily; else ('stand_in') a fake disk in the table
+	read_mount_table() answers, whose unmount takes it out of the table and moves what it held aside, leaving the empty folder.
+	'''
+	def __init__(self, monkeypatch, venue, folder, aside):
+		self.venue, self.folder, self.aside = venue, folder, aside
+		os.makedirs(folder, exist_ok=True)
+		if venue == 'vm':
+			subprocess.check_call(['mount', '-t', 'tmpfs', 'tmpfs', folder])
+		else:
+			self.real_table = rv.read_mount_table()
+			self.tables = _a_table_you_can_change(monkeypatch, self.real_table + [(os.path.realpath(folder), FAKE_DISK)])
+
+	def unmount(self):
+		if self.venue == 'vm':
+			subprocess.check_call(['umount', '-l', self.folder])
+		else:
+			os.rename(self.folder, self.aside)
+			os.mkdir(self.folder)
+			self.tables['now'] = self.real_table
+
+	def close(self):
+		if self.venue == 'vm':
+			subprocess.call(['umount', self.folder], stderr=subprocess.DEVNULL)
+
+
+def _a_batch_held_at_the_locks(job, monkeypatch, entries, meanwhile, **options):
+	'''
+	do_backup() of entries in a thread of its own while the test holds the job's restore lock, as a restore that copies holds it:
+	once the batch says it waits for its locks, meanwhile() runs, and the lock is let go. (the batch's thread, once it ended: its
+	committed and error; the lines logged from the start)
+	'''
+	from tests.test_restore_lock import WAITING, Backup, Held
+	lines = _lines(monkeypatch)
+	restore = Held('restore')
+	try:
+		# the vault known already, as it is to every batch after a job's start: one with none takes its locks first
+		backup = Backup(job, entries, vaultInfo=rv.get_vault_info(job.job_vault), matched_since=time.time_ns(), **options)
+		wait_until(lambda: WAITING in lines, message='the batch never waited for its locks')
+		meanwhile()
+	finally:
+		restore.release()
+	backup.join(10)
+	assert not backup.is_alive(), 'the batch did not end'
+	return backup, lines
+
+
+@pytest.mark.parametrize('venue', VENUES)
+def test_a_batch_whose_monitored_disk_goes_while_it_waits_for_its_locks_commits_nothing(job, poll_fast, monkeypatch, venue):
+	# fails on main (a version without the file): the monitored path is a disk of its own, and a batch (a.txt changed, b.txt new)
+	# waits for its locks behind a restore while the disk is unmounted. The look after the locks finds another filesystem at the
+	# monitored path: the attempt fails, no version
+	disk = _Disk(monkeypatch, venue, job.monitor, os.path.join(job.root, 'aside'))
+	try:
+		seed_monitor(job, {'a.txt': 'a'})
+		root_mount = rv.mount_fingerprint(rv.read_mount_table(), os.path.realpath(job.monitor))
+		versions = run_backup(job, root_mount=root_mount, matched_since=time.time_ns())
+		seed_monitor(job, {'a.txt': 'changed', 'b.txt': 'b'})
+		entries = OrderedDict([event_entry(job, 'a.txt', 'modify'), event_entry(job, 'b.txt', 'create')])
+		backup, _ = _a_batch_held_at_the_locks(job, monkeypatch, entries, disk.unmount, root_mount=root_mount)
+		assert isinstance(backup.error, rv.JobFailure), backup.error
+		assert backup.error.reason == f'the monitored filesystem changed under {job.monitor}'
+		assert committed_versions(job) == versions
+	finally:
+		disk.close()
+
+
+def _a_monitored_tree_with_an_inner_disk(job, monkeypatch, venue, tree):
+	'''disk/, a _Disk inside the monitored folder, and tree (rels under disk/ included) backed up by a first version: the _Disk.'''
+	disk = _Disk(monkeypatch, venue, os.path.join(job.monitor, 'disk'), os.path.join(job.root, 'aside'))
+	try:
+		seed_monitor(job, tree)
+		run_backup(job, matched_since=time.time_ns())
+	except BaseException:
+		disk.close()
+		raise
+	return disk
+
+
+@pytest.mark.parametrize('venue', VENUES)
+def test_an_inner_mount_gone_during_the_wait_for_the_locks_is_paused(job, poll_fast, monkeypatch, venue):
+	# fails on main (no line, disk/old.txt deleted from the version, the matched time moved): a batch of a.txt changed and, on
+	# disk/, an inner mount, f.txt changed and old.txt deleted, waits for its locks behind a restore while the disk is unmounted.
+	# The look after the locks pauses it: one line; the version holds the new a.txt and keeps the disk's last copies, with no
+	# row of its own under disk/; the matched time stays the first version's; the mount is remembered
+	disk = _a_monitored_tree_with_an_inner_disk(job, monkeypatch, venue, {'a.txt': 'a', 'disk/f.txt': 'f', 'disk/old.txt': 'o'})
+	try:
+		(_, since), _ = _recorded(job)
+		seed_monitor(job, {'a.txt': 'changed', 'disk/f.txt': 'changed'})
+		os.remove(os.path.join(job.monitor, 'disk', 'old.txt'))
+		entries = OrderedDict([event_entry(job, 'a.txt', 'modify'), event_entry(job, 'disk/f.txt', 'modify'), event_entry(job, 'disk/old.txt', 'delete')])
+		backup, lines = _a_batch_held_at_the_locks(job, monkeypatch, entries, disk.unmount)
+		assert backup.error is None and backup.committed is True
+		assert [line for line in lines if line.startswith('Inner mounts unmounted during')] == \
+			['Inner mounts unmounted during the wait for the locks, keeping their last backed-up contents: disk/; dropped 2 backup entries']
+		v1 = committed_versions(job)[1]
+		assert _read(os.path.join(v1, 'a.txt')) == 'changed'
+		assert _read(os.path.join(v1, 'disk', 'f.txt')) == 'f' and _read(os.path.join(v1, 'disk', 'old.txt')) == 'o'
+		assert os.path.join(job.monitor, 'disk') not in _read(change_list_of(v1))
+		assert _recorded(job) == ((os.path.basename(v1), since), ['disk/'])
+	finally:
+		disk.close()
+
+
+@pytest.mark.parametrize('venue', VENUES)
+def test_a_batch_emptied_by_the_look_after_the_locks_makes_no_version_and_releases_them(job, poll_fast, monkeypatch, venue):
+	# fails on main (a version that changes nothing): every entry of the batch is on disk/, an inner mount unmounted while the
+	# batch waits for its locks behind a restore. The look after the locks drops them all: no version, the batch done as one that
+	# found no differences, and a restore taking its lock right after the batch returned finds it free
+	from tests.test_restore_lock import _free
+	disk = _a_monitored_tree_with_an_inner_disk(job, monkeypatch, venue, {'a.txt': 'a', 'disk/f.txt': 'f'})
+	try:
+		versions = committed_versions(job)
+		seed_monitor(job, {'disk/f.txt': 'changed'})
+		backup, lines = _a_batch_held_at_the_locks(job, monkeypatch, OrderedDict([event_entry(job, 'disk/f.txt', 'modify')]), disk.unmount)
+		assert backup.error is None and backup.committed is True
+		assert committed_versions(job) == versions
+		assert 'No differences after delta; skipping new version' in lines
+		assert _free('restore') and _free('backup')
+		assert _recorded(job)[1] == ['disk/']
+	finally:
+		disk.close()
