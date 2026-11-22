@@ -17277,21 +17277,22 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 	again, as a disk may have joined it since the claim (a branch added, or a disk mounted where a branch's folder was or
 	at a folder on the way to it): each branch whose folder is there now (os.stat()) on a filesystem no handle is of has
 	no handle, and one opened now would miss an error another sync of it already saw, so it fails the restore, naming
-	its disk, as a copy may have landed there; one without the folder is passed over, as nothing can have landed there,
-	and so is a branch left out at the claim (disks.passed). A branch the pool listed at the claim (disks.held) and lists
-	no more, taken out through mergerfs's control file, fails it too, naming the branch, when the folder is on it now (os.stat()
-	finds it, or cannot tell): a copy may have landed there, even where the folder was not at the claim, and is in the
-	pool's view no more. So does a branch of the claim's, listed or not, whose disk was unmounted since (a lazy unmount leaves its
+	its disk (a branch of the claim's whose own disk went: its branch, see below), as a copy may have landed there; one without the folder
+	is passed over, as nothing can have landed there, and so is a branch left out at the claim (disks.passed). A branch the
+	pool listed at the claim (disks.held) and lists no more, taken out through mergerfs's control file, fails it too, naming
+	the branch, when the folder is on it now (os.stat() finds it, or cannot tell): a copy may have landed there, even where
+	the folder was not at the claim, and is in the pool's view no more. So does a branch of the claim's, listed or not, whose disk was unmounted since (a lazy unmount leaves its
 	mount point, with no such folder, on the filesystem under it) or replaced by another, found by the filesystem of the nearest
 	existing folder at its place not being one a handle is of (a place that cannot be looked at counts), where a plain ENOENT
 	at the folder passes a branch over. A branch left out at the claim because the user could not open its place is not passed
 	over by that look (disks.denied), as it was warned of, not failed: as no handle is of its filesystem, it is found unmounted or
 	replaced by the nearest existing folder at its place being on another filesystem than the claim found it on, and one whose
-	place the claim could not look at cannot be told so, and stays the warning it was. An unmounted or replaced branch is named
-	by the branch as the pool listed it at the claim (the folder at its place is on the filesystem under its mount point now,
-	whose name says nothing), a disk that joined by the disk holding the folder on it; each once. Before the syncs, and again once
-	they ran, on a pool and
-	off one, folder must still be on the
+	place the claim could not look at cannot be told so, and stays the warning it was. An unmounted or replaced branch (one the
+	claim listed whose place is on a filesystem no handle is of now, the folder there or not, and that the disk holding the
+	folder does not hold by a mount of its own at the branch or below it) is named by the branch as the pool listed it at the
+	claim (the folder at its place is on the filesystem under its mount point now, whose name says nothing), a disk that joined
+	(a branch the pool added since, or a disk mounted at the branch or at the folder) by the disk holding the folder on it; each once. Before the syncs, and
+	again once they ran, on a pool and off one, folder must still be on the
 	filesystem the run opened it on (disks.dev): a filesystem unmounted under it (a lazy unmount), or another mounted over
 	it or above it, puts what was restored since on a filesystem none of the handles is of, which fails it, the syncs
 	still run, and report.moved is set: no marker is written by the folder's path after that, as it would be written onto
@@ -17360,8 +17361,9 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 			except OSError:
 				return True
 			return dev != disks.denied[held] if held in disks.denied else dev not in disks.devs
-		# the names already failed: a disk that joined by the disk holding the folder on it (two branches of it are one line), a
-		# branch unmounted or replaced by the branch itself
+		# the names already failed: a disk that joined (a branch the pool added, or a disk mounted at a branch or at its folder) by the
+		# disk holding the folder on it (two branches of it are one line), a branch of the claim's unmounted or replaced by the branch
+		# itself, the folder at its place there or not
 		joined = set()
 		for disk, held in now if pooled else ():
 			unmounted = False
@@ -17377,6 +17379,11 @@ def sync_restore(disks, folder:str, report:RestoreReport, rel:str, after_hand_ov
 				try:
 					if os.stat(held).st_dev in disks.devs:
 						continue
+					# a filesystem no handle is of: for a branch of the claim's whose disk was unmounted (lazily, the pool still lists it, and
+					# its mount point shows the folder made under it, as a create policy such as pfrd makes it) the disk holding the folder is
+					# a mount above the branch, which says nothing of the branch: it is named by the branch, as the folder-absent case is. A
+					# disk mounted at the branch or at its folder, and a branch the pool added, is a disk that joined, named by its own mount
+					unmounted = held in claimed and is_subpath(claimed[held], disk) and os.path.realpath(claimed[held]) != os.path.realpath(disk)
 				except (FileNotFoundError, NotADirectoryError):
 					# nothing can have landed there, unless it is a disk of the claim's that was replaced
 					if held not in claimed or not replaced(held):

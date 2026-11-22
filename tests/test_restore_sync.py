@@ -868,20 +868,22 @@ def test_a_disk_that_leaves_the_pool_without_the_folder_is_passed_over(job, tmp_
 	assert 'FAILED' not in stdout
 
 
-def unmounted_lazily(mount, branch, at_the_mount):
+def unmounted_lazily(mount, branch, at_the_mount, under='/proc'):
 	'''
 	What runs to unmount the disk of a branch lazily: the folder at the branch's mount point is the empty one under the mount, a
-	folder of another filesystem than the disks' (a symlink to /proc stands in for it, as os.stat() follows it to another st_dev).
+	folder of another filesystem than the disks' (a symlink to under, /proc, stands in for it, as os.stat() follows it to another
+	st_dev; a folder of a filesystem of a test's own where the folder the restore made is to be found under it, as a pool's
+	create policy makes it there).
 	With at_the_mount the branch is the mount point itself, so it exists and is empty; else it is a folder in the mount, which is
 	no longer there.
 	'''
 	def unmount():
 		if at_the_mount:
 			os.rename(branch, branch + '.gone')
-			os.symlink('/proc', branch)
+			os.symlink(under, branch)
 		else:
 			os.rename(mount, mount + '.gone')
-			os.symlink('/proc', mount)
+			os.symlink(under, mount)
 	return unmount
 
 
@@ -949,6 +951,28 @@ def test_two_branches_unmounted_lazily_while_listed_each_fail_the_restore_by_the
 	for name in ('two', 'three'):
 		os.makedirs(os.path.join(branches[name], 'out', 'proj'))
 		unmounts.append(unmounted_lazily(os.path.dirname(branches[name]), branches[name], False))
+	ran = at_the_first_copy(monkeypatch, lambda: [unmount() for unmount in unmounts])
+	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
+	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
+	assert sorted(line for line in stdout.splitlines() if line.startswith('FAILED')) == sorted(unmounted_line(branches[name]) for name in ('two', 'three'))
+
+
+@pytest.mark.unit
+def test_branches_unmounted_lazily_with_the_folder_made_under_the_mount_each_fail_the_restore_by_their_branch(job, tmp_path, capsys, monkeypatch, fake_pool, errseq, other_filesystem):
+	# fails before the residual round's R2 (the fix wave's second-opinion finding on FW9): a claimed branch whose disk was unmounted lazily
+	# while the pool still lists it, where the pool then made the restore's folder under the bare mount point (a create policy such as
+	# pfrd), stats fine, on a filesystem no handle is of, so it was named as a disk that joined (the disk holding the folder now, '/' on a
+	# host) and deduped by that name: "the disk ... joined the pool", and one line for the two. Each is named by its branch now. The
+	# disks of the pool are all on the basetemp's filesystem, one handle; the folder under each mount is on another one
+	backed_up(job)
+	out, branches = pooled(tmp_path, fake_pool, {'one': ['one'], 'two': ['two'], 'three': ['three']})
+	unmounts = []
+	for name in ('two', 'three'):
+		os.makedirs(os.path.join(branches[name], 'out', 'proj'))
+		under = os.path.join(other_filesystem, name)
+		# what the mount point shows once its disk is out: the folders the policy made there
+		os.makedirs(os.path.join(under, name, 'out', 'proj'))
+		unmounts.append(unmounted_lazily(os.path.dirname(branches[name]), branches[name], False, under))
 	ran = at_the_first_copy(monkeypatch, lambda: [unmount() for unmount in unmounts])
 	code, stdout, err = restore(tmp_path, capsys, f'{job.monitor}/proj', out, '--version', '0')
 	assert ran and code == rv.EXIT_COMMAND_FAILED, stdout
