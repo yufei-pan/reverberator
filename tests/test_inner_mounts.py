@@ -6,7 +6,7 @@ import threading
 import time
 import pytest
 import reverberator as rv
-from tests.harness import committed_versions, on_folder_open, seed_monitor, tracked_manifest, wait_until
+from tests.harness import committed_versions, event_entry, on_folder_open, run_backup, seed_monitor, tracked_manifest, wait_until
 
 def _privileged():
 	return os.geteuid() == 0 or os.environ.get('REVERB_PRIVILEGED') == '1'
@@ -786,3 +786,129 @@ def test_a_monitored_mount_gone_while_a_first_version_waits_for_its_locks_commit
 		rv.do_backup(OrderedDict(), job_name=job.job_name, monitor_path=job.monitor, vault_path=job.vault, only_sync_attributes=True,
 			keep_n_versions=0, backup_size_limit='0', root_mount=root_mount, mount_table=mounted)
 	assert committed_versions(job) == []
+
+
+# ---- D8: a first version looks at the disks again after its walk ---------------------------------------------------------
+
+# a fake disk's fingerprint in a table stood in for, as the tests above give one
+FAKE_DISK = (b'9999', b'0:99', b'/', b'/dev/fakedisk', b'xfs')
+
+FIRST_WALK_LINE = "Inner mounts unmounted during the first version's walk, which left out what it had not reached under them: disk/"
+
+
+def _lines(monkeypatch):
+	'''The messages logged through backuperTeeLogToTl() from now on, from any thread.'''
+	lines = []
+	real = rv.backuperTeeLogToTl
+	def record(path, message, **kwargs):
+		lines.append(str(message))
+		return real(path, message, **kwargs)
+	monkeypatch.setattr(rv, 'backuperTeeLogToTl', record)
+	return lines
+
+
+def _recorded(job):
+	'''(matched, inner_mounts) the job vault's manifest records.'''
+	manifest = rv.VaultManifest(job.job_vault)
+	try:
+		return manifest.matched, manifest.inner_mounts
+	finally:
+		manifest.close()
+
+
+def _read(path):
+	with open(path, encoding='utf-8') as f:
+		return f.read()
+
+
+@pytest.mark.privileged
+@needs_root
+def test_a_first_version_walk_meeting_an_inner_disk_unmounted_midway_holds_the_matched_time(job, poll_fast, monkeypatch):
+	# fails on main (no line, the matched time recorded): disk/ is an inner tmpfs (bound from one kept aside, so it comes back with
+	# what it held), unmounted lazily by a hook in the first version's walk at disk/sub, a folder under it. One line; the matched time
+	# is not recorded; the mount is remembered and paused at the next batch; once mounted again, the next full comparison copies
+	# what the walk left out
+	store, disk = os.path.join(job.root, 'store'), os.path.join(job.monitor, 'disk')
+	os.makedirs(store)
+	os.makedirs(disk)
+	subprocess.check_call(['mount', '-t', 'tmpfs', 'tmpfs', store])
+	try:
+		seed_monitor(job, {'a.txt': 'a'})
+		os.makedirs(os.path.join(store, 'sub'))
+		for rel, text in (('f.txt', 'f'), ('sub/g.txt', 'g')):
+			with open(os.path.join(store, rel), 'w', encoding='utf-8') as f:
+				f.write(text)
+		subprocess.check_call(['mount', '--bind', store, disk])
+		lines = _lines(monkeypatch)
+		gone = []
+		def unmount():
+			if not gone:
+				gone.append(True)
+				subprocess.check_call(['umount', '-l', disk])
+		with monkeypatch.context() as walking:
+			on_folder_open(walking, os.path.join(disk, 'sub'), unmount)
+			run_backup(job, matched_since=time.time_ns())
+		assert gone, 'the walk never opened disk/sub'
+		assert lines.count(FIRST_WALK_LINE) == 1
+		assert _recorded(job) == (None, ['disk/'])
+		v0 = committed_versions(job)[0]
+		assert not os.path.lexists(os.path.join(v0, 'disk', 'sub', 'g.txt'))
+		# the next batch, the disk still away: paused, and the version keeps what the first one holds of it
+		with open(os.path.join(job.monitor, 'a.txt'), 'w', encoding='utf-8') as f:
+			f.write('changed')
+		del lines[:]
+		run_backup(job, matched_since=time.time_ns())
+		assert 'Inner mounts not mounted, keeping their last backed-up contents: disk/' in lines
+		assert _read(os.path.join(committed_versions(job)[1], 'a.txt')) == 'changed'
+		# mounted again: the next full comparison copies what the first version's walk left out
+		subprocess.check_call(['mount', '--bind', store, disk])
+		run_backup(job, matched_since=time.time_ns())
+		latest = committed_versions(job)[-1]
+		assert _read(os.path.join(latest, 'disk', 'f.txt')) == 'f'
+		assert _read(os.path.join(latest, 'disk', 'sub', 'g.txt')) == 'g'
+	finally:
+		subprocess.call(['umount', disk], stderr=subprocess.DEVNULL)
+		subprocess.call(['umount', store])
+
+
+@pytest.mark.unit
+def test_a_first_version_walk_with_its_inner_mount_gone_from_the_table_pauses_it(job, poll_fast, monkeypatch):
+	# fails on main (no line, the matched time recorded): the Docker variant of the test above, the mount table stood in for. disk/,
+	# an inner mount, is unmounted as the first version's walk opens it: it leaves the table, and its folder is the empty mount point
+	# (what it held moved aside). One line; the matched time is not recorded; the mount is remembered and paused at the next
+	# batch; once mounted again, the next full comparison copies what the walk left out
+	seed_monitor(job, {'a.txt': 'a', 'disk/f.txt': 'f', 'disk/sub/g.txt': 'g'})
+	disk, aside = os.path.join(job.monitor, 'disk'), os.path.join(job.root, 'aside')
+	real_table = rv.read_mount_table()
+	mounted = real_table + [(os.path.realpath(disk), FAKE_DISK)]
+	tables = _a_table_you_can_change(monkeypatch, mounted)
+	def unmount():
+		if tables['now'] is mounted:
+			os.rename(disk, aside)
+			os.mkdir(disk)
+			tables['now'] = real_table
+	lines = _lines(monkeypatch)
+	with monkeypatch.context() as walking:
+		on_folder_open(walking, disk, unmount)
+		run_backup(job, matched_since=time.time_ns())
+	assert tables['now'] is real_table, 'the walk never opened disk/'
+	assert lines.count(FIRST_WALK_LINE) == 1
+	assert _recorded(job) == (None, ['disk/'])
+	v0 = committed_versions(job)[0]
+	assert os.path.isdir(os.path.join(v0, 'disk')) and os.listdir(os.path.join(v0, 'disk')) == []
+	# the next batch, the disk still away: paused
+	with open(os.path.join(job.monitor, 'a.txt'), 'w', encoding='utf-8') as f:
+		f.write('changed')
+	del lines[:]
+	run_backup(job, matched_since=time.time_ns())
+	assert 'Inner mounts not mounted, keeping their last backed-up contents: disk/' in lines
+	assert _read(os.path.join(committed_versions(job)[1], 'a.txt')) == 'changed'
+	# mounted again: the next full comparison copies what the walk left out
+	os.rmdir(disk)
+	os.rename(aside, disk)
+	tables['now'] = mounted
+	run_backup(job, matched_since=time.time_ns())
+	latest = committed_versions(job)[-1]
+	assert _read(os.path.join(latest, 'disk', 'f.txt')) == 'f'
+	assert _read(os.path.join(latest, 'disk', 'sub', 'g.txt')) == 'g'
+

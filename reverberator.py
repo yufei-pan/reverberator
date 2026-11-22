@@ -5768,13 +5768,15 @@ def log_events_to_journal(backup_entries:dict,journal_path:str):
 	lines = [entry_row(path,entry) for path,entry in backup_entries.items()]
 	TSVZ.appendLinesTabularFile(journal_path,lines,header = BACKUP_JOURNAL_HEADER,createIfNotExist = True,verifyHeader = True,strict=False,teeLogger=tl)
 
-def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str) -> tuple:
+def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, root_mount, remembered_mounts:list, mount_table:list, skip, paused:set, walk:str, first_version:bool = False) -> tuple:
 	'''
 	After a walk of the monitored tree (named by walk in the log): a disk unmounted while it ran was walked as the empty
 	folder it left, so what the walk found under it is dropped from backup_entries, and its rows are linked forward as
 	for a disk paused before the walk. JobFailure is raised when the monitored root itself shows another filesystem than
 	root_mount. mount_table is the one read before the walk, remembered_mounts the inner mounts the manifest recorded.
-	Returns (paused with the inner mounts that went away added, the table read after the walk).
+	With first_version, after a first version's walk, which copied as it went and keeps no last copy under such a disk:
+	backup_entries is empty, and the line says the walk left out what it had not reached under it. Returns (paused with
+	the inner mounts that went away added, the table read after the walk).
 	'''
 	walked_table = current_mount_table()
 	check_monitored_mount(monitor_path,walked_table,root_mount)
@@ -5782,7 +5784,10 @@ def drop_unmounted_entries(backup_entries:dict, job_name:str, monitor_path:str, 
 	unmounted = paused_inner_mounts(monitor_path,seen_mounts,walked_table,skip) - paused
 	if unmounted:
 		dropped = drop_entries_under(backup_entries,[os.path.abspath(os.path.join(monitor_path,rel)) + '/' for rel in unmounted])
-		backuperTeeLogToTl(job_name,f'Inner mounts unmounted during the {walk}, keeping their last backed-up contents: {", ".join(sorted(unmounted))}; dropped {dropped} backup entries')
+		if first_version:
+			backuperTeeLogToTl(job_name,f'Inner mounts unmounted during the {walk}, which left out what it had not reached under them: {", ".join(sorted(unmounted))}')
+		else:
+			backuperTeeLogToTl(job_name,f'Inner mounts unmounted during the {walk}, keeping their last backed-up contents: {", ".join(sorted(unmounted))}; dropped {dropped} backup entries')
 	return paused | unmounted, walked_table
 
 def check_walk_errors(job_name:str, monitor_path:str, errors:list, manifest:'VaultManifest' = None, reported:set = None):
@@ -5971,6 +5976,9 @@ def do_backup(backup_entries:dict,
 					finish_copies(pending,manifest,backup_folder,job_name,reported,unsynced)
 					for monitorEntry, backupEntryPath in folders:
 						copy_file_meta(monitorEntry,backupEntryPath,unsynced)
+					# an inner disk unmounted while the walk and its copies ran left out what the walk had not reached under it: it
+					# is paused, so the commit holds the matched time and remembers it, and a comparison with it back copies the rest
+					paused, walked_table = drop_unmounted_entries({},job_name,monitor_path,root_mount,remembered_mounts,mount_table,skip,paused,"first version's walk",first_version=True)
 					record_root_meta(monitor_path,backup_folder)
 			finally:
 				# however the backup ends, no copy is left writing into this version. a copy finish_copies did not reach
