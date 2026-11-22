@@ -84,8 +84,9 @@ a design check's rework (d00537b..b9bbde4: a link a cut left in staging stays th
 Task 16 (D15) done and reviewed after one fix round (2159b07, 80398bd: a gate after a burst and a pin counting the
 trim at each commit); Task 17 (P14) done and reviewed after one docs fix round (adc1009, 2cd24c7); Task 18 (P16 step
 2, on Q15's answer) done and reviewed (4cedc54, eedbabd); Task 19 not built (every question took its
-recommended answer); the round's cleanup (three passes), Task 20's docs, the VM gate (Task 22), the final review and the
-version (Task 21) to come.
+recommended answer); the round's cleanup done in three passes (c752e08..21a5f98) and Task 20's docs (f7e7562; the shared
+lessons file's lines committed, not pushed); the flaky watcher test being looked into; the VM gate (Task 22), the final
+review and the version (Task 21) to come.
 It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
