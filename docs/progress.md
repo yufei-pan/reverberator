@@ -317,11 +317,11 @@ Kept so they are not lost; none is planned until the user picks it.
   never quiet for an hour now, so each batch comes at the one-day maximum): (a), keep the rule, one version a day and
   five days of history at Keep 5, no change to the live rule file. The user's pick 2026-11-15 (about 19:12 PST, through
   chief), "Keep the rule (Recommended)".
-- Q10, D3 on a pool: (a), widen "A manifest lost in the same cut as a split on a pool" to the cut copy kept over a lost
-  manifest on a pool. Chief's decision, 2026-11-15, on the user's words "Support pools with a limitation" (2026-11-04);
+- Q10, D3 on a pool: (a), widen "A manifest lost in the same cut as a split on a pool" (now "A manifest lost after a cut, on a
+  pool") to the cut copy kept over a lost manifest on a pool. Chief's decision, 2026-11-15, on the user's words "Support pools with a limitation" (2026-11-04);
   no vault is on a pool. The entry's approved field says "chief's decision, 2026-11-15".
-- Q11, what the length rule leaves out: (a), widen "A symlink the vault's filesystem can't hold is left out" to every
-  entry kind, and keep the temporary name. Chief's decision, 2026-11-15, on the user's pick "Accept: leave it out, warn
+- Q11, what the length rule leaves out: (a), widen "A symlink the vault's filesystem can't hold is left out" (now "A symlink or a path the vault
+  can't hold is left out") to every entry kind, and keep the temporary name. Chief's decision, 2026-11-15, on the user's pick "Accept: leave it out, warn
   (Recommended)" (2026-11-09) for the same case in a symlink; no option keeps such entries, and (b) bought about 34 bytes
   of path for a second name form read for good. The entry says it drops the shorter name that "Fixes round
   (Recommended)" (2026-11-14) had planned; its approved field says "chief's decision, 2026-11-15".
