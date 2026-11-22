@@ -7176,8 +7176,9 @@ def empty_staging(job_vault:str, keep_for:'str | None' = None) -> None:
 	text has the forward form to that folder (staged_forward_rel()) stays, however the scan judged it, until a scan finds no orphan by
 	that name: the tree committed under it, which a roll-forward does after its flush of every vault disk, so the link given back is on
 	the disk by then, or removed as a skeleton, which holds nothing such a link leads to. A failure, a link that cannot be read among
-	them (any readlink error but EINVAL, no link, ENOENT included), is logged, and leaves it for the next scan: what reads staging otherwise (repair_pool_vault() and finish_conversion_renames(),
-	by the names of a skeleton and of a conversion's trees) passes over any other name, and the put-back reads only forward-form links.
+	them (any readlink error but EINVAL, no link: ENOENT too), is logged, and leaves it for the next scan: what reads staging
+	otherwise (repair_pool_vault() and finish_conversion_renames(), by the names of a skeleton and of a conversion's trees) passes
+	over any other name, and the put-back reads only forward-form links.
 	'''
 	staging = staging_path(job_vault)
 	try:
@@ -8523,9 +8524,10 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   for each entry below it. An entry the rule leaves out whole drops out, as nothing is written for it: a create, a modify
 	   or an attrib whose path, or its copy's temporary path when it is no folder, passes the limit (a file's attrib under
 	   only_sync_attributes by its own path alone, as the replay may sync it in place: one it copies instead and leaves out for
-	   its temporary path makes a version that changes nothing, with its line); a delete whose own path
-	   does, which the version keeps; and a move whose source's own path does and whose target's copy would, or whose target is
-	   gone (an lstat that fails otherwise is its UNREADABLE line), replayed as the delete of its source and the copy to its target. A delete or a move the rule leaves in changes the version (an untracked
+	   its temporary path makes a version that changes nothing, with its line); a delete whose own path does, which the
+	   version keeps; and a move whose source's own path does and whose target's copy would, or whose target is gone (an lstat
+	   that fails otherwise is its UNREADABLE line), replayed as the delete of its source and the copy to its target. A delete
+	   or a move the rule leaves in changes the version (an untracked
 	   delete has gone already, drop_untracked_deletes()), but for a move whose source the manifest does not track: the replay
 	   renames nothing then, and copies the target, so it is the create of its target, taken as one below;
 	2. every other entry (a create, a modify or an attrib, of a folder too) has its monitored path looked at, one lstat: a
@@ -8533,8 +8535,8 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 	   device, which cp -a copies as itself). A regular file is opened once, non-blocking, and read through that handle: its
 	   last HASH_SIZE bytes (64 KiB), the tail the comparison reads ( hash_file() ), which the copy then reads from the page
 	   cache; one its handle shows of another kind (put there since the lstat) changes it unread, as does one whose open
-	   answers ENXIO (a socket put there since) or ELOOP (a link put there since, which the open does not follow). A regular file that does not
-	   open, or whose read fails (a bad sector under its tail, an EIO of a network filesystem), drops out, as its copy keeps
+	   answers ENXIO (a socket put there since) or ELOOP (a link put there since, which the open does not follow). A regular
+	   file that does not open, or whose read fails (a bad sector under its tail, an EIO of a network filesystem), drops out, as its copy keeps
 	   the last copy (an attrib too, under Only Sync Attributes: its record cannot vouch, as its tail cannot be read, so the
 	   replay copies it); so does a path that cannot be looked at, and a path gone, which the replay passes over. Two things
 	   keep an entry in the batch though its file does not open, or before its link is probed: an open that fails at once with
