@@ -3994,6 +3994,26 @@ def log_unreadable(job_name:str, root:str, errors:list, reported:set = None):
 		job_log(job_name, f'UNREADABLE: {path}: {error}; keeping its last backed-up copy')
 
 
+def unreadable_end(dest_path:str, previous_path:'str | None') -> str:
+	'''
+	How the UNREADABLE line of a file that cannot be copied ends, by what the version being made holds at dest_path and what the version before holds at
+	previous_path (None: no version before). Nothing at dest_path: the file is new, and left out of this version. An entry of the version before: its last
+	backed-up copy stays. Otherwise the copy there is the cut backup's own (a roll-forward over a lost manifest on a pool leaves it, as it cannot tell it
+	from a removed entry): it stays, and may be damaged.
+
+	Examples:
+		>>> with tempfile.TemporaryDirectory() as folder:
+		...     new, old = os.path.join(folder, 'new'), os.path.join(folder, 'old')
+		...     open(old, 'w').close()
+		...     [unreadable_end(new, None), unreadable_end(old, old), unreadable_end(old, new)]
+		['left out of this version', 'keeping its last backed-up copy', 'keeping the copy a cut backup made of it, which may be damaged']
+	'''
+	if not os.path.lexists(dest_path):
+		return 'left out of this version'
+	if previous_path is not None and os.path.lexists(previous_path):
+		return 'keeping its last backed-up copy'
+	return 'keeping the copy a cut backup made of it, which may be damaged'
+
 def check_fs_signature(path:str,signature:str):
 	'''
 	Return whether path still lives on the filesystem identified by signature.
@@ -8522,7 +8542,8 @@ def entries_all_drop_out(backup_entries:dict, monitor_path:str, newest_path:str,
 			continue
 		reported.add(path)
 		if kind == 'unreadable':
-			job_log(job_name, f'UNREADABLE: {path}: {error}; keeping its last backed-up copy')
+			held = os.path.join(newest_path, os.path.relpath(path, monitor_path))
+			job_log(job_name, f'UNREADABLE: {path}: {error}; {unreadable_end(held, held)}')
 		else:
 			job_log(job_name, f'NOT BACKED UP: {path}: a symlink whose text or path is longer than the vault\'s filesystem takes; left out of this version')
 	return True
@@ -8758,7 +8779,7 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 	A copy that succeeded takes its destination's place, as does one for which cp only reported metadata of its partial
 	file it could not keep (a warning says so): a failed read or write of the contents gets a line of its own. One that
 	failed leaves the destination as it was, keeping the last backed-up copy, when its source failed: silently when the
-	source is gone, with an UNREADABLE line (once per backup, with reported) when it could not be read. A destination holding nothing then stops being tracked in manifest, whose paths
+	source is gone, with an UNREADABLE line (once per backup, with reported; unreadable_end() says what stays) when it could not be read. A destination holding nothing then stops being tracked in manifest, whose paths
 	are relative to version_path. The source of a copy put in place without all of its metadata is appended to unsynced,
 	when given, as copy_file_meta() appends to failed. Each copy put in place is recorded in manifest as held by version_path, in the
 	transaction committing that version, and returned (as its path relative to version_path). When writing into the
@@ -8826,7 +8847,8 @@ def finish_copies(pending:list, manifest:'VaultManifest', version_path:str, job_
 					elif reported is None or copy.source_path not in reported:
 						if reported is not None:
 							reported.add(copy.source_path)
-						job_log(job_name, f'UNREADABLE: {copy.source_path}: {error or "copy failed"}; keeping its last backed-up copy')
+						rel = os.path.relpath(copy.dest_path, version_path)
+						job_log(job_name, f'UNREADABLE: {copy.source_path}: {error or "copy failed"}; {unreadable_end(copy.dest_path, None if writer.previous is None else writer.kept_path(rel))}')
 					if not os.path.lexists(copy.dest_path):
 						manifest.discard(os.path.relpath(copy.dest_path, version_path))
 			done += 1

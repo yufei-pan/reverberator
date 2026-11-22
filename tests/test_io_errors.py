@@ -1435,6 +1435,8 @@ def test_a_file_whose_tail_cannot_be_read_makes_no_version(job, poll_fast, monke
 	out = capsys.readouterr()
 	assert committed_versions(job) == before
 	assert (out.out + out.err).count(f'UNREADABLE: {path}: ') == 1
+	# the file has a last copy: the line says it stays
+	assert [line for line in (out.out + out.err).splitlines() if f'UNREADABLE: {path}: ' in line][0].endswith('; keeping its last backed-up copy')
 	assert changed or f'Error comparing {path}: ' in out.out + out.err
 	assert _matched(job) == matched
 
@@ -1519,6 +1521,29 @@ def test_a_file_deleted_between_its_lstat_and_its_tail_read_is_handled_as_on_mai
 		assert len(versions) == len(before) + 1 and not os.path.lexists(os.path.join(versions[-1], 'b.txt'))
 
 
+def test_a_new_file_whose_tail_cannot_be_read_is_left_out_and_its_line_says_so(job, poll_fast, monkeypatch, capsys):
+	# the check drops a new file it cannot read (as the test above drops a changed one), and its UNREADABLE line says it is left out of the
+	# version: there is no last copy to keep. The line ended "keeping its last backed-up copy" on 0.55.5
+	seed_monitor(job, {'a.txt': 'a'})
+	before = _settled(job)
+	seed_monitor(job, {'new.txt': 'n'})
+	path = os.path.join(job.monitor, 'new.txt')
+	st = os.lstat(path)
+	real_pread = os.pread
+	def pread(fd, length, offset):
+		held = os.fstat(fd)
+		if (held.st_dev, held.st_ino) == (st.st_dev, st.st_ino):
+			raise OSError(errno.EIO, os.strerror(errno.EIO))
+		return real_pread(fd, length, offset)
+	monkeypatch.setattr(os, 'pread', pread)
+	capsys.readouterr()
+	_events(job, [(False, 'create', 'new.txt', None)])
+	out = capsys.readouterr()
+	assert committed_versions(job) == before
+	lines = [line for line in (out.out + out.err).splitlines() if f'UNREADABLE: {path}: ' in line]
+	assert len(lines) == 1 and lines[0].endswith('; left out of this version'), lines
+
+
 def test_a_readable_change_beside_a_file_whose_tail_cannot_be_read_commits(job, poll_fast, monkeypatch, capsys):
 	# pin: the check's read of b.txt fails (EIO at os.pread), and it goes on to a.txt, a readable change, so the batch commits; b.txt's
 	# copy fails as cp fails on a read error, and it keeps its last copy with its UNREADABLE line, once
@@ -1551,7 +1576,9 @@ def test_a_readable_change_beside_a_file_whose_tail_cannot_be_read_commits(job, 
 		assert f.read() == 'a changed'
 	with open(os.path.join(versions[-1], 'b.txt')) as f:
 		assert f.read() == 'b'
-	assert _lines(capsys, 'UNREADABLE', path) == 1
+	seen = capsys.readouterr()
+	lines = [line for line in (seen.out + seen.err).splitlines() if f'UNREADABLE: {path}: ' in line]
+	assert len(lines) == 1 and lines[0].endswith('; keeping its last backed-up copy'), lines
 
 
 def _a_version_lacking_the_folder_with_the_files(job, monkeypatch):

@@ -1308,7 +1308,8 @@ def test_a_cut_create_unreadable_at_the_retry_is_left_out_with_its_line(r_job, m
 	newest = committed_versions(r_job)[-1]
 	assert not os.path.lexists(os.path.join(newest, 'new.bin'))
 	assert read_bytes(os.path.join(newest, 'small.txt')) == b's1'
-	assert len([line for line in out.splitlines() if 'UNREADABLE' in line and path in line]) == 1, out
+	unreadable = [line for line in out.splitlines() if 'UNREADABLE' in line and path in line]
+	assert len(unreadable) == 1 and unreadable[0].endswith('; left out of this version'), out
 	run_backup(r_job, **KEPT)
 	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'new.bin')) == read_bytes(path)
 
@@ -1798,7 +1799,8 @@ def test_a_lost_manifest_keeps_what_a_cut_exchange_left_in_staging(r_job, monkey
 	# and the retry's (nothing before it, as its scan gave the link back): looked at and taken out; any other line still fails the test
 	assert read_view(r_job.job_vault, os.path.basename(previous)) == view_before
 	lost = lines_at(os.path.basename(previous), 'd')
-	assert lost and all(line.endswith('None after it') or ': read None before the batch, ' in line for line in lost), lost
+	# with the ground truth off (REVERB_VIEW_GROUND_TRUTH=0) nothing is watched, so there is no line to look at
+	assert not view_truth.ENABLED or (lost and all(line.endswith('None after it') or ': read None before the batch, ' in line for line in lost)), lost
 	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost]
 
 
@@ -1808,7 +1810,7 @@ def cut_between_the_renames(job, monkeypatch, rel, events):
 	'''
 	A batch of events cut between the two renames of TreeWriter.exchange_in() at rel, the real ones (the crash harness's kill point there): the
 	version before's forward link moved to staging, the folder not in its place yet. The vault takes two renames (a pool, or rv.exchanged()
-	faked to answer False). The ground truth's lines of the cut are looked at and taken out: the version before reads nothing at rel after
+	faked to answer False). The ground truth's lines of the cut (when it is on) are looked at and taken out: the version before reads nothing at rel after
 	it, and each folder above rel, made real on the way, only its mtime moved by the first rename. Returns the version before.
 	'''
 	previous = committed_versions(job)[-1]
@@ -1825,7 +1827,7 @@ def cut_between_the_renames(job, monkeypatch, rel, events):
 	assert not os.path.lexists(os.path.join(previous, rel)) and os.path.isdir(os.path.join(tree_of(job), rel))
 	name = os.path.basename(previous)
 	lost = lines_at(name, rel)
-	assert lost and all(line.endswith('None after it') for line in lost), lost
+	assert not view_truth.ENABLED or (lost and all(line.endswith('None after it') for line in lost)), lost
 	moved = [line for line in view_truth.WRONG if any(line.startswith(f'{name}:{folder!r}: ') for folder in folders_above(rel))]
 	assert all(only_the_mtime_moved(line) for line in moved), moved
 	view_truth.WRONG[:] = [line for line in view_truth.WRONG if line not in lost + moved]
@@ -2154,7 +2156,8 @@ def test_a_cut_create_unreadable_at_the_retry_over_a_lost_manifest_is_left_out(r
 	newest = committed_versions(r_job)[-1]
 	assert not os.path.lexists(os.path.join(newest, 'new.bin')), 'the newest version keeps the cut copy'
 	assert read_bytes(os.path.join(newest, 'small.txt')) == b's1'
-	assert len([line for line in out.splitlines() if 'UNREADABLE' in line and path in line]) == 1, out
+	unreadable = [line for line in out.splitlines() if 'UNREADABLE' in line and path in line]
+	assert len(unreadable) == 1 and unreadable[0].endswith('; left out of this version'), out
 	run_backup(r_job, **KEPT)
 	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'new.bin')) == read_bytes(path)
 
@@ -2210,7 +2213,9 @@ def test_on_a_pool_a_cut_copy_over_a_lost_manifest_is_kept(r_job, fake_pool, mon
 	finally:
 		os.chmod(path, 0o644)
 	assert read_bytes(os.path.join(committed_versions(r_job)[-1], 'new.bin')) == damaged
-	assert [line for line in out.splitlines() if 'UNREADABLE' in line and path in line], out
+	unreadable = [line for line in out.splitlines() if 'UNREADABLE' in line and path in line]
+	# the copy there is the cut backup's own, which the line says may be damaged (not "its last backed-up copy": the version before holds none)
+	assert len(unreadable) == 1 and unreadable[0].endswith('; keeping the copy a cut backup made of it, which may be damaged'), out
 
 
 def hide(path, into):
@@ -2518,10 +2523,6 @@ def test_a_pool_batch_fsyncs_both_after_its_commit(r_job, fake_pool, monkeypatch
 	pool_vault(r_job, fake_pool)
 	seen = after_the_commit_point(monkeypatch)
 	assert [fsyncs for fsyncs, _ in first_version_and_a_one_file_batch(r_job, seen)] == [[r_job.job_vault] * 2] * 2
-
-
-class Cut(Exception):
-	pass
 
 
 @pytest.mark.unit
