@@ -141,7 +141,8 @@ the fix found no wrong result; its points (the compare pool's limits and errors,
 text gaps) are fixed in a second round (221a531), with the compare pool kept only if the build measures it faster
 than one compare at a time; the review after that round found the findings repeating in the compare, so the last round
 removed the parallel compare for one that runs on the replay's own thread, and cut the spec back to 106 KB with every
-decision kept (a28f86b, 2026-11-23). Next: a short check of that last round, then the plan. Built as its
+decision kept (a28f86b, 2026-11-23); a short check of that round found no bug, and a text pass followed (371dbad). The
+spec is settled. Its plan is being written (2026-11-23, `plans/2026-11-23-no-copy-move.md`); then the plan's check. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
@@ -340,7 +341,7 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     (2026-11-17), for the mode, owner and time cases.
 
 - **Q24. Whether to build the no-copy move now** (P3; written out in its spec's questions,
-  `specs/2026-11-23-no-copy-move-design.md`, a28f86b). The route links a
+  `specs/2026-11-23-no-copy-move-design.md`, 371dbad). The route links a
   file from the version before, in place of a copy, only when the version before alone holds it, it compares equal in
   full, and it has the same mode, owner, group, mtime and extended attributes.
   - (a) Build it (Recommended): on a vault that links (a mergerfs pool's answer is the pool test's to show), with Only
