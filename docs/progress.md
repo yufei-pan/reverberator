@@ -117,16 +117,17 @@ extended attributes, the previous version's file is hard-linked to the new place
 else is copied as today, so no order of events can make a version worse than a copy. It costs a read of both files in
 place of a write, and no state at rest. A watcher route cannot reach the case: a probe saw a program's back-to-back
 `mkdir` and `rename` arrive as an event in 2 of 300 runs, and every fix of 0.55.1 that filled that gap was fooled. On
-the live host the study found no such move in the retained versions and no size-limit prune since May 2026, so it is
-not urgent. Its spec is written (`specs/2026-11-23-no-copy-move-design.md`, ef89365, 2026-11-23, on Q24's recommended
+the live host the study found it not urgent (its report, outside the repo, has the details). Its spec is written (`specs/2026-11-23-no-copy-move-design.md`, ef89365, 2026-11-23, on Q24's recommended
 option with the places the other option changes marked [Q24]); where the code differs from the study it follows the
 code (the table of released files is fed where each delete is applied, from what that delete took into the version
 before; its Calls to confirm list each departure), and it adds Q25. The spec check is done (a fresh agent with the user's words, and five second opinions against the
 code): its main finding is that on a vault with two renames (a pool, or no rename exchange) the deletes are recorded
-before the replay, so as written nothing would link there while the estimate stopped charging; the spec is being revised
-from the findings (the feed then also comes from those records; the compares run in parallel where the copies run; Q24
-gains a "not now" option and lists exactly what (a) narrows). Then a re-check, Q24 rewritten here from the spec, and the
-plan; built as its own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
+before the replay, so as written nothing would link there while the estimate stopped charging; the spec was revised
+from the findings (a8bef37: the feed also comes from those records; the compares run in parallel where the copies run;
+Q24 gained a "not now" option and lists exactly what (a) narrows), and re-checked (no step back needed; new findings on
+the candidate choice, the compare's timing, the roll-forward, the estimate's shortfalls and the docs texts). Its second
+fix round runs (2026-11-23); then the review that says whether findings repeat in one part, and the plan. Built as its
+own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
 Behind it: 2026-11-12, "continue next phase please" and the pick "Fixes + lightness, one round (Recommended)", offered
@@ -332,8 +333,8 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
   - (b) Build it, only for an entry moved into a folder made in the batch under its own name: the move the user named,
     nothing more; the other copies stay as approved. Not less code than (a): it adds a pairing by name.
   - (c) Not now: keep the entry and this design on file, and build it when a size-limited job prunes for such a move or a
-    job over a tree of user files is added. The study found no such move in the live jobs' retained versions and no
-    size-limit prune since May 2026. Building costs a per-batch table and five manifest methods, a compare on a thread
+    job over a tree of user files is added. The design study found it not urgent on the live host (its report, outside
+    the repo, has the details). Building costs a per-batch table and five manifest methods, a compare on a thread
     pool, a writer verb, an estimate change (Q25), five limitations texts and seven README lines.
   - What waits on it: the whole build (it starts only on the answer, after 0.55.7). The user's words: "Drop the feature
     (Recommended)" (2026-11-07), with "the no-copy move gets its own design later", and the pick of 2026-11-12 that gave
