@@ -143,8 +143,10 @@ than one compare at a time; the review after that round found the findings repea
 removed the parallel compare for one that runs on the replay's own thread, and cut the spec back to 106 KB with every
 decision kept (a28f86b, 2026-11-23); a short check of that round found no bug, and a text pass followed (371dbad). The
 spec is settled. Its plan is written (`plans/2026-11-23-no-copy-move.md`, 6fdd367, 9 tasks, on Q24 (a) and Q25 (a), with a table
-and [Q24]/[Q25] marks for what the other options change), checked (nothing that could give a wrong version; its findings on test strength, venues and buildability fixed in
-da6288c), and re-checked (2026-11-23). The build waits for Q24 and Q25 and for round 0.55.7's merge. Built as its
+and [Q24]/[Q25] marks for what the other options change), checked twice (nothing that could give a wrong version; the findings on test strength, venues and buildability fixed
+in da6288c and ff87dd7, 114 KB, most of it test code); from here the build's own gates check its tests (each test's run
+on the base and on its task, the per-task reviews, the final review). Done as a design round (2026-11-23). The build
+waits for Q24 and Q25 and for round 0.55.7's merge, on its own branch, by subagent-driven development. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
