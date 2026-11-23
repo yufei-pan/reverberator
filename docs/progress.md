@@ -118,8 +118,11 @@ else is copied as today, so no order of events can make a version worse than a c
 place of a write, and no state at rest. A watcher route cannot reach the case: a probe saw a program's back-to-back
 `mkdir` and `rename` arrive as an event in 2 of 300 runs, and every fix of 0.55.1 that filled that gap was fooled. On
 the live host the study found no such move in the retained versions and no size-limit prune since May 2026, so it is
-not urgent. Its spec is being written (2026-11-23, one agent, on Q24's recommended option with the places the other
-option changes marked); next the spec check, then its plan; built as its own round after 0.55.7. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
+not urgent. Its spec is written (`specs/2026-11-23-no-copy-move-design.md`, ef89365, 2026-11-23, on Q24's recommended
+option with the places the other option changes marked [Q24]); where the code differs from the study it follows the
+code (the table of released files is fed where each delete is applied, from what that delete took into the version
+before; its Calls to confirm list each departure), and it adds Q25. The spec check (a fresh agent with the user's words,
+and second opinions against the code) is running; then its fixes and its plan; built as its own round after 0.55.7. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
 Behind it: 2026-11-12, "continue next phase please" and the pick "Fixes + lightness, one round (Recommended)", offered
@@ -322,6 +325,21 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
   - What waits on it: the spec's candidate rule and its tests. The user's words: "Drop the feature (Recommended)"
     (2026-11-07), with "the no-copy move gets its own design later", and the pick of 2026-11-12 that gave it "its own
     design round after". (a) goes beyond the move they named; nothing they said is dropped.
+
+- **Q25. The size estimate and a file the batch may link** (P3; written out in its spec's questions). With a size limit,
+  the estimate before each backup decides how many old versions to prune. From P3's round it charges nothing for a file
+  the batch may link (the size, mtime, mode and owner of a file the batch deletes or moves away), so a move into a new
+  folder no longer prunes for a copy that is never made. Where such a file is copied after all (its bytes or extended
+  attributes differ; its old place leaves the version after its copy; the vault refuses hard links), the vault passes its
+  limit by that copy until the next backup prunes.
+  - (a) Widen the approved entry "Size estimates leave out a version's own small blocks" to say so (Recommended): a prune
+    made for a copy never made removes a version for good, an overshoot lasts until the next prune, and a file whose bytes
+    differ with the same size, mtime, mode and owner to the nanosecond is rare.
+  - (b) Charge every copy as today: no new overshoot, but under a size limit each move into a new folder still prunes
+    older versions for the whole moved size, the harm the round exists to remove.
+  - What waits on it: the estimate's part of the spec and the entry's text (built on (a) if not answered by then, with the
+    entry's new text left out until the answer). The user's words it would narrow: none; it widens an entry the user
+    approved (2026-10-26, "Known limitation (Recommended)"; last widened 2026-11-13, "Widen the entry (Recommended)").
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
