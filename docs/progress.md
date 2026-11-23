@@ -109,8 +109,10 @@ plus tests. Next: its own round. A lost manifest then needs its layout found ano
 Behind it: the user's pick "Keep it one release" (2026-11-04). Every live vault was converted on 2026-11-06.
 
 **P3. The no-copy move into a new folder: a design round.** Source: `specs/2026-11-12-r0555-design.md`, its opening and
-"The user's words"; the known limitation "A folder or file moved into a new folder is copied whole". State: not started,
-no design yet. Next: a design study first; 0.55.1's attempt was dropped after five routes that left wrong bytes.
+"The user's words"; the known limitation "A folder or file moved into a new folder is copied whole". State: the design
+study runs (from 2026-11-23, read-only, one agent; its brief and report in the session's scratch folder, `p3/`); no
+design yet. Next: its report, then a spec with the spec check, or a question if no route is right and simple enough;
+0.55.1's attempt was dropped after five routes that left wrong bytes. Built after round 0.55.7.
 Behind it: 2026-11-12, "continue next phase please" and the pick "Fixes + lightness, one round (Recommended)", offered
 with "the no-copy move into a new folder gets its own design round after".
 
