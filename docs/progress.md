@@ -314,36 +314,48 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
   - What waits on it: the limitations entry's wording (Task 20). The user's words it would narrow: "then left"
     (2026-11-17), for the mode, owner and time cases.
 
-- **Q24. Which files the no-copy move may link** (P3). The route links a file from the previous version, in place of
-  a copy, only when a file that left the version in the same batch compares equal in full and has the same mode, owner,
-  mtime and extended attributes; open is which files that left are looked at.
-  - (a) Every file the batch's deletes released, found by size and mtime (Recommended): besides `mkdir new; mv big new/`
-    it covers a move that also renames (`mv big new/other`), a move or rename made while reverberator was down (copied
-    once today), a tree deleted and unpacked again with its times kept, and the moves that fall back to a copy today.
-    One index per batch that both deletes and copies. The copy cost leaves four approved texts, each narrowed to what is
-    left: "A move that another change of the batch outran is copied", "A move into its own old place is copied whole",
-    "A move out of a folder that just left the tree is copied", and the README's line that moves made before a stop are
-    copied once.
-  - (b) Only an entry of the same name moved into a folder made in the batch: the move the user named, nothing more;
-    the other copies stay as approved.
-  - What waits on it: the spec's candidate rule and its tests. The user's words: "Drop the feature (Recommended)"
-    (2026-11-07), with "the no-copy move gets its own design later", and the pick of 2026-11-12 that gave it "its own
-    design round after". (a) goes beyond the move they named; nothing they said is dropped.
+- **Q24. Whether to build the no-copy move now, and which files it may link** (P3; written out in its spec's questions,
+  `specs/2026-11-23-no-copy-move-design.md`, which is being re-checked and may still change this text). The route links
+  a file from the version before, in place of a copy, only when the batch's own delete took it there, it compares equal in
+  full, and it has the same mode, owner, group, mtime and extended attributes.
+  - (a) Build it, for every file the batch's deletes took, found by size, mtime, mode, owner and group, the one whose path
+    is likest the new one first (Recommended). Besides `mkdir new; mv big new/` it covers, on every vault, a move that
+    also renames (`mv big new/other`), a move or rename made while reverberator was down (copied once today), a tree
+    deleted and unpacked again at another path with its times kept, and a move out of a folder that just left the tree;
+    and, off a pool on a filesystem with rename exchange, where the version still holds the moved entry at its old place,
+    the moves that fall back to a copy (a move another change of the batch outran, a move into its own old place). Never
+    in a batch cut before its commit and finished at the next start. Beyond the main entry ("A folder or file moved into a
+    new folder is copied whole", README line 22), it narrows three approved texts to what is left ("A move that another
+    change of the batch outran is copied", "A move into its own old place is copied whole", "A move out of a folder that
+    just left the tree is copied") and README lines 15, 19, 42, 43 and 45; "Swaps in one batch are repaired by copies" and
+    "A folder found ahead of its events can reach the vault a version late" stay as they are.
+  - (b) Build it, only for an entry moved into a folder made in the batch under its own name: the move the user named,
+    nothing more; the other copies stay as approved. Not less code than (a): it adds a pairing by name.
+  - (c) Not now: keep the entry and this design on file, and build it when a size-limited job prunes for such a move or a
+    job over a tree of user files is added. The study found no such move in the live jobs' retained versions and no
+    size-limit prune since May 2026. Building costs a per-batch table and five manifest methods, a compare on a thread
+    pool, a writer verb, an estimate change (Q25), five limitations texts and seven README lines.
+  - What waits on it: the whole build (it starts only on the answer, after 0.55.7). The user's words: "Drop the feature
+    (Recommended)" (2026-11-07), with "the no-copy move gets its own design later", and the pick of 2026-11-12 that gave
+    it "its own design round after". (a) goes beyond the move they named; (c) puts off the build their pick gave a round;
+    nothing they said is dropped.
 
-- **Q25. The size estimate and a file the batch may link** (P3; written out in its spec's questions). With a size limit,
-  the estimate before each backup decides how many old versions to prune. From P3's round it charges nothing for a file
-  the batch may link (the size, mtime, mode and owner of a file the batch deletes or moves away), so a move into a new
-  folder no longer prunes for a copy that is never made. Where such a file is copied after all (its bytes or extended
-  attributes differ; its old place leaves the version after its copy; the vault refuses hard links), the vault passes its
-  limit by that copy until the next backup prunes.
+- **Q25. The size estimate and a file the batch may link** (P3; asked with Q24, moot under its (c); written out in its
+  spec's questions). With a size limit, the estimate before each backup decides how many old versions to prune. From P3's
+  round it charges nothing for a file the batch may link (the size, mtime, mode, owner and group of a file the batch
+  deletes, or of a move into its own old place), so a move into a new folder no longer prunes for a copy that is never
+  made. Where such a file is copied after all, the vault passes its limit by that copy until the next backup prunes: its
+  bytes or extended attributes differ; its twin was moved away before the delete; its delete replays after its copy; it is
+  the second match of one removed file; the vault refuses hard links; and, on a pool or a filesystem with no rename
+  exchange, every file of a move into its own old place.
   - (a) Widen the approved entry "Size estimates leave out a version's own small blocks" to say so (Recommended): a prune
-    made for a copy never made removes a version for good, an overshoot lasts until the next prune, and a file whose bytes
-    differ with the same size, mtime, mode and owner to the nanosecond is rare.
+    made for a copy never made removes a version for good, an overshoot lasts until the next prune, and the cases are rare
+    orders, or need the same size, mtime, mode, owner and group to the nanosecond.
   - (b) Charge every copy as today: no new overshoot, but under a size limit each move into a new folder still prunes
     older versions for the whole moved size, the harm the round exists to remove.
-  - What waits on it: the estimate's part of the spec and the entry's text (built on (a) if not answered by then, with the
-    entry's new text left out until the answer). The user's words it would narrow: none; it widens an entry the user
-    approved (2026-10-26, "Known limitation (Recommended)"; last widened 2026-11-13, "Widen the entry (Recommended)").
+  - What waits on it: the estimate's part of the spec and the entry's text (written only on the answer). The user's words
+    it would narrow: none; it widens an entry the user approved (2026-10-26, "Known limitation (Recommended)"; last
+    widened 2026-11-13, "Widen the entry (Recommended)").
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
