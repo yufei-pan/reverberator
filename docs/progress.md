@@ -139,8 +139,9 @@ entry; its findings (builder gaps, wording, the cold measurement taken from live
 the compares bounded by `--threads`, one lstat only where a name matches) are fixed (7bc36d4), and a re-review of
 the fix found no wrong result; its points (the compare pool's limits and errors, a link's flush and leftovers, test and
 text gaps) are fixed in a second round (221a531), with the compare pool kept only if the build measures it faster
-than one compare at a time; the review after that round (whether findings repeat in one part, and where the spec, now
-132 KB, can be cut) runs; then the plan. Built as its
+than one compare at a time; the review after that round found the findings repeating in the compare, so the last round
+removes the parallel compare for one that runs on the replay's own thread, and cuts the spec back to about 105 KB with
+every decision kept (2026-11-23); then the plan. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
@@ -298,6 +299,15 @@ upstream, remove the downstream check that stood in for it."; and design R's les
 `docs/lessons.md` only. State: in round 0.55.6 (branch `r0556`): written as the agent rules say (APIs: a lesson that
 would change a design in an unrelated repo gets one line in the shared file), listed in its Calls to confirm. Behind
 it: the main session's call (2026-11-14).
+
+**P19. Check how design R's hard-link records behave on a mergerfs pool set to answer a cross-disk link with a
+symlink.** Source: the review of P3's spec (2026-11-23). mergerfs's `link-exdev` option can make a link across its disks
+succeed by writing a symlink in its place. A record that hard-links an entry into the version before (`keep_entry()`
+through `link_or_copy()`, on a pool) would then leave a symlink to the tree's file there, and a later change of the tree's
+file would show in the older version. Read from the code and the mergerfs binary's option strings; not run on a pool.
+State: not started. Next: run the scratch pool with each `link-exdev` mode; if the record takes a symlink, the record
+checks what it made, or the pool check refuses that option. No vault is on a pool today. Behind it: the main session's
+call, on the goal (a version must hold the bytes it backed up).
 
 ## Questions waiting for the user
 
