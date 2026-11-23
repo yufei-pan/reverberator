@@ -137,7 +137,9 @@ The spec is rewritten on it (bb67c8d, 2026-11-23; 100 KB from 140), and Q24 and 
 check found it reaches the goal and that the size books' rule it rests on holds for every way the writer records an
 entry; its findings (builder gaps, wording, the cold measurement taken from live backups as the standing decision says,
 the compares bounded by `--threads`, one lstat only where a name matches) are fixed (7bc36d4), and a re-review of
-the fix runs; then the plan. Built as its
+the fix found no wrong result; its points (the compare pool's limits and errors, a link's flush and leftovers, test and
+text gaps) are being fixed in a second round (2026-11-23), with the compare pool kept only if the build measures it
+faster than one compare at a time; then the plan. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
