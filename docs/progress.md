@@ -138,8 +138,9 @@ check found it reaches the goal and that the size books' rule it rests on holds 
 entry; its findings (builder gaps, wording, the cold measurement taken from live backups as the standing decision says,
 the compares bounded by `--threads`, one lstat only where a name matches) are fixed (7bc36d4), and a re-review of
 the fix found no wrong result; its points (the compare pool's limits and errors, a link's flush and leftovers, test and
-text gaps) are being fixed in a second round (2026-11-23), with the compare pool kept only if the build measures it
-faster than one compare at a time; then the plan. Built as its
+text gaps) are fixed in a second round (221a531), with the compare pool kept only if the build measures it faster
+than one compare at a time; the review after that round (whether findings repeat in one part, and where the spec, now
+132 KB, can be cut) runs; then the plan. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
@@ -339,9 +340,10 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     kept the entry's name, and a tree deleted and unpacked elsewhere under its name with its times kept. As after a move,
     under Only Sync Attributes (the default) a later change of a linked file's mode, owner or extended attributes also
     shows at its old place in the version before (for an unpack or a `cp -p` then `rm`, the old file's place). Still copied: an
-    entry renamed in the move; two deleted entries of one name in one batch; a file changed in the move's batch; an old
-    place deleted after the copy; a cut batch's roll-forward; a vault that refuses hard links; every copy fallback, as its
-    own entry says. It narrows the entry "A folder or file moved into a new folder is copied whole" and README lines 15
+    entry renamed in the move; two deleted entries of one name in one batch; the second of two new files matching one old
+    file; a file made in the batch and then moved; a file changed in the move's batch; an old place deleted after the
+    copy; a cut batch's roll-forward; a vault that refuses hard links; a copy fallback, except where its path holds
+    another deleted entry's name and the file there is the same. It narrows the entry "A folder or file moved into a new folder is copied whole" and README lines 15
     and 22. It touches neither the watcher, the manifest, nor how the writer records.
   - (b) Not now: keep the entry and the design on file, and build it when a size-limited job prunes for such a move, or a
     job over a tree of user files is added. The design study found it not urgent on the live host (its report, outside
