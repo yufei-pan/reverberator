@@ -1,11 +1,11 @@
 # The no-copy move into a new folder (P3)
 
-A move into a folder made in the same batch (`mkdir new; mv big new/`) is copied whole today, though the vault already holds
-every byte of it. This round makes that copy hard-link each file whose old copy the batch's own delete put into the version
-before: the file at the same place below the deleted entry of the same name, when the version before alone holds it and it is
-the monitored file byte for byte and in its metadata. Everything else is copied as today. The result on disk is the state a
-move leaves (one inode, named at the old path in the version before and at the new path in the new one); it trusts no event
-and no watch, and its worst case is the copy made today.
+A move into a folder made in the same batch (`mkdir new; mv big new/`) is copied whole today when the watcher does not see it as
+a move (a move it pairs is renamed), though the vault already holds every byte of it. This round makes that copy hard-link each
+file whose old copy the batch's own delete put into the version before: the file at the same place below the deleted entry of
+the same name, when the version before alone holds it and it is the monitored file byte for byte and in its metadata. Everything
+else is copied as today. The result on disk is the state a move leaves (one inode, named at the old path in the version before
+and at the new path in the new one); it trusts no event and no watch, and its worst case is the copy made today.
 
 Built as its own round after round 0.55.7, on a branch of its own from the merged 0.55.7, as that round rewrites the replay's
 looks (its section 7), the change list (section 9) and the length rule (section 1) around the same code. The build starts only
@@ -18,10 +18,10 @@ Why now and why this way: the user gave this move its own design when 0.55.1 dro
 the case: a program's `mkdir` and `rename`, one right after the other, leave no moment in which the new folder has a watch (a
 probe saw the move arrive as an event in 2 of 300 runs), and every fix of 0.55.1 that filled that gap from a walk's view kept
 wrong bytes in some order of events. Acting at the copy needs no event at all: it reads the bytes, which is the only proof the
-manifest can be shown (it holds a file's size, mtime and last 64 KiB, and a same-size rewrite with its mtime set back keeps all
-three). It is not urgent: the study's look at how often such a move happens is in its report, kept out of this public file, and
-Q24 offers not building it yet. Its harm when it comes is the whole moved size and, under a size limit, older versions pruned
-for a copy of what the vault holds.
+manifest can be shown (it holds a file's size, its mtime and an xxh64 hash of its last 64 KiB, and a same-size rewrite before
+that tail, with its mtime set back, keeps all three). It is not urgent: the study's look at how often such a move happens is in
+its report, kept out of this public file, and Q24 offers not building it yet. Its harm when it comes is the whole moved size
+and, under a size limit, older versions pruned for a copy of what the vault holds.
 
 Why this design: an earlier draft of this spec copied the rows of the files the batch's deletes released into a temporary
 table, fed at each applied delete, and searched it by key and by path. Its two check and fix rounds kept finding problems in
@@ -55,7 +55,8 @@ marked **[Q25]**.
 
 Standing decisions that bind the build (docs/progress.md): a worktree, never the live checkout; the suite in parallel; no
 pytest as root on the host; root, loop, mount, mergerfs and power-loss tests in reverberator's own test VM; the headroom rule;
-the mergerfs and power-loss tests in the release gate; the scrub before every push.
+the mergerfs and power-loss tests in the release gate; the scrub before every push; a cold measurement from the live backups
+after a deploy, not from flushing a page cache ("Use the live backups (Recommended)", 2026-11-03).
 
 ## Summary
 
@@ -63,16 +64,17 @@ the mergerfs and power-loss tests in the release gate; the scrub before every pu
 |---|---|---|---|---|
 | 2 | Which old copy is looked at | new `released_names()` and `old_copy()`, module functions; `do_backup()` builds the names | a dict of names per batch, one lookup on disk per file copied | nothing |
 | 3 | The estimate | `do_backup()` (its call of `get_backup_size_inode()`), `get_backup_size_inode()`, `get_unskipped_size_inodes()` | a file the copy step will find is charged nothing | nothing |
-| 4 | The copy step | `do_reverb_backup()`'s `copy_path()` (its two `writer.copy()` calls), `wait_for_async_commands()` and the replay's `finally`; a new `same_file()` beside `hash_file()` (its opener shared); `entry_metadata()` (of an open handle too) | a check, a full compare of metadata and bytes on a compare pool, then the link or the copy | nothing |
+| 4 | The copy step | `do_reverb_backup()`'s `copy_path()` (its two `writer.copy()` calls), `wait_for_async_commands()` and the replay's `finally`; a new `same_file()` beside `hash_file()`, with `hash_file()`'s opener moved out as `no_follow_opener()` and a new `read_block()`; `entry_metadata()` and `xattr_names()` (of an open handle too); `--threads`' resolved number kept beside `BACKUP_SEMAPHORE` | a check, a full compare of metadata and bytes on a compare pool bounded by `--threads` too, then the link or the copy | nothing |
 | 5 | The writer's verb and the size books | new `TreeWriter.link_kept()`; `BatchSizes` (`shared` by rel, new `linked()` and `alone()`); `finish_copies()` (a link already made) | one verb, two methods of the books | nothing |
 | 6 | The log line | end of `do_reverb_backup()` | one line per batch that placed a link | nothing |
-| 10 | Docs | README lines 15, 22 and 31 (its estimate clause on Q25's answer); two docs/limitations.md entries | the narrowed main entry, the estimate entry widened (Q25) | the claim that such a move is always copied |
+| 10 | Docs | README lines 15, 22, 31 (its estimate clause on Q25's answer) and 43; three docs/limitations.md entries | the narrowed main entry, the estimate entry widened (Q25), one sentence of the name rule's reach | the claim that such a move is always copied |
 
 No change to the watcher, the manifest (no table, no statement, no stored format), the change list or any command, and none to
-`TreeWriter.record()`, `pre_record()`, `replay_ops()`, `delete_path()` or `verify()`. No number is added: the compare reuses
-`hash_file()`'s 1 MiB read, the compare pool's `COMPARE_THREADS` threads and `compare_scopes()`'s window of four times that.
-State at rest: none, on disk or in memory. Per batch: the names (a few strings), the compares in flight and a flag that cancels
-them, the links not yet placed; `BatchSizes.shared`, which exists today. One new question, Q25 (the estimate), besides Q24.
+`TreeWriter.record()`, `pre_record()`, `replay_ops()`, `delete_path()` or `verify()`. One number is added, the compare's block
+of 256 KiB, with its reason (section 4); the compare pool takes `COMPARE_THREADS` threads, or fewer where `--threads` lets fewer
+copies run, and `compare_scopes()`'s window of four times that. State at rest: none, on disk or in memory. Per batch: the names
+(a few strings), the compares in flight and a flag that cancels them, the links not yet placed; `BatchSizes.shared`, which
+exists today. One new question, Q25 (the estimate), besides Q24.
 
 ## 1. The rule that keeps a version right
 
@@ -82,8 +84,8 @@ them, the links not yet placed; `BatchSizes.shared`, which exists today. One new
 > Everything else is the copy made today.
 
 The first half keeps the vault's shape a move's shape: one path per inode in a version. The second half makes the version's
-bytes and metadata the ones a copy would have written. Access times are not compared: `entry_metadata()` leaves them out
-everywhere, and a renamed move keeps the old inode's atime too, so a link leaves the atime a move leaves.
+bytes and metadata the ones a copy would have written, its access time aside. Access times are not compared: `entry_metadata()`
+leaves them out everywhere, and a renamed move keeps the old inode's atime too, so a link leaves the atime a move leaves.
 
 **Why no order of events can give a version worse than today's copy.** For each file the replay copies today, the version now
 gets either that copy (today's code, unchanged) or a link to a file whose bytes and metadata were just compared equal to what a
@@ -149,18 +151,25 @@ findings were renames in the vault and lost events from a wrong watch path. Unde
    looks are `real_folders_to(strict=True)` and `os.lstat()`, which raise, never `os.path.lexists()`, which answers False on
    EIO and EACCES.
 8. *Bytes the vault never flushed.* The compare reads through the page cache, which can hold right bytes over a disk that never
-   got them. The old copy is a file the last commit recorded: the deletes that give names replay first (section 3), so the
-   version before holds there what the tree held at that commit. A copy of 0.55.5 or later was flushed before its commit; one
-   an older release left unchecked is read back by the next comparison that walks it, through the same page cache, before it
-   is recorded checked (`compare_entry()`), and the new version's row of a link is read back at its commit as a copy's is
-   (`record_dirty_entries()`). The draft's rule "only rows recorded checked" goes (Calls to confirm).
+   got them. The old copy is a file the last commit recorded: the deletes that give names replay first (section 3), and a
+   record acts only where a forward link of that commit still stands (`TreeWriter.record()`; `copy()` records its place
+   before it writes), so the version before holds there what the tree held at that commit, never a copy of this batch. Since
+   0.55 every copy is flushed before its commit, so its bytes are on the disk before any later batch can link it. A row an
+   older release left unchecked is of a copy whose dirty pages the kernel wrote back long ago (writeback within its expiry, 30
+   s by default, and every boot since, after which a read comes from the disk). The new version's row of a link is recorded
+   checked from its read-back at the commit (`record_dirty_entries()`), as `compare_entry()` records an unchecked row's copy
+   checked from a read-back through the same cache; `record_dirty_entries()`'s docstring, whose reason is that the commit
+   flushed every copy, gains the link's: its inode was flushed at the commit that first recorded it (an older release's
+   written back long since). The draft's rule "only rows recorded checked" goes (Calls to confirm).
 
 Items 1, 5 and 8 differ from the study's rule; Calls to confirm 3, 7 and 14 say how.
 
 ## 2. Which old copy is looked at
 
-**What it does.** For each regular file the replay is about to copy, one lookup on disk in the version before, led by the names
-of the entries the batch deleted. Nothing is filled, searched or kept between batches.
+**What it does.** For each regular file `copy_path()` is about to copy, one lookup on disk in the version before, led by the
+names of the entries the batch deleted. `copy_path()`'s two `writer.copy()` calls (14798, 14804) are the only places it is
+made: the attrib branch's copy (15025) and the move branch's (15107) are not looked up (section 4). Nothing is filled,
+searched or kept between batches.
 
 **Where.**
 - `released_names(backup_entries, monitor_path) -> dict`, a module function beside `order_backup_entries_for_replay()`
@@ -175,10 +184,12 @@ of the entries the batch deleted. Nothing is filled, searched or kept between ba
   and an old path equal to `rel`, is passed over. The first old path whose folders are real in `version_path`
   (`real_folders_to(version_path, old, strict=True)`) and whose `os.lstat()` is a regular file with `st`'s size, mtime (ns),
   mode, owner and group is returned; else None. ENOENT and ENOTDIR are "not there"; any other error of a look is raised
-  (OSError; from 0.55.7 the strict look raises `VersionLookError`), and each caller takes it as "none" (sections 3 and 4).
+  (OSError; from 0.55.7 the strict look raises `VersionLookError`, a JobFailure), and each caller takes it as "none"
+  (sections 3 and 4).
 - `do_backup()` builds the names once, right before its estimate (6399-6407), when the batch is not a roll-forward (`tree is
   None`) and holds a delete and a create or a modify; otherwise they are empty. It passes them to the estimate (section 3) and
-  to `do_reverb_backup()`, which gains the keyword `names` (empty by default).
+  to `do_reverb_backup()`, which gains the keyword `names` (empty by default). **[Q25]** (b): they are built and passed to
+  `do_reverb_backup()` the same way, and not to the estimate.
 
 **Why the names, and which.** A delete entry names what left the tree, and its record put that into the version before at the
 same path: `TreeWriter.record()` renames a file in or exchanges a folder in whole, and on two renames hard-links it in, after
@@ -192,12 +203,18 @@ would point two ways; rather than a rule to choose one, both are copied, as toda
 **Reach.** It finds the moved entry's own old copy wherever the move kept the entry's name: `cd P; mkdir new; mv big new/`,
 `mkdir -p a/b; mv big a/b/`, a move to another parent (`mkdir Q/n; mv P/big Q/n/`), a moved file as a moved folder; a move made
 while reverberator was down that kept its name (the start's full comparison lists the deletes and the creates); and a tree
-deleted and unpacked elsewhere under its own name with its times kept. It does not find an entry renamed in the move (`mv big
-new/other`), two deleted entries of one name in one batch, a delete at or above a move's source (`mv d/g y; mkdir n; mv d
-n/d`), or anything the batch holds no delete entry for (section 7).
+deleted and unpacked elsewhere under its own name with its times kept. By the same rule it links any file whose path holds a
+deleted entry's name and that is the same as the file at its place below that entry, whatever brought it there: a part of a
+folder moved out of the tree and back into a new folder of its name (`mv P/X /out/X; mkdir -p Q/X; mv /out/X/sub Q/X/`), or a
+saved copy put back under the name of a file the batch removed (`rm other; mkdir n; cp -a <saved copy of other> n/other`).
+Each is a true stand-in (section 1). It does not find an entry renamed in the move (`mv big new/other`), two deleted entries of
+one name in one batch, an entry whose own delete lies under another delete of the batch (`mkdir n; mv a/b/big n/; rm -r a`, or
+`mkdir n; cp -p P/big/x n/x; rm -r P`: only the top-most delete gives a name), a delete at or above a move's source (`mv d/g y;
+mkdir n; mv d n/d`), or anything the batch holds no delete entry for (section 7).
 
 **Cost.** In the step back's probe (scratch files, paths 8 deep): a file whose path holds no name costs one dict lookup a part,
-0.25 µs, with 100 names as with none; a hit about 4 µs before the compare; the names of 110,100 delete entries (a full
+0.25 µs, with 100 names as with none, and no look on disk (the copy step lstats the monitored file only once a part is a name,
+section 4); a hit about 4 µs before the compare; the names of 110,100 delete entries (a full
 comparison's per-row deletes of 100 folders) were built in 21 ms. No SQL statement, no index and no bound; at most one compare
 a file.
 
@@ -221,9 +238,19 @@ file the copy step will find, so the prune makes no room for a copy that is not 
 ("after five small versions, one such move left only the newest") goes for a move whose files are unchanged.
 
 **Where.**
-- `do_backup()`: `leaving = lambda path, st: old_copy(names, os.path.relpath(path, monitor_path), st, tree_now) is not None`,
-  an OSError or a `VersionLookError` answering False; None when the names are empty, a roll-forward's always. Passed as
-  `get_backup_size_inode(..., leaving=leaving)`.
+- `do_backup()`, when the names are not empty (a roll-forward's always are), defines
+
+  ```python
+  def leaving(path, st):
+      try:
+          return old_copy(names, os.path.relpath(path, monitor_path), st, tree_now) is not None
+      except (OSError, VersionLookError):
+          # a look that cannot answer: charged, as the copy step copies it
+          return False
+  ```
+
+  and passes it as `get_backup_size_inode(..., leaving=leaving)`; else `leaving` is None. `VersionLookError` is 0.55.7's, a
+  JobFailure and not an OSError, so the `except` names it beside OSError.
 - `get_backup_size_inode(..., leaving=None)` passes `leaving` to `get_unskipped_size_inodes()` (11759) only for the walks of
   what `copy_path()` copies: the main walk's call for a create or a modify entry of `taken`, every call of the `carried_in`
   subtraction (it takes back what a created folder's walk charged, through `leaving` too, so the two cancel), and the `written`
@@ -250,7 +277,9 @@ any file of that walk; so wherever the replay links, the estimate either charged
 A roll-forward has no names: its estimate is exact, as today.
 
 The estimate also leaves uncharged some files the replay copies after all, and is low by each: the vault can pass its limit by
-them until the next prune (Q25). They are exactly these four causes, on every kind of vault:
+them until the next prune (Q25). They are exactly these four causes, on every kind of vault (a hand edit of the vault during a
+batch is outside this claim, as it is outside the size books': `held_in_tree()` unlinks a forward link whose tree entry a hand
+removed, and records nothing):
 1. the file's contents or extended attributes differ from its old copy's under the same size, mtime, mode, owner and group (a
    same-size rewrite with its mtime set back; an extended attribute set in the move's batch, or one the vault refuses or sets
    itself);
@@ -297,10 +326,13 @@ walk lstats already, and for a hit the looks of `old_copy()`.
   estimate charges `n`'s files, and the replay copies them.
 - tests/test_moves_into_new_folders.py's `test_the_size_estimate_counts_what_is_written_under_a_folder_moved_into_a_new_one`
   and `test_the_size_estimate_counts_the_attribute_copies_under_a_folder_moved_into_a_new_one` change: their estimated inodes
-  are the names in `n` less the files linked (all of `big`'s but those the row writes or changes), plus the probes; `written <=
-  est_size <= grew` stays (the touched and chmodded rows keep it, as the mtime and the mode are in the key). **[Q25]** (b): the
-  estimated inodes stay the names in `n` plus the probes, and the bound becomes `written <= grew <= est_size`, as the estimate
+  are the names in `n` less the files linked (all of `big`'s but those the row writes or changes), plus the probes. Their
+  bounds stay: the first's `written <= est_size <= grew`, the second's `15 << 20 <= est_size <= grew` (the touched and
+  chmodded rows keep it, as the mtime and the mode are in the key). **[Q25]** (b): the estimated inodes stay the names in `n`
+  plus the probes, and the bounds become `written <= grew <= est_size` and `15 << 20 <= grew <= est_size`, as the estimate
   charges the files the replay links.
+- tests/test_folder_times.py's stand-in for `get_unskipped_size_inodes()` (`lambda path, *args`, line 468) takes the
+  `leaving` keyword too (`lambda path, *args, **kwargs`, passed on). **[Q25]** (b): unchanged.
 - tests/test_estimate_through_a_take.py's three tests (`test_the_put_back_through_a_take`, `test_the_attrib_put_back_through_a_take`,
   `test_file_rows_through_a_take`) stay as they are: their batch holds `n`'s create and a move into it, and no delete, so it has
   no names.
@@ -326,57 +358,82 @@ folder's walk, `copy_untracked_folder()`, a copy fallback's (`delete_and_copy()`
 
 `copy_or_link()`, on the replay's thread, each step choosing the copy (`writer.copy()`, as today) when it fails:
 1. The names are empty: copy, with no look.
-2. `st = os.lstat(source_path)`: not a regular file: copy.
-3. `old = old_copy(names, rel, st, writer.previous)`: None: copy.
-4. `writer.sizes.alone(old, writer.two_renames)`: False: copy.
-5. The compare is queued: `same_file(source_path, writer.kept_path(old), cancelled)`, submitted to the batch's compare pool, and
+2. No part of `rel` is a name (one dict lookup a part, no look on disk): copy. So a file that is no move's costs no look more
+   than today: `copy_path()`'s own `os.path.lexists()` stays its one look, also in a batch that deleted a temporary file.
+3. `st = os.lstat(source_path)`: not a regular file: copy.
+4. `old = old_copy(names, rel, st, writer.previous)`: None: copy.
+5. `writer.sizes.alone(old, writer.two_renames)`: False: copy.
+6. The compare is queued: `same_file(source_path, writer.kept_path(old), cancelled)`, submitted to the batch's compare pool, and
    the file kept in the replay's window with `rel` and `old` (where it runs, below).
-6. When the window settles it, on the replay's thread, the daemon stopping (`GREEN_LIGHT` clear) comes first: neither a link
+7. When the window settles it, on the replay's thread, the daemon stopping (`GREEN_LIGHT` clear) comes first: neither a link
    nor a copy, and the replay ends as for any stop. Then, an equal compare with `alone(old)` still True:
-   `writer.link_kept(old, source_path, rel, pending)` (section 5) makes the link; True, and the rel is kept with the file's size
-   until it is placed (section 6); False, a copy. Metadata or bytes that differ, a compare that failed, or an old copy another
-   file of the window linked first (`alone()` now False): a copy.
+   `writer.link_kept(old, source_path, rel, pending)` (section 5) makes the link; True, and the rel is kept with the linked
+   file's size (section 5) until it is placed (section 6); False, a copy. Metadata or bytes that differ, a compare that failed
+   or raised anything at all (its future's `result()` raising: a ValueError, say), or an old copy another file of the window
+   linked first (`alone()` now False): a copy.
 
-An OSError at steps 2 to 4 or of the `alone()` at the settle, and 0.55.7's `VersionLookError` from a strict look, is caught
+An OSError at steps 3 to 5 or of the `alone()` at the settle, and 0.55.7's `VersionLookError` from a strict look, is caught
 there and chooses the copy: a look that cannot answer never links (section 1, item 7). `VersionLookError` is a JobFailure, not
 an OSError, so the `except` names both.
 
-**`same_file(source, kept, cancelled) -> bool`**, beside `hash_file()` (11674). It opens the monitored file once, as
-`hash_file()` opens one (no link followed, `O_NOFOLLOW`; never a blocking open of what is not a regular file; a lease waited for
-as `cp` waits): that opener becomes a module function both use; it opens the kept file so too. It compares `entry_metadata()`'s
-tuple of each, read from its handle (`entry_metadata()` takes an open fd as well as a path: `os.fstat()` and the extended
-attributes through the fd, with `xattr_names()`'s rule for a filesystem without them), as the move branch's
-`only_attributes_differ()` compares them (14877): mode, owner, group, mtime and extended attributes; unequal: False. Then it
-reads both through those handles into two buffers of 1 MiB, the size `hash_file()`'s full hash reads in (`1 << 20`), and answers
-False at the first block that differs, at a length that differs, at any OSError, and when the daemon is stopping (`GREEN_LIGHT`
-clear) or the batch is ending (`cancelled` set), both looked at between blocks. Not `filecmp.cmp()`: its cache answers from an
-earlier result when the size and mtime are the same, which is exactly the case this compare exists for. Not `cmp -s`: it opens
-the monitored file following a link, and blocks on a FIFO swapped in since the walk, where `cp -a` does neither.
+**`same_file(source, kept, cancelled) -> bool`**, beside `hash_file()` (11674). It opens the monitored file once through
+`no_follow_opener(file, flags)`, `hash_file()`'s inner `opener()` moved out to a module function that both use (no link
+followed, `O_NOFOLLOW`; never a blocking open of what is not a regular file; a lease waited for as `cp` waits), and the kept
+file so too. It compares `entry_metadata()`'s tuple of each, read from its handle, as the move branch's `only_attributes_differ()`
+compares them (14877): mode, owner, group, mtime and extended attributes; unequal: False. `entry_metadata()` and
+`xattr_names()` take a path only today; they take an open fd too, and on an fd call `os.fstat()`, `os.listxattr(fd)` and
+`os.getxattr(fd, name)` with no `follow_symlinks` (an fd names its file, and Python raises ValueError for an fd with
+`follow_symlinks=False`), keeping `xattr_names()`'s rule for a filesystem without them. Then it reads both through those
+handles, a block at a time, by `read_block(f, buffer) -> int`, a module function (`f.readinto(buffer)`, which a buffered reader
+fills whole but at the file's end), into two `bytearray`s of 256 KiB made once per compare thread, and compares them with `==` (a
+memcmp; a memoryview's `==` goes item by item, about 70 times slower in a probe), a short last block by its slices. 256 KiB is
+coreutils' own read size (its IO_BUFSIZE: coreutils 9.7's `cat` reads 262,144 bytes at a time), so the compare reads as `cp`'s
+family does, and the pool holds at most two blocks a thread (16 MiB at 32 threads); section 9 measures it against 1 MiB, with
+the daemon's memory before and after. It answers False at the first block that differs, at a length that differs, at any
+OSError, and when the daemon is stopping (`GREEN_LIGHT` clear) or the batch is ending (`cancelled` set), both looked at between
+blocks. The opener and `read_block()` are the seams the tests stand in for (below). Not `filecmp.cmp()`: its cache answers
+from an earlier result when the size and mtime are the same, which is exactly the case this compare exists for. Not `cmp -s`:
+it opens the monitored file following a link, and blocks on a FIFO swapped in since the walk, where `cp -a` does neither.
 
 **Where it runs.** On a compare pool, in parallel, as `record_dirty_entries()` and `compare_scopes()` run their compares: a
-`ThreadPoolExecutor` of `COMPARE_THREADS` threads (`--compare_threads`, 32 by default), made by `do_reverb_backup()` when it
-queues its first compare, so a batch that compares nothing makes none. The pool is the compares' only bound, as it is for those
-two: a compare takes no `BACKUP_SEMAPHORE` permit, so the compares and the copies never wait for each other. (A permit would not
-deadlock: multiCMD's dispatcher takes a copy's permit on its own thread, and the copy's thread gives it back when its command
-ends, `_HeldPermit.__exit__`, not when a wait reaps it; but a compare waiting for one would hold the `finally`'s wait behind
-copies it has not stopped yet.) The replay keeps at most `COMPARE_THREADS * 4` compares in flight, the window `compare_scopes()`
-keeps; when it is full, the replay waits for whichever finishes first (`concurrent.futures.wait(..., return_when=FIRST_COMPLETED)`,
-in waits of `POLL_WAIT_SECONDS` between which it polls the pools, `poll_pools()`, as it does while it waits for the copies) and
-settles every one that has finished: links and copies need no order, where `compare_scopes()` settles in walk order because its
-results must be applied in that order. `wait_for_async_commands()` first settles them all: whatever a compare decides is queued
-before any wait ends, and no move, delete barrier or verification runs while a compare is open. `same_file()` polls nothing
-itself. `do_reverb_backup()`'s `finally` sets `cancelled`, a `threading.Event` of the batch, then shuts the pool down with its
-queued compares cancelled (`shutdown(wait=True, cancel_futures=True)`), then stops the copies as today: a compare already reading
-ends at its next block (a JobFailure leaves `GREEN_LIGHT` set, so the batch needs a flag of its own), and one whose open waits
-for a lease to break waits out the kernel's lease-break time at most (45 s by default), as `hash_file()`'s opener does while the
-daemon runs. A compare reads twice what one copy reads and writes nothing; the build measures it against today's copy
-(section 9).
+`ThreadPoolExecutor` of `min(COMPARE_THREADS, BACKUP_THREADS)` threads, made by `do_reverb_backup()` when it queues its first
+compare, so a batch that compares nothing makes none. `COMPARE_THREADS` is `--compare_threads` (32 by default); `BACKUP_THREADS`
+is a new module variable beside `BACKUP_SEMAPHORE`, set where the daemon's start resolves `--threads` (1616-1623) to the number
+of copies it lets run at once (2 x the cores by default), as a semaphore does not tell its count. Whole-file
+reads are what `--threads` bounds for copies, so a job run with `--threads 1` to keep its disks quiet compares one file at a
+time beside its one copy. The pool is the compares' only bound: a compare takes no `BACKUP_SEMAPHORE` permit, so the compares
+and the copies never wait for each other. (A permit would not deadlock: multiCMD's dispatcher takes a copy's permit on its own
+thread, and the copy's thread gives it back when its command ends, `_HeldPermit.__exit__`, not when a wait reaps it; but a
+compare waiting for one would hold the `finally`'s wait behind copies it has not stopped yet.) The replay keeps at most four
+times the pool's threads in flight, the window `compare_scopes()` keeps; when it is full, the replay waits for whichever
+finishes first (`concurrent.futures.wait(..., return_when=FIRST_COMPLETED)`, in waits of `POLL_WAIT_SECONDS` between which it
+polls the pools, `poll_pools()`, as it does while it waits for the copies) and settles every one that has finished: links and
+copies need no order, where `compare_scopes()` settles in walk order because its results must be applied in that order.
+`in_row_order()` (9097), the pool helper that keeps a window and hands each row back in order on the calling thread, is not
+used: it pulls its rows from one iterable it owns, where `copy_or_link()` is called per file from `copy_path()`'s two sites amid
+the walk's folder making; it goes with the 0.54 reader; and in row order one slow compare (a 1 GiB file, or a lease waited out
+for up to 45 s) would hold every later file's link, and the replay's queueing, behind it. `wait_for_async_commands()` first
+settles every compare by the same loop, each as it ends, until none is open, and then waits for the copies as today: whatever a
+compare decides is queued before any wait ends. `same_file()` polls nothing itself. `do_reverb_backup()`'s `finally` sets
+`cancelled`, a `threading.Event` of the batch, then shuts the pool down with its queued compares cancelled (`shutdown(wait=True,
+cancel_futures=True)`), then stops the copies as today: a compare already reading ends at its next block (a JobFailure leaves
+`GREEN_LIGHT` set, so the batch needs a flag of its own), and one whose open waits for a lease to break waits out the kernel's
+lease-break time at most (45 s by default), as `hash_file()`'s opener does while the daemon runs. A compare reads twice what one
+copy reads and writes nothing; the build measures it against today's copy (section 9).
+
+The window rests on the replay's order, which today's copies rest on too: no delete, move or verification runs while a compare
+is open or a link is unplaced. `replay()` runs plain deletes with no wait, but only at its front, before any copy is queued, or
+right after a move (`order_backup_entries_for_replay()`'s exception), whose wait settled every compare and placed every link;
+every move waits first, the copy fallbacks and `recheck_moved_folder()` wait after their deletes, and the verification starts
+after the replay's wait. So no record takes a folder above a compare's old path or a link's copy name into the version before
+between the compare's queueing and the wait that places the link, where its copy name would be a second name of the kept inode
+in the version before (section 5); and `copy_path()` records only the places it copies to.
 
 **State.** Per batch: the compare pool, the window (each compare with its file's rel and old path), `cancelled`, and the rels
 linked and not yet placed (section 6). No set of claimed or held old copies: `alone()` at the link is the claim. Nothing at rest.
 
 **Failure cases.** Each chooses the copy, which then fails or succeeds as today:
-- the source gone or replaced since the walk listed it (step 2, or the compare's open): the copy's own failure keeps the last
+- the source gone or replaced since the walk listed it (step 3, or the compare's open): the copy's own failure keeps the last
   backed-up copy, or, gone, the row goes with today's line;
 - no old copy, or one the version before no longer holds alone, or one that cannot be looked at;
 - metadata or bytes that differ, an unreadable side;
@@ -388,8 +445,9 @@ and a create of the new, unless said; each ends with the oracle of section 9):
 - `test_an_unchanged_file_moved_into_a_new_folder_is_linked`, off and on two renames, with Only Sync Attributes on and off: the
   new path in the newest version and the old path in the version before are one inode; no two paths of one version share one;
   one line.
-- `test_an_unchanged_folder_moved_into_a_new_folder_is_linked`, the same ways, with a subfolder, a link and an empty file in it:
-  every regular file linked, the link and folders made as today.
+- `test_an_unchanged_folder_moved_into_a_new_folder_is_linked`, the same ways, with a subfolder, a link, an empty file and a
+  file with a `user.x` extended attribute in it (the attributes read through an fd): every regular file linked, the link and
+  folders made as today.
 - `test_a_folder_moved_below_the_top_is_linked`: `cd P; mkdir new; mv big new/`, `mkdir -p P/a/b; mv P/big P/a/b/` and a move to
   another parent (`mkdir Q/n; mv P/big Q/n/`): every file linked to its own old copy.
 - `test_a_move_made_while_down_that_kept_its_name_is_linked` (a start's full comparison: the per-row deletes and the creates)
@@ -397,12 +455,13 @@ and a create of the new, unless said; each ends with the oracle of section 9):
 - `test_a_twin_of_the_same_name_size_mtime_and_tail_is_copied`: other bytes before the last 64 KiB (the twin of section 1's
   first order; the tests' `cpp`).
 - `test_a_poke_before_the_compare_is_copied`: same size and mtime kept (the tests' `poke`) after the take.
-- `test_a_write_during_the_compare`, two cases through a stand-in for `same_file()`'s read that writes into the monitored file
-  after its first block: into a block not yet compared (copied) and into one already compared (linked to the old bytes; the next
-  batch copies the new ones, and its version holds them).
-- `test_a_file_replaced_after_the_compare_opened_it_is_judged_as_opened`: a stand-in for the opener that, once it has opened the
-  monitored file, replaces it at its path with a copy of the old copy under other metadata: the compare reads the file it
-  opened, and the version never holds the old copy's bytes under the replacement's metadata.
+- `test_a_write_during_the_compare`, two cases through a `read_block()` stand-in that writes into the monitored file after its
+  first block: into a block not yet compared (copied) and into one already compared (linked to the old bytes; the next batch
+  copies the new ones, and its version holds them).
+- `test_a_file_replaced_after_the_compare_opened_it_is_judged_as_opened`: a `no_follow_opener()` stand-in that, once it has
+  opened the monitored file, replaces it at its path with a copy of the old copy under other metadata: the compare reads the
+  file it opened, and the version never holds the old copy's bytes under the replacement's metadata.
+- `test_a_compare_that_raises_is_a_copy`: a `read_block()` stand-in raising ValueError: copied, and the batch commits.
 - `test_a_source_gone_before_the_compare_is_copied_as_today` (removed in a stand-in for `old_copy()`): no link, and the lines
   and rows today's copy gives a source gone between the walk and its copy.
 - `test_metadata_that_differs_is_copied`, one case per field: mode (a chmod with the move), mtime (`touch`), an extended
@@ -411,19 +470,26 @@ and a create of the new, unless said; each ends with the oracle of section 9):
 - `test_two_new_files_and_one_old_file_link_one` (`rm -r big` with `big/a`; `n1/big/a` and `n2/big/a` created with its bytes and
   metadata): both compared, the first settled linked, the second copied, as `alone()` then answers False.
 - `test_what_the_names_do_not_reach_is_copied`, one case each: a renamed move (`mkdir n; mv big n/other`), two deleted entries
-  of one name (`x/src` and `y/src`, and `n/src` created with one's bytes), a delete at or above a move's source (`mv d/g y;
-  mkdir n; mv d n/d`), a delete and a create of one path (`rm -rf d; tar x` at `d`'s own place, times kept: the batch holds no
-  delete).
+  of one name (`x/src` and `y/src`, and `n/src` created with one's bytes), an entry whose own delete lies under another delete
+  (`mkdir n; mv a/b/big n/; rm -r a`), a delete at or above a move's source (`mv d/g y; mkdir n; mv d n/d`), a delete and a
+  create of one path (`rm -rf d; tar x` at `d`'s own place, times kept: the batch holds no delete).
+- `test_a_true_stand_in_below_a_deleted_entry_of_its_name_is_linked`, one case each: a saved copy put back under the name of a
+  file the batch removed (`rm other; mkdir n; cp -a <saved copy of other> n/other`), and a part of a folder moved out of the
+  tree and back into a new folder of its name (`mv P/X /out/X; mkdir -p Q/X; mv /out/X/sub Q/X/`): linked, as section 2's
+  reach says.
 - `test_the_compares_run_in_parallel`: a stand-in for `same_file()` that waits for a second call: two files of one moved folder
   are compared at once.
+- `test_the_compare_pool_follows_threads`: `BACKUP_THREADS` 1 and a `same_file()` stand-in that counts the calls running at
+  once: never more than one.
 - `test_the_window_settles_whichever_compare_ends_first`: a stand-in for `same_file()` that holds the first file's compare until
-  every other file of the folder is linked: they are, while it is open.
-- `test_a_job_failure_ends_the_compares_in_flight`: a stand-in read that waits for `cancelled`, and a JobFailure raised in the
-  replay: the attempt fails, and the `finally` returns once the stand-in has seen the flag.
+  every other file of the folder is linked: they are, while it is open, as `wait_for_async_commands()` settles each compare as
+  it ends.
+- `test_a_job_failure_ends_the_compares_in_flight`: a `read_block()` stand-in that waits for `cancelled`, and a JobFailure
+  raised in the replay: the attempt fails, and the `finally` returns once the stand-in has seen the flag.
 - `test_an_old_place_with_no_file_is_copied`: a delete the length rule keeps (a forward link stays at the old place in the
   version before), and a user's symlink deleted where the new path's name points: copied.
-- `test_a_stop_during_the_compare_links_nothing`: `GREEN_LIGHT` cleared from the stand-in read: no link and no copy queued for
-  the file, the batch ends as a stop does (`attempt_events()` returns False), the next attempt commits it right.
+- `test_a_stop_during_the_compare_links_nothing`: `GREEN_LIGHT` cleared from a `read_block()` stand-in: no link and no copy
+  queued for the file, the batch ends as a stop does (`attempt_events()` returns False), the next attempt commits it right.
 - `test_a_failed_look_at_the_version_before_is_a_copy`: EIO from an `os.lstat` stand-in on the old path.
 - `test_the_verification_links_too`: a file of the moved folder that the replay's walk missed and the verification finds
   missing: linked.
@@ -442,12 +508,12 @@ the size books that the file is the tree's again; the books answer whether the v
   write of the replay outside the writer (`copy_or_link()` is a closure of `do_reverb_backup()`, and `same_file()` a module
   function it names). As `copy()` does: `record(rel, True)`, `flush_if_needed()`, `_folders_for_copy(source, rel)`, here when
   the window settles the compare: nothing between the compare's queueing and its settling changes the folders above `rel` (no
-  move, delete or verification runs while a compare is open), so they stand as `copy_path()` made them, and a record or flush
-  that fails raises JobFailure, as in `copy()`. Then a fresh copy name, `partial_copy_path()` of `rel`'s path (8222), taken
-  again while one is there as `cp_af_copy_path()` does; `os.link(self.kept_path(kept_rel), temp, follow_symlinks=False)`, as
-  `link_or_copy()` (13553) makes its links, not through `link_or_copy()`, which raises outside `NO_HARD_LINK_ERRNOS` and copies
-  within them; the size books told (below); `pending.append(PendingCopy(None, source, temp, self.path(rel)))`, a link already
-  made. True.
+  move, delete or verification runs while a compare is open, section 4's order of the replay), so they stand as `copy_path()`
+  made them, and a record or flush that fails raises JobFailure, as in `copy()`. Then a fresh copy name, `partial_copy_path()`
+  of `rel`'s path (8222), taken again while one is there as `cp_af_copy_path()` does; `os.link(self.kept_path(kept_rel), temp,
+  follow_symlinks=False)`, as `link_or_copy()` (13553) makes its links, not through `link_or_copy()`, which raises outside
+  `NO_HARD_LINK_ERRNOS` and copies within them; the size books told (below); `pending.append(PendingCopy(None, source, temp,
+  self.path(rel)))`, a link already made. True.
   Any OSError of the link or of the look after it (`NO_HARD_LINK_ERRNOS` and EIO among them): the copy name removed if made,
   False, and the caller copies; the record made stays, and `copy()` repeats it and finds nothing left to do (a record acts only
   where a forward link still stands). The place `rel` never holds the old copy's inode, so the placement (`os.replace`) is
@@ -465,20 +531,24 @@ the size books that the file is the tree's again; the books answer whether the v
   recorded once, so no rel comes twice); `result()` iterates `self.shared.items()` (`for rel, (bytes_, links) in ...`; today it
   unpacks the list's triples); new `linked(rel, size, links)` and `alone(rel, two_renames)`.
 
-**The size books.** `BatchSizes` counts what the version before alone holds, each inode in the newest version that holds it.
-`link_kept()` calls `self.sizes.linked(kept_rel, size, links)`, `size` the file's and `links` its count of names right after the
-link: an `lstat()` of the new name off two renames (exact there, as `keep_entry()`'s comment says), `links_now()` on them. Not
-`st_nlink + 1` of a look before the link, as `keep_entry()` takes it: the compare ran in between. `linked()` takes the file back
-from the version before's count (`self.size -= size`, `self.inodes -= 1`) unless `rel` is in `shared` already, then sets
-`shared[rel] = (size, links)`, so the file counts nowhere while the tree holds the link, and counts in the version before again,
-by size and inode, if the tree lets it go later in the batch (the verification removes its new place, a later copy replaces it,
-the link is discarded).
+**The size books.** `BatchSizes` counts what the version before alone holds, each inode in the newest version that holds it (a
+user's symlink kept by a hard link counts in each version holding it, as its docstring says; `alone()` is asked of regular
+files only). `link_kept()` calls `self.sizes.linked(kept_rel, size, links)` from one `lstat()` of the copy name right after the
+link: `size` is the linked inode's `st_size` (the old copy's, which the compare found equal to the monitored file's; section 6
+counts the same), and `links` its count of names, that lstat's `st_nlink` off two renames and `links_now()` on them, as
+`BatchSizes.result()`'s docstring reads a count (`links_now()` where a name's attribute can be a second old: a pool, or a
+filesystem with no exchange). Not `st_nlink + 1` of a look before the link, as `keep_entry()` takes it: the compare ran in
+between. `linked()` takes the file back from the version before's count (`self.size -= size`, `self.inodes -= 1`) only when
+`rel` is not in `shared` yet, and in either case sets `shared[rel] = (size, links)`, so the file counts nowhere while the tree
+holds the link, and counts in the version before again, by size and inode, if the tree lets it go later in the batch (the
+verification removes its new place, a later copy replaces it, the link is discarded).
 - Off two renames a delete's record takes a file by a rename (`record()` at 14108 adds its size, its inode taking the forward
   link's place) or with a folder exchanged in whole (`folder_usage()`'s size and inodes), so it is not in `shared`, and
   `linked()` takes it back.
 - On two renames a delete's record takes every file by a hard link (`record()` makes every record a keep there), so the file is
   in `shared` already, pending at the count its record left; the rm of its delete dropped that count by one, and the link brings
-  it back. `linked()` takes nothing back, as the pending entry was never added.
+  it back. `linked()` takes nothing back: `keep_entry()` put the file in `shared` and never added its size or inode to the
+  counts.
 
 `linked()` tells the two apart by `shared` itself, not by the writer's `two_renames`, which an exchange that fails can still turn
 on in the middle of a batch. A roll-forward's sizes come from `measure_previous()` (7659), which counts in the version before
@@ -519,17 +589,19 @@ the tree holds this file's inode. It is the one new invariant of this round.
   with no table; the lookup, the compare and the rest of this spec stand.
 
 **Why the link sets no flush.** The commit flushes the vault's disks before its commit point when the batch placed a copy
-(`manifest.copies_unsynced`), when it rolls a cut batch forward, and on two renames always (`do_backup()`, 6511). A link writes no
-data: its inode is a file an earlier commit recorded (section 1, item 8). It adds a name, which a vault off a pool carries to the
-disk with the manifest's fsync, as it carries the batch's renames and exchanges (the power-cut tests at every step on f2fs, ext4
-and XFS; docs/limitations.md "Vaults on btrfs" for the one filesystem not covered). A batch that only links, off a pool, then
-commits with no flush of the vault's disks, one `syncfs` less per such batch.
+(`manifest.copies_unsynced`), when it rolls a cut batch forward, and on two renames always (`do_backup()`, 6511). A link writes
+no data: its inode is a file an earlier commit recorded and flushed, never a copy of this batch (section 1, item 8). It adds a
+name, which a vault off a pool carries to the disk with the manifest's fsync, as it carries the batch's renames and exchanges
+(the power-cut tests at every step on f2fs, ext4 and XFS; docs/limitations.md "Vaults on btrfs" for the one filesystem not
+covered). A batch that only links, off a pool, then commits with no flush of the vault's disks, one `syncfs` less per such
+batch.
 
 **State.** `BatchSizes.shared` keyed by rel, per batch, as before. Nothing at rest.
 
 **Failure cases.** The link refused or failing: the copy. A cut after the link and before the commit: as section 1, item 6 says.
 A stop: `stop_copies()` discards it. A folder above the new place turned into a link before the placement: left and its row
-dropped, as a copy.
+dropped, as a copy. By the replay's order (section 4) no record has taken that folder into the version before meanwhile, which
+would have made the copy name a second name of the kept inode in the version before.
 
 **Tests:**
 - tests/test_tree_writer.py (a TreeWriter alone; the module skips unless root, so these run in the VM):
@@ -558,24 +630,29 @@ a file this batch removed from the version` (`format_bytes()` for the size, as t
 of such a move writes no line at all; a copy still writes none. One line a batch, not one a file: a moved folder of 100,000 files
 writes one.
 
-**Where.** `do_reverb_backup()` keeps each rel `link_kept()` linked, with its size, until a wait reports it placed (the rels
-`finish_copies()` returns, which 0.55.7 gathers into the batch's `placed` set), and counts it then: a link never placed (left
-where a folder above stopped being real, discarded at a stop) is not counted. The line is a plain `backuperTeeLogToTl()` call
-(5462) with `monitor_path` and no flag, as the replay's other lines (`Moved … to …`, `Fixing … differences …`): logged at info
-level in the daemon's log, and printed too under `--debug`; `log_text()` escapes the whole line, the version's path with it.
+**Where.** `do_reverb_backup()` keeps each rel `link_kept()` linked, with the linked inode's size (section 5), until a wait
+reports it placed (the rels `finish_copies()` returns, which 0.55.7 gathers into the batch's `placed` set), and counts it then:
+a link never placed (left where a folder above stopped being real, discarded at a stop) is not counted. The line is a plain
+`backuperTeeLogToTl()` call (5462) with `monitor_path` and no flag, as the replay's other lines (`Moved … to …`, `Fixing …
+differences …`): logged at info level in the daemon's log, and printed too under `--debug`; `log_text()` escapes the whole line,
+the version's path with it.
 
 **State.** The rels and the count, per batch.
 
-**Failure cases.** None of its own; a stop or a JobFailure ends the batch before it, as for any line of a batch that did not
-commit.
+**Failure cases.** None of its own. A stop or a JobFailure in the replay ends the batch before it. The line is written before
+the commit, as the replay's other lines are (`Moved … to …`): a batch that fails after the replay, in `do_backup()` (a pool
+disk that drops, a flush that fails, a change list that is not there), has logged it for links its version never commits.
 
 **Tests:** `test_one_line_a_batch_names_the_files_and_bytes_linked` and, as pins, no such line in a batch that linked nothing,
-and a link left unplaced (a folder above it replaced by a link) not counted (tests/test_no_copy_move.py). It is an info line: the
-repo's alert patterns (firewatcher/reverberator.regex) match only the markers and the exit line, so nothing alerts on it.
+and a link left unplaced not counted: a `finish_copies()` stand-in first removes a folder above the link's place, its copy name
+with it, and puts a symlink there (tests/test_no_copy_move.py). It is an info line: the repo's alert patterns
+(firewatcher/reverberator.regex) match only the markers and the exit line, so nothing alerts on it.
 
 ## 7. What it does not reach
 
-Each of these stays today's copy, with today's lines; the version is right in each.
+Each of these is copied as today, with today's lines, unless the file's path also holds the name of another entry the batch
+deleted and the file at its place below that entry is the same: then it is linked, a true stand-in (section 1, and section 2's
+reach). The version is right in each.
 
 1. **A file changed in the move's batch:** its bytes, mode, owner, group, mtime or an extended attribute. That file is copied;
    the rest of a moved folder is linked. Under Only Sync Attributes too: in the move's batch such a file is copied, not linked
@@ -590,24 +667,29 @@ Each of these stays today's copy, with today's lines; the version is right in ea
 3. **An entry renamed in the move** (`mv big new/other`), and so a rename made while reverberator was down (the start's full
    comparison finds a delete and a create of another name): copied once, as today.
 4. **Two deleted entries of one name in one batch:** the name is ambiguous, and both moves are copied.
-5. **What the batch holds no delete entry for:** a delete and a create of one path (`rm -rf d; tar xpf d.tar` at `d`'s own
+5. **An entry whose own delete lies under another delete of the batch:** a move out of a folder the batch also deletes
+   (`mkdir n; mv a/b/big n/; rm -r a`), or a copy of a file under a folder it deletes (`mkdir n; cp -p P/big/x n/x; rm -r P`):
+   only the top-most delete gives a name (`a`, `P`), and the new path does not hold it.
+6. **What the batch holds no delete entry for:** a delete and a create of one path (`rm -rf d; tar xpf d.tar` at `d`'s own
    place: they collapse into the create, `change_events_to_backup_entries()`, and each file is copied over its old copy, as any
    modify is); a move into its own old place (`mv D x; mkdir D; mv x D/D`) and its swap shape; swaps in one batch; a folder found
    ahead of its events (its move came as a move); and the copy fallbacks of a move (a move another change of the batch outran, a
    move into its own old place, a move whose path passes the length limit). A fallback's delete gives no name, so its copy links
    only where its path holds the name of one of the batch's own delete entries, which its own shape does not give. The entries
    that say these are copied stay as they are.
-6. **What the version does not hold:** a move into the tree from outside it, from a skipped path or from a paused inner disk;
-   a file made in the batch and moved into a new folder.
-7. **A vault that refuses hard links** (a known limitation already), and a vault whose filesystem cannot hold a monitored file's
+7. **What the version does not hold:** a move into the tree from outside it, from a skipped path or from a paused inner disk;
+   a file made in the batch and moved into a new folder (README line 17). By the name rule, a part of a folder that left the
+   tree in the batch, moved back into a new folder of that folder's name (`mv P/X /out/X; mkdir -p Q/X; mv /out/X/sub Q/X/`),
+   is linked when the batch holds `P/X`'s delete: the version before holds `P/X/sub` (10.4 says so).
+8. **A vault that refuses hard links** (a known limitation already), and a vault whose filesystem cannot hold a monitored file's
    metadata as it is (an extended attribute it refuses or sets itself, an owner it cannot keep): its files are never linked.
-8. **The second of two new files that pair with one old file:** one link per old file.
-9. **A batch cut before its commit and finished at the next start:** its roll-forward has no names and copies as today.
-10. **Copies the replay makes outside `copy_path()`:** the attrib branch's (a swap the collapse could not replay; a chmod with
+9. **The second of two new files that pair with one old file:** one link per old file.
+10. **A batch cut before its commit and finished at the next start:** its roll-forward has no names and copies as today.
+11. **Copies the replay makes outside `copy_path()`:** the attrib branch's (a swap the collapse could not replay; a chmod with
     Only Sync Attributes off), and the move branch's copy of a moved file whose metadata changed.
 
-What the operator is told: the narrowed entry "A folder or file moved into a new folder is copied whole" and README lines 15 and
-22 (section 10).
+What the operator is told: the narrowed entry "A folder or file moved into a new folder is copied whole", README lines 15 and
+22, and the name rule's reach in "A move out of a folder that just left the tree is copied" and README line 43 (section 10).
 
 ## 8. Interactions with round 0.55.7
 
@@ -664,16 +746,18 @@ folder_name)`, empty for every version (no two paths of one version on one inode
 the newest version and the old path in the version before one inode (`read_view(..., inodes)`).
 
 **tests/test_no_copy_move.py** (new, `unit`: a module of one layer, as conftest.py's hook fails a test with two; the owner and
-group cases chown, which the `unit` layer allows, and skip unless root, as tests/test_r_readers.py's `needs_root`, so they run in
-the VM). Batches through `do_backup()` with raw events, as tests/crash_batches.py's `backup_events()` builds them; that helper
-asserts the commit (crash_batches.py:49), so it is split into `attempt_events()`, the same call returning `committed`, and the
-assert, and the tests of a stop call `attempt_events()`. "On two renames" is both ways: the batch's writer made pooled
-(`hand_over()` wrapped to pass `pooled=True`, so it is `TreeWriter(pooled=True)` as on a pool), and a filesystem with no exchange
-(`rename_exchange` patched to raise EINVAL, as tests/test_moves_into_new_folders.py's `test_on_a_filesystem_with_no_exchange`
-does: `hand_over()`'s own exchange then fails, and two renames are on from the version's build). It holds the tests named in
-sections 2 to 6, and one more: with Only Sync Attributes on and off, a link, then a chmod of the new path in the next batch: on,
-synced onto the shared inode, and the version before's old path shows the new mode (round 19's section 2.4, as for a renamed
-file; the oracle allows it); off, copied, and the version before keeps the old mode.
+group cases chown, which the `unit` layer allows, and skip unless root, as tests/test_r_readers.py's `needs_root`, so they run
+in the VM). Batches through `do_backup()` with raw events, as tests/crash_batches.py's `backup_events()` builds them; that
+helper asserts the commit (crash_batches.py:49), so it is split into `attempt_events()`, the same call returning `committed`,
+and the assert, and the tests of a stop call `attempt_events()`. "On two renames" is both ways: the batch's writer made pooled
+(`hand_over()` wrapped so that it calls the real one with its fifth argument, `pooled`, replaced by True: `do_backup()` passes
+it by position, 6445, so a wrapper adding `pooled=True` as a keyword would raise TypeError; then it is `TreeWriter(pooled=True)`
+as on a pool), and a filesystem with no exchange (`rename_exchange` patched to raise EINVAL, as
+tests/test_moves_into_new_folders.py's `test_on_a_filesystem_with_no_exchange` does: `hand_over()`'s own exchange then fails,
+and two renames are on from the version's build). It holds the tests named in sections 2 to 6, and one more: with Only Sync
+Attributes on and off, a link, then a chmod of the new path in the next batch: on, synced onto the shared inode, and the version
+before's old path shows the new mode (round 19's section 2.4, as for a renamed file; the oracle allows it); off, copied, and the
+version before keeps the old mode.
 
 tests/test_job_startup.py's `test_a_stop_saves_nothing_and_the_start_makes_one_version` keeps its assert of a copy for a rename
 made while down (`moved.txt` to `moved-to.txt`, line 309): the name changed, so it gives no old copy, on every job.
@@ -726,10 +810,13 @@ version after each round. The suite's sample as now; a longer run is the main se
 deleted file and a deleted folder, past f2fs's inline size (`past_inline()`), and their creates under their names in a new
 folder, so the batch links both; every kill point of tests/test_crash_harness.py's sweep then cuts through `link_kept()`, the
 placement and the commit, and tests/test_crash_power_loss.py's power cuts through the same. After each, both run `check_vault()`
-and `view_truth.wrong_lists()`, as today, and gain `paths_sharing_an_inode()` empty for every version and `measure_previous(version
-before, newest)` equal to `sizes_by_newest_holder()`'s count of the version before (today only
-`test_roll_forward_sizes_equal_a_clean_batch` checks those two). `test_the_kill_points_cover_every_kind_of_call` gains `link` among
-the kinds it asserts (crash_child.py counts `os.link` as `link`), so the sweep is shown to cut through a link. On a scratch
+and `view_truth.wrong_lists()`, as today, and gain `paths_sharing_an_inode()` empty for every version and
+`measure_previous(version before, newest)` equal to `sizes_by_newest_holder()`'s count of the version before (today only
+`test_roll_forward_sizes_equal_a_clean_batch` checks those two). The VM gate runs them with `REVERB_CRASH_FULL=1`, so
+`kill_points()` gives every kill point (without it they stride, tests/test_crash_harness.py:401-407, the power cuts too).
+`test_the_kill_points_cover_every_kind_of_call` gains `link` among the kinds it asserts (crash_child.py counts `os.link` as
+`link`, but only per kind, 53-62); crash_child.py also records each step's kind in order, and a new assert finds a `link` step
+among `kill_points(total)` with the default stride, so the suite's own sample is shown to cut through a link. On a scratch
 mergerfs pool in the VM (tests/test_pool_cut.py's way), the same batch with each disk put back at its own point, over a standing
 manifest and over a lost one (section 1, item 6: a placed link copied again, an unplaced copy name removed by the comparison).
 
@@ -739,22 +826,27 @@ takes the settings from mergerfs's documentation and names them in the test); ea
 the two versions, or a copy after an EXDEV), never "linked or copied"; the oracle and the sizes either way; the folders mergerfs
 makes for the link read with their times as the batch gave them.
 
-**The real daemon** (**main session**, as round 21 measured the limitation: the daemon itself, a scratch job, in the test container
-as uid 65534 or in the VM). `mkdir new; mv big new/` for a folder of 100 MB and for a file of 100 MB, `big` at the top of the
-monitored folder and below it (`cd P`), at gaps of 0, 1 ms and 1 s between the two, with `mkdir` and `rename` as two system calls
-of one program and as a shell's two commands; each again with a poke of one file of the folder before the move, between the two,
-and after it. **The number it should show** (expected, until this run measures it): vault growth of the order of a move into an
-existing folder, for the folder and for the file: 0.04 MB in round 21's measurement of that move, its folders' blocks and the
-change lists, which this move makes too with one folder more, so under 0.1 MB, where today it is 102.44 MB for the folder and
-100.11 MB for the file, at every gap; a poked file adds its own size; the entry's size-limit run (five small versions, then the
-move, under a limit that holds them; today it left only the newest) keeps all five; one line a batch; the time spent in the replay,
-against today's copy of the same. The measured figures are what 10.1's text is written with; one off them is a finding.
+**The real daemon** (**main session**, as round 21 measured the limitation: the daemon itself, a scratch job, in the test
+container as uid 65534 or in the VM). `mkdir new; mv big new/` for a folder of 100 MB and for a file of 100 MB, `big` at the top
+of the monitored folder and below it (`cd P`), at gaps of 0, 1 ms and 1 s between the two, with `mkdir` and `rename` as two
+system calls of one program and as a shell's two commands; each again with a poke of one file of the folder before the move,
+between the two, and after it. **The number it should show** (expected, until this run measures it): vault growth of the order
+of a move into an existing folder, for the folder and for the file: 0.04 MB in round 21's measurement of that move, its folders'
+blocks and the change lists, which this move makes too with one folder more, so under 0.1 MB, where today it is 102.44 MB for
+the folder and 100.11 MB for the file, at every gap; a poked file adds its own size; the entry's size-limit run (five small
+versions, then the move, under a limit that holds them; today it left only the newest) keeps all five; one line a batch; the
+time spent in the replay, against today's copy of the same. The measured figure replaces 10.1's expected one (section 11, step
+4); one off them is a finding.
 
-**Measurements in the build** (the builder's, in the container; the cold-cache ones in the VM, where the page cache may be
-dropped): the compare against today's copy for one 1 GiB file, for a folder of 10,000 files of 4 KiB, and for a mixed folder (one
-1 GiB file early in its walk and 10,000 of 4 KiB), warm and cold, on the compare pool as built; the names of a full comparison's
-1,000,000 per-row deletes; the estimate's walk of a moved folder of 100,000 files with `leaving` and without. The figures go in
-the handback; what they decide is in the Calls to confirm.
+**Measurements in the build** (the builder's, in the container, warm): the compare against today's copy for one 1 GiB file, for
+a folder of 10,000 files of 4 KiB, and for a mixed folder (one 1 GiB file early in its walk and 10,000 of 4 KiB), on the compare
+pool as built, with blocks of 256 KiB and of 1 MiB, and the process's resident memory (`VmRSS`) before, at its peak during, and
+after the 1 GiB and mixed-folder runs; the names of a full comparison's 1,000,000 per-row deletes; the estimate's walk of a
+moved folder of 100,000 files with `leaving` and without. A run in the VM after dropping its page cache is labelled a VM figure,
+not a cold one: the VM's disk is the host's, which may still serve it from its own cache. The cold figure comes from the live
+backups after the deploy, as the standing decision says (no page cache is flushed): the main session reads the replay's time of
+the first real move into a new folder that links, against a batch's copy of the same size. The figures go in the handback; what
+they decide is in the Calls to confirm, and a block size the measurement changes gets its reason beside it.
 
 **Gates:** the whole suite in the container and in the VM, the mergerfs and power-loss tests, as the release gate has them.
 
@@ -767,11 +859,13 @@ entry's "Approved" is written with its answer (the user's words or pick and the 
 line 31's estimate clause are not written (their links sentences are).
 
 Nothing else changes: "A move that another change of the batch outran is copied", "A move into its own old place is copied
-whole", "A move out of a folder that just left the tree is copied", "Swaps in one batch are repaired by copies", "A folder found
-ahead of its events can reach the vault a version late", and README lines 17, 19, 39, 42, 43, 44 and 45 stay as they are: none
-of those shapes gives the copy's path the name of one of the batch's delete entries, or its old copy is not in the version
-(section 7 says why each stays a copy). Line 115 stays: it says a file restored under Only Sync Attributes carries the newest
-metadata its shared copy has, which covers a linked file's too.
+whole", "Swaps in one batch are repaired by copies", "A folder found ahead of its events can reach the vault a version late",
+and README lines 17, 19, 39, 42, 44 and 45 stay as they are: their own shapes give the copy's path no name of the batch's delete
+entries, or their old copy is not in the version (section 7 says why each stays a copy). A copy of theirs that links anyway, by
+another deleted entry's name, is a true stand-in and costs less than they say. "A move out of a folder that just left the tree
+is copied" and README line 43 gain one sentence (10.4): a move back into a new folder of the left folder's name is the shape the
+name rule reaches. Line 115 stays: it says a file restored under Only Sync Attributes carries the newest metadata its shared
+copy has, which covers a linked file's too.
 
 **No lessons entry is required:** no API, stored format or command changes shape (the change list, the manifest and the commands
 are as they were; the log line is new and additive). The main session may add one line to docs/lessons.md: "prove a moved object
@@ -790,17 +884,20 @@ where it lands, by its bytes, not by the events that say it moved".
   mode, owner, group, mtime and extended attributes. That covers a move to the same or another folder anywhere in the tree
   (`mkdir -p a/b; mv big a/b/` too), of a file as of a folder, a move made while reverberator was down that kept the
   entry's name, and a tree deleted and unpacked elsewhere under its own name with its times kept. One line a batch says so
-  in the log (`Linked <n> files, <size>, from <version> in place of copies: ...`). An unchanged move linked so costs about
-  what a move into an existing folder costs (0.04 MB for a 100 MB folder on the real daemon), and with a size limit it
-  prunes nothing. Still copied, with no line: an entry renamed in the move (`mv big new/other`); two entries of one
-  name deleted in one batch; a file changed in the move's batch (its contents, mode, owner, group, mtime or an extended
-  attribute); every file of the move when its old place leaves the version after the copy (a batch the maximum delay takes
-  while the move-out still waits for its pair, a move landing in the instant a batch is taken, or a folder moved into a new
-  folder after a move out of it in the same batch, `mv d/g y; mkdir n; mv d n/d`), or in a batch cut before its commit and
-  finished at the next start; the second of two new files that match one removed file; and, on a vault that refuses hard
-  links or whose filesystem keeps other metadata than the monitored file has (an extended attribute it refuses or sets
-  itself, an owner it cannot keep), every such file. Such a copy costs its size (a 100 MB file 100.11 MB), and with a size
-  limit it can prune older versions to make room, as on 0.55.7, where every such move is copied.
+  in the log (`Linked <n> files, <size>, from <version> in place of copies: ...`). An unchanged move linked so is expected
+  to cost about what a move into an existing folder costs (0.04 MB for a 100 MB folder), and with a size limit the
+  estimate charges nothing for its files, so it prunes nothing for them. Still copied, with no line: an entry renamed in
+  the move (`mv big new/other`); two entries of one name deleted in one batch; an entry moved out of a folder the same
+  batch deletes (`mkdir n; mv a/big n/; rm -r a`); a file changed in the move's batch (its contents, mode, owner, group,
+  mtime or an extended attribute); a file made in the batch and then moved; a tree deleted and unpacked again at its own
+  place (each file copied over its old copy, as any change); every file of the move when its old place leaves the version
+  after the copy (a batch the maximum delay takes while the move-out still waits for its pair, a move landing in the
+  instant a batch is taken, or a folder moved into a new folder after a move out of it in the same batch, `mv d/g y; mkdir
+  n; mv d n/d`), or in a batch cut before its commit and finished at the next start; the second of two new files that
+  match one removed file; and, on a vault that refuses hard links or whose filesystem keeps other metadata than the
+  monitored file has (an extended attribute it refuses or sets itself, an owner it cannot keep), every such file. Such a
+  copy costs its size (a 100 MB file 100.11 MB), and with a size limit it can prune older versions to make room, as on
+  0.55.7, where every such move is copied.
 - **Why:** the watcher drops the events in a folder made during the batch until the batch's copy of that folder runs, the
   move's arrival with them, and a program's `mkdir` and `rename`, one right after the other, leave no moment in which the
   new folder has a watch. 0.55.1 was built to keep the arrival as a move; four reviews and the fix passes after them each
@@ -814,9 +911,11 @@ where it lands, by its bytes, not by the events that say it moved".
   0.55, and the no-copy move gets its own design later. Narrowed to what the link cannot cover: <Q24's answer>.
 ```
 
-The 0.04 MB in parentheses is the figure section 9's real-daemon run is expected to show (round 21's measurement of a move into
-an existing folder), labelled so here until that run measures it: step 4 of section 11 writes the measured figure in its place,
-and a figure off it is a finding.
+The 0.04 MB in parentheses is round 21's measurement of a move into an existing folder, which section 9's real-daemon run is
+expected to show for this move too; the text says "is expected to cost" until that run measures it. Step 4 of section 11 then
+writes "costs about ... (<the measured figure> for a 100 MB folder on the real daemon)" in its place, and a figure off it is a
+finding. **[Q25]** (b): "and with a size limit the estimate charges nothing for its files, so it prunes nothing for them"
+becomes "but with a size limit the estimate still charges its files, so it can prune older versions for them first".
 
 ### 10.2 docs/limitations.md: "Size estimates leave out a version's own small blocks" (widened, on Q25's answer)
 
@@ -832,26 +931,31 @@ those copies until the next prune.", insert:
   pool that answers EXDEV between its disks, every such file.
 ```
 
-And "The links a batch makes are in no size record:" becomes "The forward links (symlinks) a batch makes are in no size record:",
-with, after that sentence, "A hard link of the no-copy move adds a name, no inode and no block of its own." In "Why", append:
-"Charging a file the no-copy move links would prune versions for good for every move the replay links instead of copying, the
-harm the no-copy move removes; an estimate too low only passes the limit until the next prune." In "Approved", append: "Widened
-to a file the estimate expects the no-copy move to link: <Q25's answer>." **[Q25]** (b): only the links sentences, and "Approved"
-is as it was.
+Then, in the same field, "The links a batch makes are in no size record, so neither `status` nor the limit sees their bytes:"
+becomes "The forward links (symlinks) a batch makes are in no size record, so neither `status` nor the limit sees their
+bytes:", and after the sentence it opens, which ends "until that version is pruned.", insert "A hard link of the no-copy move
+adds a name, no inode and no block of its own." In "Why", append: "Charging a file the no-copy move links would prune versions
+for good for a copy never made, the harm that move removes; an estimate too low only passes the limit until the next prune."
+In "Approved", append: "Widened to a file the estimate expects the no-copy move to link: <Q25's answer>." **[Q25]** (b): only
+the links sentences, and "Approved" is as it was.
 
 ### 10.3 README
 
 - **Line 15**, its last clause "and moves made since the last backup before a stop are copied once instead of renamed." becomes
   "and a move made since the last backup before a stop is a delete and a copy: each file of the copy that is, byte for byte and
-  in its metadata, the file at its place below the deleted entry of the same name is hard-linked from the version before (read
-  twice, written never), so a move that kept the entry's name costs no copy, and the rest (a rename, say) is copied once."
+  in its metadata, the file at its place below the deleted entry of the same name is hard-linked from the version before (both
+  read once, nothing written), so a move that kept the entry's name costs no copy, and the rest (a rename, say) is copied once."
 - **Line 22**, its last sentence becomes: "A folder or file moved into a folder made in the same batch reaches the backup as a
   delete of its old place and a copy of the new folder, as nothing watched the folder when it arrived: each file of that copy
   that is, byte for byte and in its mode, owner, group, mtime and extended attributes, the file at its place below the deleted
   entry of the same name is hard-linked from the version before in place of a copy, after a read of both (one line a batch:
-  Linked <n> files, <size>, from <version> in place of copies). An unchanged move so writes no copy and prunes nothing under a
-  size limit; the rest is copied whole: a file changed in the move's batch, an entry renamed in the move, and the moves and
-  orders the known limits below name."
+  Linked <n> files, <size>, from <version> in place of copies). An unchanged move linked so writes no copy, and under a size
+  limit the estimate charges nothing for its files; the rest is copied whole: a file changed in the move's batch, an entry
+  renamed in the move, a file made in the batch (line 17), and the moves and orders the known limits below name." **[Q25]**
+  (b): "and under a size limit the estimate charges nothing for its files" is left out.
+- **Line 43**, before its last sentence ("The result is right."), comes, as 10.4 says: "From 0.55.8, a file moved back into a
+  new folder of the left folder's name (mv X /out/X; mkdir -p Q/X; mv /out/X/sub Q/X/) can instead be hard-linked from the
+  version before, as the no-copy move links a move into a new folder."
 - **Line 31.** "The links a backup makes are in no size record:" becomes "The forward links (symlinks) a backup makes are in no
   size record:", and after that sentence comes "A hard link of the no-copy move adds a name, no inode and no block of its own."
   On Q25's (a), "and of moves that fall back to a copy, which the estimate leaves out." becomes "and of moves that fall back to a
@@ -859,22 +963,43 @@ is as it was.
   passes the limit by such a file when the replay copies it after all (its contents differ under the same size, mtime, mode,
   owner and group, say; on a vault that refuses hard links, every such file)."
 
+### 10.4 docs/limitations.md: "A move out of a folder that just left the tree is copied" (one sentence)
+
+At the end of "What the operator sees", after "... as the copy of a move into a new folder can.", insert:
+
+```
+  From 0.55.8, a file moved back into a new folder of the left folder's name (`mv X /out/X; mkdir -p Q/X; mv
+  /out/X/sub Q/X/`) can instead be hard-linked from the version before, as the no-copy move links a move into a new
+  folder ("A folder or file moved into a new folder is copied where it cannot be linked").
+```
+
+In "Approved", append: "Narrowed by the no-copy move's reach: <Q24's answer>." The rest of the entry stays, its "Revisit when"
+too (Calls to confirm).
+
 ## 11. Order of the build
 
-The build starts once Q24 and Q25 are answered, on Q24's (a). **[Q24]** (b): nothing below is built. Each step is one commit whose
-tests pass, with the docs of the code it adds.
+The build starts once Q24 and Q25 are answered, on Q24's (a). **[Q24]** (b): nothing below is built. Its branch is made from the
+merged 0.55.7, a precondition: this round uses code that is 0.55.7's and not on `r0556`, `VersionLookError` and the strict looks
+(section 7 of its spec) and the set of placed rels that `wait_for_async_commands()` gathers (its section 9, which the log line
+counts by; on `r0556` the waits' callers drop the rels it returns), and meets its other changes as section 8 says. Each step is
+one commit whose tests pass, with the docs of the code it adds. tests/test_tree_writer.py skips unless root, so its tests of
+step 1 run in the VM; the builder writes them and the main session runs them there with the VM gates.
 1. Section 5: `BatchSizes` by rel with `linked()` and `alone()`, `link_kept()`, and `finish_copies()`'s link entry, with their
-   tests, `test_alone_answers_for_each_kind_of_record` among them (nothing links yet).
+   tests, `test_alone_answers_for_each_kind_of_record` among them, and the oracle's new `paths_sharing_an_inode()` in
+   tests/vault_oracle.py, which that test is the first to use (nothing links yet).
 2. Section 2: `released_names()` and `old_copy()`, with their tests (read by nothing yet).
-3. On Q25's (a), sections 3, 4 and 6 together: `same_file()`, the compare pool and `copy_or_link()` (from here files link), the
-   names built in `do_backup()`, `leaving`, and the log line. Either half alone breaks tests/test_moves_into_new_folders.py's two
-   estimate tests (the copy step alone makes the vault grow less than the estimate, which then passes `grew`; the estimate alone
-   charges fewer inodes than the names the replay copies). **[Q25]** (b): sections 4 and 6, with section 3's [Q25] (b) change of
-   those two tests (`written <= grew <= est_size`, the inodes as today) and its pin; section 3's code is not built. With them:
-   their tests, tests/test_moves_into_new_folders.py's other changes, and the texts of section 10 as Q24's and Q25's answers give
-   them.
-4. The measurements, the fuzz step, then the main session's VM gates (owner and group, crash and power loss, the pool) and the
-   real daemon's measurement, whose figure replaces the expected 0.04 MB in 10.1's text in its own commit.
+3. On Q25's (a), sections 3, 4 and 6 together: `no_follow_opener()`, `read_block()`, `same_file()`, `entry_metadata()` and
+   `xattr_names()` on an fd, `BACKUP_THREADS`, the compare pool and `copy_or_link()` (from here files link), the names built in
+   `do_backup()` and passed to `do_reverb_backup()`, `leaving`, and the log line. Either half alone breaks
+   tests/test_moves_into_new_folders.py's two estimate tests (the copy step alone makes the vault grow less than the estimate,
+   which then passes `grew`; the estimate alone charges fewer inodes than the names the replay copies). **[Q25]** (b): sections
+   4 and 6, the names built in `do_backup()` and passed to `do_reverb_backup()` as on (a) (`copy_or_link()` reads them), with
+   section 3's [Q25] (b) change of those two tests (their bounds `written <= grew <= est_size` and `15 << 20 <= grew <=
+   est_size`, the inodes as today) and its pin; `leaving` and the estimate's code are not built. With them: their tests,
+   tests/test_moves_into_new_folders.py's other changes, and the texts of section 10 as Q24's and Q25's answers give them.
+4. The measurements, the fuzz step, then the main session's VM gates (tests/test_tree_writer.py, owner and group, crash and power
+   loss with `REVERB_CRASH_FULL=1`, the pool) and the real daemon's measurement, whose figure replaces the expected 0.04 MB in
+   10.1's text in its own commit; after the deploy, the cold figure from the live backups (section 9).
 
 ## Questions for the user
 
@@ -886,13 +1011,22 @@ owner, group, mtime and extended attributes; open is whether to build it yet.
   place below it is the same, byte for byte and in its mode, owner, group, mtime and extended attributes. It reaches `mkdir new;
   mv big new/` and `mkdir -p a/b; mv big a/b/` anywhere in the tree, to the same or another parent, a moved file as a moved
   folder, a move made while reverberator was down that kept the entry's name, and a tree deleted and unpacked elsewhere under its
-  name with its times kept. Still copied: an entry renamed in the move; two deleted entries of one name in one batch; a file
-  changed in the move's batch; an old place deleted after the copy (the three orders the entry names); a cut batch's
-  roll-forward; a vault that refuses hard links; and every copy fallback, as its own entry says. It narrows the entry "A folder or
-  file moved into a new folder is copied whole" and README lines 15 and 22. What it builds: two small functions that find the old
-  copy by the deleted entries' names, one predicate on the size books (`alone()`), the compare on a compare pool, the writer verb
-  `link_kept()`, `finish_copies()`'s link entry, the estimate's `leaving` (Q25), the log line, their tests, and those texts; it
-  touches neither the watcher, the manifest, nor how the writer records.
+  name with its times kept. As after a move, under Only Sync Attributes (the default) a later change of a linked file's mode,
+  owner or extended attributes also shows at its old place in the version before (for an unpack, or a `cp -p` then `rm`, the
+  old file's place). Still copied: an entry renamed in the move; two deleted entries of one name in one batch; an entry moved
+  out of a folder the batch also deletes; a file changed in the move's batch; an old place deleted after the copy (the three
+  orders the entry names); a cut batch's roll-forward; a vault that refuses hard links; and every copy fallback, as its own
+  entry says. It narrows the entry "A folder or file moved into a new folder is copied whole" and README lines 15 and 22, and
+  adds one sentence to "A move out of a folder that just left the tree is copied" and README line 43. What it builds: two
+  small functions that find the old copy by the deleted entries' names (`released_names()`, `old_copy()`), built in
+  `do_backup()` and handed to `do_reverb_backup()` by a new keyword; one predicate on the size books (`alone()`), with
+  `BatchSizes.shared` turned into a dict by rel, `result()` reading it so, and `linked()`; `copy_or_link()` at `copy_path()`'s
+  two `writer.copy()` calls; the compare `same_file()` on a compare pool bounded by `--threads` too (a module variable for its
+  resolved number), settled in `wait_for_async_commands()` and ended in the replay's `finally`, with `hash_file()`'s opener
+  moved out to a module function, a `read_block()` beside it and `entry_metadata()` and `xattr_names()` taking an fd; the
+  writer verb `link_kept()`; `finish_copies()`'s link entry; the estimate's `leaving`, through `get_backup_size_inode()` and
+  `get_unskipped_size_inodes()` (Q25); the log line; their tests; and those texts. It touches neither the watcher, the
+  manifest, nor how the writer records.
 - (b) Not now: keep the entry and this design on file, and build it when a size-limited job prunes for such a move, or a job over
   a tree of user files is added. The study's look at how often such a move happens is in its report, which the main session gives
   with this question.
@@ -901,10 +1035,12 @@ owner, group, mtime and extended attributes; open is whether to build it yet.
   Only Sync Attributes off (there a twin elsewhere would let a later attribute change of the new file show at the twin's place
   in the older version), so on a job with the default it does nothing; it needs a table of the removed files, an index and a
   bound. It can be a round of its own if moves that rename show up in a real vault.
-- What waits on it: the whole build (section 11), and Q25, which (b) makes moot. The user's words: "Drop the feature
-  (Recommended)" (2026-11-07), with "the no-copy move gets its own design later", and the pick of 2026-11-12 that gave it "its
-  own design round after". (a) reaches beyond the move they named (a move made while down, an unpack elsewhere) by the same rule;
-  (b) keeps it at the design round their pick gave, this spec; nothing they said is dropped.
+- What waits on it: the whole build (section 11), and Q25, which (b) makes moot. The user's words: the pick "Drop the feature
+  (Recommended)" (2026-11-07), whose option said the no-copy move gets its own design later; and on 2026-11-12, "continue next
+  phase please" and the pick "Fixes + lightness, one round (Recommended)", offered with "the no-copy move into a new folder gets
+  its own design round after" (the offered text, not theirs). (a) reaches beyond the move they named (a move made while down,
+  an unpack elsewhere) by the same rule; (b) keeps it at the design round that offer gave, this spec; nothing they said is
+  dropped.
 
 **Q25. The size estimate and a file it expects the no-copy move to link** (asked with Q24; moot under its option (b)). With a size
 limit, the estimate made before each backup decides how many old versions to prune for room. From this round it charges nothing
@@ -928,12 +1064,13 @@ of moved files and of moves that fall back.
   links, or a pool that answers EXDEV, every move into a new folder passes the limit by its size until the next prune: no vault
   has shown a refused hard link yet (docs/limitations.md "A copy made where the vault refused a hard link"), and the pool test
   (section 9) shows which way mergerfs answers under the policies it names.
-- (b) Charge every copy as today: no new overshoot, but with a size limit each move into a new folder still prunes older versions
-  for the full moved size although it then costs nothing: "after five small versions, one such move left only the newest", the
-  harm the entry names and half of the reason this round exists. Built so: section 3's code is not built (no `leaving`);
-  tests/test_moves_into_new_folders.py's two estimate tests bound `written <= grew <= est_size`, their inodes as today; section
-  3's tests give way to its pin `test_the_estimate_charges_every_file_the_replay_links`; 10.2's and line 31's estimate sentences
-  are not written (section 11, step 3).
+- (b) Charge every copy as today: no new overshoot, but with a size limit each move into a new folder still prunes older
+  versions for the full moved size although it then costs nothing: "after five small versions, one such move left only the
+  newest", the harm the entry names and half of the reason this round exists. Built so: section 3's code is not built (no
+  `leaving`); tests/test_moves_into_new_folders.py's two estimate tests bound `written <= grew <= est_size` and `15 << 20 <=
+  grew <= est_size`, their inodes as today; section 3's tests give way to its pin
+  `test_the_estimate_charges_every_file_the_replay_links`; 10.2's and line 31's estimate sentences are not written (section 11,
+  step 3).
 - (Not offered: comparing the bytes at the estimate too. It would read every moved file's two copies before the prune, and again
   at the copy.)
 - What waits on it: section 3, docs 10.2 and README line 31, and the build, which starts after both answers. The user's words it
@@ -955,8 +1092,9 @@ Where this design departs from the study (`.superpowers/p3/study-report.md`, rea
 3. **The size books as evidence.** The study's "not the inode the tree still holds at that path", and its rows-under-moves
    exclusion, become `BatchSizes.alone()` (section 5), asked at the queue and again right before the link, which is also the
    claim-once. Its general claim is reasoned and its record kinds run in a probe; a test per record kind forces it (call 10).
-4. **The key** is size, mtime, mode, owner and group (the study: size and mtime), read from the version before's file, so a
-   chmod or chown made with the move is charged and copied without a compare.
+4. **The key** is size, mtime, mode, owner and group (the study: size and mtime), compared between the monitored file's lstat
+   and the old copy's lstat in the version before (where the study read a manifest row), so a chmod or chown made with the
+   move is charged and copied without a compare.
 5. **"A tree deleted and unpacked again with its times kept"** is reached only when unpacked at another path: at its own path a
    delete and a create collapse into the create (`change_events_to_backup_entries()`), so the batch holds no delete.
 6. **"Deletes replay first"** has `order_backup_entries_for_replay()`'s exception: a delete at or above a move's source can
@@ -986,33 +1124,43 @@ The step back's calls, made in this spec:
     the same lookup, so that lowers nothing it charged.
 13. The key search of the earlier draft, and with it the wider reach off Only Sync Attributes (moves that rename, twins
     elsewhere, `z` of `mv d D; mv D/k z; rm -r D`), is not built and not offered in Q24 (Q24 says why).
-14. The draft's rule "only rows recorded checked" is dropped. The old copy is a file the last commit recorded; a copy an older
-    release left unchecked is made "checked" only by a read-back through the same page cache (`compare_entry()` ->
-    `read_vault_record()` -> `hash_file()`, 64 KiB of it), and a linked file's row is read back at its commit the same way
-    (`record_dirty_entries()`), so "checked" promised no more than the compare, which reads every byte. Keeping it would need a
-    manifest lookup per delete entry before the replay.
+14. The draft's rule "only rows recorded checked" is dropped, as Not an issue in practice. The old copy is a file the last
+    commit recorded, never a copy of this batch. Since 0.55 every copy is flushed before its commit, so its bytes are on the
+    disk before any later batch can link it; a row an older release left unchecked is of a copy whose dirty pages the kernel
+    wrote back long ago (within its writeback expiry, and at every boot since). A linked file's row is recorded checked from
+    its read-back at the commit (`record_dirty_entries()`), as `compare_entry()` records an unchecked row's copy from a
+    read-back through the same page cache, so the link opens no case that is not open today; `record_dirty_entries()`'s
+    docstring gains that reason (section 1, item 8). Keeping the rule would need a manifest lookup per delete entry before
+    the replay. No code goes with it.
 15. Under Only Sync Attributes a later attribute change synced onto a linked file shows at its old place in the version before:
-    for a move, the moved file's own old copy, as for a renamed file; for a file that is only the same at the same place below
-    a same-named deleted entry (a `cp -p` and the original removed, a tree unpacked elsewhere), that file's. README line 115
-    already says a restored file under Only Sync Attributes carries its shared copy's newest metadata. The draft kept twins
-    elsewhere out under Only Sync Attributes by a second rule; the names rule allows only this one, on every job.
+    for a move, the moved file's own old copy, as for a renamed file; for a file that is only the same at the same place below a
+    same-named deleted entry (a `cp -p` and the original removed, a tree unpacked elsewhere, a saved copy put back, a part of a
+    folder moved back from outside the tree), that file's. README line 115 already says a restored file under Only Sync
+    Attributes carries its shared copy's newest metadata. The draft kept twins elsewhere out under Only Sync Attributes by a
+    second rule; the names rule allows only this one, on every job.
 
 Calls of the parts kept from the draft:
-16. The compare runs in parallel on a compare pool of `COMPARE_THREADS` threads, with `compare_scopes()`'s window, settling
-    whichever compare ends first; it opens the monitored file once and compares its metadata and bytes through that handle; the
-    link is made on the replay's thread when the window settles it, the copy queued there when it differs; the replay's `finally`
-    sets the batch's `cancelled` flag, which a compare looks at between blocks, then shuts the pool down. Not `cmp -s` on the copy
-    executor: it follows a link and blocks on a FIFO at the monitored path. If a link is slower in wall time than the copy it
-    replaces on some shape, that is a finding for the main session (the light way against the fast way), not something the
-    builder tunes.
-17. A compare takes no `BACKUP_SEMAPHORE` permit: its pool bounds it, as `record_dirty_entries()`'s and `compare_scopes()`'s bound
-    theirs; with `--threads 1` a batch may read with up to `COMPARE_THREADS` compares beside its one copy, as a comparison does
-    today.
+16. The compare runs in parallel on a compare pool of `min(COMPARE_THREADS, BACKUP_THREADS)` threads, with `compare_scopes()`'s
+    window of four times that, settling whichever compare ends first; it opens the monitored file once and compares its
+    metadata and bytes through that handle; the link is made on the replay's thread when the window settles it, the copy
+    queued there when it differs; the replay's `finally` sets the batch's `cancelled` flag, which a compare looks at between
+    blocks, then shuts the pool down. Not `cmp -s` on the copy executor: it follows a link and blocks on a FIFO at the
+    monitored path. Three reviews proposed an inline compare on the replay's thread instead (and an earlier one asked for the
+    parallel one); the pool stays: RULES.md asks that code we write can fill the machine, `compare_scopes()` already runs its
+    compares so, and an inline compare would hold the whole replay behind one large or leased file (up to 45 s). Section 9
+    measures the pool as built. If a link is slower in wall time than the copy it replaces on some shape, that is a finding for
+    the main session (the light way against the fast way), not something the builder tunes.
+17. A compare takes no `BACKUP_SEMAPHORE` permit, and its pool is bounded by `--threads` too: whole-file reads are what
+    `--threads` bounds for copies, so a job run with `--threads 1` compares one file at a time beside its one copy. That needs
+    the number `--threads` resolves to, which a semaphore does not tell: a new module variable `BACKUP_THREADS` beside
+    `BACKUP_SEMAPHORE`, set where the daemon's start sets the semaphore.
 18. No set of held or claimed old copies: two new files that pair with one old file are both compared, and the one settled
     second finds `alone()` False and is copied. A file whose key matches an old copy of other bytes costs up to two reads more
     than today's copy (the compare stops at the first difference): bounded, and rare enough (same size, mtime, mode, owner and
     group) to be Not an issue.
-19. `entry_metadata()` takes an open fd as well as a path, so the compare reads metadata and bytes through one handle.
+19. `entry_metadata()` and `xattr_names()` take an open fd as well as a path (on an fd with no `follow_symlinks`, which Python
+    refuses there), so the compare reads metadata and bytes through one handle; `hash_file()`'s opener becomes the module
+    function `no_follow_opener()`, and the compare's read `read_block()`, the seams the tests stand in for.
 20. A link sets no `copies_unsynced`: a batch of links alone, off a pool, commits without the flush of the vault's disks.
 21. Metadata that differs is a copy, with no sync onto the shared inode even under Only Sync Attributes (the study's call, kept).
 22. Access times are not compared: `entry_metadata()` leaves them out, and a renamed move keeps the old inode's atime too.
@@ -1022,10 +1170,31 @@ Calls of the parts kept from the draft:
     place is alone there as a delete's take is, and the estimate saw the same file.
 26. One heading changes: "A folder or file moved into a new folder is copied whole" becomes "... is copied where it cannot be
     linked" (docs/progress.md's P3 names it by its old heading). 10.1 states the cost of an unchanged move with the figure the
-    real daemon's run measures; until that run, the text carries the expected 0.04 MB (what a move into an existing folder
-    costs), labelled as expected in this spec, never a placeholder.
+    real daemon's run measures; until that run, the text says the move "is expected to cost" 0.04 MB (what a move into an
+    existing folder costs), never a placeholder, and never as measured.
 27. The release is called 0.55.8 in the docs texts; the number is the main session's.
 28. The found-folder tests of tests/test_moves_into_new_folders.py whose names say copied assert the link the code gives (their
     batches are taken quiet and hold the move-out's delete), and their names say linked.
 29. tests/test_job_startup.py's `test_a_stop_saves_nothing_and_the_start_makes_one_version` keeps its assert of a copy (line 309):
     a rename made while down gives no old copy, on every job.
+
+Calls of this revision:
+30. The copy step tests the names before any look: a file no part of whose path is a name costs one dict lookup a part and no
+    lstat, so a batch that deleted a temporary file adds no look to its other copies; the monitored file is lstatted only on a
+    hit.
+31. The compare reads in blocks of 256 KiB, coreutils' own read size, into two reused buffers per compare thread (16 MiB at
+    32 threads), not 1 MiB: `hash_file()`'s full-hash read, which the earlier text cited, runs nowhere but in its doctest.
+    Section 9 measures 256 KiB against 1 MiB and the memory before, during and after.
+32. A hand edit of the vault during a batch is outside the estimate's claim of four causes, as it is outside the size books'.
+33. The name rule's reach is documented as it is, by design: any file whose path holds a deleted entry's name and that is the
+    same as the file at its place below that entry links, a saved copy put back and a part of a folder moved back from outside
+    the tree among them. "A move out of a folder that just left the tree is copied" and README line 43 gain one sentence
+    (10.4); that entry's "Revisit when" ("Also when the no-copy move into a new folder gets its own design") is left as it is,
+    as this design does not reach the entry's own shapes: the main session may drop that clause.
+34. `in_row_order()` is not reused for the compares (section 4 says why): settling whichever compare ends first keeps one slow
+    file from holding the others.
+35. The cold measurement follows the standing decision: VM figures after a drop of the VM's page cache are labelled VM figures,
+    and the cold figure comes from the live backups after the deploy.
+36. The log line is written before the commit, as the replay's other lines are, so a batch that fails after its replay has
+    logged links its version never commits (section 6).
+37. The build starts from the merged 0.55.7 (section 11).
