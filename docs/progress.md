@@ -309,10 +309,20 @@ it: the main session's call (2026-11-14).
 symlink.** Source: the review of P3's spec (2026-11-23). mergerfs's `link-exdev` option can make a link across its disks
 succeed by writing a symlink in its place. A record that hard-links an entry into the version before (`keep_entry()`
 through `link_or_copy()`, on a pool) would then leave a symlink to the tree's file there, and a later change of the tree's
-file would show in the older version. Read from the code and the mergerfs binary's option strings; not run on a pool.
-State: not started. Next: run the scratch pool with each `link-exdev` mode; if the record takes a symlink, the record
-checks what it made, or the pool check refuses that option. No vault is on a pool today. Behind it: the main session's
-call, on the goal (a version must hold the bytes it backed up).
+file would show in the older version. State: checked 2026-11-23 in the test VM, on mergerfs 2.42.0 (the host's
+version), with each `link-exdev` and `rename-exdev` mode (the probe and its logs are in the git-ignored `.superpowers/p19/`
+of the worktree). No mode leaves a symlink where a hard link was asked. Under the create policy the pool tests use (pfrd,
+not path-preserving), a link or a rename across disks is made on the source's disk: real hard links, which keep the old
+bytes when the tree's file is replaced or removed. Under a path-preserving policy (epmfs) with `link-exdev=passthrough`, a
+link answers EXDEV and `link_or_copy()` copies (the entry "A copy made where the vault refused a hard link" says so).
+With any symlink mode of either option, mergerfs aborts on the call (an assertion of its own), and the pool is gone until
+it is mounted again. That is an upstream bug; its report is drafted (Q26). So on this version the record never takes a
+symlink. Two things are left. Under a path-preserving policy a tree move between disks gets EXDEV from `os.rename`,
+which `TreeWriter.rename()` raises, so the attempt fails; what the retry does is not checked. And a later mergerfs that
+fixes the abort could make the symlink. Next: a backup with such moves on an epmfs pool in the test VM, then the ladder
+for both. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
+the source's. No vault is on a pool today. Behind it: the main session's call, on the goal (a version must hold the bytes
+it backed up).
 
 ## Questions waiting for the user
 
@@ -392,6 +402,16 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
   - What waits on it: the estimate's part of the spec, its texts (written only on the answer), and the build, which
     starts after both answers. The user's words it would narrow: none; it widens an entry the user approved (2026-10-26,
     "Known limitation (Recommended)"; last widened 2026-11-13, "Widen the entry (Recommended)").
+
+- **Q26. Post a report to mergerfs** (P19). With a path-preserving create policy and a symlink mode of `link-exdev` or
+  `rename-exdev`, mergerfs 2.42.0 on Linux 7.0 aborts on a link or a rename across its disks (`ugid.hpp:87: Assertion
+  'newuid_ != FUSE_INVALID_UIDGID' failed`), and the pool's mount is dead until it is mounted again. The repro takes four
+  lines, as root. A search found no report of it. The draft is outside the repo (the git-ignored `.superpowers/p19/` of
+  the worktree), for the user to post from their own account.
+  - (a) Post it (Recommended): a crash on a documented option, with a short repro; check the tracker for the assertion
+    text just before posting.
+  - (b) Not now: keep the draft.
+  - What waits on it: nothing in reverberator. The user's words it would touch: none.
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
