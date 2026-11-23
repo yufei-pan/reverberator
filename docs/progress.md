@@ -121,8 +121,12 @@ the live host the study found no such move in the retained versions and no size-
 not urgent. Its spec is written (`specs/2026-11-23-no-copy-move-design.md`, ef89365, 2026-11-23, on Q24's recommended
 option with the places the other option changes marked [Q24]); where the code differs from the study it follows the
 code (the table of released files is fed where each delete is applied, from what that delete took into the version
-before; its Calls to confirm list each departure), and it adds Q25. The spec check (a fresh agent with the user's words,
-and second opinions against the code) is running; then its fixes and its plan; built as its own round after 0.55.7. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
+before; its Calls to confirm list each departure), and it adds Q25. The spec check is done (a fresh agent with the user's words, and five second opinions against the
+code): its main finding is that on a vault with two renames (a pool, or no rename exchange) the deletes are recorded
+before the replay, so as written nothing would link there while the estimate stopped charging; the spec is being revised
+from the findings (the feed then also comes from those records; the compares run in parallel where the copies run; Q24
+gains a "not now" option and lists exactly what (a) narrows). Then a re-check, Q24 rewritten here from the spec, and the
+plan; built as its own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
 Behind it: 2026-11-12, "continue next phase please" and the pick "Fixes + lightness, one round (Recommended)", offered
