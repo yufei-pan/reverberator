@@ -329,9 +329,11 @@ its space for good once the version before is pruned. (3) Under `link-exdev` set
 the same record's link and kills the mount again: stuck. Buckets: (2) and (3), and the symlink a fixed mergerfs would
 make, are deferred to the round after 0.55.7 (the pool check reads both options through the control file and waits,
 naming the option: the limitations entry "A vault pool that answers a cross-disk link or rename with a symlink breaks
-the pool", and a README line). (1) widens an approved entry, so it is Q27. Still open: while a pool's mergerfs is dead,
-a backup attempt fails with the manifest's open error, whose text says to remove the manifest if it stays. Next: check
-whether the daemon's own wait (the vault folder's check) catches the dead mount before that. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
+the pool", and a README line). (1) widens an approved entry, so it is Q27. An attempt already running when mergerfs dies
+fails on the manifest's open error, whose text says to remove the manifest if the error stays. The next attempt does not
+reach it: `wait_for_path()` checks the vault path with `os.path.isdir()`, which a dead mount answers False, so the job
+waits (read from the code, not run; the run called `do_backup()` directly, so it met the error again). State: checked.
+It waits on Q26 and Q27; its fixes ride the round after 0.55.7. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
 the source's. No vault is on a pool today. Behind it: the main session's call, on the goal (a version must hold the bytes
 it backed up).
 
