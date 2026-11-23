@@ -133,8 +133,10 @@ the main session takes: the route stays, and its table of released files, the fe
 size and time go; a file is looked up by the names of the batch's deleted entries, at the same place below the deleted
 one in the version before, the size books say whether the tree let it go, and the estimate asks the same lookup. It
 finds `mkdir new; mv big new/` anywhere in the tree on every kind of job; a move that renames the entry stays a copy.
-The spec is rewritten on it (bb67c8d, 2026-11-23; 100 KB from 140), and Q24 and Q25 here from it; its fresh spec
-check runs; then the plan. Built as its
+The spec is rewritten on it (bb67c8d, 2026-11-23; 100 KB from 140), and Q24 and Q25 here from it. Its fresh spec
+check found it reaches the goal and that the size books' rule it rests on holds for every way the writer records an
+entry; its findings (builder gaps, wording, the cold measurement taken from live backups as the standing decision says,
+the compares bounded by `--threads`, one lstat only where a name matches) are being fixed; then the plan. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
@@ -331,7 +333,9 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     batch copies is hard-linked from the version before when the batch deleted an entry of the same name and the file at
     the same place below it is the same. It reaches `mkdir new; mv big new/` and `mkdir -p a/b; mv big a/b/` anywhere in
     the tree, to the same or another parent, a moved file as a moved folder, a move made while reverberator was down that
-    kept the entry's name, and a tree deleted and unpacked elsewhere under its name with its times kept. Still copied: an
+    kept the entry's name, and a tree deleted and unpacked elsewhere under its name with its times kept. As after a move,
+    under Only Sync Attributes (the default) a later change of a linked file's mode, owner or extended attributes also
+    shows at its old place in the version before (for an unpack or a `cp -p` then `rm`, the old file's place). Still copied: an
     entry renamed in the move; two deleted entries of one name in one batch; a file changed in the move's batch; an old
     place deleted after the copy; a cut batch's roll-forward; a vault that refuses hard links; every copy fallback, as its
     own entry says. It narrows the entry "A folder or file moved into a new folder is copied whole" and README lines 15
@@ -342,8 +346,9 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
   - Not offered: a search by size and time for a removed file anywhere in the batch, which would add moves that rename
     the entry; with Only Sync Attributes on (the default) it would do nothing, and it needs a table, an index and a bound.
   - What waits on it: the whole build (after 0.55.7), and Q25, which (b) makes moot. The user's words: "Drop the feature
-    (Recommended)" (2026-11-07), with "the no-copy move gets its own design later", and the pick of 2026-11-12 that gave
-    it "its own design round after". (a) reaches beyond the move they named by the same rule; nothing they said is
+    (Recommended)" (2026-11-07), with "the no-copy move gets its own design later", and on 2026-11-12 the pick "Fixes +
+    lightness, one round (Recommended)", offered with "the no-copy move into a new folder gets its own design round
+    after". (a) reaches beyond the move they named by the same rule; nothing they said is
     dropped.
 
 - **Q25. The size estimate and a file the no-copy move will link** (P3; asked with Q24, moot under its (b)). With a
