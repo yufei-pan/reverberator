@@ -128,8 +128,13 @@ Q24 gained a "not now" option and lists exactly what (a) narrows), and re-checke
 the candidate choice, the compare's timing, the roll-forward, the estimate's shortfalls and the docs texts). Its second
 fix round is done (a1f9d7d); its findings kept landing in the same parts (how a candidate is found, the estimate's
 prediction), the spec grew to 140 KB, and the lookup it was given misses the main shape below the top of the monitored
-folder, so a fresh agent steps back on the design (the agent rules' "Step back when findings repeat"); no further fix
-round on those parts until it answers. Then the spec is reshaped, checked, and the plan written. Built as its
+folder, so a fresh agent stepped back on the design (the agent rules' "Step back when findings repeat"). Its answer, which
+the main session takes: the route stays, and its table of released files, the feed at the deletes and the search by
+size and time go; a file is looked up by the names of the batch's deleted entries, at the same place below the deleted
+one in the version before, the size books say whether the tree let it go, and the estimate asks the same lookup. It
+finds `mkdir new; mv big new/` anywhere in the tree on every kind of job; a move that renames the entry stays a copy.
+The spec is being rewritten on it (2026-11-23); then a fresh spec check, Q24 and Q25 here rewritten from it, and the
+plan. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
