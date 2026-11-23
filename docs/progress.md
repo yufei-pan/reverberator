@@ -318,12 +318,20 @@ link answers EXDEV and `link_or_copy()` copies (the entry "A copy made where the
 With any symlink mode of either option, mergerfs aborts on the call (an assertion of its own), and the pool is gone until
 it is mounted again. Under `rename-exdev`, it has first moved the source into `.mergerfs_rename_exdev/` on the source's
 disk, so after a remount the file is at neither name. That is an upstream bug; its report is drafted (Q26). So on this
-version the record never takes a symlink. Three things are left. Under a path-preserving policy a tree move between
-disks gets EXDEV from `os.rename`, which `TreeWriter.rename()` raises, so the attempt fails; what the retry does is not
-checked. With `rename-exdev` set to a symlink mode, whether a version then misses the moved-away file, or the retry
-brings it back, is not checked either. And a later mergerfs that fixes the abort could make the symlink. Next: backups
-with such moves on an epmfs pool in the test VM, with `rename-exdev` at passthrough and at `rel-symlink`, then the
-ladder for all three. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
+version the record never takes a symlink. Then 49 real backups on a pool of two f2fs disks (epmfs, pfrd as the
+control; a throwaway module in the same folder) gave three results. (1) Under epmfs at passthrough, a tree move between
+disks gets EXDEV from `TreeWriter.rename()`; the replay's catch-all logs an ERROR with its traceback and deletes and
+copies, and the same attempt commits with every version right. The moved bytes are stored twice until the old version
+is pruned, and records across disks are silent copies (the refused-link entry). Every pfrd case passed with no ERROR and
+no extra copy. (2) Under `rename-exdev` set to a symlink mode, the attempt fails on the abort. After a remount, the next
+one rolls the cut tree forward and commits, every version right, but the file left in `.mergerfs_rename_exdev/` holds
+its space for good once the version before is pruned. (3) Under `link-exdev` set to a symlink mode, every attempt needs
+the same record's link and kills the mount again: stuck. Buckets: (2) and (3), and the symlink a fixed mergerfs would
+make, are deferred to the round after 0.55.7 (the pool check reads both options through the control file and waits,
+naming the option: the limitations entry "A vault pool that answers a cross-disk link or rename with a symlink breaks
+the pool", and a README line). (1) widens an approved entry, so it is Q27. Still open: while a pool's mergerfs is dead,
+a backup attempt fails with the manifest's open error, whose text says to remove the manifest if it stays. Next: check
+whether the daemon's own wait (the vault folder's check) catches the dead mount before that. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
 the source's. No vault is on a pool today. Behind it: the main session's call, on the goal (a version must hold the bytes
 it backed up).
 
@@ -415,6 +423,22 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     text just before posting.
   - (b) Not now: keep the draft.
   - What waits on it: nothing in reverberator. The user's words it would touch: none.
+
+- **Q27. A vault on a mergerfs pool whose create policy is path-preserving** (P19, result 1). Under such a policy (epmfs,
+  say; mergerfs's default, pfrd, is not one), mergerfs cannot rename or hard-link across its disks and answers EXDEV. The
+  run showed every version right, but a move between disks is copied: the moved bytes are stored twice until the old
+  version is pruned (a folder's whole subtree). Today the move logs an ERROR with a traceback for each moved entry, as
+  if something had gone wrong.
+  - (a) Accept the copies and widen the approved entry "A copy made where the vault refused a hard link" to moves
+    between a path-preserving pool's disks, with one README clause. The round after 0.55.7 then logs each such move as
+    the WARNING "Not renaming ...; copying it instead", with no traceback (Recommended: it keeps such pools working, and
+    a copy is the only way to put the move into a version there; the fix is a few lines).
+  - (b) Refuse such pools: the pool check waits while a vault's pool has a path-preserving create policy, naming
+    `category.create`. No doubled bytes, but an operator on such a pool gets no backups until they change the policy,
+    and the check must know mergerfs's policy names.
+  - What waits on it: the entry's wording and the log line's fix, in the round after 0.55.7. The user's words it would
+    touch: "Support pools with a limitation" (2026-11-04), which (a) keeps and (b) narrows; it widens an entry the user
+    approved (2026-11-09, "Known limitation (Recommended)", then "Widen the entry (Recommended)").
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not

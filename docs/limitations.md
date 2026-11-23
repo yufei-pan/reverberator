@@ -1038,3 +1038,21 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   full comparison). Found by round 0.55.6's final review, reasoned from the code, not run.
 - **Why:** the walk asks the folder's listing again for each name it kept that fails to open (child_gone()).
 - **Revisit when:** the round after 0.55.6: list the folder again once for each wave of names that fail to open.
+
+### A vault pool that answers a cross-disk link or rename with a symlink breaks the pool
+
+- **Kind:** deferred.
+- **What the operator sees:** on a vault on a mergerfs pool whose create policy is path-preserving (epmfs, say) and
+  whose `link-exdev` or `rename-exdev` option is one of its symlink modes, the first hard link or rename the backup makes
+  across the pool's disks makes mergerfs 2.42.0 abort: the pool's mount answers every program with an error until it is
+  mounted again. With `link-exdev` so set, every attempt needs the same record's link and fails the same way, killing the
+  mount each time. With `rename-exdev`, the attempt after the remount rolls the cut tree forward and commits, every
+  version right, but mergerfs has already moved the source into `.mergerfs_rename_exdev/` on its disk, outside the job
+  vault, where it holds its space for good once the version before is pruned. A mergerfs that fixed the abort would make
+  the symlink, and an older version would then show the tree's later bytes. Run on a test pool of two disks, 2026-11-23.
+  Under a create policy that is not path-preserving (pfrd, mergerfs's default) a link or a rename is made on the
+  source's disk, and neither option comes into play.
+- **Why:** the abort is mergerfs's (an assertion in its fallback), and reverberator does not read the pool's options.
+- **Revisit when:** the round after 0.55.7: the pool check reads both options through the pool's control file (one
+  extended-attribute read each) and, while either is not passthrough on a vault's pool, the job waits, its reason naming
+  the option to set back.
