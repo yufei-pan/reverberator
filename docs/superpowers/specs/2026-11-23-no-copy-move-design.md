@@ -330,8 +330,8 @@ The attrib branch's copy and the move branch's copy of a moved file whose metada
 4. `old = old_copy(names, rel, st, writer.previous)`: None: copy.
 5. `writer.sizes.alone(old, writer.two_renames)`: False: copy.
 6. `kept = same_file(source_path, writer.kept_path(old), blocks)`, the batch's two block buffers made at its first compare. It
-   sits in a `try` of its own: a JobFailure is raised on, and any other exception (a ValueError, say; `same_file()` answers an
-   OSError itself) is None, the batch's first such logging an error line with its traceback, as the move branch's `except
+   sits in a `try` of its own: any exception (a ValueError, say; `same_file()` answers an OSError itself, and raises no
+   JobFailure) is None, the batch's first such logging an error line with its traceback, as the move branch's `except
    Exception` does (15123-15128), so a fault that turns every link into a copy shows.
 7. `poll_pools()`, once: a pool disk that dropped during a long compare is found before the link or the copy writes, as the
    walk's poll before each copy finds it today.
@@ -342,21 +342,23 @@ The attrib branch's copy and the move branch's copy of a moved file whose metada
    its old path and size for the log line (section 6). Else a copy.
 
 An OSError at steps 3 to 5, and 0.55.7's `VersionLookError` from the strict folder look, is caught there and chooses the copy
-(section 1, item 7). `link_kept()` is outside every `try`: its JobFailure (a record or a flush that failed) fails the attempt as
-`copy()`'s does, as the move branch raises its own (15114). The compare and the link are one step of the replay's thread, where
-the copy would be queued: the folders above `rel` stand as `copy_path()` made them, no compare is open at a delete, a move or
-the verification, and a link waits for its placement as a copy does (section 5).
+(section 1, item 7). `link_kept()` is outside every `try`: its JobFailure (a record or a flush that failed) fails the attempt
+as `copy()`'s does, as the move branch raises its own (15114), and the NotARealFolder of its folders (an OSError, which the
+same `_folders_for_copy()` call raises in `copy()` today) goes up as `copy()`'s does. The compare and the link are one step of
+the replay's thread, where the copy would be queued: the folders above `rel` stand as `copy_path()` made them, no compare is
+open at a delete, a move or the verification, and a link waits for its placement as a copy does (section 5).
 
 **`same_file(source, kept, blocks) -> 'tuple | None'`**, beside `hash_file()` (11674): the kept file's `(st_dev, st_ino)`,
 from its handle's `fstat()`, when the two are equal; else None.
 - *The permit.* It takes one `BACKUP_SEMAPHORE` permit for its opens and reads, as a copy's `cp` holds one, waiting as
-  multiCMD's dispatcher waits (`acquire(timeout=0.1)` in a loop) and giving up, None, when `GREEN_LIGHT` is clear. A
-  `try`/`finally` gives it back whatever ends the opens and reads, before `same_file()` returns, so the link or the copy that
-  follows holds none (one lost would stop every copy under `--threads 1`). So `--threads` bounds the compares' whole-file reads
-  as it bounds the copies, across the daemon's jobs. No wait closes a circle (read in multiCMD 1.51): multiCMD takes a copy's
-  permit on its dispatcher's thread and gives it back when the copy's command ends (`_HeldPermit.__exit__`), not when a wait
-  reaps it, and the replay's thread holds one only inside `same_file()`, which waits for nothing but its two files;
-  `do_backup()`'s note on `BACKUP_SEMAPHORE` (~6184) gains that.
+  multiCMD's dispatcher waits (`acquire(timeout=0.1)` in a loop) and giving up, None, when `GREEN_LIGHT` is clear, which is
+  looked at before the first acquire too, so a walk's files after a stop open nothing. A `try`/`finally` gives it back
+  whatever ends the opens and reads, before `same_file()` returns, so the link or the copy that follows holds none (one lost
+  would stop every copy under `--threads 1`). So `--threads` bounds the compares' whole-file reads as it bounds the copies,
+  across the daemon's jobs. No wait closes a circle (read in multiCMD 1.51): multiCMD takes a copy's permit on its
+  dispatcher's thread and gives it back when the copy's command ends (`_HeldPermit.__exit__`), not when a wait reaps it, and
+  the replay's thread holds one only inside `same_file()`, which waits for nothing but its two files; `do_backup()`'s note on
+  `BACKUP_SEMAPHORE` (~6184) gains that.
 - *The opens.* Each file is opened once, unbuffered (`open(path, 'rb', buffering=0, opener=no_follow_opener)`, a `FileIO`, so
   no buffered state lies between a seek and a read), through `no_follow_opener(file, flags)`, `hash_file()`'s inner `opener()`
   moved out to a module function both use: no link followed, never a blocking open of what is not a regular file, and a write
@@ -374,17 +376,20 @@ from its handle's `fstat()`, when the two are equal; else None.
   item, about 70 times slower in a probe), a short last block by its slices. 256 KiB is coreutils' own read size (its
   IO_BUFSIZE: coreutils 9.7's `cat` reads 262,144 bytes at a time), so the compare reads as `cp`'s family does; section 9
   measures it against 1 MiB.
-- *Holes.* Where both files are sparse (each fstat's `st_blocks * 512` below its `st_size`), after each block both handles seek
-  to their next data (`f.seek(pos, os.SEEK_DATA)`; ENXIO is no data to the end) and both go on from the nearer: the range
-  between is a hole in both, zeros in both, so skipping it compares what reading it would; both at their ends are equal, as
-  their sizes are; a filesystem that cannot tell holes answers every range as data. So a sparse image is compared by its data,
-  as `cp --sparse=always` copies it; a dense file costs no seek, and one that reads as sparse with no hole (a compressed or an
-  inline file) a seek pair a block.
+- *Holes.* Where both files are sparse (each fstat's `st_blocks * 512` below its `st_size`), after each block each handle asks
+  for its next data (`f.seek(pos, os.SEEK_DATA)`, which moves it there; ENXIO is no data to the end, the file's size), and
+  both then seek to the nearer of the two offsets, the handle that went further included, so both go on from the same place:
+  the range between is a hole in both, zeros in both, so skipping it compares what reading it would; both at their ends are
+  equal, as their sizes are; a filesystem that cannot tell holes answers every range as data. So a sparse image is compared by
+  its data, as `cp --sparse=always` copies it; a dense file costs no seek, and one that reads as sparse with no hole (a
+  compressed or an inline file) a seek pair a block.
 - It answers None at the first block that differs, at a length that differs, at any OSError, and when `GREEN_LIGHT` is clear,
   looked at between blocks. The opener and `read_block()` are the seams the tests stand in for.
 
-A compare reads both files' data where a copy reads one and writes it; one large file holds the replay's queueing behind it
-while it reads, as the copies queued before it run on; the build measures it against today's copy (section 9).
+A compare reads both files' data where a copy reads one and writes it; one large file, or one under another process's write
+lease (up to the lease-break time, and a stop waits for it), holds the replay's queueing behind it while it reads, as the
+copies queued before it run on (a copy waits for a lease in its own process); the build measures it against today's copy
+(section 9).
 
 **State.** Per batch: the two block buffers, whether a compare has raised (the one error line), and the links made (section 6);
 `links_refused` is the writer's (section 5). No set of claimed or held old copies: `alone()` at the link is the claim. Nothing
@@ -467,7 +472,8 @@ the size books that the file is the tree's again; the books answer whether the v
   1. `self.sizes.alone(kept_rel, self.two_renames)`: False returns False with nothing done, so the rule's first half is kept at
      this one door (`copy_or_link()`'s step 5 only spares a compare).
   2. As `copy()` does: `record(rel, True)`, `flush_if_needed()`, `_folders_for_copy(source, rel)`; a record or flush that fails
-     raises JobFailure, as in `copy()`.
+     raises JobFailure, as in `copy()`, and `_folders_for_copy()`'s NotARealFolder (an OSError) propagates as `copy()`'s
+     does: the rule for OSErrors below covers only `alone()`, the link and the look after it.
   3. A fresh copy name, `partial_copy_path()` of `rel`'s path (8222), taken again while one is there as `cp_af_copy_path()` does;
      `os.link(self.kept_path(kept_rel), temp, follow_symlinks=False)`, as `link_or_copy()` (13553) makes its links.
   4. One `lstat()` of the copy name, whose `(st_dev, st_ino)` must be `kept`, the inode the compare read through its handle;
@@ -482,13 +488,16 @@ the size books that the file is the tree's again; the books answer whether the v
      already made. True.
 
   Any OSError of `alone()`, the link or the look after it (`NO_HARD_LINK_ERRNOS` and EIO among them): the copy name removed if
-  made, False, and the caller copies; an `os.link()` refused with EPERM, ENOTSUP, EOPNOTSUPP or ENOSYS also sets
-  `self.links_refused`, a flag of the writer (so of the batch, False at its making), which `copy_or_link()`'s step 1 reads. A
-  removal of the copy name that fails raises JobFailure: that name of the kept inode, which the books were never told of, would
-  let `alone()` answer True and a second file link it again; the next attempt's repair of the cut removes what the batch made
-  (section 1, item 6). The record made stays, and `copy()` repeats it and finds nothing left to do (a record acts only where a
-  forward link still stands). The place `rel` never holds the old copy's inode (`alone()` just said no path of the tree holds
-  it), so the placement (`os.replace`) is never a rename between two names of one inode, which would leave the copy name.
+  made (`discard_temp()`: `remove_entry()`, whose call is `os.remove`), False, and the caller copies; an `os.link()` refused
+  with EPERM, ENOTSUP, EOPNOTSUPP or ENOSYS also sets `self.links_refused`, a flag of the writer (so of the batch, False at
+  its making), which `copy_or_link()`'s step 1 reads. A removal of the copy name that fails raises JobFailure: the batch
+  cannot go on with that name of the kept inode left in the tree, as the copy that follows would be committed beside it, a
+  file in the version that no row holds, and for a file not in `shared` (off two renames) the books, never told of it, would
+  also let `alone()` answer True and a second file link it again; the next attempt's repair of the cut removes what the batch
+  made (section 1, item 6). The record made stays, and `copy()` repeats it and finds nothing left to do (a record acts only
+  where a forward link still stands). The place `rel` never holds the old copy's inode (`alone()` just said no path of the
+  tree holds it), so the placement (`os.replace`) is never a rename between two names of one inode, which would leave the copy
+  name.
 - `finish_copies()` (8946): a pending entry whose task is None is a link already made. Its loop branches on that before it reads
   `copy.task.stderr` (8969), which a link has none of: no lines, succeeded; it is put in place and returned among the entries put
   in place, as a finished copy is (0.55.7's section 9 reads that list as what the replay applied), or, where a folder above its
@@ -525,9 +534,10 @@ only files the tree does not share: a linked file is shared, so it needs nothing
 
 **The invariant `alone()` rests on.** `alone(rel, two_renames)`: `rel` is not in `shared`, or the file's count of names now
 (`links_now()` on two renames, an `lstat()` elsewhere, as `result()` reads it) is below the count `shared` holds for it. Asked
-only of a regular file of the version before reached through real folders (`old_copy()` looked), it is meant to say: no path of
-the tree holds this file's inode. It is the one new invariant of this round, run in the step back's probe for the record kinds
-its test lists and reasoned in general:
+only of a regular file of the version before reached through real folders (`old_copy()` looked), it is meant to say: no path
+of the tree holds this file's inode. It is the one new invariant of this round, run in the step back's probe for seven of the
+ten record kinds its test lists (not an unfold's entry kept by a hard link, a record copied, or `remove_now()`) and on no real
+pool, and reasoned in general; the test forces each:
 - A batch's version before starts as forward links alone (`hand_over()`), so each regular file in it came by a record of the
   tree's entry during the batch (`record()`, through `unfold()`, `hard_link_tree()` and `exchange_in()`). A record without keep
   renames the file in, or exchanges its folder in whole, which takes the tree's name away. A record with keep (every record on
@@ -552,14 +562,17 @@ its test lists and reasoned in general:
 
 **Failure cases.** The link refused or failing, or the kept path no longer the compared inode: the copy. Its copy name not
 removable: JobFailure. A cut after the link and before the commit: as section 1, item 6 says. A stop: `stop_copies()` discards
-it. A folder above the new place no longer real at the placement: the link is left and its row dropped, as a copy is, and no
-name of the kept inode is left behind (read in the code). Whatever stops that folder being real before the placement removes
-the copy name with it: a placement's `replace_entry()` (8498) removes the real folder it replaces whole (`shutil.rmtree`), and
-a delete that replays after the link (one behind a move, after `recheck_moved_folder()`'s links) removes the tree's folder with
-everything in it. No record can take the copy name into the version before instead: `link_kept()`'s own record left every
-folder above `rel` real there (or none, below a folder this batch made), a record takes a folder whole only at a forward link,
-and the copy name, made after that record, has no entry of the version before to record. The books then count the file back in
-the version before, its count having dropped.
+it. A folder above the new place that is a link or a file at the placement: the link is left and its row dropped, as a copy
+is, and no name of the kept inode is left behind (read in the code). What makes that folder so before the placement removes
+the copy name with it: a placement's `replace_entry()` (8498) removes the real folder it replaces whole (`shutil.rmtree`). A
+folder that is gone is another case: `finish_copies()` looks with `missing_ok`, which counts it real, and the placement then
+raises FileNotFoundError (the copy name went with it). The replay's order never gives it: a delete that replays after a link
+(one behind a move, after `recheck_moved_folder()`'s links) reaches a link's place only when the move's target lies under the
+deleted path, and then the monitored target is gone and the recheck walks nothing, so no link was made. No record can take the
+copy name into the version before instead: `link_kept()`'s own record left every folder above `rel` real there (or none, below
+a folder this batch made), a record takes a folder whole only at a forward link, and the copy name, made after that record,
+has no entry of the version before to record. The books then count the file back in the version before, its count having
+dropped.
 
 **Tests:**
 - tests/test_tree_writer.py (a TreeWriter alone; the module skips unless root, so these run in the VM):
@@ -578,9 +591,9 @@ the version before, its count having dropped.
 - `test_a_kept_file_swapped_after_its_compare_is_a_copy`, two cases: an `os.link` stand-in that first puts another inode with
   the same bytes and metadata at the kept path, and one that makes a symlink to the kept file at the copy name and returns, as
   a mergerfs `link-exdev` symlink mode does: copied, no copy name left, the kept file's count as it was.
-- `test_a_copy_name_that_cannot_be_removed_fails_the_attempt`: an `os.lstat` stand-in answering another inode for the copy name
-  and an `os.unlink` stand-in failing on it: JobFailure; the next attempt commits right, and no two paths of a version share an
-  inode.
+- `test_a_copy_name_that_cannot_be_removed_fails_the_attempt`: an `os.lstat` stand-in answering another inode for the copy
+  name and an `os.remove` stand-in (what `remove_entry()` calls) failing on it: JobFailure; the next attempt commits right,
+  and no two paths of a version share an inode.
 - `test_a_batch_of_links_alone_flushes_as_a_batch_of_copies`: a spy on `flush_copies()`: called off and on two renames.
 - `test_a_stop_before_a_link_is_placed_leaves_no_copy_name`: `GREEN_LIGHT` cleared after `link_kept()`: no
   `.reverberator-partial` name in the tree, the version before's file whole, its link count back.
@@ -594,13 +607,16 @@ list's name writes it). Its lead word is one no other line has: "Linked" leads t
 13066). Today the copy of such a move writes no line at all; a copy still writes none. One line an attempt, not one a file: a
 moved folder of 100,000 files writes one.
 
-**Where.** `do_reverb_backup()` keeps the old path and size of each link `link_kept()` made, and at the end counts those the tree
-still holds by the books: `not writer.sizes.alone(old, writer.two_renames)`, one look each, as the commit's `result()` reads
-them (an error of that look: not counted). A link never placed (discarded at a stop, left where a folder above stopped being
-real) or let go later in the batch (the verification removes its new place, a later copy replaces it) has dropped its count and
-is not counted. The line is a plain `backuperTeeLogToTl()` call (5462) with `monitor_path` and no flag, as the replay's other
-lines (`Moved … to …`, `Fixing … differences …`): logged at info level in the daemon's log, and printed too under `--debug`;
-`log_text()` escapes the whole line, the version's path with it.
+**Where.** `do_reverb_backup()` keeps the size of each link `link_kept()` made, a dict keyed by its old path as `shared` is (a
+link let go and a second one made from the same old file are one entry, counted once), and at the end counts those the tree
+still holds by the books: `not writer.sizes.alone(old, writer.two_renames)`, one look each (an lstat, or `links_now()` on two
+renames), as the commit's `result()` reads them (an error of that look: not counted). The look is small beside the compare
+that came before it; counting from `result()`'s own pass instead would mark `shared`'s entries and move the line to
+`do_backup()`, a part for one lstat a link. A link never placed (discarded at a stop, left where a folder above stopped being
+real) or let go later in the batch (the verification removes its new place, a later copy replaces it) has dropped its count
+and is not counted. The line is a plain `backuperTeeLogToTl()` call (5462) with `monitor_path` and no flag, as the replay's
+other lines (`Moved … to …`, `Fixing … differences …`): logged at info level in the daemon's log, and printed too under
+`--debug`; `log_text()` escapes the whole line, the version's path with it.
 
 **State.** The links made, per batch.
 
@@ -608,11 +624,12 @@ lines (`Moved … to …`, `Fixing … differences …`): logged at info level i
 the commit, as the replay's other lines are: a batch that fails after the replay, in `do_backup()` (a pool disk that drops, a
 flush that fails), has logged it for links its version never commits, and its next attempt logs its own.
 
-**Tests:** `test_one_line_a_batch_names_the_files_and_bytes_linked` and, as pins, no such line in a batch that linked nothing; a
-link left unplaced not counted (a `finish_copies()` stand-in first removes a folder above the link's place, its copy name with
-it, and puts a symlink there); and a link the verification removes not counted (section 5's test of a linked file the tree lets
-go, its line asserted) (tests/test_no_copy_move.py). It is an info line: the repo's alert patterns
-(firewatcher/reverberator.regex) match only the markers and the exit line, so nothing alerts on it.
+**Tests:** `test_one_line_a_batch_names_the_files_and_bytes_linked` and, as pins, no such line in a batch that linked nothing;
+a link left unplaced not counted (a `finish_copies()` stand-in first removes a folder above the link's place, its copy name
+with it, and puts a symlink there); a link the verification removes not counted (section 5's test of a linked file the tree
+lets go, its line asserted); and one old file linked twice, the first link let go before the second, counted once
+(tests/test_no_copy_move.py). It is an info line: the repo's alert patterns (firewatcher/reverberator.regex) match only the
+markers and the exit line, so nothing alerts on it.
 
 ## 7. What it does not reach
 
@@ -1030,8 +1047,10 @@ Departures from the study (`.superpowers/p3/study-report.md`, read against e166b
    left out of the estimate or charged through the same lookup (sections 3, 7, 10).
 
 The step back's calls:
-10. The tree's letting go is read in the size books, not fed from the deletes (run for its test's record kinds, reasoned in
-    general); if a hole is found, the fallback is what each delete took, as a set of rels beside the names (section 5).
+10. The tree's letting go is read in the size books, not fed from the deletes (run in a probe for seven of its test's ten
+    record kinds, reasoned for the rest and in general, and forced by the test); if a hole is found, the fallback is what each
+    delete took, a set of rels beside the names, fed by `record()` and `remove_queued()` reporting what they took and, on two
+    renames, `pre_record()` what each delete's record took (section 5).
 11. One rule on every job, Only Sync Attributes on or off; an ambiguous name is a copy (a bounded cost, no number); a tie rule
     can come once something needs it (section 2).
 12. The draft's key search (renamed moves, twins elsewhere, off Only Sync Attributes only) is not built or offered: it does
@@ -1048,8 +1067,8 @@ The compare and the link:
 16. A compare holds one `BACKUP_SEMAPHORE` permit while it opens and reads, given back by `try`/`finally` before the link or
     copy; no wait closes a circle, read in multiCMD 1.51 (section 4).
 17. `poll_pools()` once after each compare, before the link or the copy (section 4).
-18. A compare raising anything but an OSError or a JobFailure is a copy, one error line with its traceback a batch; a
-    JobFailure, and `link_kept()`'s, fails the attempt (section 4).
+18. A compare raising anything but an OSError is a copy, one error line with its traceback a batch (`same_file()` raises no
+    JobFailure); a JobFailure of `link_kept()` or of the pool poll after the compare fails the attempt (section 4).
 19. Unbuffered handles; `hash_file()`'s post-open steps; `entry_metadata()` and `xattr_names()` on an fd; the seams
     `no_follow_opener()` and `read_block()`. Not `filecmp.cmp()` (its cache answers by size and mtime, the very case) nor
     `cmp -s` (it follows a link and blocks on a FIFO) (section 4).
@@ -1066,8 +1085,8 @@ The compare and the link:
     into the version before (sections 4, 5).
 26. `link_kept()` asks `alone()` itself and links only the compared inode: the check exists for mergerfs's `link-exdev` symlink
     modes, which the pool gate's third run forces; on a pool it rests on the default `inodecalc` (reasoned) (sections 5, 9).
-27. A copy name `link_kept()` cannot remove fails the attempt, as a name of the kept inode the books do not know would let a
-    second file link it (section 5).
+27. A copy name `link_kept()` cannot remove fails the attempt, as the copy after it would be committed beside the name (and,
+    off two renames, a second file could link the old file again) (section 5).
 28. `finish_copies()`'s branch for a folder above no longer real removes nothing more for a link: the copy name went with the
     folder; the ruling to remove one there is not built (section 5).
 29. Metadata that differs is a copy, with no sync onto the shared inode under Only Sync Attributes (the study's call); access
