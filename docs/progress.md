@@ -110,9 +110,18 @@ Behind it: the user's pick "Keep it one release" (2026-11-04). Every live vault 
 
 **P3. The no-copy move into a new folder: a design round.** Source: `specs/2026-11-12-r0555-design.md`, its opening and
 "The user's words"; the known limitation "A folder or file moved into a new folder is copied whole". State: the design
-study runs (from 2026-11-23, read-only, one agent; its brief and report in the session's scratch folder, `p3/`); no
-design yet. Next: its report, then a spec with the spec check, or a question if no route is right and simple enough;
-0.55.1's attempt was dropped after five routes that left wrong bytes. Built after round 0.55.7.
+study is done (2026-11-23, read-only; its brief, report and probes in the git-ignored `.superpowers/p3/` of the
+worktree). Its route: leave the watcher as it is and act at the copy. When the replay is about to copy a regular file
+and a file that left the version in the same batch compares equal in full, with the same mode, owner, mtime and
+extended attributes, the previous version's file is hard-linked to the new place (the state a move leaves); anything
+else is copied as today, so no order of events can make a version worse than a copy. It costs a read of both files in
+place of a write, and no state at rest. A watcher route cannot reach the case: a probe saw a program's back-to-back
+`mkdir` and `rename` arrive as an event in 2 of 300 runs, and every fix of 0.55.1 that filled that gap was fooled. On
+the live host the study found no such move in the retained versions and no size-limit prune since May 2026, so it is
+not urgent. Next: its spec (on Q24's recommended option) and the spec check, then its plan; built as its own round
+after 0.55.7. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
+proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
+page that a compare sees).
 Behind it: 2026-11-12, "continue next phase please" and the pick "Fixes + lightness, one round (Recommended)", offered
 with "the no-copy move into a new folder gets its own design round after".
 
@@ -297,6 +306,22 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     its own metadata changes. One more value and its rules, in the round after 0.55.6.
   - What waits on it: the limitations entry's wording (Task 20). The user's words it would narrow: "then left"
     (2026-11-17), for the mode, owner and time cases.
+
+- **Q24. Which files the no-copy move may link** (P3). The route links a file from the previous version, in place of
+  a copy, only when a file that left the version in the same batch compares equal in full and has the same mode, owner,
+  mtime and extended attributes; open is which files that left are looked at.
+  - (a) Every file the batch's deletes released, found by size and mtime (Recommended): besides `mkdir new; mv big new/`
+    it covers a move that also renames (`mv big new/other`), a move or rename made while reverberator was down (copied
+    once today), a tree deleted and unpacked again with its times kept, and the moves that fall back to a copy today.
+    One index per batch that both deletes and copies. The copy cost leaves four approved texts, each narrowed to what is
+    left: "A move that another change of the batch outran is copied", "A move into its own old place is copied whole",
+    "A move out of a folder that just left the tree is copied", and the README's line that moves made before a stop are
+    copied once.
+  - (b) Only an entry of the same name moved into a folder made in the batch: the move the user named, nothing more;
+    the other copies stay as approved.
+  - What waits on it: the spec's candidate rule and its tests. The user's words: "Drop the feature (Recommended)"
+    (2026-11-07), with "the no-copy move gets its own design later", and the pick of 2026-11-12 that gave it "its own
+    design round after". (a) goes beyond the move they named; nothing they said is dropped.
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
