@@ -118,8 +118,8 @@ else is copied as today, so no order of events can make a version worse than a c
 place of a write, and no state at rest. A watcher route cannot reach the case: a probe saw a program's back-to-back
 `mkdir` and `rename` arrive as an event in 2 of 300 runs, and every fix of 0.55.1 that filled that gap was fooled. On
 the live host the study found no such move in the retained versions and no size-limit prune since May 2026, so it is
-not urgent. Next: its spec (on Q24's recommended option) and the spec check, then its plan; built as its own round
-after 0.55.7. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
+not urgent. Its spec is being written (2026-11-23, one agent, on Q24's recommended option with the places the other
+option changes marked); next the spec check, then its plan; built as its own round after 0.55.7. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
 Behind it: 2026-11-12, "continue next phase please" and the pick "Fixes + lightness, one round (Recommended)", offered
