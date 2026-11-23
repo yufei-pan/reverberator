@@ -126,7 +126,10 @@ before the replay, so as written nothing would link there while the estimate sto
 from the findings (a8bef37: the feed also comes from those records; the compares run in parallel where the copies run;
 Q24 gained a "not now" option and lists exactly what (a) narrows), and re-checked (no step back needed; new findings on
 the candidate choice, the compare's timing, the roll-forward, the estimate's shortfalls and the docs texts). Its second
-fix round runs (2026-11-23); then the review that says whether findings repeat in one part, and the plan. Built as its
+fix round is done (a1f9d7d); its findings kept landing in the same parts (how a candidate is found, the estimate's
+prediction), the spec grew to 140 KB, and the lookup it was given misses the main shape below the top of the monitored
+folder, so a fresh agent steps back on the design (the agent rules' "Step back when findings repeat"); no further fix
+round on those parts until it answers. Then the spec is reshaped, checked, and the plan written. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
