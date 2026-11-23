@@ -316,11 +316,14 @@ not path-preserving), a link or a rename across disks is made on the source's di
 bytes when the tree's file is replaced or removed. Under a path-preserving policy (epmfs) with `link-exdev=passthrough`, a
 link answers EXDEV and `link_or_copy()` copies (the entry "A copy made where the vault refused a hard link" says so).
 With any symlink mode of either option, mergerfs aborts on the call (an assertion of its own), and the pool is gone until
-it is mounted again. That is an upstream bug; its report is drafted (Q26). So on this version the record never takes a
-symlink. Two things are left. Under a path-preserving policy a tree move between disks gets EXDEV from `os.rename`,
-which `TreeWriter.rename()` raises, so the attempt fails; what the retry does is not checked. And a later mergerfs that
-fixes the abort could make the symlink. Next: a backup with such moves on an epmfs pool in the test VM, then the ladder
-for both. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
+it is mounted again. Under `rename-exdev`, it has first moved the source into `.mergerfs_rename_exdev/` on the source's
+disk, so after a remount the file is at neither name. That is an upstream bug; its report is drafted (Q26). So on this
+version the record never takes a symlink. Three things are left. Under a path-preserving policy a tree move between
+disks gets EXDEV from `os.rename`, which `TreeWriter.rename()` raises, so the attempt fails; what the retry does is not
+checked. With `rename-exdev` set to a symlink mode, whether a version then misses the moved-away file, or the retry
+brings it back, is not checked either. And a later mergerfs that fixes the abort could make the symlink. Next: backups
+with such moves on an epmfs pool in the test VM, with `rename-exdev` at passthrough and at `rel-symlink`, then the
+ladder for all three. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
 the source's. No vault is on a pool today. Behind it: the main session's call, on the goal (a version must hold the bytes
 it backed up).
 
