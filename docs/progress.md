@@ -133,15 +133,15 @@ the main session takes: the route stays, and its table of released files, the fe
 size and time go; a file is looked up by the names of the batch's deleted entries, at the same place below the deleted
 one in the version before, the size books say whether the tree let it go, and the estimate asks the same lookup. It
 finds `mkdir new; mv big new/` anywhere in the tree on every kind of job; a move that renames the entry stays a copy.
-The spec is rewritten on it (bb67c8d, 2026-11-23; 100 KB from 140), and Q24 and Q25 here from it. Its fresh spec
+The spec is rewritten on it (bb67c8d, 2026-11-23; 100 KB from 140), and Q24 and Q25 here from it, kept in step since. Its fresh spec
 check found it reaches the goal and that the size books' rule it rests on holds for every way the writer records an
 entry; its findings (builder gaps, wording, the cold measurement taken from live backups as the standing decision says,
 the compares bounded by `--threads`, one lstat only where a name matches) are fixed (7bc36d4), and a re-review of
 the fix found no wrong result; its points (the compare pool's limits and errors, a link's flush and leftovers, test and
 text gaps) are fixed in a second round (221a531), with the compare pool kept only if the build measures it faster
 than one compare at a time; the review after that round found the findings repeating in the compare, so the last round
-removes the parallel compare for one that runs on the replay's own thread, and cuts the spec back to about 105 KB with
-every decision kept (2026-11-23); then the plan. Built as its
+removed the parallel compare for one that runs on the replay's own thread, and cut the spec back to 106 KB with every
+decision kept (a28f86b, 2026-11-23). Next: a short check of that last round, then the plan. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
@@ -343,18 +343,22 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
   `specs/2026-11-23-no-copy-move-design.md`, bb67c8d, whose fresh check may still change this text). The route links a
   file from the version before, in place of a copy, only when the version before alone holds it, it compares equal in
   full, and it has the same mode, owner, group, mtime and extended attributes.
-  - (a) Build it (Recommended): on every kind of vault, with Only Sync Attributes on or off, a file under a folder the
-    batch copies is hard-linked from the version before when the batch deleted an entry of the same name and the file at
-    the same place below it is the same. It reaches `mkdir new; mv big new/` and `mkdir -p a/b; mv big a/b/` anywhere in
-    the tree, to the same or another parent, a moved file as a moved folder, a move made while reverberator was down that
-    kept the entry's name, and a tree deleted and unpacked elsewhere under its name with its times kept. As after a move,
-    under Only Sync Attributes (the default) a later change of a linked file's mode, owner or extended attributes also
-    shows at its old place in the version before (for an unpack or a `cp -p` then `rm`, the old file's place). Still copied: an
-    entry renamed in the move; two deleted entries of one name in one batch; the second of two new files matching one old
-    file; a file made in the batch and then moved; a file changed in the move's batch; an old place deleted after the
-    copy; a cut batch's roll-forward; a vault that refuses hard links; a copy fallback, except where its path holds
-    another deleted entry's name and the file there is the same. It narrows the entry "A folder or file moved into a new folder is copied whole" and README lines 15
-    and 22. It touches neither the watcher, the manifest, nor how the writer records.
+  - (a) Build it (Recommended): on a vault that links (a mergerfs pool's answer is the pool test's to show), with Only
+    Sync Attributes on or off, a file under a folder the batch copies is hard-linked from the version before when the
+    batch deleted an entry of the same name and the file at the same place below it is the same. It reaches `mkdir new;
+    mv big new/` and `mkdir -p a/b; mv big a/b/` anywhere in the tree, to the same or another parent, a moved file as a
+    moved folder, a move made while reverberator was down that kept the entry's name, and a tree deleted and unpacked
+    elsewhere under its name with its times kept. As after a move, under Only Sync Attributes (the default) a later
+    change of a linked file's mode, owner, times or extended attributes also shows at its old place in the version
+    before (for an unpack or a `cp -p` then `rm`, the old file's place). Every copy the names do not reach stays a copy
+    (the spec's section 7), chiefly: an entry renamed in the move; two deleted entries of one name in one batch; the
+    second of two new files matching one old file; a file made in the batch and then moved; a file changed in the move's
+    batch; an old place deleted after the copy; a delete and a create of one path; swaps; a cut batch's roll-forward; a
+    vault that refuses hard links; a copy fallback, except where its path holds another deleted entry's name and the file
+    there is the same. It narrows the entry "A folder or file moved into a new folder is copied whole" and README lines
+    15 and 22, adds a sentence to "A move out of a folder that just left the tree is copied" and README lines 4, 43 and
+    115, and drops that entry's spent revisit clause. It touches neither the watcher, the manifest, nor how the writer
+    records. It is built after 0.55.7.
   - (b) Not now: keep the entry and the design on file, and build it when a size-limited job prunes for such a move, or a
     job over a tree of user files is added. The design study found it not urgent on the live host (its report, outside
     the repo, has the details).
@@ -371,7 +375,8 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
   for a file the copy step will find (its place below an entry of the same name the batch deletes holds a file of its
   size, mtime, mode, owner and group), so a move into a new folder no longer prunes for a copy that is never made. Where
   such a file is copied after all, the vault passes its limit by that copy until the next backup prunes, for four causes:
-  its bytes or extended attributes differ; its delete removes nothing there (the length rule, or another kind at its
+  its bytes or extended attributes differ, or it changed after the estimate looked (then by its whole size); its delete
+  removes nothing there (the length rule, or another kind at its
   place); it is the second of two new files matching one removed file; its link fails (a vault that refuses hard links,
   or a mergerfs pool answering EXDEV between its disks: every such file, every time) or a look or read fails.
   - (a) Widen the approved entry "Size estimates leave out a version's own small blocks" to say so (Recommended): a prune
