@@ -340,7 +340,7 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     (2026-11-17), for the mode, owner and time cases.
 
 - **Q24. Whether to build the no-copy move now** (P3; written out in its spec's questions,
-  `specs/2026-11-23-no-copy-move-design.md`, bb67c8d, whose fresh check may still change this text). The route links a
+  `specs/2026-11-23-no-copy-move-design.md`, a28f86b). The route links a
   file from the version before, in place of a copy, only when the version before alone holds it, it compares equal in
   full, and it has the same mode, owner, group, mtime and extended attributes.
   - (a) Build it (Recommended): on a vault that links (a mergerfs pool's answer is the pool test's to show), with Only
