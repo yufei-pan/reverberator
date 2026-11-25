@@ -146,7 +146,7 @@ spec is settled. Its plan is written (`plans/2026-11-23-no-copy-move.md`, 6fdd36
 and [Q24]/[Q25] marks for what the other options change), checked twice (nothing that could give a wrong version; the findings on test strength, venues and buildability fixed
 in da6288c and ff87dd7, 114 KB, most of it test code); from here the build's own gates check its tests (each test's run
 on the base and on its task, the per-task reviews, the final review). Done as a design round (2026-11-23). The build
-waits for Q24 and Q25 and for round 0.55.7's merge, on its own branch, by subagent-driven development. Built as its
+waits for Q24 (Q25 is decided, for Q24 (a): Closed) and for round 0.55.7's merge, on its own branch, by subagent-driven development. Built as its
 own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
@@ -329,11 +329,13 @@ its space for good once the version before is pruned. (3) Under `link-exdev` set
 the same record's link and kills the mount again: stuck. Buckets: (2) and (3), and the symlink a fixed mergerfs would
 make, are deferred to the round after 0.55.7 (the pool check reads both options through the control file and waits,
 naming the option: the limitations entry "A vault pool that answers a cross-disk link or rename with a symlink breaks
-the pool", and a README line). (1) widens an approved entry, so it is Q27. An attempt already running when mergerfs dies
+the pool", and a README line). (1) widened an approved entry, so it was Q27, decided (a) (Closed): the entry "A copy
+made where the vault refused a hard link" is widened, with a README clause, and the ERROR becomes a WARNING in the round
+after 0.55.7 (the deferred entry "A move between a pool's disks logs an ERROR with a traceback"). An attempt already running when mergerfs dies
 fails on the manifest's open error, whose text says to remove the manifest if the error stays. The next attempt does not
 reach it: `wait_for_path()` checks the vault path with `os.path.isdir()`, which a dead mount answers False, so the job
 waits (read from the code, not run; the run called `do_backup()` directly, so it met the error again). State: checked.
-It waits on Q26 and Q27; its fixes ride the round after 0.55.7. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
+It waits on Q26 (nothing in reverberator waits on that); its fixes ride the round after 0.55.7. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
 the source's. No vault is on a pool today. Behind it: the main session's call, on the goal (a version must hold the bytes
 it backed up).
 
@@ -392,29 +394,12 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     the repo, has the details).
   - Not offered: a search by size and time for a removed file anywhere in the batch, which would add moves that rename
     the entry; with Only Sync Attributes on (the default) it would do nothing, and it needs a table, an index and a bound.
-  - What waits on it: the whole build (after 0.55.7), and Q25, which (b) makes moot. The user's words: "Drop the feature
+  - What waits on it: the whole build (after 0.55.7). Q25, the size estimate's part, is decided for (a) (Closed); (b)
+    makes it moot. The user's words: "Drop the feature
     (Recommended)" (2026-11-07), with "the no-copy move gets its own design later", and on 2026-11-12 the pick "Fixes +
     lightness, one round (Recommended)", offered with "the no-copy move into a new folder gets its own design round
     after". (a) reaches beyond the move they named by the same rule; nothing they said is
     dropped.
-
-- **Q25. The size estimate and a file the no-copy move will link** (P3; asked with Q24, moot under its (b)). With a
-  size limit, the estimate before each backup decides how many old versions to prune. From P3's round it charges nothing
-  for a file the copy step will find (its place below an entry of the same name the batch deletes holds a file of its
-  size, mtime, mode, owner and group), so a move into a new folder no longer prunes for a copy that is never made. Where
-  such a file is copied after all, the vault passes its limit by that copy until the next backup prunes, for four causes:
-  its bytes or extended attributes differ, or it changed after the estimate looked (then by its whole size); its delete
-  removes nothing there (the length rule, or another kind at its
-  place); it is the second of two new files matching one removed file; its link fails (a vault that refuses hard links,
-  or a mergerfs pool answering EXDEV between its disks: every such file, every time) or a look or read fails.
-  - (a) Widen the approved entry "Size estimates leave out a version's own small blocks" to say so (Recommended): a prune
-    made for a copy never made removes a version for good, an overshoot lasts until the next prune; no vault has shown a
-    refused hard link yet, and the pool test shows which way mergerfs answers.
-  - (b) Charge every copy as today: no new overshoot, but under a size limit each move into a new folder still prunes
-    older versions for the whole moved size, the harm the round exists to remove.
-  - What waits on it: the estimate's part of the spec, its texts (written only on the answer), and the build, which
-    starts after both answers. The user's words it would narrow: none; it widens an entry the user approved (2026-10-26,
-    "Known limitation (Recommended)"; last widened 2026-11-13, "Widen the entry (Recommended)").
 
 - **Q26. Post a report to mergerfs** (P19). With a path-preserving create policy and a symlink mode of `link-exdev` or
   `rename-exdev`, mergerfs 2.42.0 on Linux 7.0 aborts on a link or a rename across its disks (`ugid.hpp:87: Assertion
@@ -425,22 +410,6 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
     text just before posting.
   - (b) Not now: keep the draft.
   - What waits on it: nothing in reverberator. The user's words it would touch: none.
-
-- **Q27. A vault on a mergerfs pool whose create policy is path-preserving** (P19, result 1). Under such a policy (epmfs,
-  say; mergerfs's default, pfrd, is not one), mergerfs cannot rename or hard-link across its disks and answers EXDEV. The
-  run showed every version right, but a move between disks is copied: the moved bytes are stored twice until the old
-  version is pruned (a folder's whole subtree). Today the move logs an ERROR with a traceback for each moved entry, as
-  if something had gone wrong.
-  - (a) Accept the copies and widen the approved entry "A copy made where the vault refused a hard link" to moves
-    between a path-preserving pool's disks, with one README clause. The round after 0.55.7 then logs each such move as
-    the WARNING "Not renaming ...; copying it instead", with no traceback (Recommended: it keeps such pools working, and
-    a copy is the only way to put the move into a version there; the fix is a few lines).
-  - (b) Refuse such pools: the pool check waits while a vault's pool has a path-preserving create policy, naming
-    `category.create`. No doubled bytes, but an operator on such a pool gets no backups until they change the policy,
-    and the check must know mergerfs's policy names.
-  - What waits on it: the entry's wording and the log line's fix, in the round after 0.55.7. The user's words it would
-    touch: "Support pools with a limitation" (2026-11-04), which (a) keeps and (b) narrows; it widens an entry the user
-    approved (2026-11-09, "Known limitation (Recommended)", then "Widen the entry (Recommended)").
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
@@ -470,6 +439,19 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Q27, a vault on a mergerfs pool whose create policy is path-preserving (P19, result 1: a move between its disks is
+  deleted and copied, the moved bytes stored twice until the version before is pruned, with an ERROR and its traceback
+  for each move; every version right): (a), chief's decision, 2026-11-24. The approved entry "A copy made where the vault
+  refused a hard link" is widened to such moves, with a README clause, and the round after 0.55.7 logs each one as the
+  WARNING "Not renaming ...; copying it instead", with no traceback (the deferred entry "A move between a pool's disks
+  logs an ERROR with a traceback"). It keeps "Support pools with a limitation" (2026-11-04). Reversed by "refuse
+  path-preserving pools": the pool check would then wait on such a pool, naming `category.create`.
+- Q25, the size estimate and a file the no-copy move will link (P3): (a), chief's decision, 2026-11-24, applying only if
+  the user picks (a) on Q24 (under (b) it is moot): the estimate charges nothing for a file the copy step will find, and
+  the approved entry "Size estimates leave out a version's own small blocks" is widened to the overshoot when such a file
+  is copied after all (its bytes or extended attributes differ or it changed after the estimate looked; its delete
+  removes nothing there; the second of two new files matching one removed file; a failed link, look or read), written
+  with P3's build. Reversed by "charge every copy as today".
 - Q20 to Q23, round 0.55.7's questions (`specs/2026-11-22-r0557-design.md`, where each is written out at length), each
   decided on its recommended option, the one the spec and plan build: chief's decisions, 2026-11-22. A known limitation's
   approved field says "chief's decision, 2026-11-22"; the plan's Task 18 says what a reversal by the user changes.

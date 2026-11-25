@@ -269,11 +269,18 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   can free space. And where the batch was cut before it changed a name, the newest version's own file, flushed at the
   commit of the version before, is replaced by a copy of the record copy, which no flush is known to cover; at a name the
   retry does not copy again (under an inner mount unmounted at the start, say) the newest version keeps that copy under a
-  checked row. A mergerfs pool that answers EXDEV between its disks does the same.
-- **Why:** no other copy of those bytes exists.
-- **Revisit when:** a vault ever shows refused hard links.
+  checked row. A mergerfs pool that answers EXDEV between its disks does the same. Such a pool, one whose create policy
+  is path-preserving (epmfs, say) with `link-exdev` and `rename-exdev` at passthrough, their default, also refuses a
+  rename between its disks: a move in the tree whose entry and new folder sit on different disks of the vault's pool is
+  deleted and copied, so the moved bytes (a folder's whole subtree) are stored twice until the version before is pruned.
+  Every version holds the right bytes (run on a test pool of two disks, 2026-11-23). Under a create policy that is not
+  path-preserving (pfrd, mergerfs's default) a link or a rename is made on the source's disk and nothing is copied.
+- **Why:** no other copy of those bytes exists; and on a pool that cannot rename or link between its disks, a copy is
+  the only way to put the move into a version.
+- **Revisit when:** a vault ever shows refused hard links, or a vault is put on a path-preserving pool.
 - **Approved:** 2026-11-09, the user's choice "Known limitation (Recommended)", then "Widen the entry (Recommended)"
-  for the second way; 2026-11-13, "Widen the entry (Recommended)".
+  for the second way; 2026-11-13, "Widen the entry (Recommended)"; 2026-11-24, chief's decision, widening it to moves
+  between the disks of a path-preserving pool, on the user's words "Support pools with a limitation" (2026-11-04).
 
 ### A clock set back after a read was stamped
 
@@ -1056,3 +1063,15 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
 - **Revisit when:** the round after 0.55.7: the pool check reads both options through the pool's control file (one
   extended-attribute read each) and, while either is not passthrough on a vault's pool, the job waits, its reason naming
   the option to set back.
+
+### A move between a pool's disks logs an ERROR with a traceback
+
+- **Kind:** deferred.
+- **What the operator sees:** on a vault on a mergerfs pool that refuses a rename between its disks (the entry "A copy
+  made where the vault refused a hard link"), each move the backup copies instead logs an ERROR, "Failed to move
+  <source> to <target>", with the Python traceback of the pool's EXDEV answer, then "Doing delete & copy instead", as if
+  something had gone wrong. The attempt commits, and every version holds the right bytes.
+- **Why:** `TreeWriter.rename()` raises every OSError but a missing source, and the replay's catch-all reports it as a
+  failure; a refused rename was not foreseen there.
+- **Revisit when:** the round after 0.55.7: such a move logs one WARNING, "Not renaming <source> to <target>: ...;
+  copying it instead", with no traceback, as a move whose source is not in the version does.
