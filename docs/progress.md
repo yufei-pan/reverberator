@@ -146,8 +146,8 @@ spec is settled. Its plan is written (`plans/2026-11-23-no-copy-move.md`, 6fdd36
 and [Q24]/[Q25] marks for what the other options change), checked twice (nothing that could give a wrong version; the findings on test strength, venues and buildability fixed
 in da6288c and ff87dd7, 114 KB, most of it test code); from here the build's own gates check its tests (each test's run
 on the base and on its task, the per-task reviews, the final review). Done as a design round (2026-11-23). The build
-waits for Q24 (Q25 is decided, for Q24 (a): Closed) and for round 0.55.7's merge, on its own branch, by subagent-driven development. Built as its
-own round after 0.55.7, and only after Q24's answer. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
+waits for round 0.55.7's merge (Q24 and Q25 are answered: Closed), on its own branch, by subagent-driven development. Built as its
+own round after 0.55.7. The main session's calls: build it (the user's pick of 2026-11-12 gave it its own design round), and the
 proof is the full compare alone (no inode column: no format change, and an inode cannot show a write through a mapped
 page that a compare sees).
 Behind it: 2026-11-12, "continue next phase please" and the pick "Fixes + lightness, one round (Recommended)", offered
@@ -358,38 +358,6 @@ out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chie
   - What waits on it: the limitations entry's wording (Task 20). The user's words it would narrow: "then left"
     (2026-11-17), for the mode, owner and time cases.
 
-- **Q24. Whether to build the no-copy move now** (P3; written out in its spec's questions,
-  `specs/2026-11-23-no-copy-move-design.md`, 371dbad). The route links a
-  file from the version before, in place of a copy, only when the version before alone holds it, it compares equal in
-  full, and it has the same mode, owner, group, mtime and extended attributes.
-  - (a) Build it (Recommended): on a vault that links (a mergerfs pool's answer is the pool test's to show), with Only
-    Sync Attributes on or off, a file under a folder the batch copies is hard-linked from the version before when the
-    batch deleted an entry of the same name and the file at the same place below it is the same. It reaches `mkdir new;
-    mv big new/` and `mkdir -p a/b; mv big a/b/` anywhere in the tree, to the same or another parent, a moved file as a
-    moved folder, a move made while reverberator was down that kept the entry's name, and a tree deleted and unpacked
-    elsewhere under its name with its times kept. As after a move, under Only Sync Attributes (the default) a later
-    change of a linked file's mode, owner, times or extended attributes also shows at its old place in the version
-    before (for an unpack or a `cp -p` then `rm`, the old file's place). Every copy the names do not reach stays a copy
-    (the spec's section 7), chiefly: an entry renamed in the move; two deleted entries of one name in one batch; the
-    second of two new files matching one old file; a file made in the batch and then moved; a file changed in the move's
-    batch; an old place deleted after the copy; a delete and a create of one path; swaps; a cut batch's roll-forward; a
-    vault that refuses hard links; a copy fallback, except where its path holds another deleted entry's name and the file
-    there is the same. It narrows the entry "A folder or file moved into a new folder is copied whole" and README lines
-    15 and 22, adds a sentence to "A move out of a folder that just left the tree is copied" and README lines 4, 43 and
-    115, and drops that entry's spent revisit clause. It touches neither the watcher, the manifest, nor how the writer
-    records. It is built after 0.55.7.
-  - (b) Not now: keep the entry and the design on file, and build it when a size-limited job prunes for such a move, or a
-    job over a tree of user files is added. The design study found it not urgent on the live host (its report, outside
-    the repo, has the details).
-  - Not offered: a search by size and time for a removed file anywhere in the batch, which would add moves that rename
-    the entry; with Only Sync Attributes on (the default) it would do nothing, and it needs a table, an index and a bound.
-  - What waits on it: the whole build (after 0.55.7). Q25, the size estimate's part, is decided for (a) (Closed); (b)
-    makes it moot. The user's words: "Drop the feature
-    (Recommended)" (2026-11-07), with "the no-copy move gets its own design later", and on 2026-11-12 the pick "Fixes +
-    lightness, one round (Recommended)", offered with "the no-copy move into a new folder gets its own design round
-    after". (a) reaches beyond the move they named by the same rule; nothing they said is
-    dropped.
-
 - **Q26. Post a report to mergerfs** (P19). With a path-preserving create policy and a symlink mode of `link-exdev` or
   `rename-exdev`, mergerfs 2.42.0 on Linux 7.0 aborts on a link or a rename across its disks (`ugid.hpp:87: Assertion
   'newuid_ != FUSE_INVALID_UIDGID' failed`), and the pool's mount is dead until it is mounted again. The repro takes four
@@ -428,6 +396,11 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Q24, whether to build the no-copy move (P3; its spec's questions, `specs/2026-11-23-no-copy-move-design.md`): (a),
+  build it, as its own round after 0.55.7, by the spec and plan as written (a file under a folder the batch copies is
+  hard-linked from the version before when the batch deleted an entry of the same name and the file at the same place
+  below it is the same; every copy the names do not reach stays a copy). The user's pick 2026-11-26 (01:02 PST, through
+  chief), "Build it (Recommended)", offered with the design study's finding that it is not urgent on the live host.
 - Q19, roll out 0.55.6 (P1): (a), roll out now by the runbook. The user's pick 2026-11-26 (00:57 PST, through chief),
   "Roll out now (Recommended)": merge into main, back up the rule file, restart the live backup service, health check;
   then the push after a healthy restart, with chief's OK.
@@ -439,7 +412,7 @@ Kept so they are not lost; none is planned until the user picks it.
   logs an ERROR with a traceback"). It keeps "Support pools with a limitation" (2026-11-04). Reversed by "refuse
   path-preserving pools": the pool check would then wait on such a pool, naming `category.create`.
 - Q25, the size estimate and a file the no-copy move will link (P3): (a), chief's decision, 2026-11-24, applying only if
-  the user picks (a) on Q24 (under (b) it is moot): the estimate charges nothing for a file the copy step will find, and
+  the user picks (a) on Q24, which they did on 2026-11-26: the estimate charges nothing for a file the copy step will find, and
   the approved entry "Size estimates leave out a version's own small blocks" is widened to the overshoot when such a file
   is copied after all (its bytes or extended attributes differ or it changed after the estimate looked; its delete
   removes nothing there; the second of two new files matching one removed file; a failed link, look or read), written
