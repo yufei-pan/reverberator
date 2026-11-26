@@ -335,7 +335,7 @@ after 0.55.7 (the deferred entry "A move between a pool's disks logs an ERROR wi
 fails on the manifest's open error, whose text says to remove the manifest if the error stays. The next attempt does not
 reach it: `wait_for_path()` checks the vault path with `os.path.isdir()`, which a dead mount answers False, so the job
 waits (read from the code, not run; the run called `do_backup()` directly, so it met the error again). State: checked.
-It waits on Q26 (nothing in reverberator waits on that); its fixes ride the round after 0.55.7. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
+Q26 is answered (the user posts the report: Closed); its fixes ride the round after 0.55.7. The candidate fixes: read the pool's `link-exdev` through its control file, or compare the link's inode with
 the source's. No vault is on a pool today. Behind it: the main session's call, on the goal (a version must hold the bytes
 it backed up).
 
@@ -343,30 +343,6 @@ it backed up).
 
 Round 0.55.6's questions, from its spec (`specs/2026-11-14-r0556-design.md` section 26, 1e96eeb, where each is written
 out at length), are all closed: the user answered Q9, Q13, Q14 and Q15, and chief decided Q10 to Q12 (2026-11-15).
-
-- **Q18. A folder whose metadata copy fails every time, beyond its extended attributes** (P16 step 2, Task 18). Q15
-  (a), which the user picked on 2026-11-17, said: "A copy that fails every time is tried once more, then left." Built,
-  that holds for a folder whose extended attributes alone fail to copy (its record then matches the monitored folder).
-  When the failed copy also leaves the folder's mode, owner or time different (an attribute write failing with a full
-  disk or an I/O error before the mode is set; a change of owner the vault's filesystem refuses), every later comparison
-  that meets the folder copies it again, fails again, and makes a version that changes nothing, with its ERROR line, as
-  0.55.5 does today. Under Keep N Versions each such version pushes the oldest out.
-  - (a) Accept it as built and say so in the limitations entry (Recommended: no worse than 0.55.5; the case needs a copy
-    that fails every time, which the ERROR line already reports; a stop needs a second mark with its own state).
-  - (b) Build a "gave up" mark: after the failed retry the row is marked so no comparison copies the folder again until
-    its own metadata changes. One more value and its rules, in the round after 0.55.6.
-  - What waits on it: the limitations entry's wording (Task 20). The user's words it would narrow: "then left"
-    (2026-11-17), for the mode, owner and time cases.
-
-- **Q26. Post a report to mergerfs** (P19). With a path-preserving create policy and a symlink mode of `link-exdev` or
-  `rename-exdev`, mergerfs 2.42.0 on Linux 7.0 aborts on a link or a rename across its disks (`ugid.hpp:87: Assertion
-  'newuid_ != FUSE_INVALID_UIDGID' failed`), and the pool's mount is dead until it is mounted again. The repro takes four
-  lines, as root. A search found no report of it. The draft is outside the repo (the git-ignored `.superpowers/p19/` of
-  the worktree), for the user to post from their own account.
-  - (a) Post it (Recommended): a crash on a documented option, with a short repro; check the tracker for the assertion
-    text just before posting.
-  - (b) Not now: keep the draft.
-  - What waits on it: nothing in reverberator. The user's words it would touch: none.
 
 - **Q7.** The upstream report to the f2fs list (a checkpoint inside `symlink(2)` keeps a link with no target) is
   drafted, for the user to send from their own address (the draft is outside the repo). The user, 2026-11-14: "Not
@@ -396,6 +372,18 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Q26, a report to mergerfs (P19: with a path-preserving create policy and a symlink mode of `link-exdev` or
+  `rename-exdev`, mergerfs 2.42.0 aborts on a link or a rename across its disks, `ugid.hpp:87: Assertion 'newuid_ !=
+  FUSE_INVALID_UIDGID' failed`): (a), post it. The user's pick 2026-11-26 (through chief), "Post it (Recommended)": the
+  user posts the draft from their own account when they like; just before, the agent checks mergerfs's tracker for the
+  assertion text and whether a release after 2.42.0 fixed it. The draft stays ready outside the repo (the git-ignored
+  `.superpowers/p19/mergerfs-report-draft.md` of the worktree; kept elsewhere if the worktree goes).
+- Q18, a folder whose metadata copy fails every time, beyond its extended attributes (P16 step 2, Task 18: when the
+  failed copy leaves the folder's mode, owner or mtime different, every later comparison that meets it copies it again
+  and makes a version that changes nothing, with its ERROR line, as 0.55.5 does): (a), accept it as built, a known
+  limitation; the entry "A folder whose extended attributes alone fail to copy keeps the wrong ones" says so. The
+  user's pick 2026-11-26 (through chief), "Accept it as built (Recommended)", narrowing "then left" (2026-11-17) for the
+  mode, owner and time cases.
 - Q24, whether to build the no-copy move (P3; its spec's questions, `specs/2026-11-23-no-copy-move-design.md`): (a),
   build it, as its own round after 0.55.7, by the spec and plan as written (a file under a folder the batch copies is
   hard-linked from the version before when the batch deleted an entry of the same name and the file at the same place

@@ -489,7 +489,8 @@ Each entry here has the user's OK. Reviewers read this file first and don't rais
   for a failure that leaves the mode, owner or mtime different would be a second mark with rules of its own.
 - **Revisit when:** such failures are seen in the log.
 - **Approved:** 2026-11-04, the user's choice "All three (Recommended)"; 2026-11-17, the mark and its one retry built,
-  the user's answer (through chief) "Build the retry (Recommended)".
+  the user's answer (through chief) "Build the retry (Recommended)"; 2026-11-26, the copy again at every comparison when
+  the mode, owner or mtime is left different, the user's answer (through chief) "Accept it as built (Recommended)".
 
 ### On a mergerfs pool, a folder cloned to another disk can lose setgid
 
