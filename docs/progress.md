@@ -59,45 +59,18 @@ limits are kept outside this public repo, in the agent's private notes beside it
 
 ## Open parts
 
-**P1. The deferred entries of `docs/limitations.md`.** Source: the 17 entries whose kind is deferred. State: round
-0.55.6 (branch `r0556`) takes the entries whose "Revisit when" names the round after 0.55.5 (15 of the 17); its spec
-(`specs/2026-11-14-r0556-design.md`, 0c13d04). The other two wait for upstream fixes. Where the round stands
-(2026-11-15): the spec check against the user's words and a second opinion against the code are done (their reports are
-in the session's scratch folder, `r0556/`), and the spec is revised from them (1e96eeb, 33 findings: 29 taken or
-corrected, 4 rejected with reasons in its commits). Its questions were Q9 to Q15, all closed (the user's picks and
-chief's decisions). The plan is written (`plans/2026-11-15-r0556.md`, 68fc1b0, 22 tasks) on the recommended options; a
-table at its top and a [Q<n>] mark on each task say what another answer changes, Task 18 runs only on Q15 (a), and Task
-2 (the healing test) runs second so Q15 can be asked while the round builds. The plan corrects the spec in places
-(listed in its Calls to confirm; the spec stays as written). Building since 2026-11-16 22:15 PST (chief's decision of
-that time), by subagent-driven development, on the recommended options, which Q9 to
-Q15's answers all took; the build's ledger (task by task, rulings, deferred minors) is the git-ignored
-`.superpowers/sdd/2026-11-15-r0556/progress.md` in the worktree. Where it stands (2026-11-17 11:20 PST): Task 1 (P15)
-done and reviewed (71e4e42..1b5febe); Task 2 (P16's healing check) done and reviewed after two fix rounds
-(2dc2fd0..8aed9ab), its results asked as Q15 (answered (a) 2026-11-17, so Task 18 is built); Task 3 (P4 to P6) done and
-reviewed (926e963); Task 4 (P13) done and reviewed (4670ea0); Task 5 (P10) done and reviewed (c8eb142); Task 6 (P11)
-done and reviewed after one fix round (3869779..f255db9); Task 7 (P12, D14, D13's watcher half) done and reviewed (b509e24..a41adcd; the walk's loop in the faster shape the main
-session ruled on, a2d3a28, at Task 6's figure); Task 8 (D2, D1) done and reviewed (789edec); Task 9 (D4) done and reviewed after one fix
-round (4f712ac..db9bd4b); Task 10 (D8, D7) done and reviewed (2b252b4, 93f6be9); Task 11 (D9, D11) done and reviewed
-(8a8dfb7: a one-file batch reads /etc/fstab once, 18 times on a pool before); Task 12 (D10) done and reviewed (8c70fd6); Task 13 (D5, D6) done and reviewed after one fix
-round (a15a420..b565fd2); Task 14 (D3 item 1) done and reviewed (102cf04); Task 15 (D3 items 2, 3) done and reviewed after two fix rounds and
-a design check's rework (4449b76..07aba64: a link a cut left in staging stays there until the scan after the commit);
-Task 16 (D15) done and reviewed after one fix round (46d124f, ee55869: a gate after a burst and a pin counting the
-trim at each commit); Task 17 (P14) done and reviewed after one docs fix round (8c127fd, d2070f3); Task 18 (P16 step
-2, on Q15's answer) done and reviewed (4652c40, eedbabd); Task 19 not built (every question took its
-recommended answer); the round's cleanup done in three passes (88738db..cd8893e) and Task 20's docs (d2081b6; the shared
-lessons file's lines committed, not pushed); the flaky watcher test fixed in the test (28e879c: it wrote before the
-watcher's settle had removed the moved folder's watches; 22 of 240 runs under load failed before, none after); the final
-review done (2026-11-22: with fixes), its fix wave, re-review and residual pass done, every finding fixed or
-bucketed (fourteen deferred entries for the round after 0.55.6); the VM gate passed on the last code commit and the
-container suite on the version commit; version 0.55.6 at e166baa. Q19 answered (the user, 2026-11-26): merged into main
-by fast-forward (300365a) and the rule file backed up; the restart onto it, its health check and the push come next; a history cleanup before the push is done (2026-11-22). The round's record (measurements, Calls to confirm,
-the build's rulings): `docs/progress/r0556.md`. Next: the round after 0.55.6 (0.55.7, its fourteen
-deferred entries): its spec (`specs/2026-11-22-r0557-design.md`, 2026-11-22) is written, checked by fresh agents four
-times and revised after each (a step back redesigned two parts that drew findings in every round); its questions Q20
-to Q23 are decided, each on its recommended option (chief's decisions, 2026-11-22; Closed); its plan is written
-(`plans/2026-11-22-r0557.md`, 20 tasks, on those options: a table at its top and a [Q<n>] mark on each task say what
-another answer would change). It is built on its own branch after the roll-out, when chief's word on the shared usage limits allows it.
-It pauses for shared usage limits as those decisions say. Behind it: a deferral is planned work; the user's pick 2026-11-14, "Fixes round (Recommended)".
+**P1. The deferred entries of `docs/limitations.md`.** Source: the entries whose kind is deferred. State: round 0.55.6
+(branch `r0556`), which took the entries whose "Revisit when" named the round after 0.55.5, is released (2026-11-26:
+Closed; its build, measurements, rulings and Calls to confirm are in `docs/progress/r0556.md`, its ledger in the
+git-ignored `.superpowers/sdd/2026-11-15-r0556/progress.md` of the worktree). Next: round 0.55.7, its fourteen deferred
+entries for the round after 0.55.6: its spec (`specs/2026-11-22-r0557-design.md`, 2026-11-22) is written, checked by
+fresh agents four times and revised after each (a step back redesigned two parts that drew findings in every round);
+its questions Q20 to Q23 are decided, each on its recommended option (chief's decisions, 2026-11-22; Closed); its plan
+is written (`plans/2026-11-22-r0557.md`, 20 tasks, on those options: a table at its top and a [Q<n>] mark on each task
+say what another answer would change). It is built on its own branch from main, when chief's word on the shared usage
+limits allows it. After it: the entries naming the round after 0.55.7 (P19's fixes among them), and P3's build as its
+own round. Two entries wait for upstream fixes. Behind it: a deferral is planned work; the user's pick 2026-11-14,
+"Fixes round (Recommended)".
 
 **P2. Remove the 0.54 reader, prune and conversion code.** Source: `specs/2026-11-04-round19-vault-r-design.md` sections
 8, 9 ("the 0.54 parts go in a later release") and 12 step 3; `plans/2026-11-05-round20.md`; commit 9ab7949 ("stays for
@@ -152,14 +125,6 @@ proof is the full compare alone (no inode column: no format change, and an inode
 page that a compare sees).
 Behind it: 2026-11-12, "continue next phase please" and the pick "Fixes + lightness, one round (Recommended)", offered
 with "the no-copy move into a new folder gets its own design round after".
-
-**P4. Remove the backuper's dead branch** at `reverberator.py` ~4988-4995. **P5. Remove the lost-manifest branch of
-`drop_untracked_deletes(newest_path=)`.** **P6. Remove `remove_pending_file()`.** Source: round 0.55.5's final review
-and its second opinions (parts that can go; not in a spec). State: built on branch `r0556` (Task 3, 926e963, reviewed;
-41 lines fewer). The review found one more unreachable part of the same kind, the rebuild before `hand_over()` in
-`do_backup()`, with tests that reach it by hand: it goes in the round's cleanup before the final review (the main
-session's call, as these were). Done with the round's merge. Behind them: "simpler and smarter is better"; ruled "can go, next round" by the main session: its own
-housekeeping, with no pick of the user's.
 
 **P7. The live measurement after design R.** Source: `plans/2026-11-05-round20.md`, Rollout; the round 19 spec's real
 writes after release. State: measuring. To measure on the current release: writes per backup of the busiest job and per day (the vault disks' lifetime write counters) against
@@ -230,80 +195,9 @@ swap, peak 158 MB; at 14 hours (15:20), anonymous 91.2 MB (18.5 MB in memory, 72
 145 MB swapped) and 150 MB peak. The README (line 90) says idle memory stays near 35 MB, which the tests measured: live,
 only the resident part is near it, as swap holds the rest. If the anonymous total stays far above it, find what holds
 the memory and correct the line. A reading at 45 hours (2026-11-15 23:01 PST, 20 minutes after a 19,731-entry batch, so not idle): resident 86 MB
-(74 MB of it anonymous), 39 MB in swap, peak 158 MB. housekeepd takes the reading (case 572, from 2026-11-16, the user's pick "Leave housekeepd a note (Recommended)"). Behind it: the
+(74 MB of it anonymous), 39 MB in swap, peak 158 MB. housekeepd takes the reading (case 572, from 2026-11-16, the user's pick "Leave housekeepd a note (Recommended)"). 0.55.6 replaced 0.55.5
+on 2026-11-26 01:24 PST after 12 days; a minute after its first backups it was resident 104 MB, none in swap, peak 178 MB. Behind it: the
 user's pick "Trim, shrink, 2 arenas (Recommended)" (2026-11-13).
-
-**P10 to P13. Four parts of round 22's first watcher design that the step back never took up.** Source:
-`specs/2026-11-08-round22-watcher-design.md`. Its top says it was not built; the step back replaced its watcher work
-and says nothing of these. State: in round 0.55.6 (branch `r0556`), spec in its check. Behind them: the user's
-picks 2026-11-14, "Carry all four (Recommended)" and "Fixes round (Recommended)".
-- **P10. A tree walk without recursion** (its 2.3): `iter_tree_entries()` recursed by `yield from`, so a tree
-  deeper than about 1,000 levels left its deepest folders unwatched, and the comparison, restore and vault walks
-  through the same function stopped at the same depth. Built on branch `r0556` (Task 5, c8eb142, reviewed): both walks
-  and `settle()`'s `is_real()` keep a stack, with the same yields in the same order; a tree 1,200 levels deep is
-  watched, backed up, listed and restored. Done with the round's merge.
-- **P11. The walk follows no link that replaced a folder while it ran** (2.5, item 7): the tree's watches were added
-  without `IN_DONT_FOLLOW`, and the listing followed such a link. Built on branch `r0556` (Task 6, 3869779 and its fix
-  f255db9, reviewed): each folder below a walk's root is opened with `O_NOFOLLOW` and listed by its handle, its watch
-  added with `IN_ONLYDIR | IN_DONT_FOLLOW`; a folder replaced by a link or a file is gone, with one INFO line; the walks
-  of folders the tree just made, and the size estimate, follow no link at their root. One case three second opinions
-  raised, a folder *above* replaced by a link after the walk entered it, the spec rules Not an issue; one of them adds a
-  file protected only by an ancestor folder's mode, which the final review weighs (the build's ledger). Done with the
-  round's merge.
-- **P12. The walk catches `OSError`, not every `Exception`** (section 7): the broad catch hid
-  `tests/test_inner_mounts.py:91`, which used `errno` without importing it. Built on branch `r0556` (Task 7, b509e24 and
-  a2d3a28, reviewed): the walk catches only its reads' OSError, so a bug in what it calls fails the backup attempt or
-  the watcher's job with its traceback; it lists a parent once when many of its folders vanish (D14), and the watcher
-  counts a folder it cannot open unwatched (D13's watcher half). Done with the round's merge.
-- **P13. "Event name not found, ignoring event" as a DEBUG line** (item 9): built on branch `r0556` (Task 4, 4670ea0,
-  reviewed): no log-file line for every chmod or touch of a watched folder any more, unless DEBUG. Its review found that
-  a change to the monitored folder's own metadata alone makes no version (older than this round): a deferred entry in
-  `docs/limitations.md` for the round after 0.55.6.
-
-**P14. Spec text left behind the code** (documentation only). Source: the round 19 spec's sections 2.2 (a folder under
-keep is hard-linked, not exchanged), 3 (the staging rule, the lost-manifest row), 4.3 ("No forward rule is used"), 5 (a
-filesystem with no exchange is treated as a pool, not only mergerfs), 6 (the estimate changed) and 13 (line numbers),
-where the round 20 plan's proposed spec edits were applied only in part; the 0.55.5 spec's L4 summary table (three and
-four mount-table reads, not two and three) and its 5.9 (L10 decides "gone" by listing the parent, not by an lstat).
-State: built on branch `r0556` (Task 17, 8c127fd and its fix d2070f3, reviewed): each edit says the rule the code
-follows, with this round's changes in a clause. Done with the round's merge. Behind it: the main session's own
-housekeeping, with no pick of the user's.
-
-**P15. Every test module carries its layer marker.** Source: `specs/2026-08-12-full-test-suite-design.md`, Goals and
-"1 Pytest config". State: built on branch `r0556` (Task 1, 71e4e42..1b5febe, reviewed): every test carries exactly
-one layer by what it does (twenty modules had tests with none, not the eight first counted; about twenty tests had a
-wrong or a second layer), the collection fails a module with an unmarked or a two-layer test, and the two `unittest`
-modules are pytest functions. A few wording points and one more test's layer wait for the round's cleanup. Done with
-the round's merge. Behind it: that spec's goals; no pick of the user's is on record for it.
-
-**P16. Check whether a folder whose own metadata copy failed heals in later versions.** Source: the user's pick
-2026-11-03, "Not an issue, check healing (Recommended)", on a folder that keeps the setgid or default ACL it inherited
-when its own metadata copy fails (an ERROR line, and the folder listed as unsynced). State: not started; no spec, plan
-or commit has a result. Round 18 (0.54) and design R changed how folder metadata is copied since, so the check runs on
-the current release. The entry "A folder whose extended attributes alone fail to copy keeps the wrong ones" covers
-only the xattr case. State: in round 0.55.6 (branch `r0556`). Step 1, the check, is built and reviewed (Task 2,
-2dc2fd0..8aed9ab, tests/test_io_errors.py: 40 results, the same on 0.55.5's code). Its results were Q15, which the
-user answered (a) on 2026-11-17: step 2 is plan Task 18 (the failed folder's row is marked, so the next comparison that
-meets the folder copies its metadata again, once), not started. Spec section 16's reasoned list ("reasoned, not run")
-is superseded by those results. Behind it: that pick, "Fixes round (Recommended)" (2026-11-14), and Q15's answer,
-"Build the retry (Recommended)" (2026-11-17).
-
-**P17. Four notes the names-chains spec (2026-10-21, "Left as they are") never wrote down** (was Q3): the commands
-redirect stdout and stderr process-wide while they load the rules (~14814); `get_path_fs_info` logs through the
-backuper's logger in the commands (~11106); folders that cannot be locked (NFS) are not kept apart, and a microsecond
-window between an in-place mkdir and its lock can leave an extra empty moved-aside folder (~16190); a `cp` that outlives
-the stop timeout may write a partial file after the lock is released. State: in round 0.55.6 (branch `r0556`): each
-goes down the ladder there; one left as a known limitation comes back to the user as its own question. Behind it: the
-main session's call (2026-11-14), told to the user with the round's question.
-
-**P18. Lines for the shared lessons file** (was Q4), which the 0.55.5 spec (section 11) and plan (Task 13) said to
-propose and never did: sharpen "What a restart rescans follows from what could change while it was down, not from the
-job it resumes." with "; when it rescans everything, drop the saved work it would resume"; add "A record describes an
-object, not a name: move it with the object, and only once the object has moved."; add "When a guarantee moves
-upstream, remove the downstream check that stood in for it."; and design R's lesson (its section 15), which is in
-`docs/lessons.md` only. State: in round 0.55.6 (branch `r0556`): written as the agent rules say (APIs: a lesson that
-would change a design in an unrelated repo gets one line in the shared file), listed in its Calls to confirm. Behind
-it: the main session's call (2026-11-14).
 
 **P19. Check how design R's hard-link records behave on a mergerfs pool set to answer a cross-disk link with a
 symlink.** Source: the review of P3's spec (2026-11-23). mergerfs's `link-exdev` option can make a link across its disks
@@ -372,6 +266,25 @@ Kept so they are not lost; none is planned until the user picks it.
 
 ## Closed
 
+- Round 0.55.6's parts, released in 0.55.6 (2026-11-26), each built and reviewed on branch `r0556` (the record:
+  `docs/progress/r0556.md`):
+  - P4 to P6, the backuper's dead branch, the lost-manifest branch of `drop_untracked_deletes(newest_path=)` and
+    `remove_pending_file()`: removed (Task 3, 926e963), with the unreachable rebuild before `hand_over()` in the round's
+    cleanup. Their basis: "simpler and smarter is better" (2026-11-03).
+  - P10 to P13, round 22's four first-design parts: the walk without recursion (Task 5, c8eb142), no link followed that
+    replaced a folder mid-walk (Task 6, 3869779, f255db9), the walk's catch narrowed to OSError (Task 7, b509e24,
+    a2d3a28), "Event name not found" at DEBUG (Task 4, 4670ea0). The user's pick 2026-11-14, "Carry all four
+    (Recommended)".
+  - P14, spec text behind the code: corrected (Task 17, 8c127fd, d2070f3).
+  - P15, every test's layer marker: one layer each, checked at collection (Task 1, 71e4e42..1b5febe).
+  - P16, a folder whose own metadata copy failed: the healing check (Task 2, 2dc2fd0..8aed9ab; its results were Q15)
+    and the one retry (Task 18, 4652c40, eedbabd); what still repeats is accepted (Q18). The user's picks 2026-11-03,
+    2026-11-17 and 2026-11-26.
+  - P17, the names-chains spec's four notes: three notes and note 3's microsecond window Not an issue (the round's spec,
+    section 17); two restores at once into one NFS folder a known limitation (Q14, the user's pick 2026-11-15).
+  - P18, lines for the shared lessons file: written in `docs/lessons.md` and in the shared file's own repo, where they
+    stay (the user's pick 2026-11-26, through chief, "The session's own call (Recommended)", for who decides a new
+    shared line).
 - Q26, a report to mergerfs (P19: with a path-preserving create policy and a symlink mode of `link-exdev` or
   `rename-exdev`, mergerfs 2.42.0 aborts on a link or a rename across its disks, `ugid.hpp:87: Assertion 'newuid_ !=
   FUSE_INVALID_UIDGID' failed`): (a), post it. The user's pick 2026-11-26 (through chief), "Post it (Recommended)": the
@@ -472,6 +385,8 @@ Kept so they are not lost; none is planned until the user picks it.
 - Q3 and Q4 became rows P17 and P18 (2026-11-14): work for round 0.55.6, not questions for the user.
 
 Releases, newest first (the spec and plan of each are in `docs/superpowers/`):
+- 0.55.6, 2026-11-26 (e166baa; main f055908 at the roll-out): the fixes round, fifteen deferred entries and P4 to P6, P10 to
+  P18.
 - 0.55.5, 2026-11-14 (9fcbcfa; main 720e518): four deferred fixes and the lightness round.
 - 0.55.4, 2026-11-11 (60baf6a): round 22's step back, the watcher's always-probed move.
 - 0.55.3, 2026-11-10 (9bbb0f8): the flush round, syncs through handles opened before the writes.
